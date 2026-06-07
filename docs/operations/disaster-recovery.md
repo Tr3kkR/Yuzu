@@ -9,7 +9,12 @@
 | `pending-agents.cfg` | `/etc/yuzu/` | Yes — pending approval queue |
 | `*.db` (all SQLite databases) | `/var/lib/yuzu/` | Yes — all operational data |
 | TLS certificates | `/etc/yuzu/certs/` | Yes — mTLS identity |
-| Content definitions | `/usr/share/yuzu/content/` | No — can be re-imported |
+
+> Shipped InstructionDefinitions live inside the `yuzu-server` binary
+> (embedded at build time by `server/core/scripts/embed_content.py`)
+> and are re-seeded into `instructions.db` on first boot. Operator
+> edits to definitions persist in `instructions.db`, which is already
+> covered above.
 
 ## Backup Strategy
 

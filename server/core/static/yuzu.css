@@ -397,7 +397,19 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 }
 @media (max-width: 1280px) {
   .main-grid { grid-template-columns: 1fr !important; }
-  .history, .scope { display: none !important; }
+  /* Keep the agent/scope panel visible on narrow screens — it is how the
+     operator targets devices, so hiding it breaks the dashboard. Collapse
+     only the optional history rail and reflow the dashboard to two columns
+     so the scope panel is never clipped. (Was: hid .history AND .scope,
+     which made agents disappear on any window <=1280px.) */
+  .history { display: none !important; }
+  .dashboard-grid {
+    grid-template-columns: minmax(0, 1fr) 220px !important;
+    grid-template-areas:
+      "instrbar scope"
+      "results  scope"
+      "footer   scope" !important;
+  }
 }
 
 /* YAML split-panel editor */

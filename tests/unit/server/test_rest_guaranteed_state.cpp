@@ -74,9 +74,10 @@ struct RestGsHarness {
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
 
-        auto auth_fn = [this](const httplib::Request&, httplib::Response&)
-            -> std::optional<auth::Session> {
-            if (session_user.empty()) return std::nullopt;
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+            if (session_user.empty())
+                return std::nullopt;
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
@@ -84,15 +85,17 @@ struct RestGsHarness {
         };
 
         // perm_fn always grants — RBAC is exercised in test_rbac_store.cpp.
-        auto perm_fn = [](const httplib::Request&, httplib::Response&,
-                          const std::string&, const std::string&) -> bool {
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool {
             return true;
         };
 
+        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -113,8 +116,7 @@ struct RestGsHarness {
                             /*product_pack_store=*/nullptr,
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
-                            /*license_store=*/nullptr,
-                            store.get());
+                            /*license_store=*/nullptr, store.get());
     }
 
     ~RestGsHarness() {
@@ -125,18 +127,17 @@ struct RestGsHarness {
         fs::remove(db_path.string() + "-shm");
     }
 
-    static std::string make_rule_body(const std::string& rule_id,
-                                       const std::string& name,
-                                       const std::string& yaml = "name: example\n") {
+    static std::string make_rule_body(const std::string& rule_id, const std::string& name,
+                                      const std::string& yaml = "name: example\n") {
         nlohmann::json j;
-        j["rule_id"]          = rule_id;
-        j["name"]             = name;
-        j["yaml_source"]      = yaml;
-        j["enabled"]          = true;
+        j["rule_id"] = rule_id;
+        j["name"] = name;
+        j["yaml_source"] = yaml;
+        j["enabled"] = true;
         j["enforcement_mode"] = "enforce";
-        j["severity"]         = "high";
-        j["os_target"]        = "windows";
-        j["scope_expr"]       = "tag:env=prod";
+        j["severity"] = "high";
+        j["os_target"] = "windows";
+        j["scope_expr"] = "tag:env=prod";
         return j.dump();
     }
 };
@@ -147,7 +148,7 @@ TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
           "[rest][guaranteed_state][create]") {
     RestGsHarness h;
     auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
-                            RestGsHarness::make_rule_body("r-001", "block-rdp"));
+                           RestGsHarness::make_rule_body("r-001", "block-rdp"));
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK(res->body.find("\"rule_id\":\"r-001\"") != std::string::npos);
@@ -182,10 +183,12 @@ TEST_CASE("REST gs.rules: missing required fields → 400",
 TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
           "[rest][guaranteed_state][conflict]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "dup-name"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "dup-name"))
+                ->status == 201);
     auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
-                            RestGsHarness::make_rule_body("r-002", "dup-name"));
+                           RestGsHarness::make_rule_body("r-002", "dup-name"));
     REQUIRE(res);
     CHECK(res->status == 409);
     // Body must NOT carry the kConflictPrefix marker — that's an internal
@@ -197,13 +200,16 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
     CHECK(h.audit_log[1].result == "denied");
 }
 
-TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
-          "[rest][guaranteed_state][crud]") {
+TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[rest][guaranteed_state][crud]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-002", "rule-b"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-002", "rule-b"))
+                ->status == 201);
 
     auto list = h.sink.Get("/api/v1/guaranteed-state/rules");
     REQUIRE(list);
@@ -231,7 +237,7 @@ TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
     REQUIRE(refetched.has_value());
     CHECK_FALSE(refetched->enabled);
     CHECK(refetched->severity == "critical");
-    CHECK(refetched->version == 2);  // bumped by handler
+    CHECK(refetched->version == 2); // bumped by handler
 
     auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/r-001");
     REQUIRE(del);
@@ -239,8 +245,7 @@ TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
     CHECK_FALSE(h.store->get_rule("r-001").has_value());
 }
 
-TEST_CASE("REST gs.rules: get unknown id → 404",
-          "[rest][guaranteed_state][not_found]") {
+TEST_CASE("REST gs.rules: get unknown id → 404", "[rest][guaranteed_state][not_found]") {
     RestGsHarness h;
     auto got = h.sink.Get("/api/v1/guaranteed-state/rules/nope");
     REQUIRE(got);
@@ -253,8 +258,10 @@ TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
     // denied audit, matching the sibling /push 400 branch. Asymmetric audit
     // coverage across sibling rejection paths was the original finding.
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
     // Non-object body (top-level array) — body.is_object() is false.
     auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-001", "[1,2,3]");
     REQUIRE(upd);
@@ -283,8 +290,10 @@ TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
 TEST_CASE("REST gs.push: returns 202 + audits the operator action",
           "[rest][guaranteed_state][push]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
     nlohmann::json push;
     push["scope"] = "tag:env=prod";
     push["full_sync"] = true;
@@ -292,24 +301,29 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     REQUIRE(res);
     CHECK(res->status == 202);
     CHECK(res->body.find("\"queued\":true") != std::string::npos);
-    // Response body uses a stable operational phrase, not an engineer-facing
-    // roadmap reference (BL-6 / ER-Dep2).
-    CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
+    // Real fan-out landed: the body reports the rule count and the number of
+    // in-scope agents the push was dispatched to (direct + gateway transports).
+    // The old "agent delivery is asynchronous / deferred" phrasing is gone —
+    // see docs/user-manual/guaranteed-state.md.
+    CHECK(res->body.find("\"rules\":1") != std::string::npos);
+    CHECK(res->body.find("\"agents\":") != std::string::npos);
 
-    REQUIRE(h.audit_log.size() == 2);  // create + push
+    REQUIRE(h.audit_log.size() == 2); // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
     // Vocabulary matches sibling handlers: "success" (not the prior novel
     // "accepted"), target_id is empty because a push is fleet-level rather
-    // than per-entity, and the scope expression lives in detail alongside
-    // the fan-out-deferred marker so SIEM correlation rules can filter on it.
+    // than per-entity, and the scope expression lives in detail alongside the
+    // agents=<count> fan-out result so SIEM correlation rules can filter on it.
     CHECK(push_audit.result == "success");
     CHECK(push_audit.target_id == "");
     CHECK(push_audit.target_type == "GuaranteedState");
     CHECK(push_audit.detail.find("rules=1") != std::string::npos);
     CHECK(push_audit.detail.find("full_sync=true") != std::string::npos);
     CHECK(push_audit.detail.find("scope=\"tag:env=prod\"") != std::string::npos);
-    CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
+    // Audit detail records the dispatched agent count, not the retired
+    // fan_out_deferred_pr3 marker (push now actually delivers).
+    CHECK(push_audit.detail.find("agents=") != std::string::npos);
 }
 
 TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
@@ -360,15 +374,14 @@ TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
     // The structural frame of the detail is intact.
     CHECK(d.find("rules=0") != std::string::npos);
     CHECK(d.find("full_sync=false") != std::string::npos);
-    CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
+    CHECK(d.find("agents=") != std::string::npos);
 }
 
-TEST_CASE("REST gs.events: filter + limit pagination",
-          "[rest][guaranteed_state][events]") {
+TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state][events]") {
     RestGsHarness h;
     GuaranteedStateEventRow ev;
     ev.event_id = "e-1";
-    ev.rule_id  = "r-001";
+    ev.rule_id = "r-001";
     ev.agent_id = "agent-A";
     ev.event_type = "drift.detected";
     ev.severity = "high";
@@ -388,19 +401,19 @@ TEST_CASE("REST gs.events: filter + limit pagination",
     CHECK(j["data"][0]["event_id"].get<std::string>() == "e-1");
 }
 
-TEST_CASE("REST gs.events: invalid limit → 400",
-          "[rest][guaranteed_state][events][validation]") {
+TEST_CASE("REST gs.events: invalid limit → 400", "[rest][guaranteed_state][events][validation]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
 
-TEST_CASE("REST gs.status: returns store rule_count rollup",
-          "[rest][guaranteed_state][status]") {
+TEST_CASE("REST gs.status: returns store rule_count rollup", "[rest][guaranteed_state][status]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status");
     REQUIRE(res);
@@ -418,8 +431,7 @@ TEST_CASE("REST gs.status: returns store rule_count rollup",
     CHECK_FALSE(j["data"].contains("errored"));
 }
 
-TEST_CASE("REST gs.alerts: empty list placeholder",
-          "[rest][guaranteed_state][alerts]") {
+TEST_CASE("REST gs.alerts: empty list placeholder", "[rest][guaranteed_state][alerts]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/alerts");
     REQUIRE(res);
@@ -427,4 +439,154 @@ TEST_CASE("REST gs.alerts: empty list placeholder",
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"].is_array());
     CHECK(j["data"].empty());
+}
+
+// ── C3b: structured authoring + resilience validation + schema discovery ─────
+
+namespace {
+// A full structured Guard body (spark + assertion + remediation). `resilience`
+// is the remediation.params object carrying the C3b resilience policy.
+std::string make_structured_body(const std::string& rule_id, const std::string& name,
+                                 const std::string& remediation_type, nlohmann::json resilience) {
+    nlohmann::json j;
+    j["rule_id"] = rule_id;
+    j["name"] = name;
+    j["enforcement_mode"] = "enforce";
+    j["severity"] = "high";
+    j["spark"] = {{"type", "registry-change"}, {"params", nlohmann::json::object()}};
+    j["assertion"] = {{"type", "registry-value-equals"},
+                      {"params",
+                       {{"hive", "HKLM"},
+                        {"key", "SOFTWARE\\YuzuTest"},
+                        {"value_name", "Flag"},
+                        {"value_type", "REG_DWORD"},
+                        {"expected", "1"}}}};
+    j["remediation"] = {{"type", remediation_type}, {"params", std::move(resilience)}};
+    return j.dump();
+}
+} // namespace
+
+TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience params",
+          "[rest][guaranteed_state][create][resilience]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-res", "bounded-guard", "enforce",
+                             {{"mode", "BOUNDED"}, {"max_attempts", 3}}));
+    REQUIRE(res);
+    CHECK(res->status == 201);
+
+    auto stored = h.store->get_rule("r-res");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    const auto& params = spec["remediation"]["params"];
+    // Canonical-out: mode lowercased, numeric stored as a decimal string.
+    CHECK(params["mode"].get<std::string>() == "bounded");
+    CHECK(params["max_attempts"].get<std::string>() == "3");
+}
+
+TEST_CASE("REST gs.rules: invalid resilience params → 400 A4 envelope + denied audit",
+          "[rest][guaranteed_state][create][resilience][validation]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-bad", "bad-guard", "enforce",
+                             {{"mode", "bounded"}, {"max_attempts", 0}})); // 0 invalid
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    // A4 envelope shape (contract decision 3).
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"].get<int>() == 400);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"].contains("remediation"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    // Rule not persisted; reject audited.
+    CHECK_FALSE(h.store->get_rule("r-bad").has_value());
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.rules: PUT re-authors structured spec (no silent drop)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-edit", "edit-guard", "enforce",
+                                           {{"mode", "persist"}}))
+                ->status == 201);
+
+    // Tune the resilience policy via PUT — the pre-C3b PUT returned 200 but
+    // silently dropped structured blocks. Now it must re-derive the spec.
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-edit",
+                          make_structured_body("r-edit", "edit-guard", "enforce",
+                                               {{"mode", "bounded"}, {"max_attempts", 2}}));
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+
+    auto stored = h.store->get_rule("r-edit");
+    REQUIRE(stored.has_value());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "bounded");
+    CHECK(spec["remediation"]["params"]["max_attempts"].get<std::string>() == "2");
+    CHECK(stored->version == 2);
+}
+
+TEST_CASE("REST gs.rules: PUT with an incomplete structured body → 400 (not silently dropped)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-meta", "meta-guard"))
+                ->status == 201);
+    // A remediation block with no spark/assertion is an incomplete structured
+    // edit — rejected explicitly rather than 200-and-drop.
+    nlohmann::json partial;
+    partial["remediation"] = {{"type", "enforce"}, {"params", {{"mode", "bounded"}}}};
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-meta", partial.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+    auto j = nlohmann::json::parse(upd->body);
+    CHECK(j["error"]["message"].get<std::string>().find("spark") != std::string::npos);
+}
+
+TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured spec",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-keep", "keep-guard", "enforce",
+                                           {{"mode", "backoff"}, {"backoff_initial_ms", 500}}))
+                ->status == 201);
+    // Toggle enabled only — must not wipe spec_json.
+    nlohmann::json meta;
+    meta["enabled"] = false;
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-keep", meta.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+    auto stored = h.store->get_rule("r-keep");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "backoff");
+}
+
+TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_state][schemas]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/schemas");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("schemas"));
+    CHECK(j["schemas"].is_array());
+
+    // Conditional GET with the matching ETag → 304 Not Modified.
+    auto cached = h.sink.Get("/api/v1/guaranteed-state/schemas",
+                             {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
 }

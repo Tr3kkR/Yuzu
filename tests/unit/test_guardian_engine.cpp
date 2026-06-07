@@ -94,6 +94,40 @@ struct GuardianFixture {
         r.set_enforcement_mode("enforce");
         return r;
     }
+
+    // A rule that actually arms a RegistryGuard on Windows (registry-change spark
+    // + registry-value-equals assertion). The key need not exist — post-C1 the
+    // guard worker stays ALIVE on a nearest-ancestor watch (waiting for the key to
+    // appear) instead of exiting; get_status is still fail-closed because there is
+    // no self-test verdict yet, so the rule reports "errored" regardless.
+    static gpb::GuaranteedStateRule make_registry_rule(const std::string& id,
+                                                       const std::string& mode) {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.set_enforcement_mode(mode);
+        r.mutable_spark()->set_type("registry-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("registry-value-equals");
+        (*a->mutable_params())["hive"] = "HKCU";
+        (*a->mutable_params())["key"] = "SOFTWARE\\YuzuTest\\GuardStatusTest";
+        (*a->mutable_params())["value_name"] = "Flag";
+        (*a->mutable_params())["value_type"] = "REG_DWORD";
+        (*a->mutable_params())["expected"] = "1";
+        return r;
+    }
+
+    // A rule that arms a ServiceGuard on Windows (service-status-change spark +
+    // service-running assertion). The service need not exist — the guard watches the
+    // SCM for it; get_status is fail-closed regardless (no self-test verdict yet).
+    static gpb::GuaranteedStateRule make_service_rule(const std::string& id,
+                                                      const std::string& mode) {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.set_enforcement_mode(mode);
+        r.mutable_spark()->set_type("service-status-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("service-running");
+        (*a->mutable_params())["service_name"] = "Spooler";
+        return r;
+    }
 };
 
 } // namespace
@@ -236,10 +270,58 @@ TEST_CASE("GuardianEngine: dispatch get_status returns serialised proto",
     REQUIRE(status.ParseFromString(dr.output));
     CHECK(status.agent_id() == "agent-test");
     CHECK(status.total_rules() == 2);
-    // PR 2 reports every rule as errored — no real guards yet.
+    // Fail-closed: rules report errored, never compliant, without a real verdict.
     CHECK(status.errored_rules() == 2);
     CHECK(status.compliant_rules() == 0);
     CHECK(status.rules_size() == 2);
+}
+
+TEST_CASE("GuardianEngine: get_status is fail-closed — an armed guard is never healthy/compliant",
+          "[guardian][engine][status][health]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    // audit (not enforce) so this status test never triggers C2's enforce-mode key
+    // recreation as a side effect — it only needs an armed guard to assert
+    // fail-closed status, which holds regardless of enforcement mode.
+    *p.add_rules() = GuardianFixture::make_registry_rule("reg-1", "audit");
+    // Serialize-then-dispatch so the params Map is parsed INSIDE the agent DLL
+    // (the #501 cross-image hash-seed reason the helper exists). On Windows this
+    // arms a real RegistryGuard (post-C1 its worker stays alive on a nearest-
+    // ancestor watch while the key is absent); off-Windows no guard arms. Either
+    // way the status MUST be fail-closed.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    auto status = f.engine->get_status();
+    REQUIRE(status.rules_size() == 1);
+    // The B1/UP-1/F4 false-green fix: armed (or dead-but-armed) does NOT prove
+    // compliance or health. guard_healthy is a reserved field, default false.
+    CHECK_FALSE(status.rules(0).guard_healthy());
+    CHECK(status.rules(0).status() == "errored");
+    CHECK(status.compliant_rules() == 0);
+    CHECK(status.errored_rules() == 1);
+}
+
+TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-closed",
+          "[guardian][engine][service][status]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    // audit mode: on Windows this arms a real ServiceGuard whose worker watches the
+    // SCM for the named service; off-Windows no guard arms. Either way the rule is
+    // persisted and status is fail-closed (no self-test verdict yet → "errored",
+    // never healthy/compliant) — the same B1/UP-1/F4 invariant as the registry case.
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-1", "audit");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    auto status = f.engine->get_status();
+    REQUIRE(status.rules_size() == 1);
+    CHECK_FALSE(status.rules(0).guard_healthy());
+    CHECK(status.rules(0).status() == "errored");
+    CHECK(status.compliant_rules() == 0);
+    CHECK(status.errored_rules() == 1);
 }
 
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
@@ -253,7 +335,7 @@ TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
     CHECK(dr.output.find("not_a_real_action") != std::string::npos);
 }
 
-TEST_CASE("GuardianEngine: dispatch push_rules with missing param → exit_code 1",
+TEST_CASE("GuardianEngine: dispatch push_rules with missing payload → exit_code 1",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;
     apb::CommandRequest cmd;
@@ -261,7 +343,9 @@ TEST_CASE("GuardianEngine: dispatch push_rules with missing param → exit_code 
     cmd.set_action("push_rules");
     auto dr = f.engine->dispatch(cmd);
     CHECK(dr.exit_code == 1);
-    CHECK(dr.output.find("missing 'push' parameter") != std::string::npos);
+    // The push rides in the `payload` bytes field (not a `parameters` entry)
+    // since the payload-bytes migration; an empty payload reports accordingly.
+    CHECK(dr.output.find("missing payload") != std::string::npos);
 }
 
 TEST_CASE("GuardianEngine: dispatch push_rules with garbage proto → exit_code 2",

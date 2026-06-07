@@ -1,6 +1,10 @@
 #include "instruction_store.hpp"
 #include "migration_runner.hpp"
+#include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
+#include "response_templates_engine.hpp"
+#include "scope_yaml.hpp"
 #include "store_errors.hpp"
+#include "yaml_scan.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -41,7 +45,8 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
         // does strict validation on the chart objects themselves.
         nlohmann::json out = nlohmann::json::array();
         for (const auto& el : v) {
-            if (el.is_object()) out.push_back(el);
+            if (el.is_object())
+                out.push_back(el);
         }
         return out.dump();
     }
@@ -86,6 +91,7 @@ InstructionDefinition row_to_def(sqlite3_stmt* stmt) {
     d.required_plugins = col_text(stmt, 21);
     d.readable_payload = col_text(stmt, 22);
     d.visualization_spec = col_text(stmt, 23);
+    d.response_templates_spec = col_text(stmt, 24);
     return d;
 }
 
@@ -94,7 +100,7 @@ const char* kSelectAllCols = "id, name, version, type, plugin, action, descripti
                              "created_by, created_at, updated_at, "
                              "yaml_source, parameter_schema, result_schema, approval_mode, "
                              "concurrency_mode, platforms, min_agent_version, required_plugins, "
-                             "readable_payload, visualization_spec";
+                             "readable_payload, visualization_spec, response_templates_spec";
 
 } // namespace
 
@@ -189,41 +195,92 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
         // ALTER entirely (governance arch-B2 / CP-5).
         {2, "ALTER TABLE instruction_definitions ADD COLUMN visualization_spec "
             "TEXT NOT NULL DEFAULT '{}';"},
+        // Issue #254 (8.2): named response view configurations
+        // (column subset + sort + filters) on InstructionDefinition. Same
+        // probe-and-stamp pattern as v2.
+        {3, "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec "
+            "TEXT NOT NULL DEFAULT '[]';"},
     };
-    // Pre-migration probe: if `instruction_definitions` already has the
-    // visualization_spec column AND `schema_meta` says we're below v2,
-    // stamp v2 directly so the runner skips the duplicate-column ALTER.
-    // The probe is a read-only PRAGMA query — safe to run on any state.
-    {
+    // Pre-migration probe: stamp schema_meta past any version whose ALTER
+    // would duplicate-column on the live DB (so the runner skips it). Same
+    // technique as the original v2 guard (governance arch-B2 / CP-5),
+    // generalised so v3 inherits the protection.
+    //
+    // UP-4 hardening (Gate 4 governance): every SQLite step return is
+    // checked. If the stamp insert fails, we close the DB rather than
+    // letting the migration runner attempt the duplicate-column ALTER —
+    // a silent-stamp + duplicate-column-ALTER chain wedged the store
+    // (`is_open()` false) with no diagnostic, leaving the operator
+    // staring at /readyz="ok" while every definition call returned 503.
+    bool stamp_failed = false;
+    auto probe_and_stamp = [&](const char* column_name, int target_version) {
+        if (stamp_failed)
+            return; // earlier stamp failed; skip remaining
         sqlite3_stmt* probe = nullptr;
         bool col_exists = false;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM pragma_table_info('instruction_definitions') "
-                               "WHERE name='visualization_spec' LIMIT 1",
-                               -1, &probe, nullptr) == SQLITE_OK) {
-            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+        int rc = sqlite3_prepare_v2(db_,
+                                    "SELECT 1 FROM pragma_table_info('instruction_definitions') "
+                                    "WHERE name=? LIMIT 1",
+                                    -1, &probe, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("InstructionStore: probe prepare failed for {} (rc={}): {}", column_name,
+                          rc, sqlite3_errmsg(db_));
+            stamp_failed = true;
+            return;
+        }
+        sqlite3_bind_text(probe, 1, column_name, -1, SQLITE_TRANSIENT);
+        int probe_rc = sqlite3_step(probe);
+        if (probe_rc != SQLITE_ROW && probe_rc != SQLITE_DONE) {
+            spdlog::error("InstructionStore: probe step failed for {} (rc={}): {}", column_name,
+                          probe_rc, sqlite3_errmsg(db_));
             sqlite3_finalize(probe);
+            stamp_failed = true;
+            return;
         }
+        col_exists = (probe_rc == SQLITE_ROW);
+        sqlite3_finalize(probe);
+
         int current_v = MigrationRunner::current_version(db_, "instruction_store");
-        if (col_exists && current_v < 2) {
-            // Stamp schema_meta directly. MigrationRunner::set_version is
-            // private, but the table layout is stable.
+        if (col_exists && current_v < target_version) {
             sqlite3_stmt* stamp = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "INSERT OR REPLACE INTO schema_meta "
-                                   "(store, version, upgraded_at) VALUES (?, 2, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
-                auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-                sqlite3_bind_text(stamp, 1, "instruction_store", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now);
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
-                spdlog::info("InstructionStore: visualization_spec column already "
-                             "present, stamping schema_meta to v2 (arch-B2)");
+            int prep_rc = sqlite3_prepare_v2(db_,
+                                             "INSERT OR REPLACE INTO schema_meta "
+                                             "(store, version, upgraded_at) VALUES (?, ?, ?)",
+                                             -1, &stamp, nullptr);
+            if (prep_rc != SQLITE_OK) {
+                spdlog::error("InstructionStore: stamp prepare failed for v{} ({}): {}",
+                              target_version, column_name, sqlite3_errmsg(db_));
+                stamp_failed = true;
+                return;
             }
+            auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+            sqlite3_bind_text(stamp, 1, "instruction_store", -1, SQLITE_STATIC);
+            sqlite3_bind_int(stamp, 2, target_version);
+            sqlite3_bind_int64(stamp, 3, now);
+            int step_rc = sqlite3_step(stamp);
+            sqlite3_finalize(stamp);
+            if (step_rc != SQLITE_DONE) {
+                spdlog::error("InstructionStore: stamp step failed for v{} ({}, rc={}): {}; "
+                              "refusing to run migration ledger to avoid duplicate-column ALTER",
+                              target_version, column_name, step_rc, sqlite3_errmsg(db_));
+                stamp_failed = true;
+                return;
+            }
+            spdlog::info("InstructionStore: {} column already present, stamping schema_meta to v{} "
+                         "(arch-B2)",
+                         column_name, target_version);
         }
+    };
+    probe_and_stamp("visualization_spec", 2);
+    probe_and_stamp("response_templates_spec", 3);
+    if (stamp_failed) {
+        spdlog::error("InstructionStore: probe-and-stamp failed; closing database "
+                      "(governance UP-4 hardening — fail-closed instead of wedging boot)");
+        sqlite3_close(db_);
+        db_ = nullptr;
+        return;
     }
     if (!MigrationRunner::run(db_, "instruction_store", kMigrations)) {
         spdlog::error("InstructionStore: schema migration failed, closing database");
@@ -300,7 +357,8 @@ std::optional<InstructionDefinition> InstructionStore::get_definition(const std:
     return get_definition_impl(id);
 }
 
-std::optional<InstructionDefinition> InstructionStore::get_definition_impl(const std::string& id) const {
+std::optional<InstructionDefinition>
+InstructionStore::get_definition_impl(const std::string& id) const {
     if (!db_)
         return std::nullopt;
 
@@ -325,6 +383,35 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
     return create_definition_impl(def);
 }
 
+namespace {
+
+// Shared spec.scope validation for the create AND update paths (PR-E governance
+// arch-B1/UP-4): validating only at create was bypassable via update_definition
+// (reachable from the dashboard YAML-edit PUT and the response-template persist
+// path), so a clean definition could be edited to carry a forbidden
+// fromResultSet+dynamic / +managementGroups combo. Both paths now run this.
+// Only errors when spec.scope.fromResultSet is present with a forbidden combo;
+// scope-less and selector-only definitions (incl. all bundled content) pass.
+// Resolution is deferred to dispatch — a since-expired fromResultSet is still
+// valid here. Also caps oversize input (UP-3, mirrors PolicyStore) and rejects
+// the inline flow-mapping form the block-form line-scanners cannot see (UP-6).
+std::optional<std::string> validate_definition_scope(const std::string& yaml_source) {
+    if (yaml_source.empty())
+        return std::nullopt;
+    if (yaml_source.size() > 1048576)
+        return "yaml_source too large (max 1MB)";
+    auto raw_scope = yaml_scan::extract_yaml_value(yaml_source, "scope");
+    if (!raw_scope.empty() && raw_scope.front() == '{')
+        return "inline flow-mapping scope is not supported; use the block form "
+               "(scope: <newline> indented fromResultSet: <id-or-alias>)";
+    auto sb = parse_scope_block(yaml_source);
+    auto asn = yaml_scan::extract_yaml_section(yaml_source, "spec.assignment");
+    return validate_scope_block(sb, yaml_scan::extract_yaml_value(asn, "mode"),
+                                !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+}
+
+} // namespace
+
 std::expected<std::string, std::string>
 InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     if (!db_)
@@ -335,6 +422,9 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
         return std::unexpected("type must be 'question' or 'action'");
     if (def.plugin.empty())
         return std::unexpected("plugin is required");
+
+    if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
 
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();
@@ -352,8 +442,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     // anyway and hope SQLite's PK rejects it".
     if (!def.id.empty()) {
         sqlite3_stmt* exists_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1",
-                               -1, &exists_stmt, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1", -1,
+                               &exists_stmt, nullptr) != SQLITE_OK) {
             spdlog::error("InstructionStore: prepare failed in duplicate-id check: {}",
                           sqlite3_errmsg(db_));
             return std::unexpected("internal: duplicate-id check failed");
@@ -362,8 +452,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
         bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
         sqlite3_finalize(exists_stmt);
         if (exists)
-            return std::unexpected(std::string(kConflictPrefix) +
-                                   " instruction definition '" + id + "' already exists");
+            return std::unexpected(std::string(kConflictPrefix) + " instruction definition '" + id +
+                                   "' already exists");
     }
 
     const char* sql = R"(
@@ -373,8 +463,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
          created_by, created_at, updated_at,
          yaml_source, parameter_schema, result_schema, approval_mode,
          concurrency_mode, platforms, min_agent_version, required_plugins,
-         readable_payload, visualization_spec)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         readable_payload, visualization_spec, response_templates_spec)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -410,6 +500,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
     auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
     sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
+    auto rts = def.response_templates_spec.empty() ? "[]" : def.response_templates_spec;
+    sqlite3_bind_text(stmt, i++, rts.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
@@ -428,6 +520,11 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
     if (def.id.empty())
         return std::unexpected("id is required for update");
 
+    // arch-B1/UP-4: the same scope-block validation the create path enforces —
+    // update_definition must not be a bypass for the fromResultSet rules.
+    if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
+
     const char* sql = R"(
         UPDATE instruction_definitions SET
             name=?, version=?, type=?, plugin=?, action=?, description=?,
@@ -435,7 +532,7 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
             updated_at=?,
             yaml_source=?, parameter_schema=?, result_schema=?, approval_mode=?,
             concurrency_mode=?, platforms=?, min_agent_version=?, required_plugins=?,
-            readable_payload=?, visualization_spec=?
+            readable_payload=?, visualization_spec=?, response_templates_spec=?
         WHERE id=?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -469,6 +566,8 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
     auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
     sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
+    auto rts = def.response_templates_spec.empty() ? "[]" : def.response_templates_spec;
+    sqlite3_bind_text(stmt, i++, rts.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
@@ -535,14 +634,131 @@ std::string InstructionStore::export_definition_json(const std::string& id) cons
     j["required_plugins"] = def->required_plugins;
     j["readable_payload"] = def->readable_payload;
     j["visualization_spec"] = def->visualization_spec;
+    j["response_templates_spec"] = def->response_templates_spec;
     return j.dump(2);
 }
 
 std::expected<std::string, std::string>
 InstructionStore::import_definition_json(const std::string& json_str) {
+    return import_definition_json_impl(json_str, /*check_signature=*/true);
+}
+
+std::expected<std::string, std::string>
+InstructionStore::import_definition_json_trusted(const std::string& json_str) {
+    return import_definition_json_impl(json_str, /*check_signature=*/false);
+}
+
+std::expected<std::string, std::string>
+InstructionStore::import_definition_json_impl(const std::string& json_str, bool check_signature) {
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
         return std::unexpected("invalid JSON");
+
+    // ── Ed25519 signature verification (#1073 / W7.4 sibling-gap closure) ──
+    // Wire format mirrors ProductPack: optional top-level `signature` +
+    // `publicKey` fields, hex-encoded. The signed content is the
+    // `yaml_source` field's bytes verbatim — yaml_source is the
+    // authoritative source-of-truth representation of the definition.
+    //
+    // This gates the IMPORT surface. Authoring surfaces (POST /api/instructions,
+    // POST /api/instructions/yaml, PUT /api/instructions/{id}) trust the
+    // InstructionDefinition:Write RBAC permission as the author trust
+    // boundary — see SECURITY SCOPE comment on the public method in the .hpp.
+    //
+    // The trusted boot-content path (`import_definition_json_trusted`)
+    // skips this gate by passing check_signature=false — bundled content
+    // authenticity comes from build-time binary linkage, not runtime
+    // signature.
+    if (check_signature) {
+        // Round 1 governance unhappy-path R5: distinguish "field absent"
+        // from "field present but wrong JSON type". Returning empty-string
+        // silently for both made attacker-corrupted payloads
+        // ({"signature": 42}) reject with the misleading "unsigned" error.
+        // Use a tri-state so we can emit a precise rejection reason.
+        enum class FieldState { Absent, WrongType, Present };
+        auto extract_str = [&](const char* key, std::string& out) -> FieldState {
+            if (!parsed.contains(key))
+                return FieldState::Absent;
+            const auto& v = parsed[key];
+            if (v.is_null())
+                return FieldState::Absent; // null treated as absent
+            if (!v.is_string())
+                return FieldState::WrongType;
+            out = v.get<std::string>();
+            return out.empty() ? FieldState::Absent : FieldState::Present;
+        };
+        std::string sig_hex, pub_hex, yaml_source;
+        const auto sig_state = extract_str("signature", sig_hex);
+        const auto pub_state = extract_str("publicKey", pub_hex);
+        const auto yaml_state = extract_str("yaml_source", yaml_source);
+
+        if (sig_state == FieldState::WrongType || pub_state == FieldState::WrongType ||
+            yaml_state == FieldState::WrongType) {
+            return std::unexpected(
+                "instruction-import has signing field of wrong JSON type — "
+                "signature, publicKey, and yaml_source must be strings when present");
+        }
+
+        // R6 (unhappy-path): length-validate hex strings BEFORE handing to
+        // ProductPackStore::verify_signature so an attacker can't post a
+        // multi-MB sig_hex and trigger a server-side allocation peak.
+        // Ed25519: signature = 64 bytes (128 hex chars), public key = 32
+        // bytes (64 hex chars). Reject any other length.
+        constexpr std::size_t kEd25519SigHexLen = 128;
+        constexpr std::size_t kEd25519PubHexLen = 64;
+        if (sig_state == FieldState::Present && sig_hex.size() != kEd25519SigHexLen) {
+            return std::unexpected("signature length invalid — Ed25519 signature must be "
+                                   "exactly 128 hex chars (64 bytes)");
+        }
+        if (pub_state == FieldState::Present && pub_hex.size() != kEd25519PubHexLen) {
+            return std::unexpected("publicKey length invalid — Ed25519 public key must be "
+                                   "exactly 64 hex chars (32 bytes)");
+        }
+
+        if (sig_state == FieldState::Present && pub_state == FieldState::Present) {
+            // Both fields present → verify. Failure rejects unconditionally
+            // regardless of `require_signed_definitions_` (a failed signature
+            // is evidence of tampering, not a policy question).
+            if (yaml_state != FieldState::Present) {
+                return std::unexpected(
+                    "instruction-import has signature + publicKey but no yaml_source — "
+                    "yaml_source is the signed content carrier; cannot verify");
+            }
+            if (!ProductPackStore::verify_signature(yaml_source, sig_hex, pub_hex)) {
+                spdlog::error("InstructionStore::import_definition_json: signature verification "
+                              "FAILED — rejecting definition (content may be tampered)");
+                // R2 / Gate 4 consistency CONS-BLOCKING-2: wording aligned
+                // with ProductPackStore's parallel error
+                // ("signature verification failed for pack '<name>' — content
+                // may have been tampered with"). Both surfaces now use
+                // "content" as the noun and "may have been tampered with"
+                // as the suffix; SIEM full-string parsers see one shape.
+                return std::unexpected(
+                    "signature verification failed for instruction — content may "
+                    "have been tampered with");
+            }
+            spdlog::info("InstructionStore::import_definition_json: signature verified");
+        } else if (sig_state == FieldState::Present || pub_state == FieldState::Present) {
+            // Exactly one field present — incomplete signing metadata, reject.
+            return std::unexpected(
+                "instruction-import has incomplete signing metadata — both "
+                "signature and publicKey must be present together (or both absent)");
+        } else {
+            // No signature → unsigned import; gated by require_signed_definitions_.
+            if (require_signed_definitions_.load(std::memory_order_relaxed)) {
+                spdlog::error("InstructionStore::import_definition_json: definition is unsigned "
+                              "but signature enforcement is enabled — rejecting");
+                // gov W7.4 R1 CONS-BLOCKING-2 pattern: error names the operator-
+                // facing CLI flag so the rejection is actionable.
+                return std::unexpected(
+                    "instruction-import is unsigned and signature enforcement is enabled "
+                    "(set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 "
+                    "to bypass)");
+            }
+            spdlog::info("InstructionStore::import_definition_json: definition has no signature "
+                         "— importing as unverified");
+        }
+    }
 
     std::unique_lock lock(mtx_);
 
@@ -604,7 +820,8 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     auto normalize_to_array = [](const nlohmann::json& v) -> std::string {
         if (v.is_string()) {
             auto inner = nlohmann::json::parse(v.get<std::string>(), nullptr, false);
-            if (inner.is_discarded()) return v.get<std::string>(); // pass through
+            if (inner.is_discarded())
+                return v.get<std::string>(); // pass through
             return normalize_to_array_helper(inner);
         }
         return normalize_to_array_helper(v);
@@ -620,6 +837,79 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     };
     if (auto v = pick_spec_field(); v) {
         def.visualization_spec = normalize_to_array(*v);
+    }
+
+    // Issue #254 (8.2): spec.responseTemplates — accept canonical
+    // `responseTemplates` (camelCase YAML), the snake-case storage column
+    // name `response_templates_spec`, and the explicit pre-serialised
+    // string form. Always normalises to a JSON array string at rest.
+    auto pick_templates_field = [&]() -> std::optional<nlohmann::json> {
+        if (parsed.contains("response_templates_spec") &&
+            !parsed["response_templates_spec"].is_null())
+            return parsed["response_templates_spec"];
+        if (parsed.contains("responseTemplates") && !parsed["responseTemplates"].is_null())
+            return parsed["responseTemplates"];
+        if (parsed.contains("response_templates") && !parsed["response_templates"].is_null())
+            return parsed["response_templates"];
+        return std::nullopt;
+    };
+    // Hardening (governance S-4 / sec-L3 / dsl-S2 / F-2): build the storage
+    // form via a single normalisation pass that (a) accepts string / object /
+    // array shapes, (b) bounds the inner string-form parse depth + size to
+    // mitigate sec-M4 (operator-tier JSON bomb on import), and (c) silently
+    // strips any element with `id == "__default__"` so an imported pack
+    // cannot inject a stuck reserved-id row that REST PUT/DELETE refuse to
+    // remove. UP-15 / UP-17: a malformed inner string is dropped with a
+    // logged warning rather than passed through verbatim, so a bad import
+    // surfaces in logs instead of silently wedging the templates view.
+    static constexpr size_t kMaxImportTemplateStringBytes = 256 * 1024; // 256 KiB
+    auto strip_reserved_id = [](const nlohmann::json& el) -> bool {
+        if (!el.is_object())
+            return true; // drop non-objects entirely
+        if (el.contains("id") && el["id"].is_string() &&
+            el["id"].get<std::string>() ==
+                std::string(::yuzu::server::ResponseTemplatesEngine::kDefaultId)) {
+            return true; // drop reserved id
+        }
+        return false;
+    };
+    auto normalise_templates_array = [&](const nlohmann::json& src) -> nlohmann::json {
+        nlohmann::json out = nlohmann::json::array();
+        if (src.is_array()) {
+            for (const auto& el : src) {
+                if (strip_reserved_id(el))
+                    continue;
+                out.push_back(el);
+            }
+        } else if (src.is_object()) {
+            if (!strip_reserved_id(src))
+                out.push_back(src);
+        }
+        return out;
+    };
+    if (auto v = pick_templates_field(); v) {
+        if (v->is_string()) {
+            const std::string& s = v->get_ref<const std::string&>();
+            if (s.size() > kMaxImportTemplateStringBytes) {
+                spdlog::warn("InstructionStore::import_definition_json: "
+                             "responseTemplates string exceeds {} bytes; dropped "
+                             "(governance sec-M4 / UP-15)",
+                             kMaxImportTemplateStringBytes);
+                def.response_templates_spec = "[]";
+            } else {
+                auto inner = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
+                if (inner.is_discarded()) {
+                    spdlog::warn("InstructionStore::import_definition_json: "
+                                 "responseTemplates string is not valid JSON; dropped "
+                                 "(governance UP-15)");
+                    def.response_templates_spec = "[]";
+                } else {
+                    def.response_templates_spec = normalise_templates_array(inner).dump();
+                }
+            }
+        } else {
+            def.response_templates_spec = normalise_templates_array(*v).dump();
+        }
     }
 
     return create_definition_impl(def);
@@ -671,16 +961,15 @@ std::expected<std::string, std::string> InstructionStore::create_set(const Instr
     // handler at /api/v1/instruction-sets both rely on (Gate 4 C-B1).
     if (!s.id.empty()) {
         sqlite3_stmt* exists_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1",
-                               -1, &exists_stmt, nullptr) != SQLITE_OK)
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1", -1,
+                               &exists_stmt, nullptr) != SQLITE_OK)
             return std::unexpected("internal: duplicate-id check failed");
         sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
         bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
         sqlite3_finalize(exists_stmt);
         if (exists)
-            return std::unexpected(std::string(kConflictPrefix) +
-                                   " instruction set '" + id + "' already exists");
+            return std::unexpected(std::string(kConflictPrefix) + " instruction set '" + id +
+                                   "' already exists");
     }
 
     sqlite3_stmt* stmt = nullptr;

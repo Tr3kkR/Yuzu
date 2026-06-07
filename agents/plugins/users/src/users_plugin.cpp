@@ -360,10 +360,16 @@ int do_local_users(yuzu::CommandContext& ctx) {
             enabled = false;
         }
 
-        // Try to get last login from lastlog
+        // Try to get last login from lastlog. `user` comes from /etc/passwd
+        // (local-trust), but guard the shell interpolation with the same
+        // allowlist the operator-facing paths use — a hostile local account
+        // name must not be able to inject into the lastlog command.
         std::string last_logon = "unknown";
-        auto lastlog_out =
-            run_command(std::format("lastlog -u {} 2>/dev/null | tail -1", user).c_str());
+        std::string lastlog_out;
+        if (is_safe_identifier(user)) {
+            lastlog_out =
+                run_command(std::format("lastlog -u {} 2>/dev/null | tail -1", user).c_str());
+        }
         if (!lastlog_out.empty() && lastlog_out.find("Never") != std::string::npos) {
             last_logon = "Never";
         } else if (!lastlog_out.empty()) {
@@ -472,7 +478,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 std::string last_logon = "Never";
                 if (u.usri2_last_logon != 0) {
                     time_t t = static_cast<time_t>(u.usri2_last_logon);
-                    struct tm tm_buf{};
+                    struct tm tm_buf {};
                     localtime_s(&tm_buf, &t);
                     char time_str[64]{};
                     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
@@ -642,8 +648,7 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
             std::istringstream ss(members_str);
             std::string member;
             while (ss >> member) {
-                ctx.write_output(
-                    std::format("group_member|{}|{}|user", member, group_name));
+                ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
             }
         }
     } else {
@@ -660,9 +665,9 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     DWORD total_entries = 0;
     DWORD_PTR resume = 0;
 
-    NET_API_STATUS status = NetLocalGroupGetMembers(
-        nullptr, wgroup.c_str(), 2, reinterpret_cast<LPBYTE*>(&buf), MAX_PREFERRED_LENGTH,
-        &entries_read, &total_entries, &resume);
+    NET_API_STATUS status =
+        NetLocalGroupGetMembers(nullptr, wgroup.c_str(), 2, reinterpret_cast<LPBYTE*>(&buf),
+                                MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
 
     if (status == NERR_Success || status == ERROR_MORE_DATA) {
         for (DWORD i = 0; i < entries_read; ++i) {
@@ -824,16 +829,14 @@ int do_primary_user(yuzu::CommandContext& ctx) {
         }
 
         if (!primary.empty()) {
-            ctx.write_output(
-                std::format("primary_user|{}|{}|event_log_4624", primary, max_count));
+            ctx.write_output(std::format("primary_user|{}|{}|event_log_4624", primary, max_count));
         } else {
             ctx.write_output("primary_user|unknown|0|no logon events found");
         }
     } else {
         // Fallback: check user profiles in registry
-        auto reg_out = run_command(
-            "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows "
-            "NT\\CurrentVersion\\ProfileList\" /s 2>&1");
+        auto reg_out = run_command("reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows "
+                                   "NT\\CurrentVersion\\ProfileList\" /s 2>&1");
         if (!reg_out.empty()) {
             std::string last_user;
             std::istringstream ss(reg_out);
@@ -855,8 +858,7 @@ int do_primary_user(yuzu::CommandContext& ctx) {
                 }
             }
             if (!last_user.empty()) {
-                ctx.write_output(
-                    std::format("primary_user|{}|0|profile_list", last_user));
+                ctx.write_output(std::format("primary_user|{}|0|profile_list", last_user));
             } else {
                 ctx.write_output("primary_user|unknown|0|no profiles found");
             }
@@ -882,8 +884,7 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #ifdef __linux__
-    auto last_out =
-        run_command(std::format("last -F -n {} 2>/dev/null", count).c_str());
+    auto last_out = run_command(std::format("last -F -n {} 2>/dev/null", count).c_str());
     if (!last_out.empty()) {
         std::istringstream ss(last_out);
         std::string line;
@@ -925,8 +926,7 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto last_out =
-        run_command(std::format("last -n {} 2>/dev/null", count).c_str());
+    auto last_out = run_command(std::format("last -n {} 2>/dev/null", count).c_str());
     if (!last_out.empty()) {
         std::istringstream ss(last_out);
         std::string line;
@@ -967,10 +967,9 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
 #elif defined(_WIN32)
     // Query Windows Security Event Log for logon (4624) and logoff (4634) events
     auto logon_out = run_command(
-        std::format(
-            "wevtutil qe Security /q:\"*[System[(EventID=4624 or EventID=4634)]]\" /c:{} "
-            "/f:text /rd:true 2>&1",
-            count)
+        std::format("wevtutil qe Security /q:\"*[System[(EventID=4624 or EventID=4634)]]\" /c:{} "
+                    "/f:text /rd:true 2>&1",
+                    count)
             .c_str());
 
     if (!logon_out.empty() && logon_out.find("Access is denied") == std::string::npos) {
@@ -991,16 +990,13 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
 
             if (trimmed.starts_with("Event[")) {
                 // New event — emit previous if we have data
-                if (!current_user.empty() && current_user != "-" &&
-                    current_user != "SYSTEM" && !current_user.empty() &&
-                    current_user.back() != '$') {
-                    std::string event_type =
-                        (current_event_id == "4624") ? "logon" : "logoff";
-                    ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", current_user,
-                                                 event_type, current_logon_type,
-                                                 current_source.empty() ? "-" : current_source,
-                                                 current_time.empty() ? "-" : current_time,
-                                                 current_event_id));
+                if (!current_user.empty() && current_user != "-" && current_user != "SYSTEM" &&
+                    !current_user.empty() && current_user.back() != '$') {
+                    std::string event_type = (current_event_id == "4624") ? "logon" : "logoff";
+                    ctx.write_output(std::format(
+                        "session_history|{}|{}|{}|{}|{}|{}", current_user, event_type,
+                        current_logon_type, current_source.empty() ? "-" : current_source,
+                        current_time.empty() ? "-" : current_time, current_event_id));
                 }
                 current_event_id.clear();
                 current_time.clear();
@@ -1067,11 +1063,10 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (!current_user.empty() && current_user != "-" && current_user != "SYSTEM" &&
             current_user.back() != '$') {
             std::string event_type = (current_event_id == "4624") ? "logon" : "logoff";
-            ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", current_user,
-                                         event_type, current_logon_type,
-                                         current_source.empty() ? "-" : current_source,
-                                         current_time.empty() ? "-" : current_time,
-                                         current_event_id));
+            ctx.write_output(
+                std::format("session_history|{}|{}|{}|{}|{}|{}", current_user, event_type,
+                            current_logon_type, current_source.empty() ? "-" : current_source,
+                            current_time.empty() ? "-" : current_time, current_event_id));
         }
     } else {
         ctx.write_output("session_history|error|Cannot access Security event log (requires "
@@ -1093,8 +1088,8 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"logged_on",    "sessions",        "local_users",
-                                     "local_admins", "group_members",   "primary_user",
+        static const char* acts[] = {"logged_on",       "sessions",      "local_users",
+                                     "local_admins",    "group_members", "primary_user",
                                      "session_history", nullptr};
         return acts;
     }
@@ -1103,8 +1098,7 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "logged_on")
             return do_logged_on(ctx);
         if (action == "sessions")

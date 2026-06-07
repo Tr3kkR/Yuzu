@@ -300,6 +300,59 @@ spec:
       title: Process count over time
 ```
 
+#### `spec.responseTemplates`
+
+Optional list of named response-view configurations consumed by the dashboard's filter bar dropdown and the `GET/POST/PUT/DELETE /api/v1/definitions/{id}/response-templates` REST endpoints (issue #254, Phase 8.2). When omitted, the engine synthesises a single `__default__` template from `spec.result.columns` (preferred) or the plugin's column schema, so every definition has at least one selectable view without authoring.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | string | No | auto | Stable 32-hex id. Auto-generated on POST when omitted. The reserved id `__default__` is rejected — operators cannot author or overwrite the synthesised default. |
+| `name` | string | Yes | -- | Operator-facing label shown in the dropdown. Max 200 characters. |
+| `description` | string | No | `""` | Optional longer description. Reserved for future tooltip rendering. |
+| `columns` | array of strings | No | `[]` | Subset of plugin column names to render. Empty / omitted means "show all". The `Agent` pseudo-column is always shown regardless of this list. |
+| `sort` | object | No | -- | `{column: <name>, dir: asc\|desc}`. Defines the initial sort applied when the operator picks the template. The dashboard's column-header click still wins. |
+| `filters` | array of objects | No | `[]` | List of `{column, op, value}` clauses. `op` ∈ `equals`, `not_equals`, `contains`, `starts_with`, `ends_with`. The dashboard auto-applies `equals`-op clauses to the URL filter map; other ops are honoured by REST consumers but not auto-applied client-side in this revision. |
+| `default` | boolean | No | `false` | When `true` this template replaces the synthesised `__default__` in the dropdown. At most one operator-authored template may be marked `default` per definition. |
+
+Example — a "Failures only" view for a vulnerability scan definition:
+
+```yaml
+spec:
+  responseTemplates:
+    - name: Failures only
+      columns: [Severity, Title, Detail]
+      sort: {column: Severity, dir: desc}
+      filters:
+        - {column: Severity, op: equals, value: high}
+    - name: Critical view
+      default: true
+      columns: [Severity, Category, Title]
+      filters:
+        - {column: Severity, op: equals, value: critical}
+```
+
+> **Authoring through the dashboard YAML editor strips response templates.** Same caveat as `spec.visualization` — the lightweight line-scanner used by `POST /api/instructions/yaml` does not extract `spec.responseTemplates` into the indexed column. Use `POST /api/v1/definitions/import` (JSON envelope) or the in-tree `content/definitions/` library, or call `POST /api/v1/definitions/{id}/response-templates` directly to author templates against an already-imported definition.
+
+#### `spec.offload`
+
+Optional per-instruction override for the response-offload control plane (issue #255, Phase 8.3). Targets are global config registered through `POST /api/v1/offload-targets` with their own URL, auth (none / bearer / basic / hmac), event filter, and batch size. By default every enabled target whose `event_types` filter matches the fired event receives a copy of the payload. `spec.offload.targets` restricts that fan-out to a named subset for a specific definition.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `targets` | array of strings | No | `[]` | Names of registered offload targets to receive responses for this definition. Empty / omitted means "fan out to every enabled target whose `event_types` matches" (the default behaviour). When set, only targets whose `name` appears here AND whose `event_types` matches receive the event. |
+
+Example — an inventory-collection definition that only ships its responses to the `siem-archive` target (other webhooks/offload targets do not receive these events):
+
+```yaml
+spec:
+  offload:
+    targets: [siem-archive]
+```
+
+> **`spec.offload.targets` is not extracted by the dashboard YAML editor or the JSON import endpoint.** The field is preserved verbatim in the `yaml_source` source-of-truth column on `instruction_definitions` but is **not** denormalised into an indexed column and is **not** consulted by the dispatcher in this revision. Authoring this field has no current effect on fan-out behaviour. See the runtime caveat below.
+
+> **Runtime correlation is opt-in.** The `agent.registered` and `execution.completed` events fan out globally to every enabled offload target whose `event_types` filter matches, regardless of `spec.offload.targets`. The store's `OffloadTargetStore::fire_event` accepts an optional `target_filter` argument that callers can use to restrict fan-out to a named subset, but the agent-service dispatch path does not currently extract the filter from the originating definition. Wiring the dispatcher to walk `command_id → execution_id → definition_id → InstructionStore::get_definition` and read `spec.offload.targets` is tracked as a follow-up.
+
 #### `status`
 
 | Field | Type | Required | Default | Description |
@@ -1191,7 +1244,53 @@ agent_version >= "0.9.0"
 | `len()` | `len(tag:name) > 5` | String length for validation |
 | `startswith()` | `startswith(hostname, "web-")` | Prefix check (more readable than LIKE) |
 
-### 9.3 CEL (Common Expression Language)
+Note: `EXISTS`, `MATCHES`, `len()`, and `startswith()` are implemented in the scope engine today (the "planned" label predates them). Tag presence lowers to `EXISTS tag:<name>` — see §9.3.
+
+### 9.3 Scope walking — composable scope (`fromResultSet:`)
+
+Scope walking (capability §30, `docs/scope-walking-design.md`) lets a scope target the members of a previously-saved **result set** — Yuzu's composable-scope primitive. A result set is a per-operator, TTL-bounded, lineage-tracked set of device ids built from an earlier query.
+
+**Scope atom.** The scope engine accepts a bare atom `from_result_set:<id-or-alias>` (implemented, `scope_engine.cpp`). It resolves to the members of the referenced set and composes with attribute predicates via `AND` / `OR` / `NOT`. Membership is owner-checked at evaluation: a set the dispatching operator does not own resolves to zero devices (no cross-operator targeting). Offline / stale members drop silently.
+
+```
+from_result_set:rs_01HXYZ AND ostype == "windows"
+```
+
+**YAML authoring form.** Where a `spec.scope:` block is accepted, the mapping form may carry `fromResultSet:` (a canonical `rs_` id or a per-operator alias), optionally refined by a `selector:` composed with `AND`:
+
+```yaml
+spec:
+  scope:
+    fromResultSet: "windows-chrome-suspects"   # id or per-operator alias
+    selector:                                    # optional refinement (AND-ed)
+      platform: windows
+      tags:
+        - production
+  assignment:
+    mode: static
+```
+
+This lowers to the scope-engine string `from_result_set:windows-chrome-suspects AND ostype == "windows" AND EXISTS tag:production` — `selector.platform` → `ostype == "<value>"` (lower-cased); each `selector.tags` entry → `EXISTS tag:<name>` (a presence check, since Yuzu tags are key=value).
+
+**Validation (at YAML load):**
+
+1. `fromResultSet` may not be combined with `assignment.managementGroups` — a result set already defines a fixed device set; layering management-group filtering on top is rejected.
+2. When `fromResultSet` is present, `assignment.mode` must be `static` (an omitted mode defaults to static). `dynamic` is rejected — the point of a result set is a fixed target.
+3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and the dispatch targets zero of that set's devices.
+4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
+5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
+
+> Tag presence (`EXISTS tag:<name>`) requires the tag to have a **non-empty value**; a device carrying a tag with an empty value is treated as not having it.
+
+**Current support (this release):**
+
+- **Aliases** in a `from_result_set:` ref are resolved at the dispatch layer against the dispatching operator's owned sets (a canonical `rs_` id is used verbatim). The `/api/scope/estimate` preview resolves them too.
+- **Instruction definitions** validate a `spec.scope` block at import; the operator still supplies the `from_result_set:` scope at dispatch time. (A definition-embedded scope that auto-applies at dispatch is a follow-up.)
+- **Policies** do **not** yet support `fromResultSet:` — a policy is evaluated continuously while a result set is TTL-bounded; `create_policy` rejects it with a clear error. (Tracked for a follow-up that adds a policy owner + pinned-set semantics.)
+
+See `docs/scope-walking-design.md` §7 and the Chrome-IR walkthrough (§10).
+
+### 9.4 CEL (Common Expression Language)
 
 Yuzu implements a CEL-compatible expression evaluator (`server/core/src/cel_eval.cpp`) for typed policy evaluation expressions. CEL is not used for device targeting (the scope DSL is simpler and sufficient for that purpose).
 
@@ -1652,8 +1751,11 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.sql` | `tar` | Y | Y | Y | Verified |
 | `tar.rollup` | `tar` | Y | Y | Y | Verified |
 | `tar.compatibility` | `tar` | Y | Y | Y | Verified |
+| `tar.fleet_snapshot` | `tar` | Y | Y | Y | Active |
 
 **`tar.compatibility`** -- Emit the live OS compatibility matrix for all four capture sources (process, tcp, service, user). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`.
+
+**`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 
 ### 14.16 Test and Debug
 

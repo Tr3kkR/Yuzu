@@ -197,6 +197,12 @@ TEST_CASE("PolicyStore: create fragment with wrong kind", "[policy_store][fragme
     auto result = store.create_fragment("kind: Policy\nname: oops\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    // Issue #621: error must include a worked example so operators sending
+    // partial YAML (or sending `kind` as a request param) get unstuck without
+    // having to find the docs separately. The prefix above stays stable so
+    // existing scripts that grep on it keep working.
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][fragment]") {
@@ -205,6 +211,11 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][frag
     auto result = store.create_fragment("name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    // Governance Gate 7 (consistency S2 / QA SHOULD): docs link must be
+    // pinned on this branch too — not just the wrong-kind branch — so the
+    // operator-facing UX is symmetric across both `kind`-failure modes.
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: fragment with check only (no fix, no postCheck)",
@@ -304,6 +315,109 @@ TEST_CASE("PolicyStore: create policy from YAML", "[policy_store][policy]") {
     REQUIRE(pol->management_groups.size() == 2);
     CHECK(pol->management_groups[0] == "all-devices");
     CHECK(pol->management_groups[1] == "windows-servers");
+}
+
+TEST_CASE("PolicyStore: scope.selector mapping lowers to an expression (PR-E)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    // Before PR-E a `scope:` that opened a `selector:` mapping was read by the
+    // scalar extractor as empty and silently stored no scope. It now lowers.
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Selector Policy
+fragment: )" + frag.value() +
+                       R"(
+scope:
+  selector:
+    platform: Windows
+    tags:
+      - prod
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE(result.has_value());
+    auto pol = store.get_policy(result.value());
+    REQUIRE(pol.has_value());
+    CHECK(pol->scope_expression == "ostype == \"windows\" AND EXISTS tag:prod");
+}
+
+TEST_CASE("PolicyStore: scope.fromResultSet is rejected for policies (deferred to PR-E2)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: RS Policy
+fragment: )" + frag.value() +
+                       R"(
+scope:
+  fromResultSet: rs_abc
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("fromResultSet") != std::string::npos);
+}
+
+TEST_CASE("PolicyStore: scalar scope.fromResultSet is also rejected (#1221 MEDIUM-1)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    // The mapping form above is rejected via parse_scope_block. The SCALAR form
+    // (`scope: from_result_set:rs_abc`) makes extract_yaml_value non-empty, which
+    // pre-fix skipped the `scope.empty()` branch and stored the ref verbatim —
+    // bypassing the policy ban (fail-closed at eval, but a latent live path for
+    // PR-E2). It must be rejected at create with the same fromResultSet error.
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Scalar RS Policy
+fragment: )" + frag.value() +
+                       R"(
+scope: from_result_set:rs_abc
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("fromResultSet") != std::string::npos);
+
+    // The same ref composed into a larger scalar expression is likewise rejected.
+    std::string yaml2 = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Composed RS Policy
+fragment: )" + frag.value() +
+                        R"(
+scope: ostype == "windows" AND from_result_set:rs_abc
+)";
+    auto result2 = store.create_policy(yaml2);
+    REQUIRE_FALSE(result2.has_value());
+    CHECK(result2.error().find("fromResultSet") != std::string::npos);
+}
+
+TEST_CASE("PolicyStore: inline flow-mapping scope is rejected (UP-6)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Inline Policy
+fragment: )" + frag.value() +
+                       R"(
+scope: {selector: {platform: windows}}
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("inline flow-mapping") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: query policies with filters", "[policy_store][policy]") {
@@ -434,6 +548,24 @@ TEST_CASE("PolicyStore: create policy with wrong kind", "[policy_store][policy]"
     auto r = store.create_policy("kind: PolicyFragment\nname: wrong\n");
     REQUIRE(!r.has_value());
     CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
+    // Issue #621: same UX expectation as create_fragment — operators must
+    // see a worked example in the error body, not just the prefix.
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
+}
+
+TEST_CASE("PolicyStore: create policy with missing kind", "[policy_store][policy]") {
+    PolicyStore store(":memory:");
+
+    // Governance Gate 7 (consistency S2 / QA SHOULD): symmetric coverage
+    // with the create_fragment "missing kind" case above. Without this
+    // test the asymmetry would let a future regression that drops the
+    // worked-example body from create_policy alone slip through CI.
+    auto r = store.create_policy("name: no-kind\ndescription: missing kind field\n");
+    REQUIRE(!r.has_value());
+    CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create policy with missing fragment", "[policy_store][policy]") {

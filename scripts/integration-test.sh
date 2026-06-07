@@ -126,7 +126,7 @@ case "${YUZU_REUSE_STACK:-auto}" in
         if ! detect_phase4_stack; then
             echo "integration-test: YUZU_REUSE_STACK=1 set but no Phase 4 stack detected on" >&2
             echo "  127.0.0.1:8080 (/readyz) + :8081 (/healthz). Start the stack first with" >&2
-            echo "  'bash scripts/linux-start-UAT.sh' or unset YUZU_REUSE_STACK." >&2
+            echo "  'bash scripts/start-UAT.sh' or unset YUZU_REUSE_STACK." >&2
             exit 1
         fi
         REUSE_STACK=true
@@ -248,6 +248,30 @@ wait_for_http() {
         fi
     done
     return 0
+}
+
+# poll_metric_at_least <metrics-url> <metric-name> <min-value> [timeout-s]
+#
+# Polls a Prometheus /metrics endpoint and waits for `metric-name` to reach at
+# least `min-value`. Handles both bare metrics (`name VALUE`) and labelled
+# metrics (`name{labels} VALUE`) by matching `^name` followed by space, `{`, or
+# end of line, and taking the last field as the value. Uses the awk-no-exit
+# pattern from #988 — `; exit` causes upstream SIGPIPE under `set -o pipefail`
+# and breaks the poll loop on the first iteration. Returns 0 if the threshold
+# is met within timeout, 1 otherwise. Caller checks the return code.
+poll_metric_at_least() {
+    local url="$1" name="$2" min="$3" timeout="${4:-30}"
+    local i resp value
+    for i in $(seq 1 "$timeout"); do
+        resp=$(curl -sf --max-time 2 "$url" 2>/dev/null || echo "")
+        value=$(echo "$resp" | awk -v n="$name" \
+            '$0 ~ "^"n"([ {]|$)" { val=$NF } END { print val }')
+        if [[ -n "$value" ]] && [[ "${value%.*}" -ge "$min" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 # ── Cleanup on exit ──────────────────────────────────────────────────
@@ -604,14 +628,15 @@ if ! $REUSE_STACK; then
         AGENT_PIDS+=($!)
     done
 
-    # Wait for agents to register (poll for up to 15s)
-    log "  Waiting for agents to register..."
-    for i in $(seq 1 15); do
-        if grep -qi "register\|session" "$WORK_DIR/agent-1.log" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
+    # Wait for agents to register. Poll the server's /metrics for
+    # yuzu_fleet_agents_healthy >= 1 rather than greping the agent log for
+    # generic English ("register|session") — the metric is the authoritative
+    # answer to "is the agent connected" and dodges the log-buffer race that
+    # bit the REUSE-mode test (the agent log can show fresh content but a
+    # concurrent `cat … || echo ""` reads empty under WSL2 drvfs).
+    log "  Waiting for agents to register (polling /metrics)..."
+    poll_metric_at_least "http://127.0.0.1:$SERVER_WEB_PORT/metrics" \
+        yuzu_fleet_agents_healthy 1 15 || true
 
     ALIVE_AGENTS=0
     for pid in "${AGENT_PIDS[@]}"; do
@@ -627,10 +652,17 @@ else
     # confirmed 2026-04-19 against a live v0.11.0 server; keep in sync
     # with server/core/src/metrics.cpp if it drifts.
     log "Phase 4 reuse: verifying registered agent count via /metrics..."
+    # The fleet-health recompute thread runs on a 15s interval, so a freshly
+    # registered agent can take up to one full interval to appear in /metrics.
+    # 20 attempts (~20s) covers one recompute + buffer. (#1008)
     AGENT_COUNT_FROM_METRICS=0
-    for i in $(seq 1 10); do
+    for i in $(seq 1 20); do
         METRICS=$(curl -sf --max-time 2 "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
-        HEALTHY=$(echo "$METRICS" | awk '/^yuzu_fleet_agents_healthy[[:space:]]/ { print $2; exit }')
+        # awk-no-exit pattern: `; exit` causes upstream SIGPIPE under
+        # `set -o pipefail` and breaks the loop on the first iteration
+        # without any of the expected metrics having been parsed.
+        # (#988-pattern carried over from feat/quic-transport.)
+        HEALTHY=$(echo "$METRICS" | awk '/^yuzu_fleet_agents_healthy[[:space:]]/ { val=$2 } END { print val }')
         if [[ -n "$HEALTHY" ]] && [[ "${HEALTHY%.*}" -ge 1 ]]; then
             AGENT_COUNT_FROM_METRICS=${HEALTHY%.*}
             break
@@ -641,7 +673,7 @@ else
         log "  Phase 4 agent confirmed: yuzu_fleet_agents_healthy = $AGENT_COUNT_FROM_METRICS"
         ALIVE_AGENTS=$AGENT_COUNT_FROM_METRICS
     else
-        echo "FAIL: Phase 4 reuse — yuzu_fleet_agents_healthy < 1 on /metrics after 10s" >&2
+        echo "FAIL: Phase 4 reuse — yuzu_fleet_agents_healthy < 1 on /metrics after 20s" >&2
         exit 1
     fi
 fi
@@ -707,40 +739,58 @@ else
     fail "Gateway process died"
 fi
 
+# Test 5 — agent is connected to the server. Previously: `cat agent.log |
+# grep -qi "register|session|connect|heartbeat"`. That was fragile by design:
+# generic English against volatile log content, with a `cat … || echo ""`
+# fallback that silently swallowed empty reads (WSL2 drvfs race). The metric
+# is the authoritative answer — yuzu_fleet_agents_healthy is the server-side
+# gauge of currently-healthy agents.
 log "Test: Agent registration in logs"
-AGENT1_LOG=$(cat "$AGENT_LOG_PATH" 2>/dev/null || echo "")
-if echo "$AGENT1_LOG" | grep -qi "register\|session\|connect\|heartbeat"; then
-    pass "Agent log shows connection activity ($AGENT_LOG_PATH)"
-    TESTS=$((TESTS + 1))
+TESTS=$((TESTS + 1))
+if poll_metric_at_least "http://127.0.0.1:$SERVER_WEB_PORT/metrics" \
+       yuzu_fleet_agents_healthy 1 30; then
+    pass "Agent connected per yuzu_fleet_agents_healthy >= 1"
 else
-    fail "Agent log shows no connection activity ($AGENT_LOG_PATH)"
+    fail "yuzu_fleet_agents_healthy stayed < 1 after 30s (agent did not register)"
 fi
 
 # ── Test 6: Gateway logs show agent connections ───────────────────────
+# Previously: grep "agent|connect|register|started" on the gateway log. Same
+# anti-pattern. The gateway exports yuzu_gw_agents_current (gauge) — live
+# count of agents currently connected via this gateway node. If the gauge is
+# zero we fall back to a STRICT error-pattern check on the gateway log,
+# because there is no metric for "gateway is in a bad state" — that signal
+# only exists as Erlang crash/error report headers in the log. The fallback
+# fails LOUDLY on empty file (the original silently masked it).
 log "Test: Gateway sees agent connections"
-GW_LOG=$(cat "$GATEWAY_LOG_PATH" 2>/dev/null || echo "")
-if echo "$GW_LOG" | grep -qi "agent\|connect\|register\|started"; then
-    pass "Gateway log shows activity"
-    TESTS=$((TESTS + 1))
+TESTS=$((TESTS + 1))
+if poll_metric_at_least "http://127.0.0.1:$GW_METRICS_PORT/metrics" \
+       yuzu_gw_agents_current 1 30; then
+    pass "Gateway sees >= 1 connected agent (yuzu_gw_agents_current)"
+elif [[ ! -s "$GATEWAY_LOG_PATH" ]]; then
+    fail "Gateway shows no connected agents AND log is empty/missing at $GATEWAY_LOG_PATH"
+elif grep -qE '\[error\]|CRASH REPORT|=ERROR REPORT|badarg|Supervisor: .* terminating' \
+        "$GATEWAY_LOG_PATH" 2>/dev/null; then
+    fail "Gateway shows no connected agents AND log contains errors — see $GATEWAY_LOG_PATH"
 else
-    # Gateway may not have proto stubs compiled — check if it at least started
-    if echo "$GW_LOG" | grep -qi "error\|crash\|badarg"; then
-        fail "Gateway has errors in log"
-    else
-        pass "Gateway started (no agent traffic yet — proto stubs may be needed)"
-        TESTS=$((TESTS + 1))
-    fi
+    pass "Gateway started cleanly (no agent traffic yet, no errors in log)"
 fi
 
 # ── Test 7: Server logs show gateway-mode activity ────────────────────
+# Previously: grep "gateway|register|agent|listen" on the server log, with
+# both branches calling pass() — the test could NEVER fail (latent bug).
+# Replace with a real assertion: the same yuzu_fleet_agents_healthy gauge
+# polled by Test 5, since a gateway-relayed agent showing up in that metric
+# is direct evidence that the server's gateway-mode path is doing its job.
+# We use a short 5s timeout here because Test 5 already established the
+# metric is reachable and ≥1 — this is just defence-in-depth.
 log "Test: Server gateway-mode operation"
-SERVER_LOG=$(cat "$SERVER_LOG_PATH" 2>/dev/null || echo "")
-if echo "$SERVER_LOG" | grep -qi "gateway\|register\|agent\|listen"; then
-    pass "Server log shows gateway-mode activity"
-    TESTS=$((TESTS + 1))
+TESTS=$((TESTS + 1))
+if poll_metric_at_least "http://127.0.0.1:$SERVER_WEB_PORT/metrics" \
+       yuzu_fleet_agents_healthy 1 5; then
+    pass "Server gateway-mode active (agent visible via /metrics)"
 else
-    pass "Server started (checking log for activity)"
-    TESTS=$((TESTS + 1))
+    fail "Server gateway-mode broken: yuzu_fleet_agents_healthy < 1"
 fi
 
 # ── Test 8: Multiple heartbeat cycles ─────────────────────────────────

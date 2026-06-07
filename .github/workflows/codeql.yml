@@ -2,8 +2,18 @@ name: "CodeQL"
 
 # CodeQL C++ + GitHub Actions static analysis across BOTH self-hosted
 # runners, running in parallel:
-#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64)  — gcc-13 build
+#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64/yuzu-shulgi) — gcc-13 build
 #   - yuzu-local-windows (labels: self-hosted/Windows/X64) — MSVC build
+#
+# The Linux leg pins `yuzu-shulgi` explicitly so it can't drift to
+# `scw-eager-lumiere` (cloud builder, labels self-hosted/Linux/X64/
+# yuzu-cloud-builder). The cloud builder is sized for nightly Coverage
+# and routinely sits below the 40 GB disk threshold this workflow
+# requires; matching `[self-hosted, Linux, X64]` alone gives GH free
+# reign to assign whichever runner is idle, which produces non-
+# deterministic failures (run 25986790721 hit Scaleway at 23 GB free
+# and died at the disk check before any CodeQL work). Same selector
+# pattern nightly.yml uses for the equivalent meson workload.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -63,7 +73,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  security-events: write
   contents: read
 
 env:
@@ -75,6 +84,9 @@ env:
 jobs:
   analyze:
     name: "Analyze (${{ matrix.os }})"
+    permissions:
+      contents: read
+      security-events: write   # github/codeql-action/upload-sarif
     # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
     # build_tests=false): 14m49s with 155/156 compiles being real misses
     # on a 32-thread runner. Current config (+security-and-quality +
@@ -90,7 +102,10 @@ jobs:
       matrix:
         include:
           - os: linux
-            runner: [self-hosted, Linux, X64]
+            # yuzu-shulgi pin — see header comment. The cloud builder
+            # (scw-eager-lumiere) carries `yuzu-cloud-builder` instead;
+            # this list intentionally excludes it.
+            runner: [self-hosted, Linux, X64, yuzu-shulgi]
             triplet: x64-linux
             vcpkg_bin: vcpkg
             build_dir: build-linux-codeql
@@ -133,6 +148,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       # ─── MSVC environment (Windows only) ──────────────────────────
       # CLAUDE.md forbids direct use of vcvars64.bat because it returns
@@ -203,8 +219,16 @@ jobs:
         # triplet tree (#741). The shared script invalidates both halves
         # of vcpkg_installed/ together and uses the same key as ci.yml so
         # the binary cache is shared cleanly across workflows.
-        shell: bash
-        run: bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
+        # `/usr/bin/bash` (absolute path) — matches the Windows callers
+        # in ci.yml:464 and release.yml:439. A bare `bash` does a PATH
+        # lookup; on the Windows self-hosted runner `C:\WINDOWS\system32`
+        # sits ahead of `C:\msys64\usr\bin`, so bare `bash` resolves to
+        # WSL's `C:\Windows\System32\bash.EXE`, which refuses to run
+        # under the runner's LocalSystem service account
+        # (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED). `/usr/bin/bash` works on
+        # both Linux (real path) and MSYS2 (maps to
+        # C:/msys64/usr/bin/bash.exe).
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
 
       - name: Install vcpkg packages
         env:
@@ -232,29 +256,54 @@ jobs:
             --triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE"
 
-      - name: Ensure Erlang on PATH (gateway custom_target, linux only)
+      # Install Erlang/OTP + rebar3 for the gateway custom_target. The
+      # meson `gateway` custom_target fires when `find_program('rebar3')`
+      # succeeds at configure time; on the self-hosted Linux runner
+      # rebar3 sits at /home/github-runner/.local/bin/rebar3 so the
+      # custom_target IS scheduled, and the Build step then dies with
+      # `/usr/bin/env: 'escript': No such file or directory` if Erlang
+      # isn't on PATH. Gateway is Erlang and contributes zero TUs to
+      # C++ CodeQL — CodeQL has no Erlang extractor and dialyzer is
+      # the gateway's canonical static-analysis tool (see
+      # `.github/workflows/release.yml` line 296, the `gateway-dialyzer`
+      # skill, and CLAUDE.md "Always run rebar3 dialyzer"). But the
+      # custom_target must succeed or `meson compile` fails the whole
+      # job. Mirror ci.yml's "Install Erlang/OTP and rebar3" step
+      # verbatim — same pinned SHA, same OTP version, same ImageOS
+      # override. Runs reliably on the same yuzu-wsl2-linux runner on
+      # every Tier-2 PR build. Replaces the prior `scripts/ensure-erlang.sh`
+      # +`$GITHUB_PATH` plumbing (PR #923) which could not find Erlang
+      # at all when the runner lacked a kerl/asdf/brew install — the
+      # 2026-05-10 and 2026-05-17 scheduled runs both failed on this
+      # branch. Linux only — Windows uses build_gateway.py's C:\Erlang
+      # junction lookup.
+      - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
-        run: |
-          # The meson `gateway` custom_target fires when rebar3 is
-          # detected. If it is, set up the Erlang toolchain so the
-          # compile step doesn't fail on `.gateway_built`. Gateway is
-          # Erlang and doesn't contribute to C++ CodeQL, but the
-          # custom_target must succeed or meson compile fails. Linux
-          # only — Windows CodeQL leg does not build the gateway.
-          if command -v rebar3 >/dev/null 2>&1; then
-            source scripts/ensure-erlang.sh
-            command -v erl >/dev/null || {
-              echo "::warning::ensure-erlang.sh did not resolve erl on PATH"
-            }
-          else
-            echo "rebar3 not installed — gateway target will be skipped"
-          fi
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          # erlef/setup-beam can't auto-detect the self-hosted runner OS;
+          # the explicit ImageOS hint matches ci.yml:230.
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           languages: ${{ matrix.languages }}
-          queries: +security-and-quality
+          # The leading `+` means "augment the default suite" (applies
+          # to the whole comma-separated list, not to individual items —
+          # a stray `+` on the second entry triggers
+          # "Specifier for external repository is invalid").
+          # security-and-quality — generic CWE coverage (memory leaks,
+          #   UAF, null deref, taint to system/popen, etc.).
+          # ./.github/codeql/queries — Yuzu-specific queries that the
+          #   generic suite cannot encode (per-project directory scope,
+          #   plugin ABI conventions, threat model). See qlpack.yml in
+          #   that directory and the close-out comment on issue #371
+          #   for the design rationale and deferred catalog.
+          queries: +security-and-quality,./.github/codeql/queries
           # Scope the scan to first-party code; see the config file for
           # the list of vendored/generated paths that are excluded.
           config-file: ./.github/codeql/codeql-config.yml
@@ -318,6 +367,21 @@ jobs:
         # CodeQL's tracer wraps this step's compile invocations to build
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
+        #
+        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # tracer attaches to compiler processes; if ccache returns a
+        # cached object file without invoking the compiler, the tracer
+        # never sees that translation unit and CodeQL's database omits
+        # it entirely. With persistent ccache on the self-hosted runner
+        # this silently dropped 98% of TUs from the database (e.g. only
+        # 1 of 47 plugin .cpp files was reaching analysis), making most
+        # custom and standard queries report 0 alerts on plugin code.
+        # `RECACHE` forces the compiler to actually run while still
+        # updating the cache, so non-CodeQL CI builds keep their cache
+        # warm. `CCACHE_DISABLE=true` would also work but would skip
+        # the cache update and degrade subsequent CI builds.
+        env:
+          CCACHE_RECACHE: "true"
         run: meson compile -C ${{ matrix.build_dir }}
 
       - name: ccache stats
@@ -325,6 +389,50 @@ jobs:
         run: ccache -s
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        # `upload: never` — we need to filter the SARIF before upload
+        # because CodeQL's `paths` / `paths-ignore` config keys do not
+        # reliably suppress findings whose location is a transitively-
+        # included header in compiled C/C++. The `output` directory
+        # holds the raw SARIF for post-processing.
+        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
+          category: "${{ matrix.category }}"
+          output: codeql-sarif
+          upload: never
+
+      - name: Filter SARIF (drop non-security findings in vendored/generated paths + Catch2 TEST_CASE FP in tests/)
+        # Strips results in vcpkg_installed/, build-*/, vcpkg/, and
+        # generated proto code unless the rule has a security-severity.
+        # Also strips cpp/unused-static-function in tests/ (Catch2
+        # TEST_CASE registration false-positive). Security-severity
+        # findings in vendored code are KEPT — even though we cannot
+        # patch upstream, a vendor vulnerability that ships in our
+        # binary is a real exposure to customers and we need to stay
+        # aware of it (track via dedicated vendor-security process).
+        #
+        # Why this is necessary: CodeQL's paths/paths-ignore config does
+        # not reliably suppress C/C++ findings in transitively-included
+        # vendored headers. Full writeup:
+        #   https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8
+        #
+        # Implemented in Python rather than jq because jq is not on
+        # PATH in the MSYS2 environment used by the Windows self-hosted
+        # runner; python is already required by "Assert toolchain
+        # available" so the dependency is free. Probe both names because
+        # the canonical executable differs by platform: Linux runners
+        # have `python3`, Windows MSYS2 runners have `python`.
+        run: |
+          PYTHON=$(command -v python3 || command -v python)
+          if [[ -z "$PYTHON" ]]; then
+            echo "::error::no python interpreter on PATH (tried python3, python)"
+            exit 1
+          fi
+          for f in codeql-sarif/*.sarif; do
+            "$PYTHON" scripts/ci/filter-codeql-sarif.py "$f"
+          done
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

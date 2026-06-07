@@ -1,0 +1,320 @@
+# Yuzu Viz-UAT — server + gateway + agent in containers, no analytics stack
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  DEV / UAT ONLY — DO NOT DEPLOY TO PRODUCTION                            ║
+# ║  This compose runs server with --no-tls --no-https --metrics-no-auth     ║
+# ║  --no-analytics --no-nvd-sync --no-ota. The launcher bakes               ║
+# ║  admin/adminpassword1 into yuzu-server.cfg. None of those flags or       ║
+# ║  credentials belong in any production deployment. If you are looking     ║
+# ║  for a production reference, see docs/user-manual/server-admin.md.       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# Minimal three-service compose for exercising the feat/viz-engine ladder:
+#   * tar.fleet_snapshot action (PR 1)
+#   * FleetTopologyStore (PR 2; not yet REST-exposed)
+#   * Future PRs will exercise REST + dashboard renderer here
+#
+# Network topology:
+#   Agent  --> Gateway(:50051)  --> Server(:50055)   (registration + heartbeats)
+#   Server --> Gateway(:50063)  --> Agent            (command fanout)
+#   Operator (host) --> Server(:8080)                (REST API + dashboard)
+#
+# Both server and agent images build for the host's architecture via the
+# `--build-arg TRIPLET=arm64-linux` override the launcher applies. On Apple
+# Silicon Docker buildx runs the build natively in a linux/arm64 VM. The same
+# Dockerfiles produce x64 images on Linux x64 hosts (default TRIPLET=x64-linux).
+#
+# Usage (always go through the launcher, not direct compose):
+#   bash scripts/start-viz-uat.sh           # build + start + verify
+#   bash scripts/start-viz-uat.sh stop      # docker compose down -v
+#   bash scripts/start-viz-uat.sh status    # ps + last logs
+#
+# Direct `docker compose up` requires VIZ_UAT_CONFIG to point at an existing
+# yuzu-server.cfg (the launcher generates one with PBKDF2-hashed admin
+# credentials). Without VIZ_UAT_CONFIG set, compose treats the bind path as
+# missing -- there is no safe default.
+
+# Shared body for the three Cedar & Vale local tier agents (see the
+# agent-frontend / agent-app / agent-db services below). `x-`-prefixed
+# top-level keys are ignored by Compose's schema and exist only to host the
+# YAML anchor. Identical to the `agent` service body except (a) it lives under
+# the cedar-vale-local profile and (b) hostname/container_name are set per
+# tier on the merging service, not here.
+x-cedar-vale-agent: &cedar_vale_agent
+  profiles: ["cedar-vale-local"]
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.agent
+  image: yuzu-agent-viz-uat:latest
+  environment:
+    YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+    NO_PROXY: "*"
+    no_proxy: "*"
+  entrypoint: ["/bin/bash", "-c"]
+  command:
+    - |
+      exec yuzu-agent \
+        --server gateway:50051 \
+        --no-tls \
+        --plugin-dir /usr/lib/yuzu/plugins \
+        --data-dir /var/lib/yuzu-agent \
+        --log-level info \
+        --enrollment-token "$$YUZU_ENROLLMENT_TOKEN"
+  depends_on:
+    gateway:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  # ── Yuzu Server (gateway mode, no analytics, no NVD sync) ───────────────
+  server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.server
+    image: yuzu-server-viz-uat:latest
+    container_name: yuzu-viz-server
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--log-level"
+      - "info"
+      - "--metrics-no-auth"
+      - "--no-analytics"
+      - "--no-nvd-sync"
+      - "--no-ota"
+      - "--config"
+      - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
+    environment:
+      # OrbStack / Docker Desktop on macOS inject HTTP_PROXY=http://proxyproxy.orb.internal:8305
+      # (and equivalent http_proxy/HTTPS_PROXY/all_proxy) into containers via daemon-level
+      # default-env propagation. gRPC's HTTP/2 client honours these env vars and routes
+      # cross-container traffic — including gateway↔server upstream RPC — through the
+      # proxy, which returns 502 because it can't proxy gRPC bidi. Force NO_PROXY=*
+      # so EVERY destination bypasses the proxy. Inter-container DNS (the `gateway`
+      # / `server` compose service names) resolves on the user-defined bridge network
+      # and doesn't need a proxy.
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "8080:8080"   # Web dashboard + REST API (operator-facing)
+      - "50055:50055" # Gateway upstream (debugging convenience)
+    volumes:
+      # VIZ_UAT_CONFIG must be set explicitly -- the launcher always exports
+      # it after generate_config() writes the cfg file. There is no compose
+      # default because the previous default `./viz-uat/yuzu-server.cfg`
+      # resolved relative to the compose-file directory (deploy/docker/),
+      # not the launcher's $VIZ_UAT_DIR, and silently bound a non-existent
+      # path. (governance round 2, xp-B1.)
+      - ${VIZ_UAT_CONFIG:?Set VIZ_UAT_CONFIG to an absolute path -- usually start-viz-uat.sh handles this}:/etc/yuzu/yuzu-server.cfg:ro
+      - server-data:/var/lib/yuzu
+    healthcheck:
+      # 127.0.0.1 not localhost (avoid IPv6-first resolve when server binds IPv4 only)
+      test: ["CMD", "bash", "-c",
+             "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Erlang Gateway ──────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.gateway
+    image: yuzu-gateway-viz-uat:latest
+    container_name: yuzu-viz-gateway
+    environment:
+      # See server.environment — same proxy-bypass rationale.
+      NO_PROXY: "*"
+      no_proxy: "*"
+      # #659: ephemeral viz-UAT stack — accept the default cookie (single gateway, no clustering).
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
+    ports:
+      - "8081:8081"   # Health/readiness (operator-visible)
+      - "9568:9568"   # Prometheus metrics
+      - "50051:50051" # Agent-facing gRPC. Exposed so a yuzu-agent running OUTSIDE
+                      # the compose stack (e.g. on an OrbStack VM, on bare metal, on
+                      # the host) can register. In-container agent reaches gateway
+                      # via the `gateway` service hostname on the internal network
+                      # and doesn't need this binding.
+    volumes:
+      - ./gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1 (not localhost) — Alpine's getent resolves localhost to ::1
+      # first; the Erlang health endpoint binds IPv4 only, so the IPv6 lookup
+      # gets ECONNREFUSED.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Yuzu Agent (container) ───────────────────────────────────────────────
+  # Optional. Gated behind the `in-container-agent` profile so the default
+  # compose-up brings only server + gateway. When you want the in-container
+  # agent (a thin, mostly idle host with no real loopback traffic), run:
+  #   docker compose --profile in-container-agent up agent
+  # For richer demos (real services chatting via loopback / Unix sockets),
+  # run a native yuzu-agent on an OrbStack VM or bare-metal host pointing
+  # at the host-exposed gateway port (gateway service exposes 50051 to the
+  # host for this purpose). See docs/plans/threat-graph-roadmap.md.
+  agent:
+    profiles: ["in-container-agent"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.agent
+    image: yuzu-agent-viz-uat:latest
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      # See server.environment — same proxy-bypass rationale, even more
+      # important here because the agent's gRPC client is the one that
+      # originally tripped on the proxy injection.
+      NO_PROXY: "*"
+      no_proxy: "*"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        exec yuzu-agent \
+          --server gateway:50051 \
+          --no-tls \
+          --plugin-dir /usr/lib/yuzu/plugins \
+          --data-dir /var/lib/yuzu-agent \
+          --log-level info \
+          --enrollment-token "$$YUZU_ENROLLMENT_TOKEN"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Cedar & Vale local tier agents (cedar-vale-local profile) ────────────
+  # Three NAMED in-container agents that model the fictional Cedar & Vale
+  # three-tier company WITHOUT needing OrbStack VMs (the `cedar-vale` launcher
+  # mode requires the macOS-only `orb` CLI). Each service sets `hostname:` so
+  # the agent reports yuzu-frontend / yuzu-app / yuzu-db to the server via
+  # gethostname() — that's what makes /viz/fleet label the three planes by
+  # tier instead of by opaque container hash. Bring up with:
+  #   VIZ_UAT_AGENT_MODE=cedar-vale-local bash scripts/start-viz-uat.sh start
+  # (the launcher activates the profile; do not `--scale` these — they are
+  # one-replica-each by design so the hostnames stay distinct).
+  #
+  # The shared body lives in the x-cedar-vale-agent anchor below; each service
+  # merges it and overrides only container_name + hostname. The agent auto-
+  # generates its own UUID agent-id on first boot (no --agent-id, no data
+  # volume — ephemeral, matching the `agent` service), so the three are
+  # distinct on both agent_id and hostname.
+  agent-frontend:
+    <<: *cedar_vale_agent
+    container_name: yuzu-frontend
+    hostname: yuzu-frontend
+
+  agent-app:
+    <<: *cedar_vale_agent
+    container_name: yuzu-app
+    hostname: yuzu-app
+
+  agent-db:
+    <<: *cedar_vale_agent
+    container_name: yuzu-db
+    hostname: yuzu-db
+
+  # ── Cedar & Vale REAL three-tier app (cedar-vale-app profile) ────────────
+  # Envoy (frontend) -> node (app, impress.js deck) -> Postgres (db, slide
+  # content). Each tier co-hosts a yuzu-agent (see deploy/docker/cedar-vale/
+  # tier-entrypoint.sh) so the agent natively sees that tier's listeners and
+  # connections. Renders in /viz/fleet as a stack — frontend on top (Envoy
+  # :8080 is a web port), app in the middle (node :3000 is deliberately NOT a
+  # web port), db at the bottom (Postgres :5432) — with two persistent blue
+  # tubes (Envoy->node via Envoy health checks, node->Postgres via the pg pool
+  # keepalive). Bring up with:
+  #   VIZ_UAT_AGENT_MODE=cedar-vale-app bash scripts/start-viz-uat.sh restart
+  #
+  # hostname: is the tier label the viz shows; container_name is yuzu-cv-* to
+  # avoid colliding with the plain-agent cedar-vale-local containers above.
+  # All three COPY the trixie-built agent from yuzu-agent-viz-uat:latest, so
+  # the launcher must build that image first (build_images does, before the
+  # mode switch). Tiers run on trixie bases so the agent's glibc matches.
+  cv-db:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-db
+    image: yuzu-cv-db:latest
+    container_name: yuzu-cv-db
+    hostname: yuzu-db
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      POSTGRES_USER: cedar
+      POSTGRES_PASSWORD: vale
+      POSTGRES_DB: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cv-app:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-app
+    image: yuzu-cv-app:latest
+    container_name: yuzu-cv-app
+    hostname: yuzu-app
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      PGHOST: cv-db
+      PGPORT: "5432"
+      PGUSER: cedar
+      PGPASSWORD: vale
+      PGDATABASE: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-db:
+        condition: service_started
+    restart: unless-stopped
+
+  cv-frontend:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-frontend
+    image: yuzu-cv-frontend:latest
+    container_name: yuzu-cv-frontend
+    hostname: yuzu-frontend
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "8088:8080"   # the presentation (Envoy listener) — operator-facing
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-app:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  server-data:

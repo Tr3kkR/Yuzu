@@ -9,22 +9,21 @@ name: CLA Assistant
 # pull request and require every commit author to sign the CLA before merge.
 #
 # ─────────────────────────────────────────────────────────────────────────
-#  DISABLED UNTIL CLA_REPO_ACCESS_TOKEN IS PROVISIONED.
+#  ACTIVE on Tr3kkR/Yuzu (activated 2026-05-21).
 # ─────────────────────────────────────────────────────────────────────────
-# To activate:
-#   1. Create a GitHub Personal Access Token (classic) with `repo` scope
-#      on an account that can write to this repository.
-#   2. Add it as repository secret `CLA_REPO_ACCESS_TOKEN`.
-#   3. Change the workflow-level `if:` guard below from `false` to
-#      `github.repository == 'Tr3kkR/Yuzu'`.
-#   4. Optionally create a separate private repo to store signatures
-#      (recommended) and update `path-to-document` / `remote-repository-name`.
+# Provisioning (in place):
+#   - Secret `CLA_REPO_ACCESS_TOKEN`: classic PAT (`repo` scope) able to
+#     write the signatures store.
+#   - Signatures store: private repo `Tr3kkR/Yuzu-cla-signatures`, branch
+#     `main`, file `signatures/cla.json` (auto-created on first signature).
+#   - Guard: runs only on the canonical repo; forks of Yuzu are skipped.
 #
-# Until those steps are completed, this workflow is a no-op. Merging PRs
-# without a signed CLA in the pre-activation window locks those
-# contributions into AGPL only (the Project Steward cannot relicense them
-# under the commercial license). See CONTRIBUTING.md for how contributors
-# should sign manually in the meantime.
+# To make the CLA *block* merges (not just comment), add this job's status
+# context to the `Protect Dev` / `Protect Main` rulesets' required checks.
+#
+# NOTE: any external contribution merged BEFORE activation was not covered by
+# a signed CLA, so it is AGPL-only and cannot be relicensed commercially.
+# See CONTRIBUTING.md.
 
 on:
   issue_comment:
@@ -43,12 +42,12 @@ jobs:
       contents: read
       pull-requests: write
       statuses: write
-    # Deliberately disabled; flip to the live condition when ready.
-    if: false
+    # Live on the canonical repo only; forks of Yuzu skip the CLA gate.
+    if: github.repository == 'Tr3kkR/Yuzu'
     steps:
       - name: CLA Assistant
         if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with `repo` scope; required because GITHUB_TOKEN cannot write

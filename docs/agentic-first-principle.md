@@ -53,6 +53,8 @@ Every long-running operation emits Server-Sent Events on a documented, authentic
 
 **Future.** A new authenticated `/api/v1/events?since=…&filter=execution_id:X|agent_id:Y` channel emits structured JSON envelopes. The `ExecutionEventBus` referenced in `docs/executions-history-ladder.md` is the canonical source. No new bus.
 
+**Status (2026-05-18 — sprint W5.1).** Skeleton shipped at `GET /api/v1/events?execution_id=<id>` (`rest_api_v1.cpp`). Requires `Execution:Read`, replays via `?since=<event_id>` or `Last-Event-ID`, audits `api.v1.events.subscribe` with a correlation id, surfaces partial audit-persist failure via `Sec-Audit-Failed: true` (CC6.6 contract from PR #883), and is enumerated under `/api/v1/openapi.json`. The shape contract for the JSON envelope and the A4 error envelope is testable in isolation via `server/core/src/rest_a4_envelope.hpp` so future MCP / discovery surfaces can reuse it. Multi-execution / `?filter=execution_id:X|agent_id:Y` syntax is W5.2.
+
 **Enforced by.** `architect` on any change that introduces a new long-running operation — the operation is incomplete without the corresponding event taxonomy and SSE wiring.
 
 ## A4 — Error envelope

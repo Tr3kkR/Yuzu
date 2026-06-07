@@ -27,6 +27,7 @@
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -50,7 +51,10 @@ fs::path uniq(const std::string& prefix) {
 // later REQUIRE in the constructor throws (qa-B2 fixture leak fix).
 struct SqliteHandleGuard {
     sqlite3* db{nullptr};
-    ~SqliteHandleGuard() { if (db) sqlite3_close(db); }
+    ~SqliteHandleGuard() {
+        if (db)
+            sqlite3_close(db);
+    }
 };
 
 struct ExecHarness {
@@ -78,6 +82,15 @@ struct ExecHarness {
     /// registered BEFORE dispatch). Empty when the dispatch path has no
     /// tracker context.
     std::string last_dispatch_execution_id;
+    /// #1088 — override the (command_id, sent) pair the dispatch stub
+    /// returns. Default keeps the legacy stub behavior (`"", 0`) so the
+    /// route hits its 503 "no agents reached" branch (the PR-2 UP2-4
+    /// regression-net path that does not exercise the response builder).
+    /// Tests that need to reach the 200 response builder — e.g. asserting
+    /// the new `execution_id` field in the response body — set these to
+    /// non-default values.
+    std::string dispatch_cmd_override;
+    int dispatch_sent_override{0};
     /// PR 4 audit-coverage regression net: captures every audit_fn call
     /// the routes layer makes so tests can assert the SSE handler's
     /// audit-on-success / audit-absence-on-denied policy (qe-S4).
@@ -99,10 +112,10 @@ struct ExecHarness {
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
     explicit ExecHarness(bool with_bus = true)
-        : tracker_db(uniq("wf-routes-exec")),
-          instr_db(uniq("wf-routes-inst")),
+        : tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
           resp_db(uniq("wf-routes-resp")) {
-        for (auto& p : {tracker_db, instr_db, resp_db}) fs::remove(p);
+        for (auto& p : {tracker_db, instr_db, resp_db})
+            fs::remove(p);
 
         // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
         // throwing REQUIRE in any later constructor step still closes it.
@@ -126,15 +139,15 @@ struct ExecHarness {
                                                     /*cleanup_interval_min=*/60);
         REQUIRE(responses->is_open());
 
-        auto auth_fn = [](const httplib::Request&, httplib::Response&)
-            -> std::optional<auth::Session> {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
             return s;
         };
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string&, const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
             if (!perm_grant) {
                 res.status = 403;
                 return false;
@@ -142,12 +155,15 @@ struct ExecHarness {
             return true;
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                                const std::string& result, const std::string& target_type,
-                                const std::string& target_id, const std::string& detail) {
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
         };
-        auto emit_fn = [](const std::string&, const httplib::Request&) {};
-        auto scope_fn = [](const std::string&) -> std::pair<std::size_t, std::size_t> {
+        auto emit_fn = [](const std::string&, const httplib::Request&) {
+        };
+        auto scope_fn = [](const std::string&,
+                           const std::string&) -> std::pair<std::size_t, std::size_t> {
             return {0, 0};
         };
         // PR 2: cmd_dispatch signature gained `execution_id` parameter so
@@ -156,13 +172,11 @@ struct ExecHarness {
         // race close). The test stub captures the last (command_id,
         // execution_id) pair for assertion.
         auto cmd_dispatch = [this](const std::string&, const std::string&,
-                                    const std::vector<std::string>&,
-                                    const std::string&,
-                                    const std::unordered_map<std::string, std::string>&,
-                                    const std::string& execution_id)
-            -> std::pair<std::string, int> {
+                                   const std::vector<std::string>&, const std::string&,
+                                   const std::unordered_map<std::string, std::string>&,
+                                   const std::string& execution_id) -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
-            return {"", 0};
+            return {dispatch_cmd_override, dispatch_sent_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
@@ -243,8 +257,8 @@ struct ExecHarness {
         e.agents_success = agents_success;
         e.agents_failure = agents_failure;
         e.agents_responded = agents_success + agents_failure;
-        e.completed_at = (agents_targeted == agents_success + agents_failure)
-                              ? dispatched_at + 60 : 0;
+        e.completed_at =
+            (agents_targeted == agents_success + agents_failure) ? dispatched_at + 60 : 0;
         auto id = tracker->create_execution(e);
         REQUIRE(id.has_value());
         return *id;
@@ -254,8 +268,8 @@ struct ExecHarness {
     /// execution_id directly to exercise query_by_execution; leaving it
     /// empty exercises the legacy timestamp-window fallback path.
     void store_response(const std::string& command_id, const std::string& agent_id,
-                         const std::string& output, const std::string& execution_id = "",
-                         int64_t timestamp = 1735689610) {
+                        const std::string& output, const std::string& execution_id = "",
+                        int64_t timestamp = 1735689610) {
         StoredResponse r;
         r.instruction_id = command_id;
         r.agent_id = agent_id;
@@ -268,8 +282,8 @@ struct ExecHarness {
 
     /// Stamp a per-agent status row.
     void agent_status(const std::string& exec_id, const std::string& agent_id,
-                      const std::string& status, int exit_code = 0,
-                      const std::string& error = {}, int64_t completed_at = 1735689660) {
+                      const std::string& status, int exit_code = 0, const std::string& error = {},
+                      int64_t completed_at = 1735689660) {
         AgentExecStatus s;
         s.agent_id = agent_id;
         s.status = status;
@@ -294,8 +308,7 @@ TEST_CASE("executions list: empty state", "[workflow][executions][list]") {
     CHECK(res->body.find("No executions yet") != std::string::npos);
 }
 
-TEST_CASE("executions list: renders definition name not bare id",
-          "[workflow][executions][list]") {
+TEST_CASE("executions list: renders definition name not bare id", "[workflow][executions][list]") {
     ExecHarness h;
     h.make_def("def-known", "Inspect Service");
     h.make_exec("def-known", "completed", 5, 5, 0);
@@ -321,8 +334,7 @@ TEST_CASE("executions list: id stub fallback when definition is unknown",
     CHECK(res->body.find("def-orphan-1") != std::string::npos);
 }
 
-TEST_CASE("executions list: definition_id query filter",
-          "[workflow][executions][list]") {
+TEST_CASE("executions list: definition_id query filter", "[workflow][executions][list]") {
     ExecHarness h;
     h.make_def("def-A", "Definition A");
     h.make_def("def-B", "Definition B");
@@ -388,8 +400,8 @@ TEST_CASE("executions list: sparkbar aria-label summarises counts",
 
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
-    CHECK(res->body.find("47 succeeded, 3 failed, 0 running, 0 pending of 50")
-          != std::string::npos);
+    CHECK(res->body.find("47 succeeded, 3 failed, 0 running, 0 pending of 50") !=
+          std::string::npos);
 }
 
 TEST_CASE("executions list: zero-agent execution renders empty-state sparkbar",
@@ -412,8 +424,7 @@ TEST_CASE("executions detail: 404 on unknown id", "[workflow][executions][detail
     CHECK(res->status == 404);
 }
 
-TEST_CASE("executions detail: 403 when perm_fn denies",
-          "[workflow][executions][detail][rbac]") {
+TEST_CASE("executions detail: 403 when perm_fn denies", "[workflow][executions][detail][rbac]") {
     ExecHarness h;
     h.make_def("def-X", "X");
     auto eid = h.make_exec("def-X", "completed", 1, 1, 0);
@@ -423,8 +434,7 @@ TEST_CASE("executions detail: 403 when perm_fn denies",
     CHECK(res->status == 403);
 }
 
-TEST_CASE("executions detail: KPI strip shows counts + p50/p95",
-          "[workflow][executions][detail]") {
+TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[workflow][executions][detail]") {
     ExecHarness h;
     h.make_def("def-K", "K");
     auto eid = h.make_exec("def-K", "completed", 3, 2, 1);
@@ -504,8 +514,7 @@ TEST_CASE("executions detail: agent grid uses decile bucketing above 1024 agents
     h.make_def("def-Big", "Big");
     auto eid = h.make_exec("def-Big", "completed", 1500, 1500, 0);
     for (int i = 0; i < 1500; ++i) {
-        h.agent_status(eid, "agent-" + std::to_string(i), "success", 0, "",
-                        1735689601);
+        h.agent_status(eid, "agent-" + std::to_string(i), "success", 0, "", 1735689601);
     }
 
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
@@ -523,8 +532,8 @@ TEST_CASE("executions detail: error_detail truncates without tearing UTF-8",
     h.make_def("def-U", "U");
     auto eid = h.make_exec("def-U", "completed", 1, 0, 1);
     // 130-byte UTF-8 string mixing ASCII + 4-byte emoji at the boundary.
-    std::string err = std::string(118, 'x') + std::string("\xF0\x9F\x94\xA5") +
-                      std::string("\xF0\x9F\x94\xA5");
+    std::string err =
+        std::string(118, 'x') + std::string("\xF0\x9F\x94\xA5") + std::string("\xF0\x9F\x94\xA5");
     h.agent_status(eid, "a1", "failure", 1, err, 1735689601);
 
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
@@ -541,7 +550,7 @@ TEST_CASE("executions detail: sidebar carries dispatched_by + ISO timestamps",
     ExecHarness h;
     h.make_def("def-M", "M");
     auto eid = h.make_exec("def-M", "completed", 1, 1, 0,
-                            /*dispatched_at=*/1735689600);
+                           /*dispatched_at=*/1735689600);
     h.agent_status(eid, "a1", "success", 0, "", 1735689660);
 
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
@@ -639,8 +648,7 @@ TEST_CASE("executions detail: agent_id containing single-quote is bound via "
     CHECK(res->body.find("scrollToAgentRow(") == std::string::npos);
     // The agent_id must appear as a data-agent-id attribute value (with
     // its single quote escaped to &#39; for HTML attribute context).
-    CHECK(res->body.find("data-agent-id=\"agent&#39;with&#39;quote\"")
-          != std::string::npos);
+    CHECK(res->body.find("data-agent-id=\"agent&#39;with&#39;quote\"") != std::string::npos);
 }
 
 TEST_CASE("ExecutionTracker.query_executions: last_error_detail opt-in default "
@@ -685,9 +693,9 @@ TEST_CASE("executions detail PR2: responses correlated by exact execution_id "
     ExecHarness h;
     h.make_def("def-X", "X");
     auto exec_a = h.make_exec("def-X", "completed", 1, 1, 0,
-                                /*dispatched_at=*/1735689600);
+                              /*dispatched_at=*/1735689600);
     auto exec_b = h.make_exec("def-X", "completed", 1, 1, 0,
-                                /*dispatched_at=*/1735689600);
+                              /*dispatched_at=*/1735689600);
     h.agent_status(exec_a, "agent-shared", "success", 0, "", 1735689601);
     h.agent_status(exec_b, "agent-shared", "success", 0, "", 1735689602);
     // Both executions used the same definition + same agent + overlapping
@@ -718,7 +726,7 @@ TEST_CASE("executions detail PR2: legacy timestamp-window fallback when no "
     ExecHarness h;
     h.make_def("def-Y", "Y");
     auto eid = h.make_exec("def-Y", "completed", 1, 1, 0,
-                            /*dispatched_at=*/1735689600);
+                           /*dispatched_at=*/1735689600);
     h.agent_status(eid, "agent-1", "success", 0, "", 1735689601);
     // Store a legacy response: execution_id is empty (pre-PR-2 path), and
     // instruction_id MATCHES the definition_id so the legacy fallback's
@@ -737,7 +745,7 @@ TEST_CASE("executions detail PR2: PR-2 rows are NOT diluted by legacy fallback",
     ExecHarness h;
     h.make_def("def-Z", "Z");
     auto eid = h.make_exec("def-Z", "completed", 1, 1, 0,
-                            /*dispatched_at=*/1735689600);
+                           /*dispatched_at=*/1735689600);
     h.agent_status(eid, "agent-1", "success", 0, "", 1735689601);
     // PR-2 row tagged correctly.
     h.store_response("cmd-real", "agent-1", "tagged-row",
@@ -771,12 +779,50 @@ TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id
     ExecHarness h;
     h.make_def("def-FAST", "FAST");
     auto res = h.sink.Post("/api/instructions/def-FAST/execute",
-                            R"({"params":{},"agent_ids":["agent-1"]})");
+                           R"({"params":{},"agent_ids":["agent-1"]})");
     // The cmd_dispatch stub returns sent=0 so the route returns 503, but
     // that fires AFTER cmd_dispatch is called with the execution_id —
     // which is what we're pinning here.
     REQUIRE(res);
     CHECK(!h.last_dispatch_execution_id.empty());
+}
+
+TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execution_id",
+          "[workflow][executions][execute][issue-1088][agentic]") {
+    // The agentic-first workflow shipped in W5.1 (#1094) is:
+    //   1. dispatch via POST /api/instructions/:id/execute OR MCP execute_instruction
+    //   2. subscribe to live events via GET /api/v1/events?execution_id=<id>
+    // The handoff was broken: dispatch returned only command_id, but the
+    // SSE endpoint requires execution_id with no public bridge. #1088
+    // closes the gap by adding execution_id to the dispatch response.
+    // This test pins the contract: dispatch response body MUST contain a
+    // non-empty execution_id that can be used immediately with the SSE
+    // endpoint.
+    ExecHarness h;
+    h.make_def("def-AGENTIC", "Agentic");
+    // Override the dispatch stub to return sent>0 so the route reaches
+    // the response-build path (default stub returns 0 → 503).
+    h.dispatch_cmd_override = "cmd-agentic-abc";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/instructions/def-AGENTIC/execute",
+                           R"({"params":{},"agent_ids":["a1","a2","a3"]})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("execution_id"));
+    REQUIRE(body["execution_id"].is_string());
+    CHECK(!body["execution_id"].get<std::string>().empty());
+    // The execution_id returned MUST be the same one threaded into the
+    // dispatch closure — proves the response and the agent-side mapping
+    // see the same id.
+    CHECK(body["execution_id"].get<std::string>() == h.last_dispatch_execution_id);
+    // Backwards-compat: command_id, agents_reached, definition_id are
+    // still present.
+    CHECK(body["command_id"] == "cmd-agentic-abc");
+    CHECK(body["agents_reached"] == 3);
+    CHECK(body["definition_id"] == "def-AGENTIC");
 }
 
 TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
@@ -843,8 +889,10 @@ TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase
     // Both agents present — HF-1 regression would drop one.
     bool saw_a1 = false, saw_a2 = false;
     for (const auto& r : rows) {
-        if (r.output == "agent1-done") saw_a1 = true;
-        if (r.output == "agent2-done") saw_a2 = true;
+        if (r.output == "agent1-done")
+            saw_a1 = true;
+        if (r.output == "agent2-done")
+            saw_a2 = true;
     }
     CHECK(saw_a1);
     CHECK(saw_a2);
@@ -861,7 +909,7 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
     ExecHarness h;
     h.make_def("def-FAIL", "FAIL");
     auto res = h.sink.Post("/api/instructions/def-FAIL/execute",
-                            R"({"params":{},"agent_ids":["agent-1"]})");
+                           R"({"params":{},"agent_ids":["agent-1"]})");
     REQUIRE(res);
     CHECK(res->status == 503); // sent=0 from cmd_dispatch stub
 
@@ -904,8 +952,7 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[workflow][executions
     CHECK(res->status == 410);
 }
 
-TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution",
-          "[workflow][executions][pr3]") {
+TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[workflow][executions][pr3]") {
     ExecHarness h;
     h.make_def("def-FORBID", "Forbid");
     auto exec_id = h.make_exec("def-FORBID", "running", 5, 0, 0);
@@ -941,22 +988,25 @@ TEST_CASE("SSE handler: ExecutionTracker.update_agent_status publishes "
     auto exec_id = h.make_exec("def-INT", "running", 3, 0, 0);
 
     std::vector<ExecutionEvent> seen;
-    auto sub = h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
-        seen.push_back(ev);
-    });
+    auto sub =
+        h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) { seen.push_back(ev); });
 
     h.agent_status(exec_id, "agent-1", "running");
     h.agent_status(exec_id, "agent-1", "success");
 
     h.event_bus->unsubscribe(exec_id, sub);
 
-    // Each update_agent_status emits one agent-transition. refresh_counts
-    // is not invoked by these helpers, so the only events we expect are
-    // the two explicit transitions.
-    REQUIRE(seen.size() >= 2);
+    // UAT 2026-05-06: each update_agent_status now chains refresh_counts
+    // so a state change publishes BOTH agent-transition AND
+    // execution-progress in that order. With agents_targeted=3 and only
+    // 1 agent responding, no terminal threshold is crossed — no
+    // execution-completed events. Total = 4 (2 transitions + 2 progress).
+    REQUIRE(seen.size() >= 4);
     CHECK(seen[0].event_type == "agent-transition");
     CHECK(seen[0].data.find("agent-1") != std::string::npos);
-    CHECK(seen.back().data.find("success") != std::string::npos);
+    CHECK(seen[1].event_type == "execution-progress");
+    CHECK(seen[2].event_type == "agent-transition");
+    CHECK(seen[3].event_type == "execution-progress");
     // Per-execution monotonic ids; first event of a fresh channel is id=1.
     CHECK(seen[0].id == 1);
     CHECK(seen.back().id >= seen[0].id);
@@ -975,26 +1025,38 @@ TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
     h.tracker->set_agents_targeted(exec_id, 2);
 
     std::vector<ExecutionEvent> seen;
-    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
-        seen.push_back(ev);
-    });
+    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) { seen.push_back(ev); });
 
+    // UAT 2026-05-06: update_agent_status now chains refresh_counts, so
+    // explicit refresh_counts() calls are redundant and would publish a
+    // duplicate progress event AFTER the terminal-completed event,
+    // violating the documented "progress before completed" ordering.
     h.agent_status(exec_id, "agent-1", "success");
-    h.tracker->refresh_counts(exec_id);
     h.agent_status(exec_id, "agent-2", "success");
-    h.tracker->refresh_counts(exec_id);
 
     // Filter out per-agent transitions, keep progress+completed only.
     std::vector<std::string> kinds;
-    for (const auto& ev : seen) kinds.push_back(ev.event_type);
+    for (const auto& ev : seen)
+        kinds.push_back(ev.event_type);
     auto count = [&](const std::string& k) {
         return static_cast<int>(std::count(kinds.begin(), kinds.end(), k));
     };
-    CHECK(count("execution-progress") >= 1);
+    // #872 — exact counts (was `>= 1`): 2 agent_status calls, each chaining
+    // refresh_counts via update_agent_status, so we expect exactly 2
+    // agent-transition + 2 execution-progress, and the second refresh_counts
+    // crosses the terminal threshold → 1 execution-completed. A regression
+    // that publishes a stray progress event AFTER the completed event would
+    // bump count("execution-progress") to 3 and fail this assertion (the
+    // old `>= 1` would still pass it).
+    CHECK(count("agent-transition") == 2);
+    CHECK(count("execution-progress") == 2);
     CHECK(count("execution-completed") == 1);
 
-    // execution-completed must come AFTER the corresponding progress
-    // event so a client receiving them in order sees counts THEN status.
+    // execution-completed must come AFTER the FINAL execution-progress so
+    // a client receiving them in order sees counts THEN status. The loop
+    // tracks last_progress_idx (not first_progress_idx) so a regression
+    // that publishes progress→completed→progress would fail here too —
+    // last_progress_idx would land AFTER completed_idx.
     auto last_progress_idx = -1;
     auto completed_idx = -1;
     for (std::size_t i = 0; i < seen.size(); ++i) {
@@ -1019,9 +1081,7 @@ TEST_CASE("SSE handler: mark_cancelled publishes terminal execution-completed",
     auto exec_id = h.make_exec("def-CANCEL", "running", 5, 0, 0);
 
     std::vector<ExecutionEvent> seen;
-    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
-        seen.push_back(ev);
-    });
+    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) { seen.push_back(ev); });
 
     h.tracker->mark_cancelled(exec_id, "tester");
 
@@ -1043,13 +1103,16 @@ TEST_CASE("SSE handler: ring buffer holds events for late-connecting client",
     h.agent_status(exec_id, "agent-2", "success");
     h.agent_status(exec_id, "agent-3", "failure");
 
+    // UAT 2026-05-06: each update_agent_status chains refresh_counts, so
+    // every state change publishes 2 events (agent-transition +
+    // execution-progress). 3 calls -> 6 events. agents_targeted=5 so no
+    // terminal threshold crossed. Ids are 1..6 in publish order.
     auto snap = h.event_bus->snapshot(exec_id);
-    REQUIRE(snap.size() == 3);
-    // Ids are 1..3 in publish order — pinning the contract that
-    // replay_since(0) returns them in arrival order.
+    REQUIRE(snap.size() == 6);
     CHECK(snap[0].id == 1);
     CHECK(snap[1].id == 2);
     CHECK(snap[2].id == 3);
+    CHECK(snap[5].id == 6);
 }
 
 TEST_CASE("SSE handler: per-execution channel partitioning under the routes layer",
@@ -1066,11 +1129,17 @@ TEST_CASE("SSE handler: per-execution channel partitioning under the routes laye
     h.agent_status(a, "agent-1", "success");
     h.agent_status(b, "agent-9", "failure");
 
+    // UAT 2026-05-06: each update_agent_status chains refresh_counts, so
+    // each agent_status call publishes 2 events on its channel
+    // (agent-transition + execution-progress). agents_targeted=2 so the
+    // single response doesn't cross the terminal threshold.
     auto snap_a = h.event_bus->snapshot(a);
     auto snap_b = h.event_bus->snapshot(b);
-    REQUIRE(snap_a.size() == 1);
-    REQUIRE(snap_b.size() == 1);
+    REQUIRE(snap_a.size() == 2);
+    REQUIRE(snap_b.size() == 2);
+    CHECK(snap_a[0].event_type == "agent-transition");
     CHECK(snap_a[0].data.find("agent-1") != std::string::npos);
+    CHECK(snap_b[0].event_type == "agent-transition");
     CHECK(snap_b[0].data.find("agent-9") != std::string::npos);
     // No cross-leak: agent-9 must not appear in exec A's channel.
     CHECK(snap_a[0].data.find("agent-9") == std::string::npos);
@@ -1147,7 +1216,8 @@ TEST_CASE("SSE handler: 503 when execution_event_bus is null (no-bus path)",
     // the live-subscribe success branch.
     bool saw_subscribe = false;
     for (const auto& a : h.audit_calls) {
-        if (a.action == "execution.live_subscribe") saw_subscribe = true;
+        if (a.action == "execution.live_subscribe")
+            saw_subscribe = true;
     }
     CHECK_FALSE(saw_subscribe);
 }

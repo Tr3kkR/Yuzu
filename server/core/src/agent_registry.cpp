@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "custom_properties_store.hpp"
+#include "result_set_store.hpp"
+#include "device_token_store.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
@@ -16,6 +20,14 @@ using yuzu::server::html_escape;
 
 AgentRegistry::AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics)
     : bus_(bus), metrics_(metrics) {}
+
+void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
+    // Take mu_ so a concurrent register_agent cannot observe a half-written
+    // pointer. In practice this setter is called once during startup wiring,
+    // but the lock costs nothing under that pattern and removes a footgun.
+    std::lock_guard lock(mu_);
+    device_token_store_ = store;
+}
 
 void AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
@@ -43,8 +55,20 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
         std::lock_guard lock(mu_);
         // Clean up stale session_to_agent_ entry from a prior connection
         auto old = agents_.find(info.agent_id());
-        if (old != agents_.end() && !old->second->session_id.empty()) {
-            session_to_agent_.erase(old->second->session_id);
+        if (old != agents_.end()) {
+            // W1.5 / #823: re-registration revokes any device tokens still
+            // bound to this agent_id BEFORE the new session is installed. An
+            // attacker who briefly held this identity (mTLS-disabled flow,
+            // #779) could otherwise replay tokens previously issued to it
+            // indefinitely. Done under `mu_` so the install and the revoke
+            // are observed atomically by any concurrent reader. First-time
+            // registrations skip the revoke (agents_ has no entry), which
+            // preserves the operator workflow of pre-issuing a token for an
+            // agent_id that has not registered yet.
+            if (device_token_store_)
+                device_token_store_->revoke_by_principal(info.agent_id());
+            if (!old->second->session_id.empty())
+                session_to_agent_.erase(old->second->session_id);
         }
         agents_[info.agent_id()] = session;
     }
@@ -55,9 +79,10 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
                  info.hostname(), info.plugins_size());
 }
 
-void AgentRegistry::set_stream(const std::string& agent_id,
-                grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
-                grpc::ServerContext* context) {
+void AgentRegistry::set_stream(
+    const std::string& agent_id,
+    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
+    grpc::ServerContext* context) {
     std::lock_guard lock(mu_);
     auto it = agents_.find(agent_id);
     if (it != agents_.end()) {
@@ -66,7 +91,8 @@ void AgentRegistry::set_stream(const std::string& agent_id,
         it->second->server_context = context;
         it->second->last_activity_epoch_ms.store(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
             std::memory_order_relaxed);
     }
 }
@@ -92,18 +118,20 @@ void AgentRegistry::touch_activity(const std::string& agent_id) {
     {
         std::lock_guard lock(mu_);
         auto it = agents_.find(agent_id);
-        if (it == agents_.end()) return;
+        if (it == agents_.end())
+            return;
         session = it->second;
     }
-    session->last_activity_epoch_ms.store(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count(),
-        std::memory_order_relaxed);
+    session->last_activity_epoch_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count(),
+                                          std::memory_order_relaxed);
 }
 
 void AgentRegistry::reap_stale_sessions(std::chrono::seconds timeout) {
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch()).count();
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
     auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
 
     // Collect shared_ptrs (not raw pointers) to keep sessions alive during TryCancel.
@@ -123,7 +151,8 @@ void AgentRegistry::reap_stale_sessions(std::chrono::seconds timeout) {
         std::lock_guard slock(session->stream_mu);
         if (session->server_context) {
             spdlog::warn("Session timeout: cancelling Subscribe stream for agent {} "
-                         "(no activity for >{}s)", id, timeout.count());
+                         "(no activity for >{}s)",
+                         id, timeout.count());
             session->server_context->TryCancel();
         }
     }
@@ -191,6 +220,95 @@ void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::str
     }
 }
 
+void AgentRegistry::sweep_and_publish_trusted_gateway_locked() {
+    // Caller MUST hold trusted_gateway_mu_.
+    const auto now = std::chrono::steady_clock::now();
+
+    // Pass 1: drop anything past the TTL window.
+    for (auto it = trusted_gateway_peer_ips_.begin(); it != trusted_gateway_peer_ips_.end();) {
+        if (now - it->second > kTrustedGatewayTtl) {
+            it = trusted_gateway_peer_ips_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Pass 2: if at cap, evict the single oldest entry to make room.
+    // We're called from `note_trusted_gateway_peer` BEFORE the insert,
+    // so being AT the cap means the imminent insert would push over —
+    // drop one now. Linear scan is fine: the map is bounded at
+    // kTrustedGatewayCap, and this only runs on the (rare) insert path.
+    if (trusted_gateway_peer_ips_.size() >= kTrustedGatewayCap) {
+        auto oldest = trusted_gateway_peer_ips_.begin();
+        for (auto it = std::next(oldest); it != trusted_gateway_peer_ips_.end(); ++it) {
+            if (it->second < oldest->second) {
+                oldest = it;
+            }
+        }
+        if (oldest != trusted_gateway_peer_ips_.end()) {
+            trusted_gateway_peer_ips_.erase(oldest);
+        }
+    }
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
+void AgentRegistry::note_trusted_gateway_peer(std::string_view peer_ip) {
+    // #826: defence-in-depth — never record an empty string. An empty
+    // peer IP would later satisfy `is_trusted_gateway_peer("")` and
+    // re-create the bypass we're trying to close.
+    if (peer_ip.empty())
+        return;
+    std::lock_guard lock(trusted_gateway_mu_);
+
+    // W1.3 R2 / UP-2: opportunistic sweep + cap enforcement BEFORE the
+    // insert so a fresh entry never causes the map to exceed
+    // kTrustedGatewayCap. Sweep also refreshes the published gauge,
+    // which is important so an operator sees the set shrinking as TTL
+    // expirations land — without the sweep, a quiet system would show
+    // a stale max-size gauge until the next insert hit cap.
+    sweep_and_publish_trusted_gateway_locked();
+
+    // Insert OR refresh — repeat ProxyRegisters from the same gateway
+    // update last_seen so an active gateway stays trusted indefinitely.
+    trusted_gateway_peer_ips_[std::string(peer_ip)] = std::chrono::steady_clock::now();
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
+bool AgentRegistry::is_trusted_gateway_peer(std::string_view peer_ip) const {
+    // #826: empty is NEVER trusted. Without this guard a caller that
+    // failed to extract the peer IP from the gRPC context would pass
+    // an empty string and the check would pass spuriously.
+    if (peer_ip.empty())
+        return false;
+    std::lock_guard lock(trusted_gateway_mu_);
+    auto it = trusted_gateway_peer_ips_.find(std::string(peer_ip));
+    if (it == trusted_gateway_peer_ips_.end())
+        return false;
+    // W1.3 R2 / UP-3: stale entries do not satisfy the trusted check.
+    // We do not erase here (const method, would require shared→unique
+    // upgrade); the next `note_trusted_gateway_peer` sweep evicts it.
+    const auto age = std::chrono::steady_clock::now() - it->second;
+    return age <= kTrustedGatewayTtl;
+}
+
+std::size_t AgentRegistry::trusted_gateway_peer_count() const {
+    std::lock_guard lock(trusted_gateway_mu_);
+    return trusted_gateway_peer_ips_.size();
+}
+
+void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset) {
+    std::lock_guard lock(trusted_gateway_mu_);
+    for (auto& [ip, last_seen] : trusted_gateway_peer_ips_) {
+        last_seen -= offset;
+    }
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
 bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {
     std::shared_ptr<AgentSession> session;
     {
@@ -201,14 +319,22 @@ bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandReques
         session = it->second;
     }
     std::lock_guard slock(session->stream_mu);
-    if (session->stream)
-        return session->stream->Write(cmd, grpc::WriteOptions());
-    // Gateway agent -- no local stream but agent is registered
+    // #1004: prefer the gateway-pending path when `gateway_node` is set.
+    // The canonical fanout path for gateway-routed agents is
+    // forward_gateway_pending() → ManagementService.SendCommand, not the
+    // Subscribe stream — `--gateway-mode` relaxes peer validation so a
+    // gateway may also hold a Subscribe stream as proxy, but that stream
+    // is not the wire the gateway uses to deliver commands to its
+    // connected agents. Checking gateway_node first prevents the silent
+    // black-hole where the command is Write()-en into the gateway's
+    // Subscribe stream and never reaches the agent.
     if (!session->gateway_node.empty()) {
         std::lock_guard glock(gw_pending_mu_);
         gw_pending_.push_back({agent_id, cmd});
         return true;
     }
+    if (session->stream)
+        return session->stream->Write(cmd, grpc::WriteOptions());
     return false;
 }
 
@@ -224,11 +350,13 @@ int AgentRegistry::send_to_all(const pb::CommandRequest& cmd) {
     int count = 0;
     for (auto& s : snapshot) {
         std::lock_guard slock(s->stream_mu);
-        if (s->stream && s->stream->Write(cmd, grpc::WriteOptions())) {
-            ++count;
-        } else if (!s->gateway_node.empty()) {
+        // #1004: mirror send_to() — gateway-pending path wins over any
+        // Subscribe stream the gateway may also hold for the agent.
+        if (!s->gateway_node.empty()) {
             std::lock_guard glock(gw_pending_mu_);
             gw_pending_.push_back({s->agent_id, cmd});
+            ++count;
+        } else if (s->stream && s->stream->Write(cmd, grpc::WriteOptions())) {
             ++count;
         }
     }
@@ -252,7 +380,8 @@ std::string AgentRegistry::display_name(const std::string& agent_id) const {
     auto it = agents_.find(agent_id);
     if (it != agents_.end() && !it->second->hostname.empty())
         return it->second->hostname;
-    if (agent_id.size() > 12) return agent_id.substr(0, 12);
+    if (agent_id.size() > 12)
+        return agent_id.substr(0, 12);
     return agent_id;
 }
 
@@ -270,198 +399,204 @@ nlohmann::json AgentRegistry::to_json_obj() const {
     return arr;
 }
 
-std::string AgentRegistry::to_json() const { return to_json_obj().dump(); }
+std::string AgentRegistry::to_json() const {
+    return to_json_obj().dump();
+}
 
 const std::unordered_map<std::string, std::string>& AgentRegistry::action_descriptions() {
     static const std::unordered_map<std::string, std::string> m = {
         // example
-        {"example.ping",            "Returns a 'pong' response"},
-        {"example.echo",            "Echoes back the supplied message parameter"},
+        {"example.ping", "Returns a 'pong' response"},
+        {"example.echo", "Echoes back the supplied message parameter"},
         // status
-        {"status.version",          "Agent version, build number, and git commit hash"},
-        {"status.info",             "Platform OS, architecture, and hostname"},
-        {"status.health",           "Uptime, current timestamp, and memory RSS"},
-        {"status.plugins",          "Installed plugins with version and description"},
-        {"status.modules",          "Loaded modules with version and status"},
-        {"status.connection",       "Server address, TLS status, debug and verbose settings"},
-        {"status.switch",           "Switch address, session ID, connected since, reconnect count"},
-        {"status.config",           "Full agent configuration dump"},
+        {"status.version", "Agent version, build number, and git commit hash"},
+        {"status.info", "Platform OS, architecture, and hostname"},
+        {"status.health", "Uptime, current timestamp, and memory RSS"},
+        {"status.plugins", "Installed plugins with version and description"},
+        {"status.modules", "Loaded modules with version and status"},
+        {"status.connection", "Server address, TLS status, debug and verbose settings"},
+        {"status.switch", "Switch address, session ID, connected since, reconnect count"},
+        {"status.config", "Full agent configuration dump"},
         // processes
-        {"processes.list",          "Enumerate all running processes (PID and name)"},
-        {"processes.query",         "Filter processes by case-insensitive name match"},
+        {"processes.list", "Enumerate all running processes (PID and name)"},
+        {"processes.query", "Filter processes by case-insensitive name match"},
         // hardware
-        {"hardware.manufacturer",   "System manufacturer string"},
-        {"hardware.model",          "System model / product name"},
-        {"hardware.bios",           "BIOS/UEFI vendor, version, and release date"},
-        {"hardware.processors",     "Installed CPUs with model, cores, threads, clock speed"},
-        {"hardware.memory",         "Installed memory modules (DIMMs) with size and type"},
-        {"hardware.disks",          "Physical disk drives with size and media type"},
+        {"hardware.manufacturer", "System manufacturer string"},
+        {"hardware.model", "System model / product name"},
+        {"hardware.bios", "BIOS/UEFI vendor, version, and release date"},
+        {"hardware.processors", "Installed CPUs with model, cores, threads, clock speed"},
+        {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
+        {"hardware.disks", "Physical disk drives with size and media type"},
         // os_info
-        {"os_info.os_name",         "Full OS product name"},
-        {"os_info.os_version",      "OS version string"},
-        {"os_info.os_build",        "OS build identifier"},
-        {"os_info.os_arch",         "CPU architecture"},
-        {"os_info.uptime",          "System uptime in seconds and human-readable form"},
+        {"os_info.os_name", "Full OS product name"},
+        {"os_info.os_version", "OS version string"},
+        {"os_info.os_build", "OS build identifier"},
+        {"os_info.os_arch", "CPU architecture"},
+        {"os_info.uptime", "System uptime in seconds and human-readable form"},
         // services
-        {"services.list",           "Installed services with name, status, and startup type"},
-        {"services.running",        "Only currently running services"},
+        {"services.list", "Installed services with name, status, and startup type"},
+        {"services.running", "Only currently running services"},
         {"services.set_start_mode", "Change a service's startup type (automatic/manual/disabled)"},
         // users
-        {"users.logged_on",         "Currently logged-on users"},
-        {"users.sessions",          "Active interactive sessions"},
-        {"users.local_users",       "Enumerate local user accounts"},
-        {"users.local_admins",      "Members of the local Administrators group"},
-        {"users.group_members",     "Members of a specified local group"},
-        {"users.primary_user",      "Primary user (most frequent login)"},
-        {"users.session_history",   "Historical login/logout session records"},
+        {"users.logged_on", "Currently logged-on users"},
+        {"users.sessions", "Active interactive sessions"},
+        {"users.local_users", "Enumerate local user accounts"},
+        {"users.local_admins", "Members of the local Administrators group"},
+        {"users.group_members", "Members of a specified local group"},
+        {"users.primary_user", "Primary user (most frequent login)"},
+        {"users.session_history", "Historical login/logout session records"},
         // tags
-        {"tags.set",                "Set a tag key-value pair"},
-        {"tags.get",                "Get a tag value by key"},
-        {"tags.get_all",            "Get all tags"},
-        {"tags.delete",             "Delete a tag by key"},
-        {"tags.check",              "Check if a tag key exists"},
-        {"tags.clear",              "Clear all tags"},
-        {"tags.count",              "Count total tags"},
+        {"tags.set", "Set a tag key-value pair"},
+        {"tags.get", "Get a tag value by key"},
+        {"tags.get_all", "Get all tags"},
+        {"tags.delete", "Delete a tag by key"},
+        {"tags.check", "Check if a tag key exists"},
+        {"tags.clear", "Clear all tags"},
+        {"tags.count", "Count total tags"},
         // registry
-        {"registry.get_value",      "Read a Windows registry value"},
-        {"registry.set_value",      "Write a Windows registry value"},
-        {"registry.delete_value",   "Delete a Windows registry value"},
-        {"registry.delete_key",     "Delete a Windows registry key"},
-        {"registry.key_exists",     "Check if a registry key exists"},
+        {"registry.get_value", "Read a Windows registry value"},
+        {"registry.set_value", "Write a Windows registry value"},
+        {"registry.delete_value", "Delete a Windows registry value"},
+        {"registry.delete_key", "Delete a Windows registry key"},
+        {"registry.key_exists", "Check if a registry key exists"},
         {"registry.enumerate_keys", "List subkeys under a registry key"},
-        {"registry.enumerate_values","List values in a registry key"},
+        {"registry.enumerate_values", "List values in a registry key"},
         {"registry.get_user_value", "Get a registry value for a specific user SID"},
         // filesystem
-        {"filesystem.exists",       "Check if a path exists, report type and size"},
-        {"filesystem.list_dir",     "List directory contents (max 1000 entries)"},
-        {"filesystem.file_hash",    "Compute SHA-256 (or SHA-1) hash of a file"},
-        {"filesystem.create_temp",  "Create a secure temporary file (owner-only permissions)"},
-        {"filesystem.create_temp_dir","Create a secure temporary directory (owner-only permissions)"},
+        {"filesystem.exists", "Check if a path exists, report type and size"},
+        {"filesystem.list_dir", "List directory contents (max 1000 entries)"},
+        {"filesystem.file_hash", "Compute SHA-256 (or SHA-1) hash of a file"},
+        {"filesystem.create_temp", "Create a secure temporary file (owner-only permissions)"},
+        {"filesystem.create_temp_dir",
+         "Create a secure temporary directory (owner-only permissions)"},
         // content_dist
-        {"content_dist.stage",      "Download a file to staging directory with hash verification"},
-        {"content_dist.execute_staged","Execute a previously staged file"},
+        {"content_dist.stage", "Download a file to staging directory with hash verification"},
+        {"content_dist.execute_staged", "Execute a previously staged file"},
         {"content_dist.list_staged", "List files in the staging directory"},
-        {"content_dist.cleanup",    "Remove staged files older than N hours"},
+        {"content_dist.cleanup", "Remove staged files older than N hours"},
         // script_exec
-        {"script_exec.exec",        "Execute a command with arguments (no shell interpretation)"},
-        {"script_exec.powershell",  "Run a PowerShell script (Windows only)"},
-        {"script_exec.bash",        "Run a bash script (Linux/macOS only)"},
+        {"script_exec.exec", "Execute a command with arguments (no shell interpretation)"},
+        {"script_exec.powershell", "Run a PowerShell script (Windows only)"},
+        {"script_exec.bash", "Run a bash script (Linux/macOS only)"},
         // windows_updates
-        {"windows_updates.installed","List recently installed updates or packages"},
+        {"windows_updates.installed", "List recently installed updates or packages"},
         {"windows_updates.missing", "List available updates or packages not yet installed"},
         // agent_logging
-        {"agent_logging.get_log",   "Return the last N lines of the agent log file"},
-        {"agent_logging.get_key_files","List important agent files with sizes and modification times"},
+        {"agent_logging.get_log", "Return the last N lines of the agent log file"},
+        {"agent_logging.get_key_files",
+         "List important agent files with sizes and modification times"},
         // installed_apps
-        {"installed_apps.list",     "List all installed applications"},
-        {"installed_apps.query",    "Search for an application by name (partial match)"},
+        {"installed_apps.list", "List all installed applications"},
+        {"installed_apps.query", "Search for an application by name (partial match)"},
         // network_config
         {"network_config.adapters", "Network adapters with MAC, speed, and status"},
-        {"network_config.ip_addresses","Assigned IP addresses with subnet and gateway"},
-        {"network_config.dns_servers","Configured DNS servers per adapter"},
-        {"network_config.proxy",    "System proxy configuration"},
+        {"network_config.ip_addresses", "Assigned IP addresses with subnet and gateway"},
+        {"network_config.dns_servers", "Configured DNS servers per adapter"},
+        {"network_config.proxy", "System proxy configuration"},
         // network_actions
-        {"network_actions.flush_dns","Flush the DNS resolver cache"},
-        {"network_actions.ping",    "Ping a host (params: host, count)"},
+        {"network_actions.flush_dns", "Flush the DNS resolver cache"},
+        {"network_actions.ping", "Ping a host (params: host, count)"},
         // netstat
-        {"netstat.netstat_list",    "Active TCP/UDP connections and listening sockets with owning PID"},
+        {"netstat.netstat_list",
+         "Active TCP/UDP connections and listening sockets with owning PID"},
         // device_identity
-        {"device_identity.device_name","Machine hostname"},
-        {"device_identity.domain",  "DNS/AD domain and join status"},
-        {"device_identity.ou",      "Active Directory organizational unit path"},
+        {"device_identity.device_name", "Machine hostname"},
+        {"device_identity.domain", "DNS/AD domain and join status"},
+        {"device_identity.ou", "Active Directory organizational unit path"},
         // discovery
-        {"discovery.scan_subnet",   "ARP scan + ping sweep of a subnet to find live hosts"},
+        {"discovery.scan_subnet", "ARP scan + ping sweep of a subnet to find live hosts"},
         // firewall
-        {"firewall.state",          "Firewall state per profile/backend"},
-        {"firewall.rules",          "List firewall rules (summary)"},
+        {"firewall.state", "Firewall state per profile/backend"},
+        {"firewall.rules", "List firewall rules (summary)"},
         // certificates
-        {"certificates.list",       "List certificates in system stores"},
-        {"certificates.details",    "Get details for a certificate by thumbprint"},
-        {"certificates.delete",     "Delete a certificate by thumbprint from a given store"},
+        {"certificates.list", "List certificates in system stores"},
+        {"certificates.details", "Get details for a certificate by thumbprint"},
+        {"certificates.delete", "Delete a certificate by thumbprint from a given store"},
         // event_logs
-        {"event_logs.errors",       "Recent error events from a specified log"},
-        {"event_logs.query",        "Search events by keyword"},
+        {"event_logs.errors", "Recent error events from a specified log"},
+        {"event_logs.query", "Search events by keyword"},
         // wmi
-        {"wmi.query",              "Run a WQL SELECT query"},
-        {"wmi.get_instance",       "Get all properties of a WMI class instance"},
+        {"wmi.query", "Run a WQL SELECT query"},
+        {"wmi.get_instance", "Get all properties of a WMI class instance"},
         // bitlocker
-        {"bitlocker.state",        "BitLocker / LUKS / FileVault status per volume"},
+        {"bitlocker.state", "BitLocker / LUKS / FileVault status per volume"},
         // antivirus
-        {"antivirus.products",     "List installed antivirus products"},
-        {"antivirus.status",       "Windows Defender detailed status"},
+        {"antivirus.products", "List installed antivirus products"},
+        {"antivirus.status", "Windows Defender detailed status"},
         // http_client
-        {"http_client.download",   "Download a file from URL with optional hash verification"},
-        {"http_client.get",        "HTTP GET a URL, return status and body"},
-        {"http_client.head",       "HTTP HEAD a URL, return status and headers"},
+        {"http_client.download", "Download a file from URL with optional hash verification"},
+        {"http_client.get", "HTTP GET a URL, return status and body"},
+        {"http_client.head", "HTTP HEAD a URL, return status and headers"},
         // chargen
-        {"chargen.chargen_start",  "Begin generating rotating ASCII character lines (RFC 864)"},
-        {"chargen.chargen_stop",   "Stop all running chargen sessions"},
+        {"chargen.chargen_start", "Begin generating rotating ASCII character lines (RFC 864)"},
+        {"chargen.chargen_stop", "Stop all running chargen sessions"},
         // ioc
-        {"ioc.check",             "Check indicators of compromise against local endpoint state"},
+        {"ioc.check", "Check indicators of compromise against local endpoint state"},
         // quarantine
-        {"quarantine.quarantine",  "Isolate device from network, whitelisting management server"},
-        {"quarantine.unquarantine","Remove quarantine firewall rules and restore network access"},
-        {"quarantine.status",      "Check whether quarantine rules are currently active"},
-        {"quarantine.whitelist",   "Add or remove IPs from an active quarantine whitelist"},
+        {"quarantine.quarantine", "Isolate device from network, whitelisting management server"},
+        {"quarantine.unquarantine", "Remove quarantine firewall rules and restore network access"},
+        {"quarantine.status", "Check whether quarantine rules are currently active"},
+        {"quarantine.whitelist", "Add or remove IPs from an active quarantine whitelist"},
         // agent_actions
-        {"agent_actions.set_log_level","Change the spdlog log level at runtime"},
-        {"agent_actions.info",     "Return agent runtime info from config context"},
+        {"agent_actions.set_log_level", "Change the spdlog log level at runtime"},
+        {"agent_actions.info", "Return agent runtime info from config context"},
         // software_actions
-        {"software_actions.list_upgradable","List packages/apps that can be upgraded (read-only)"},
-        {"software_actions.installed_count","Quick count of installed packages or apps"},
+        {"software_actions.list_upgradable", "List packages/apps that can be upgraded (read-only)"},
+        {"software_actions.installed_count", "Quick count of installed packages or apps"},
         // network_diag
-        {"network_diag.listening",  "List listening TCP ports"},
-        {"network_diag.connections","List established TCP connections"},
+        {"network_diag.listening", "List listening TCP ports"},
+        {"network_diag.connections", "List established TCP connections"},
         // msi_packages
-        {"msi_packages.list",       "List all installed MSI packages"},
-        {"msi_packages.product_codes","Compact list of installed MSI product code GUIDs"},
+        {"msi_packages.list", "List all installed MSI packages"},
+        {"msi_packages.product_codes", "Compact list of installed MSI product code GUIDs"},
         // sccm
-        {"sccm.client_version",     "Check if SCCM client is installed and report version"},
-        {"sccm.site",              "Get SCCM site assignment info"},
+        {"sccm.client_version", "Check if SCCM client is installed and report version"},
+        {"sccm.site", "Get SCCM site assignment info"},
         // storage
-        {"storage.set",            "Store a key-value pair in persistent storage"},
-        {"storage.get",            "Retrieve a value by key from persistent storage"},
-        {"storage.delete",         "Delete a key from persistent storage"},
-        {"storage.list",           "List keys matching a prefix"},
-        {"storage.clear",          "Delete all keys for this plugin"},
+        {"storage.set", "Store a key-value pair in persistent storage"},
+        {"storage.get", "Retrieve a value by key from persistent storage"},
+        {"storage.delete", "Delete a key from persistent storage"},
+        {"storage.list", "List keys matching a prefix"},
+        {"storage.clear", "Delete all keys for this plugin"},
         // interaction
-        {"interaction.notify",     "Show a desktop notification/toast message"},
-        {"interaction.message_box","Show a modal message dialog, return button clicked"},
-        {"interaction.input",      "Show a text input dialog, return entered text"},
-        {"interaction.survey",     "Show a multi-question survey form, collect responses"},
-        {"interaction.set_dnd",    "Enable or disable Do Not Disturb mode"},
+        {"interaction.notify", "Show a desktop notification/toast message"},
+        {"interaction.message_box", "Show a modal message dialog, return button clicked"},
+        {"interaction.input", "Show a text input dialog, return entered text"},
+        {"interaction.survey", "Show a multi-question survey form, collect responses"},
+        {"interaction.set_dnd", "Enable or disable Do Not Disturb mode"},
         // asset_tags
-        {"asset_tags.sync",        "Push current structured tags from server; detect changes"},
-        {"asset_tags.status",      "Report locally cached tags and sync metadata"},
-        {"asset_tags.get",         "Get a specific structured tag value by category key"},
-        {"asset_tags.changes",     "Report the change log (what changed and when)"},
+        {"asset_tags.sync", "Push current structured tags from server; detect changes"},
+        {"asset_tags.status", "Report locally cached tags and sync metadata"},
+        {"asset_tags.get", "Get a specific structured tag value by category key"},
+        {"asset_tags.changes", "Report the change log (what changed and when)"},
         // procfetch
-        {"procfetch.procfetch_fetch","Enumerate processes with PID, name, path, and SHA-1 hash"},
+        {"procfetch.procfetch_fetch", "Enumerate processes with PID, name, path, and SHA-1 hash"},
         // sockwho
-        {"sockwho.sockwho_list",   "Map open sockets to owning processes (PID, name, path)"},
+        {"sockwho.sockwho_list", "Map open sockets to owning processes (PID, name, path)"},
         // wol
-        {"wol.wake",              "Send a Wake-on-LAN magic packet to a MAC address"},
-        {"wol.check",             "Ping a host to verify it responded to WoL wake"},
+        {"wol.wake", "Send a Wake-on-LAN magic packet to a MAC address"},
+        {"wol.check", "Ping a host to verify it responded to WoL wake"},
         // vuln_scan
-        {"vuln_scan.scan",        "Full vulnerability scan (CVE + configuration checks)"},
-        {"vuln_scan.cve_scan",    "CVE-only: match installed software against known CVEs"},
+        {"vuln_scan.scan", "Full vulnerability scan (CVE + configuration checks)"},
+        {"vuln_scan.cve_scan", "CVE-only: match installed software against known CVEs"},
         {"vuln_scan.config_scan", "Configuration and compliance checks only"},
-        {"vuln_scan.summary",     "Quick severity counts from a full vulnerability scan"},
+        {"vuln_scan.summary", "Quick severity counts from a full vulnerability scan"},
         // wifi
-        {"wifi.list_networks",    "Scan for visible WiFi networks (SSID, signal, security)"},
-        {"wifi.connected",        "Currently connected WiFi network info"},
+        {"wifi.list_networks", "Scan for visible WiFi networks (SSID, signal, security)"},
+        {"wifi.connected", "Currently connected WiFi network info"},
         // diagnostics
         {"diagnostics.log_level", "Read current agent log level from config"},
-        {"diagnostics.certificates","List TLS certificate paths and whether they exist"},
-        {"diagnostics.connection_info","Server address, TLS, session, channel state, latency, uptime"},
+        {"diagnostics.certificates", "List TLS certificate paths and whether they exist"},
+        {"diagnostics.connection_info",
+         "Server address, TLS, session, channel state, latency, uptime"},
         // tar (Timeline Activity Record)
-        {"tar.status",            "Current TAR collection status, event counts, and DB size"},
-        {"tar.query",             "Query recorded timeline events by type and time range"},
-        {"tar.snapshot",          "Trigger an immediate full-state snapshot"},
-        {"tar.export",            "Export timeline events as structured data"},
-        {"tar.configure",         "Update TAR collection intervals and retention settings"},
-        {"tar.collect_fast",      "Run fast collectors (processes + network connections)"},
-        {"tar.collect_slow",      "Run slow collectors (services + users + installed apps)"},
+        {"tar.status", "Current TAR collection status, event counts, and DB size"},
+        {"tar.query", "Query recorded timeline events by type and time range"},
+        {"tar.snapshot", "Trigger an immediate full-state snapshot"},
+        {"tar.export", "Export timeline events as structured data"},
+        {"tar.configure", "Update TAR collection intervals and retention settings"},
+        {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
+        {"tar.collect_slow", "Run slow collectors (services + users + installed apps)"},
     };
     return m;
 }
@@ -485,8 +620,8 @@ std::string AgentRegistry::help_json() const {
     sorted.reserve(best.size());
     for (const auto* pm : best | std::views::values)
         sorted.push_back(pm);
-    std::ranges::sort(
-        sorted, [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
+    std::ranges::sort(sorted,
+                      [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
     const auto& descs = action_descriptions();
     nlohmann::json plugins_arr = nlohmann::json::array();
@@ -536,9 +671,8 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     sorted.reserve(best.size());
     for (const auto* pm : best | std::views::values)
         sorted.push_back(pm);
-    std::ranges::sort(sorted, [](const PluginMeta* a, const PluginMeta* b) {
-        return a->name < b->name;
-    });
+    std::ranges::sort(sorted,
+                      [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
     if (!filter.empty()) {
         std::erase_if(sorted, [&](const PluginMeta* pm) { return pm->name != filter; });
@@ -550,11 +684,20 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
         out.reserve(s.size());
         for (char c : s) {
             switch (c) {
-                case '&':  out += "&amp;";  break;
-                case '<':  out += "&lt;";   break;
-                case '>':  out += "&gt;";   break;
-                case '"':  out += "&quot;";  break;
-                default:   out += c;
+            case '&':
+                out += "&amp;";
+                break;
+            case '<':
+                out += "&lt;";
+                break;
+            case '>':
+                out += "&gt;";
+                break;
+            case '"':
+                out += "&quot;";
+                break;
+            default:
+                out += c;
             }
         }
         return out;
@@ -565,30 +708,52 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
 
     for (const auto* pm : sorted) {
         if (pm->actions.empty()) {
-            html += "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
-                    "<td class=\"col-agent\" title=\"" + esc(pm->name) + "\">" + esc(pm->name) + "</td>"
-                    "<td title=\"\u2014\">\u2014</td>"
-                    "<td title=\"" + esc(pm->description) + "\">" + esc(pm->description) + "</td></tr>"
-                    "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
-                    "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" + esc(pm->name) + "</div>"
-                    "<div class=\"detail-label\">Action</div><div class=\"detail-value\">\u2014</div>"
-                    "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" + esc(pm->description) + "</div>"
-                    "</div></td></tr>";
+            html +=
+                "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
+                "<td class=\"col-agent\" title=\"" +
+                esc(pm->name) + "\">" + esc(pm->name) +
+                "</td>"
+                "<td title=\"\u2014\">\u2014</td>"
+                "<td title=\"" +
+                esc(pm->description) + "\">" + esc(pm->description) +
+                "</td></tr>"
+                "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
+                "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" +
+                esc(pm->name) +
+                "</div>"
+                "<div class=\"detail-label\">Action</div><div class=\"detail-value\">\u2014</div>"
+                "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" +
+                esc(pm->description) +
+                "</div>"
+                "</div></td></tr>";
             ++row_count;
         } else {
             for (const auto& act : pm->actions) {
                 auto key = pm->name + "." + act;
                 auto it = descs.find(key);
                 std::string desc = it != descs.end() ? it->second : "";
-                html += "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
-                        "<td class=\"col-agent\" title=\"" + esc(pm->name) + "\">" + esc(pm->name) + "</td>"
-                        "<td title=\"" + esc(act) + "\">" + esc(act) + "</td>"
-                        "<td title=\"" + esc(desc) + "\">" + esc(desc) + "</td></tr>"
-                        "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
-                        "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" + esc(pm->name) + "</div>"
-                        "<div class=\"detail-label\">Action</div><div class=\"detail-value\">" + esc(act) + "</div>"
-                        "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" + esc(desc) + "</div>"
-                        "</div></td></tr>";
+                html +=
+                    "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
+                    "<td class=\"col-agent\" title=\"" +
+                    esc(pm->name) + "\">" + esc(pm->name) +
+                    "</td>"
+                    "<td title=\"" +
+                    esc(act) + "\">" + esc(act) +
+                    "</td>"
+                    "<td title=\"" +
+                    esc(desc) + "\">" + esc(desc) +
+                    "</td></tr>"
+                    "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
+                    "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" +
+                    esc(pm->name) +
+                    "</div>"
+                    "<div class=\"detail-label\">Action</div><div class=\"detail-value\">" +
+                    esc(act) +
+                    "</div>"
+                    "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" +
+                    esc(desc) +
+                    "</div>"
+                    "</div></td></tr>";
                 ++row_count;
             }
         }
@@ -598,17 +763,18 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     // The swap target is #results-tbody (innerHTML).  If <span> OOB
     // elements appear before <tr> rows, the browser's parser rejects the
     // <span> inside <tbody> and the subsequent <tr> rows are lost.
-    std::string context = filter.empty() ? "help \u2014 all plugins"
-                                         : "help " + std::string(filter);
+    std::string context =
+        filter.empty() ? "help \u2014 all plugins" : "help " + std::string(filter);
     std::string result;
     // Primary swap content: <tr> rows (valid inside <tbody>)
     result += html;
     // OOB side-effects: context label + row count (extracted by HTMX
     // regardless of position, won't break the tbody parse context)
-    result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" style=\"font-size:0.75rem;color:#8b949e\">"
-              + esc(context) + "</span>";
-    result += "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">"
-              + std::to_string(row_count) + "</span>";
+    result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" "
+              "style=\"font-size:0.75rem;color:#8b949e\">" +
+              esc(context) + "</span>";
+    result +=
+        "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">" + std::to_string(row_count) + "</span>";
     // OOB: set the thead to Plugin/Action/Description for help display
     result += "<thead id=\"results-thead\" hx-swap-oob=\"innerHTML\">"
               "<tr><th class=\"col-agent\">Plugin</th><th>Action</th><th>Description</th></tr>"
@@ -636,18 +802,30 @@ std::string AgentRegistry::autocomplete_html(std::string_view query) const {
         out.reserve(s.size());
         for (char c : s) {
             switch (c) {
-                case '&':  out += "&amp;";  break;
-                case '<':  out += "&lt;";   break;
-                case '>':  out += "&gt;";   break;
-                case '"':  out += "&quot;";  break;
-                default:   out += c;
+            case '&':
+                out += "&amp;";
+                break;
+            case '<':
+                out += "&lt;";
+                break;
+            case '>':
+                out += "&gt;";
+                break;
+            case '"':
+                out += "&quot;";
+                break;
+            default:
+                out += c;
             }
         }
         return out;
     };
 
     // Build sorted command list with descriptions
-    struct CmdEntry { std::string cmd; std::string desc; };
+    struct CmdEntry {
+        std::string cmd;
+        std::string desc;
+    };
     std::vector<CmdEntry> all_cmds;
 
     // "help" pseudo-command
@@ -658,8 +836,8 @@ std::string AgentRegistry::autocomplete_html(std::string_view query) const {
         for (const auto& act : pm->actions) {
             auto key = pm->name + "." + act;
             auto it = descs.find(key);
-            all_cmds.push_back({pm->name + " " + act,
-                                it != descs.end() ? it->second : pm->description});
+            all_cmds.push_back(
+                {pm->name + " " + act, it != descs.end() ? it->second : pm->description});
         }
     }
 
@@ -669,15 +847,17 @@ std::string AgentRegistry::autocomplete_html(std::string_view query) const {
         if (e.cmd.starts_with(q) && e.cmd != q)
             matches.push_back(&e);
     }
-    std::ranges::sort(matches, [](const CmdEntry* a, const CmdEntry* b) {
-        return a->cmd < b->cmd;
-    });
-    if (matches.size() > 15) matches.resize(15);
+    std::ranges::sort(matches,
+                      [](const CmdEntry* a, const CmdEntry* b) { return a->cmd < b->cmd; });
+    if (matches.size() > 15)
+        matches.resize(15);
 
     std::string html;
     for (const auto* m : matches) {
-        html += "<div class=\"ac-item\" data-cmd=\"" + esc(m->cmd) + "\">"
-                "<span>" + esc(m->cmd) + "</span>";
+        html += "<div class=\"ac-item\" data-cmd=\"" + esc(m->cmd) +
+                "\">"
+                "<span>" +
+                esc(m->cmd) + "</span>";
         if (!m->desc.empty())
             html += "<span class=\"ac-desc\">" + esc(m->desc) + "</span>";
         html += "</div>";
@@ -705,17 +885,31 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
         out.reserve(s.size());
         for (char c : s) {
             switch (c) {
-                case '&':  out += "&amp;";  break;
-                case '<':  out += "&lt;";   break;
-                case '>':  out += "&gt;";   break;
-                case '"':  out += "&quot;";  break;
-                default:   out += c;
+            case '&':
+                out += "&amp;";
+                break;
+            case '<':
+                out += "&lt;";
+                break;
+            case '>':
+                out += "&gt;";
+                break;
+            case '"':
+                out += "&quot;";
+                break;
+            default:
+                out += c;
             }
         }
         return out;
     };
 
-    struct Entry { std::string name; std::string desc; std::string plugin; std::string action; };
+    struct Entry {
+        std::string name;
+        std::string desc;
+        std::string plugin;
+        std::string action;
+    };
     std::vector<Entry> results;
     std::unordered_set<std::string> seen_plugins;
 
@@ -729,7 +923,8 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
             std::ranges::transform(full_lower, full_lower.begin(), ::tolower);
             std::string desc_lower = desc;
             std::ranges::transform(desc_lower, desc_lower.begin(), ::tolower);
-            if (full_lower.find(q) != std::string::npos || desc_lower.find(q) != std::string::npos) {
+            if (full_lower.find(q) != std::string::npos ||
+                desc_lower.find(q) != std::string::npos) {
                 results.push_back({full, desc, pm->name, act});
                 seen_plugins.insert(pm->name);
             }
@@ -737,8 +932,8 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
         // Also match just plugin name
         std::string pname_lower = pm->name;
         std::ranges::transform(pname_lower, pname_lower.begin(), ::tolower);
-        if (pname_lower.find(q) != std::string::npos && !pm->actions.empty()
-            && !seen_plugins.contains(pm->name)) {
+        if (pname_lower.find(q) != std::string::npos && !pm->actions.empty() &&
+            !seen_plugins.contains(pm->name)) {
             auto& first_act = pm->actions.front();
             auto key = pm->name + "." + first_act;
             auto it = descs.find(key);
@@ -748,7 +943,8 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
     }
 
     std::ranges::sort(results, [](const Entry& a, const Entry& b) { return a.name < b.name; });
-    if (results.size() > 8) results.resize(8);
+    if (results.size() > 8)
+        results.resize(8);
 
     std::string html;
     if (!results.empty()) {
@@ -756,11 +952,20 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
     }
     for (size_t i = 0; i < results.size(); ++i) {
         const auto& r = results[i];
-        html += "<div class=\"cmd-result\" data-index=\"" + std::to_string(i) + "\""
-                " data-type=\"instruction\" data-plugin=\"" + esc(r.plugin) + "\""
-                " data-action=\"" + esc(r.action) + "\">"
-                "<span class=\"cmd-result-name\">" + esc(r.name) + "</span>"
-                "<span class=\"cmd-result-desc\">" + esc(r.desc) + "</span>"
+        html += "<div class=\"cmd-result\" data-index=\"" + std::to_string(i) +
+                "\""
+                " data-type=\"instruction\" data-plugin=\"" +
+                esc(r.plugin) +
+                "\""
+                " data-action=\"" +
+                esc(r.action) +
+                "\">"
+                "<span class=\"cmd-result-name\">" +
+                esc(r.name) +
+                "</span>"
+                "<span class=\"cmd-result-desc\">" +
+                esc(r.desc) +
+                "</span>"
                 "<span class=\"cmd-result-type badge badge-info\">Instruction</span>"
                 "</div>";
     }
@@ -817,15 +1022,63 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
-std::vector<std::string> AgentRegistry::evaluate_scope(
-    const yuzu::scope::Expression& expr,
-    const TagStore* tag_store,
-    const CustomPropertiesStore* props_store) const {
+// Collect every from_result_set:<id> reference in a scope expression so the
+// resolver can preload owner-checked membership once per set. The scope AST is
+// a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
+static void collect_result_set_ids(const yuzu::scope::Expression& expr,
+                                   std::vector<std::string>& out) {
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (cond->attribute.starts_with("from_result_set:"))
+            out.push_back(cond->attribute.substr(16));
+    } else if (const auto* comb =
+                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb)
+            for (const auto& child : (*comb)->children)
+                collect_result_set_ids(child, out);
+    }
+}
+
+std::vector<std::string>
+AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
+                              std::string_view principal) const {
+    // Preload owner-checked membership for every from_result_set:<id> the
+    // expression references — once per set, before the agent loop, rather than a
+    // store query per agent while holding mu_ (review finding F). The owner join
+    // in member_set_owned is the authorization gate: a set `principal` does not
+    // own yields an empty membership and therefore never matches, so an operator
+    // cannot target another operator's set by id (review finding B1). Aliases
+    // are not resolved here; callers that accept aliases pre-resolve them.
+    std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
+    if (rs_store && !principal.empty()) {
+        std::vector<std::string> refs;
+        collect_result_set_ids(expr, refs);
+        const std::string owner(principal);
+        for (const auto& rsid : refs) {
+            if (rs_members.contains(rsid))
+                continue;
+            auto mem = rs_store->member_set_owned(rsid, owner);
+            // Touch only sets we actually own (non-empty owned membership): keeps
+            // a set actively used as scope from being GC'd mid-investigation
+            // (review finding I), and never extends another operator's set TTL.
+            if (!mem.empty())
+                rs_store->touch(rsid);
+            rs_members.emplace(rsid, std::move(mem));
+        }
+    }
+
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
+            // from_result_set:<id> — composable-scope membership (capability
+            // §30). EXISTS-semantics: "true" iff this device is an owner-checked
+            // member of the preloaded set.
+            if (key.starts_with("from_result_set:")) {
+                auto it = rs_members.find(key.substr(16));
+                return (it != rs_members.end() && it->second.contains(id)) ? "true" : "";
+            }
             if (key == "ostype")
                 return session->os;
             if (key == "hostname")

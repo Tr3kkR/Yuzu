@@ -10,9 +10,65 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
-| 0.12.x (next) | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). |
+| 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. |
+| 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
+| 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
+
+## ⚠️ Breaking: `--mfa-enforcement` now enforces
+
+Releases before this one accepted `--mfa-enforcement=admin-only` and
+`--mfa-enforcement=required` but treated them as **no-ops** (the parser
+accepted the value for forward-compat and the server emitted a startup
+`WARN`). **This release makes them enforce.** If you staged the flag based
+on that prior documentation, enforcement goes live the instant you start
+the new build.
+
+What changes on upgrade if the flag is set to `admin-only` or `required`:
+
+- An **un-enrolled** user covered by the mode can no longer log in directly.
+  `POST /login` returns a 202 `mfa_enrollment_required` challenge and the
+  user must complete TOTP enrollment (scan QR → enter first code at
+  `POST /login/mfa/enroll`) before a session is minted. This is a no-lockout
+  bootstrap, **but** it requires the user to enroll at their next login.
+- The startup log line for non-default modes changes from `WARN` (no-op) to
+  `INFO` (enforcement active).
+- An operator can no longer disable their own MFA while the mode protects
+  their role.
+
+**Before upgrading with the flag set, do ONE of:**
+
+1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
+   users enroll (Settings → Multi-Factor Authentication), *then* set
+   `admin-only`/`required` and restart. or
+2. Upgrade with the flag set and accept that affected un-enrolled users will
+   be walked through enrollment on their next login.
+
+**SSO / OIDC pre-flight (required reading if you use SSO):** under
+`required` (and `admin-only` for admin SSO users), OIDC sessions are
+MFA-gated by the IdP's `amr` claim — an SSO login the IdP did **not** MFA
+is blocked from high-risk endpoints (it must re-authenticate via SSO),
+symmetric with a local user being forced to enrol. Yuzu cannot mint a
+second factor for an external identity, so **before enabling
+`required`/`admin-only` with SSO you MUST verify your IdP asserts an `amr`
+claim containing a recognized MFA method** (Entra: `mfa`; others:
+`otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
+unable to reach high-risk endpoints — recoverable by restarting in
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md`). Under `optional`,
+no IdP `amr` configuration is required (SSO sessions pass the gate).
+
+**Single-admin deployments:** do not first-boot a fresh single-admin
+deployment straight into `required`. Enroll the admin under `optional` first,
+then switch. If you do start with `required`, the admin must complete
+login-time enrollment within `--mfa-login-pending-secs` (default 120s); if
+the token expires, restart with `optional`, log in, enroll, then re-enable.
+
+**Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
+admin can't enroll): restart the server with `--mfa-enforcement=optional`
+(this re-seeds the in-memory config), log in, resolve enrollment, then
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
 
 ## Upgrade Order
 
@@ -134,6 +190,11 @@ Start-Service yuzu-server  # or start manually
 
 ### Linux (systemd)
 
+> **Breaking (#659):** the gateway refuses to start without a non-default Erlang
+> distribution cookie. `.deb`/`.rpm` installs auto-generate `/etc/yuzu/gateway.env`;
+> for tarball/manual installs create it once (see "Gateway distribution cookie now
+> required" under *Upgrade notes by release* below) before the restart step.
+
 ```bash
 sudo systemctl stop yuzu-gateway
 # Replace the release directory
@@ -226,6 +287,178 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### Gateway distribution cookie now required (#659) — **BREAKING**
+
+The Erlang gateway shipped a hardcoded default distribution cookie
+(`yuzu_gw_secret_change_me`). The cookie is the sole authentication for
+inter-node RPC, so a publicly-known value is unauthenticated remote code
+execution for anyone who can reach EPMD (TCP 4369). The gateway now **refuses to
+boot** with the default (or an empty/unsubstituted) cookie unless explicitly
+overridden.
+
+**Before upgrading:**
+
+- **`.deb` / `.rpm` installs** auto-generate a unique cookie into
+  `/etc/yuzu/gateway.env` (mode `0640`, `root:yuzu-gw`) on first install and
+  never clobber it on upgrade — no action needed for a single node.
+- **Tarball / manual systemd installs** must create the env file once:
+  ```bash
+  sudo install -d -m 0755 /etc/yuzu
+  printf 'YUZU_GW_COOKIE=%s\n' "$(openssl rand -hex 32)" | sudo tee /etc/yuzu/gateway.env >/dev/null
+  sudo chown root:yuzu-gw /etc/yuzu/gateway.env && sudo chmod 0640 /etc/yuzu/gateway.env
+  ```
+  The systemd unit loads it via `EnvironmentFile=-/etc/yuzu/gateway.env`.
+- **Docker / Compose** deployments must set `YUZU_GW_COOKIE` in the gateway
+  service environment (e.g. `export YUZU_GW_COOKIE=$(openssl rand -hex 32)` then
+  reference it). Dev/CI may instead set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`.
+- **Multi-node clusters:** every node must share the **same** cookie — set an
+  identical `YUZU_GW_COOKIE` (or write the same `/etc/yuzu/gateway.env`) on all
+  nodes; the per-host auto-generated value will NOT match across hosts.
+
+**Recovery — gateway won't start after upgrade:**
+
+| Symptom | Diagnose | Fix |
+|---|---|---|
+| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+
+> The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
+> `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
+> Yuzu packages). To remove the cookie after uninstall: `sudo shred -u /etc/yuzu/gateway.env`.
+
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
+> guard and restores the unauthenticated-RPC surface. It exists only for
+> ephemeral dev/CI stacks.
+
+### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
+
+`InstructionStore::import_definition_json` (the storage path behind
+`POST /api/instructions/import`) previously accepted unsigned JSON
+envelopes without verification. After upgrade, unsigned imports are
+rejected with:
+
+```
+instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)
+```
+
+This is intentional and closes the sibling-gap to #802. Without the
+gate, any operator with `InstructionDefinition:Write` permission can
+import a definition that dispatches an arbitrary plugin invocation on
+every targeted agent — same fleet-RCE blast radius the pack-signing
+default closed.
+
+**Two migration paths, in order of preference:**
+
+1. **Sign your imports.** Generate an Ed25519 keypair, sign the
+   `yaml_source` field's bytes with the private key, and wrap the
+   envelope with `signature: <hex>` + `publicKey: <hex>` top-level
+   fields. The wire format mirrors ProductPack: signature is hex-
+   encoded over the verbatim `yaml_source` bytes; `publicKey` is the
+   hex-encoded raw Ed25519 public key (32 bytes / 64 hex chars).
+   Until the dedicated helper script lands (tracked as a follow-up
+   issue covering both pack-signing and definition-signing tooling),
+   use the raw `openssl` recipe directly:
+
+   ```bash
+   # One-time: generate a keypair (rotate periodically per your policy).
+   openssl genpkey -algorithm Ed25519 -out yuzu-signing.pem
+   openssl pkey -in yuzu-signing.pem -pubout -outform DER \
+       | tail -c 32 | xxd -p -c 64    # → 64-hex publicKey
+
+   # Per definition: sign yaml_source bytes, hex-encode the output.
+   echo -n "$YAML_SOURCE" \
+       | openssl pkeyutl -sign -inkey yuzu-signing.pem -rawin \
+       | xxd -p -c 128                # → 128-hex signature
+   ```
+
+   Inject `signature` and `publicKey` as top-level string fields in
+   the JSON envelope POSTed to `/api/instructions/import`. See the
+   REST API reference (`docs/user-manual/rest-api.md` →
+   `POST /api/instructions/import`) for the full signing-rules table
+   and per-rejection error strings.
+
+2. **Opt out temporarily** (legacy environments only). Pass
+   `--allow-unsigned-definitions` to `yuzu-server` or set
+   `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` in the service environment. The
+   server emits an `InstructionStore: signature enforcement DISABLED
+   by configuration` warning on every start AND a
+   `server.unsigned_definitions_allowed` audit row at boot, so the
+   relaxed posture is recoverable from both operator logs and the
+   audit store. **Remove the flag** as soon as the signing migration
+   completes.
+
+**Pre-existing imported definitions are unaffected.** The gate fires
+only on the public import path. The bundled-content boot seed (the
+`kBundledDefinitions` baked into `yuzu-server` at build time) routes
+through an internal `import_definition_json_trusted` variant that
+bypasses the gate; its authenticity comes from binary linkage, not
+runtime signature.
+
+**Authoring surfaces are NOT gated.** `POST /api/instructions`,
+`POST /api/instructions/yaml`, and `PUT /api/instructions/{id}` — the
+dashboard and CLI surfaces where operators author definitions in-
+session — continue to trust `InstructionDefinition:Write` as the
+author trust boundary (the operator IS the source; there is no
+supply chain to authenticate). The `--allow-unsigned-definitions`
+flag does NOT affect those surfaces; they have always accepted
+unsigned author-time input and continue to. The architectural
+question of whether authoring surfaces should ALSO require signed
+envelopes is tracked as a follow-up issue with operator-decision-
+required framing (UX trade-off: gating authoring would break in-
+browser definition authoring).
+
+**Audit-trail evidence chain.** Every rejection emits an
+`instruction.import / denied` audit row with the store error string
+in `detail` (stable SIEM-keyable tokens listed in the
+`audit-log.md` reference). If the audit-store write itself fails
+(locked DB, disk full), the response carries `Sec-Audit-Failed: true`
+header AND `audit_emitted: false` in the JSON body, surfacing the
+SOC 2 CC7.2 evidence gap to the operator immediately rather than
+silently dropping the event.
+
+### Product pack signature enforcement now on-by-default (#802 / W7.4) — **BREAKING**
+
+The `ProductPackStore` previously shipped with signature enforcement
+**disabled** by default and the setter to enable it was never wired to
+any operator-facing flag — the protection was effectively unreachable.
+After upgrade, calls to install a `ProductPack` without a `signature:`
+field are rejected with:
+
+```
+pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)
+```
+
+This is intentional. Unsigned packs are a fleet-wide arbitrary-code-
+execution surface: any operator with `Pack:Install` permission, or a
+MITM on pack delivery, could install a pack containing
+`InstructionDefinition` or plugin payloads that would then execute on
+every enrolled agent.
+
+**Two migration paths, in order of preference:**
+
+1. **Sign your packs.** Generate an Ed25519 keypair, sign each pack's
+   non-metadata YAML content with the private key, and add
+   `signature: <hex>` + `publicKey: <hex>` fields to each pack's
+   `ProductPack` metadata document. The existing verify path
+   (`ProductPackStore::verify_signature`) accepts the result. Pack
+   install then succeeds and the `verified` column in the store is set
+   to true so a future "show only verified packs" query has the data
+   it needs.
+
+2. **Opt out temporarily** (legacy environments only). Pass
+   `--allow-unsigned-packs` to `yuzu-server` or set
+   `YUZU_ALLOW_UNSIGNED_PACKS=1` in the service environment. The
+   server emits a `[SECURITY] product pack signature enforcement
+   DISABLED by configuration` warning on every start and writes a
+   `server.unsigned_packs_allowed` audit row, so the relaxed posture
+   is recoverable from both operator logs and the audit store.
+   **Remove the flag** as soon as the pack-signing migration completes;
+   it is not intended as a permanent configuration.
+
+**Pre-existing installed packs are unaffected.** The check fires only
+on the install path (`POST /api/product-packs`). List, get, and
+uninstall paths do not re-verify, so already-installed unsigned packs
+remain queryable and uninstallable after upgrade.
 
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 
@@ -422,6 +655,34 @@ Safe on fresh installs (no matching rows). If you are upgrading **from** a v0.11
 **Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/v1/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
 
 **Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/v1/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead; it preserves the same disable-retention semantic and passes validation. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
+
+### v0.12.0 — A3 UX ladder (#620, #622, #624)
+
+Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None require code changes on the operator side, but two of them require **action if you maintain a local compose override**:
+
+**1. Container healthchecks now pass (#622).** The shipped `docker-compose.uat.yml` healthcheck blocks were updated to use tools available in each runtime image (`bash` + `/dev/tcp` for the server; busybox `wget --spider` for the gateway). After upgrade, `docker compose ps` reports `(healthy)` instead of `(unhealthy)`.
+
+> **If you maintain a local copy of the compose file** (e.g. `docker-compose.local.yml` or a pinned vendored copy), your override still uses the broken pre-fix healthcheck pattern and will continue showing `(unhealthy)` until you sync the change. Replace your server-service healthcheck stanza with:
+>
+> ```yaml
+>     healthcheck:
+>       test:
+>         - "CMD"
+>         - "bash"
+>         - "-c"
+>         - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /livez HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3 ; rc=$? ; exec 3>&- ; exit $rc"
+> ```
+>
+> And the gateway-service healthcheck stanza with:
+>
+> ```yaml
+>     healthcheck:
+>       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
+> ```
+
+**2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
+
+**3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
 
 ## Rollback
 

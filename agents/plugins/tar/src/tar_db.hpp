@@ -27,13 +27,13 @@ struct sqlite3; // Forward declaration
 namespace yuzu::tar {
 
 struct TarEvent {
-    int64_t id{0};              // row id (0 for new events)
-    int64_t timestamp{0};       // epoch seconds
-    std::string event_type;     // process, network, service, user
-    std::string event_action;   // started, stopped, connected, disconnected, state_changed,
-                                // login, logout
-    std::string detail_json;    // JSON object with type-specific details
-    int64_t snapshot_id{0};     // groups events from same collection cycle
+    int64_t id{0};            // row id (0 for new events)
+    int64_t timestamp{0};     // epoch seconds
+    std::string event_type;   // process, network, service, user
+    std::string event_action; // started, stopped, connected, disconnected, state_changed,
+                              // login, logout
+    std::string detail_json;  // JSON object with type-specific details
+    int64_t snapshot_id{0};   // groups events from same collection cycle
 };
 
 // ── Typed event structs for warehouse tables ────────────────────────────────
@@ -41,7 +41,7 @@ struct TarEvent {
 struct ProcessEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;   // started, stopped
+    std::string action; // started, stopped
     uint32_t pid{0};
     uint32_t ppid{0};
     std::string name;
@@ -52,7 +52,7 @@ struct ProcessEvent {
 struct NetworkEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;       // connected, disconnected
+    std::string action; // connected, disconnected
     std::string proto;
     std::string local_addr;
     int local_port{0};
@@ -67,7 +67,7 @@ struct NetworkEvent {
 struct ServiceEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;           // started, stopped, state_changed
+    std::string action; // started, stopped, state_changed
     std::string name;
     std::string display_name;
     std::string status;
@@ -79,7 +79,7 @@ struct ServiceEvent {
 struct UserEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;   // login, logout
+    std::string action; // login, logout
     std::string user;
     std::string domain;
     std::string logon_type;
@@ -90,7 +90,7 @@ struct UserEvent {
 using QueryRow = std::vector<std::string>;
 
 struct QueryResult {
-    std::vector<std::string> columns;  // column names
+    std::vector<std::string> columns; // column names
     std::vector<QueryRow> rows;
 };
 
@@ -165,16 +165,49 @@ public:
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
 
+    /**
+     * Return one row per unique (proto, local_addr, local_port, remote_addr,
+     * remote_port, pid) ESTABLISHED connection observed at or after
+     * `since_ts`. Each row's `ts` is set to MAX(ts) across observations of
+     * that 5-tuple — i.e. the most recent time TAR saw the connection. Used
+     * by `tar.fleet_snapshot` to widen the per-host viz from "currently
+     * established at sample time" to "established within the rolling
+     * window", so the viz draws blue tubes for connections that have
+     * existed recently even if they're closed at the moment of the call.
+     *
+     * LISTEN / TIME_WAIT / CLOSE_WAIT / etc. are filtered out — they aren't
+     * "this box talks to that box" edges.
+     */
+    std::expected<std::vector<NetworkEvent>, std::string>
+    query_recent_tcp_connections(int64_t since_ts);
+
     // ── Generic SQL execution (for warehouse queries and aggregation) ────────
 
     /**
-     * Execute arbitrary read-only SQL and return results.
-     * Used by tar.sql action. Returns error string on failure.
-     * The caller is responsible for SQL validation (SELECT-only, etc.)
-     * Enforces a maximum row limit to prevent agent DoS.
+     * Execute TRUSTED, internally-constructed read-only SQL on the read-write
+     * connection (NO authorizer). For internal callers ONLY — rollup / stats /
+     * diff queries built from constants and integer-parsed values, never operator
+     * or network input. For any UNTRUSTED operator SQL use execute_user_query
+     * instead (#760). Enforces a maximum row limit to prevent agent DoS.
      */
     std::expected<QueryResult, std::string> execute_query(const std::string& sql,
-                                                           int max_rows = 10000);
+                                                          int max_rows = 10000);
+
+    /**
+     * Execute UNTRUSTED operator SQL (the tar.sql action) in a sandbox: a
+     * dedicated read-only SQLite connection with an authorizer that permits
+     * only SELECT / READ of registry-known warehouse tables. Writes are
+     * structurally impossible (read-only handle); non-SELECT statements,
+     * ATTACH/PRAGMA, unknown tables, and trailing statements are rejected at
+     * prepare time. Fails closed (returns an error) if the sandbox connection
+     * is unavailable. Callers must still pre-validate via
+     * validate_and_translate_sql — this is defence in depth, not a substitute.
+     * Recovery: if the read-only connection cannot be opened at startup it stays
+     * unavailable for the process lifetime (fail closed); restart the agent to
+     * retry.
+     */
+    std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
+                                                               int max_rows = 10000);
 
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
@@ -195,7 +228,12 @@ private:
     void set_config_locked(const std::string& key, const std::string& value);
 
     sqlite3* db_{nullptr};
+    // Read-only, authorizer-sandboxed connection used only by execute_user_query
+    // for untrusted operator SQL (#760). Null if it could not be opened, in
+    // which case user queries fail closed.
+    sqlite3* query_db_{nullptr};
     std::mutex mu_;
+    std::mutex query_mu_;
 };
 
 } // namespace yuzu::tar

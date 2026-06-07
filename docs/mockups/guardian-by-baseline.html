@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — Guardian: By-Baseline list + full-page Baseline detail</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile). Real dashboard navy palette, reused
+  from guardian-overview.html so it ports cleanly into guardian_ui.cpp.
+
+  Two surfaces:
+    1. By-Baseline LIST  — stats-forward cards (replaces today's thin table).
+    2. Baseline FULL PAGE — replaces the cramped gs-modal-card. A real page
+       (sibling of /guardian), reached by a link, with a back-link + page header.
+       In production: GET /guardian/baseline/<id>, mirroring the Fleet-Viz
+       list -> host-page pattern (viz_routes.cpp / viz_host_page_ui.cpp).
+
+  Design rules honoured:
+   - Mode-aware: this baseline is all-Observe, so we LEAD with the compliance
+     breakdown and DROP the "100% enforcement success / 0 remediated" block.
+     (That block only renders when the baseline contains Enforce-mode guards.)
+   - Fleet-scale figures (N of 148 agents), not the 1-agent rig snapshot.
+   - Member guards = filterable table ("drifting only"); a per-device census is
+     on-demand (Refresh), never auto-loaded -> no added fleet traffic.
+  Fake (but rig-shaped) data: real CIS Windows 11 guard names + 16 drift / 4 ok.
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#243553; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --white:#fff; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff; --slate:#6f86a6;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
+  .wrap{max-width:1040px;margin:0 auto}
+  a{color:inherit;text-decoration:none}
+  h2{font-size:1.15rem;margin:0 0 .15rem;color:var(--white)}
+  .sub{color:var(--muted);font-size:.78rem;margin-bottom:1rem}
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.3rem 0 .5rem}
+  .tabs{display:flex;gap:.4rem;margin-bottom:1rem;align-items:center}
+  .tab{background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:.4rem;padding:.3rem .8rem;font-size:.78rem;cursor:pointer}
+  .tab.active{color:var(--white);border-color:var(--accent)}
+  .win{margin-left:auto;display:flex;gap:.3rem;align-items:center;font-size:.7rem;color:var(--muted)}
+  .win b{border:1px solid var(--border);border-radius:.3rem;padding:.1rem .45rem;cursor:pointer;color:var(--muted)}
+  .win b.on{color:var(--white);border-color:var(--accent)}
+
+  /* lifecycle pills */
+  .life{font-size:.66rem;font-weight:700;border-radius:.3rem;padding:.1rem .45rem;text-transform:uppercase;letter-spacing:.04em}
+  .life.dep{color:var(--green);border:1px solid rgba(78,210,126,.5)}
+  .life.draft{color:var(--slate);border:1px solid var(--border)}
+
+  /* ── By-Baseline cards ── */
+  .blcard{display:grid;grid-template-columns:1.5fr 2fr 1fr;gap:1.1rem;background:var(--surface);border:1px solid var(--border);
+    border-radius:.6rem;padding:.9rem 1rem;margin-bottom:.7rem;cursor:pointer;transition:border-color .12s}
+  .blcard:hover{border-color:var(--accent)}
+  .blcard .name{font-size:1rem;font-weight:700;color:var(--white)}
+  .blcard .desc{font-size:.72rem;color:var(--muted);margin-top:.25rem}
+  .blcard .meta{font-size:.68rem;color:var(--muted);margin-top:.4rem}
+  .col-r{text-align:right;font-size:.7rem;color:var(--muted)}
+  .col-r .big{font-size:1.2rem;font-weight:700;color:var(--white)}
+  .view{color:var(--accent);font-size:.72rem;font-weight:600}
+
+  /* ── proportion bar (compliance) ── */
+  .pbar{display:flex;height:18px;border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+  .pbar > span{display:flex;align-items:center;justify-content:center;font-size:.58rem;color:#04101f;font-weight:700}
+  .plegend{display:flex;flex-wrap:wrap;gap:.9rem;margin-top:.4rem;font-size:.64rem;color:var(--muted)}
+  .plegend i{display:inline-block;width:.55rem;height:.55rem;border-radius:2px;margin-right:.3rem;vertical-align:middle}
+  .plegend b{color:var(--white)}
+
+  /* ── stat tiles ── */
+  .strip{display:flex;flex-wrap:wrap;gap:.55rem}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.55rem .8rem;min-width:120px;flex:1}
+  .stat .n{font-size:1.45rem;font-weight:700;color:var(--white);line-height:1.1}
+  .stat .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .stat .sx{font-size:.62rem;color:var(--muted);margin-top:.12rem}
+  .n.good{color:var(--green)} .n.warn{color:var(--yellow)} .n.bad{color:var(--red)} .n.unk{color:var(--slate)} .n.info{color:var(--lightblue)}
+
+  /* ── page header (detail) ── */
+  .back{font-size:.74rem;color:var(--accent);display:inline-block;margin-bottom:.7rem;cursor:pointer}
+  .phead{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}
+  .phead h2{font-size:1.4rem}
+  .phead .hl{display:flex;align-items:center;gap:.6rem}
+  .actions{display:flex;gap:.45rem;flex-shrink:0}
+  .btn{font-size:.72rem;padding:.34rem .7rem;border-radius:.35rem;border:1px solid var(--border);background:var(--surface2);color:var(--fg);cursor:pointer}
+  .btn.accent{border-color:var(--accent);color:var(--accent);background:none}
+  .btn.danger{color:var(--red)}
+
+  /* ── member-guard table ── */
+  .filters{display:flex;gap:.4rem;align-items:center;margin:.2rem 0 .6rem}
+  .chip{font-size:.7rem;padding:.22rem .6rem;border-radius:.35rem;border:1px solid var(--border);color:var(--muted);background:var(--surface);cursor:pointer}
+  .chip.on{color:var(--white);border-color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:.78rem}
+  th{text-align:left;padding:.42rem .55rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;user-select:none}
+  td{padding:.42rem .55rem;border-bottom:1px solid var(--border)}
+  tr.click{cursor:pointer} tr.click:hover td{background:var(--surface)}
+  .gname{color:var(--white);font-weight:600}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .sev{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em}
+  .sev.high{color:var(--red)} .sev.medium{color:var(--yellow)} .sev.low{color:var(--lightblue)}
+  .mode.observe{color:var(--lightblue);font-weight:700} .mode.enforce{color:var(--yellow);font-weight:700}
+  .st-ok{color:var(--green);font-weight:600} .st-drift{color:var(--yellow);font-weight:600} .st-unk{color:var(--slate)}
+  .muted{color:var(--muted)}
+
+  .events{font-size:.74rem}
+  .ev{display:flex;gap:.6rem;padding:.32rem 0;border-bottom:1px solid var(--border)}
+  .ev .t{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .badge{font-size:.58rem;font-weight:700;padding:.05rem .35rem;border-radius:.25rem;background:rgba(255,204,0,.15);color:var(--yellow);text-transform:uppercase}
+  .note{margin-top:1rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .note b{color:var(--lightblue)}
+  .placeholder{text-align:center;color:var(--muted);padding:1.5rem 1rem;font-size:.8rem;background:var(--surface);border:1px dashed var(--border);border-radius:.5rem}
+  .placeholder b{display:block;color:var(--fg);margin-bottom:.25rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ════════════════ VIEW 1 — BY-BASELINE LIST ════════════════ -->
+<div id="view-list">
+  <h2>Guardian</h2>
+  <div class="sub">Guaranteed State enforcement — live status, Guards &amp; Baselines</div>
+  <div class="tabs">
+    <span class="tab">Fleet</span>
+    <span class="tab">By Guard</span>
+    <span class="tab active">By Baseline</span>
+    <span class="win">window:<b>24h</b><b class="on">7d</b><b>30d</b></span>
+  </div>
+
+  <!-- CIS Windows 11 — deployed, all-Observe -->
+  <div class="blcard" onclick="showDetail()">
+    <div>
+      <div class="name">CIS Windows 11</div>
+      <div class="desc">CIS Microsoft Windows 11 Enterprise Benchmark — 20 Observe guards</div>
+      <div class="meta">20 guards · fleet-wide (no group targeting yet)</div>
+      <span class="life dep" style="margin-top:.5rem;display:inline-block">&#9679; deployed</span>
+    </div>
+    <div>
+      <div class="pbar">
+        <span style="width:62%;background:var(--green)">62%</span>
+        <span style="width:33%;background:var(--yellow)"></span>
+        <span style="width:0%;background:var(--red)"></span>
+        <span style="width:5%;background:var(--slate)"></span>
+      </div>
+      <div class="plegend">
+        <span><i style="background:var(--green)"></i>Compliant <b>1840</b></span>
+        <span><i style="background:var(--yellow)"></i>Drifted <b>988</b></span>
+        <span><i style="background:var(--red)"></i>Error <b>0</b></span>
+        <span><i style="background:var(--slate)"></i>Unknown <b>132</b></span>
+      </div>
+      <div class="meta" style="margin-top:.5rem"><span class="st-drift">16 of 20 guards drifting</span> on 141 of 148 agents</div>
+    </div>
+    <div class="col-r">
+      <div class="big">141<span style="font-size:.7rem;color:var(--muted)">/148</span></div>
+      <div>agents reporting</div>
+      <div style="margin-top:.5rem">988 drift events · 7d</div>
+      <div style="margin-top:.25rem">deployed today 10:20</div>
+      <div class="view" style="margin-top:.5rem">View &rarr;</div>
+    </div>
+  </div>
+
+  <!-- Server Hardening — deployed, MIXED (has Enforce guards) -->
+  <div class="blcard" onclick="alert('mockup: would open Server Hardening L2 page (mixed Observe+Enforce → shows the effectiveness block)')">
+    <div>
+      <div class="name">Server Hardening L2</div>
+      <div class="desc">Member-server lockdown — 9 guards (4 Enforce · 5 Observe)</div>
+      <div class="meta">9 guards · fleet-wide</div>
+      <span class="life dep" style="margin-top:.5rem;display:inline-block">&#9679; deployed</span>
+    </div>
+    <div>
+      <div class="pbar">
+        <span style="width:94%;background:var(--green)">94%</span>
+        <span style="width:3%;background:var(--yellow)"></span>
+        <span style="width:3%;background:var(--red)"></span>
+        <span style="width:0%;background:var(--slate)"></span>
+      </div>
+      <div class="plegend">
+        <span><i style="background:var(--green)"></i>Compliant <b>372</b></span>
+        <span><i style="background:var(--yellow)"></i>Drifted <b>12</b></span>
+        <span><i style="background:var(--red)"></i>Error <b>12</b></span>
+        <span><i style="background:var(--slate)"></i>Unknown <b>0</b></span>
+      </div>
+      <div class="meta" style="margin-top:.5rem"><span class="st-ok">remediating</span> · 31 auto-remediated · 2 failed (7d)</div>
+    </div>
+    <div class="col-r">
+      <div class="big">44<span style="font-size:.7rem;color:var(--muted)">/44</span></div>
+      <div>agents reporting</div>
+      <div style="margin-top:.5rem">33 drift events · 7d</div>
+      <div style="margin-top:.25rem">deployed yesterday</div>
+      <div class="view" style="margin-top:.5rem">View &rarr;</div>
+    </div>
+  </div>
+
+  <!-- RDP Lockdown — draft -->
+  <div class="blcard" style="opacity:.78" onclick="alert('mockup: draft baseline page — nothing deployed, so compliance reads Unknown')">
+    <div>
+      <div class="name">RDP Lockdown</div>
+      <div class="desc">Disable RDP on workstations — 3 guards</div>
+      <div class="meta">3 guards · not assigned</div>
+      <span class="life draft" style="margin-top:.5rem;display:inline-block">&#9675; draft</span>
+    </div>
+    <div>
+      <div class="pbar"><span style="width:100%;background:var(--surface2);color:var(--muted)">not deployed</span></div>
+      <div class="plegend"><span>No agents armed — deploy to start reporting.</span></div>
+    </div>
+    <div class="col-r">
+      <div class="big muted">—</div>
+      <div>never deployed</div>
+      <div class="view" style="margin-top:.5rem">View &rarr;</div>
+    </div>
+  </div>
+
+  <div class="note">Cards roll up across the fleet from the <b>delta status feed</b> (compliant/drifted/error/unknown,
+    reported only on change) + the <b>drift-event log</b> — no extra agent traffic. Whole card is a link to the
+    Baseline page. &nbsp;<i>By Guard view gets the same card treatment next.</i></div>
+</div>
+
+<!-- ════════════════ VIEW 2 — BASELINE FULL PAGE ════════════════ -->
+<div id="view-detail" style="display:none">
+  <span class="back" onclick="showList()">&larr; All baselines</span>
+
+  <div class="phead">
+    <div>
+      <div class="hl"><h2>CIS Windows 11</h2><span class="life dep">&#9679; deployed</span></div>
+      <div class="sub" style="margin:.35rem 0 0">CIS Microsoft Windows 11 Enterprise Benchmark — 20 Observe (Watch) guards ·
+        deployed today 10:20:56 by admin</div>
+    </div>
+    <div class="actions">
+      <button class="btn accent">Edit</button>
+      <button class="btn">Re-deploy</button>
+      <button class="btn danger">Delete</button>
+    </div>
+  </div>
+
+  <div class="sech">Compliance — as of last check-in</div>
+  <div style="display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">
+    <div style="font-size:2.2rem;font-weight:700;color:var(--white);line-height:1">62%<div style="font-size:.66rem;color:var(--muted);font-weight:400;text-transform:uppercase;letter-spacing:.05em">compliant · 141/148 agents reporting</div></div>
+    <div style="flex:1;min-width:340px">
+      <div class="pbar">
+        <span style="width:62%;background:var(--green)">1840</span>
+        <span style="width:33%;background:var(--yellow)">988</span>
+        <span style="width:0%;background:var(--red)"></span>
+        <span style="width:5%;background:var(--slate)">132</span>
+      </div>
+      <div class="plegend">
+        <span><i style="background:var(--green)"></i>Compliant <b>1840</b></span>
+        <span><i style="background:var(--yellow)"></i>Drifted <b>988</b></span>
+        <span><i style="background:var(--red)"></i>Error <b>0</b></span>
+        <span><i style="background:var(--slate)"></i>Unknown <b>132</b> <span class="muted">(not reported yet)</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="strip" style="margin-top:.9rem">
+    <div class="stat"><div class="n info">20</div><div class="l">Member guards</div><div class="sx">16 drifting · 4 clean</div></div>
+    <div class="stat"><div class="n">148</div><div class="l">Agents targeted</div><div class="sx">141 reporting · 7 unknown</div></div>
+    <div class="stat"><div class="n warn">16</div><div class="l">Guards drifting</div><div class="sx">on 141 agents</div></div>
+    <div class="stat"><div class="n warn">988</div><div class="l">Drift detected</div><div class="sx">7d</div></div>
+  </div>
+  <!-- mode-aware: all-Observe baseline => NO enforcement-effectiveness tiles. -->
+  <div class="note" style="margin-top:.5rem;border:none;padding:0">
+    <b>Observe baseline</b> — no auto-remediation, so no "enforcement success" tiles. Add an Enforce-mode guard and a
+    <i>Remediated / Failed / Success-rate</i> block appears here (see Server Hardening L2).
+  </div>
+
+  <div class="sech">Member guards (20)</div>
+  <div class="filters">
+    <span class="chip on" onclick="filt(this,'all')">All 20</span>
+    <span class="chip" onclick="filt(this,'drift')">Drifting 16</span>
+    <span class="chip" onclick="filt(this,'ok')">Compliant 4</span>
+    <span style="margin-left:auto;font-size:.66rem;color:var(--muted)">click a guard → its full page · click a header to sort</span>
+  </div>
+  <table id="mg">
+    <thead><tr>
+      <th onclick="sortBy(0)">Guard</th><th onclick="sortBy(1)">Severity</th><th>Mode</th>
+      <th onclick="sortBy(3)">State now</th><th class="num" onclick="sortBy(4)">Detected 7d</th><th>Last activity</th>
+    </tr></thead>
+    <tbody>
+      <!-- 16 drifting -->
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — Defender real-time protection not disabled</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 138 / 148</td><td class="num">132</td><td class="muted">2m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — Windows Firewall enabled (Domain profile)</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 41 / 148</td><td class="num">44</td><td class="muted">2m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — Windows Firewall enabled (Public profile)</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 39 / 148</td><td class="num">42</td><td class="muted">5m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — LSASS runs as protected process (RunAsPPL)</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 120 / 148</td><td class="num">118</td><td class="muted">7m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — WDigest cleartext credentials disabled</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 22 / 148</td><td class="num">24</td><td class="muted">12m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="2"><td class="gname">CIS — SMBv1 server disabled</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 18 / 148</td><td class="num">19</td><td class="muted">18m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — AutoPlay disabled for non-volume devices</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 96 / 148</td><td class="num">94</td><td class="muted">3m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — AutoRun disabled (NoDriveTypeAutoRun)</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 94 / 148</td><td class="num">92</td><td class="muted">3m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — Force audit policy subcategory settings</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 61 / 148</td><td class="num">63</td><td class="muted">9m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — PowerShell script block logging enabled</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 77 / 148</td><td class="num">79</td><td class="muted">4m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — Removable storage: deny all access</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 52 / 148</td><td class="num">54</td><td class="muted">11m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — Restrict anonymous enumeration (RestrictAnonymous)</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 33 / 148</td><td class="num">35</td><td class="muted">14m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — SMB client signing required</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 29 / 148</td><td class="num">31</td><td class="muted">16m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — SMB server signing required</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 27 / 148</td><td class="num">28</td><td class="muted">16m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — UAC admin elevation prompt</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 14 / 148</td><td class="num">15</td><td class="muted">21m ago</td></tr>
+      <tr class="click" data-s="drift" data-sev="1"><td class="gname">CIS — WinRM service Basic auth disabled (AllowBasic)</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-drift">drifted on 11 / 148</td><td class="num">12</td><td class="muted">24m ago</td></tr>
+      <!-- 4 compliant -->
+      <tr class="click" data-s="ok" data-sev="2"><td class="gname">CIS — LM hash storage disabled (NoLMHash)</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-ok">compliant · 148/148</td><td class="num muted">0</td><td class="muted">—</td></tr>
+      <tr class="click" data-s="ok" data-sev="2"><td class="gname">CIS — RDP disabled</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-ok">compliant · 148/148</td><td class="num muted">0</td><td class="muted">—</td></tr>
+      <tr class="click" data-s="ok" data-sev="2"><td class="gname">CIS — UAC enabled (EnableLUA)</td><td><span class="sev high">high</span></td><td><span class="mode observe">Observe</span></td><td class="st-ok">compliant · 148/148</td><td class="num muted">0</td><td class="muted">—</td></tr>
+      <tr class="click" data-s="ok" data-sev="1"><td class="gname">CIS — Restrict anonymous SAM enumeration (RestrictAnonymousSAM)</td><td><span class="sev medium">medium</span></td><td><span class="mode observe">Observe</span></td><td class="st-ok">compliant · 148/148</td><td class="num muted">0</td><td class="muted">—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="sech">Assignment <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">(management groups)</span></div>
+  <div class="placeholder"><b>Targeting not available yet</b>
+    Management-group targeting (included / excluded groups) lands when the global management-group feature is ready.
+    Deploy currently applies this Baseline's enabled Guards <strong>fleet-wide</strong> (all agents, OS-filtered per Guard).</div>
+
+  <div class="sech">Recent events (this baseline)</div>
+  <div class="events">
+    <div class="ev"><span class="t">10:24:02</span><span class="badge">drift</span><span>Defender real-time protection — drift on <b>WIN-PRD-0148</b></span></div>
+    <div class="ev"><span class="t">10:23:55</span><span class="badge">drift</span><span>AutoPlay non-volume — drift on <b>WIN-PRD-0142</b></span></div>
+    <div class="ev"><span class="t">10:23:41</span><span class="badge">drift</span><span>SMBv1 server disabled — drift on <b>WIN-LAB-0027</b></span></div>
+    <div class="ev"><span class="t">10:22:18</span><span class="badge">drift</span><span>UAC admin elevation prompt — drift on <b>WIN-PRD-0061</b></span></div>
+    <div class="ev"><span class="t" style="text-align:center;width:100%;color:var(--accent);cursor:pointer">view all 988 events for this baseline &rarr;</span></div>
+  </div>
+
+  <div class="note">Per-guard "state now" is the rolled-up delta status across targeted agents. A full <b>per-device census</b>
+    (which agent is drifted vs compliant) loads <b>on demand</b> from a guard's page via Refresh — never auto-polled,
+    so opening this page adds no fleet traffic.</div>
+</div>
+
+<script>
+  function showDetail(){document.getElementById('view-list').style.display='none';document.getElementById('view-detail').style.display='';window.scrollTo(0,0);}
+  function showList(){document.getElementById('view-detail').style.display='none';document.getElementById('view-list').style.display='';window.scrollTo(0,0);}
+  function filt(el,k){
+    document.querySelectorAll('.filters .chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');
+    document.querySelectorAll('#mg tbody tr').forEach(r=>{r.style.display=(k==='all'||r.dataset.s===k)?'':'none';});
+  }
+  let asc=true;
+  function sortBy(col){
+    const tb=document.querySelector('#mg tbody');const rows=[...tb.rows];
+    rows.sort((a,b)=>{
+      let x,y;
+      if(col===1){x=+a.dataset.sev;y=+b.dataset.sev;}
+      else if(col===4){x=+a.cells[4].innerText||0;y=+b.cells[4].innerText||0;}
+      else if(col===3){x=a.dataset.s;y=b.dataset.s;}
+      else{x=a.cells[col].innerText.toLowerCase();y=b.cells[col].innerText.toLowerCase();}
+      return (x>y?1:x<y?-1:0)*(asc?1:-1);
+    });
+    asc=!asc;rows.forEach(r=>tb.appendChild(r));
+  }
+  document.querySelectorAll('.win b').forEach(b=>b.onclick=function(){document.querySelectorAll('.win b').forEach(x=>x.classList.remove('on'));b.classList.add('on');});
+</script>
+</div>
+</body>
+</html>

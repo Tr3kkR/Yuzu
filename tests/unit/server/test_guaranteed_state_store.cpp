@@ -19,11 +19,13 @@
 
 #include "guaranteed_state_store.hpp"
 #include "store_errors.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <thread>
 
@@ -74,23 +76,10 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
 // RAII guard for a per-test temp database file. Constructed FIRST so the
 // destructor fires even if downstream construction throws (prior governance
 // memory qe-B1 — partial-construction leaks when RAII wraps come later).
-struct TempDbFile {
-    std::filesystem::path path;
-    TempDbFile() {
-        auto tmp = std::filesystem::temp_directory_path();
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        path = tmp / ("yuzu-gs-test-" + std::to_string(gen()) + ".db");
-    }
-    ~TempDbFile() noexcept {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        std::filesystem::remove(path.string() + "-wal", ec);
-        std::filesystem::remove(path.string() + "-shm", ec);
-    }
-    TempDbFile(const TempDbFile&) = delete;
-    TempDbFile& operator=(const TempDbFile&) = delete;
-};
+// Use the shared fixture (unique_temp_path + -wal/-shm cleanup) rather than a
+// local random_device variant — matches the CLAUDE.md test-helper mandate and
+// avoids the flake-#473 salt pitfalls (qa-S4 / #1209).
+using yuzu::test::TempDbFile;
 
 } // namespace
 
@@ -102,6 +91,44 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     REQUIRE(store.is_open());
     CHECK(store.rule_count() == 0);
     CHECK(store.event_count() == 0);
+}
+
+// ── M6 / #1209: monotonic policy generation ─────────────────────────────────
+
+TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
+          "[guaranteed_state_store][generation]") {
+    GuaranteedStateStore store(":memory:");
+    CHECK(store.current_policy_generation() == 0);  // seeded at 0
+
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(store.current_policy_generation() == 1);  // create bumped
+
+    auto r = make_rule("r1", "guard-one");
+    r.enabled = false;
+    REQUIRE(store.update_rule(r));
+    CHECK(store.current_policy_generation() == 2);  // update bumped
+
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(store.current_policy_generation() == 3);  // delete bumped
+
+    // A failed mutation (unknown rule) must NOT advance the generation —
+    // otherwise a reconcile would chase a phantom version.
+    CHECK_FALSE(store.update_rule(make_rule("nope", "missing")));
+    CHECK(store.current_policy_generation() == 3);
+}
+
+TEST_CASE("GuaranteedStateStore: policy_generation persists across reopen",
+          "[guaranteed_state_store][generation]") {
+    TempDbFile tmp;
+    {
+        GuaranteedStateStore store(tmp.path);
+        REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+        CHECK(store.current_policy_generation() == 1);
+    }
+    // Reopen: the counter is persisted, not reset — an agent that applied
+    // generation 1 before a server restart must not look stale afterwards.
+    GuaranteedStateStore reopened(tmp.path);
+    CHECK(reopened.current_policy_generation() == 1);
 }
 
 // ── Rule CRUD ──────────────────────────────────────────────────────────────
@@ -457,6 +484,15 @@ TEST_CASE("GuaranteedStateStore: batch insert with duplicate rolls back whole ba
     // None of the batch's new IDs should have landed.
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
+
+    // Regression guard for the B1 transaction-safety fix: a rolled-back batch must
+    // NOT leave the connection wedged in an open transaction. A subsequent batch
+    // (which issues its own BEGIN) must succeed — before the SqliteTxn RAII owner,
+    // a failure/exception between BEGIN and COMMIT could strand the transaction and
+    // make the next BEGIN fail (and a still-open stmt make sqlite3_close BUSY-leak).
+    auto after = store.insert_events({make_event("evt-after-rollback", "rule-1", "agent-A")});
+    REQUIRE(after.has_value());
+    CHECK(store.event_count() == 2);
 }
 
 TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",
@@ -581,4 +617,132 @@ TEST_CASE("GuaranteedStateStore: start_cleanup is a no-op on a closed store",
     bad.start_cleanup();
     bad.stop_cleanup();
     SUCCEED();
+}
+
+TEST_CASE("GuaranteedStateStore: overview aggregations", "[guaranteed_state_store][overview]") {
+    yuzu::test::TempDbFile db{std::string_view{"gs-agg-"}};
+    GuaranteedStateStore store{db.path, 30, 60};
+    REQUIRE(store.is_open());
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
+                  std::string ts) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
+        e.event_type = std::move(type);
+        return e;
+    };
+    // Insertion order == rowid order, so the LAST event per (agent,rule) is "latest".
+    REQUIRE(store.insert_event(ev("e1", "r1", "a1", "drift.detected", "2026-06-04T10:00:00Z")).has_value());
+    REQUIRE(store.insert_event(ev("e2", "r1", "a1", "drift.remediated", "2026-06-04T10:01:00Z")).has_value());
+    REQUIRE(store.insert_event(ev("e3", "r1", "a2", "drift.detected", "2026-06-04T10:02:00Z")).has_value());
+    REQUIRE(store.insert_event(ev("e4", "r2", "a1", "remediation.failed", "2026-06-04T10:03:00Z")).has_value());
+
+    SECTION("rule_activity: per-rule window counts") {
+        std::map<std::string, GuardianRuleActivity> m;
+        for (auto& a : store.rule_activity("")) m[a.rule_id] = a;
+        REQUIRE(m.count("r1"));
+        CHECK(m["r1"].detected == 2);
+        CHECK(m["r1"].remediated == 1);
+        CHECK(m["r1"].failed == 0);
+        CHECK(m["r1"].distinct_agents == 2);
+        CHECK(m["r1"].last_activity == "2026-06-04T10:02:00Z");
+        CHECK(m["r2"].failed == 1);
+        CHECK(m["r2"].distinct_agents == 1);
+    }
+    SECTION("daily_remediations: per-day fixed/failed") {
+        auto days = store.daily_remediations("");
+        REQUIRE(days.size() == 1);
+        CHECK(days[0].day == "2026-06-04");
+        CHECK(days[0].remediated == 1);
+        CHECK(days[0].failed == 1);
+    }
+    SECTION("since cutoff excludes earlier events") {
+        std::map<std::string, GuardianRuleActivity> m;
+        for (auto& a : store.rule_activity("2026-06-04T10:02:30Z")) m[a.rule_id] = a;
+        CHECK(m.count("r1") == 0);  // all r1 events precede the cutoff
+        CHECK(m["r2"].failed == 1);
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
+          "[guaranteed_state_store][census]") {
+    yuzu::test::TempDbFile db{std::string_view{"gs-census-"}};
+    GuaranteedStateStore store{db.path, 30, 60};
+    REQUIRE(store.is_open());
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
+                  std::string ts) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
+        e.event_type = std::move(type);
+        return e;
+    };
+    auto census = [&] {
+        std::map<std::pair<std::string, std::string>, std::string> m;
+        for (auto& s : store.agent_rule_statuses())
+            m[{s.agent_id, s.rule_id}] = s.state;
+        return m;
+    };
+
+    // (a1,r1): compliant → drift → remediated  ⇒ final "compliant".
+    REQUIRE(store.insert_event(ev("c1", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+    REQUIRE(store.insert_event(ev("c2", "r1", "a1", "drift.detected", "2026-06-04T10:01:00Z")));
+    REQUIRE(store.insert_event(ev("c3", "r1", "a1", "drift.remediated", "2026-06-04T10:02:00Z")));
+    // (a2,r1): drift only ⇒ "drifted".
+    REQUIRE(store.insert_event(ev("c4", "r1", "a2", "drift.detected", "2026-06-04T10:00:30Z")));
+    // (a1,r2): unhealthy ⇒ "errored".
+    REQUIRE(store.insert_event(ev("c5", "r2", "a1", "guard.unhealthy", "2026-06-04T10:00:00Z")));
+    // guard.armed carries no verdict ⇒ no census row.
+    REQUIRE(store.insert_event(ev("c6", "r3", "a9", "guard.armed", "2026-06-04T10:00:00Z")));
+
+    {
+        auto m = census();
+        CHECK(m[{"a1", "r1"}] == "compliant");
+        CHECK(m[{"a2", "r1"}] == "drifted");
+        CHECK(m[{"a1", "r2"}] == "errored");
+        CHECK(m.count({"a9", "r3"}) == 0); // guard.armed left no census row
+    }
+
+    SECTION("a late-arriving OLDER event does not regress a newer state") {
+        // a1/r1 is compliant as of 10:02; replay an older 10:01 drift — must be ignored.
+        REQUIRE(store.insert_event(ev("c7", "r1", "a1", "drift.detected", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("a newer event updates the state") {
+        REQUIRE(store.insert_event(ev("c8", "r1", "a1", "drift.detected", "2026-06-04T10:05:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "drifted");
+    }
+    SECTION("batch ingest maintains the census transactionally") {
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("b1", "r5", "a5", "guard.compliant", "2026-06-04T11:00:00Z"),
+            ev("b2", "r5", "a5", "drift.detected", "2026-06-04T11:01:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        CHECK(census()[{"a5", "r5"}] == "drifted"); // latest in the batch wins
+    }
+    SECTION("rule-filtered status returns only that guard's per-device rows (Slice C drill-down)") {
+        auto r1 = store.agent_rule_statuses("r1");
+        CHECK(r1.size() == 2); // a1 + a2
+        for (const auto& s : r1)
+            CHECK(s.rule_id == "r1");
+        CHECK(store.agent_rule_statuses("r2").size() == 1);   // a1 only
+        CHECK(store.agent_rule_statuses("nope").empty());     // unknown rule
+        CHECK(store.agent_rule_statuses().size() == 3);       // unfiltered = whole fleet
+    }
+    SECTION("deleting a rule drops its status rows (no orphan census inflation)") {
+        GuaranteedStateRuleRow r;
+        r.rule_id = "r1";
+        r.name = "rule-one";
+        r.yaml_source = "x";
+        r.enforcement_mode = "audit";
+        r.severity = "high";
+        r.created_at = "2026-06-04T09:00:00Z";
+        r.updated_at = r.created_at;
+        REQUIRE(store.create_rule(r)); // r1 already has a1/a2 status rows from above
+        REQUIRE(census().count({"a1", "r1"}) == 1);
+
+        REQUIRE(store.delete_rule("r1"));
+        auto m = census();
+        CHECK(m.count({"a1", "r1"}) == 0); // gone with the rule
+        CHECK(m.count({"a2", "r1"}) == 0);
+        CHECK(m.count({"a1", "r2"}) == 1); // an unrelated rule's status is untouched
+    }
 }

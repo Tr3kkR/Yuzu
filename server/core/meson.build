@@ -65,6 +65,90 @@ echarts_embed = custom_target(
   ],
 )
 
+# Build-time embed of vendored Three.js r168 + OrbitControls (PR 4 of
+# feat/viz-engine ladder). Same chunked-raw-string pattern as ECharts;
+# fragment loader in PR 5 wires `<script type="importmap">` so the
+# OrbitControls module's `import ... from 'three'` resolves to the
+# vendored file. We ship the ES-module form rather than UMD because
+# Three.js dropped UMD in r150+ -- modern releases only publish
+# `three.module.min.js`. Symbols: kThreeJs (~685 KB), kThreeOrbitControlsJs (~32 KB).
+three_embed = custom_target(
+  'three_js_bundle',
+  input: 'vendor/three.module.min.js',
+  output: 'three_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeJs',
+  ],
+)
+
+three_orbit_embed = custom_target(
+  'three_orbit_controls_js_bundle',
+  input: 'vendor/three-orbit-controls.js',
+  output: 'three_orbit_controls_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeOrbitControlsJs',
+  ],
+)
+
+# Build-time embed of the Yuzu fleet-viz renderer module (PR 5 + PR 6 of
+# feat/viz-engine ladder). Hand-written before PR 6 (~10 KB) when it fit
+# under MSVC's 16,380-byte raw-string-literal limit; PR 6 took the bundle
+# past that limit, so we now codegen via embed_js.py like ECharts and
+# Three.js. Symbol: kYuzuVizJs (std::string).
+yuzu_viz_js_embed = custom_target(
+  'yuzu_viz_js_bundle',
+  input: 'static/yuzu-viz.js',
+  output: 'yuzu_viz_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizJs',
+  ],
+)
+
+# PR 9-pre: per-host renderer module + vendored Cytoscape.js 3.33.3 (MIT).
+# Cytoscape ships as ESM minified (cytoscape.esm.min.mjs from the npm
+# tarball) so the importmap entry in viz_host_page_ui.cpp can resolve
+# `import cytoscape from "cytoscape"`. The renderer uses cytoscape's
+# built-in `cose` force-directed layout — no layout extension is vendored
+# (the faster `fcose` is a UMD bundle with an external cose-base
+# dependency that doesn't resolve cleanly against an ESM importmap).
+yuzu_viz_host_js_embed = custom_target(
+  'yuzu_viz_host_js_bundle',
+  input: 'static/yuzu-viz-host.js',
+  output: 'yuzu_viz_host_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizHostJs',
+  ],
+)
+
+cytoscape_js_embed = custom_target(
+  'cytoscape_js_bundle',
+  input: 'static/cytoscape.min.js',
+  output: 'cytoscape_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'CytoscapeJs',
+  ],
+)
+
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
 # after the design-token expansion. Chunking into ~14 KB
@@ -104,11 +188,28 @@ inter_embed = custom_target(
 # upserts them into the instruction store, so charts are populated
 # without operator intervention. Sidesteps yaml-cpp on Windows MSVC
 # (#625) by doing the parse at build time with PyYAML.
+#
+# PyYAML is a hard build dependency: the embedded vector is the only
+# path by which shipped InstructionDefinitions reach the server (no
+# filesystem fallback at runtime), so a missing PyYAML used to silently
+# produce a binary with an empty Instructions tab. Probe at configure
+# time so the failure surfaces here rather than mid-compile.
+embed_python = find_program('python3', 'python')
+_yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
+if _yaml_probe.returncode() != 0
+  error(
+    'PyYAML is required to embed shipped InstructionDefinitions but is '
+    + 'not importable from ' + embed_python.full_path() + '. '
+    + 'Install with `pip install pyyaml` (Linux/macOS) or '
+    + '`pacman -S python-yaml` (MSYS2). See CLAUDE.md "Instruction Engine".'
+  )
+endif
+
 content_embed = custom_target(
   'bundled_content',
   output: 'bundled_content.cpp',
   command: [
-    find_program('python3', 'python'),
+    embed_python,
     files('scripts/embed_content.py'),
     meson.project_source_root() / 'content',
     '@OUTPUT@',
@@ -116,9 +217,26 @@ content_embed = custom_target(
   build_always_stale: true,  # always re-scan content/ for edits
 )
 
+# Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
+# server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
+# static lib with warnings off so third-party source does not trip our
+# warning_level=3 — same isolation the vcpkg deps get via include_type:'system'.
+qrcodegen_lib = static_library(
+  'qrcodegen',
+  files('vendor/qrcodegen/qrcodegen.cpp'),
+  include_directories: include_directories('vendor/qrcodegen'),
+  override_options: ['warning_level=0', 'werror=false'],
+)
+qrcodegen_dep = declare_dependency(
+  link_with: qrcodegen_lib,
+  include_directories: include_directories('vendor/qrcodegen'),
+)
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
-  [echarts_embed, yuzu_css_embed, inter_embed, content_embed,
+  [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -127,7 +245,11 @@ yuzu_server_core_lib = static_library(
     'src/auth.cpp',
     'src/auth_db.cpp',
     'src/auth_routes.cpp',
+    'src/mfa_step_up.cpp',
+    'src/mfa_qr.cpp',
+    'src/totp.cpp',
     'src/auto_approve.cpp',
+    'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/chargen_ui.cpp',
     'src/procfetch_ui.cpp',
@@ -143,6 +265,8 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
+    'src/yaml_scan.cpp',
+    'src/scope_yaml.cpp',
     'src/analytics_event_store.cpp',
     'src/analytics_sinks.cpp',
     'src/data_export.cpp',
@@ -150,11 +274,14 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
     'src/execution_event_bus.cpp',
+    'src/fleet_topology_store.cpp',
+    'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
+    'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
     'src/error_codes.cpp',
@@ -163,20 +290,38 @@ yuzu_server_core_lib = static_library(
     'src/legacy_shim.cpp',
     'src/management_group_store.cpp',
     'src/api_token_store.cpp',
+    'src/secure_random.cpp',
     'src/quarantine_store.cpp',
+    'src/result_set_store.cpp',
+    'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
+    'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',
+    'src/baseline_store.cpp',
+    'src/guardian_push_builder.cpp',
+    'src/guardian_ingest.cpp',
+    'src/guardian_resilience_schema.cpp',
+    'src/guardian_rule_spec.cpp',
+    'src/guardian_schema_registry.cpp',
+    'src/guardian_form_render.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_routes.cpp',
+    'src/guardian_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
     'src/webhook_routes.cpp',
+    'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
+    'src/viz_routes.cpp',
+    'src/viz_page_ui.cpp',
+    'src/viz_host_page_ui.cpp',
     'src/compliance_ui.cpp',
+    'src/guardian_ui.cpp',
+    'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
@@ -184,6 +329,7 @@ yuzu_server_core_lib = static_library(
     'src/inventory_store.cpp',
     'src/notification_store.cpp',
     'src/webhook_store.cpp',
+    'src/offload_target_store.cpp',
     'src/directory_sync.cpp',
     'src/patch_manager.cpp',
     'src/deployment_store.cpp',
@@ -201,6 +347,7 @@ yuzu_server_core_lib = static_library(
     'src/static_js_bundle.cpp',
     'src/charts_js_bundle.cpp',
     'src/visualization_engine.cpp',
+    'src/response_templates_engine.cpp',
     'src/icons_svg.cpp',
     'src/migration_runner.cpp',
     'src/rate_limiter.cpp',
@@ -210,14 +357,14 @@ yuzu_server_core_lib = static_library(
   include_directories: ['include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
 )
 
 executable(

@@ -96,11 +96,19 @@ jobs:
       all_healthy: ${{ steps.health.outputs.all_healthy }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Probe runner health
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
         run: python3 scripts/ci/runner-health-check.py --mode preflight
+
+      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
+      # otherwise only runs at release time, so a regex regression would surface
+      # too late (after the full build matrix). No build deps — just bash.
+      - name: Shell gate tests
+        run: bash tests/shell/test_check_compose_versions.sh
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
@@ -131,6 +139,7 @@ jobs:
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
+          persist-credentials: false
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
@@ -200,6 +209,7 @@ jobs:
           # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
           # runner-reset.sh.
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -306,6 +316,14 @@ jobs:
       - name: Test
         run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
 
+      # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
+      # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
+      # does not drive main()), so cover them here against the just-built binary.
+      - name: Break-glass CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_mfa_reset.sh
+
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
       # the last 100 lines, which is enough for a Catch2 failure but loses
@@ -399,6 +417,7 @@ jobs:
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: false
+          persist-credentials: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -416,6 +435,15 @@ jobs:
           done
           meson --version
           ccache --version | head -1
+          # Governance UAT 2026-05-06 build-ci B-2: PyYAML must be
+          # importable for `meson setup` to pass — embed_content.py
+          # hard-fails without it. The runner image should provision
+          # python-yaml via MSYS2 pacman, but ensure idempotently here
+          # so a re-baked runner doesn't silently break release. Use
+          # the hash-pinned requirements file so a compromised PyPI
+          # cannot inject a malicious wheel (Gate 7 re-review LOW).
+          python -c "import yaml" >/dev/null 2>&1 || \
+            python -m pip install --user --require-hashes -r requirements-ci.txt
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -553,6 +581,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -560,6 +589,9 @@ jobs:
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
+          # Governance UAT 2026-05-06 build-ci B-1: PyYAML hard-required
+          # at meson configure time for the content embed.
+          pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
       # Split restore + always-save: `save-always: true` is deprecated and
       # documented as "does not work as intended" by the actions/cache
@@ -701,6 +733,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: detect
         run: |
           # PRs diff against the base ref; pushes diff against the SHA
@@ -740,6 +773,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install system packages
         run: |

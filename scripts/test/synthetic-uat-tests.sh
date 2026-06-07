@@ -173,7 +173,19 @@ else
     T2_START=$(now_ms)
     T2_BODY=$(curl -s --max-time "$TIMEOUT_S" "$GATEWAY_HEALTH_URL/readyz" 2>/dev/null || echo '{"status":"error"}')
     T2_MS=$(elapsed_ms "$T2_START")
-    if echo "$T2_BODY" | grep -q '"ready"'; then
+    # Parse /readyz JSON via python3 rather than greping for the literal
+    # `"ready"` substring — a response like `{"status":"degraded","note":
+    # "ready_for_disposal"}` would false-positive the old grep. python3 is a
+    # hard build dependency project-wide (CLAUDE.md), so it's safe to invoke
+    # here. Mirrors the same change in scripts/start-UAT.sh test 2.
+    if echo "$T2_BODY" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("status") == "ready" else 1)
+' 2>/dev/null; then
         ok "gateway healthy (${T2_MS}ms)"
         PASSED=$((PASSED + 1))
         record_timing "gateway-readyz" "$T2_MS"
@@ -192,7 +204,8 @@ if [[ $NO_AGENT -eq 1 ]]; then
 else
     T3_START=$(now_ms)
     T3_COUNT=$(curl -s --max-time "$TIMEOUT_S" "$DASHBOARD_URL/metrics" 2>/dev/null \
-        | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+        | awk '/^yuzu_agents_registered_total /{print $2; exit}')
+    T3_COUNT="${T3_COUNT:-0}"
     T3_MS=$(elapsed_ms "$T3_START")
     if [[ "$T3_COUNT" -ge 1 ]]; then
         ok "server sees $T3_COUNT registered agent(s) (${T3_MS}ms)"
@@ -213,7 +226,8 @@ if [[ -z "$GATEWAY_METRICS_URL" ]]; then
 else
     T4_START=$(now_ms)
     T4_COUNT=$(curl -s --max-time "$TIMEOUT_S" "$GATEWAY_METRICS_URL/metrics" 2>/dev/null \
-        | grep -oP 'yuzu_gw_agents_connected_total\{[^}]*\} \K[0-9]+' || echo "0")
+        | awk '/^yuzu_gw_agents_connected_total\{/{print $2; exit}')
+    T4_COUNT="${T4_COUNT:-0}"
     T4_MS=$(elapsed_ms "$T4_START")
     if [[ "$T4_COUNT" -ge 1 ]]; then
         ok "gateway sees $T4_COUNT connected agent(s) (${T4_MS}ms)"

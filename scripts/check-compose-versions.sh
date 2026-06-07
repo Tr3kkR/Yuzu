@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify docker-compose files reference the expected Yuzu version.
 #
-# Enforces two rules for every `ghcr.io/<owner>/yuzu-{server,gateway,agent}:<tag>`
+# Enforces two rules for every `ghcr.io/<owner>/yuzu-{server,gateway,agent}[-chisel]:<tag>`
 # reference in tracked compose files:
 #
 #   1. The tag must be parameterized as `${YUZU_VERSION:-<default>}` — bare
@@ -30,18 +30,26 @@ if [[ $# -lt 1 || -z "${1:-}" ]]; then
 fi
 
 EXPECTED="$1"
+shift
 
-# Explicit list of tracked compose files to check. Local-only files
-# (`docker-compose.local.yml`) are gitignored and omitted. If a new compose
-# file is added it must be consciously opted in here.
-FILES=(
-  docker-compose.uat.yml
-  deploy/docker/docker-compose.yml
-  deploy/docker/docker-compose.reference.yml
-  deploy/docker/docker-compose.uat.yml
-  deploy/docker/docker-compose.full-uat.yml
-  deploy/docker/docker-compose.sanitizer-uat.yml
-)
+# Files to check. Explicit args after the version override the default tracked
+# list — used by tests/shell/test_check_compose_versions.sh for hermetic
+# fixtures; the release job passes only the version, so it uses the default.
+# Local-only files (`docker-compose.local.yml`) are gitignored and omitted; a
+# new tracked compose must be opted in here consciously.
+if [ "$#" -gt 0 ]; then
+  FILES=("$@")
+else
+  FILES=(
+    docker-compose.uat.yml
+    deploy/docker/docker-compose.yml
+    deploy/docker/docker-compose.reference.yml
+    deploy/docker/docker-compose.uat.yml
+    deploy/docker/docker-compose.full-uat.yml
+    deploy/docker/docker-compose.sanitizer-uat.yml
+    deploy/docker/docker-compose.demo.yml
+  )
+fi
 
 fail=0
 
@@ -64,8 +72,8 @@ for f in "${FILES[@]}"; do
   while IFS=: read -r lineno rest; do
     [[ -z "$lineno" ]] && continue
     # Pull just the tag off the matched line.
-    if [[ "$rest" =~ ghcr\.io/[^/]+/yuzu-(server|gateway|agent):([^[:space:]\"\']+) ]]; then
-      tag="${BASH_REMATCH[2]}"
+    if [[ "$rest" =~ ghcr\.io/[^/]+/yuzu-(server|gateway|agent)(-chisel)?:([^[:space:]\"\']+) ]]; then
+      tag="${BASH_REMATCH[3]}"
     else
       continue
     fi
@@ -88,7 +96,7 @@ for f in "${FILES[@]}"; do
     fi
 
     # Anything else (latest, local, sha-*, ...) is intentional and allowed.
-  done < <(grep -nE 'ghcr\.io/[^/]+/yuzu-(server|gateway|agent):' "$f" || true)
+  done < <(grep -nE 'ghcr\.io/[^/]+/yuzu-(server|gateway|agent)(-chisel)?:' "$f" || true)
 done
 
 if [[ $fail -ne 0 ]]; then

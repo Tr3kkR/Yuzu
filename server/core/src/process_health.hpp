@@ -135,7 +135,7 @@ private:
                     auto pos = line.find_first_of("0123456789");
                     if (pos != std::string::npos) {
                         long long kb = 0;
-                        auto [ptr, ec] = std::from_chars(
+                        [[maybe_unused]] auto [ptr, ec] = std::from_chars(
                             line.data() + pos, line.data() + line.size(), kb);
                         if (ec == std::errc{})
                             out = kb * 1024;

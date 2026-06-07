@@ -36,7 +36,8 @@ services:
       - "50055:50055"
     volumes:
       - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
-      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+      # InstructionDefinitions are embedded into yuzu-server at build time
+      # (server/core/scripts/embed_content.py); no host mount required.
       - sanitizer-logs:/var/log/yuzu
     restart: "no"
 
@@ -45,6 +46,8 @@ services:
     container_name: yuzu-san-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
+      # #659: ephemeral UAT stack — accept the default cookie (single gateway, no clustering).
+      - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"
       - "50063:50063"

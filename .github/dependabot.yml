@@ -26,6 +26,8 @@ updates:
       github-codeql:
         patterns:
           - "github/codeql-action/*"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/deploy/docker"
@@ -35,6 +37,25 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    cooldown:
+      default-days: 7
+    # Base-image major lines are pinned and bumped deliberately, not by
+    # auto-PR — a base bump is a coordinated migration, not a one-line diff.
+    #   erlang: tag is the bare major (`28`), so 28.x point releases arrive
+    #     as digest updates and still flow; we only block the major. OTP 29
+    #     is a lockstep change across release.yml (otp-version),
+    #     ensure-erlang.sh, every gateway Dockerfile + the chiselled image,
+    #     and a clean dialyzer/eunit pass (declined #1139).
+    #   ubuntu: tag is major.minor (`24.04`), so 24.10 (interim) would arrive
+    #     as a *minor* bump — block major AND minor to stay on the 24.04 LTS.
+    #     Digest refreshes of 24.04 still flow and keep it patched. Next hop
+    #     is the 26.04 LTS (already used by the chiselled images), done by
+    #     hand (declined #1140).
+    ignore:
+      - dependency-name: "erlang"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ubuntu"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # Python tooling consumed by CI (meson, and whatever else lands in
   # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
@@ -47,3 +68,5 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    cooldown:
+      default-days: 7

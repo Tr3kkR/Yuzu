@@ -17,13 +17,12 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  # Top-level baseline = least-privilege read. id-token + attestations are
-  # shared across every build job (each calls actions/attest-build-provenance);
-  # contents:write and packages:write are scoped per-job to only the jobs
-  # that actually need them (Scorecard Token-Permissions hardening).
+  # Top-level baseline = least-privilege read. Every elevated scope
+  # (id-token, attestations, packages, contents:write) is opted into
+  # per-job — Scorecard Token-Permissions zeroes the score on any
+  # workflow-level write to a sensitive scope, even one shared across
+  # multiple jobs.
   contents: read
-  id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
-  attestations: write   # actions/attest-build-provenance across all build jobs
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -37,6 +36,10 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     # 90 = backstop for the slow GHA cache backend / 9P filesystem
     # observed during v0.11.0 retags. Cache surgery (restore-only)
     # should make this irrelevant in practice; keeping the wider
@@ -49,6 +52,22 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
+
+      # Activate Erlang/OTP + rebar3 so the meson `.gateway_built` custom_target
+      # (auto-enabled whenever rebar3 is on PATH — meson.build gates the gateway
+      # purely on `find_program('rebar3')`) can run `escript` at compile time.
+      # The github-runner user has rebar3 in ~/.local/bin but no OTP runtime on
+      # PATH, so without this the Build step fails at `.gateway_built` with
+      # "escript: No such file or directory". Pin matches ci.yml + the
+      # "Build Gateway (Erlang)" job so an OTP bump moves all three together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Verify build dependencies
         run: |
@@ -61,6 +80,18 @@ jobs:
             echo "Install with: sudo apt-get install -y ccache rpm"
             exit 1
           fi
+
+      - name: Install Python build deps (PyYAML for content embed)
+        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+        # configure-time dependency for the bundled-content embed
+        # (server/core/scripts/embed_content.py). meson setup fails
+        # with error() if `import yaml` returns non-zero. Without an
+        # explicit install step, this self-hosted runner relied on
+        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
+        # ~/.local on the same runner). A runner re-bake would break
+        # release. Install explicitly and hash-pinned.
+        run: |
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
 
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux
@@ -113,9 +144,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-linux-x64"
-          mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
+          mkdir -p "${STAGING}/bin" "${STAGING}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server
+          # at build time — no content/ directory shipped).
           cp build-linux/server/core/yuzu-server "${STAGING}/bin/"
           cp build-linux/agents/core/yuzu-agent "${STAGING}/bin/"
 
@@ -124,9 +156,6 @@ jobs:
 
           # Plugin shared libraries
           find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
-
-          # Content definitions
-          cp content/definitions/*.yaml "${STAGING}/content/definitions/"
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
@@ -163,11 +192,6 @@ jobs:
           output-file: yuzu-linux-x64.cdx.json
           artifact-name: yuzu-linux-x64.cdx.json
           upload-artifact: false
-          # Explicit source name + version stops Syft from deriving the
-          # artifact ID from the working-directory path ("(which is not
-          # ideal)" warning emitted on every release run otherwise).
-          source-name: yuzu-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -177,8 +201,6 @@ jobs:
           output-file: yuzu-linux-x64.spdx.json
           artifact-name: yuzu-linux-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-linux-x64
-          source-version: ${{ github.ref_name }}
 
       # ── SLSA build provenance ───────────────────────────────────────
       # Records that these specific artifacts came from this specific
@@ -240,12 +262,18 @@ jobs:
     name: "Build Gateway (Erlang)"
     needs: [build-linux]
     runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 30
     env:
       ImageOS: ubuntu24
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
@@ -327,8 +355,6 @@ jobs:
           output-file: yuzu-gateway-linux-x64.cdx.json
           artifact-name: yuzu-gateway-linux-x64.cdx.json
           upload-artifact: false
-          source-name: yuzu-gateway-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate gateway SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -338,8 +364,6 @@ jobs:
           output-file: yuzu-gateway-linux-x64.spdx.json
           artifact-name: yuzu-gateway-linux-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-gateway-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest gateway provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -389,6 +413,10 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: [self-hosted, Windows]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     # 90 = backstop. Same rationale as Build Linux x64. Defender
     # exclusions on the runner should keep tar/zstd extraction off
     # the Defender scan path, but if exclusions ever drift the wider
@@ -401,6 +429,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -520,11 +549,12 @@ jobs:
       - name: Package archive
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
           $staging = "yuzu-${version}-windows-x64"
-          New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
+          New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server.exe
+          # at build time — no content/ directory shipped).
           Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"
           Copy-Item "build-windows/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
@@ -540,15 +570,12 @@ jobs:
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
           }
 
-          # Content definitions
-          Copy-Item "content/definitions/*.yaml" "${staging}/content/definitions/"
-
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-windows-x64.zip"
 
       - name: Build Windows installers (InnoSetup)
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           # Install InnoSetup 6
           choco install innosetup -y --no-progress
@@ -590,7 +617,7 @@ jobs:
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           $certPath = "${{ runner.temp }}\signing-cert.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
@@ -629,8 +656,6 @@ jobs:
           output-file: yuzu-windows-x64.cdx.json
           artifact-name: yuzu-windows-x64.cdx.json
           upload-artifact: false
-          source-name: yuzu-windows-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate Windows SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -640,8 +665,6 @@ jobs:
           output-file: yuzu-windows-x64.spdx.json
           artifact-name: yuzu-windows-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-windows-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest Windows provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -682,7 +705,14 @@ jobs:
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
-    runs-on: macos-14
+    # macos-15 = Apple Silicon, Xcode 16 / Apple Clang 16 (accepts -std=c++23).
+    # macos-14 ships Apple Clang 15, which rejects -std=c++23 ("invalid value
+    # 'c++23'") — that broke the v0.12.0 first cut. Matches ci.yml's macOS job.
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 90
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
@@ -692,6 +722,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -699,6 +730,12 @@ jobs:
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
+          # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+          # configure-time dependency for the bundled-content embed
+          # (server/core/scripts/embed_content.py). meson setup fails
+          # with error() if `import yaml` returns non-zero. Install via
+          # the same hash-pinned requirements file used elsewhere.
+          pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
       - name: Cache ccache
         # Restore-only: release builds consume cache, never produce.
@@ -882,9 +919,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-macos-arm64"
-          mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
+          mkdir -p "${STAGING}/bin" "${STAGING}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server
+          # at build time — no content/ directory shipped).
           cp build-macos/server/core/yuzu-server "${STAGING}/bin/"
           cp build-macos/agents/core/yuzu-agent "${STAGING}/bin/"
 
@@ -893,9 +931,6 @@ jobs:
 
           # Plugin dylibs
           find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
-
-          # Content definitions
-          cp content/definitions/*.yaml "${STAGING}/content/definitions/"
 
           tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
 
@@ -955,8 +990,6 @@ jobs:
           output-file: yuzu-macos-arm64.cdx.json
           artifact-name: yuzu-macos-arm64.cdx.json
           upload-artifact: false
-          source-name: yuzu-macos-arm64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate macOS SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -966,8 +999,6 @@ jobs:
           output-file: yuzu-macos-arm64.spdx.json
           artifact-name: yuzu-macos-arm64.spdx.json
           upload-artifact: false
-          source-name: yuzu-macos-arm64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest macOS provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -1030,24 +1061,32 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Lowercase repository owner
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
         id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           # Tag convention mirrors scripts/docker-release.sh:
@@ -1067,7 +1106,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1075,6 +1114,16 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # TRIPLET is the vcpkg triplet baked into the Dockerfile for
+          # vcpkg install + meson configure. The Dockerfile defaults to
+          # `x64-linux`, but pinning explicitly here is QE-R2-02 follow-up
+          # from feat/viz-engine governance round 2: when arm64 publishing
+          # lands the matrix will need to set this per-row, and the
+          # explicit build-arg becomes load-bearing rather than aspirational.
+          # Dockerfile.gateway does not consume TRIPLET (rebar3 path); the
+          # build-arg is still safe -- unused build-args are ignored.
+          build-args: |
+            TRIPLET=x64-linux
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}
@@ -1149,17 +1198,397 @@ jobs:
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
       - name: Image summary
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
             echo "## Published \`yuzu-${{ matrix.image }}\` image"
             echo ""
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "$META_TAGS"
             echo '```'
             echo ""
-            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
             echo "Signed with cosign keyless + SLSA provenance attestation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Chiselled demo images — server + gateway + agent, multi-arch ─────
+  # Publishes the FROM-scratch chiselled Ubuntu 26.04 demo images to GHCR
+  # under a distinct `-chisel` repo suffix (see docs/demo-environment.md).
+  # Deliberately NOT in the `release` job's needs: a slow or failed
+  # demo-image build must never block the actual GitHub release. Mirrors
+  # docker-publish (login / metadata / cosign / attestation / lowercase
+  # owner) but differs in three ways:
+  #   1. Multi-arch linux/amd64,linux/arm64 (docker-publish is amd64-only).
+  #   2. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
+  #      the vcpkg triplet from buildx's TARGETARCH per-arch; forcing
+  #      x64-linux would bake an x64 binary into the arm64 image.
+  #   3. A distinct local buildcache path (-chisel suffix) so it never
+  #      collides with docker-publish's cache.
+  docker-publish-chisel:
+    name: "Publish ${{ matrix.image }}-chisel image"
+    # Mirror docker-publish's needs (core builds must pass) but stay OUT
+    # of the release job's needs: so this never gates the release.
+    needs: [build-linux, build-gateway]
+    runs-on: [self-hosted, Linux]
+    # Job-level concurrency so a re-tagged release (same ref) cancels an
+    # in-flight 6 h QEMU build instead of wedging the single self-hosted
+    # Linux runner slot behind a stale emulated arm64 compile. The
+    # workflow-level concurrency is cancel-in-progress:false (a real
+    # release must run to completion); this narrower group trades that
+    # for runner-slot liveness on the demo-image path specifically — SRE
+    # flagged the starvation risk. Group is keyed on github.ref + the
+    # matrix image so a re-push of the same tag is treated as a
+    # supersede PER IMAGE — without `${{ matrix.image }}`, the three
+    # matrix legs (server/gateway/agent) share a single group and
+    # GitHub cancels two of them at scheduling time. Observed on
+    # v0.12.0 release run 26413256206 where server-chisel and
+    # agent-chisel were cancelled at 1s runtime, leaving gateway-chisel
+    # as the only published variant.
+    concurrency:
+      group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
+      cancel-in-progress: true
+    # Generous timeout: the server/agent chisel images compile all of
+    # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
+    # does it under QEMU emulation. docs/demo-environment.md flags up to a
+    # ~240 min cold-cache risk for the emulated arm64 build.
+    #
+    # INTERIM STRATEGY: arm64 is built via QEMU on the amd64 self-hosted
+    # runner. This is slow but needs no extra runner. The sustainable path
+    # is a native arm64 runner (self-hosted or GitHub-hosted
+    # ubuntu-24.04-arm) + per-arch manifest merge — a runner-topology
+    # decision tracked as the "Open decision — arm64 build strategy" note
+    # in docs/demo-environment.md ("Publishing"). Revisit before relying on
+    # the QEMU path for every release.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            dockerfile: deploy/docker/Dockerfile.server.chisel
+          - image: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway.chisel
+          - image: agent
+            dockerfile: deploy/docker/Dockerfile.agent.chisel
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # QEMU registers binf_misc handlers so buildx can build the
+      # linux/arm64 leg on this amd64 runner. Required for the multi-arch
+      # build below; see the INTERIM STRATEGY note on timeout-minutes.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          # Force the docker-container driver. Multi-platform push needs a
+          # builder that can produce an OCI manifest list; the ambient
+          # `docker` driver on the self-hosted runner cannot do
+          # cross-arch / manifest-list builds and a leftover docker-driver
+          # builder would make the linux/amd64,linux/arm64 push fail.
+          driver: docker-container
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          # Distinct `-chisel` suffix — must not collide with the non-chisel
+          # yuzu-${image} images published by docker-publish.
+          images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+          # Tag convention mirrors docker-publish / scripts/docker-release.sh:
+          #   - stable (no -alpha/-beta/-rc suffix): :X.Y.Z + :X.Y + :latest
+          #   - pre-release:                         :X.Y.Z-suffix only
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=yuzu-${{ matrix.image }}-chisel
+            org.opencontainers.image.description=Yuzu ${{ matrix.image }} chiselled demo image
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Multi-arch is the whole point of this job. The arm64 leg runs
+          # under QEMU emulation on the amd64 runner (see timeout note).
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
+          # Dockerfiles derive the vcpkg triplet from buildx's per-arch
+          # TARGETARCH when TRIPLET is empty
+          # (T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;;
+          # *) echo x64-linux;; esac)}"). Pinning TRIPLET=x64-linux here (as
+          # docker-publish does) would bake an x64 binary into the arm64
+          # image. gateway.chisel ignores TRIPLET (rebar3 path).
+          # Distinct local buildcache path so chisel never collides with
+          # the non-chisel docker-publish cache. mode=max caches
+          # intermediate layers too (best hit rate) — important given the
+          # full vcpkg-from-source compile.
+          cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel
+          cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel,mode=max
+          # Disable buildx's own provenance/sbom attestation — we emit
+          # GitHub-native attestations + cosign signatures below so
+          # customers have a single verification path via `gh
+          # attestation verify` and `cosign verify`.
+          provenance: false
+          sbom: false
+
+      # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
+      # Mirrors docker-publish's SBOM steps so the chisel demo images get
+      # the same supply-chain coverage (compliance flagged that the chisel
+      # images had cosign + SLSA but no SBOM). Syft scans the pushed
+      # multi-arch image by digest. Same SHA-pinned anchore/sbom-action +
+      # upload-artifact versions as docker-publish.
+      - name: Generate image SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: yuzu-${{ matrix.image }}-chisel-image.cdx.json
+          artifact-name: yuzu-${{ matrix.image }}-chisel-image.cdx.json
+          upload-artifact: false
+
+      - name: Generate image SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: yuzu-${{ matrix.image }}-chisel-image.spdx.json
+          artifact-name: yuzu-${{ matrix.image }}-chisel-image.spdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-${{ matrix.image }}-chisel-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-chisel-image.cdx.json
+            yuzu-${{ matrix.image }}-chisel-image.spdx.json
+          retention-days: 3
+
+      # ── SLSA build provenance (by image digest) ─────────────────────
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+        run: |
+          # cosign v3.0+ auto-detects the OIDC issuer from the workflow's
+          # id-token; an explicit --oidc-issuer is redundant and a hard
+          # error in v3 (see docker-publish for the #495 history).
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Image summary
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (multi-arch)"
+            echo ""
+            echo '```'
+            echo "$META_TAGS"
+            echo '```'
+            echo ""
+            echo "**Digest:** \`$BUILD_DIGEST\`"
+            echo ""
+            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Signed with cosign keyless + SLSA provenance attestation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Agent-bundle delivery image — published + SIGNED after the release ─
+  # The 3-triplet agent bundle (yuzu-agent-bundle-chisel) repackages the
+  # release's OWN signed agent archives, so it can only be built once the
+  # GitHub Release exists -> needs: [release]. It runs on a GitHub-hosted
+  # runner (no compilation, just download + repackage; gh/docker/buildx/cosign
+  # all preinstalled), reuses scripts/build-agent-bundle.sh as the single
+  # source of truth, then signs + SBOMs + attests the pushed image exactly
+  # like docker-publish. It is deliberately NOT in the release job's needs:
+  # (it depends on release, not vice-versa), so it never gates the release.
+  docker-publish-agent-bundle:
+    name: "Publish agent-bundle image"
+    needs: [release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: agent-bundle-publish-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version + image ref
+        id: ref
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-agent-bundle-chisel" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          driver: docker-container
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      # Reuse the maintainer script (download release artifacts -> verify by
+      # sha256 -> lay out -> buildx multi-arch -> push). GH_TOKEN lets its
+      # `gh release download` authenticate against this just-published release.
+      - name: Build + push multi-arch agent bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/build-agent-bundle.sh \
+            --version "${{ steps.ref.outputs.version }}" \
+            --multiarch --push
+
+      - name: Resolve pushed image digest
+        id: digest
+        run: |
+          DIGEST="$(docker buildx imagetools inspect \
+            '${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}' \
+            --format '{{.Manifest.Digest}}')"
+          echo "value=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
+
+      - name: Generate bundle SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
+          format: cyclonedx-json
+          output-file: yuzu-agent-bundle-chisel-image.cdx.json
+          artifact-name: yuzu-agent-bundle-chisel-image.cdx.json
+          upload-artifact: false
+
+      - name: Generate bundle SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
+          format: spdx-json
+          output-file: yuzu-agent-bundle-chisel-image.spdx.json
+          artifact-name: yuzu-agent-bundle-chisel-image.spdx.json
+          upload-artifact: false
+
+      - name: Upload bundle SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-agent-bundle-chisel-image-sbom
+          path: |
+            yuzu-agent-bundle-chisel-image.cdx.json
+            yuzu-agent-bundle-chisel-image.spdx.json
+          retention-days: 3
+
+      - name: Attest bundle provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ steps.ref.outputs.image }}
+          subject-digest: ${{ steps.digest.outputs.value }}
+          push-to-registry: true
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.digest.outputs.value }}
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Bundle summary
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          DIGEST: ${{ steps.digest.outputs.value }}
+        run: |
+          {
+            echo "## Published \`yuzu-agent-bundle-chisel\` delivery image (multi-arch)"
+            echo ""
+            echo "**Tag:** \`${IMAGE}:${VERSION}\`  **Digest:** \`${DIGEST}\`"
+            echo ""
+            echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance + SBOM."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Create GitHub Release ────────────────────────────────────────────
@@ -1174,6 +1603,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Validate docker-compose image versions
         run: |
@@ -1341,12 +1772,14 @@ jobs:
           fi
 
       - name: Generate release notes
+        env:
+          HAS_CHANGELOG: ${{ steps.changelog.outputs.has_changelog }}
         run: |
           OWNER="${{ github.repository_owner }}"
-          TAG="${{ github.ref_name }}"
+          TAG="${GITHUB_REF_NAME}"
 
           # Start with changelog content if available
-          if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+          if [ "$HAS_CHANGELOG" = "true" ]; then
             cat changelog_section.md > release-notes.md
             echo "" >> release-notes.md
           else
@@ -1458,9 +1891,10 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ steps.prerelease.outputs.is_prerelease }}
         run: |
           PRERELEASE_FLAG=""
-          if [[ "${{ steps.prerelease.outputs.is_prerelease }}" == "true" ]]; then
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
 
@@ -1472,22 +1906,35 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          gh release create "${{ github.ref_name }}" \
-            --title "Yuzu ${{ github.ref_name }}" \
-            --notes-file release-notes.md \
-            ${PRERELEASE_FLAG} \
-            artifacts/yuzu-linux-x64.tar.gz \
-            artifacts/yuzu-gateway-linux-x64.tar.gz \
-            artifacts/yuzu-windows-x64.zip \
-            artifacts/YuzuAgentSetup-*.exe \
-            artifacts/YuzuServerSetup-*.exe \
-            artifacts/YuzuAgent-*.pkg \
-            artifacts/yuzu-macos-arm64.tar.gz \
-            artifacts/*.deb \
-            artifacts/*.rpm \
-            artifacts/*.cdx.json \
-            artifacts/*.spdx.json \
-            artifacts/*.intoto.jsonl \
-            artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.sigstore \
-            "${WIZARD_ASSET[@]}"
+          # Idempotent on re-tag: if the release already exists (e.g.
+          # operator deleted + recreated the tag to backfill a CI bug
+          # like the chisel-publish concurrency miss in run 26413256206),
+          # skip the create+upload so the dependent docker-publish-*
+          # jobs can still run cleanly without "release already exists"
+          # blowing up Create Release. Asset re-upload would require
+          # --clobber per-file and risks signature drift on already-
+          # published artifacts; the safer behavior is leave the
+          # published release untouched.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::notice::Release ${GITHUB_REF_NAME} already exists; skipping create+upload (assets already published, signatures preserved)"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "Yuzu ${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG} \
+              artifacts/yuzu-linux-x64.tar.gz \
+              artifacts/yuzu-gateway-linux-x64.tar.gz \
+              artifacts/yuzu-windows-x64.zip \
+              artifacts/YuzuAgentSetup-*.exe \
+              artifacts/YuzuServerSetup-*.exe \
+              artifacts/YuzuAgent-*.pkg \
+              artifacts/yuzu-macos-arm64.tar.gz \
+              artifacts/*.deb \
+              artifacts/*.rpm \
+              artifacts/*.cdx.json \
+              artifacts/*.spdx.json \
+              artifacts/*.intoto.jsonl \
+              artifacts/SHA256SUMS \
+              artifacts/SHA256SUMS.sigstore \
+              "${WIZARD_ASSET[@]}"
+          fi

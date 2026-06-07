@@ -21,50 +21,50 @@ The page is also the surface where **scope walking** (per `docs/scope-walking-de
 ## 2. Information architecture
 
 ```
-Dashboard ──────────────────────────────────────────────────────────────────
-│
-├─ Devices       (existing)
-├─ Inventory     (existing)
-├─ Instructions  (existing)
-├─ Policies      (existing)
-├─ TAR           (new — this page) ─────────────────────────────────────────┐
-│                                                                            │
-│  /tar                                                            │
-│  ┌────────────────────────────────────────────────────────────────────┐    │
-│  │  [Scope chip ▼]  windows-chrome-suspects · 2,798 devices · pinned │    │
-│  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-│  ┌─ Retention-paused sources (PR-A) ─────────────────────────────────┐    │
-│  │   device              source     paused since   live rows  oldest │    │
-│  │   prod-eu-1 (Linux)   process    2026-04-25      18,402   31d 4h  │    │
-│  │   prod-eu-1 (Linux)   tcp        2026-04-25       4,193   31d 4h  │    │
-│  │   ...                                                              │    │
-│  │   [Re-enable]  [Purge data]  [Export CSV]                          │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-│  ┌─ TAR SQL (PR-D, scope-walking-aware) ──────────────────────────────┐   │
-│  │   $TAR  > SELECT name, COUNT(*) FROM process_hourly GROUP BY name  │   │
-│  │   [Run scoped to: windows-chrome-suspects]                         │   │
-│  │                                                                     │   │
-│  │   results... (streamed)                                             │   │
-│  │   [Save as result set ▼ "chrome-procs"]                             │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│  ┌─ Process tree viewer (PR-H) ──────────────────────────────────────┐    │
-│  │   device: [pick from scope ▼]                                     │    │
-│  │                                                                    │    │
-│  │   1   systemd                                                      │    │
-│  │   ├── 234   sshd                                                   │    │
-│  │   │   └── 1402  bash (user=alice)                                  │    │
-│  │   │       └── 1419  python3 train.py  ← still running              │    │
-│  │   ├── 412   docker                                                 │    │
-│  │   │   ├── 998   containerd                                         │    │
-│  │   │   └── ...                                                      │    │
-│  │   ├── 814   yuzu-agent  (★ self)                                   │    │
-│  │   ...                                                              │    │
-│  │   Tree as observed since 2026-04-12 09:14 UTC (agent install)      │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-│                                                                            │
-├─ Settings      (existing)                                                  │
-└────────────────────────────────────────────────────────────────────────────┘
+ Dashboard ──────────────────────────────────────────────────────────────────
+ │
+ ├─ Devices       (existing)
+ ├─ Inventory     (existing)
+ ├─ Instructions  (existing)
+ ├─ Policies      (existing)
+ ├─ TAR           (new — this page) ──────────────────────────────────────────┐
+ │                                                                            │
+ │  /tar                                                                      │
+ │  ┌────────────────────────────────────────────────────────────────────┐    │
+ │  │  [Scope chip ▼]  windows-chrome-suspects · 2,798 devices · pinned  │    │
+ │  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
+ │  └────────────────────────────────────────────────────────────────────┘    │
+ │  ┌─ Retention-paused sources (PR-A) ──────────────────────────────────┐    │
+ │  │   device              source     paused since   live rows  oldest  │    │
+ │  │   prod-eu-1 (Linux)   process    2026-04-25      18,402   31d 4h   │    │
+ │  │   prod-eu-1 (Linux)   tcp        2026-04-25       4,193   31d 4h   │    │
+ │  │   ...                                                              │    │
+ │  │   [Re-enable]  [Purge data]  [Export CSV]                          │    │
+ │  └────────────────────────────────────────────────────────────────────┘    │
+ │  ┌─ TAR SQL (PR-D, scope-walking-aware) ──────────────────────────────┐    │
+ │  │   $TAR  > SELECT name, COUNT(*) FROM process_hourly GROUP BY name  │    │
+ │  │   [Run scoped to: windows-chrome-suspects]                         │    │
+ │  │                                                                    │    │
+ │  │   results... (streamed)                                            │    │
+ │  │   [Save as result set ▼ "chrome-procs"]                            │    │
+ │  └────────────────────────────────────────────────────────────────────┘    │
+ │  ┌─ Process tree viewer (PR-H) ───────────────────────────────────────┐    │
+ │  │   device: [pick from scope ▼]                                      │    │
+ │  │                                                                    │    │
+ │  │   1   systemd                                                      │    │
+ │  │   ├── 234   sshd                                                   │    │
+ │  │   │   └── 1402  bash (user=alice)                                  │    │
+ │  │   │       └── 1419  python3 train.py  ← still running              │    │
+ │  │   ├── 412   docker                                                 │    │
+ │  │   │   ├── 998   containerd                                         │    │
+ │  │   │   └── ...                                                      │    │
+ │  │   ├── 814   yuzu-agent  (★ self)                                   │    │
+ │  │   ...                                                              │    │
+ │  │   Tree as observed since 2026-04-12 09:14 UTC (agent install)      │    │
+ │  └────────────────────────────────────────────────────────────────────┘    │
+ │                                                                            │
+ ├─ Settings      (existing)                                                  │
+ └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 URL structure:
@@ -209,7 +209,7 @@ The reconstruction is O(events_in_window) per device. For a 30-day window on a 2
 | Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `tar.status` fleet-wide; same tier as run-instruction/tar-execute |
 | Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
 | Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
-| TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and is parameter-checked SELECT-only |
+| TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
 | Process tree view | `Infrastructure:Read` | With redaction pass |
 | Re-seed process tree | `Infrastructure:Update` | Dispatches `tar.process_tree` to one device |
@@ -234,7 +234,7 @@ Audit actions: `tar.status.scan` (operator-triggered Scan fleet — emitted by P
 - `docs/yuzu-guardian-design-v1.1.md` — agent tamper-resistance, foundational to the process tree's data quality claim
 - `docs/yuzu-guardian-windows-implementation-plan.md` — Windows-first hardening PR ladder
 - `agents/plugins/tar/src/tar_aggregator.cpp` — the #539 retention pause that the retention-paused list surfaces
-- `agents/plugins/tar/src/tar_plugin.cpp` — the action surface (`tar.status`, `tar.configure`, future `tar.process_tree`, `tar.purge_source`)
+- `agents/plugins/tar/src/tar_plugin.cpp` — the action surface (`tar.status`, `tar.configure`, `tar.fleet_snapshot`, future `tar.process_tree`, `tar.purge_source`)
 - `server/core/src/dashboard_routes.cpp` — the existing TAR SQL fragment to be relocated and extended
 - `docs/data-architecture.md` — error code taxonomy, audit envelope conventions
 - `docs/yaml-dsl-spec.md` — DSL surface (gains `fromResultSet:` per scope-walking-design §7)

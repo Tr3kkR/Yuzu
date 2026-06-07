@@ -3,6 +3,8 @@
 #include <yuzu/plugin.h>
 
 #include <array>
+#include <cstddef>
+#include <cstdint> // SIZE_MAX (sha256_file max_bytes default)
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -35,6 +37,20 @@ inline constexpr std::array<std::string_view, 3> kReservedPluginNames{
 /// (e.g. agent metrics) can match on this prefix to count rejections by
 /// category without re-parsing free-form text.
 inline constexpr std::string_view kReservedNameReason = "reserved plugin name";
+
+/// Maximum length of a plugin's self-declared name. Names are operator-visible
+/// identifiers used in logs, Prometheus label values, and the command-dispatch
+/// match; bounding them keeps log lines and label cardinality sane and stops a
+/// plugin from declaring a pathological multi-kilobyte name.
+inline constexpr std::size_t kMaxPluginNameLen = 64;
+
+/// Stable, fixed reason string recorded verbatim in LoadError::reason when a
+/// plugin is rejected because its declared name is empty, over-length, or
+/// contains a byte outside the identifier set [A-Za-z0-9_]. Unlike
+/// kReservedNameReason this carries no variable suffix — the offending name is
+/// deliberately NOT echoed, because a crafted name may carry newline or control
+/// bytes that would forge log lines / corrupt the error channel. See #822.
+inline constexpr std::string_view kInvalidNameReason = "invalid plugin name";
 
 /// Stable reason prefixes for code-signing rejections. The metric label
 /// derives from the prefix so operators can alert distinctly on
@@ -85,8 +101,51 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
     return false;
 }
 
-/// SHA-256 hash a file on disk. Returns lowercase hex or empty on failure.
-[[nodiscard]] std::string sha256_file(const std::filesystem::path& path);
+/// True if `name` is a well-formed plugin identifier: non-empty, at most
+/// kMaxPluginNameLen bytes, and composed solely of ASCII alphanumerics and the
+/// underscore. The character test is written out by hand rather than using
+/// std::isalnum — that function is locale-sensitive (so the verdict could
+/// differ between hosts) and is undefined behaviour for negative `char` values
+/// (high-bit bytes). This is constexpr and locale-independent, so the result is
+/// identical on every platform.
+///
+/// The loader enforces this on a plugin's self-declared name BEFORE any
+/// reserved-name or dispatch comparison so a crafted name (NUL-truncation,
+/// embedded control bytes, path/pipe/newline characters) can never diverge
+/// between the std::string_view security check here and a downstream C-string
+/// consumer of descriptor->name. Reserved names (e.g. "__guard__") are
+/// themselves valid identifiers — they pass this check and are then rejected
+/// by is_reserved_plugin_name. See #822.
+[[nodiscard]] constexpr bool is_valid_plugin_name(std::string_view name) noexcept {
+    if (name.empty() || name.size() > kMaxPluginNameLen) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Compile-time pins for the is_valid_plugin_name contract (#822). Reserved
+// names are themselves valid identifiers (they reach the reserved-name check
+// and are rejected there, not here); empty, charset-violating, and embedded-NUL
+// names are rejected.
+static_assert(is_valid_plugin_name("__guard__"));
+static_assert(is_valid_plugin_name("example_42"));
+static_assert(!is_valid_plugin_name(""));
+static_assert(!is_valid_plugin_name("bad name"));
+static_assert(!is_valid_plugin_name(std::string_view{"nul\0byte", 8}));
+
+/// SHA-256 hash a file on disk. Returns lowercase hex, or empty on failure OR if
+/// the file exceeds `max_bytes` (a bounded read — defends a hashing-DoS / TOCTOU
+/// grow on an attacker-controlled path, e.g. Guardian's file-hash-equals guard).
+/// Default SIZE_MAX = unbounded (existing trusted-plugin callers are unchanged).
+[[nodiscard]] std::string sha256_file(const std::filesystem::path& path,
+                                      std::size_t max_bytes = SIZE_MAX);
 
 /// Load a plugin allowlist file (one "sha256  filename" per line, like sha256sum output).
 /// Returns a map of filename -> expected hash. Empty map on failure or missing file.

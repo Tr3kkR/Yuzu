@@ -433,7 +433,7 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
 
     // Deliver to each matching webhook asynchronously on detached threads.
     // The counting semaphore limits concurrent deliveries to 10.
-    for (const auto& wh : matching) {
+    for ([[maybe_unused]] const auto& wh : matching) {
         std::thread([this, wh, event_type, payload_json]() {
             deliver_single(wh, event_type, payload_json);
         }).detach();

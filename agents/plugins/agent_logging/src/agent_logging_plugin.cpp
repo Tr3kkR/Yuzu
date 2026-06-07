@@ -44,7 +44,8 @@ YuzuPluginContext* g_ctx = nullptr;
  * Helper to read a config value via the raw plugin context.
  */
 std::string_view cfg(std::string_view key) {
-    if (!g_ctx) return {};
+    if (!g_ctx)
+        return {};
     const char* val = yuzu_ctx_get_config(g_ctx, std::string{key}.c_str());
     return val ? std::string_view{val} : std::string_view{};
 }
@@ -56,6 +57,16 @@ std::string_view cfg(std::string_view key) {
  *   3. Platform default paths
  */
 std::string get_log_file_path() {
+    // Every fs::exists below uses the noexcept (error_code) overload —
+    // the throwing form raises filesystem_error on EACCES (e.g. parent
+    // directory unreadable by the agent's effective user), and that
+    // exception propagates out of the command handler and crashes the
+    // whole agent process. Treat any stat failure as "log file not at
+    // this path" rather than fatal. (Observed 2026-05-12: macOS dev box,
+    // `/Library/Application Support/Yuzu/yuzu-agent.log` parent had
+    // restricted perms; do_get_log brought down the entire agent.)
+    std::error_code ec;
+
     // Try explicit log file config
     auto log_file = cfg("agent.log_file");
     if (!log_file.empty()) {
@@ -66,7 +77,7 @@ std::string get_log_file_path() {
     auto data_dir = cfg("agent.data_dir");
     if (!data_dir.empty()) {
         fs::path p = fs::path{std::string{data_dir}} / "yuzu-agent.log";
-        if (fs::exists(p)) {
+        if (fs::exists(p, ec)) {
             return p.string();
         }
     }
@@ -77,25 +88,30 @@ std::string get_log_file_path() {
     const char* prog_data = std::getenv("ProgramData");
     if (prog_data) {
         fs::path p = fs::path{prog_data} / "Yuzu" / "yuzu-agent.log";
-        if (fs::exists(p)) return p.string();
+        if (fs::exists(p, ec))
+            return p.string();
     }
 #elif defined(__APPLE__)
     {
         fs::path p = "/Library/Application Support/Yuzu/yuzu-agent.log";
-        if (fs::exists(p)) return p.string();
+        if (fs::exists(p, ec))
+            return p.string();
     }
     {
         fs::path p = "/var/log/yuzu/yuzu-agent.log";
-        if (fs::exists(p)) return p.string();
+        if (fs::exists(p, ec))
+            return p.string();
     }
 #else // Linux
     {
         fs::path p = "/var/log/yuzu/yuzu-agent.log";
-        if (fs::exists(p)) return p.string();
+        if (fs::exists(p, ec))
+            return p.string();
     }
     {
         fs::path p = "/opt/yuzu/yuzu-agent.log";
-        if (fs::exists(p)) return p.string();
+        if (fs::exists(p, ec))
+            return p.string();
     }
 #endif
 
@@ -110,7 +126,8 @@ std::string get_log_file_path() {
 std::deque<std::string> tail_file(const std::string& path, int count) {
     std::deque<std::string> lines;
     std::ifstream file(path);
-    if (!file.is_open()) return lines;
+    if (!file.is_open())
+        return lines;
 
     std::string line;
     while (std::getline(file, line)) {
@@ -131,12 +148,11 @@ std::string format_file_time(const fs::file_time_type& ft) {
     // clock_cast and file_clock::to_sys are not portable across all compilers,
     // so compute via relative offset from "now" in both clock domains.
     auto file_now = fs::file_time_type::clock::now();
-    auto sys_now  = std::chrono::system_clock::now();
-    auto diff     = ft - file_now;
-    auto sys_tp   = sys_now + diff;
-    auto epoch_s  = std::chrono::duration_cast<std::chrono::seconds>(
-                        sys_tp.time_since_epoch())
-                        .count();
+    auto sys_now = std::chrono::system_clock::now();
+    auto diff = ft - file_now;
+    auto sys_tp = sys_now + diff;
+    auto epoch_s =
+        std::chrono::duration_cast<std::chrono::seconds>(sys_tp.time_since_epoch()).count();
     return std::format("{}", epoch_s);
 }
 
@@ -145,10 +161,12 @@ std::string format_file_time(const fs::file_time_type& ft) {
  */
 void emit_file_info(yuzu::CommandContext& ctx, const fs::path& path) {
     std::error_code ec;
-    if (!fs::exists(path, ec) || ec) return;
+    if (!fs::exists(path, ec) || ec)
+        return;
 
     auto size = fs::file_size(path, ec);
-    if (ec) size = 0;
+    if (ec)
+        size = 0;
 
     auto mtime = fs::last_write_time(path, ec);
     std::string mtime_str = ec ? "0" : format_file_time(mtime);
@@ -161,10 +179,12 @@ void emit_file_info(yuzu::CommandContext& ctx, const fs::path& path) {
  */
 void scan_directory(yuzu::CommandContext& ctx, const fs::path& dir) {
     std::error_code ec;
-    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
+        return;
 
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        if (ec) break;
+        if (ec)
+            break;
         if (entry.is_regular_file()) {
             emit_file_info(ctx, entry.path());
         }
@@ -191,12 +211,9 @@ public:
         return {};
     }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        g_ctx = nullptr;
-    }
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override { g_ctx = nullptr; }
 
-    int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "get_log")
             return do_get_log(ctx, params);
         if (action == "get_key_files")
@@ -212,10 +229,11 @@ private:
         int lines = 50; // default
         auto lines_param = params.get("lines");
         if (!lines_param.empty()) {
-            auto [ptr, ec] = std::from_chars(
-                lines_param.data(), lines_param.data() + lines_param.size(), lines);
+            [[maybe_unused]] auto [ptr, ec] =
+                std::from_chars(lines_param.data(), lines_param.data() + lines_param.size(), lines);
             if (ec != std::errc{} || lines < 1) {
-                ctx.write_output("status|error|invalid lines parameter: must be a positive integer");
+                ctx.write_output(
+                    "status|error|invalid lines parameter: must be a positive integer");
                 return 1;
             }
         }
@@ -225,11 +243,15 @@ private:
             lines = 500;
         }
 
-        // Find log file
+        // Find log file. "No log file on this host" is not an error — it's
+        // a legitimate empty result (e.g. agent logging to stderr-only).
+        // Report it as status|empty with rc=0 so callers can distinguish
+        // empty-set from genuine failures.
         std::string log_path = get_log_file_path();
         if (log_path.empty()) {
-            ctx.write_output("status|error|agent log file not found");
-            return 1;
+            ctx.write_output("status|empty|agent log file not configured on this host");
+            ctx.write_output("line_count|0");
+            return 0;
         }
 
         ctx.write_output(std::format("log_file|{}", log_path));
@@ -267,7 +289,8 @@ private:
         // Just report the standard install path
         {
             fs::path p = "/usr/local/bin/yuzu-agent";
-            if (fs::exists(p)) {
+            std::error_code ec;
+            if (fs::exists(p, ec)) {
                 emit_file_info(ctx, p);
             }
         }

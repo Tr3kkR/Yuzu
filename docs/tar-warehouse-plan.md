@@ -232,9 +232,9 @@ Add `parameters` map to the existing signature so the SQL can be forwarded to th
 - `tests/unit/test_tar_sql_executor.cpp` -- SELECT-only validation, injection rejection, timeout
 
 ### Integration
-1. Build: `meson compile -C builddir`
-2. Unit tests: `meson test -C builddir --print-errorlogs`
-3. UAT: `bash scripts/linux-start-UAT.sh`
+1. Build: `meson compile -C build-linux`
+2. Unit tests: `meson test -C build-linux --print-errorlogs`
+3. UAT: `bash scripts/start-UAT.sh`
 4. Verify tables: `tar.sql` with `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_live'`
 5. After 60s collection: `tar.sql` with `SELECT * FROM $Process_Live LIMIT 10`
 6. After 15min rollup: `tar.sql` with `SELECT * FROM $Process_Hourly`

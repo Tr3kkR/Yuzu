@@ -47,6 +47,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
 | `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
 | `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
+| `--trusted-nat-cidr` | *(none)* | Comma-separated (or repeatable) CIDR ranges (IPv4 or IPv6) declaring a trusted NAT boundary for **direct-connect** agents. When an agent's Register and Subscribe source IPs *both* fall within one declared range, a per-session peer-IP mismatch is downgraded from a hard reject to an *advisory* (audit `result="ok" outcome=advisory`; counted on `yuzu_grpc_subscribe_peer_advisory_total`) instead of rejecting the stream. Strict exact-match is the default when absent; mismatches outside every declared range still reject (the stolen-session guard stays intact). Use for fleets behind multi-egress NAT, proxy pools, CG-NAT, or SD-WAN where an agent may egress from different public IPs on its two connections. **Security note:** declaring a range asserts the hosts in it are mutually trusted not to replay each other's sessions; keep ranges as narrow as possible (never `0.0.0.0/0`). Malformed entries are logged and ignored at startup. Env: `YUZU_TRUSTED_NAT_CIDR`. |
+| `--nat-trust-mtls-identity` | off | Also downgrade a peer-IP mismatch to advisory when the Subscribe mTLS client identity matches the identity bound at Register (#1128). **SAFE ONLY WITH PER-AGENT CLIENT CERTIFICATES.** With a shared/fleet-wide client cert every identity "matches", turning this into a session-replay bypass (an insider agent could hijack another agent's session from its own IP). Off by default; enable only if each agent presents a unique client certificate. When both `--nat-trust-mtls-identity` and `--trusted-nat-cidr` are configured, mTLS-identity match takes precedence: a session whose mTLS identity matches records `reason=mtls_identity_match` (visible on the audit `detail` and the `yuzu_grpc_subscribe_peer_advisory_total{reason=...}` label), and CIDR containment is not consulted for that session. Enabling the flag emits a `warn`-level startup line — confirm it appears in the boot log so the operator who pulled the lever can sign off on the per-agent-cert posture. Env: `YUZU_NAT_TRUST_MTLS_IDENTITY`. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -63,6 +65,14 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
+| `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
+| `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
+| `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 11 high-risk REST + Settings endpoints (PR2 of the MFA ladder) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
+| `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
 
@@ -150,6 +160,12 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
+
+Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
+
+MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
+
 ### v0.10.0 — API token revocation is owner-scoped
 
 Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
@@ -173,6 +189,68 @@ The new `/tar` dashboard page (issue #547) surfaces every device × source pair 
 
 **Audit log additions.** Two new audit actions emit on operator activity: `tar.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `tar.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
 
+### vNEXT — Fleet visualization (3D) (`/viz/fleet`)
+
+The fleet-visualization feature ladder lands across the `feat/viz-engine` branch. PRs 1–12 are shipped: agent collector + server store + REST/fragment routes + page scaffold + camera controls + cube renderer + Sprite labels + hover tooltip + interior process nodes coloured by category + intra-cube localhost edges + per-cube listening-socket spheres + cross-machine connection edges + push-based topology ingestion + **three-tier stacked layout, talking-socket dots, curved tube wires, loopback-bind filter (PR 12)**. Remaining ladder PRs add the vulnerability overlay and final polish (LOD, edge bundling, a11y, perf).
+
+**Operator-visible state today (PRs 1–12).** Navigating to `/viz/fleet` shows one translucent cube per fleet machine, **organized into three architectural tiers** — frontend cubes on the top Y plane, applications in the middle plane, databases on the bottom plane. Within each tier, machines fall onto a deterministic per-tier grid (FNV-1a hash on `agent_id`). Live agents render at opacity `0.18`; stale agents (no `tar.fleet_snapshot` push within the staleness threshold) drop to `0.08`. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`. Hostname `Sprite` labels render below each cube. Inside each cube, one `SphereGeometry` dot per process is laid out deterministically (`hash(pid|ppid)`-mod-bucket inside the cube's interior) and coloured from a six-category palette: system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`, runtime `#bc8cff`, other `#8b949e`. Each cube's TOP face carries a ring of cream-coloured listening-socket spheres (one per `listeners[]` row) with `:port` labels; **loopback-only listeners (`127.x`, `::1`) are now hidden from the surface** — they aren't reachable from other instances. Each cube's BOTTOM face carries a ring of cool-blue **talking-socket** dots (one per unique outbound `(proto, dst_ip, dst_port)`). **Cross-machine connections render as thick curved tubes** (`THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents) that drop from the source's talking dot down/across to the destination's listener sphere. External (off-fleet) destinations render as short grey stub lines with ring markers. Hover order: listener sockets → talking sockets → process dots → edges → cubes. WASD pans, drag rotates, wheel zooms.
+
+**Tier classification heuristic.** `classifyTier` reads `listeners[]` port hints (`DB_PORTS = {3306, 5432, 6379, 27017, 1521, 1433, 9042, 9200, 5984, 8086, 11211}` / `WEB_PORTS = {80, 443, 8080, 8443, 8088}`) plus process-category strings (`'database'`, `'web'`). Priority is **db > web > app**: a host with any DB signal lands on the database tier regardless of whether it also serves web traffic. A host with no DB or web signal defaults to the application tier. **Known limitations:** (a) databases on non-standard ports (e.g. Postgres on 5431 for a sharded cluster) fall through to the application tier unless one of the host's processes is classified as `database` by `process_category.hpp`; (b) `WEB_PORTS` is intentionally narrow — it covers reverse proxies / load balancers / API gateways on ports 80/443/8080/8443/8088 but **not** dev-server defaults (3000/4200/5173/8000), because in a classic three-tier deployment a nodejs/django/vite server listening on those ports is application work, not the front edge. There is no operator-accessible override today; both limitations are tracked as a follow-up issue on function-aware tier classification.
+
+**Why empty cubes show no lines.** Intra-cube edges appear only for processes with *active* loopback socket pairs (e.g. Prometheus scraping node_exporter, a client connected to a local Redis / Postgres). A fresh agent with no inter-process loopback traffic shows process dots but no lines — this is expected, not a bug. Lines appear as workloads generate loopback flows.
+
+**Browser requirements.** The page uses ES module imports resolved through an `<script type="importmap">` declaration. importmap is supported in Chrome 89+, Firefox 108+, Safari 16.4+, and Edge 89+ (all browsers shipped after early 2023). Older browsers receive a visible error overlay on the page rather than a blank canvas — the page detects via `HTMLScriptElement.supports('importmap')` before attempting the module load. **`MeshPhysicalMaterial` cubes additionally require WebGL 2.0**, which is bundled with all browsers in the import-map support floor but can be disabled by enterprise group policy on locked-down terminals. Browsers without WebGL 2 will see the grid but the cubes will fail to render with a black or missing material; verify WebGL 2 is enabled in browser policy before pilot rollout. Operators on enterprise-locked browser configurations that lag 2+ years should test on a representative deployment. **Page weight:** the `/viz/fleet` route pulls three.js (~685 KB), three-orbit (~32 KB), htmx (~51 KB), the yuzu-viz renderer (~84 KB), plus the design-system CSS. Approximate first-load total is ~1.5 MB of JS (uncompressed). For metered-link or low-bandwidth deployments, consider `--viz-disable` as a default and enabling it selectively for ops staff.
+
+**Reverse-proxy deployment constraint.** The page hard-codes static asset paths (`/static/three.module.min.js`, `/static/three-orbit-controls.js`, `/static/yuzu-viz.js`) and the API path (`/api/v1/viz/fleet/topology`). Sub-path proxy deployments (e.g. nginx `location /yuzu/`) are NOT supported — the absolute paths would 404 against the rewritten origin. Mount Yuzu at the root path of its host or a fronting domain.
+
+**Cache posture.** The `/viz/fleet` page response sets `Cache-Control: no-cache, no-store, must-revalidate` so a server upgrade cannot leave operators with a stale page that references the new vendored assets (which themselves cache for 24 hours via `max-age=86400`). The vendored asset bundles are content-addressed by server binary version — a fresh page revalidation after upgrade picks up any bundle changes immediately.
+
+**Kill switch behaviour.** `--viz-disable` / `YUZU_VIZ_DISABLE` disables the **whole feature**: the REST/fragment endpoints, the per-host drill-down routes, **and** the `/viz/fleet` and `/viz/host/<id>` page shells all return `503` (a plain-text "fleet visualization is disabled by an administrator" body). An operator who sets the flag will not see a half-working page. The static asset routes (`/static/yuzu-viz.js` etc.) are not gated — they are inert without the page — so gating them at a reverse proxy is optional, not required. The kill switch is **boot-time only** (seeded from config at startup); there is no runtime toggle, so disabling viz under a live incident requires a server restart.
+
+**Sizing and capacity.** Push-based ingestion holds one `RawAgentSnapshot` per agent in an in-memory `pushed_` map. Per-agent footprint is bounded by the parser caps (4096 processes + 4096 connections per snapshot, ~1–2 MB worst case, typically 5–20 KB). The map is hard-capped at **100 000 agents** (`kPushedMapHardCap`); at the cap, a new agent's push evicts the least-recently-seen entry (LRU by server receipt time) and emits a `topology.push.evicted_for_cap` audit event. Watch `yuzu_viz_pushed_map_size` and alert before it approaches the cap. The store is **in-memory only** — on server restart it is empty until agents re-push (recovery window ≈ one agent push cycle, ~30–60 s); the pull-based dispatch fetcher serves as the cold-start fallback during that window.
+
+**Permission model.** The page route is auth-gated only (`require_auth`); the data fetch at `GET /api/v1/viz/fleet/topology` enforces `Response:Read`. An operator with a session but without `Response:Read` can land on the page (sees the grid and the "Access denied" overlay when the JS fetch fires) but every JSON fetch returns 403. The `viz.fleet_topology` audit row is emitted on the API path, not the page path — auditors querying "who accessed fleet visualization?" should filter on the `FleetTopology` `target_type` (covered in detail in `audit-log.md`).
+
+**Browser-side errors are not server-logged.** WebGL context loss, module-fetch 503, and importmap-resolution failures surface only in the operator's browser console. A future polish PR will add a client-error beacon; today, support engineers diagnosing "viz is blank" reports should ask for a screenshot of the browser console.
+
+**Per-host drill-down (`/viz/host/<agent_id>`).** Double-clicking a cube
+opens a new tab with a 2D bipartite IPC graph (processes + sockets,
+Cytoscape `cose` layout) above the existing TAR process tree, with
+cross-pane select-to-highlight and a resizable splitter. The page route
+is auth-gated only; the data fetch (`GET /api/v1/viz/host/<agent_id>/topology`)
+enforces `Response:Read` and honours the `--viz-disable` kill switch.
+Audit rows are emitted as `viz.host_topology` (`target_type = HostTopology`).
+The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
+templating; any other character returns `400`.
+
+**Connection window — `fleet_snapshot_window_seconds` (TAR plugin config).**
+`tar.fleet_snapshot` reports not only the connections ESTABLISHED at the
+exact `/proc` sample instant but also connections TAR observed recently
+in its `tcp_live` warehouse, so short-lived flows still reach the viz.
+The look-back window is operator-tunable via the TAR plugin's KV config
+key `fleet_snapshot_window_seconds` (default `3600`). It is a TAR plugin
+config key, not a server CLI flag — set it through the TAR plugin's
+configuration surface. The 60 s sampler still cannot see sub-interval
+connections; that needs kernel eventing (tracked separately).
+
+### vNEXT — Agent interval triggers now functional
+
+`yuzu_register_trigger` / `yuzu_unregister_trigger` were previously no-op
+stubs — no `TriggerEngine` was instantiated on the agent, so interval
+triggers were silently discarded and never fired. As a result the TAR
+warehouse `*_live` tables (`tcp_live` and friends) sat permanently empty
+in the field, and any plugin that registered an interval trigger had it
+silently dropped.
+
+**Upgrade caveat.** After upgrading the **agent** daemon, registered
+interval triggers begin firing for the first time. On the first
+`collect_fast` cycle (default 60 s) the TAR `*_live` tables start
+populating, and operators may see a small increase in per-agent CPU/IO
+proportional to the number of registered triggers. Any plugin that
+registered an interval trigger expecting the old no-op behaviour will now
+have that trigger fire — this is the fix, not a regression. Server-only
+upgrades are unaffected; the change is entirely agent-side.
+
 ### vNEXT — Plugin code signing (#80)
 
 Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).
@@ -188,6 +266,48 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 **Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
+
+### vNEXT — Response templates (#254, Phase 8.2)
+
+Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
+
+**Schema migration.** `instruction_definitions` gains one column: `response_templates_spec TEXT NOT NULL DEFAULT '[]'`. The migration ledger advances from v2 to v3. `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.
+
+**Pre-upgrade snapshot (recommended).** Take a backup of the InstructionStore database before upgrade:
+
+```bash
+cp /var/lib/yuzu/instructions.db /var/lib/yuzu/instructions.db.bak
+# or, for a hot-running server, use SQLite's online backup:
+sqlite3 /var/lib/yuzu/instructions.db ".backup /var/lib/yuzu/instructions.db.bak"
+```
+
+**Post-upgrade validation.**
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT version FROM schema_meta WHERE store='instruction_store';"
+# expected output: 3
+```
+
+If the value is `2` instead of `3`, the migration did not run — check the server logs for `MigrationRunner: instruction_store migrated to v3` (or for a `probe-and-stamp failed` line in the InstructionStore section).
+
+**Boot wedge recovery.** A corrupt schema_meta row or a pre-existing `response_templates_spec` column with a missing schema_meta v3 stamp will trip the probe-and-stamp guard, which fails closed (server logs `InstructionStore: probe-and-stamp failed; closing database`). To recover, restore the snapshot or apply the column manually:
+
+```bash
+# Stop the server first.
+systemctl stop yuzu-server
+
+sqlite3 /var/lib/yuzu/instructions.db \
+  "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec TEXT NOT NULL DEFAULT '[]';"
+sqlite3 /var/lib/yuzu/instructions.db \
+  "INSERT OR REPLACE INTO schema_meta (store, version, upgraded_at) VALUES ('instruction_store', 3, strftime('%s','now'));"
+
+systemctl start yuzu-server
+```
+
+**New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
+
+**Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
 
 ---
 
@@ -205,6 +325,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts. |
+| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
@@ -411,6 +532,60 @@ The server emits an audit event on every branch:
 > until the process is restarted against its on-disk config. To remove
 > the account you are signed in as, first create a second admin, log
 > out, log in as the second admin, and delete the original.
+
+---
+
+### Force-logging out a user (incident response)
+
+Use this when an account credential is suspected of compromise but the
+account itself should remain functional (the user reports a stolen
+laptop but still needs to keep working from a clean device, or a
+short-lived contractor's badge is being rotated).
+
+1. Navigate to **Settings > User Management**.
+2. Click **Revoke sessions** next to the target user.
+3. Confirm the blast-radius warning. The user's active dashboard
+   sessions end immediately; their account remains intact and they
+   can re-authenticate normally.
+
+The audit log records `session.revoke_all` with `target_id=<username>`,
+`target_type=User`, and `detail=count=<N>` where N is the number of
+in-memory cookie sessions wiped. The action is also surfaced on the
+`yuzu_auth_sessions_revoked_total{caller="admin",scope="cookies"}`
+Prometheus counter — a sustained spike there is the operator's
+automated alert for either a real incident response in progress or
+a misbehaving automation script.
+
+> **API tokens are not revoked by this flow.** Use it for a leaked
+> session cookie. If the user's API tokens are also implicated, either
+> revoke them individually via Settings → API Tokens or instruct the
+> user to click **Sign out everywhere** themselves (see below), which
+> revokes both cookies and tokens.
+
+> **Verify persistence after a partial failure.** If the response body
+> reports `db_persisted: false` (or the audit row shows `result=partial`
+> with `db_error=true`), the in-memory wipe succeeded but the
+> persisted `auth.db` rows survive. A server restart will resurrect
+> those sessions. Either retry the revoke after the DB lock clears, or
+> see `docs/ops-runbooks/auth-db-recovery.md` for emergency manual
+> revocation via the SQLite CLI.
+
+### Self-service "Sign out everywhere"
+
+Any user — not just admins — can wipe every credential bearing their
+identity by clicking the **Sign out everywhere** button on their own
+row in Settings → Users. Unlike the admin **Revoke sessions** button,
+this revokes BOTH cookie sessions AND every API token the user owns
+(the lost-laptop scenario must kill every credential, not just
+browser cookies). After the request the page redirects to `/login`
+and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
+
+> **MCP-tier and service-scoped tokens cannot self-revoke.** Those
+> credential classes have no other write privilege; accepting a
+> self-revoke from one would create a novel DoS surface against the
+> human owner. The endpoint returns 403 and the audit row records
+> `session.revoke_all.self` with `result=denied`. Use the dashboard
+> from a password-authenticated session.
 
 ---
 
@@ -769,6 +944,30 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 
 ---
 
+## File Logging
+
+Yuzu writes logs to stdout by default. File logging is opt-in via `--log-file`, with a best-effort fallback at the platform default path (`/var/log/yuzu/server.log` on Linux, `C:\ProgramData\Yuzu\logs\server.log` on Windows, `~/Library/Logs/Yuzu/server.log` on macOS).
+
+| Path | Behaviour | Failure mode |
+|---|---|---|
+| `--log-file <path>` (explicit) | Writes to `<path>` in addition to stdout. | If the file/directory cannot be opened, server logs an ERROR and continues without file logging. |
+| Platform default path (implicit) | Writes to the platform default path if it exists and is writable. | If the directory cannot be created or the file cannot be opened, server logs a single INFO line and continues without file logging. The default fallback is best-effort observability, not load-bearing. |
+
+The Docker server image pre-creates `/var/log/yuzu` (mode 0750, owned by the `yuzu` user) so the implicit default path works out of the box. When mounting an external host volume at `/var/log/yuzu`, ensure the host directory is owned by the same UID as the in-container `yuzu` user (verify with `docker exec yuzu-server id yuzu`); a wrong-ownership mount silently degrades to stdout-only logging.
+
+## Health Endpoints
+
+Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and monitoring integrations. All four are unauthenticated and exempt from the API rate limiter.
+
+| Path | Use case | Body | Draining-aware |
+|---|---|---|---|
+| `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200) or `{"status":"draining"}` (503) | **Yes** |
+| `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
+| `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
+
+**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches.
+
 ## Deployment
 
 Yuzu provides multiple deployment options: Docker Compose for quick setup, systemd units for bare-metal Linux, and a development stack script for local testing.
@@ -787,6 +986,7 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 | `deploy/docker/docker-compose.reference.yml` | Copyable deployment template — pulls pinned ghcr.io images, uses a named `server-data` volume, carries inline TLS hardening + backup + rollback commentary. Requires operator hardening (TLS, bind address) before production use. |
 | `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
 | `docker-compose.uat.yml` | Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse) |
+| `deploy/docker/docker-compose.demo.yml` | Chiselled (FROM scratch) Ubuntu 26.04 sales-demo stack — server + gateway + N agent replicas, release-pinned. Entry point `scripts/start-demo.sh`; see `docs/demo-environment.md`. Not for production (runs `--no-tls` with a baked admin password). |
 
 **Usage:**
 
@@ -839,8 +1039,8 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 
 ```bash
 # Copy binaries
-sudo cp builddir/yuzu-server /usr/local/bin/
-sudo cp builddir/yuzu-agent /usr/local/bin/
+sudo cp build-linux/server/core/yuzu-server /usr/local/bin/
+sudo cp build-linux/agents/core/yuzu-agent /usr/local/bin/
 
 # Create service user
 sudo useradd --system --no-create-home yuzu

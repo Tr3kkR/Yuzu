@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace yuzu::server::auth {
 class AuthManager;
@@ -14,7 +15,7 @@ namespace yuzu::server {
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
-    std::string web_address{"127.0.0.1"};             // HTMX web UI bind address
+    std::string web_address{"127.0.0.1"};            // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
     bool tls_enabled{true};
@@ -51,6 +52,22 @@ struct Config {
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
 
+    // #1128: operator-declared multi-egress NAT/proxy ranges. When a direct-
+    // connect agent's Register and Subscribe present different source IPs that
+    // BOTH fall inside one of these CIDRs, the per-session peer-IP mismatch is
+    // downgraded to advisory (audit + metric) instead of rejected. Empty = the
+    // strict exact-match binding (default, no relaxation).
+    std::vector<std::string> trusted_nat_cidrs;
+
+    // #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. When
+    // true, a peer-IP mismatch is also downgraded to advisory if the Subscribe
+    // mTLS identity matches the one bound at Register. SAFE ONLY WITH PER-AGENT
+    // CLIENT CERTS — a shared/fleet-wide cert makes every identity "match",
+    // which would let an insider replay another agent's session from its own IP
+    // (the IP guard is waived). Default false: identity-match never relaxes the
+    // IP binding unless the operator affirms per-agent certs via this flag.
+    bool nat_trust_mtls_identity{false};
+
     // NVD CVE feed
     std::string nvd_api_key; // Optional NVD API key for higher rate limits
     std::string nvd_proxy;   // HTTP proxy for NVD API (e.g. "http://proxy:8080")
@@ -79,7 +96,8 @@ struct Config {
     std::string oidc_client_secret; // Client secret (required for Entra web platform)
     std::string oidc_redirect_uri;  // Callback URL (auto-computed from web port if empty)
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
-    bool oidc_skip_tls_verify{false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    bool oidc_skip_tls_verify{
+        false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
 
     // Response persistence
     int response_retention_days{90};
@@ -115,9 +133,52 @@ struct Config {
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
 
+    // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
+    // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-
+    // service enrollment, no enforcement at login). PR3 wires admin-only /
+    // required by gating /login against users.mfa_enrolled_at.
+    std::string mfa_enforcement{"optional"}; // "optional" | "admin-only" | "required"
+    /// How long after a successful MFA proof (login or step-up) high-risk
+    /// endpoints accept the session as "stepped up" without re-prompting.
+    /// Default 300 s mirrors common bank/SaaS UX. Lowering to <60 s pushes
+    /// every privileged click through TOTP; raising to >900 s weakens
+    /// the CC6.6 evidence chain.
+    int mfa_step_up_window_secs{300};
+    /// How long the intermediate "mfa_pending" token is valid (window
+    /// between password success and TOTP submission). Default 120 s.
+    int mfa_login_pending_secs{120};
+
     // MCP (Model Context Protocol) server
-    bool mcp_disable{false};    // Kill switch: reject all MCP requests
-    bool mcp_read_only{false};  // Restrict MCP to read-only tools only
+    bool mcp_disable{false};   // Kill switch: reject all MCP requests
+    bool mcp_read_only{false}; // Restrict MCP to read-only tools only
+
+    // Fleet visualization (PR 3 of feat/viz-engine ladder)
+    bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
+
+    // Product pack signature enforcement (#802 / W7.4)
+    /// When true, install_pack accepts packs WITHOUT a `signature` field
+    /// (legacy unsigned packs). Default false — the secure posture rejects
+    /// unsigned packs to close the fleet-wide arbitrary-code-execution
+    /// surface a MITM or unprivileged-uploader could otherwise exploit.
+    /// Wired via --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1.
+    /// Setting true at startup emits the `server.unsigned_packs_allowed`
+    /// audit event + a startup spdlog::warn so the relaxed posture is
+    /// loud in both audit log and operator-visible logs.
+    bool allow_unsigned_packs{false};
+
+    // Instruction-definition signature enforcement (#1073 / W7.4 sibling-gap)
+    /// When true, `InstructionStore::import_definition_json` accepts
+    /// definitions WITHOUT a `signature` field (legacy unsigned imports).
+    /// Default false — the secure posture rejects unsigned imports to close
+    /// the equivalent fleet-wide arbitrary-code-execution surface that #802
+    /// closed for ProductPack: an operator with `InstructionDefinition:Write`
+    /// can otherwise publish an arbitrary definition (carrying a plugin
+    /// invocation) that executes on every targeted agent. Wired via
+    /// --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1.
+    /// Setting true at startup emits the `server.unsigned_definitions_allowed`
+    /// audit event + a startup spdlog::warn — exact parity with
+    /// `--allow-unsigned-packs`.
+    bool allow_unsigned_definitions{false};
 };
 
 /**

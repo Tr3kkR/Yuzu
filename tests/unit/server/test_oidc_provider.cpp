@@ -118,6 +118,85 @@ TEST_CASE("OIDC: parse valid ID token", "[oidc]") {
     CHECK(result->iat == 1700000000);
 }
 
+TEST_CASE("OIDC: parse ID token with amr array (PR3)", "[oidc][amr]") {
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "amr": ["pwd", "mfa"]
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    REQUIRE(result->amr.size() == 2);
+    CHECK(result->amr[0] == "pwd");
+    CHECK(result->amr[1] == "mfa");
+}
+
+TEST_CASE("OIDC: parse ID token with amr as a lone string (non-conformant IdP)", "[oidc][amr]") {
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "amr": "mfa"
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    REQUIRE(result->amr.size() == 1);
+    CHECK(result->amr[0] == "mfa");
+}
+
+TEST_CASE("OIDC: amr absent leaves the vector empty", "[oidc][amr]") {
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->amr.empty());
+}
+
+TEST_CASE("OIDC: malformed iat/exp/sub do not throw (sec-M1 type-guard)", "[oidc][amr]") {
+    // A signature-valid token whose iat is a JSON string, or sub is a
+    // number, must NOT throw an uncaught nlohmann type_error out of
+    // parse_id_token (PR3 makes iat load-bearing → a throw would 500 the
+    // /auth/callback). Type-guarded extraction leaves the bad field at its
+    // default instead.
+    auto jwt = make_test_jwt(R"({
+        "sub": 12345,
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": "not-a-number",
+        "iat": "also-not-a-number",
+        "amr": ["mfa"]
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value()); // did not throw
+    CHECK(result->sub.empty());  // numeric sub → guarded out
+    CHECK(result->iat == 0);     // string iat → left at default
+    CHECK(result->exp == 0);
+    REQUIRE(result->amr.size() == 1); // valid claims still parsed
+    CHECK(result->amr[0] == "mfa");
+}
+
+TEST_CASE("OIDC: float-encoded iat is accepted (sec-M1)", "[oidc][amr]") {
+    // Some IdPs emit iat as 1700000000.0. The double-cast extraction keeps
+    // it usable instead of throwing on get<int64_t>().
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "iat": 1700000000.0
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->iat == 1700000000);
+}
+
 TEST_CASE("OIDC: parse ID token with aud as array", "[oidc]") {
     auto jwt = make_test_jwt(R"({
         "sub": "user123",
@@ -168,6 +247,112 @@ TEST_CASE("OIDC: validate_claims — valid", "[oidc]") {
 
     auto result = provider.validate_claims(claims, "test-nonce");
     CHECK(result.has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — missing exp is rejected (Gate 8)", "[oidc]") {
+    // OIDC Core requires exp. A token with no exp (claims.exp left at 0 by
+    // the parser, e.g. missing or non-numeric) must be rejected, not
+    // treated as never-expiring.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "test-nonce";
+    claims.exp = 0; // missing/invalid
+
+    auto result = provider.validate_claims(claims, "test-nonce");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("exp") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — future iat is rejected (Hermes A1)", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now + 7200; // 2h in the future, well past clock skew
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("future") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — iat within clock-skew window is accepted (UP-D4)",
+          "[oidc][amr]") {
+    // The future-iat rejection uses a generous 300 s skew so honest IdP/
+    // server NTP drift does not cause a total SSO outage. A token issued
+    // ~a minute "ahead" must still be accepted.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now + 120; // 2 min ahead — within the 300 s tolerance
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — nbf in the past is accepted", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now;
+    claims.nbf = now - 60; // already valid
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — nbf in the future is rejected (Hermes A3)", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now;
+    claims.nbf = now + 1800; // not valid for another 30 min
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nbf") != std::string::npos);
 }
 
 TEST_CASE("OIDC: validate_claims — wrong issuer", "[oidc]") {

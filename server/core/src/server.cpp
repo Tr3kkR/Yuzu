@@ -40,21 +40,35 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "baseline_store.hpp"
+#include "guardian_push_builder.hpp"
+#include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_matcher.hpp"
+#include "result_set_store.hpp"
+#include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "guardian_routes.hpp"
+#include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
+#include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
+#include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
+#include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "viz_routes.hpp"
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
@@ -64,6 +78,7 @@
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
+#include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
@@ -74,6 +89,7 @@
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "cidr_match.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -85,30 +101,27 @@
 // CPPHTTPLIB_VERSION_NUM changed from int to string in v0.37+, so we detect via
 // the presence of the Request::form member instead of a preprocessor version check.
 #if __has_include(<httplib.h>)
-  // httplib 0.18+ has req.form.has_file(); older versions have req.has_file().
-  // We detect at compile time: if Request::form exists, use the new API.
-  namespace yuzu::detail {
-    template<typename T, typename = void>
-    struct has_form_member : std::false_type {};
-    template<typename T>
-    struct has_form_member<T, std::void_t<decltype(std::declval<T>().form)>> : std::true_type {};
-  }
-  template<typename Req>
-  bool yuzu_req_has_file(const Req& req, const std::string& name) {
-      if constexpr (yuzu::detail::has_form_member<Req>::value)
-          return req.form.has_file(name);
-      else
-          return req.has_file(name);
-  }
-  template<typename Req>
-  auto yuzu_req_get_file(const Req& req, const std::string& name) {
-      if constexpr (yuzu::detail::has_form_member<Req>::value)
-          return req.form.get_file(name);
-      else
-          return req.get_file_value(name);
-  }
-  #define YUZU_REQ_HAS_FILE(req, name)  yuzu_req_has_file(req, name)
-  #define YUZU_REQ_GET_FILE(req, name)  yuzu_req_get_file(req, name)
+// httplib 0.18+ has req.form.has_file(); older versions have req.has_file().
+// We detect at compile time: if Request::form exists, use the new API.
+namespace yuzu::detail {
+template <typename T, typename = void> struct has_form_member : std::false_type {};
+template <typename T>
+struct has_form_member<T, std::void_t<decltype(std::declval<T>().form)>> : std::true_type {};
+} // namespace yuzu::detail
+template <typename Req> bool yuzu_req_has_file(const Req& req, const std::string& name) {
+    if constexpr (yuzu::detail::has_form_member<Req>::value)
+        return req.form.has_file(name);
+    else
+        return req.has_file(name);
+}
+template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string& name) {
+    if constexpr (yuzu::detail::has_form_member<Req>::value)
+        return req.form.get_file(name);
+    else
+        return req.get_file_value(name);
+}
+#define YUZU_REQ_HAS_FILE(req, name) yuzu_req_has_file(req, name)
+#define YUZU_REQ_GET_FILE(req, name) yuzu_req_get_file(req, name)
 #endif
 
 #include <nlohmann/json.hpp>
@@ -154,6 +167,8 @@ extern const char* const kSettingsHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kTarPageHtml;
+extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
+extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
@@ -162,13 +177,22 @@ extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
 namespace yuzu::server {
-extern const std::string kYuzuCss;       // server/core/static/yuzu.css (build-time embed)
+extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
-extern const std::string kEChartsJs;     // server/core/vendor/echarts.min.js (Apache-2.0)
-extern const std::string_view kInterVariableWoff2;  // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
-extern const std::vector<std::string> kBundledDefinitions;  // build-time embed of content/definitions/
-extern const std::vector<std::string> kBundledSets;         // build-time embed of content/packs/*sets*
-}  // namespace yuzu::server
+extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
+extern const std::string kThreeJs;   // server/core/vendor/three.module.min.js (MIT, three.js r168)
+extern const std::string
+    kThreeOrbitControlsJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
+extern const std::string
+    kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
+extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
+extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
+extern const std::string_view
+    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
+extern const std::vector<std::string>
+    kBundledDefinitions;                            // build-time embed of content/definitions/
+extern const std::vector<std::string> kBundledSets; // build-time embed of content/packs/*sets*
+} // namespace yuzu::server
 
 namespace yuzu::server {
 
@@ -190,7 +214,6 @@ namespace detail {
 }
 } // namespace detail
 
-
 // -- ServerImpl ---------------------------------------------------------------
 
 class ServerImpl final : public Server {
@@ -200,8 +223,7 @@ public:
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_, cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
                          auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode),
-          api_rate_limiter_(cfg_.rate_limit),
-          login_rate_limiter_(cfg_.login_rate_limit) {
+          api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
@@ -229,9 +251,9 @@ public:
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
-                         "Total number of management groups", "gauge");
+                          "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
-                         "Total members across all management groups", "gauge");
+                          "Total members across all management groups", "gauge");
         metrics_.describe("yuzu_heartbeats_received_total", "Total heartbeats received from agents",
                           "counter");
         metrics_.describe("yuzu_server_cert_reloads_total",
@@ -239,21 +261,118 @@ public:
         metrics_.describe("yuzu_server_cert_reload_failures_total",
                           "Total failed certificate hot-reload attempts", "gauge");
         metrics_.describe("yuzu_server_token_cache_hits_total",
-                          "API token validate_token calls served from in-memory cache",
-                          "counter");
+                          "API token validate_token calls served from in-memory cache", "counter");
         metrics_.describe("yuzu_server_token_cache_misses_total",
-                          "API token validate_token calls that fell through to SQLite",
-                          "counter");
+                          "API token validate_token calls that fell through to SQLite", "counter");
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
+        // absent/expired/not-owned set at dispatch. Audit rows are not
+        // Prometheus-alertable; this counter makes the failure mode (silent
+        // under-scope to zero targets) visible to an on-call SRE.
+        metrics_.describe("yuzu_scope_resolution_failed_total",
+                          "from_result_set: scope references that failed owner-checked "
+                          "resolution at dispatch (set absent, expired, or not owned)",
+                          "counter");
         // Audit-pipeline observability (governance PR4 OBS-4). Increments when
         // audit_store->add_event()'s SQLite step does not return DONE — pages
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
-                          "Audit events that failed to persist (sqlite3_step != DONE)",
+                          "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
+        // Increments in the token-create handlers (api_token, device_token)
+        // when `secure_random::fill_random` returns prng_failure (entropy
+        // exhaustion). Operators wire a Prometheus rule like
+        //   rate(yuzu_secure_random_failure_total[5m]) > 0
+        // to page on-call short of grepping audit logs.
+        metrics_.describe("yuzu_secure_random_failure_total",
+                          "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
+                          "issuance, labelled by reason and call site",
+                          "counter");
+        // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
+        // Three high-signal variants each get their own counter so SRE
+        // can alert directly without a labels selector. The remaining
+        // variants bucket under yuzu_device_token_rejected_total{variant=...}
+        // so they're still visible without flooding paging surface.
+        // Alert recipes:
+        //   rate(yuzu_device_token_binding_mismatch_total[5m]) > 0
+        //     — stolen-token impersonation attempt in progress (#826)
+        //   rate(yuzu_device_token_unbound_legacy_total[5m]) > 0
+        //     — legacy any-device token is being presented; rotate
+        //   rate(yuzu_device_token_revoked_attempt_total[5m]) > 0
+        //     — revoked token replay; investigate originating IP
+        metrics_.describe("yuzu_device_token_binding_mismatch_total",
+                          "Device-token presenter did not match the bound device_id "
+                          "(#826 stolen-token impersonation attempt)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_unbound_legacy_total",
+                          "Device-token validation refused because the stored row has "
+                          "empty device_id (W1.2 R2 HIGH-1/HIGH-2 — pre-#824 legacy)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_revoked_attempt_total",
+                          "Replay attempt against a revoked device token", "counter");
+        metrics_.describe("yuzu_device_token_rejected_total",
+                          "Low-signal device-token validation rejections (not_found, "
+                          "expired, invalid_input, internal_error), labelled by variant",
+                          "counter");
+        // W1.4 / #827: enrollment-token race-loss counter. Fires when two
+        // agents concurrently presented the same one-time enrollment token
+        // and the second consumer lost the atomic-claim race. Each
+        // increment is one credential-leak signal — a non-zero rate over
+        // 5 min means a leaked enrollment token is in active use by more
+        // than one party. Alert recipe:
+        //   rate(yuzu_enrollment_token_race_lost_total[5m]) > 0
+        // Audit row with `variant=already_consumed already_consumed_by=
+        // <agent_id>` accompanies each increment.
+        metrics_.describe("yuzu_enrollment_token_race_lost_total",
+                          "Enrollment-token consume lost the atomic-claim race "
+                          "(#827 — leaked token presented by a second agent)",
+                          "counter");
+        // Low-signal enrollment-token rejection bucket. Variants are
+        // `not_found`, `revoked`, `expired`, `invalid_input`,
+        // `invalid_input_length`, `internal_error`. The high-signal
+        // `already_consumed` variant has its own dedicated counter above
+        // so SRE can page on race-loss without a label selector.
+        metrics_.describe("yuzu_enrollment_token_rejected_total",
+                          "Low-signal enrollment-token validation rejections "
+                          "(not_found, revoked, expired, invalid_input, "
+                          "invalid_input_length, internal_error), labelled by variant",
+                          "counter");
+        // #826 sec-S1: Subscribe peer-mismatch rejections, labelled by
+        // gateway_mode so an operator can distinguish "agent reconnected
+        // from a new IP" (steady state in gateway deployments) from
+        // "stolen session_id in non-gateway deployment" (active attack).
+        metrics_.describe("yuzu_grpc_subscribe_peer_mismatch_total",
+                          "Subscribe RPC rejected because the peer IP differs from the "
+                          "Register peer IP and is not a trusted gateway (stolen-session "
+                          "signal, #1059). Labelled event=security (SIEM-routing tag — "
+                          "Splunk et al. ingest via their Prometheus receiver and filter "
+                          "on event) and gateway_mode (true|false)",
+                          "counter");
+        metrics_.describe("yuzu_grpc_subscribe_identity_mismatch_total",
+                          "Subscribe RPC rejected because the mTLS client identity does not "
+                          "match the identity bound at Register time (stolen-session signal, "
+                          "#1118). Labelled event=security (SIEM-routing tag)",
+                          "counter");
+        // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
+        // NAT-aware accommodation applied. Paired with _peer_mismatch_total
+        // (rejects): a spike here without a matching reject spike is benign
+        // multi-egress churn; a spike in BOTH is worth investigating. reason
+        // distinguishes the accommodation that fired.
+        metrics_.describe("yuzu_grpc_subscribe_peer_advisory_total",
+                          "Subscribe RPC peer-IP mismatch tolerated under a NAT-aware "
+                          "accommodation instead of rejected (#1128). Labelled event=security "
+                          "(SIEM-routing tag) and reason (mtls_identity_match|trusted_nat_cidr)",
+                          "counter");
+        metrics_.describe("yuzu_register_denied_total",
+                          "Register/ProxyRegister rejected an admin-denied agent before "
+                          "consuming its enrollment token (#1067). Labelled source "
+                          "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
+                          "persistently-denied identity hammering Register is a "
+                          "credential-abuse signal",
                           "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on
@@ -262,6 +381,12 @@ public:
         metrics_.describe("yuzu_auth_login_duration_seconds",
                           "Login PBKDF2 verify latency in seconds, by method and result",
                           "histogram");
+        // Session-revocation observability (CC7.2 anomaly-detection +
+        // capacity planning). Counter labels: caller=admin|self,
+        // result=success|partial|denied, scope=cookies|all (all = /me's
+        // "Sign out everywhere" which also revokes API tokens).
+        metrics_.describe("yuzu_auth_sessions_revoked_total",
+                          "Total session revocations, by caller, result, and scope", "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -275,42 +400,169 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_baselines_total",
+                          "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
-        metrics_.describe("yuzu_server_cpu_usage_percent",
-                          "Server process CPU usage percentage", "gauge");
-        metrics_.describe("yuzu_server_memory_bytes",
-                          "Server process memory usage in bytes", "gauge");
-        metrics_.describe("yuzu_server_open_connections",
-                          "Number of connected gRPC agent streams", "gauge");
+        metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
+                          "gauge");
+        metrics_.describe("yuzu_server_memory_bytes", "Server process memory usage in bytes",
+                          "gauge");
+        metrics_.describe("yuzu_server_open_connections", "Number of connected gRPC agent streams",
+                          "gauge");
         metrics_.describe("yuzu_server_command_queue_depth",
                           "Number of in-flight command executions", "gauge");
-        metrics_.describe("yuzu_server_uptime_seconds",
-                          "Server process uptime in seconds", "gauge");
+        metrics_.describe("yuzu_server_uptime_seconds", "Server process uptime in seconds",
+                          "gauge");
         // PR 5b — surface ExecutionEventBus internals so SREs can alert on
         // SSE backpressure (events_dropped non-zero rate), retention-window
         // sizing (gc_channels_total trend), and live-subscriber load
         // (subscribers_active gauge). Pairs with the bounded ring buffer
         // contract documented in CLAUDE.md "Executions-history ladder PR 3".
         metrics_.describe("yuzu_server_sse_channels_active",
-                          "Per-execution SSE channels currently in the bus map",
-                          "gauge");
+                          "Per-execution SSE channels currently in the bus map", "gauge");
         metrics_.describe("yuzu_server_sse_subscribers_active",
-                          "Total live SSE subscribers across all channels",
-                          "gauge");
+                          "Total live SSE subscribers across all channels", "gauge");
         metrics_.describe("yuzu_server_sse_events_dropped_total",
                           "Cumulative SSE events dropped by the ring buffer "
                           "(slow-subscriber backpressure signal)",
                           "counter");
         metrics_.describe("yuzu_server_sse_gc_sweeps_total",
-                          "Cumulative ExecutionEventBus GC sweeps run",
-                          "counter");
+                          "Cumulative ExecutionEventBus GC sweeps run", "counter");
         metrics_.describe("yuzu_server_sse_gc_channels_total",
                           "Cumulative SSE channels reaped after retention "
                           "window + zero subscribers",
                           "counter");
+        // W5.1 — endpoint-scoped agentic SSE metrics. Distinct from the
+        // bus-level yuzu_server_sse_* family above: those measure the
+        // ExecutionEventBus regardless of consumer, these measure the
+        // /api/v1/events handler specifically (label `route="events"`).
+        // governance R2 fix for consistency-MED (missing describe()
+        // calls left /metrics output without # HELP / # TYPE).
+        metrics_.describe("yuzu_server_sse_api_subscriptions_total",
+                          "Cumulative successful subscribes on /api/v1/events "
+                          "(labelled by route)",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_api_active",
+                          "Live /api/v1/events subscriptions currently held by "
+                          "httplib worker threads (labelled by route). Alert on "
+                          "saturation of the configured worker pool size.",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_api_queue_overflow_total",
+                          "Cumulative events dropped from per-connection /api/v1/events "
+                          "queues (kPerConnectionQueueCapDefault overflow; slow-consumer "
+                          "backpressure on the route-side queue, distinct from the "
+                          "bus-level yuzu_server_sse_events_dropped_total).",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_api_replay_gap_total",
+                          "Cumulative /api/v1/events connections that received a "
+                          "synthetic replay-gap envelope because the bus ring buffer "
+                          "had already evicted events the client requested via ?since "
+                          "or Last-Event-ID.",
+                          "counter");
+        // Fleet visualization observability (PR 3 + PR 6 of feat/viz-engine).
+        // gov R6 SRE OBS-1: every metric has a describe() so /metrics
+        // includes # HELP and # TYPE lines for Prometheus / Grafana scrapers.
+        metrics_.describe("yuzu_viz_topology_request_seconds",
+                          "End-to-end /api/v1/viz/fleet/topology request latency", "histogram");
+        metrics_.describe("yuzu_viz_topology_fetch_duration_seconds",
+                          "Inner agent-dispatch (tar.fleet_snapshot fan-out) duration "
+                          "on cache-miss refills only; observed even on fetcher exception",
+                          "histogram");
+        metrics_.describe("yuzu_viz_cache_hit_total",
+                          "Fleet topology requests served from the FleetTopologyStore cache",
+                          "counter");
+        metrics_.describe("yuzu_viz_cache_miss_total",
+                          "Fleet topology requests that triggered a cache refill", "counter");
+        metrics_.describe("yuzu_viz_oversize_response_total",
+                          "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
+                          "counter");
+        metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
+                          "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
+        metrics_.describe("yuzu_viz_refill_oversize_drops_total",
+                          "Refills exceeding max_snapshot_bytes (returned to caller, not cached)",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_wait_timeouts_total",
+                          "Single-flight waiters that timed out before the refill completed",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_waiters_total",
+                          "Fetch waiters that piggybacked on an in-flight refill", "gauge");
+        // PR 10 hardening — push-ingestion metrics. `via` label
+        // distinguishes the direct HeartbeatRequest path from the
+        // gateway BatchHeartbeat path; sum across the label set to
+        // get fleet-wide push volume.
+        metrics_.describe("yuzu_viz_topology_pushed_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads accepted into the "
+                          "FleetTopologyStore via heartbeat. Labelled by via=direct|gateway.",
+                          "counter");
+        metrics_.describe("yuzu_viz_topology_push_parse_errors_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads rejected by the shared "
+                          "parser (oversized, row-cap exceeded, malformed JSON). Labelled "
+                          "by via=direct|gateway.",
+                          "counter");
+        metrics_.describe("yuzu_viz_local_edges_dropped_total",
+                          "EdgeScope::Local connection edges dropped from the snapshot "
+                          "before serialisation because no reciprocal half was visible in "
+                          "the same agent payload (PR 8). Non-zero under normal churn; a "
+                          "spike vs steady-state indicates systematic loss (kernel race, "
+                          "agent connection-cap truncation, half-open sockets).",
+                          "gauge");
+        // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure modes were
+        // previously dark (no Prometheus exposure). A non-zero rate on the
+        // first two is operator-actionable: a rejection spike means an
+        // IP-spoof campaign or a NAT/DHCP misconfiguration; a cap-eviction
+        // spike means the fleet outgrew kPushedMapHardCap (or a cap-flood
+        // attack). pushed_map_size is the memory-pressure gauge to alert on
+        // before evictions begin.
+        metrics_.describe("yuzu_viz_topology_push_rejected_total",
+                          "Agent fleet_snapshot pushes rejected by the UP-1 IP-spoof guard "
+                          "(claimed local_ip owned by a live agent). Non-zero signals a "
+                          "spoofing campaign or NAT/DHCP misconfiguration.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_cap_evictions_total",
+                          "FleetTopologyStore pushed_ entries evicted because the map was at "
+                          "kPushedMapHardCap when a new agent pushed (CAP-1 LRU). Non-zero "
+                          "means the fleet outgrew the cap or a cap-flood attack is evicting "
+                          "legitimate agents.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_map_size",
+                          "Current occupancy of the FleetTopologyStore pushed_ map. Primary "
+                          "memory-pressure signal — alert before it approaches "
+                          "kPushedMapHardCap (100000).",
+                          "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
+
+        // #1128: NAT-aware Subscribe binding — operator-declared multi-egress
+        // CIDRs. Empty (default) keeps the strict exact-match peer binding.
+        // gov UP-9: fail-loud on a mistyped CIDR rather than silently treating
+        // it as a range that matches nothing (operator would believe the
+        // relaxation is active when it isn't).
+        if (!cfg_.trusted_nat_cidrs.empty()) {
+            std::size_t valid_cidrs = 0;
+            for (const auto& cidr : cfg_.trusted_nat_cidrs) {
+                if (yuzu::server::detail::is_valid_cidr(cidr))
+                    ++valid_cidrs;
+                else
+                    spdlog::warn("--trusted-nat-cidr: ignoring malformed CIDR '{}' (not a valid "
+                                 "IPv4/IPv6 network) — agents will NOT be matched against it",
+                                 cidr);
+            }
+            spdlog::info("--trusted-nat-cidr: {} valid, {} invalid of {} configured range(s)",
+                         valid_cidrs, cfg_.trusted_nat_cidrs.size() - valid_cidrs,
+                         cfg_.trusted_nat_cidrs.size());
+        }
+        if (cfg_.nat_trust_mtls_identity)
+            // warn-level (gov chaos CH-3 / UP-2): this flag intentionally
+            // relaxes a security control, so the visibility budget is the same
+            // as --no-tls's ERROR banner — info-level would lose the line in a
+            // multi-thousand-line boot log piped to a file, exactly the path
+            // most production operators use.
+            spdlog::warn("--nat-trust-mtls-identity enabled: mTLS-identity match will relax the "
+                         "Subscribe peer-IP binding. Ensure client certs are PER-AGENT (a shared "
+                         "fleet-wide cert makes this a session-replay bypass — gov UP-2).");
+        agent_service_.set_trusted_nat_cidrs(cfg_.trusted_nat_cidrs);
+        agent_service_.set_nat_trust_mtls_identity(cfg_.nat_trust_mtls_identity);
 
         // Wire metrics registry into auth manager so authenticate() can
         // observe login latency. Optional in tests/CLI tools that don't
@@ -325,8 +577,8 @@ public:
 
         // Create gateway management client for command forwarding
         if (!cfg_.gateway_command_address.empty()) {
-            gw_mgmt_channel_ = grpc::CreateChannel(
-                cfg_.gateway_command_address, grpc::InsecureChannelCredentials());
+            gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address,
+                                                   grpc::InsecureChannelCredentials());
             gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
             spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
         }
@@ -345,7 +597,8 @@ public:
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
             if (cfg_.oidc_skip_tls_verify)
-                spdlog::warn("OIDC TLS certificate verification DISABLED — do not use in production");
+                spdlog::warn(
+                    "OIDC TLS certificate verification DISABLED — do not use in production");
             // Fallback endpoints for Entra ID — OidcProvider constructor will
             // override from the OIDC discovery document if reachable.
             // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
@@ -376,24 +629,51 @@ public:
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
-        // Setup file logger
+        // Setup file logger.
+        //
+        // The default platform log paths (/var/log/yuzu on Linux,
+        // C:\ProgramData\Yuzu\logs on Windows, ~/Library/Logs/Yuzu on macOS)
+        // may not exist or be writable in containerised or rootless
+        // deployments. Issue #624: when the directory cannot be created we
+        // used to log a WARN + ERROR pair on every boot which made operators
+        // think the server was broken. The file logger is best-effort
+        // observability, not load-bearing — if the path is unwritable we
+        // log a single info line and proceed. Operators who want file
+        // logging can pass --log-file explicitly (handled separately in
+        // main.cpp).
         auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
+        bool parent_ready = parent.empty();
         if (!parent.empty()) {
             std::error_code ec;
             std::filesystem::create_directories(parent, ec);
+            parent_ready = !ec;
             if (ec) {
-                spdlog::warn("Could not create log directory {}: {}", parent.string(),
-                             ec.message());
+                // INFO not DEBUG (governance Gate 7): default loglevel is INFO,
+                // so DEBUG is invisible — operators auditing the SOC 2 evidence
+                // chain or troubleshooting "where did my logs go?" need a single
+                // visible breadcrumb. WARN was the original UX bug (false-positive
+                // scary message on every container boot when the directory simply
+                // didn't exist). INFO is the canonical "single startup crumb"
+                // level — appears in default operator output, no alarm semantics.
+                spdlog::info("Default log directory {} not creatable ({}); "
+                             "skipping default file logger. Pass --log-file to override.",
+                             parent.string(), ec.message());
             }
         }
-        try {
-            file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
-            file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
-            file_logger_->flush_on(spdlog::level::info);
-            spdlog::info("Log file: {}", log_path.string());
-        } catch (const spdlog::spdlog_ex& ex) {
-            spdlog::error("Failed to create file logger: {}", ex.what());
+        if (parent_ready) {
+            try {
+                file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
+                file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
+                file_logger_->flush_on(spdlog::level::info);
+                spdlog::info("Log file: {}", log_path.string());
+            } catch (const spdlog::spdlog_ex& ex) {
+                // INFO not DEBUG — see rationale on the create_directories
+                // branch above.
+                spdlog::info("Default file logger unavailable ({}); "
+                             "pass --log-file to override.",
+                             ex.what());
+            }
         }
 
         // Initialize NVD CVE database
@@ -409,9 +689,8 @@ public:
         // Initialize OTA update registry
         if (cfg_.ota_enabled) {
             auto update_db_path = cfg_.db_dir() / "update_packages.db";
-            auto update_dir = cfg_.update_dir.empty()
-                                  ? cfg_.db_dir() / "agent-updates"
-                                  : cfg_.update_dir;
+            auto update_dir =
+                cfg_.update_dir.empty() ? cfg_.db_dir() / "agent-updates" : cfg_.update_dir;
             std::error_code ec;
             std::filesystem::create_directories(update_dir, ec);
             update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
@@ -431,6 +710,228 @@ public:
             }
         }
 
+        // Seed kill-switch from cfg_; runtime flip path can land later.
+        viz_disabled_.store(cfg_.viz_disable, std::memory_order_release);
+        if (cfg_.viz_disable) {
+            // gov R3 F-1 (compliance): the per-request audit row only fires
+            // when a request hits the disabled endpoint. Operators deploying
+            // with --viz-disable from boot need a startup-time evidence line
+            // confirming the kill-switch took effect. Mirrors the MCP
+            // precedent at server.cpp:5161 below.
+            spdlog::warn("[VIZ] viz endpoint disabled by configuration "
+                         "(--viz-disable / YUZU_VIZ_DISABLE)");
+        }
+
+        // Initialize fleet topology store (PR 3 of feat/viz-engine).
+        //
+        // The fetcher dispatches `tar.fleet_snapshot` to every connected
+        // agent on cache miss, polls the response_store for matches keyed
+        // on the synthesised command_id, and returns whatever arrived
+        // before the deadline. Missing agents come back as stale=true rows
+        // so the renderer dims their cubes rather than disappearing them.
+        //
+        // Notes on integration choices:
+        //  * No execution_id is recorded for the fetcher dispatch. The
+        //    executions tracker is operator-facing; an automated cache
+        //    refill happening every 60s would otherwise spam its history
+        //    pane. record_send_time stays so the standard latency
+        //    histogram still observes these dispatches (sec-INFO-10:
+        //    intentionally opted-out of cmd_execution_ids_).
+        //  * forward_gateway_pending() drains commands queued for
+        //    gateway-proxied agents so a fleet that mixes direct and
+        //    gateway-connected hosts gets uniform dispatch.
+        //  * The poll loop sleeps in 100ms increments; a future PR can
+        //    swap in the response-arrival event bus when one exists.
+        if (response_store_) {
+            auto fetcher =
+                [this](std::chrono::milliseconds deadline) -> std::vector<RawAgentSnapshot> {
+                std::vector<RawAgentSnapshot> out;
+                if (!response_store_ || !response_store_->is_open())
+                    return out;
+
+                auto agent_ids = registry_.all_ids();
+                if (agent_ids.empty())
+                    return out;
+
+                // Sibling dispatchers use `<plugin>-<hex>` (server.cpp:2820,
+                // 4879, 5014). Stick to that shape so anyone grepping
+                // response_store for `tar-` finds viz fetcher dispatches too,
+                // and so the `<plugin>-` prefix doesn't lie about the actual
+                // wire plugin (gov R3 C-3).
+                const auto command_id =
+                    "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin("tar");
+                cmd.set_action("fleet_snapshot");
+
+                agent_service_.record_send_time(command_id);
+
+                std::unordered_set<std::string> dispatched;
+                dispatched.reserve(agent_ids.size());
+                for (const auto& aid : agent_ids) {
+                    if (registry_.send_to(aid, cmd))
+                        dispatched.insert(aid);
+                }
+                forward_gateway_pending();
+
+                if (dispatched.empty())
+                    return out;
+
+                // Poll response_store for matching responses until we have
+                // one per dispatched agent OR the deadline elapses. Each
+                // response carries `instruction_id == command_id` (set by
+                // agent_service when the frame arrives -- naming overload
+                // we live with).
+                const auto t_deadline = std::chrono::steady_clock::now() + deadline;
+                std::vector<StoredResponse> matched;
+                std::unordered_set<std::string> seen;
+                while (std::chrono::steady_clock::now() < t_deadline &&
+                       seen.size() < dispatched.size()) {
+                    ResponseQuery q;
+                    q.limit = static_cast<int>(dispatched.size()) + 16;
+                    auto rows = response_store_->query(command_id, q);
+                    for (const auto& r : rows) {
+                        if (seen.insert(r.agent_id).second)
+                            matched.push_back(r);
+                    }
+                    if (seen.size() >= dispatched.size())
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                // Deduplicate by agent_id (one response per agent expected;
+                // duplicates ignored).
+                std::unordered_set<std::string> have;
+                out.reserve(dispatched.size());
+                for (const auto& r : matched) {
+                    if (!have.insert(r.agent_id).second)
+                        continue;
+                    // CommandResponse::Status enum: 1 == SUCCESS. Anything
+                    // else (FAILURE / TIMEOUT / REJECTED / RUNNING-only-row)
+                    // is treated as a stale snapshot for renderer purposes.
+                    if (r.status != 1) {
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
+                        rs.stale = true;
+                        if (auto sess = registry_.get_session(r.agent_id)) {
+                            rs.os = sess->os;
+                            rs.hostname = sess->hostname;
+                        }
+                        out.push_back(std::move(rs));
+                        continue;
+                    }
+                    // PR 10 hardening — share the parser with the push
+                    // ingestion sites so caps + sanitisation + field
+                    // set stay in lock-step (arch-B3 / cons-S1).
+                    std::string os_from_session, hostname_fallback, parse_err;
+                    if (auto sess = registry_.get_session(r.agent_id)) {
+                        os_from_session = sess->os;
+                        hostname_fallback = sess->hostname;
+                    }
+                    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(
+                        r.output, r.agent_id, os_from_session, &parse_err);
+                    if (parsed.has_value()) {
+                        out.push_back(std::move(*parsed));
+                    } else {
+                        spdlog::warn("FleetTopologyStore fetcher: rejected "
+                                     "fleet_snapshot.v1 from {} ({})",
+                                     r.agent_id, parse_err);
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
+                        rs.os = std::move(os_from_session);
+                        rs.hostname = std::move(hostname_fallback);
+                        rs.stale = true;
+                        out.push_back(std::move(rs));
+                    }
+                }
+
+                // Agents that were dispatched but never responded -> stale
+                // entries so the aggregate snapshot still shows them.
+                int dispatch_timeouts = 0;
+                for (const auto& aid : dispatched) {
+                    if (have.contains(aid))
+                        continue;
+                    RawAgentSnapshot rs;
+                    rs.agent_id = aid;
+                    rs.stale = true;
+                    if (auto sess = registry_.get_session(aid)) {
+                        rs.hostname = sess->hostname;
+                        rs.os = sess->os;
+                    }
+                    out.push_back(std::move(rs));
+                    ++dispatch_timeouts;
+                }
+                if (dispatch_timeouts > 0) {
+                    metrics_.counter("yuzu_viz_agent_dispatch_timeout_total")
+                        .increment(static_cast<double>(dispatch_timeouts));
+                }
+
+                return out;
+            };
+
+            // 60s TTL, 5s fetch deadline, 256 MiB max snapshot bytes from
+            // PR 2 defaults. nvd_db_ may be null if NVD store failed to open;
+            // the store handles that gracefully (vuln overlay becomes inert).
+            fleet_topology_store_ = std::make_unique<FleetTopologyStore>(
+                std::move(fetcher), nvd_db_ ? nvd_db_.get() : nullptr);
+
+            // PR 6 / OBS-2: wire the agent-dispatch duration histogram.
+            // Distinguishes "agent dispatch is slow" from "the rest of
+            // the request is slow" -- viz_routes.cpp already times the
+            // whole HTTP path via yuzu_viz_topology_request_seconds.
+            // Captures only on cache miss / refill (warm requests skip
+            // the fetcher entirely).
+            fleet_topology_store_->set_fetch_duration_observer(
+                [this](std::chrono::duration<double> elapsed) {
+                    metrics_.histogram("yuzu_viz_topology_fetch_duration_seconds")
+                        .observe(elapsed.count());
+                });
+            // gov R6 SRE OBS-2: log so a future refactor that silently
+            // skips the wire-up (re-ordered init, conditional metrics-off
+            // mode, etc.) leaves a positive trace operators can grep for
+            // when the histogram count fails to increment.
+            spdlog::debug("FleetTopologyStore: fetch-duration observer wired "
+                          "(yuzu_viz_topology_fetch_duration_seconds)");
+
+            // Gate 7 UP-9 / hp-S1 — roster provider. The push path skips
+            // the dispatch fetcher, so a registered agent that has not
+            // pushed (legacy build mid rolling-upgrade, TAR plugin off,
+            // wedged first-cycle pump) would silently vanish from the
+            // topology. The store consults this to emit a stale placeholder
+            // cube for every registered-but-unpushed agent. Session-sourced
+            // identity only — no agent-controlled JSON.
+            fleet_topology_store_->set_roster_provider(
+                [this]() -> std::vector<FleetTopologyStore::RosterEntry> {
+                    std::vector<FleetTopologyStore::RosterEntry> roster;
+                    auto ids = registry_.all_ids();
+                    roster.reserve(ids.size());
+                    for (const auto& aid : ids) {
+                        FleetTopologyStore::RosterEntry e;
+                        e.agent_id = aid;
+                        if (auto sess = registry_.get_session(aid)) {
+                            e.hostname = sess->hostname;
+                            e.os = sess->os;
+                        }
+                        roster.push_back(std::move(e));
+                    }
+                    return roster;
+                });
+
+            // UAT 2026-05-12: wire the store into AgentServiceImpl so a
+            // fresh Register() drops both cache slots — eliminates the
+            // up-to-60 s "stale ghost cube" window operators saw after
+            // server restarts.
+            agent_service_.set_fleet_topology_store(fleet_topology_store_.get());
+            // PR 10: also wire into the gateway upstream service so
+            // BatchHeartbeat ingests pushed snapshots from
+            // gateway-routed agents (the path 100% of viz-UAT traffic
+            // takes today).
+            if (gateway_service_)
+                gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
+        }
+
         // Initialize audit store
         {
             auto audit_db = cfg_.db_dir() / "audit.db";
@@ -438,6 +939,231 @@ public:
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
             }
+            // PR 10 hardening — wire AuditStore into FleetTopologyStore
+            // so push success (first-per-agent) and rejections emit
+            // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
+            // run after fleet_topology_store_ AND audit_store_ are
+            // both initialised; that ordering is fixed here.
+            if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
+                fleet_topology_store_->set_audit_store(audit_store_.get());
+
+            // Gate 7 compliance F-1 — durable evidence that the viz
+            // kill-switch took effect. The per-request `kill_switch` audit
+            // row in VizRoutes only fires when a request actually hits a
+            // disabled endpoint; a cold deployment with --viz-disable and
+            // no viz traffic would leave zero audit rows despite the
+            // feature being off. Emit one startup AuditEvent so an auditor
+            // asking "was viz disabled during window X?" can answer it from
+            // the audit store, not just process logs. Emitted here (rather
+            // than at the viz_disabled_ seed above) because audit_store_ is
+            // only constructed now.
+            if (cfg_.viz_disable && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.viz_disabled";
+                ev.target_type = "FleetTopology";
+                ev.target_id = "viz";
+                ev.detail = "fleet visualization endpoints disabled at startup "
+                            "(--viz-disable / YUZU_VIZ_DISABLE)";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #802 / W7.4 — mirror the viz-disable audit emission pattern:
+            // when the operator has opted out of signed-pack enforcement,
+            // emit a startup-time audit row so the relaxed posture is
+            // recoverable from the audit store, not only from process logs.
+            // Auditors and incident-response queries asking "was unsigned
+            // pack acceptance enabled during window X?" can answer from
+            // the audit log. The matching `--allow-unsigned-packs` startup
+            // warn fires earlier at the ProductPackStore construction
+            // site; the audit row fires here because audit_store_ is only
+            // constructed at this phase.
+            if (cfg_.allow_unsigned_packs && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.unsigned_packs_allowed";
+                ev.target_type = "ProductPack";
+                // gov R1 CONS-BLOCKING-1: use a feature-name scope label
+                // rather than "*" wildcard. The audit_store query planner
+                // uses `WHERE target_id = ?` (audit_store.cpp:191) — "*"
+                // would only match this exact row, not "all packs". Mirrors
+                // the sibling `server.viz_disabled` row which uses
+                // `target_id="viz"`. Future startup-posture audit rows
+                // should follow `target_id=<feature_name>` (see
+                // docs/observability-conventions.md startup-posture pattern).
+                ev.target_id = "signature_enforcement";
+                ev.detail = "product pack signature enforcement disabled at startup "
+                            "(--allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS) — "
+                            "unsigned packs will be accepted at install";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #1073 / W7.4 sibling-gap — same startup-posture audit emission
+            // as the unsigned_packs row above, but for instruction-import.
+            // Auditors querying "was unsigned definition acceptance enabled
+            // during window X?" answer from the audit log, not from process
+            // logs. Mirrors the unsigned_packs target_id convention
+            // (`signature_enforcement` is the feature scope).
+            if (cfg_.allow_unsigned_definitions && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.unsigned_definitions_allowed";
+                ev.target_type = "InstructionDefinition";
+                ev.target_id = "signature_enforcement";
+                ev.detail = "instruction-definition signature enforcement disabled at startup "
+                            "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
+                            "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
+            // a session-management bug that leaves evict_pushed un-called
+            // can't grow the map unbounded. Cap at the same hard ceiling
+            // as the /viz machines_max DoS guard.
+            if (fleet_topology_store_)
+                fleet_topology_store_->set_pushed_map_cap(FleetTopologyStore::kPushedMapHardCap);
+
+            // #1000 / arch-S2 — construct the shared HeartbeatIngestion now
+            // that fleet_topology_store_ and health_store_ are wired, then
+            // inject into both ingestion paths so they cannot drift.
+            heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+            agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
+            if (gateway_service_)
+                gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    if (!guaranteed_state_store_)
+                        return;
+                    const std::uint64_t current =
+                        guaranteed_state_store_->current_policy_generation();
+                    if (agent_gen >= current)
+                        return;  // agent already at or ahead of current policy
+                    const std::string agent_id(agent_id_sv);
+
+                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
+                    // Claim the slot under the lock BEFORE any work so concurrent
+                    // heartbeats from the same agent can't both reconcile, and a
+                    // stuck/hostile agent can't turn every heartbeat into a registry
+                    // scan. Wall-clock based so it self-heals a re-registered/wiped
+                    // agent after the interval (no generation-keyed dedupe hole).
+                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
+                    const auto reconcile_now = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard lk(guardian_reconcile_mu_);
+                        auto last = guardian_last_reconcile_.find(agent_id);
+                        if (last != guardian_last_reconcile_.end() &&
+                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
+                            metrics_
+                                .counter("yuzu_server_guardian_reconciles_total",
+                                         {{"result", "rate_limited"}})
+                                .increment();
+                            return;
+                        }
+                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
+                    }
+
+                    auto sess = registry_.get_session(agent_id);
+                    if (!sess) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "no_session"}})
+                            .increment();
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
+                    // Baseline gate (docs/guardian-baseline-model.md): the rule source
+                    // is the union of member Guards of *deployed* Baselines, so an
+                    // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    const auto rules = guardian::filter_deployed_members(
+                        guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+                    std::unordered_map<std::string, bool> scope_member;
+                    auto push = guardian::build_agent_push(
+                        rules, sess->os,
+                        [&](const std::string& expr) {
+                            auto cached = scope_member.find(expr);
+                            if (cached != scope_member.end())
+                                return cached->second;
+                            bool member = false;
+                            if (auto parsed = yuzu::scope::parse(expr)) {
+                                for (const auto& id : registry_.evaluate_scope(
+                                         *parsed, tag_store_.get(),
+                                         custom_properties_store_.get()))
+                                    if (id == agent_id) {
+                                        member = true;
+                                        break;
+                                    }
+                            }
+                            scope_member.emplace(expr, member);
+                            return member;
+                        },
+                        /*full_sync=*/true, current);
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per re-push (random suffix) so a same-generation reconcile
+                    // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-reconcile-" + std::to_string(current) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(agent_id, cmd)) {
+                        forward_gateway_pending();
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "sent"}})
+                            .increment();
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "reconcile"}})
+                            .increment();
+                        metrics_.gauge("yuzu_server_guardian_policy_generation")
+                            .set(static_cast<double>(current));
+                        // Durable audit of a system-initiated enforcement re-deploy
+                        // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
+                        // row per agent per interval, not per heartbeat.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile re-push (generation " +
+                                        std::to_string(agent_gen) + " -> " +
+                                        std::to_string(current) + ")";
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
+                                     agent_id, agent_gen, current);
+                    }
+                });
         }
 
         // Initialize tag store
@@ -471,10 +1197,26 @@ public:
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
             agent_service_.set_analytics_store(analytics_store_.get());
+        // W1.4 / #827: AuditStore for enrollment-token consume rows.
+        // Direct path (AgentServiceImpl) AND gateway path
+        // (GatewayUpstreamServiceImpl) both get the same store so the
+        // success+failure audit trail is uniform regardless of how the
+        // agent reached us.
+        if (audit_store_ && audit_store_->is_open()) {
+            agent_service_.set_audit_store(audit_store_.get());
+            if (gateway_service_) {
+                gateway_service_->set_audit_store(audit_store_.get());
+            }
+        }
+        if (analytics_store_ && gateway_service_) {
+            gateway_service_->set_analytics_store(analytics_store_.get());
+        }
         if (notification_store_)
             agent_service_.set_notification_store(notification_store_.get());
         if (webhook_store_)
             agent_service_.set_webhook_store(webhook_store_.get());
+        if (offload_target_store_)
+            agent_service_.set_offload_target_store(offload_target_store_.get());
         if (inventory_store_)
             agent_service_.set_inventory_store(inventory_store_.get());
 
@@ -482,6 +1224,21 @@ public:
         {
             auto instr_db = cfg_.db_dir() / "instructions.db";
             instruction_store_ = std::make_unique<InstructionStore>(instr_db);
+            // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
+            // require_signed_definitions_=true. Wire the operator opt-out
+            // immediately after construction, before any import path can
+            // execute, so legacy unsigned imports are accepted iff the
+            // operator explicitly enabled --allow-unsigned-definitions.
+            if (instruction_store_) {
+                instruction_store_->set_require_signed_definitions(
+                    !cfg_.allow_unsigned_definitions);
+                if (cfg_.allow_unsigned_definitions) {
+                    spdlog::warn("InstructionStore: signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-definitions / "
+                                 "YUZU_ALLOW_UNSIGNED_DEFINITIONS) — unsigned "
+                                 "instruction imports will be accepted");
+                }
+            }
             if (instruction_store_ && instruction_store_->is_open()) {
                 // RAII pool owns the shared connection (fixes G3-ARCH-T2-002).
                 // Declare instr_db_pool_ before the consumers in the member list
@@ -496,6 +1253,11 @@ public:
                     execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
                     execution_tracker_->create_tables();
                     execution_tracker_->set_event_bus(execution_event_bus_.get());
+                    // UAT 2026-05-06 #8: AgentServiceImpl notifies the
+                    // tracker on every response so the per-agent KPI
+                    // table populates and SSE agent-transition fires
+                    // for live drawer updates.
+                    agent_service_.set_execution_tracker(execution_tracker_.get());
 
                     approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
                     approval_manager_->create_tables();
@@ -525,9 +1287,8 @@ public:
                 // hand (Gate 6 SRE-O2).
                 {
                     auto audit_bundle = [this](std::string_view target_type,
-                                                const std::string& target_id,
-                                                std::string_view result,
-                                                const std::string& detail) {
+                                               const std::string& target_id,
+                                               std::string_view result, const std::string& detail) {
                         // Hardening round 1 INFO — audit_store_ is
                         // initialized at server.cpp:394, before this
                         // block at :441; the null branch is unreachable
@@ -542,69 +1303,79 @@ public:
                             return;
                         }
                         AuditEvent ev{};
-                        ev.timestamp      = std::time(nullptr);
-                        ev.principal      = "system";
+                        ev.timestamp = std::time(nullptr);
+                        ev.principal = "system";
                         ev.principal_role = "system";
-                        ev.action         = "content.bundled_import";
-                        ev.target_type    = std::string(target_type);
-                        ev.target_id      = target_id;
-                        ev.detail         = detail;
-                        ev.result         = std::string(result);
-                        audit_store_->log(ev);
+                        ev.action = "content.bundled_import";
+                        ev.target_type = std::string(target_type);
+                        ev.target_id = target_id;
+                        ev.detail = detail;
+                        ev.result = std::string(result);
+                        (void)audit_store_->log(ev);
                     };
                     auto envelope_id = [](const std::string& env) -> std::string {
                         auto p = nlohmann::json::parse(env, nullptr, false);
-                        return p.is_discarded() ? std::string{}
-                                                : p.value("id", std::string{});
+                        return p.is_discarded() ? std::string{} : p.value("id", std::string{});
                     };
                     int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
                     for (const auto& env : kBundledDefinitions) {
                         auto id = envelope_id(env);
-                        auto r = instruction_store_->import_definition_json(env);
+                        // #1073 / W7.4 sibling-gap: bundled content is
+                        // authenticated by build-time binary linkage; route
+                        // through the trusted variant so the runtime
+                        // signature gate doesn't reject definitions baked
+                        // into yuzu-server at compile time. The public
+                        // `import_definition_json` is reserved for
+                        // operator/network-supplied input.
+                        auto r = instruction_store_->import_definition_json_trusted(env);
                         if (r) {
                             ++defs_imported;
-                            audit_bundle("InstructionDefinition", *r,
-                                         "success", "boot-time content embed");
+                            audit_bundle("InstructionDefinition", *r, "success",
+                                         "boot-time content embed");
                         } else if (is_conflict_error(r.error())) {
                             ++defs_skipped;
                         } else {
                             ++defs_errored;
-                            spdlog::warn("bundled definition import failed: id={} error={}",
-                                         id, r.error());
-                            audit_bundle("InstructionDefinition", id,
-                                         "error", r.error());
+                            spdlog::warn("bundled definition import failed: id={} error={}", id,
+                                         r.error());
+                            audit_bundle("InstructionDefinition", id, "error", r.error());
                         }
                     }
                     int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
                     for (const auto& env : kBundledSets) {
                         auto parsed = nlohmann::json::parse(env, nullptr, false);
-                        if (parsed.is_discarded()) { ++sets_errored; continue; }
+                        if (parsed.is_discarded()) {
+                            ++sets_errored;
+                            continue;
+                        }
                         InstructionSet s;
-                        s.id          = parsed.value("id", "");
-                        s.name        = parsed.value("name", s.id);
+                        s.id = parsed.value("id", "");
+                        s.name = parsed.value("name", s.id);
                         s.description = parsed.value("description", "");
-                        s.created_by  = parsed.value("created_by", "system");
-                        if (s.id.empty()) { ++sets_errored; continue; }
+                        s.created_by = parsed.value("created_by", "system");
+                        if (s.id.empty()) {
+                            ++sets_errored;
+                            continue;
+                        }
                         auto r = instruction_store_->create_set(s);
                         if (r) {
                             ++sets_imported;
-                            audit_bundle("InstructionSet", *r,
-                                         "success", "boot-time content embed");
+                            audit_bundle("InstructionSet", *r, "success",
+                                         "boot-time content embed");
                         } else if (is_conflict_error(r.error())) {
                             ++sets_skipped;
                         } else {
                             ++sets_errored;
-                            spdlog::warn("bundled set import failed: id={} error={}",
-                                         s.id, r.error());
-                            audit_bundle("InstructionSet", s.id,
-                                         "error", r.error());
+                            spdlog::warn("bundled set import failed: id={} error={}", s.id,
+                                         r.error());
+                            audit_bundle("InstructionSet", s.id, "error", r.error());
                         }
                     }
                     spdlog::info(
                         "bundled content: {} definitions imported / {} skipped / {} errored; "
                         "{} sets imported / {} skipped / {} errored",
-                        defs_imported, defs_skipped, defs_errored,
-                        sets_imported, sets_skipped, sets_errored);
+                        defs_imported, defs_skipped, defs_errored, sets_imported, sets_skipped,
+                        sets_errored);
                 }
             }
         }
@@ -645,6 +1416,13 @@ public:
             auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
+        {
+            // Scope-walking result sets (capability §30).
+            auto rs_db = cfg_.db_dir() / "result_sets.db";
+            result_set_store_ = std::make_unique<ResultSetStore>(rs_db);
+            if (result_set_store_ && result_set_store_->is_open())
+                spdlog::info("ResultSetStore initialized at {}", rs_db.string());
+        }
 
         // Phase 5: Policy Engine
         {
@@ -661,13 +1439,32 @@ public:
         // exists, and bounded growth is the default from day one (#452 §5).
         {
             auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
-            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
-                gs_db, cfg_.guardian_event_retention_days);
+            guaranteed_state_store_ =
+                std::make_unique<GuaranteedStateStore>(gs_db, cfg_.guardian_event_retention_days);
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
                 guaranteed_state_store_->start_cleanup();
                 spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
                              gs_db.string(), cfg_.guardian_event_retention_days);
+                // Step 5: ingest agent `__guard__` events arriving on the Subscribe
+                // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
+                agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
+                // Guardian Half B: gateway-connected agents' drift events arrive
+                // via GatewayUpstream.ForwardGuardianMessage, not the direct
+                // Subscribe loop — wire the same store so they ingest through the
+                // shared path. Gateway service exists only in gateway mode.
+                if (gateway_service_)
+                    gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
             }
+        }
+
+        // Guardian Baselines — the deployable collection of Guards (M:N members +
+        // included/excluded management-group assignment). Control-plane only; the
+        // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
+        {
+            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
+            if (baseline_store_ && baseline_store_->is_open())
+                spdlog::info("BaselineStore initialized at {}", bl_db.string());
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -699,6 +1496,21 @@ public:
             product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
             if (product_pack_store_ && product_pack_store_->is_open()) {
                 spdlog::info("ProductPackStore initialized at {}", pack_db.string());
+                // #802 / W7.4: enforce signed-pack-by-default. Default
+                // ProductPackStore ctor sets require_signed_packs_=true; we
+                // invert only when the operator opts in via the flag, and
+                // make the relaxed posture loud in operator logs + audit
+                // (audit emission deferred to post-audit_store_-construction
+                // block below to mirror the viz_disable pattern).
+                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                if (cfg_.allow_unsigned_packs) {
+                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-packs / "
+                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                 "accepted at install — this exposes the fleet to "
+                                 "arbitrary instruction/plugin execution. Sign packs and "
+                                 "remove the flag as soon as feasible.");
+                }
             }
         }
 
@@ -710,6 +1522,10 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+        }
+        {
+            auto offload_db = cfg_.db_dir() / "offload_targets.db";
+            offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
         }
 
         // Phase 7: Inventory Store (Issue 7.17)
@@ -760,6 +1576,16 @@ public:
         }
     }
 
+    // Destruction must guarantee every background thread is joined before its
+    // captured members are torn down. stop() does that join and is idempotent
+    // (guarded by the stop_entered_ CAS), so calling it here is safe even when
+    // the normal shutdown path already ran. Without this, a destruction that
+    // skips stop() — run() early-returning on a TLS/bind failure after the
+    // policy-eval / health threads were spawned, or an exception during late
+    // construction — would destroy a still-joinable std::thread and call
+    // std::terminate, or free borrowed stores out from under a live thread.
+    ~ServerImpl() override { stop(); }
+
     void run() override {
         spdlog::info("run(): entering");
         grpc::EnableDefaultHealthCheckService(true);
@@ -787,8 +1613,8 @@ public:
                 // Previously this was hardcoded `true`, which silently accepted any
                 // unauthenticated peer on the management plane.
                 auto mgmt_tls = build_tls_credentials(
-                    cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key,
-                    cfg_.mgmt_tls_ca_cert, cfg_.allow_one_way_tls, "management listener");
+                    cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
+                    cfg_.allow_one_way_tls, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
                     return;
@@ -834,9 +1660,9 @@ public:
 
         // Create AuthRoutes — must precede start_web_server which uses it
         auth_routes_ = std::make_unique<AuthRoutes>(
-            cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(),
-            audit_store_.get(), mgmt_group_store_.get(), tag_store_.get(),
-            analytics_store_.get(), oidc_mu_, oidc_provider_);
+            cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
+            mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
+            oidc_provider_);
 
         start_web_server();
 
@@ -857,7 +1683,7 @@ public:
         }
         if (cfg_.cert_reload_enabled && cfg_.tls_enabled) {
             spdlog::warn("gRPC TLS certificate hot-reload is not yet supported; "
-                          "gRPC listeners will use the certificates loaded at startup");
+                         "gRPC listeners will use the certificates loaded at startup");
         }
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
@@ -890,6 +1716,29 @@ public:
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
                 }
+                // Publish FleetTopologyStore internals so the 256 MiB store-
+                // level oversize cap and single-flight refill timeouts are
+                // observable -- the route-level yuzu_viz_oversize_response_total
+                // only fires on the machines_max gate, not on the byte cap
+                // (gov R3 OBS-1).
+                if (fleet_topology_store_) {
+                    metrics_.gauge("yuzu_viz_refill_oversize_drops_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_oversize_drops()));
+                    metrics_.gauge("yuzu_viz_refill_wait_timeouts_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_wait_timeouts()));
+                    metrics_.gauge("yuzu_viz_refill_waiters_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_waiters()));
+                    metrics_.gauge("yuzu_viz_local_edges_dropped_total")
+                        .set(static_cast<double>(fleet_topology_store_->local_edges_dropped()));
+                    // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure-mode
+                    // counters, previously unscraped.
+                    metrics_.gauge("yuzu_viz_topology_push_rejected_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_rejected_count()));
+                    metrics_.gauge("yuzu_viz_pushed_cap_evictions_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_evicted_for_cap()));
+                    metrics_.gauge("yuzu_viz_pushed_map_size")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_map_size()));
+                }
                 // Publish audit event write rate so the audit subsystem is observable.
                 if (audit_store_) {
                     metrics_.gauge("yuzu_server_audit_events_total", {{"result", "success"}})
@@ -914,14 +1763,11 @@ public:
                     metrics_.gauge("yuzu_server_sse_subscribers_active")
                         .set(static_cast<double>(execution_event_bus_->subscribers_total()));
                     metrics_.gauge("yuzu_server_sse_events_dropped_total")
-                        .set(static_cast<double>(
-                            execution_event_bus_->events_dropped_total()));
+                        .set(static_cast<double>(execution_event_bus_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_sse_gc_sweeps_total")
-                        .set(static_cast<double>(
-                            execution_event_bus_->gc_sweeps_total()));
+                        .set(static_cast<double>(execution_event_bus_->gc_sweeps_total()));
                     metrics_.gauge("yuzu_server_sse_gc_channels_total")
-                        .set(static_cast<double>(
-                            execution_event_bus_->gc_channels_total()));
+                        .set(static_cast<double>(execution_event_bus_->gc_channels_total()));
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
                 // gauges for the count-now values (SQL COUNT(*)) and for the
@@ -934,11 +1780,13 @@ public:
                     metrics_.gauge("yuzu_server_guardian_events_total")
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
-                        .set(static_cast<double>(
-                            guaranteed_state_store_->events_written_total()));
+                        .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
-                        .set(static_cast<double>(
-                            guaranteed_state_store_->events_reaped_total()));
+                        .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                }
+                if (baseline_store_) {
+                    metrics_.gauge("yuzu_server_guardian_baselines_total")
+                        .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
                 // Process health sampling (22.1)
                 {
@@ -950,15 +1798,17 @@ public:
                         .set(static_cast<double>(ph.memory_vss_bytes));
                     metrics_.gauge("yuzu_server_open_connections")
                         .set(static_cast<double>(registry_.agent_count()));
-                    auto queue_depth = execution_tracker_
-                        ? static_cast<double>(
-                              execution_tracker_->query_executions({.status = "running"}).size())
-                        : 0.0;
+                    auto queue_depth =
+                        execution_tracker_
+                            ? static_cast<double>(
+                                  execution_tracker_->query_executions({.status = "running"})
+                                      .size())
+                            : 0.0;
                     metrics_.gauge("yuzu_server_command_queue_depth").set(queue_depth);
                     auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now() - server_start_time_).count();
-                    metrics_.gauge("yuzu_server_uptime_seconds")
-                        .set(static_cast<double>(uptime_s));
+                                        std::chrono::steady_clock::now() - server_start_time_)
+                                        .count();
+                    metrics_.gauge("yuzu_server_uptime_seconds").set(static_cast<double>(uptime_s));
                 }
             }
             spdlog::info("Fleet health recomputation thread stopped");
@@ -972,41 +1822,41 @@ public:
         const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
         const bool no_tls_active = !cfg_.tls_enabled;
         if (insecure_skip_verify_active || no_tls_active) {
-            insecure_tls_reminder_thread_ = std::thread([this, insecure_skip_verify_active,
-                                                        no_tls_active]() {
-                using namespace std::chrono_literals;
-                while (!stop_requested_.load(std::memory_order_acquire)) {
-                    // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
-                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
-                         ++i) {
-                        std::this_thread::sleep_for(5s);
+            insecure_tls_reminder_thread_ =
+                std::thread([this, insecure_skip_verify_active, no_tls_active]() {
+                    using namespace std::chrono_literals;
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
+                        for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                             ++i) {
+                            std::this_thread::sleep_for(5s);
+                        }
+                        if (stop_requested_.load(std::memory_order_acquire))
+                            break;
+                        const char* posture =
+                            no_tls_active ? "--no-tls" : "--insecure-skip-client-verify";
+                        const char* detail =
+                            no_tls_active
+                                ? "TLS is fully disabled; both agent and management gRPC "
+                                  "listeners accept plaintext from any peer with no encryption "
+                                  "and no peer authentication. Restart with TLS certificates "
+                                  "to leave this posture."
+                                : "Agent / management listener still running without client "
+                                  "certificate verification. Re-enable mTLS by supplying "
+                                  "--ca-cert (and --management-ca-cert if applicable).";
+                        spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                     .principal = "system",
+                                                     .principal_role = "system",
+                                                     .action = "server.tls_degraded",
+                                                     .target_type = "server",
+                                                     .target_id = posture,
+                                                     .detail = detail,
+                                                     .result = "warning"});
+                        }
                     }
-                    if (stop_requested_.load(std::memory_order_acquire))
-                        break;
-                    const char* posture = no_tls_active ? "--no-tls"
-                                                        : "--insecure-skip-client-verify";
-                    const char* detail =
-                        no_tls_active
-                            ? "TLS is fully disabled; both agent and management gRPC "
-                              "listeners accept plaintext from any peer with no encryption "
-                              "and no peer authentication. Restart with TLS certificates "
-                              "to leave this posture."
-                            : "Agent / management listener still running without client "
-                              "certificate verification. Re-enable mTLS by supplying "
-                              "--ca-cert (and --management-ca-cert if applicable).";
-                    spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
-                    if (audit_store_ && audit_store_->is_open()) {
-                        audit_store_->log({.timestamp = std::time(nullptr),
-                                           .principal = "system",
-                                           .principal_role = "system",
-                                           .action = "server.tls_degraded",
-                                           .target_type = "server",
-                                           .target_id = posture,
-                                           .detail = detail,
-                                           .result = "warning"});
-                    }
-                }
-            });
+                });
         }
 
         agent_server_->Wait();
@@ -1018,9 +1868,8 @@ public:
         // re-enters stop() on a different thread while the first is still
         // joining threads — causing "Resource deadlock avoided".
         bool expected = false;
-        if (!stop_entered_.compare_exchange_strong(expected, true,
-                                                   std::memory_order_acq_rel)) {
-            return;  // Another thread is already running stop()
+        if (!stop_entered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return; // Another thread is already running stop()
         }
 
         spdlog::info("Shutting down server...");
@@ -1042,6 +1891,18 @@ public:
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
+        }
+
+        // Join the policy evaluation thread (uses policy_evaluator_ + stores,
+        // so it must stop before any of them are torn down)
+        if (policy_eval_thread_.joinable()) {
+            policy_eval_thread_.join();
+        }
+
+        // Join the result-set maintenance thread (borrows result_set_store_,
+        // execution_tracker_, response_store_ — must stop before teardown)
+        if (result_set_maint_thread_.joinable()) {
+            result_set_maint_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -1082,8 +1943,43 @@ public:
             web_thread_.join();
         }
 
-        // Release Phase 2 components before closing shared DB
-        // Release Phase 2 components before closing shared DB (RAII handles close)
+        // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
+        // reset further down. Detached delivery threads continue past
+        // process exit's perspective but get a fair chance to finish
+        // before the SQLite handle goes away. flush_all() spawns a final
+        // round of detached deliveries; we don't join them, but the
+        // buffer state is consistent (RESTART-1 from Gate 6 SRE).
+        if (offload_target_store_) {
+            offload_target_store_->flush_all();
+        }
+
+        // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
+        // ManagementService streams drain before we drop the stores they
+        // reference. Without a deadline, Shutdown() waits indefinitely for
+        // all RPCs to finish, and the Subscribe RPC is a long-lived
+        // bidirectional stream that never completes on its own. With a
+        // deadline, RPCs are forcibly cancelled at expiry.
+        //
+        // Governance round (UAT 2026-05-06 architect Gate 3 B-1):
+        // AgentServiceImpl borrows execution_tracker_ via a raw pointer
+        // (set_execution_tracker), and Subscribe/process_gateway_response
+        // call notify_exec_tracker -> update_agent_status on every
+        // CommandResponse frame. Resetting execution_tracker_ before the
+        // gRPC drain race-windowed a use-after-free during graceful
+        // shutdown. Drain producers first, null the borrowed pointer
+        // explicitly, then release the tracker.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        if (agent_server_)
+            agent_server_->Shutdown(deadline);
+        if (mgmt_server_)
+            mgmt_server_->Shutdown(deadline);
+
+        // Now safe: gRPC streams have either completed or been cancelled,
+        // so no thread is inside notify_exec_tracker holding the borrowed
+        // pointer. Null it before reset for belt-and-braces.
+        agent_service_.set_execution_tracker(nullptr);
+
+        // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
         // but in the explicit reset path we drop the tracker first
@@ -1092,16 +1988,6 @@ public:
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
-
-        // Shutdown with a deadline — without one, Shutdown() waits
-        // indefinitely for all RPCs to finish.  The Subscribe RPC is a
-        // long-lived bidirectional stream that never completes on its own,
-        // so a bare Shutdown() hangs forever.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
     }
 
 private:
@@ -1152,7 +2038,8 @@ private:
                 return nullptr;
             }
             spdlog::warn("{} TLS running without client certificate verification "
-                         "(--insecure-skip-client-verify)", listener_name);
+                         "(--insecure-skip-client-verify)",
+                         listener_name);
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
@@ -1230,8 +2117,7 @@ private:
     // Used by instruction editor routes. YAML helpers are also duplicated in
     // settings_routes.cpp (anonymous namespace) for the settings YAML preview.
 
-    static std::string highlight_yaml_value(const std::string& val,
-                                             const std::string& key = {}) {
+    static std::string highlight_yaml_value(const std::string& val, const std::string& key = {}) {
         if (val.empty())
             return {};
         auto trimmed = val;
@@ -1246,14 +2132,17 @@ private:
             return "<span class=\"yact\">" + html_escape(val) + "</span>";
         if (key == "approval" && (trimmed == "required" || trimmed == "\"required\""))
             return "<span class=\"yar\">" + html_escape(val) + "</span>";
-        if (key == "concurrency" && (trimmed == "single" || trimmed == "serial"
-                                     || trimmed == "\"single\"" || trimmed == "\"serial\""))
+        if (key == "concurrency" && (trimmed == "single" || trimmed == "serial" ||
+                                     trimmed == "\"single\"" || trimmed == "\"serial\""))
             return "<span class=\"ycc\">" + html_escape(val) + "</span>";
         if (trimmed == "true" || trimmed == "false" || trimmed == "True" || trimmed == "False")
             return "<span class=\"yb\">" + html_escape(val) + "</span>";
         bool is_number = !trimmed.empty();
         for (char c : trimmed) {
-            if (c != '-' && c != '.' && (c < '0' || c > '9')) { is_number = false; break; }
+            if (c != '-' && c != '.' && (c < '0' || c > '9')) {
+                is_number = false;
+                break;
+            }
         }
         if (is_number && !trimmed.empty())
             return "<span class=\"yn\">" + html_escape(val) + "</span>";
@@ -1262,10 +2151,12 @@ private:
 
     static std::string highlight_yaml_kv(const std::string& line) {
         std::size_t i = 0;
-        while (i < line.size() && line[i] == ' ') ++i;
+        while (i < line.size() && line[i] == ' ')
+            ++i;
         auto key_start = i;
         while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) ||
-                                   line[i] == '_' || line[i] == '-' || line[i] == '.')) ++i;
+                                   line[i] == '_' || line[i] == '-' || line[i] == '.'))
+            ++i;
         if (i >= line.size() || line[i] != ':' || i == key_start)
             return html_escape(line);
         auto indent = line.substr(0, key_start);
@@ -1273,8 +2164,8 @@ private:
         auto rest = line.substr(i + 1);
         bool is_schema = (key == "apiVersion" || key == "kind");
         std::string key_cls = is_schema ? "ya" : "yk";
-        return html_escape(indent) + "<span class=\"" + key_cls + "\">" +
-               html_escape(key) + "</span>:" + highlight_yaml_value(rest, key);
+        return html_escape(indent) + "<span class=\"" + key_cls + "\">" + html_escape(key) +
+               "</span>:" + highlight_yaml_value(rest, key);
     }
 
     static std::string highlight_yaml(std::string_view source) {
@@ -1285,21 +2176,36 @@ private:
         while (pos <= source.size()) {
             auto nl = source.find('\n', pos);
             std::string line;
-            if (nl == std::string_view::npos) { line = std::string(source.substr(pos)); pos = source.size() + 1; }
-            else { line = std::string(source.substr(pos, nl - pos)); pos = nl + 1; }
-            result += "<div class=\"yl\"><span class=\"ln\">" + std::to_string(line_num++) + "</span>";
+            if (nl == std::string_view::npos) {
+                line = std::string(source.substr(pos));
+                pos = source.size() + 1;
+            } else {
+                line = std::string(source.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+            result +=
+                "<div class=\"yl\"><span class=\"ln\">" + std::to_string(line_num++) + "</span>";
             auto trimmed_start = line.find_first_not_of(' ');
-            if (trimmed_start == std::string::npos) { result += "&nbsp;"; }
-            else if (line[trimmed_start] == '#') { result += "<span class=\"yc\">" + html_escape(line) + "</span>"; }
-            else if (line == "---" || line == "...") { result += "<span class=\"yd\">" + html_escape(line) + "</span>"; }
-            else if (line[trimmed_start] == '-' && trimmed_start + 1 < line.size() && line[trimmed_start + 1] == ' ') {
+            if (trimmed_start == std::string::npos) {
+                result += "&nbsp;";
+            } else if (line[trimmed_start] == '#') {
+                result += "<span class=\"yc\">" + html_escape(line) + "</span>";
+            } else if (line == "---" || line == "...") {
+                result += "<span class=\"yd\">" + html_escape(line) + "</span>";
+            } else if (line[trimmed_start] == '-' && trimmed_start + 1 < line.size() &&
+                       line[trimmed_start + 1] == ' ') {
                 auto indent2 = line.substr(0, trimmed_start);
                 auto after_dash = line.substr(trimmed_start + 2);
                 result += html_escape(indent2) + "<span class=\"yd\">-</span> ";
-                if (after_dash.find(':') != std::string::npos) result += highlight_yaml_kv(after_dash);
-                else result += highlight_yaml_value(after_dash);
-            } else if (line.find(':') != std::string::npos) { result += highlight_yaml_kv(line); }
-            else { result += html_escape(line); }
+                if (after_dash.find(':') != std::string::npos)
+                    result += highlight_yaml_kv(after_dash);
+                else
+                    result += highlight_yaml_value(after_dash);
+            } else if (line.find(':') != std::string::npos) {
+                result += highlight_yaml_kv(line);
+            } else {
+                result += html_escape(line);
+            }
             result += "</div>";
         }
         return result;
@@ -1307,11 +2213,16 @@ private:
 
     static std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
         std::vector<std::string> errors;
-        if (yaml_source.empty()) errors.push_back("YAML source is empty");
-        if (yaml_source.find("apiVersion:") == std::string::npos) errors.push_back("Missing apiVersion field");
-        if (yaml_source.find("kind:") == std::string::npos) errors.push_back("Missing kind field");
-        if (yaml_source.find("plugin:") == std::string::npos) errors.push_back("Missing spec.plugin field");
-        if (yaml_source.find("action:") == std::string::npos) errors.push_back("Missing spec.action field");
+        if (yaml_source.empty())
+            errors.push_back("YAML source is empty");
+        if (yaml_source.find("apiVersion:") == std::string::npos)
+            errors.push_back("Missing apiVersion field");
+        if (yaml_source.find("kind:") == std::string::npos)
+            errors.push_back("Missing kind field");
+        if (yaml_source.find("plugin:") == std::string::npos)
+            errors.push_back("Missing spec.plugin field");
+        if (yaml_source.find("action:") == std::string::npos)
+            errors.push_back("Missing spec.action field");
         return errors;
     }
 
@@ -1367,15 +2278,15 @@ private:
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id) {
-        return auth_routes_->require_scoped_permission(req, res, securable_type, operation, agent_id);
+        return auth_routes_->require_scoped_permission(req, res, securable_type, operation,
+                                                       agent_id);
     }
 
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
         if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-            bool global_read =
-                rbac_store_->check_permission(username, "Infrastructure", "Read");
+            bool global_read = rbac_store_->check_permission(username, "Infrastructure", "Read");
             if (!global_read) {
                 auto visible = mgmt_group_store_->get_visible_agents(username);
                 std::set<std::string> visible_set(visible.begin(), visible.end());
@@ -1428,8 +2339,7 @@ private:
                 auto* stub = gw_mgmt_stub_.get();
                 auto* svc = &agent_service_;
                 auto cmd_id = gp.cmd.command_id();
-                spdlog::debug("Forwarding command {} to gateway for agent {}",
-                              cmd_id, gp.agent_id);
+                spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
                 std::thread([stub, svc, gp = std::move(gp), cmd_id]() {
                     ::yuzu::server::v1::SendCommandRequest req;
                     req.add_agent_ids(gp.agent_id);
@@ -1439,14 +2349,14 @@ private:
                     // Retry up to 3 times on transient connection failures
                     for (int attempt = 0; attempt < 3; ++attempt) {
                         if (attempt > 0) {
-                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})",
-                                         cmd_id, attempt + 1);
+                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
+                                         attempt + 1);
                             std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
                         }
 
                         grpc::ClientContext ctx;
-                        ctx.set_deadline(
-                            std::chrono::system_clock::now() + std::chrono::seconds(300));
+                        ctx.set_deadline(std::chrono::system_clock::now() +
+                                         std::chrono::seconds(300));
                         auto reader = stub->SendCommand(&ctx, req);
 
                         ::yuzu::server::v1::SendCommandResponse resp;
@@ -1457,22 +2367,19 @@ private:
                         }
                         auto status = reader->Finish();
                         if (status.ok()) {
-                            spdlog::debug(
-                                "Gateway SendCommand for {} completed: {} response(s)",
-                                cmd_id, resp_count);
-                            return;  // success — done
+                            spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
+                                          cmd_id, resp_count);
+                            return; // success — done
                         }
                         // Only retry on UNAVAILABLE (connection refused / not ready)
                         if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-                            spdlog::warn(
-                                "Gateway SendCommand RPC for {} failed: {} ({})",
-                                cmd_id, status.error_message(),
-                                static_cast<int>(status.error_code()));
-                            return;  // non-transient error — don't retry
+                            spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
+                                         status.error_message(),
+                                         static_cast<int>(status.error_code()));
+                            return; // non-transient error — don't retry
                         }
-                        spdlog::warn(
-                            "Gateway SendCommand for {} unavailable (attempt {}): {}",
-                            cmd_id, attempt + 1, status.error_message());
+                        spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
+                                     cmd_id, attempt + 1, status.error_message());
                     }
                     spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
                 }).detach();
@@ -1487,9 +2394,10 @@ private:
 
         // Build the sync command with all 4 structured category values
         ::yuzu::agent::v1::CommandRequest cmd;
-        cmd.set_command_id("asset-tag-sync-" + std::to_string(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()));
+        cmd.set_command_id("asset-tag-sync-" +
+                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count()));
         cmd.set_plugin("asset_tags");
         cmd.set_action("sync");
 
@@ -1513,19 +2421,60 @@ private:
 
     // -- Cookie/audit/event helpers: thin delegation wrappers to AuthRoutes --
 
-    std::string session_cookie_attrs() const {
-        return auth_routes_->session_cookie_attrs();
-    }
+    std::string session_cookie_attrs() const { return auth_routes_->session_cookie_attrs(); }
 
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
                                 const std::string& result) {
         return auth_routes_->make_audit_event(req, action, result);
     }
 
-    void audit_log(const httplib::Request& req, const std::string& action,
-                   const std::string& result, const std::string& target_type = {},
-                   const std::string& target_id = {}, const std::string& detail = {}) {
-        auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
+    // `[[nodiscard]]` per #1073 R2 governance / PR #883 SOC 2 CC7.2 pattern:
+    // callers on security-relevant paths MUST inspect the return and signal
+    // audit-write failure to the operator (e.g. `Sec-Audit-Failed: true`
+    // header). Silently discarding the return on a denied/success path
+    // re-opens the evidence-chain gap whose closure was the whole point of
+    // PR #883 and which Gate 4 unhappy-path UP-1/UP-11 re-flagged on the
+    // import handler. Non-security audits (config.update, custom_property.*,
+    // tag.*, etc.) may still discard with explicit `(void)` cast.
+    [[nodiscard]] bool audit_log(const httplib::Request& req, const std::string& action,
+                                 const std::string& result, const std::string& target_type = {},
+                                 const std::string& target_id = {},
+                                 const std::string& detail = {}) {
+        return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
+    }
+
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly. Carries the dispatch/instruction correlation id (command_id),
+    // the result-set ref, principal + role, and reason — the forensic chain the
+    // design §10 walkthrough requires (gov C-B1/F1). Also increments a
+    // Prometheus counter so the failure is alertable rather than buried in
+    // audit.db (gov OBS-2), and logs at warn so a signal survives even when the
+    // audit write itself fails (gov OBS-3 / F3 / UP-2).
+    void audit_scope_resolution_failed(const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& ref) {
+        metrics_.counter("yuzu_scope_resolution_failed_total").increment();
+        spdlog::warn("scope resolution failed: command={} principal={} ref={} "
+                     "(result set absent, expired, or not owned)",
+                     command_id, principal.empty() ? "unknown" : principal, ref);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED command=" + command_id + " ref=" + ref +
+                    " reason=result set not found, expired, or not owned by principal";
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: instruction.scope_resolution_failed "
+                          "(command={} ref={})",
+                          command_id, ref);
     }
 
     // Apply stored runtime config overrides on startup
@@ -1633,59 +2582,108 @@ private:
         web_server_->set_write_timeout(30);
 
         // -- Auth middleware (pre-routing) -----------------------------------
-        web_server_->set_pre_routing_handler(
-            [this](const httplib::Request& req,
-                   httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Lightweight probes — always allowed, no auth, no rate limit
-                if (req.path == "/livez" || req.path == "/readyz") {
-                    return httplib::Server::HandlerResponse::Unhandled;
-                }
-
-                // Rate limiting — check before auth to protect against brute force
-                bool is_login = (req.path == "/login" && req.method == "POST");
-                auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
-                if (!limiter.allow(req.remote_addr)) {
-                    res.status = 429;
-                    res.set_header("Retry-After", "1");
-                    res.set_content(R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})", "application/json");
-                    return httplib::Server::HandlerResponse::Handled;
-                }
-
-                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
-                if (req.path == "/login" || req.path == "/health" ||
-                    req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                    req.path == "/api/v1/openapi.json" ||
-                    req.path.starts_with("/static/")) {
-                    return httplib::Server::HandlerResponse::Unhandled;
-                }
-
-                // /metrics: localhost always unauthenticated; remote depends on config
-                if (req.path == "/metrics") {
-                    if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
-                        return httplib::Server::HandlerResponse::Unhandled;
-                    }
-                    if (!cfg_.metrics_require_auth) {
-                        return httplib::Server::HandlerResponse::Unhandled;
-                    }
-                    // Remote callers fall through to normal auth check below
-                }
-
-                auto session = auth_routes_->resolve_session(req);
-
-                if (!session) {
-                    // API calls and MCP endpoint get 401 JSON, pages get redirect
-                    if (req.path.starts_with("/api/") || req.path == "/events" ||
-                        req.path.starts_with("/mcp/")) {
-                        res.status = 401;
-                        res.set_content(R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})", "application/json");
-                    } else {
-                        res.set_redirect("/login");
-                    }
-                    return httplib::Server::HandlerResponse::Handled;
-                }
-
+        web_server_->set_pre_routing_handler([this](const httplib::Request& req,
+                                                    httplib::Response& res)
+                                                 -> httplib::Server::HandlerResponse {
+            // Lightweight probes — always allowed, no auth, no rate limit.
+            // /health and /api/health are included here (governance Gate 7,
+            // unhappy-path UP-1) so monitoring integrations behind a NAT or
+            // sharing a source-IP bucket with authed REST traffic cannot
+            // 429-starve the health probe. The endpoints themselves are
+            // strictly read-only and documented as unauthenticated.
+            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
+                req.path == "/api/health") {
                 return httplib::Server::HandlerResponse::Unhandled;
-            });
+            }
+
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            // `/login/mfa/stepup` joins this bucket (PR2): the endpoint
+            // accepts the same TOTP / recovery code space as `/login/mfa`
+            // so a malicious operator with a stolen valid session could
+            // pound the space to brute-force the secret. Step-up has no
+            // per-pending-token attempts cap (the session IS the
+            // credential), so the per-IP rate limit is the only brake.
+            // `/login/mfa/enroll` joins it too (PR3): it confirms the first
+            // code against a provisional TOTP secret during enforced
+            // enrollment, so it is the same online-guessing surface and
+            // must not fall through to the looser bucket.
+            bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
+                             req.path == "/login/mfa/stepup" ||
+                             req.path == "/login/mfa/enroll") &&
+                            req.method == "POST";
+            auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
+            if (!limiter.allow(req.remote_addr)) {
+                res.status = 429;
+                res.set_header("Retry-After", "1");
+                res.set_content(
+                    R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
+            // /health and /api/health are ALSO covered by the early-return
+            // exemption at the top of this lambda (which additionally skips
+            // rate limiting). They are kept in this list as defense-in-depth
+            // — a future contributor narrowing the early-return back to
+            // /livez|/readyz alone would silently start requiring auth on
+            // /health without this lower entry. Governance Gate 7, security
+            // re-review LOW. Do not remove either site without updating both.
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            // `/login/mfa/enroll` (PR3) is also pre-session: it completes
+            // an enforced login for an un-enrolled user who has only the
+            // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
+            // is deliberately NOT here — it requires an existing session.)
+            if (req.path == "/login" || req.path == "/login/mfa" ||
+                req.path == "/login/mfa/enroll" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path.starts_with("/static/")) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+
+            // /metrics: localhost always unauthenticated; remote depends on config
+            if (req.path == "/metrics") {
+                if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+                if (!cfg_.metrics_require_auth) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+                // Remote callers fall through to normal auth check below
+            }
+
+            auto session = auth_routes_->resolve_session(req);
+
+            if (!session) {
+                // API calls and MCP endpoint get 401 JSON, pages get redirect
+                if (req.path.starts_with("/api/") || req.path == "/events" ||
+                    req.path.starts_with("/mcp/")) {
+                    res.status = 401;
+                    res.set_content(
+                        R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else {
+                    res.set_redirect("/login");
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
         auth_routes_->register_routes(*web_server_);
@@ -1703,54 +2701,46 @@ private:
         // Server::create was called.
         const auto security_headers =
             security::HeaderBundle::make(cfg_.csp_extra_sources, cfg_.https_enabled);
-        spdlog::info(
-            "Security headers active: CSP={} bytes, HSTS={}, "
-            "Referrer-Policy=\"{}\", Permissions-Policy={} bytes",
-            security_headers.csp.size(),
-            security_headers.https_enabled ? "on" : "off",
-            security_headers.referrer_policy,
-            security_headers.permissions_policy.size());
+        spdlog::info("Security headers active: CSP={} bytes, HSTS={}, "
+                     "Referrer-Policy=\"{}\", Permissions-Policy={} bytes",
+                     security_headers.csp.size(), security_headers.https_enabled ? "on" : "off",
+                     security_headers.referrer_policy, security_headers.permissions_policy.size());
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
-        web_server_->set_post_routing_handler(
-            [this, security_headers](
-                const httplib::Request& req, httplib::Response& res) {
-                // -- Security response headers (SOC2-C1) ---------------------
-                // Applied to ALL responses (dashboard, API, metrics, health,
-                // error pages).
-                security_headers.apply(res);
+        web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
+                                                                       httplib::Response& res) {
+            // -- Security response headers (SOC2-C1) ---------------------
+            // Applied to ALL responses (dashboard, API, metrics, health,
+            // error pages).
+            security_headers.apply(res);
 
-                // CORS headers for all /api/ responses (H6)
-                // Only reflect Origin if it matches the server's own origin
-                // to prevent credentialed cross-origin attacks.
-                if (req.path.starts_with("/api/")) {
-                    auto origin = req.get_header_value("Origin");
-                    if (!origin.empty()) {
-                        auto scheme = cfg_.https_enabled ? "https" : "http";
-                        auto port = cfg_.https_enabled ? cfg_.https_port : cfg_.web_port;
-                        auto self_origin =
-                            std::format("{}://{}:{}", scheme, cfg_.web_address, port);
-                        auto localhost_origin =
-                            std::format("{}://localhost:{}", scheme, port);
-                        auto loopback_origin =
-                            std::format("{}://127.0.0.1:{}", scheme, port);
-                        if (origin == self_origin || origin == localhost_origin ||
-                            origin == loopback_origin) {
-                            res.set_header("Access-Control-Allow-Origin", origin);
-                            res.set_header("Access-Control-Allow-Credentials", "true");
-                        }
+            // CORS headers for all /api/ responses (H6)
+            // Only reflect Origin if it matches the server's own origin
+            // to prevent credentialed cross-origin attacks.
+            if (req.path.starts_with("/api/")) {
+                auto origin = req.get_header_value("Origin");
+                if (!origin.empty()) {
+                    auto scheme = cfg_.https_enabled ? "https" : "http";
+                    auto port = cfg_.https_enabled ? cfg_.https_port : cfg_.web_port;
+                    auto self_origin = std::format("{}://{}:{}", scheme, cfg_.web_address, port);
+                    auto localhost_origin = std::format("{}://localhost:{}", scheme, port);
+                    auto loopback_origin = std::format("{}://127.0.0.1:{}", scheme, port);
+                    if (origin == self_origin || origin == localhost_origin ||
+                        origin == loopback_origin) {
+                        res.set_header("Access-Control-Allow-Origin", origin);
+                        res.set_header("Access-Control-Allow-Credentials", "true");
                     }
-                    res.set_header("Access-Control-Allow-Methods",
-                                   "GET, POST, PUT, DELETE, OPTIONS");
-                    res.set_header("Access-Control-Allow-Headers",
-                                   "Content-Type, Authorization, X-Yuzu-Token");
-                    res.set_header("Access-Control-Max-Age", "86400");
                 }
+                res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+                res.set_header("Access-Control-Allow-Headers",
+                               "Content-Type, Authorization, X-Yuzu-Token");
+                res.set_header("Access-Control-Max-Age", "86400");
+            }
 
-                metrics_
-                    .counter("yuzu_http_requests_total",
-                             {{"method", req.method}, {"status", std::to_string(res.status)}})
-                    .increment();
-            });
+            metrics_
+                .counter("yuzu_http_requests_total",
+                         {{"method", req.method}, {"status", std::to_string(res.status)}})
+                .increment();
+        });
 
         // -- Prometheus metrics endpoint ----------------------------------------
         web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
@@ -1765,96 +2755,126 @@ private:
         });
 
         // -- Health endpoint (7.2) ------------------------------------------------
-        web_server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+        // Mounted on both /health and /api/health (issue #620). The /api alias
+        // exists so monitoring integrations that prefix every REST call with
+        // /api/ keep working — a side-effect of #401's move from /api/health → /health.
+        auto health_handler = [this](const httplib::Request& req, httplib::Response& res) {
+            // Resolve auth FIRST so we can gate expensive work on it.
+            // Governance Gate 7 round 2 (security MEDIUM): /health and
+            // /api/health are rate-limit-exempt for monitoring stability;
+            // the bounded but non-trivial work below (SQLite scans on
+            // pending-agents and execution_tracker) must only run for
+            // authenticated callers, otherwise an unauth flood becomes a
+            // DoS amplification primitive. Unauth callers get the cheap
+            // probe response — status, uptime, agent count from in-memory
+            // registry, store ok flags from is_open() (constant-time member
+            // checks), and version. Authed callers additionally get
+            // pending-agent count, execution stats, and process sampler.
+            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
+
             auto now = std::chrono::steady_clock::now();
-            auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
-                                  now - server_start_time_)
-                                  .count();
+            auto uptime_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(now - server_start_time_).count();
 
-            // Agent counts
+            // Cheap: in-memory agent registry count.
             auto online = registry_.agent_count();
-            auto pending_agents = auth_mgr_.list_pending_agents();
-            int pending_count = 0;
-            for (const auto& a : pending_agents) {
-                if (a.status == auth::PendingStatus::pending)
-                    ++pending_count;
-            }
 
-            // Store health
+            // Store health — is_open() is a constant-time member check, no DB I/O.
             auto response_ok = response_store_ && response_store_->is_open();
             auto audit_ok = audit_store_ && audit_store_->is_open();
             auto instruction_ok = instruction_store_ && instruction_store_->is_open();
             auto policy_ok = policy_store_ && policy_store_->is_open();
-
-            // Execution stats
-            int in_flight = 0;
-            int completed_last_hour = 0;
-            int failed_last_hour = 0;
-            if (execution_tracker_) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                in_flight = static_cast<int>(running.size());
-                auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-                auto hour_ago = now_epoch - 3600;
-                auto recent = execution_tracker_->query_executions({.limit = 1000});
-                for (const auto& e : recent) {
-                    if (e.completed_at >= hour_ago) {
-                        if (e.status == "completed")
-                            ++completed_last_hour;
-                        else if (e.status == "failed")
-                            ++failed_last_hour;
-                    }
-                }
-            }
-
             // Guardian store is load-bearing for the /api/v1/guaranteed-state/*
             // surface; prior to inclusion here /healthz reported "healthy" while
             // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+            // Guardian Baselines store — load-bearing for the Baseline dashboard +
+            // deploy surface; same rationale as the Guard store row above.
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
+            // Phase 8.3 #255 — same pattern as Guardian above. Without
+            // this row /healthz would report "healthy" while every
+            // /api/v1/offload-targets endpoint and every fire_event call
+            // silently no-ops on a migration failure (HC-1 from Gate 6).
+            bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
 
             // Determine overall status
-            bool all_stores_ok =
-                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
+            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
                 {"status", status},
                 {"uptime_seconds", uptime_sec},
-                {"agents",
-                 {{"online", online}, {"pending", pending_count}}},
+                {"agents", {{"online", online}}}, // pending added below for authed callers
                 {"stores",
                  {{"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
-                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"}}},
-                {"executions",
-                 {{"in_flight", in_flight},
-                  {"completed_last_hour", completed_last_hour},
-                  {"failed_last_hour", failed_last_hour}}},
+                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
+                  {"baselines", baseline_ok ? "ok" : "error"},
+                  {"offload_target", offload_target_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
                 {"version", std::string(yuzu::kVersionString)}};
 
-            // Process health (22.1) — only include for authenticated requests
-            // to avoid leaking process internals to unauthenticated callers.
-            // Check auth without returning 401 (health probe must stay open).
-            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
+            // Authenticated extension — heavier work, only run when the caller
+            // has a session. Adds: agents.pending (SQLite scan), executions.*
+            // (SQLite scan + 1h-window loop), system.* (process_health_sampler).
             if (is_authenticated) {
+                auto pending_agents = auth_mgr_.list_pending_agents();
+                int pending_count = 0;
+                for (const auto& a : pending_agents) {
+                    if (a.status == auth::PendingStatus::pending)
+                        ++pending_count;
+                }
+                health["agents"]["pending"] = pending_count;
+
+                int in_flight = 0;
+                int completed_last_hour = 0;
+                int failed_last_hour = 0;
+                if (execution_tracker_) {
+                    auto running = execution_tracker_->query_executions({.status = "running"});
+                    in_flight = static_cast<int>(running.size());
+                    auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+                    auto hour_ago = now_epoch - 3600;
+                    auto recent = execution_tracker_->query_executions({.limit = 1000});
+                    for (const auto& e : recent) {
+                        if (e.completed_at >= hour_ago) {
+                            if (e.status == "completed")
+                                ++completed_last_hour;
+                            else if (e.status == "failed")
+                                ++failed_last_hour;
+                        }
+                    }
+                }
+                health["executions"] = {{"in_flight", in_flight},
+                                        {"completed_last_hour", completed_last_hour},
+                                        {"failed_last_hour", failed_last_hour}};
+
+                // Process health (22.1) — leaks process internals so
+                // intentionally authenticated-only.
                 auto ph = process_health_sampler_.sample();
-                health["system"] = {
-                    {"cpu_percent", ph.cpu_percent},
-                    {"memory_rss_bytes", static_cast<int64_t>(ph.memory_rss_bytes)},
-                    {"memory_vss_bytes", static_cast<int64_t>(ph.memory_vss_bytes)},
-                    {"grpc_connections", static_cast<int>(online)},
-                    {"command_queue_depth", in_flight}};
+                health["system"] = {{"cpu_percent", ph.cpu_percent},
+                                    {"memory_rss_bytes", static_cast<int64_t>(ph.memory_rss_bytes)},
+                                    {"memory_vss_bytes", static_cast<int64_t>(ph.memory_vss_bytes)},
+                                    {"grpc_connections", static_cast<int>(online)},
+                                    {"command_queue_depth", in_flight}};
             }
 
             res.set_content(health.dump(), "application/json");
-        });
+        };
+        // Both URLs MUST be served by the SAME handler instance — do not split
+        // into two lambda bodies. The unauthenticated `system.*` gating above
+        // is load-bearing and must run identically on both routes; forking the
+        // body invites a future regression where the alias diverges in subtle
+        // ways. Governance Gate 7, architect NICE-2.
+        web_server_->Get("/health", health_handler);
+        web_server_->Get("/api/health", health_handler);
 
         // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
         web_server_->Get("/livez", [](const httplib::Request&, httplib::Response& res) {
@@ -1883,16 +2903,15 @@ private:
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},
-                {"management_group_store",
-                 mgmt_group_store_ && mgmt_group_store_->is_open()},
-                {"runtime_config_store",
-                 runtime_config_store_ && runtime_config_store_->is_open()},
+                {"management_group_store", mgmt_group_store_ && mgmt_group_store_->is_open()},
+                {"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()},
                 {"inventory_store", inventory_store_ && inventory_store_->is_open()},
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
                  guaranteed_state_store_ && guaranteed_state_store_->is_open()},
+                {"baseline_store", baseline_store_ && baseline_store_->is_open()},
                 // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
                 // legacy config-file-only deployments (auth_db_ == nullptr
                 // in AuthManager) and false only when an opted-in AuthDB
@@ -1900,6 +2919,44 @@ private:
                 // an operator can detect a corrupt auth.db without scraping
                 // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
                 {"auth_db", auth_mgr_.is_auth_db_ok()},
+                // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
+                // and the AgentService fan-out path. A migration failure
+                // would silently no-op all offload deliveries while the
+                // probe reported "ready" (HC-1 gap from Gate 6 SRE).
+                {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
+                // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
+                // load-bearing in this batch — AgentServiceImpl's
+                // notify_exec_tracker calls update_agent_status on every
+                // CommandResponse frame. The tracker has no is_open() of
+                // its own; it shares the instructions DB pool. We probe
+                // the pointer (nullptr means the pool failed to construct)
+                // AND the underlying instr_db_pool_ explicitly, so a
+                // pool-open failure surfaces as /readyz=503 rather than a
+                // silent no-op on every response.
+                {"execution_tracker",
+                 execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // gov R3 HC-1: FleetTopologyStore became load-bearing for
+                // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
+                // Pure in-memory store with no is_open(); pointer-not-null is
+                // the right probe. Without this, a store-construction failure
+                // would leave /readyz "ready" while every viz request 503s.
+                {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
+                // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
+                // that fails to open AND `--allow-unsigned-packs` set produces
+                // a silent half-state — the audit row at startup says "unsigned
+                // packs allowed" but every install returns 503 because the
+                // store is dead. Without this readyz entry, an LB or operator
+                // dashboard would not detect the half-state. Pairs with the
+                // workflow_routes.cpp install handler's `is_open()` guard.
+                {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
+                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
+                // scoped command dispatch and the /api/scope/estimate preview
+                // resolve from_result_set: aliases and owner-check membership
+                // against it. A failed migration / corrupt result_sets.db would
+                // silently degrade every scoped dispatch to zero targets while
+                // /readyz reported "ready".
+                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
             };
 
             std::string failed_list;
@@ -1917,453 +2974,468 @@ private:
                 res.set_content(R"({"status":"ready"})", "application/json");
             } else {
                 res.status = 503;
-                res.set_content("{\"status\":\"not ready\",\"failed_stores\":[" +
-                                    failed_list + "]}",
+                res.set_content("{\"status\":\"not ready\",\"failed_stores\":[" + failed_list +
+                                    "]}",
                                 "application/json");
             }
         });
 
         // -- Health summary dashboard fragment (7.2) ----------------------------
-        web_server_->Get("/fragments/health/summary",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session)
-                                 return;
+        web_server_->Get("/fragments/health/summary", [this](const httplib::Request& req,
+                                                             httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
 
-                             auto now = std::chrono::steady_clock::now();
-                             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
-                                                   now - server_start_time_)
-                                                   .count();
+            auto now = std::chrono::steady_clock::now();
+            auto uptime_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(now - server_start_time_).count();
 
-                             // Store health
-                             bool response_ok = response_store_ && response_store_->is_open();
-                             bool audit_ok = audit_store_ && audit_store_->is_open();
-                             bool instruction_ok = instruction_store_ && instruction_store_->is_open();
-                             bool policy_ok = policy_store_ && policy_store_->is_open();
-                             bool guaranteed_state_ok =
-                                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
-                             bool all_ok = response_ok && audit_ok && instruction_ok &&
-                                           policy_ok && guaranteed_state_ok;
+            // Store health
+            bool response_ok = response_store_ && response_store_->is_open();
+            bool audit_ok = audit_store_ && audit_store_->is_open();
+            bool instruction_ok = instruction_store_ && instruction_store_->is_open();
+            bool policy_ok = policy_store_ && policy_store_->is_open();
+            bool guaranteed_state_ok =
+                guaranteed_state_store_ && guaranteed_state_store_->is_open();
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
+            bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+                          guaranteed_state_ok && baseline_ok;
 
-                             // Execution stats
-                             int in_flight = 0;
-                             if (execution_tracker_) {
-                                 auto running = execution_tracker_->query_executions({.status = "running"});
-                                 in_flight = static_cast<int>(running.size());
-                             }
+            // Execution stats
+            int in_flight = 0;
+            if (execution_tracker_) {
+                auto running = execution_tracker_->query_executions({.status = "running"});
+                in_flight = static_cast<int>(running.size());
+            }
 
-                             // Format uptime
-                             auto days = uptime_sec / 86400;
-                             auto hours = (uptime_sec % 86400) / 3600;
-                             auto mins = (uptime_sec % 3600) / 60;
-                             std::string uptime_str;
-                             if (days > 0)
-                                 uptime_str = std::to_string(days) + "d " + std::to_string(hours) + "h";
-                             else if (hours > 0)
-                                 uptime_str = std::to_string(hours) + "h " + std::to_string(mins) + "m";
-                             else
-                                 uptime_str = std::to_string(mins) + "m";
+            // Format uptime
+            auto days = uptime_sec / 86400;
+            auto hours = (uptime_sec % 86400) / 3600;
+            auto mins = (uptime_sec % 3600) / 60;
+            std::string uptime_str;
+            if (days > 0)
+                uptime_str = std::to_string(days) + "d " + std::to_string(hours) + "h";
+            else if (hours > 0)
+                uptime_str = std::to_string(hours) + "h " + std::to_string(mins) + "m";
+            else
+                uptime_str = std::to_string(mins) + "m";
 
-                             auto online = registry_.agent_count();
+            auto online = registry_.agent_count();
 
-                             // Process health for dashboard
-                             auto ph = process_health_sampler_.sample();
-                             auto rss_mb = ph.memory_rss_bytes / (1024 * 1024);
-                             char cpu_buf[16];
-                             std::snprintf(cpu_buf, sizeof(cpu_buf), "%.1f", ph.cpu_percent);
+            // Process health for dashboard
+            auto ph = process_health_sampler_.sample();
+            auto rss_mb = ph.memory_rss_bytes / (1024 * 1024);
+            char cpu_buf[16];
+            std::snprintf(cpu_buf, sizeof(cpu_buf), "%.1f", ph.cpu_percent);
 
-                             // Only render the strip if there are issues
-                             if (all_ok && in_flight == 0) {
-                                 // Minimal healthy summary
-                                 std::string html =
-                                     "<div class=\"health-strip health-ok\" "
-                                     "style=\"display:flex;gap:1.5rem;align-items:center;"
-                                     "padding:0.4rem 1rem;background:var(--surface-1);"
-                                     "border-left:3px solid var(--green);border-radius:4px;"
-                                     "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">"
-                                     "<span>Server healthy</span>"
-                                     "<span>Uptime: " + uptime_str + "</span>"
-                                     "<span>Agents online: " + std::to_string(online) + "</span>"
-                                     "<span>CPU: " + std::string(cpu_buf) + "%</span>"
-                                     "<span>Mem: " + std::to_string(rss_mb) + " MB</span>"
-                                     "</div>";
-                                 res.set_content(html, "text/html; charset=utf-8");
-                                 return;
-                             }
+            // Only render the strip if there are issues
+            if (all_ok && in_flight == 0) {
+                // Minimal healthy summary
+                std::string html =
+                    "<div class=\"health-strip health-ok\" "
+                    "style=\"display:flex;gap:1.5rem;align-items:center;"
+                    "padding:0.4rem 1rem;background:var(--surface-1);"
+                    "border-left:3px solid var(--green);border-radius:4px;"
+                    "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">"
+                    "<span>Server healthy</span>"
+                    "<span>Uptime: " +
+                    uptime_str +
+                    "</span>"
+                    "<span>Agents online: " +
+                    std::to_string(online) +
+                    "</span>"
+                    "<span>CPU: " +
+                    std::string(cpu_buf) +
+                    "%</span>"
+                    "<span>Mem: " +
+                    std::to_string(rss_mb) +
+                    " MB</span>"
+                    "</div>";
+                res.set_content(html, "text/html; charset=utf-8");
+                return;
+            }
 
-                             // Degraded or busy — show warning strip
-                             std::string html =
-                                 "<div class=\"health-strip health-warn\" "
-                                 "style=\"display:flex;gap:1.5rem;align-items:center;"
-                                 "padding:0.4rem 1rem;background:var(--surface-1);"
-                                 "border-left:3px solid var(--yellow);border-radius:4px;"
-                                 "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">";
+            // Degraded or busy — show warning strip
+            std::string html =
+                "<div class=\"health-strip health-warn\" "
+                "style=\"display:flex;gap:1.5rem;align-items:center;"
+                "padding:0.4rem 1rem;background:var(--surface-1);"
+                "border-left:3px solid var(--yellow);border-radius:4px;"
+                "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">";
 
-                             if (!all_ok) {
-                                 html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
-                                 if (!response_ok) html += "responses ";
-                                 if (!audit_ok) html += "audit ";
-                                 if (!instruction_ok) html += "instructions ";
-                                 if (!policy_ok) html += "policies ";
-                                 html += "</span>";
-                             }
+            if (!all_ok) {
+                html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
+                if (!response_ok)
+                    html += "responses ";
+                if (!audit_ok)
+                    html += "audit ";
+                if (!instruction_ok)
+                    html += "instructions ";
+                if (!policy_ok)
+                    html += "policies ";
+                html += "</span>";
+            }
 
-                             html += "<span>Uptime: " + uptime_str + "</span>";
-                             html += "<span>Agents: " + std::to_string(online) + "</span>";
-                             html += "<span>CPU: " + std::string(cpu_buf) + "%</span>";
-                             html += "<span>Mem: " + std::to_string(rss_mb) + " MB</span>";
-                             if (in_flight > 0)
-                                 html += "<span>In-flight: " + std::to_string(in_flight) + "</span>";
+            html += "<span>Uptime: " + uptime_str + "</span>";
+            html += "<span>Agents: " + std::to_string(online) + "</span>";
+            html += "<span>CPU: " + std::string(cpu_buf) + "%</span>";
+            html += "<span>Mem: " + std::to_string(rss_mb) + " MB</span>";
+            if (in_flight > 0)
+                html += "<span>In-flight: " + std::to_string(in_flight) + "</span>";
 
-                             html += "</div>";
-                             res.set_content(html, "text/html; charset=utf-8");
-                         });
+            html += "</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+        });
 
         // -- Runtime Configuration API (7.3) ------------------------------------
-        web_server_->Get("/api/config",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
+        web_server_->Get("/api/config", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
 
-                             nlohmann::json config_obj;
-                             // Current effective values (from cfg_ + overrides)
-                             config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
-                             config_obj["response_retention_days"] = cfg_.response_retention_days;
-                             config_obj["audit_retention_days"] = cfg_.audit_retention_days;
-                             config_obj["guardian_event_retention_days"] =
-                                 cfg_.guardian_event_retention_days;
-                             config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
-                             config_obj["log_level"] = spdlog::level::to_string_view(
-                                                           spdlog::default_logger()->level())
-                                                           .data();
+            nlohmann::json config_obj;
+            // Current effective values (from cfg_ + overrides)
+            config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
+            config_obj["response_retention_days"] = cfg_.response_retention_days;
+            config_obj["audit_retention_days"] = cfg_.audit_retention_days;
+            config_obj["guardian_event_retention_days"] = cfg_.guardian_event_retention_days;
+            config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
+            config_obj["log_level"] =
+                spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
-                             // Overrides from store
-                             nlohmann::json overrides = nlohmann::json::object();
-                             if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                                 auto entries = runtime_config_store_->get_all();
-                                 for (const auto& e : entries) {
-                                     overrides[e.key] = {{"value", e.value},
-                                                         {"updated_by", e.updated_by},
-                                                         {"updated_at", e.updated_at}};
-                                 }
-                             }
+            // Overrides from store
+            nlohmann::json overrides = nlohmann::json::object();
+            if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                auto entries = runtime_config_store_->get_all();
+                for (const auto& e : entries) {
+                    overrides[e.key] = {{"value", e.value},
+                                        {"updated_by", e.updated_by},
+                                        {"updated_at", e.updated_at}};
+                }
+            }
 
-                             nlohmann::json allowed = nlohmann::json::array();
-                             for (const auto& k : RuntimeConfigStore::allowed_keys())
-                                 allowed.push_back(k);
+            nlohmann::json allowed = nlohmann::json::array();
+            for (const auto& k : RuntimeConfigStore::allowed_keys())
+                allowed.push_back(k);
 
-                             res.set_content(
-                                 nlohmann::json({{"config", config_obj},
-                                                 {"overrides", overrides},
-                                                 {"allowed_keys", allowed}})
-                                     .dump(),
-                                 "application/json");
-                         });
+            res.set_content(
+                nlohmann::json(
+                    {{"config", config_obj}, {"overrides", overrides}, {"allowed_keys", allowed}})
+                    .dump(),
+                "application/json");
+        });
 
-        web_server_->Put(R"(/api/config/([a-z_]+))",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Write"))
-                                 return;
-                             if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
-                                 res.status = 503;
-                                 res.set_content(R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+        web_server_->Put(R"(/api/config/([a-z_]+))", [this](const httplib::Request& req,
+                                                            httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Write"))
+                return;
+            if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto key = req.matches[1].str();
-                             std::string value;
-                             try {
-                                 auto j = nlohmann::json::parse(req.body);
-                                 if (j.contains("value"))
-                                     value = j["value"].is_string() ? j["value"].get<std::string>()
-                                                                     : j["value"].dump();
-                                 else {
-                                     res.status = 400;
-                                     res.set_content(R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
-                                                     "application/json");
-                                     return;
-                                 }
-                             } catch (...) {
-                                 res.status = 400;
-                                 res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+            auto key = req.matches[1].str();
+            std::string value;
+            try {
+                auto j = nlohmann::json::parse(req.body);
+                if (j.contains("value"))
+                    value =
+                        j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
+                else {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+            } catch (...) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             // Validate integer-typed keys BEFORE persisting so a
-                             // non-numeric or negative value does not silently land
-                             // in RuntimeConfigStore while leaving cfg_ at the old
-                             // value (the prior `try { stoi } catch (...) {}` path
-                             // was a ghost-write: store persists, cfg ignores,
-                             // operator sees 200 with no effect). UP-R5 from the
-                             // Guardian PR 2 governance re-run.
-                             const bool is_int_key =
-                                 key == "heartbeat_timeout" ||
-                                 key == "response_retention_days" ||
-                                 key == "audit_retention_days" ||
-                                 key == "guardian_event_retention_days";
-                             int parsed_int = 0;
-                             if (is_int_key) {
-                                 auto first = value.data();
-                                 auto last = value.data() + value.size();
-                                 auto [ptr, ec] = std::from_chars(first, last, parsed_int);
-                                 if (ec != std::errc{} || ptr != last || parsed_int < 0) {
-                                     res.status = 400;
-                                     res.set_content(
-                                         R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})",
-                                         "application/json");
-                                     return;
-                                 }
-                             }
+            // Validate integer-typed keys BEFORE persisting so a
+            // non-numeric or negative value does not silently land
+            // in RuntimeConfigStore while leaving cfg_ at the old
+            // value (the prior `try { stoi } catch (...) {}` path
+            // was a ghost-write: store persists, cfg ignores,
+            // operator sees 200 with no effect). UP-R5 from the
+            // Guardian PR 2 governance re-run.
+            const bool is_int_key =
+                key == "heartbeat_timeout" || key == "response_retention_days" ||
+                key == "audit_retention_days" || key == "guardian_event_retention_days";
+            int parsed_int = 0;
+            if (is_int_key) {
+                auto first = value.data();
+                auto last = value.data() + value.size();
+                auto [ptr, ec] = std::from_chars(first, last, parsed_int);
+                if (ec != std::errc{} || ptr != last || parsed_int < 0) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+            }
 
-                             // Get username from session
-                             auto session = require_auth(req, res);
-                             if (!session)
-                                 return;
+            // Get username from session
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
 
-                             auto result = runtime_config_store_->set(key, value, session->username);
-                             if (!result) {
-                                 res.status = 400;
-                                 res.set_content(
-                                     nlohmann::json({{"error", result.error()}}).dump(),
-                                     "application/json");
-                                 return;
-                             }
+            auto result = runtime_config_store_->set(key, value, session->username);
+            if (!result) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                "application/json");
+                return;
+            }
 
-                             // Apply the change to in-memory config. Integer keys
-                             // parsed above; direct assignment here means no
-                             // second `try { stoi }` that could swallow errors.
-                             if (key == "heartbeat_timeout") {
-                                 cfg_.session_timeout = std::chrono::seconds(parsed_int);
-                             } else if (key == "response_retention_days") {
-                                 cfg_.response_retention_days = parsed_int;
-                             } else if (key == "audit_retention_days") {
-                                 cfg_.audit_retention_days = parsed_int;
-                             } else if (key == "guardian_event_retention_days") {
-                                 cfg_.guardian_event_retention_days = parsed_int;
-                             }
-                             // log_level is applied inside RuntimeConfigStore::set()
+            // Apply the change to in-memory config. Integer keys
+            // parsed above; direct assignment here means no
+            // second `try { stoi }` that could swallow errors.
+            if (key == "heartbeat_timeout") {
+                cfg_.session_timeout = std::chrono::seconds(parsed_int);
+            } else if (key == "response_retention_days") {
+                cfg_.response_retention_days = parsed_int;
+            } else if (key == "audit_retention_days") {
+                cfg_.audit_retention_days = parsed_int;
+            } else if (key == "guardian_event_retention_days") {
+                cfg_.guardian_event_retention_days = parsed_int;
+            }
+            // log_level is applied inside RuntimeConfigStore::set()
 
-                             audit_log(req, "config.update", "success", "RuntimeConfig", key,
-                                       "value=" + value);
+            (void)audit_log(req, "config.update", "success", "RuntimeConfig", key,
+                            "value=" + value);
 
-                             res.set_content(
-                                 nlohmann::json({{"key", key}, {"value", value}, {"applied", true}})
-                                     .dump(),
-                                 "application/json");
-                         });
+            res.set_content(
+                nlohmann::json({{"key", key}, {"value", value}, {"applied", true}}).dump(),
+                "application/json");
+        });
 
         // -- Custom Properties API (7.6) ----------------------------------------
 
         // GET /api/agents/:id/properties
-        web_server_->Get(R"(/api/agents/([^/]+)/properties)",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                                 res.status = 503;
-                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+        web_server_->Get(R"(/api/agents/([^/]+)/properties)", [this](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto agent_id = req.matches[1].str();
-                             auto props = custom_properties_store_->get_properties(agent_id);
-                             nlohmann::json arr = nlohmann::json::array();
-                             for (const auto& p : props) {
-                                 arr.push_back({{"key", p.key},
-                                                {"value", p.value},
-                                                {"type", p.type},
-                                                {"updated_at", p.updated_at}});
-                             }
-                             res.set_content(
-                                 nlohmann::json({{"agent_id", agent_id}, {"properties", arr}}).dump(),
-                                 "application/json");
-                         });
+            auto agent_id = req.matches[1].str();
+            auto props = custom_properties_store_->get_properties(agent_id);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& p : props) {
+                arr.push_back({{"key", p.key},
+                               {"value", p.value},
+                               {"type", p.type},
+                               {"updated_at", p.updated_at}});
+            }
+            res.set_content(nlohmann::json({{"agent_id", agent_id}, {"properties", arr}}).dump(),
+                            "application/json");
+        });
 
         // PUT /api/agents/:id/properties/:key
-        web_server_->Put(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Write"))
-                                 return;
-                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                                 res.status = 503;
-                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+        web_server_->Put(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))", [this](
+                                                                                     const httplib::
+                                                                                         Request&
+                                                                                             req,
+                                                                                     httplib::
+                                                                                         Response&
+                                                                                             res) {
+            if (!require_permission(req, res, "Infrastructure", "Write"))
+                return;
+            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto agent_id = req.matches[1].str();
-                             auto key = req.matches[2].str();
+            auto agent_id = req.matches[1].str();
+            auto key = req.matches[2].str();
 
-                             std::string value;
-                             std::string type = "string";
-                             try {
-                                 auto j = nlohmann::json::parse(req.body);
-                                 if (j.contains("value"))
-                                     value = j["value"].is_string() ? j["value"].get<std::string>()
-                                                                     : j["value"].dump();
-                                 else {
-                                     res.status = 400;
-                                     res.set_content(R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
-                                                     "application/json");
-                                     return;
-                                 }
-                                 if (j.contains("type") && j["type"].is_string())
-                                     type = j["type"].get<std::string>();
-                             } catch (...) {
-                                 res.status = 400;
-                                 res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+            std::string value;
+            std::string type = "string";
+            try {
+                auto j = nlohmann::json::parse(req.body);
+                if (j.contains("value"))
+                    value =
+                        j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
+                else {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                if (j.contains("type") && j["type"].is_string())
+                    type = j["type"].get<std::string>();
+            } catch (...) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto result =
-                                 custom_properties_store_->set_property(agent_id, key, value, type);
-                             if (!result) {
-                                 res.status = 400;
-                                 res.set_content(
-                                     nlohmann::json({{"error", result.error()}}).dump(),
-                                     "application/json");
-                                 return;
-                             }
+            auto result = custom_properties_store_->set_property(agent_id, key, value, type);
+            if (!result) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                "application/json");
+                return;
+            }
 
-                             audit_log(req, "custom_property.set", "success", "Agent", agent_id,
-                                       key + "=" + value);
+            (void)audit_log(req, "custom_property.set", "success", "Agent", agent_id,
+                            key + "=" + value);
 
-                             res.set_content(
-                                 nlohmann::json(
-                                     {{"agent_id", agent_id}, {"key", key}, {"value", value}, {"type", type}})
-                                     .dump(),
-                                 "application/json");
-                         });
+            res.set_content(
+                nlohmann::json(
+                    {{"agent_id", agent_id}, {"key", key}, {"value", value}, {"type", type}})
+                    .dump(),
+                "application/json");
+        });
 
         // DELETE /api/agents/:id/properties/:key
-        web_server_->Delete(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
-                            [this](const httplib::Request& req, httplib::Response& res) {
-                                if (!require_permission(req, res, "Infrastructure", "Write"))
-                                    return;
-                                if (!custom_properties_store_ ||
-                                    !custom_properties_store_->is_open()) {
-                                    res.status = 503;
-                                    res.set_content(
-                                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                                        "application/json");
-                                    return;
-                                }
+        web_server_->Delete(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))", [this](
+                                                                                        const httplib::
+                                                                                            Request&
+                                                                                                req,
+                                                                                        httplib::
+                                                                                            Response&
+                                                                                                res) {
+            if (!require_permission(req, res, "Infrastructure", "Write"))
+                return;
+            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                                auto agent_id = req.matches[1].str();
-                                auto key = req.matches[2].str();
+            auto agent_id = req.matches[1].str();
+            auto key = req.matches[2].str();
 
-                                bool deleted =
-                                    custom_properties_store_->delete_property(agent_id, key);
-                                if (!deleted) {
-                                    res.status = 404;
-                                    res.set_content(R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
-                                                    "application/json");
-                                    return;
-                                }
+            bool deleted = custom_properties_store_->delete_property(agent_id, key);
+            if (!deleted) {
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                                audit_log(req, "custom_property.delete", "success", "Agent",
-                                          agent_id, "key=" + key);
+            (void)audit_log(req, "custom_property.delete", "success", "Agent", agent_id,
+                            "key=" + key);
 
-                                res.set_content(
-                                    nlohmann::json({{"deleted", true}, {"key", key}}).dump(),
-                                    "application/json");
-                            });
+            res.set_content(nlohmann::json({{"deleted", true}, {"key", key}}).dump(),
+                            "application/json");
+        });
 
         // GET /api/property-schemas
-        web_server_->Get("/api/property-schemas",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                                 res.status = 503;
-                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                                                 "application/json");
-                                 return;
-                             }
+        web_server_->Get("/api/property-schemas", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto schemas = custom_properties_store_->list_schemas();
-                             nlohmann::json arr = nlohmann::json::array();
-                             for (const auto& s : schemas) {
-                                 arr.push_back({{"key", s.key},
-                                                {"display_name", s.display_name},
-                                                {"type", s.type},
-                                                {"description", s.description},
-                                                {"validation_regex", s.validation_regex}});
-                             }
-                             res.set_content(nlohmann::json({{"schemas", arr}}).dump(),
-                                             "application/json");
-                         });
+            auto schemas = custom_properties_store_->list_schemas();
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& s : schemas) {
+                arr.push_back({{"key", s.key},
+                               {"display_name", s.display_name},
+                               {"type", s.type},
+                               {"description", s.description},
+                               {"validation_regex", s.validation_regex}});
+            }
+            res.set_content(nlohmann::json({{"schemas", arr}}).dump(), "application/json");
+        });
 
         // POST /api/property-schemas
-        web_server_->Post("/api/property-schemas",
-                          [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_permission(req, res, "Infrastructure", "Write"))
-                                  return;
-                              if (!custom_properties_store_ ||
-                                  !custom_properties_store_->is_open()) {
-                                  res.status = 503;
-                                  res.set_content(
-                                      R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                                      "application/json");
-                                  return;
-                              }
+        web_server_->Post("/api/property-schemas", [this](const httplib::Request& req,
+                                                          httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Write"))
+                return;
+            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                              CustomPropertySchema schema;
-                              try {
-                                  auto j = nlohmann::json::parse(req.body);
-                                  schema.key = j.value("key", "");
-                                  schema.display_name = j.value("display_name", "");
-                                  schema.type = j.value("type", "string");
-                                  schema.description = j.value("description", "");
-                                  schema.validation_regex = j.value("validation_regex", "");
-                              } catch (...) {
-                                  res.status = 400;
-                                  res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                                                  "application/json");
-                                  return;
-                              }
+            CustomPropertySchema schema;
+            try {
+                auto j = nlohmann::json::parse(req.body);
+                schema.key = j.value("key", "");
+                schema.display_name = j.value("display_name", "");
+                schema.type = j.value("type", "string");
+                schema.description = j.value("description", "");
+                schema.validation_regex = j.value("validation_regex", "");
+            } catch (...) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                              if (schema.key.empty()) {
-                                  res.status = 400;
-                                  res.set_content(R"({"error":{"code":400,"message":"'key' is required"},"meta":{"api_version":"v1"}})",
-                                                  "application/json");
-                                  return;
-                              }
+            if (schema.key.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"'key' is required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                              auto result = custom_properties_store_->upsert_schema(schema);
-                              if (!result) {
-                                  res.status = 400;
-                                  res.set_content(
-                                      nlohmann::json({{"error", result.error()}}).dump(),
-                                      "application/json");
-                                  return;
-                              }
+            auto result = custom_properties_store_->upsert_schema(schema);
+            if (!result) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                "application/json");
+                return;
+            }
 
-                              audit_log(req, "property_schema.create", "success",
-                                        "PropertySchema", schema.key);
+            (void)audit_log(req, "property_schema.create", "success", "PropertySchema", schema.key);
 
-                              res.status = 201;
-                              res.set_content(
-                                  nlohmann::json({{"key", schema.key},
-                                                  {"display_name", schema.display_name},
-                                                  {"type", schema.type},
-                                                  {"description", schema.description},
-                                                  {"validation_regex", schema.validation_regex}})
-                                      .dump(),
-                                  "application/json");
-                          });
+            res.status = 201;
+            res.set_content(nlohmann::json({{"key", schema.key},
+                                            {"display_name", schema.display_name},
+                                            {"type", schema.type},
+                                            {"description", schema.description},
+                                            {"validation_regex", schema.validation_regex}})
+                                .dump(),
+                            "application/json");
+        });
 
         // -- Current user info (/api/me) --------------------------------------
         web_server_->Get("/api/me", [this](const httplib::Request& req, httplib::Response& res) {
             auto session = require_auth(req, res);
             if (!session)
                 return;
-            auto j = nlohmann::json({{"username", session->username},
-                                     {"role", auth::role_to_string(session->role)}});
+            auto j = nlohmann::json(
+                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
@@ -2372,7 +3444,8 @@ private:
                     j["rbac_role"] = roles[0].role_name;
                 } else {
                     // Fallback: map legacy role to RBAC role name
-                    j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
+                    j["rbac_role"] =
+                        session->role == auth::Role::admin ? "Administrator" : "Viewer";
                 }
             } else {
                 j["rbac_enabled"] = false;
@@ -2386,28 +3459,22 @@ private:
         // active dev/UAT is picked up on a normal browser reload. The bundle
         // is ~22 KB; revalidation cost is negligible. Switch back to
         // max-age + content-hashed URL for prod once the skin stabilises.
-        web_server_->Get("/static/yuzu.css",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control",
-                                            "no-cache, no-store, must-revalidate");
-                             res.set_content(yuzu::server::kYuzuCss,
-                                             "text/css; charset=utf-8");
-                         });
-        web_server_->Get("/static/icons.svg",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=3600");
-                             res.set_content(kYuzuIconsSvg, "image/svg+xml");
-                         });
-        web_server_->Get("/static/htmx.js",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=86400");
-                             res.set_content(kHtmxJs, "application/javascript; charset=utf-8");
-                         });
-        web_server_->Get("/static/sse.js",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=86400");
-                             res.set_content(kSseJs, "application/javascript; charset=utf-8");
-                         });
+        web_server_->Get("/static/yuzu.css", [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(yuzu::server::kYuzuCss, "text/css; charset=utf-8");
+        });
+        web_server_->Get("/static/icons.svg", [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=3600");
+            res.set_content(kYuzuIconsSvg, "image/svg+xml");
+        });
+        web_server_->Get("/static/htmx.js", [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(kHtmxJs, "application/javascript; charset=utf-8");
+        });
+        web_server_->Get("/static/sse.js", [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(kSseJs, "application/javascript; charset=utf-8");
+        });
         // Issue #253: response visualization renderer.
         // /static/echarts.min.js is the vendored Apache ECharts 5 library
         // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
@@ -2415,36 +3482,90 @@ private:
         // Yuzu design-system CSS tokens for theming. Both are cached aggressively
         // because the bundle is content-addressed by binary version.
         web_server_->Get(
-            "/static/echarts.min.js",
-            [](const httplib::Request&, httplib::Response& res) {
+            "/static/echarts.min.js", [](const httplib::Request&, httplib::Response& res) {
                 res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kEChartsJs,
-                                "application/javascript; charset=utf-8");
+                res.set_content(yuzu::server::kEChartsJs, "application/javascript; charset=utf-8");
             });
+
+        // PR 4 of feat/viz-engine: vendored Three.js r168 (MIT) + OrbitControls
+        // (MIT, ES module). Modern Three.js (r150+) ships only as ES modules,
+        // so PR 5's page scaffold loads these via `<script type="importmap">`
+        // mapping `"three"` to `/static/three.module.min.js` and
+        // `"three/addons/controls/OrbitControls.js"` to
+        // `/static/three-orbit-controls.js`. Cache-Control matches the
+        // ECharts pattern: public, max-age=86400, content-addressed by
+        // server binary version.
+        web_server_->Get(
+            "/static/three.module.min.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
+            });
+        web_server_->Get("/static/three-orbit-controls.js",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=86400");
+                             res.set_content(yuzu::server::kThreeOrbitControlsJs,
+                                             "application/javascript; charset=utf-8");
+                         });
+        // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
+        // type="module" so it can resolve the `import 'three'` bare
+        // specifier through the importmap declared in viz_page_ui.cpp.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate -- matches the
+        // /viz/fleet page shell. The renderer bundles change on every
+        // feat/viz-engine PR; a `max-age` here means operators serve a
+        // stale renderer (wrong tier classification, missing features,
+        // outdated layout code) for up to the max-age window after a
+        // server upgrade, with no signal that anything is wrong. The page
+        // shell already revalidates; the bundle it pulls must too, or the
+        // skew window just moves from the HTML to the JS. ~88 KB of
+        // revalidated body per page load is cheap next to a silently-stale
+        // renderer. Vendored libs below (cytoscape, three) keep max-age --
+        // they're content-stable and only change on a deliberate refresh.
+        web_server_->Get(
+            "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+                res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
+            });
+
+        // PR 9-pre: per-host renderer + vendored Cytoscape.js 3.33.3 (MIT).
+        // yuzu-viz-host.js is the ES module entry; cytoscape.min.js is the
+        // ESM minified Cytoscape bundle resolved via the importmap in
+        // viz_host_page_ui.cpp. The renderer uses cytoscape's built-in
+        // `cose` layout — no layout-extension asset is served.
+        //
+        // yuzu-viz-host.js gets the same no-cache treatment as yuzu-viz.js
+        // (it's our renderer code, changes every viz PR); cytoscape.min.js
+        // keeps max-age (vendored, content-stable).
+        web_server_->Get("/static/yuzu-viz-host.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
+        });
+        web_server_->Get("/static/cytoscape.min.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
+        });
         // Inter variable webfont (SIL OFL) — the Yuzu design system's
         // default family. Single woff2 covers all weights via font-
         // variation-settings on the @font-face declaration in
         // css_bundle.cpp.
-        web_server_->Get(
-            "/static/fonts/InterVariable.woff2",
-            [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=2592000, immutable");
-                // Zero-copy: pass the byte view's data+size directly so we
-                // don't allocate a 345 KB std::string per fetch. (Gate 3
-                // cpp-S1.) httplib's set_content(const char*, size_t, ...)
-                // copies into the response buffer once.
-                res.set_content(yuzu::server::kInterVariableWoff2.data(),
-                                yuzu::server::kInterVariableWoff2.size(),
-                                "font/woff2");
-            });
+        web_server_->Get("/static/fonts/InterVariable.woff2", [](const httplib::Request&,
+                                                                 httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=2592000, immutable");
+            // Zero-copy: pass the byte view's data+size directly so we
+            // don't allocate a 345 KB std::string per fetch. (Gate 3
+            // cpp-S1.) httplib's set_content(const char*, size_t, ...)
+            // copies into the response buffer once.
+            res.set_content(yuzu::server::kInterVariableWoff2.data(),
+                            yuzu::server::kInterVariableWoff2.size(), "font/woff2");
+        });
 
-        web_server_->Get(
-            "/static/yuzu-charts.js",
-            [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kYuzuChartsJs,
-                                "application/javascript; charset=utf-8");
-            });
+        web_server_->Get("/static/yuzu-charts.js", [](const httplib::Request&,
+                                                      httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(yuzu::server::kYuzuChartsJs, "application/javascript; charset=utf-8");
+        });
 
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
@@ -2452,6 +3573,29 @@ private:
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
+
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // both surfaces atomically). Hoisted to the top of start_web_server
+        // because SettingsRoutes::register_routes (called just below) and
+        // RestApiV1::register_routes (called later in this same function)
+        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement);
+        };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
@@ -2470,21 +3614,17 @@ private:
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
                    const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                (void)audit_log(req, action, result, target_type, target_id, detail);
             },
-            cfg_, auth_mgr_, auto_approve_,
-            api_token_store_.get(),
-            mgmt_group_store_.get(),
-            tag_store_.get(),
-            update_registry_.get(),
-            runtime_config_store_.get(),
-            audit_store_.get(),
-            gateway_service_ != nullptr,
-            gateway_service_ ? SettingsRoutes::GatewaySessionCountFn(
-                [this]() -> std::size_t { return gateway_service_->session_count(); })
-                : SettingsRoutes::GatewaySessionCountFn{},
-            [this]() -> std::string { return registry_.to_json(); },
-            oidc_mu_, oidc_provider_);
+            cfg_, auth_mgr_, auto_approve_, api_token_store_.get(), mgmt_group_store_.get(),
+            tag_store_.get(), update_registry_.get(), runtime_config_store_.get(),
+            audit_store_.get(), gateway_service_ != nullptr,
+            gateway_service_ ? SettingsRoutes::GatewaySessionCountFn([this]() -> std::size_t {
+                return gateway_service_->session_count();
+            })
+                             : SettingsRoutes::GatewaySessionCountFn{},
+            [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
+            /*metrics_registry=*/&metrics_, step_up_fn);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -2527,13 +3667,14 @@ private:
 
         // -- Agent listing API ------------------------------------------------
 
-        web_server_->Get("/api/agents", [this](const httplib::Request& req, httplib::Response& res) {
+        web_server_->Get("/api/agents", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
             if (!require_permission(req, res, "Infrastructure", "Read"))
                 return;
             auto session = require_auth(req, res);
-            if (!session) return;
-            res.set_content(get_visible_agents_json(session->username).dump(),
-                            "application/json");
+            if (!session)
+                return;
+            res.set_content(get_visible_agents_json(session->username).dump(), "application/json");
         });
 
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
@@ -2545,33 +3686,45 @@ private:
         });
 
         // Help table HTML fragment (HTMX)
-        web_server_->Get("/api/help/html", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            std::string filter;
-            if (req.has_param("filter")) filter = req.get_param_value("filter");
-            res.set_content(registry_.help_html(filter), "text/html");
-        });
+        web_server_->Get("/api/help/html",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             std::string filter;
+                             if (req.has_param("filter"))
+                                 filter = req.get_param_value("filter");
+                             res.set_content(registry_.help_html(filter), "text/html");
+                         });
 
         // Autocomplete HTML fragment (HTMX)
-        web_server_->Get("/api/help/autocomplete", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            std::string q;
-            if (req.has_param("q")) q = req.get_param_value("q");
-            if (q.empty()) { res.set_content("", "text/html"); return; }
-            res.set_content(registry_.autocomplete_html(q), "text/html");
-        });
+        web_server_->Get("/api/help/autocomplete",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             std::string q;
+                             if (req.has_param("q"))
+                                 q = req.get_param_value("q");
+                             if (q.empty()) {
+                                 res.set_content("", "text/html");
+                                 return;
+                             }
+                             res.set_content(registry_.autocomplete_html(q), "text/html");
+                         });
 
         // Command palette instruction search HTML fragment (HTMX)
-        web_server_->Get("/api/help/palette", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            std::string q;
-            if (req.has_param("q")) q = req.get_param_value("q");
-            if (q.empty()) { res.set_content("", "text/html"); return; }
-            res.set_content(registry_.palette_html(q), "text/html");
-        });
+        web_server_->Get("/api/help/palette",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             std::string q;
+                             if (req.has_param("q"))
+                                 q = req.get_param_value("q");
+                             if (q.empty()) {
+                                 res.set_content("", "text/html");
+                                 return;
+                             }
+                             res.set_content(registry_.palette_html(q), "text/html");
+                         });
 
         // -- NVD CVE feed endpoints -------------------------------------------
 
@@ -2595,19 +3748,21 @@ private:
                              res.set_content(j.dump(), "application/json");
                          });
 
-        web_server_->Post(
-            "/api/nvd/sync", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Infrastructure", "Execute"))
-                    return;
-                if (!nvd_sync_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                // Run sync in a detached thread so we don't block the HTTP response
-                std::thread([this] { nvd_sync_->sync_now(); }).detach();
-                res.set_content(R"({"status":"sync_started"})", "application/json");
-            });
+        web_server_->Post("/api/nvd/sync", [this](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Execute"))
+                return;
+            if (!nvd_sync_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            // Run sync in a detached thread so we don't block the HTTP response
+            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            res.set_content(R"({"status":"sync_started"})", "application/json");
+        });
 
         web_server_->Post("/api/nvd/match", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
@@ -2615,7 +3770,9 @@ private:
                 return;
             if (!nvd_db_ || !nvd_db_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
             // Parse inventory: array of {name, version} or pipe-delimited lines
@@ -2633,7 +3790,9 @@ private:
                 }
             } catch (...) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2663,8 +3822,9 @@ private:
 
             if (plugin.empty() || action.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"plugin and action are required"},"meta":{"api_version":"v1"}})",
-                                "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"plugin and action are required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2674,7 +3834,9 @@ private:
 
             if (!registry_.has_any()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2697,8 +3859,10 @@ private:
             // Stagger/delay: prevent thundering herd on large-fleet dispatch
             auto stagger = extract_json_int(req.body, "stagger", 0);
             auto delay = extract_json_int(req.body, "delay", 0);
-            if (stagger > 0) cmd.set_stagger_seconds(stagger);
-            if (delay > 0) cmd.set_delay_seconds(delay);
+            if (stagger > 0)
+                cmd.set_stagger_seconds(stagger);
+            if (delay > 0)
+                cmd.set_delay_seconds(delay);
 
             agent_service_.record_send_time(command_id);
 
@@ -2712,12 +3876,30 @@ private:
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
                     for (const auto& m : members) {
-                        if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                        if (registry_.send_to(m.agent_id, cmd))
+                            ++sent;
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal, principal_role;
+                if (auto s = require_auth(req, res)) {
+                    principal = s->username;
+                    principal_role = auth::role_to_string(s->role);
+                }
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -2725,7 +3907,9 @@ private:
                         "application/json");
                     return;
                 }
-                auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
+                auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -2747,32 +3931,31 @@ private:
 
             if (sent == 0) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
-                                "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
             metrics_.counter("yuzu_commands_dispatched_total").increment();
-            event_bus_.publish("command-status",
-                "<span id=\"status-badge\" class=\"badge-running\""
-                " hx-swap-oob=\"outerHTML\">RUNNING</span>");
+            event_bus_.publish("command-status", "<span id=\"status-badge\" class=\"badge-running\""
+                                                 " hx-swap-oob=\"outerHTML\">RUNNING</span>");
             spdlog::info("Command dispatched: {}:{} → {} agent(s)", plugin, action, sent);
-            audit_log(req, "command.dispatch", "success", "command", command_id,
-                      plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
+            (void)audit_log(req, "command.dispatch", "success", "command", command_id,
+                            plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
             emit_event("command.dispatched", req, {{"target_count", sent}},
                        {{"plugin", plugin},
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header("HX-Trigger",
-                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
-                " agent(s)\",\"level\":\"success\"}}");
+            res.set_header("HX-Trigger", "{\"showToast\":{\"message\":\"Command sent to " +
+                                             std::to_string(sent) +
+                                             " agent(s)\",\"level\":\"success\"}}");
             res.set_content(
-                nlohmann::json(
-                    {{"status", "sent"},
-                     {"command_id", command_id},
-                     {"agents_reached", sent},
-                     {"thead_html", agent_service_.thead_for_plugin(plugin)}})
+                nlohmann::json({{"status", "sent"},
+                                {"command_id", command_id},
+                                {"agents_reached", sent},
+                                {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
         });
@@ -2827,7 +4010,9 @@ private:
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2863,7 +4048,9 @@ private:
                     filter.until = std::stoll(req.get_param_value("until"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2895,7 +4082,9 @@ private:
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2915,7 +4104,9 @@ private:
                     q.limit = 10000; // higher default for exports
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2965,13 +4156,17 @@ private:
             auto instruction_id = req.matches[1].str();
             if (instruction_id.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"instruction_id required"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"instruction_id required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -2991,7 +4186,9 @@ private:
                     q.offset = std::stoi(req.get_param_value("offset"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3018,7 +4215,9 @@ private:
 
             if (!audit_store_ || !audit_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"audit store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"audit store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3042,7 +4241,9 @@ private:
                     q.offset = std::stoi(req.get_param_value("offset"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3075,14 +4276,18 @@ private:
 
             if (!tag_store_ || !tag_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
             auto agent_id = req.get_param_value("agent_id");
             if (agent_id.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"agent_id parameter required"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"agent_id parameter required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3098,109 +4303,123 @@ private:
                             "application/json");
         });
 
-        web_server_->Post(
-            "/api/tags/set", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Tag", "Write"))
-                    return;
-                if (!tag_store_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Post("/api/tags/set", [this](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!require_permission(req, res, "Tag", "Write"))
+                return;
+            if (!tag_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto agent_id = extract_json_string(req.body, "agent_id");
-                auto key = extract_json_string(req.body, "key");
-                auto value = extract_json_string(req.body, "value");
+            auto agent_id = extract_json_string(req.body, "agent_id");
+            auto key = extract_json_string(req.body, "key");
+            auto value = extract_json_string(req.body, "value");
 
-                if (agent_id.empty() || key.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+            if (agent_id.empty() || key.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                if (!TagStore::validate_key(key)) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"invalid tag key"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+            if (!TagStore::validate_key(key)) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid tag key"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                tag_store_->set_tag(agent_id, key, value, "api");
-                if (key == "service")
-                    ensure_service_management_group(value);
-                // Push updated tags to agent if a structured category changed
-                // Case-insensitive: API may receive "Role" but kCategoryKeys are lowercase
-                {
-                    std::string lower_key = key;
-                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                        [](unsigned char c) { return std::tolower(c); });
-                    for (auto cat_key : kCategoryKeys) {
-                        if (cat_key == lower_key) {
-                            push_asset_tags_to_agent(agent_id);
-                            break;
-                        }
+            tag_store_->set_tag(agent_id, key, value, "api");
+            if (key == "service")
+                ensure_service_management_group(value);
+            // Push updated tags to agent if a structured category changed
+            // Case-insensitive: API may receive "Role" but kCategoryKeys are lowercase
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        push_asset_tags_to_agent(agent_id);
+                        break;
                     }
                 }
-                audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+            }
+            (void)audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Tag updated","level":"success"}})");
+            res.set_content(R"({"status":"ok"})", "application/json");
+        });
+
+        web_server_->Post("/api/tags/delete", [this](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            if (!require_permission(req, res, "Tag", "Delete"))
+                return;
+            if (!tag_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+
+            auto agent_id = extract_json_string(req.body, "agent_id");
+            auto key = extract_json_string(req.body, "key");
+
+            if (agent_id.empty() || key.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+
+            bool deleted = tag_store_->delete_tag(agent_id, key);
+            (void)audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
+                            agent_id + ":" + key);
+            if (deleted) {
                 res.set_header("HX-Trigger",
-                    R"({"showToast":{"message":"Tag updated","level":"success"}})");
-                res.set_content(R"({"status":"ok"})", "application/json");
-            });
+                               R"({"showToast":{"message":"Tag deleted","level":"success"}})");
+            }
+            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+        });
 
-        web_server_->Post(
-            "/api/tags/delete", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Tag", "Delete"))
-                    return;
-                if (!tag_store_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Post("/api/tags/query", [this](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            if (!require_permission(req, res, "Tag", "Read"))
+                return;
+            if (!tag_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto agent_id = extract_json_string(req.body, "agent_id");
-                auto key = extract_json_string(req.body, "key");
+            auto key = extract_json_string(req.body, "key");
+            auto value = extract_json_string(req.body, "value");
 
-                if (agent_id.empty() || key.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+            if (key.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"key required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                bool deleted = tag_store_->delete_tag(agent_id, key);
-                audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
-                          agent_id + ":" + key);
-                if (deleted) {
-                    res.set_header("HX-Trigger",
-                        R"({"showToast":{"message":"Tag deleted","level":"success"}})");
-                }
-                res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
-            });
-
-        web_server_->Post(
-            "/api/tags/query", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Tag", "Read"))
-                    return;
-                if (!tag_store_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-
-                auto key = extract_json_string(req.body, "key");
-                auto value = extract_json_string(req.body, "value");
-
-                if (key.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"key required"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-
-                auto agents = tag_store_->agents_with_tag(key, value);
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& a : agents)
-                    arr.push_back(a);
-                res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
+            auto agents = tag_store_->agents_with_tag(key, value);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& a : agents)
+                arr.push_back(a);
+            res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
+                            "application/json");
+        });
 
         // -- Help page --------------------------------------------------------
         web_server_->Get("/help", [](const httplib::Request&, httplib::Response& res) {
@@ -3213,15 +4432,325 @@ private:
         // RBAC; loading the page unauthenticated would just produce a blank
         // shell that immediately redirects on first fragment request. Mirror
         // the /instructions pattern.
-        web_server_->Get("/tar",
+        web_server_->Get("/tar", [this](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session) {
+                res.set_redirect("/login");
+                return;
+            }
+            res.set_content(kTarPageHtml, "text/html; charset=utf-8");
+        });
+
+        // ── Result Sets (scope walking — capability §30) ─────────────────
+        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
+        // fragment authenticates and filters/loads by the session principal.
+        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
+        web_server_->Get("/result-sets",
                          [this](const httplib::Request& req, httplib::Response& res) {
                              auto session = require_auth(req, res);
                              if (!session) {
                                  res.set_redirect("/login");
                                  return;
                              }
-                             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
+                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
                          });
+
+        // Owner-scoped sidebar list.
+        web_server_->Get(
+            "/fragments/result-sets/sidebar",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                if (!result_set_store_) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+                std::string next;
+                std::string selected =
+                    req.has_param("selected") ? req.get_param_value("selected") : "";
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, selected),
+                                "text/html; charset=utf-8");
+            });
+
+        // Detail pane for one set (owner-checked).
+        web_server_->Get(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_ ? result_set_store_->get(id) : std::nullopt;
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                auto chain = result_set_store_->lineage(id, session->username);
+                res.set_content(render_result_set_detail(*row, chain),
+                                "text/html; charset=utf-8");
+            });
+
+        // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
+        auto rs_detail_after = [this](const std::string& id, const std::string& owner,
+                                      httplib::Response& res) {
+            auto row = result_set_store_->get(id);
+            if (!row || row->owner_principal != owner) {
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                return;
+            }
+            auto chain = result_set_store_->lineage(id, owner);
+            res.set_header("HX-Trigger", "resultSetsChanged");
+            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+        };
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto pinned = result_set_store_->pin(id);
+                if (!pinned) {
+                    // Don't audit a success that didn't happen, and tell the
+                    // operator why (review merged_bug_009). PinLimit is the
+                    // 50-pin cap; otherwise a transient store error.
+                    audit_log(req, "result_set.pin",
+                              pinned.error() == ResultSetError::PinLimit ? "denied" : "failure",
+                              "ResultSet", id, to_string(pinned.error()));
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{{"showToast",
+                                        {{"level", "error"}, {"message", to_string(pinned.error())}}}}
+                            .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto unpinned = result_set_store_->unpin(id);
+                if (!unpinned) {
+                    audit_log(req, "result_set.unpin", "failure", "ResultSet", id,
+                              to_string(unpinned.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(unpinned.error())}}}}
+                                       .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto del = result_set_store_->delete_set(id);
+                if (!del) {
+                    // Pinned sets must be unpinned first — re-render the detail
+                    // so the operator sees why nothing was deleted.
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.delete", "success", "ResultSet", id, "");
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+            });
+
+        // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
+        web_server_->Post(
+            "/fragments/result-sets/create",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = req.has_param("name") ? req.get_param_value("name") : "";
+                cr.source_kind = std::string(source_kind::kManualCurate);
+                cr.source_payload = R"({"note":"dashboard CSV import"})";
+
+                std::vector<std::string> members;
+                if (req.has_param("device_ids")) {
+                    std::string raw = req.get_param_value("device_ids");
+                    std::string cur;
+                    auto flush = [&]() {
+                        // trim whitespace
+                        std::size_t a = cur.find_first_not_of(" \t\r\n");
+                        std::size_t b = cur.find_last_not_of(" \t\r\n");
+                        if (a != std::string::npos)
+                            members.push_back(cur.substr(a, b - a + 1));
+                        cur.clear();
+                    };
+                    for (char c : raw) {
+                        if (c == '\n' || c == ',')
+                            flush();
+                        else
+                            cur += c;
+                    }
+                    flush();
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    // Surface quota / too-many-members / store errors instead of
+                    // silently re-rendering as if the create succeeded (review
+                    // merged_bug_009). The store enforces kMaxMembersPerSet, so an
+                    // oversized pasted CSV lands here as TooManyMembers (B4).
+                    if (created.error() == ResultSetError::QuotaExceeded ||
+                        created.error() == ResultSetError::TooManyMembers)
+                        metrics_.counter("yuzu_result_set_quota_rejected").increment();
+                    audit_log(req, "result_set.create", "denied", "ResultSet", "",
+                              to_string(created.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(created.error())}}}}
+                                       .dump());
+                    std::string next;
+                    auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.create", "success", "ResultSet", created->id,
+                          cr.source_kind);
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_sets_sidebar(sets, created->id),
+                                "text/html; charset=utf-8");
+            });
+
+        // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
+        // (same posture as /tar) but the per-request RBAC check happens
+        // inside VizRoutes when the page's JS hits /api/v1/viz/fleet/topology.
+        // The page itself is just the renderer scaffold + nav chrome -- no
+        // per-machine data is rendered server-side; the JSON fetch on the
+        // client is what enforces Response.Read.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate forces the
+        // browser to revalidate the page HTML on every navigation. This
+        // closes the gov R4 UP-10 / DEP-1 / CHAOS-C3 "stale page + new
+        // bundle" skew window: the page references a hard-coded importmap
+        // for `/static/three.module.min.js` etc. that are themselves
+        // cached for 24 hours. Without revalidation, a heuristically-
+        // cached stale page after a server upgrade pairs with new asset
+        // bytes (or vice versa), producing a silent blank canvas with a
+        // module-resolution console error.
+        //
+        // Future-PR ordering note (gov R4 arch-S1): if a future PR
+        // introduces a regex route like `R"(/viz/([^/]+))"` for per-
+        // machine drill-in, register it AFTER this literal route or the
+        // first-match-wins routing in cpp-httplib would swallow `fleet`
+        // as a path parameter.
+        web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session) {
+                res.set_redirect("/login");
+                return;
+            }
+            // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
+            // shell, not just the REST/fragment endpoints. Previously the
+            // shell rendered and only the JSON fetch 503'd, leaving the
+            // operator with a half-working page and a console error. 503
+            // here matches the VizRoutes posture and the invariant doc's
+            // "a disabled viz surface returns 503".
+            if (viz_disabled_.load(std::memory_order_acquire)) {
+                res.status = 503;
+                res.set_content("fleet visualization is disabled by an administrator "
+                                "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                "text/plain; charset=utf-8");
+                return;
+            }
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
+        });
+
+        // PR 9-pre: per-host drill-down page. Opened by the 3D viz's
+        // dblclick handler in a new tab. Must be registered AFTER
+        // /viz/fleet (literal match wins; the regex below would otherwise
+        // swallow `fleet` as a parameter — gov R4 arch-S1 ordering).
+        // Agent_id is URL-decoded by httplib (req.matches[1]); we replace
+        // `{{AGENT_ID}}` in the static HTML with the sanitised id so the
+        // renderer can read it from data-agent-id without parsing the URL.
+        // Allow-list: a-z A-Z 0-9 dash underscore dot — anything else is
+        // 400 (the agent_id schema is hexadecimal-uuid-ish; nothing else
+        // should reach this route).
+        web_server_->Get(
+            R"(/viz/host/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) {
+                    res.set_redirect("/login");
+                    return;
+                }
+                // Gate 7 sec-L1 / cons-N1 — kill switch on the host
+                // drill-down page shell too (cons-N1 confirmed the gap
+                // spans both viz page routes, not just /viz/fleet).
+                if (viz_disabled_.load(std::memory_order_acquire)) {
+                    res.status = 503;
+                    res.set_content("fleet visualization is disabled by an administrator "
+                                    "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                    "text/plain; charset=utf-8");
+                    return;
+                }
+                const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                for (char c : raw_id) {
+                    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+                    if (!ok) {
+                        res.status = 400;
+                        res.set_content("invalid agent_id", "text/plain");
+                        return;
+                    }
+                }
+                std::string html(kVizHostPageHtml);
+                const std::string token = "{{AGENT_ID}}";
+                for (auto pos = html.find(token); pos != std::string::npos;
+                     pos = html.find(token, pos + raw_id.size())) {
+                    html.replace(pos, token.size(), raw_id);
+                }
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+                res.set_content(std::move(html), "text/html; charset=utf-8");
+            });
 
         // -- Instruction management page --------------------------------------
         web_server_->Get("/instructions",
@@ -3235,20 +4764,22 @@ private:
                          });
 
         // -- Generic JSON-to-CSV export -----------------------------------------
-        web_server_->Post(
-            "/api/export/json-to-csv", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Response", "Read"))
-                    return;
+        web_server_->Post("/api/export/json-to-csv", [this](const httplib::Request& req,
+                                                            httplib::Response& res) {
+            if (!require_permission(req, res, "Response", "Read"))
+                return;
 
-                auto csv = data_export::json_array_to_csv(req.body);
-                if (csv.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
-                res.set_content(csv, "text/csv; charset=utf-8");
-            });
+            auto csv = data_export::json_array_to_csv(req.body);
+            if (csv.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
+            res.set_content(csv, "text/csv; charset=utf-8");
+        });
 
         // -- Instruction Definitions API --------------------------------------
 
@@ -3258,8 +4789,9 @@ private:
                 return;
             if (!instruction_store_ || !instruction_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
-                                "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3279,7 +4811,9 @@ private:
                     q.limit = std::stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3308,7 +4842,9 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3335,13 +4871,13 @@ private:
                 def.response_ttl_days = j.value("response_ttl_days", 90);
                 def.approval_mode = j.value("approval_mode", "auto");
                 // Validate approval_mode
-                if (def.approval_mode != "auto" &&
-                    def.approval_mode != "role-gated" &&
+                if (def.approval_mode != "auto" && def.approval_mode != "role-gated" &&
                     def.approval_mode != "always") {
                     res.status = 400;
                     res.set_content(
                         nlohmann::json({{"error", "invalid approval_mode: " + def.approval_mode +
-                            " (must be auto, role-gated, or always)"}}).dump(),
+                                                      " (must be auto, role-gated, or always)"}})
+                            .dump(),
                         "application/json");
                     return;
                 }
@@ -3360,24 +4896,25 @@ private:
                     bool is_conflict = is_conflict_error(result.error());
                     res.status = is_conflict ? 409 : 400;
                     if (is_conflict) {
-                        audit_log(req, "instruction.create", "denied",
-                                  "instruction", def.id, "duplicate_id");
+                        (void)audit_log(req, "instruction.create", "denied",
+                                        "InstructionDefinition", def.id, "duplicate_id");
                     }
-                    auto body_msg = is_conflict
-                        ? std::string(strip_conflict_prefix(result.error()))
-                        : result.error();
+                    auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                                : result.error();
                     res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                     "application/json");
                     return;
                 }
-                audit_log(req, "instruction.create", "success", "instruction", *result, def.name);
+                (void)audit_log(req, "instruction.create", "success", "InstructionDefinition",
+                                *result, def.name);
                 emit_event("instruction.created", req,
                            {{"name", def.name},
                             {"plugin", def.plugin},
                             {"action", def.action},
                             {"type", def.type}},
                            {{"instruction_id", *result}});
-                res.set_header("HX-Trigger",
+                res.set_header(
+                    "HX-Trigger",
                     R"({"showToast":{"message":"Instruction definition created","level":"success"}})");
                 res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
             } catch (const std::exception& e) {
@@ -3392,7 +4929,9 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3400,7 +4939,9 @@ private:
             auto def = instruction_store_->get_definition(id);
             if (!def) {
                 res.status = 404;
-                res.set_content(R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3428,7 +4969,9 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3440,34 +4983,43 @@ private:
                 auto existing = instruction_store_->get_definition(id);
                 if (!existing) {
                     res.status = 404;
-                    res.set_content(R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})", "application/json");
+                    res.set_content(
+                        R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
+                        "application/json");
                     return;
                 }
 
                 InstructionDefinition def = *existing;
-                if (j.contains("name")) def.name = j["name"].get<std::string>();
-                if (j.contains("version")) def.version = j["version"].get<std::string>();
-                if (j.contains("type")) def.type = j["type"].get<std::string>();
-                if (j.contains("plugin")) def.plugin = j["plugin"].get<std::string>();
+                if (j.contains("name"))
+                    def.name = j["name"].get<std::string>();
+                if (j.contains("version"))
+                    def.version = j["version"].get<std::string>();
+                if (j.contains("type"))
+                    def.type = j["type"].get<std::string>();
+                if (j.contains("plugin"))
+                    def.plugin = j["plugin"].get<std::string>();
                 if (j.contains("action")) {
                     def.action = j["action"].get<std::string>();
                     // Normalize action to lowercase
                     for (auto& c : def.action)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 }
-                if (j.contains("description")) def.description = j["description"].get<std::string>();
-                if (j.contains("enabled")) def.enabled = j["enabled"].get<bool>();
+                if (j.contains("description"))
+                    def.description = j["description"].get<std::string>();
+                if (j.contains("enabled"))
+                    def.enabled = j["enabled"].get<bool>();
                 if (j.contains("instruction_set_id"))
                     def.instruction_set_id = j["instruction_set_id"].get<std::string>();
                 if (j.contains("approval_mode")) {
                     def.approval_mode = j["approval_mode"].get<std::string>();
-                    if (def.approval_mode != "auto" &&
-                        def.approval_mode != "role-gated" &&
+                    if (def.approval_mode != "auto" && def.approval_mode != "role-gated" &&
                         def.approval_mode != "always") {
                         res.status = 400;
                         res.set_content(
-                            nlohmann::json({{"error", "invalid approval_mode: " + def.approval_mode +
-                                " (must be auto, role-gated, or always)"}}).dump(),
+                            nlohmann::json(
+                                {{"error", "invalid approval_mode: " + def.approval_mode +
+                                               " (must be auto, role-gated, or always)"}})
+                                .dump(),
                             "application/json");
                         return;
                     }
@@ -3480,9 +5032,10 @@ private:
                                     "application/json");
                     return;
                 }
-                audit_log(req, "instruction.update", "success", "instruction", id);
+                (void)audit_log(req, "instruction.update", "success", "InstructionDefinition", id);
                 emit_event("instruction.updated", req, {}, {{"instruction_id", id}});
-                res.set_header("HX-Trigger",
+                res.set_header(
+                    "HX-Trigger",
                     R"({"showToast":{"message":"Instruction definition updated","level":"success"}})");
                 res.set_content(R"({"status":"ok"})", "application/json");
             } catch (const std::exception& e) {
@@ -3497,35 +5050,40 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
             bool deleted = instruction_store_->delete_definition(id);
             if (deleted) {
-                audit_log(req, "instruction.delete", "success", "instruction", id);
+                (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
                 emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
-                res.set_header("HX-Trigger",
+                res.set_header(
+                    "HX-Trigger",
                     R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
             }
             res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
         });
 
-        web_server_->Get(R"(/api/instructions/([^/]+)/export)",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "InstructionDefinition", "Read"))
-                                 return;
-                             if (!instruction_store_) {
-                                 res.status = 503;
-                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                                 return;
-                             }
+        web_server_->Get(R"(/api/instructions/([^/]+)/export)", [this](const httplib::Request& req,
+                                                                       httplib::Response& res) {
+            if (!require_permission(req, res, "InstructionDefinition", "Read"))
+                return;
+            if (!instruction_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                             auto id = req.matches[1].str();
-                             auto json = instruction_store_->export_definition_json(id);
-                             res.set_content(json, "application/json");
-                         });
+            auto id = req.matches[1].str();
+            auto json = instruction_store_->export_definition_json(id);
+            res.set_content(json, "application/json");
+        });
 
         web_server_->Post("/api/instructions/import", [this](const httplib::Request& req,
                                                              httplib::Response& res) {
@@ -3533,7 +5091,9 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3547,71 +5107,111 @@ private:
                 // endpoint that exercises duplicate-id rejection most.
                 bool is_conflict = is_conflict_error(result.error());
                 res.status = is_conflict ? 409 : 400;
-                if (is_conflict) {
-                    audit_log(req, "instruction.import", "denied",
-                              "instruction", "", "duplicate_id");
-                }
-                auto body_msg = is_conflict
-                    ? std::string(strip_conflict_prefix(result.error()))
-                    : result.error();
-                res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
-                                "application/json");
+                // R4 (gov R1 unhappy/security HIGH): audit EVERY rejection
+                // path, not just conflicts. The #1073 signature gate adds
+                // five new rejection branches (signature_invalid,
+                // signature_incomplete, signature_wrong_length, signature_
+                // missing_content, unsigned_rejected); each is an access
+                // decision the SOC 2 CC6.7 audit trail must reflect. The
+                // detail is the store-returned error message classified
+                // either as "duplicate_id" (the legacy contract) or the
+                // raw error text (which begins with a stable token like
+                // "signature verification failed" / "instruction-import
+                // is unsigned" / etc. that SIEM rules can key on).
+                std::string detail = is_conflict ? "duplicate_id" : result.error();
+                // R2 / Gate 4 unhappy UP-1 + compliance CO-1: capture the
+                // audit_log return and surface failure to the operator via
+                // Sec-Audit-Failed header (PR #883 / SOC 2 CC7.2 pattern at
+                // rest_api_v1.cpp:1129). Silently discarding the bool on a
+                // security-decision audit row re-opens the evidence-chain
+                // gap whose closure was the whole point of R4's hoist.
+                // R2 / Gate 4 consistency CONS-BLOCKING-1: target_type is
+                // now the RBAC-securable PascalCase "InstructionDefinition"
+                // matching ProductPack's W7.4 R2 normalisation, NOT the
+                // legacy lowercase "instruction" string.
+                const bool audit_ok = audit_log(req, "instruction.import", "denied",
+                                                "InstructionDefinition", "", detail);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
+                                            : result.error();
+                // R3 governance security MEDIUM-1: body field mirrors the
+                // captured bool, NOT a hardcoded `false`. On the rare
+                // happy-rejection path (request denied AND audit row
+                // persisted successfully) the operator sees
+                // `audit_emitted: true`. Symmetric with the success branch
+                // below.
+                res.set_content(
+                    nlohmann::json({{"error", body_msg}, {"audit_emitted", audit_ok}}).dump(),
+                    "application/json");
                 return;
             }
-            audit_log(req, "instruction.import", "success", "instruction", *result);
+            // R2 success-branch: same Sec-Audit-Failed treatment so a wedged
+            // audit-store on a successful import surfaces to the operator —
+            // SOC 2 CC7.2 requires the evidence row, and silently landing a
+            // definition in the DB without the row is a half-broken chain.
+            const bool audit_ok =
+                audit_log(req, "instruction.import", "success", "InstructionDefinition", *result);
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
             res.set_header("HX-Trigger",
-                R"({"showToast":{"message":"Definitions imported","level":"success"}})");
-            res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+                           R"({"showToast":{"message":"Definitions imported","level":"success"}})");
+            res.set_content(nlohmann::json({{"id", *result}, {"audit_emitted", audit_ok}}).dump(),
+                            "application/json");
         });
 
         // -- Instruction Sets API ---------------------------------------------
 
-        web_server_->Get(
-            "/api/instruction-sets", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "InstructionSet", "Read"))
-                    return;
-                if (!instruction_store_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Get("/api/instruction-sets", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!require_permission(req, res, "InstructionSet", "Read"))
+                return;
+            if (!instruction_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto sets = instruction_store_->list_sets();
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : sets) {
-                    arr.push_back({{"id", s.id},
-                                   {"name", s.name},
-                                   {"description", s.description},
-                                   {"created_by", s.created_by},
-                                   {"created_at", s.created_at}});
-                }
-                res.set_content(nlohmann::json({{"sets", arr}}).dump(), "application/json");
-            });
+            auto sets = instruction_store_->list_sets();
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& s : sets) {
+                arr.push_back({{"id", s.id},
+                               {"name", s.name},
+                               {"description", s.description},
+                               {"created_by", s.created_by},
+                               {"created_at", s.created_at}});
+            }
+            res.set_content(nlohmann::json({{"sets", arr}}).dump(), "application/json");
+        });
 
-        web_server_->Post(
-            "/api/instruction-sets", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "InstructionSet", "Write"))
-                    return;
-                if (!instruction_store_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Post("/api/instruction-sets", [this](const httplib::Request& req,
+                                                          httplib::Response& res) {
+            if (!require_permission(req, res, "InstructionSet", "Write"))
+                return;
+            if (!instruction_store_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto name = extract_json_string(req.body, "name");
-                auto desc = extract_json_string(req.body, "description");
-                InstructionSet s;
-                s.name = name;
-                s.description = desc;
-                auto result = instruction_store_->create_set(s);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            });
+            auto name = extract_json_string(req.body, "name");
+            auto desc = extract_json_string(req.body, "description");
+            InstructionSet s;
+            s.name = name;
+            s.description = desc;
+            auto result = instruction_store_->create_set(s);
+            if (!result) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                                "application/json");
+                return;
+            }
+            res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+        });
 
         web_server_->Delete(R"(/api/instruction-sets/([^/]+))", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
@@ -3619,7 +5219,9 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3630,48 +5232,52 @@ private:
 
         // -- Execution API ----------------------------------------------------
 
-        web_server_->Get(
-            "/api/executions", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Execution", "Read"))
-                    return;
-                if (!execution_tracker_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Get("/api/executions", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            if (!require_permission(req, res, "Execution", "Read"))
+                return;
+            if (!execution_tracker_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                ExecutionQuery q;
-                if (req.has_param("definition_id"))
-                    q.definition_id = req.get_param_value("definition_id");
-                if (req.has_param("status"))
-                    q.status = req.get_param_value("status");
-                try {
-                    if (req.has_param("limit"))
-                        q.limit = std::stoi(req.get_param_value("limit"));
-                } catch (const std::exception&) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+            ExecutionQuery q;
+            if (req.has_param("definition_id"))
+                q.definition_id = req.get_param_value("definition_id");
+            if (req.has_param("status"))
+                q.status = req.get_param_value("status");
+            try {
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto execs = execution_tracker_->query_executions(q);
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& e : execs) {
-                    arr.push_back({{"id", e.id},
-                                   {"definition_id", e.definition_id},
-                                   {"status", e.status},
-                                   {"dispatched_by", e.dispatched_by},
-                                   {"dispatched_at", e.dispatched_at},
-                                   {"agents_targeted", e.agents_targeted},
-                                   {"agents_responded", e.agents_responded},
-                                   {"agents_success", e.agents_success},
-                                   {"agents_failure", e.agents_failure},
-                                   {"completed_at", e.completed_at},
-                                   {"rerun_of", e.rerun_of}});
-                }
-                res.set_content(nlohmann::json({{"executions", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
+            auto execs = execution_tracker_->query_executions(q);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& e : execs) {
+                arr.push_back({{"id", e.id},
+                               {"definition_id", e.definition_id},
+                               {"status", e.status},
+                               {"dispatched_by", e.dispatched_by},
+                               {"dispatched_at", e.dispatched_at},
+                               {"agents_targeted", e.agents_targeted},
+                               {"agents_responded", e.agents_responded},
+                               {"agents_success", e.agents_success},
+                               {"agents_failure", e.agents_failure},
+                               {"completed_at", e.completed_at},
+                               {"rerun_of", e.rerun_of}});
+            }
+            res.set_content(nlohmann::json({{"executions", arr}, {"count", arr.size()}}).dump(),
+                            "application/json");
+        });
 
         web_server_->Get(R"(/api/executions/([^/]+))", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
@@ -3679,7 +5285,9 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3687,7 +5295,9 @@ private:
             auto exec = execution_tracker_->get_execution(id);
             if (!exec) {
                 res.status = 404;
-                res.set_content(R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3715,7 +5325,9 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3738,7 +5350,9 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3763,7 +5377,9 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3781,36 +5397,40 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "execution.rerun", "success", "execution", *result, "rerun of " + id);
+            (void)audit_log(req, "execution.rerun", "success", "execution", *result,
+                            "rerun of " + id);
             emit_event("execution.created", req, {},
                        {{"execution_id", *result}, {"parent_id", id}, {"trigger", "rerun"}});
-            res.set_header("HX-Trigger",
+            res.set_header(
+                "HX-Trigger",
                 R"({"showToast":{"message":"Execution rerun initiated","level":"success"}})");
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
         });
 
-        web_server_->Post(R"(/api/executions/([^/]+)/cancel)",
-                          [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_permission(req, res, "Execution", "Execute"))
-                                  return;
-                              if (!execution_tracker_) {
-                                  res.status = 503;
-                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                                  return;
-                              }
+        web_server_->Post(R"(/api/executions/([^/]+)/cancel)", [this](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+            if (!require_permission(req, res, "Execution", "Execute"))
+                return;
+            if (!execution_tracker_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                              auto id = req.matches[1].str();
-                              auto session = auth_routes_->resolve_session(req);
-                              auto user = session ? session->username : "unknown";
+            auto id = req.matches[1].str();
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : "unknown";
 
-                              execution_tracker_->mark_cancelled(id, user);
-                              audit_log(req, "execution.cancel", "success", "execution", id);
-                              emit_event("execution.completed", req, {{"status", "cancelled"}},
-                                         {{"execution_id", id}});
-                              res.set_header("HX-Trigger",
-                                  R"({"showToast":{"message":"Execution cancelled","level":"success"}})");
-                              res.set_content(R"({"status":"cancelled"})", "application/json");
-                          });
+            execution_tracker_->mark_cancelled(id, user);
+            (void)audit_log(req, "execution.cancel", "success", "execution", id);
+            emit_event("execution.completed", req, {{"status", "cancelled"}},
+                       {{"execution_id", id}});
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Execution cancelled","level":"success"}})");
+            res.set_content(R"({"status":"cancelled"})", "application/json");
+        });
 
         web_server_->Get(R"(/api/executions/([^/]+)/children)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
@@ -3818,7 +5438,9 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3834,36 +5456,38 @@ private:
 
         // -- Schedule API -----------------------------------------------------
 
-        web_server_->Get(
-            "/api/schedules", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Schedule", "Read"))
-                    return;
-                if (!schedule_engine_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Get("/api/schedules", [this](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!require_permission(req, res, "Schedule", "Read"))
+                return;
+            if (!schedule_engine_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                ScheduleQuery q;
-                if (req.has_param("definition_id"))
-                    q.definition_id = req.get_param_value("definition_id");
-                if (req.has_param("enabled_only"))
-                    q.enabled_only = true;
+            ScheduleQuery q;
+            if (req.has_param("definition_id"))
+                q.definition_id = req.get_param_value("definition_id");
+            if (req.has_param("enabled_only"))
+                q.enabled_only = true;
 
-                auto scheds = schedule_engine_->query_schedules(q);
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : scheds) {
-                    arr.push_back({{"id", s.id},
-                                   {"name", s.name},
-                                   {"definition_id", s.definition_id},
-                                   {"enabled", s.enabled},
-                                   {"frequency_type", s.frequency_type},
-                                   {"next_execution_at", s.next_execution_at},
-                                   {"last_executed_at", s.last_executed_at},
-                                   {"execution_count", s.execution_count}});
-                }
-                res.set_content(nlohmann::json({{"schedules", arr}}).dump(), "application/json");
-            });
+            auto scheds = schedule_engine_->query_schedules(q);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& s : scheds) {
+                arr.push_back({{"id", s.id},
+                               {"name", s.name},
+                               {"definition_id", s.definition_id},
+                               {"enabled", s.enabled},
+                               {"frequency_type", s.frequency_type},
+                               {"next_execution_at", s.next_execution_at},
+                               {"last_executed_at", s.last_executed_at},
+                               {"execution_count", s.execution_count}});
+            }
+            res.set_content(nlohmann::json({{"schedules", arr}}).dump(), "application/json");
+        });
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
@@ -3871,7 +5495,9 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3898,9 +5524,9 @@ private:
                                     "application/json");
                     return;
                 }
-                audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
+                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
                 res.set_header("HX-Trigger",
-                    R"({"showToast":{"message":"Schedule created","level":"success"}})");
+                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
                 res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
@@ -3914,16 +5540,18 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
             bool deleted = schedule_engine_->delete_schedule(id);
             if (deleted) {
-                audit_log(req, "schedule.delete", "success", "schedule", id);
+                (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
-                    R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
+                               R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
             }
             res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
         });
@@ -3934,7 +5562,9 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -3947,37 +5577,39 @@ private:
 
         // -- Approval API -----------------------------------------------------
 
-        web_server_->Get(
-            "/api/approvals", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Approval", "Read"))
-                    return;
-                if (!approval_manager_) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+        web_server_->Get("/api/approvals", [this](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!require_permission(req, res, "Approval", "Read"))
+                return;
+            if (!approval_manager_) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                ApprovalQuery q;
-                if (req.has_param("status"))
-                    q.status = req.get_param_value("status");
-                if (req.has_param("submitted_by"))
-                    q.submitted_by = req.get_param_value("submitted_by");
+            ApprovalQuery q;
+            if (req.has_param("status"))
+                q.status = req.get_param_value("status");
+            if (req.has_param("submitted_by"))
+                q.submitted_by = req.get_param_value("submitted_by");
 
-                auto approvals = approval_manager_->query(q);
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& a : approvals) {
-                    arr.push_back({{"id", a.id},
-                                   {"definition_id", a.definition_id},
-                                   {"status", a.status},
-                                   {"submitted_by", a.submitted_by},
-                                   {"submitted_at", a.submitted_at},
-                                   {"reviewed_by", a.reviewed_by},
-                                   {"reviewed_at", a.reviewed_at},
-                                   {"review_comment", a.review_comment},
-                                   {"scope_expression", a.scope_expression}});
-                }
-                res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
-            });
+            auto approvals = approval_manager_->query(q);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& a : approvals) {
+                arr.push_back({{"id", a.id},
+                               {"definition_id", a.definition_id},
+                               {"status", a.status},
+                               {"submitted_by", a.submitted_by},
+                               {"submitted_at", a.submitted_at},
+                               {"reviewed_by", a.reviewed_by},
+                               {"reviewed_at", a.reviewed_at},
+                               {"review_comment", a.review_comment},
+                               {"scope_expression", a.scope_expression}});
+            }
+            res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
+        });
 
         web_server_->Get("/api/approvals/pending/count", [this](const httplib::Request& req,
                                                                 httplib::Response& res) {
@@ -3997,7 +5629,9 @@ private:
                 return;
             if (!approval_manager_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -4013,10 +5647,10 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "approval.approve", "success", "approval", id);
+            (void)audit_log(req, "approval.approve", "success", "approval", id);
             emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
             res.set_header("HX-Trigger",
-                R"({"showToast":{"message":"Approved","level":"success"}})");
+                           R"({"showToast":{"message":"Approved","level":"success"}})");
             res.set_content(R"({"status":"approved"})", "application/json");
         });
 
@@ -4026,7 +5660,9 @@ private:
                 return;
             if (!approval_manager_) {
                 res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
+                res.set_content(
+                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
             }
 
@@ -4042,11 +5678,11 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "approval.reject", "success", "approval", id);
+            (void)audit_log(req, "approval.reject", "success", "approval", id);
             emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
                        {{"approval_id", id}});
             res.set_header("HX-Trigger",
-                R"({"showToast":{"message":"Rejected","level":"warning"}})");
+                           R"({"showToast":{"message":"Rejected","level":"warning"}})");
             res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
@@ -4264,102 +5900,99 @@ private:
         });
 
         // -- YAML save endpoint (HTMX form POST from editor) --
-        web_server_->Post(
-            "/api/instructions/yaml", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "InstructionDefinition", "Write"))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
-                if (!instruction_store_) {
-                    res.set_content(
-                        "<div class=\"alert alert-error\">Instruction store not available</div>",
-                        "text/html");
-                    return;
-                }
+        web_server_->Post("/api/instructions/yaml", [this](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            if (!require_permission(req, res, "InstructionDefinition", "Write"))
+                return;
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
+            if (!instruction_store_) {
+                res.set_content(
+                    "<div class=\"alert alert-error\">Instruction store not available</div>",
+                    "text/html");
+                return;
+            }
 
-                auto yaml_source = req.get_param_value("yaml_source");
-                auto def_id = req.get_param_value("id");
+            auto yaml_source = req.get_param_value("yaml_source");
+            auto def_id = req.get_param_value("id");
 
-                if (yaml_source.empty()) {
-                    res.set_content(
-                        "<div class=\"alert alert-error\">YAML source cannot be empty</div>",
-                        "text/html");
-                    return;
-                }
+            if (yaml_source.empty()) {
+                res.set_content(
+                    "<div class=\"alert alert-error\">YAML source cannot be empty</div>",
+                    "text/html");
+                return;
+            }
 
-                // Minimal YAML field extraction (name, plugin, action from the YAML text).
-                // Full yaml-cpp parsing is deferred; for now we extract fields via simple
-                // line scanning — the YAML source is stored verbatim as source of truth.
-                auto extract = [&](const std::string& key) -> std::string {
-                    auto needle = key + ": ";
-                    auto pos = yaml_source.find(needle);
-                    if (pos == std::string::npos)
-                        return {};
-                    auto start = pos + needle.size();
-                    auto end = yaml_source.find('\n', start);
-                    auto val = yaml_source.substr(start, end - start);
-                    // Strip quotes
-                    if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
-                        val = val.substr(1, val.size() - 2);
-                    return val;
-                };
+            // Minimal YAML field extraction (name, plugin, action from the YAML text).
+            // Full yaml-cpp parsing is deferred; for now we extract fields via simple
+            // line scanning — the YAML source is stored verbatim as source of truth.
+            auto extract = [&](const std::string& key) -> std::string {
+                auto needle = key + ": ";
+                auto pos = yaml_source.find(needle);
+                if (pos == std::string::npos)
+                    return {};
+                auto start = pos + needle.size();
+                auto end = yaml_source.find('\n', start);
+                auto val = yaml_source.substr(start, end - start);
+                // Strip quotes
+                if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
+                    val = val.substr(1, val.size() - 2);
+                return val;
+            };
 
-                InstructionDefinition def;
-                def.name = extract("name");
-                def.version = extract("version");
-                def.plugin = extract("plugin");
-                def.action = extract("action");
-                // Normalize action to lowercase — agent plugins match case-sensitively
-                for (auto& c : def.action)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                def.type = extract("type");
-                def.description = extract("description");
-                def.concurrency_mode = extract("concurrency");
-                def.approval_mode = extract("approval");
-                // Validate approval_mode — reject unknown values at creation time
-                if (!def.approval_mode.empty() &&
-                    def.approval_mode != "auto" &&
-                    def.approval_mode != "role-gated" &&
-                    def.approval_mode != "always") {
-                    res.set_content(
-                        "<div class=\"alert alert-error\">Invalid approval mode: &quot;" +
-                        html_escape(def.approval_mode) +
-                        "&quot;. Must be auto, role-gated, or always.</div>",
-                        "text/html");
-                    return;
-                }
-                def.yaml_source = yaml_source;
-                def.created_by = session->username;
-                def.enabled = true;
-
-                if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
-                    res.set_content("<div class=\"alert alert-error\">Missing required fields: "
-                                    "name, plugin, action</div>",
-                                    "text/html");
-                    return;
-                }
-
-                std::string msg;
-                if (!def_id.empty()) {
-                    def.id = def_id;
-                    auto result = instruction_store_->update_definition(def);
-                    msg = result ? "Definition updated" : "Update failed: " + result.error();
-                } else {
-                    auto result = instruction_store_->create_definition(def);
-                    msg = result ? "Definition created" : "Create failed: " + result.error();
-                }
-
-                std::string cls =
-                    msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
-                {
-                    auto level = msg.find("failed") == std::string::npos ? "success" : "error";
-                    nlohmann::json trigger = {{"showToast", {{"message", msg}, {"level", level}}}};
-                    res.set_header("HX-Trigger", trigger.dump());
-                }
-                res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
+            InstructionDefinition def;
+            def.name = extract("name");
+            def.version = extract("version");
+            def.plugin = extract("plugin");
+            def.action = extract("action");
+            // Normalize action to lowercase — agent plugins match case-sensitively
+            for (auto& c : def.action)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            def.type = extract("type");
+            def.description = extract("description");
+            def.concurrency_mode = extract("concurrency");
+            def.approval_mode = extract("approval");
+            // Validate approval_mode — reject unknown values at creation time
+            if (!def.approval_mode.empty() && def.approval_mode != "auto" &&
+                def.approval_mode != "role-gated" && def.approval_mode != "always") {
+                res.set_content("<div class=\"alert alert-error\">Invalid approval mode: &quot;" +
+                                    html_escape(def.approval_mode) +
+                                    "&quot;. Must be auto, role-gated, or always.</div>",
                                 "text/html");
-            });
+                return;
+            }
+            def.yaml_source = yaml_source;
+            def.created_by = session->username;
+            def.enabled = true;
+
+            if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
+                res.set_content("<div class=\"alert alert-error\">Missing required fields: "
+                                "name, plugin, action</div>",
+                                "text/html");
+                return;
+            }
+
+            std::string msg;
+            if (!def_id.empty()) {
+                def.id = def_id;
+                auto result = instruction_store_->update_definition(def);
+                msg = result ? "Definition updated" : "Update failed: " + result.error();
+            } else {
+                auto result = instruction_store_->create_definition(def);
+                msg = result ? "Definition created" : "Create failed: " + result.error();
+            }
+
+            std::string cls =
+                msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
+            {
+                auto level = msg.find("failed") == std::string::npos ? "success" : "error";
+                nlohmann::json trigger = {{"showToast", {{"message", msg}, {"level", level}}}};
+                res.set_header("HX-Trigger", trigger.dump());
+            }
+            res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
+                            "text/html");
+        });
 
         // -- YAML validate endpoint --
         web_server_->Post("/api/instructions/validate-yaml", [this](const httplib::Request& req,
@@ -4401,8 +6034,7 @@ private:
                         html += "<div class='err'>" + html_escape(e) + "</div>";
                     html += "</div>";
                 } else {
-                    html +=
-                        R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors"></div>)";
+                    html += R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors"></div>)";
                 }
                 res.set_content(html, "text/html");
             });
@@ -4462,137 +6094,371 @@ private:
             });
 
         // -- Scope API --------------------------------------------------------
-        web_server_->Post(
-            "/api/scope/validate", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
+        web_server_->Post("/api/scope/validate", [this](const httplib::Request& req,
+                                                        httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
 
-                auto expression = extract_json_string(req.body, "expression");
-                if (expression.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
+            auto expression = extract_json_string(req.body, "expression");
+            if (expression.empty()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
-                auto result = yuzu::scope::validate(expression);
-                if (result) {
-                    res.set_content(R"({"valid":true})", "application/json");
-                } else {
-                    res.set_content(
-                        nlohmann::json({{"valid", false}, {"error", result.error()}}).dump(),
-                        "application/json");
-                }
-            });
+            auto result = yuzu::scope::validate(expression);
+            if (result) {
+                res.set_content(R"({"valid":true})", "application/json");
+            } else {
+                res.set_content(
+                    nlohmann::json({{"valid", false}, {"error", result.error()}}).dump(),
+                    "application/json");
+            }
+        });
 
         // -- Inventory REST endpoints (Issue 7.17) --------------------------------
 
         // GET /api/inventory/tables — list available inventory data types
-        web_server_->Get("/api/inventory/tables",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Inventory", "Read"))
-                    return;
-                if (!inventory_store_ || !inventory_store_->is_open()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                auto tables = inventory_store_->list_tables();
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& t : tables) {
-                    arr.push_back({{"plugin", t.plugin},
-                                   {"agent_count", t.agent_count},
-                                   {"last_collected", t.last_collected}});
-                }
-                res.set_content(nlohmann::json({{"tables", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
+        web_server_->Get("/api/inventory/tables", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!require_permission(req, res, "Inventory", "Read"))
+                return;
+            if (!inventory_store_ || !inventory_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto tables = inventory_store_->list_tables();
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& t : tables) {
+                arr.push_back({{"plugin", t.plugin},
+                               {"agent_count", t.agent_count},
+                               {"last_collected", t.last_collected}});
+            }
+            res.set_content(nlohmann::json({{"tables", arr}, {"count", arr.size()}}).dump(),
+                            "application/json");
+        });
 
         // GET /api/inventory/:agent_id/:plugin — get inventory for agent+plugin
-        web_server_->Get(R"(/api/inventory/([^/]+)/([^/]+))",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Inventory", "Read"))
-                    return;
-                if (!inventory_store_ || !inventory_store_->is_open()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                auto agent_id = req.matches[1].str();
-                auto plugin = req.matches[2].str();
-                auto record = inventory_store_->get(agent_id, plugin);
-                if (!record) {
-                    res.status = 404;
-                    res.set_content(R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                nlohmann::json data_obj;
-                try {
-                    data_obj = nlohmann::json::parse(record->data_json);
-                } catch (...) {
-                    data_obj = record->data_json;
-                }
-                res.set_content(nlohmann::json({{"agent_id", record->agent_id},
-                                                {"plugin", record->plugin},
-                                                {"data", data_obj},
-                                                {"collected_at", record->collected_at}}).dump(),
-                                "application/json");
-            });
+        web_server_->Get(R"(/api/inventory/([^/]+)/([^/]+))", [this](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+            if (!require_permission(req, res, "Inventory", "Read"))
+                return;
+            if (!inventory_store_ || !inventory_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto agent_id = req.matches[1].str();
+            auto plugin = req.matches[2].str();
+            auto record = inventory_store_->get(agent_id, plugin);
+            if (!record) {
+                res.status = 404;
+                res.set_content(
+                    R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            nlohmann::json data_obj;
+            try {
+                data_obj = nlohmann::json::parse(record->data_json);
+            } catch (...) {
+                data_obj = record->data_json;
+            }
+            res.set_content(nlohmann::json({{"agent_id", record->agent_id},
+                                            {"plugin", record->plugin},
+                                            {"data", data_obj},
+                                            {"collected_at", record->collected_at}})
+                                .dump(),
+                            "application/json");
+        });
 
         // POST /api/inventory/query — query inventory across agents
-        web_server_->Post("/api/inventory/query",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Inventory", "Read"))
-                    return;
-                if (!inventory_store_ || !inventory_store_->is_open()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})", "application/json");
-                    return;
-                }
-                InventoryQuery q;
-                q.agent_id = body.value("agent_id", "");
-                q.plugin = body.value("plugin", "");
-                q.since = body.value("since", int64_t{0});
-                q.until = body.value("until", int64_t{0});
-                q.limit = body.value("limit", 100);
-                if (q.limit > 1000) q.limit = 1000;
+        web_server_->Post("/api/inventory/query", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!require_permission(req, res, "Inventory", "Read"))
+                return;
+            if (!inventory_store_ || !inventory_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            InventoryQuery q;
+            q.agent_id = body.value("agent_id", "");
+            q.plugin = body.value("plugin", "");
+            q.since = body.value("since", int64_t{0});
+            q.until = body.value("until", int64_t{0});
+            q.limit = body.value("limit", 100);
+            if (q.limit > 1000)
+                q.limit = 1000;
 
-                auto records = inventory_store_->query(q);
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& r : records) {
-                    nlohmann::json data_obj;
-                    try { data_obj = nlohmann::json::parse(r.data_json); }
-                    catch (...) { data_obj = r.data_json; }
-                    arr.push_back({{"agent_id", r.agent_id},
-                                   {"plugin", r.plugin},
-                                   {"data", data_obj},
-                                   {"collected_at", r.collected_at}});
+            auto records = inventory_store_->query(q);
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& r : records) {
+                nlohmann::json data_obj;
+                try {
+                    data_obj = nlohmann::json::parse(r.data_json);
+                } catch (...) {
+                    data_obj = r.data_json;
                 }
-                res.set_content(nlohmann::json({{"results", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
+                arr.push_back({{"agent_id", r.agent_id},
+                               {"plugin", r.plugin},
+                               {"data", data_obj},
+                               {"collected_at", r.collected_at}});
+            }
+            res.set_content(nlohmann::json({{"results", arr}, {"count", arr.size()}}).dump(),
+                            "application/json");
+        });
 
         // -- Extracted route modules ------------------------------------------------
         // Common callback lambdas shared by all extracted route modules.
-        auto auth_fn = [this](const httplib::Request& req, httplib::Response& res)
-            -> std::optional<auth::Session> { return require_auth(req, res); };
+        auto auth_fn = [this](const httplib::Request& req,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            return require_auth(req, res);
+        };
         auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
-            audit_log(req, action, result, target_type, target_id, detail);
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
         };
 
-        // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*, /api/compliance/*
+        // Shared command-dispatch closure — sends a CommandRequest to agents via
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so the
+        // PolicyEvaluator and WorkflowRoutes drive the EXACT same dispatch path.
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> std::pair<std::string, int> {
+            // Normalize action to lowercase — agent plugins register actions
+            // in lowercase and match case-sensitively.
+            auto norm_action = action;
+            for (auto& c : norm_action)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto command_id =
+                plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+            detail::pb::CommandRequest cmd;
+            cmd.set_command_id(command_id);
+            cmd.set_plugin(plugin);
+            cmd.set_action(norm_action);
+            for (const auto& [k, v] : parameters)
+                (*cmd.mutable_parameters())[k] = v;
+            agent_service_.record_send_time(command_id);
+            // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
+            if (!execution_id.empty()) {
+                agent_service_.record_execution_id(command_id, execution_id);
+            }
+            int sent = 0;
+            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                auto group_id = scope_expr.substr(6);
+                if (mgmt_group_store_) {
+                    auto members = mgmt_group_store_->get_members(group_id);
+                    for (const auto& m : members)
+                        if (registry_.send_to(m.agent_id, cmd))
+                            ++sent;
+                }
+            } else if (!scope_expr.empty()) {
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Role is not available on the tracked path (principal recovered
+                // from the execution row, no live session); principal + command
+                // id still identify the actor for the forensic chain.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
+                if (parsed) {
+                    auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
+                    for (const auto& aid : matched)
+                        if (registry_.send_to(aid, cmd))
+                            ++sent;
+                }
+            } else if (agent_ids.empty()) {
+                sent = registry_.send_to_all(cmd);
+            } else {
+                for (const auto& aid : agent_ids)
+                    if (registry_.send_to(aid, cmd))
+                        ++sent;
+            }
+            forward_gateway_pending();
+            if (sent > 0)
+                metrics_.counter("yuzu_commands_dispatched_total").increment();
+            return {command_id, sent};
+        };
+
+        // PolicyEvaluator — drives the compliance check -> verdict pipeline.
+        // A background thread ticks it: dispatch due policies' check
+        // instructions, collect responses, evaluate the CEL, write status.
+        policy_evaluator_ = std::make_unique<PolicyEvaluator>(PolicyEvaluator::Deps{
+            .policy_store = policy_store_.get(),
+            .instruction_store = instruction_store_.get(),
+            .response_store = response_store_.get(),
+            .registry = &registry_,
+            .tag_store = tag_store_.get(),
+            .custom_properties_store = custom_properties_store_.get(),
+            .mgmt_group_store = mgmt_group_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        policy_eval_thread_ = std::thread([this]() {
+            spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (policy_evaluator_) {
+                    // tick() touches JSON parsing, the CEL evaluator and SQLite —
+                    // any of which can throw on a malformed policy/result. An
+                    // exception escaping a std::thread entry calls std::terminate,
+                    // so a single bad policy must not take the process (or silently
+                    // kill compliance evaluation). Catch, log, and keep ticking.
+                    try {
+                        policy_evaluator_->tick();
+                    } catch (const std::exception& e) {
+                        spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
+                    } catch (...) {
+                        spdlog::error("policy_eval: tick threw unknown exception — thread continuing");
+                    }
+                }
+            }
+        });
+
+        // Result-set maintenance thread (capability §30) — materialises pending
+        // result sets once their producing execution reaches a terminal state,
+        // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
+        // gauges. Borrows result_set_store_, execution_tracker_, response_store_
+        // and metrics_, so it MUST be joined before any of them are torn down
+        // (join sits next to the policy-eval join in stop()).
+        if (result_set_store_ && result_set_store_->is_open()) {
+            result_set_maint_thread_ = std::thread([this]() {
+                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
+                constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                int tick = 0;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    try {
+                        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+
+                        // 1) Materialise terminal pending sets.
+                        for (const auto& p : result_set_store_->list_pending()) {
+                            if (p.source_execution_id.empty())
+                                continue;
+                            bool terminal = false;
+                            if (execution_tracker_) {
+                                auto sum = execution_tracker_->get_summary(p.source_execution_id);
+                                terminal = sum.agents_targeted > 0 &&
+                                           sum.agents_responded >= sum.agents_targeted;
+                            }
+                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
+                            if (!terminal && !timed_out)
+                                continue;
+
+                            // Membership: every responder whose (status,
+                            // output) satisfies the pending row's matcher.
+                            // rs_matcher centralises the per-producer rule —
+                            // empty matcher = SUCCESS responders; tar_rows_ge
+                            // = SUCCESS with ≥N rows; column/op/value = a
+                            // matching output row (PR-D, design §3.3).
+                            std::vector<std::string> members;
+                            std::unordered_set<std::string> seen;
+                            if (response_store_) {
+                                for (const auto& r :
+                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
+                                        continue;
+                                    if (seen.insert(r.agent_id).second)
+                                        members.push_back(r.agent_id);
+                                }
+                            }
+                            if (result_set_store_->materialize(p.id, members)) {
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialized"}})
+                                    .increment();
+                            } else {
+                                // Don't count a materialization that didn't happen
+                                // (review finding bug_008); surface the failure so
+                                // SRE can alert on a stuck pending row.
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialize_failed"}})
+                                    .increment();
+                            }
+                        }
+
+                        // 2) GC sweep on the slow cadence.
+                        if (++tick % kGcEveryNTicks == 0) {
+                            int swept = result_set_store_->gc_sweep();
+                            if (swept > 0) {
+                                metrics_.counter("yuzu_result_set_gc_total")
+                                    .increment(static_cast<double>(swept));
+                                spdlog::info("result-set GC swept {} expired set(s)", swept);
+                            }
+                        }
+
+                        // 3) Refresh alive gauges.
+                        auto c = result_set_store_->counts();
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                            .set(static_cast<double>(c.pinned));
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                            .set(static_cast<double>(c.total - c.pinned));
+                    } catch (const std::exception& e) {
+                        spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("result_set_maint: tick threw unknown — thread continuing");
+                    }
+                }
+            });
+        }
+
+        // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
+        // /api/compliance/*
         compliance_routes_ = std::make_unique<ComplianceRoutes>();
         compliance_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn,
@@ -4600,26 +6466,60 @@ private:
                    const nlohmann::json& attrs, const nlohmann::json& payload_data) {
                 emit_event(event_type, req, attrs, payload_data);
             },
-            policy_store_.get(),
-            [this]() -> std::string { return registry_.to_json(); });
+            policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
+            policy_evaluator_.get());
+
+        // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
+        // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
+        // mock-backed (contract-shaped) until the parallel backend on
+        // feat/guardian-mvp lands; live data is used where it already exists
+        // (rule CRUD + event query on GuaranteedStateStore).
+        guardian_routes_ = std::make_unique<GuardianRoutes>();
+        guardian_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            [this](const std::string& event_type, const httplib::Request& req,
+                   const nlohmann::json& attrs, const nlohmann::json& payload_data) {
+                emit_event(event_type, req, attrs, payload_data);
+            },
+            guaranteed_state_store_.get(),
+            baseline_store_.get(),
+            [this]() -> std::string { return registry_.to_json(); },
+            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // REST endpoint uses. guardian_push_fn_ is assigned just below during
+            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // registration time, so the ordering is fine.
+            [this](const std::string& scope, bool full_sync) -> int {
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+            });
+
+        // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
+        // (PR 3 of feat/viz-engine ladder)
+        viz_routes_ = std::make_unique<VizRoutes>();
+        viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
         dashboard_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
-            response_store_.get(),
-            mgmt_group_store_.get(),
-            &registry_,
-            tag_store_.get(),
-            &event_bus_,
+            *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
+            mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
             [this]() -> std::string { return registry_.to_json(); },
             // DispatchFn — reuses /api/command dispatch logic
+            //
+            // Fed into DashboardRoutes (legacy /api/command UI surface);
+            // signature MUST stay at 5 parameters. The MCP and REST
+            // execute-instruction surfaces have their own 6-parameter
+            // dispatch closures (see server.cpp ~5812 for WorkflowRoutes
+            // and ~6032 for McpServer) with `execution_id` threaded
+            // through for the ExecutionTracker mapping (PR 2 UP2-4
+            // race close + #1088 agentic-first bridging).
             [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids,
-                   const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
-                auto command_id = plugin + "-" +
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                auto command_id =
+                    plugin + "-" +
                     auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
                 detail::pb::CommandRequest cmd;
@@ -4636,23 +6536,27 @@ private:
                     if (mgmt_group_store_) {
                         auto members = mgmt_group_store_->get_members(group_id);
                         for (const auto& m : members) {
-                            if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                            if (registry_.send_to(m.agent_id, cmd))
+                                ++sent;
                         }
                     }
                 } else if (!scope_expr.empty()) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
-                        auto matched = registry_.evaluate_scope(
-                            *parsed, tag_store_.get(), custom_properties_store_.get());
+                        auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                                custom_properties_store_.get(),
+                                                                result_set_store_.get());
                         for (const auto& aid : matched) {
-                            if (registry_.send_to(aid, cmd)) ++sent;
+                            if (registry_.send_to(aid, cmd))
+                                ++sent;
                         }
                     }
                 } else if (agent_ids.empty()) {
                     sent = registry_.send_to_all(cmd);
                 } else {
                     for (const auto& aid : agent_ids) {
-                        if (registry_.send_to(aid, cmd)) ++sent;
+                        if (registry_.send_to(aid, cmd))
+                            ++sent;
                     }
                 }
 
@@ -4674,14 +6578,14 @@ private:
                     // fragment parsing and silently discard <tbody> tags
                     // outside a <table> context (foster parenting).
                     event_bus_.publish("command-status",
-                        "<span id=\"status-badge\" class=\"badge-running\""
-                        " hx-swap-oob=\"outerHTML\">RUNNING</span>");
+                                       "<span id=\"status-badge\" class=\"badge-running\""
+                                       " hx-swap-oob=\"outerHTML\">RUNNING</span>");
+                    event_bus_.publish(
+                        "output", "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
+                                  "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
+                                  "Waiting for results...</td></tr></tbody>");
                     event_bus_.publish("output",
-                        "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
-                        "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
-                        "Waiting for results...</td></tr></tbody>");
-                    event_bus_.publish("output",
-                        "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
+                                       "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
                 }
                 return {command_id, sent};
             },
@@ -4689,28 +6593,27 @@ private:
             [this](const std::string& text) -> std::pair<std::string, std::string> {
                 auto help = registry_.help_json();
                 auto data = nlohmann::json::parse(help, nullptr, false);
-                if (!data.is_object() || !data.contains("plugins")) return {"", ""};
+                if (!data.is_object() || !data.contains("plugins"))
+                    return {"", ""};
                 for (const auto& p : data["plugins"]) {
                     auto pname = p.value("name", "");
                     auto& actions = p["actions"];
                     // "plugin" alone → first action
                     if (text == pname && !actions.empty()) {
-                        auto aname = actions[0].is_string()
-                                         ? actions[0].get<std::string>()
-                                         : actions[0].value("name", "");
+                        auto aname = actions[0].is_string() ? actions[0].get<std::string>()
+                                                            : actions[0].value("name", "");
                         return {pname, aname};
                     }
                     // "plugin action" → specific action
                     for (const auto& a : actions) {
-                        auto aname = a.is_string() ? a.get<std::string>()
-                                                    : a.value("name", "");
-                        if (text == pname + " " + aname) return {pname, aname};
+                        auto aname = a.is_string() ? a.get<std::string>() : a.value("name", "");
+                        if (text == pname + " " + aname)
+                            return {pname, aname};
                     }
                 }
                 return {"", ""};
             },
-            &metrics_,
-            instruction_store_.get());
+            &metrics_, instruction_store_.get());
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
@@ -4726,12 +6629,17 @@ private:
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
         };
-        wf_deps.scope_fn = [this](const std::string& expression)
-            -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
-            if (!parsed) return {0, registry_.agent_count()};
-            auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                    custom_properties_store_.get());
+        wf_deps.scope_fn =
+            [this](const std::string& expression,
+                   const std::string& principal) -> std::pair<std::size_t, std::size_t> {
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
+            if (!parsed)
+                return {0, registry_.agent_count()};
+            auto matched =
+                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
+                                         result_set_store_.get(), principal);
             return {matched.size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
@@ -4740,62 +6648,7 @@ private:
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
-        wf_deps.command_dispatch_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids,
-                   const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> std::pair<std::string, int> {
-                // Normalize action to lowercase — agent plugins register actions
-                // in lowercase and match case-sensitively.
-                auto norm_action = action;
-                for (auto& c : norm_action)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                auto command_id = plugin + "-" +
-                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id(command_id);
-                cmd.set_plugin(plugin);
-                cmd.set_action(norm_action);
-                for (const auto& [k, v] : parameters)
-                    (*cmd.mutable_parameters())[k] = v;
-                agent_service_.record_send_time(command_id);
-                // PR 2 / UP2-4: register the command_id → execution_id
-                // mapping BEFORE any RPC is sent so a sub-millisecond
-                // loopback agent's response cannot win the race against
-                // mapping registration. Empty execution_id (out-of-band
-                // dispatch with no tracker row) skips registration —
-                // record_execution_id is a no-op for empty values.
-                if (!execution_id.empty()) {
-                    agent_service_.record_execution_id(command_id, execution_id);
-                }
-                int sent = 0;
-                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
-                    auto group_id = scope_expr.substr(6);
-                    if (mgmt_group_store_) {
-                        auto members = mgmt_group_store_->get_members(group_id);
-                        for (const auto& m : members)
-                            if (registry_.send_to(m.agent_id, cmd)) ++sent;
-                    }
-                } else if (!scope_expr.empty()) {
-                    auto parsed = yuzu::scope::parse(scope_expr);
-                    if (parsed) {
-                        auto matched = registry_.evaluate_scope(
-                            *parsed, tag_store_.get(), custom_properties_store_.get());
-                        for (const auto& aid : matched)
-                            if (registry_.send_to(aid, cmd)) ++sent;
-                    }
-                } else if (agent_ids.empty()) {
-                    sent = registry_.send_to_all(cmd);
-                } else {
-                    for (const auto& aid : agent_ids)
-                        if (registry_.send_to(aid, cmd)) ++sent;
-                }
-                forward_gateway_pending();
-                if (sent > 0)
-                    metrics_.counter("yuzu_commands_dispatched_total").increment();
-                return {command_id, sent};
-            };
+        wf_deps.command_dispatch_fn = command_dispatch_fn;
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
         // PR 3 — SSE event bus for live execution updates. Server owns
@@ -4806,26 +6659,28 @@ private:
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
-        notification_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
-            notification_store_.get());
+        notification_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                              notification_store_.get());
 
         // WebhookRoutes — /api/webhooks/*
         webhook_routes_ = std::make_unique<WebhookRoutes>();
         webhook_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn,
             [this](const std::string& event_type, const httplib::Request& req,
-                   const nlohmann::json& attrs, const nlohmann::json& payload) {
-                emit_event(event_type, req, attrs, payload);
-            },
+                   const nlohmann::json& attrs,
+                   const nlohmann::json& payload) { emit_event(event_type, req, attrs, payload); },
             webhook_store_.get());
+
+        // OffloadRoutes — /api/v1/offload-targets/* (Phase 8.3, #255)
+        offload_routes_ = std::make_unique<OffloadRoutes>();
+        offload_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                         offload_target_store_.get());
 
         // DiscoveryRoutes — /api/directory/*, /api/patches/*, /api/deployments/*, /api/discovery/*
         discovery_routes_ = std::make_unique<DiscoveryRoutes>();
-        discovery_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
-            directory_sync_.get(), patch_manager_.get(),
-            deployment_store_.get(), discovery_store_.get());
+        discovery_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                           directory_sync_.get(), patch_manager_.get(),
+                                           deployment_store_.get(), discovery_store_.get());
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -4840,8 +6695,8 @@ private:
             },
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
-                   const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
             },
             rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
             quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
@@ -4855,7 +6710,7 @@ private:
                 // Case-insensitive match: API may receive "Role" but kCategoryKeys are lowercase
                 std::string lower_key = key;
                 std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                    [](unsigned char c) { return std::tolower(c); });
+                               [](unsigned char c) { return std::tolower(c); });
                 for (auto cat_key : kCategoryKeys) {
                     if (cat_key == lower_key) {
                         push_asset_tags_to_agent(agent_id);
@@ -4863,12 +6718,170 @@ private:
                     }
                 }
             },
-            inventory_store_.get(),
-            product_pack_store_.get(),
+            inventory_store_.get(), product_pack_store_.get(),
             /*sw_deploy_store=*/nullptr,
             /*device_token_store=*/nullptr,
-            /*license_store=*/nullptr,
-            guaranteed_state_store_.get());
+            /*license_store=*/nullptr, guaranteed_state_store_.get(),
+            /*metrics_registry=*/&metrics_,
+            // session_revoke_fn — composes the cookie-session wipe
+            // (AuthManager dual-write) with optional API-token revocation
+            // when called from /me's "Sign out everywhere" flow. Exposes
+            // the dual-write outcome (db_persisted) so the REST handler
+            // can audit a partial failure honestly (CC6.6 evidence).
+            [this](const std::string& username,
+                   bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
+                const auto revoke = auth_mgr_.invalidate_user_sessions(username);
+                std::size_t tokens = 0;
+                if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
+                    tokens = api_token_store_->revoke_for_principal(username);
+                }
+                // CC7.2 anomaly-detection signal: a spike in this counter
+                // is the operator's automated alert for compromised-account
+                // response or rogue automation calling /me in a loop.
+                // Caller dimension is inferred from the api-tokens flag:
+                // /me passes true (self full-credential revoke), admin
+                // path passes false (cookies only, automation tokens
+                // intact). Result dimension carries db_persisted so SOC 2
+                // partial-failure rows are filterable.
+                metrics_
+                    .counter("yuzu_auth_sessions_revoked_total",
+                             {{"caller", revoke_api_tokens ? "self" : "admin"},
+                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"scope", revoke_api_tokens ? "all" : "cookies"}})
+                    .increment();
+                return RestApiV1::SessionRevokeResult{
+                    revoke.count,
+                    tokens,
+                    revoke.db_persisted,
+                };
+            },
+            // W5.1 — pass the per-execution event bus into the REST
+            // layer so `GET /api/v1/events` can subscribe agentic
+            // workers to live execution transitions. Same bus the
+            // dashboard SSE handler uses; nullptr leaves the new
+            // route registered but returning 503.
+            execution_event_bus_.get(),
+            // Scope-walking result-set store (capability §30). nullptr leaves
+            // the /api/v1/result-sets routes unregistered.
+            result_set_store_.get(),
+            // Same hoisted dispatch closure the workflow + policy engines use,
+            // so the async result-set producers (from-tar-query /
+            // from-instruction-result / re-eval) drive the exact dispatch path
+            // (PR-D). Empty closure would 503 those routes.
+            command_dispatch_fn,
+            // PR2 MFA step-up gate for the high-risk REST handlers; empty
+            // closure disables the gate (preserves pre-PR2 behaviour).
+            step_up_fn,
+            // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
+            // GuaranteedStatePush from the store's enabled rules (typed
+            // spark/assertion/remediation from spec_json) and deliver as a
+            // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
+            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
+            // toggle deploys via this exact fan-out. The parenthesised assignment yields
+            // the assigned std::function, which is what gets passed here by value.
+            (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
+                if (!guaranteed_state_store_)
+                    return 0;
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                // Read (never bump) the monotonic generation: a reconcile re-push
+                // (M5) must carry the SAME generation as the policy-change push that
+                // minted it, otherwise catching one lagging agent up would make the
+                // rest of the fleet look stale and trigger a reconcile storm. The
+                // store bumps the counter on rule mutations; we only read it here.
+                // Replaces wall-clock seconds, which could repeat or step backwards
+                // and wedge the heartbeat reconcile. (M6 / #1209.)
+                const std::uint64_t generation =
+                    guaranteed_state_store_->current_policy_generation();
+                // Baseline gate: push only Guards that are members of a *deployed*
+                // Baseline (docs/guardian-baseline-model.md). With nothing deployed
+                // the set is empty and a full_sync converges agents to zero guards.
+                const auto rules = guardian::filter_deployed_members(
+                    guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+
+                // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
+                // toggle to the affected rule's scope_expr (was the whole fleet); an
+                // empty scope still means fleet-wide.
+                std::vector<std::string> targets;
+                if (scope.empty()) {
+                    targets = registry_.all_ids();
+                } else if (scope.starts_with("group:") && mgmt_group_store_) {
+                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                        targets.push_back(m.agent_id);
+                } else {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                       custom_properties_store_.get());
+                }
+
+                // Per-rule scope membership, evaluated once per distinct scope_expr
+                // and cached, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents × rules).
+                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                auto agent_in_scope = [&](const std::string& aid,
+                                          const std::string& expr) -> bool {
+                    auto it = scope_cache.find(expr);
+                    if (it == scope_cache.end()) {
+                        std::unordered_set<std::string> ids;
+                        if (auto parsed = yuzu::scope::parse(expr)) {
+                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                            ids.insert(v.begin(), v.end());
+                        }
+                        it = scope_cache.emplace(expr, std::move(ids)).first;
+                    }
+                    return it->second.contains(aid);
+                };
+
+                // Build and send a per-agent FILTERED push (M4 / #1209): each agent
+                // receives only the enabled rules that target its OS and name it in
+                // scope, so a Linux box is no longer handed Windows registry guards.
+                int sent = 0;
+                for (const auto& aid : targets) {
+                    auto sess = registry_.get_session(aid);
+                    const std::string agent_os = sess ? sess->os : std::string{};
+                    auto push = guardian::build_agent_push(
+                        rules, agent_os,
+                        [&](const std::string& expr) { return agent_in_scope(aid, expr); },
+                        full_sync, generation);
+
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per push (random suffix) so two pushes in the same second
+                    // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-push-" + std::to_string(now_s) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    // Binary serialized proto rides in the `payload` bytes field, not the
+                    // `parameters` string map: proto3 string values must be valid UTF-8, and
+                    // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(aid, cmd)) {
+                        ++sent;
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "policy_change"}})
+                            .increment();
+                    }
+                }
+                metrics_.gauge("yuzu_server_guardian_policy_generation")
+                    .set(static_cast<double>(generation));
+                // Drain gw_pending_ so the push reaches gateway-connected agents.
+                // send_to only QUEUES for a gateway agent (it has no local Subscribe
+                // stream — the gateway holds it); direct agents already got the inline
+                // write. Every other dispatch site drains here; the Guardian push
+                // omitted it, so over a gateway the push silently never arrived and no
+                // guard armed (works in direct mode, breaks via gateway). See
+                // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
+                forward_gateway_pending();
+                return sent;
+            }));
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -4877,8 +6890,7 @@ private:
             web_server_->Post("/mcp/v1/", [](const httplib::Request&, httplib::Response& res) {
                 res.set_header("Content-Type", "application/json");
                 res.set_content(
-                    mcp::error_response_null(mcp::kMcpDisabled,
-                                             "MCP is disabled on this server"),
+                    mcp::error_response_null(mcp::kMcpDisabled, "MCP is disabled on this server"),
                     "application/json");
             });
         } else {
@@ -4894,21 +6906,25 @@ private:
                 [this](const httplib::Request& req, const std::string& action,
                        const std::string& result, const std::string& target_type,
                        const std::string& target_id, const std::string& detail) {
-                    audit_log(req, action, result, target_type, target_id, detail);
+                    (void)audit_log(req, action, result, target_type, target_id, detail);
                 },
-                [this]() { return registry_.to_json_obj(); },
-                rbac_store_.get(), instruction_store_.get(), execution_tracker_.get(),
-                response_store_.get(), audit_store_.get(), tag_store_.get(),
-                inventory_store_.get(), policy_store_.get(), mgmt_group_store_.get(),
-                approval_manager_.get(), schedule_engine_.get(),
+                [this]() { return registry_.to_json_obj(); }, rbac_store_.get(),
+                instruction_store_.get(), execution_tracker_.get(), response_store_.get(),
+                audit_store_.get(), tag_store_.get(), inventory_store_.get(), policy_store_.get(),
+                mgmt_group_store_.get(), approval_manager_.get(), schedule_engine_.get(),
                 cfg_.mcp_read_only, cfg_.mcp_disable,
-                // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction
+                // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction.
+                // #1088 — execution_id parameter added so the MCP tool's
+                // pre-created execution row is bridged into
+                // AgentServiceImpl's cmd_execution_ids_ map BEFORE any
+                // RPC fires (UP2-4 race close from PR 2). Empty
+                // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,
-                       const std::vector<std::string>& agent_ids,
-                       const std::string& scope_expr,
-                       const std::unordered_map<std::string, std::string>& parameters)
-                    -> std::pair<std::string, int> {
-                    auto command_id = plugin + "-" +
+                       const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                       const std::unordered_map<std::string, std::string>& parameters,
+                       const std::string& execution_id) -> std::pair<std::string, int> {
+                    auto command_id =
+                        plugin + "-" +
                         auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
                     detail::pb::CommandRequest cmd;
@@ -4918,32 +6934,58 @@ private:
                     for (const auto& [k, v] : parameters)
                         (*cmd.mutable_parameters())[k] = v;
                     agent_service_.record_send_time(command_id);
+                    if (!execution_id.empty()) {
+                        agent_service_.record_execution_id(command_id, execution_id);
+                    }
 
                     int sent = 0;
-                    if (!scope_expr.empty() && scope_expr != "__all__" && scope_expr.starts_with("group:")) {
+                    if (!scope_expr.empty() && scope_expr != "__all__" &&
+                        scope_expr.starts_with("group:")) {
                         auto group_id = scope_expr.substr(6);
                         if (mgmt_group_store_) {
                             for (const auto& m : mgmt_group_store_->get_members(group_id))
-                                if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                                if (registry_.send_to(m.agent_id, cmd))
+                                    ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        // Role unavailable on the MCP path (principal recovered
+                        // from the MCP-created execution row); principal + command
+                        // id identify the actor for the forensic chain.
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
                             for (const auto& aid : registry_.evaluate_scope(
-                                     *parsed, tag_store_.get(), custom_properties_store_.get()))
-                                if (registry_.send_to(aid, cmd)) ++sent;
+                                     *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                     result_set_store_.get(), principal))
+                                if (registry_.send_to(aid, cmd))
+                                    ++sent;
                         }
                     } else if (agent_ids.empty()) {
                         sent = registry_.send_to_all(cmd);
                     } else {
                         for (const auto& aid : agent_ids)
-                            if (registry_.send_to(aid, cmd)) ++sent;
+                            if (registry_.send_to(aid, cmd))
+                                ++sent;
                     }
 
                     forward_gateway_pending();
                     if (sent > 0)
                         metrics_.counter("yuzu_commands_dispatched_total").increment();
-                    spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action, sent);
+                    spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
+                                 sent);
                     return {command_id, sent};
                 });
         }
@@ -5016,7 +7058,9 @@ private:
                                 httplib::Response& res) {
         if (!registry_.has_any()) {
             res.status = 503;
-            res.set_content(R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})", "application/json");
+            res.set_content(
+                R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
         }
 
@@ -5033,11 +7077,18 @@ private:
 
         if (sent == 0) {
             res.status = 503;
-            res.set_content(R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})", "application/json");
+            res.set_content(
+                R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
+
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
@@ -5144,7 +7195,8 @@ private:
 
     // Phase 2: Instruction system
     std::unique_ptr<InstructionStore> instruction_store_;
-    std::unique_ptr<InstructionDbPool> instr_db_pool_;  // RAII owner — declared before consumers so it outlives them
+    std::unique_ptr<InstructionDbPool>
+        instr_db_pool_; // RAII owner — declared before consumers so it outlives them
     /// PR 3 — per-execution SSE event bus. Process-local; the tracker
     /// borrows this pointer and publishes onto it; `WorkflowRoutes`
     /// registers the SSE handler that subscribes per-connection.
@@ -5174,18 +7226,68 @@ private:
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
+    std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<GuardianRoutes> guardian_routes_;
+    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
+    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
+    // which point it is set.
+    std::function<int(const std::string&, bool)> guardian_push_fn_;
+
+    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
+    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
+    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
+    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
+    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
+    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
+    // is agent_id -> last reconcile time, guarded by its own mutex.
+    std::mutex guardian_reconcile_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        guardian_last_reconcile_;
+
+    // The Baseline gate's input: the union of member-Guard rule_ids across all
+    // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
+    // was deployed) — NOT its live member set. A Guard reaches an agent only as a
+    // member of a deployed Baseline (docs/guardian-baseline-model.md), so the push
+    // fan-out and the heartbeat reconcile filter their rule source through this via
+    // guardian::filter_deployed_members. Empty when nothing is deployed — a
+    // full_sync push then converges agents to zero guards (correct by model).
+    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // format) so an edit to a deployed Baseline's members does not change what the
+    // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
+    std::unordered_set<std::string> deployed_member_rule_ids() const {
+        if (!baseline_store_)
+            return {};
+        return baseline_store_->deployed_member_rule_ids();
+    }
+
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
     std::unique_ptr<WebhookRoutes> webhook_routes_;
+    std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+
+    // Fleet visualization (PR 3 of feat/viz-engine ladder)
+    std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
+    /// #1000 / arch-S2: shared heartbeat-ingestion pipeline. Constructed
+    /// after fleet_topology_store_ + health_store_ + metrics are wired;
+    /// injected into AgentServiceImpl and GatewayUpstreamServiceImpl so
+    /// both ingestion paths funnel through one entry point.
+    std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
+    std::unique_ptr<VizRoutes> viz_routes_;
+    /// Atomic kill-switch consulted by VizRoutes on every request. Defaults
+    /// to cfg_.viz_disable; runtime config could expose a flip path later.
+    std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
@@ -5198,6 +7300,7 @@ private:
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
     std::unique_ptr<WebhookStore> webhook_store_;
+    std::unique_ptr<OffloadTargetStore> offload_target_store_;
 
     // Phase 7: Inventory Store (Issue 7.17)
     std::unique_ptr<InventoryStore> inventory_store_;
@@ -5213,6 +7316,8 @@ private:
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
+    std::thread policy_eval_thread_;
+    std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

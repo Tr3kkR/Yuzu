@@ -91,8 +91,8 @@ if [[ -z "$RUN_ID" ]]; then
 fi
 
 # Validate RUN_ID before it's interpolated into filesystem paths (UP-9).
-if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "coverage-gate: invalid --run-id '$RUN_ID' (allowed: A-Z a-z 0-9 . _ -)" >&2
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ || "$RUN_ID" == "." || "$RUN_ID" == ".." ]]; then
+    echo "coverage-gate: invalid --run-id (allowed: A-Z a-z 0-9 . _ -)" >&2
     exit 2
 fi
 
@@ -203,10 +203,18 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     # a different compiler they can set CC/CXX and drop the native-file,
     # but the gate's default must match CI.
     MESON_SETUP_EXTRA=()
-    NATIVE_FILE="$YUZU_ROOT/meson/native/linux-gcc13.ini"
-    if [[ -f "$NATIVE_FILE" ]]; then
-        MESON_SETUP_EXTRA+=(--native-file "$NATIVE_FILE")
-        echo "coverage-gate: using native-file $NATIVE_FILE (matches ci.yml coverage job)" | tee -a "$GATE_LOG"
+    # The Linux native-file pins gcc-13 for parity with CI's coverage job.
+    # On macOS the host toolchain is Apple Clang 15 and gcc-13 isn't on PATH,
+    # so applying the Linux native-file resolves grpc/grpc++ against the wrong
+    # pkg-config tree and the configure step fails. Only apply on Linux. (#1009)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        NATIVE_FILE="$YUZU_ROOT/meson/native/linux-gcc13.ini"
+        if [[ -f "$NATIVE_FILE" ]]; then
+            MESON_SETUP_EXTRA+=(--native-file "$NATIVE_FILE")
+            echo "coverage-gate: using native-file $NATIVE_FILE (matches ci.yml coverage job)" | tee -a "$GATE_LOG"
+        fi
+    else
+        echo "coverage-gate: host $(uname -s) — skipping linux-gcc13 native-file, using host default compiler" | tee -a "$GATE_LOG"
     fi
     # Propagate the vcpkg install root so fresh `build-linux-coverage/`
     # can find grpc/protobuf/sqlite3/etc. Without this `meson setup` fails
@@ -214,10 +222,18 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     # the cmake_prefix_path from the sibling `build-linux/`.
     # Per the governance Round 1 fix and issue #460, the install tree
     # lives per-OS; use the Linux path here.
-    VCPKG_X64_LINUX="$YUZU_ROOT/vcpkg_installed/x64-linux"
-    if [[ -d "$VCPKG_X64_LINUX" ]]; then
-        MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_X64_LINUX")
-        echo "coverage-gate: using cmake_prefix_path=$VCPKG_X64_LINUX" | tee -a "$GATE_LOG"
+    # Pick the per-host vcpkg install tree. (#1009)
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)  VCPKG_TRIPLET="x64-linux" ;;
+        Linux-aarch64) VCPKG_TRIPLET="arm64-linux" ;;
+        Darwin-arm64)  VCPKG_TRIPLET="arm64-osx" ;;
+        Darwin-x86_64) VCPKG_TRIPLET="x64-osx" ;;
+        *)             VCPKG_TRIPLET="x64-linux" ;;
+    esac
+    VCPKG_INSTALLED="$YUZU_ROOT/vcpkg_installed/$VCPKG_TRIPLET"
+    if [[ -d "$VCPKG_INSTALLED" ]]; then
+        MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_INSTALLED")
+        echo "coverage-gate: using cmake_prefix_path=$VCPKG_INSTALLED" | tee -a "$GATE_LOG"
     fi
     if ! meson setup "$BUILD_DIR" \
         "${MESON_SETUP_EXTRA[@]}" \

@@ -64,37 +64,43 @@ struct VizHarness {
         fs::remove(resp_db);
         instruction_store = std::make_unique<InstructionStore>(inst_db);
         REQUIRE(instruction_store->is_open());
+        // #1073: InstructionStore defaults to require_signed_definitions=true.
+        // These tests exercise the import path + visualization-spec
+        // normalisation, not the signature gate — opt out so unsigned
+        // fixtures still pass.
+        instruction_store->set_require_signed_definitions(false);
         response_store = std::make_unique<ResponseStore>(resp_db, /*retention=*/0,
-                                                          /*cleanup_interval=*/60);
+                                                         /*cleanup_interval=*/60);
         REQUIRE(response_store->is_open());
 
-        auto auth_fn = [](const httplib::Request&, httplib::Response&)
-            -> std::optional<auth::Session> {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
             return s;
         };
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string&, const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
             if (!perm_grant) {
                 res.status = 403;
                 return false;
             }
             return true;
         };
-        auto audit_fn = [this](const httplib::Request&, const std::string& a,
-                               const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) {
+        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
+        auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti,
+                               const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
-                            /*quarantine_store=*/nullptr,
-                            response_store.get(),
+                            /*quarantine_store=*/nullptr, response_store.get(),
                             instruction_store.get(),
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
@@ -155,8 +161,7 @@ struct VizHarness {
 
 } // namespace
 
-TEST_CASE("REST visualization: missing definition_id → 400",
-          "[rest][visualization][validation]") {
+TEST_CASE("REST visualization: missing definition_id → 400", "[rest][visualization][validation]") {
     VizHarness h;
     auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization");
     REQUIRE(res);
@@ -176,8 +181,8 @@ TEST_CASE("REST visualization: malformed definition_id → 400",
     // dashboard fragment; an unbounded value no longer flows into SQL
     // bind / audit / log without validation.
     VizHarness h;
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-001/visualization?definition_id=evil%22%3E%3Cscript%3E");
+    auto res =
+        h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=evil%22%3E%3Cscript%3E");
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("[A-Za-z0-9._-]") != std::string::npos);
@@ -192,51 +197,45 @@ TEST_CASE("REST visualization: perm_fn denies → 403, no audit emission",
     // operator-only endpoint to lower-privileged sessions.
     VizHarness h;
     h.perm_grant = false;
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
+    auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST visualization: null stores → 503",
-          "[rest][visualization][unavailable]") {
+TEST_CASE("REST visualization: null stores → 503", "[rest][visualization][unavailable]") {
     // Closes governance qe-3: 503 path was untested. Mounts the route with
     // null stores so the guard at the top of the handler fires.
     yuzu::server::test::TestRouteSink sink;
-    auto auth_fn = [](const httplib::Request&, httplib::Response&)
-        -> std::optional<auth::Session> {
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
         auth::Session s;
         s.username = "x";
         s.role = auth::Role::admin;
         return s;
     };
-    auto perm_fn = [](const httplib::Request&, httplib::Response&,
-                      const std::string&, const std::string&) -> bool { return true; };
-    auto audit_fn = [](const httplib::Request&, const std::string&,
-                       const std::string&, const std::string&,
-                       const std::string&, const std::string&) {};
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool {
+        return true;
+    };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
     RestApiV1 api;
-    api.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                        nullptr, nullptr, nullptr, nullptr,
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                         /*response_store=*/nullptr,
-                        /*instruction_store=*/nullptr,
-                        nullptr, nullptr, nullptr, nullptr, nullptr,
-                        {}, {}, nullptr, nullptr, nullptr, nullptr, nullptr,
-                        nullptr);
+                        /*instruction_store=*/nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        {}, {}, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
-    auto res = sink.Get(
-        "/api/v1/executions/cmd-001/visualization?definition_id=foo");
+    auto res = sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=foo");
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->body.find("service unavailable") != std::string::npos);
 }
 
-TEST_CASE("REST visualization: unknown definition_id → 404",
-          "[rest][visualization][not_found]") {
+TEST_CASE("REST visualization: unknown definition_id → 404", "[rest][visualization][not_found]") {
     VizHarness h;
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
+    auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(res->body.find("not found") != std::string::npos);
@@ -246,8 +245,7 @@ TEST_CASE("REST visualization: definition without spec.visualization → 404",
           "[rest][visualization][not_found]") {
     VizHarness h;
     auto def_id = h.make_def(""); // no visualization configured
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-001/visualization?definition_id=" + def_id);
+    auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=" + def_id);
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(res->body.find("no visualization configured") != std::string::npos);
@@ -260,13 +258,12 @@ TEST_CASE("REST visualization: pie chart over procfetch responses → 200 with b
                     "title":"Top procs"})";
     auto def_id = h.make_def(spec, "procfetch");
 
-    h.push_response("cmd-A1", "agent-1",
+    h.push_response(
+        "cmd-A1", "agent-1",
         "1|chrome|/usr/bin/chrome|d\n2|chrome|/usr/bin/chrome|d\n3|firefox|/usr/bin/ff|c");
-    h.push_response("cmd-A1", "agent-2",
-        "1|chrome|/usr/bin/chrome|d\n2|sshd|/usr/sbin/sshd|s");
+    h.push_response("cmd-A1", "agent-2", "1|chrome|/usr/bin/chrome|d\n2|sshd|/usr/sbin/sshd|s");
 
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-A1/visualization?definition_id=" + def_id);
+    auto res = h.sink.Get("/api/v1/executions/cmd-A1/visualization?definition_id=" + def_id);
     REQUIRE(res);
     CHECK(res->status == 200);
 
@@ -324,12 +321,12 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
     });
     REQUIRE(h.instruction_store->import_definition_json(import_body.dump()).has_value());
 
-    h.push_response("cmd-multi", "agent-1",
+    h.push_response(
+        "cmd-multi", "agent-1",
         "1|chrome|/usr/bin/chrome|d\n2|chrome|/usr/bin/chrome|d\n3|firefox|/usr/bin/ff|c");
 
     // index=0 returns the pie
-    auto res0 = h.sink.Get(
-        "/api/v1/executions/cmd-multi/visualization?definition_id=def-multi");
+    auto res0 = h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi");
     REQUIRE(res0);
     CHECK(res0->status == 200);
     auto body0 = nlohmann::json::parse(res0->body);
@@ -339,8 +336,8 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
     CHECK(body0["data"]["chart_count"] == 2);
 
     // index=1 returns the bar
-    auto res1 = h.sink.Get(
-        "/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=1");
+    auto res1 =
+        h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=1");
     REQUIRE(res1);
     CHECK(res1->status == 200);
     auto body1 = nlohmann::json::parse(res1->body);
@@ -350,21 +347,21 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
     CHECK(body1["data"]["chart_count"] == 2);
 
     // index=2 → 404 (out of range)
-    auto res2 = h.sink.Get(
-        "/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=2");
+    auto res2 =
+        h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=2");
     REQUIRE(res2);
     CHECK(res2->status == 404);
     CHECK(res2->body.find("out of range") != std::string::npos);
 
     // negative index → 400
-    auto res_neg = h.sink.Get(
-        "/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=-1");
+    auto res_neg =
+        h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=-1");
     REQUIRE(res_neg);
     CHECK(res_neg->status == 400);
 
     // garbage index → 400
-    auto res_bad = h.sink.Get(
-        "/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=abc");
+    auto res_bad =
+        h.sink.Get("/api/v1/executions/cmd-multi/visualization?definition_id=def-multi&index=abc");
     REQUIRE(res_bad);
     CHECK(res_bad->status == 400);
 }
@@ -383,8 +380,8 @@ TEST_CASE("REST visualization: legacy single-object spec is still index-0 reacha
 
     h.push_response("cmd-legacy-single", "a1", "1|chrome|/u/b/c|d");
 
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-legacy-single/visualization?definition_id=" + def_id);
+    auto res =
+        h.sink.Get("/api/v1/executions/cmd-legacy-single/visualization?definition_id=" + def_id);
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -402,8 +399,7 @@ TEST_CASE("REST visualization: snake_case keys still accepted as legacy alias",
     auto spec = R"({"type":"bar","processor":"single_series","label_field":1})";
     auto def_id = h.make_def(spec, "procfetch");
     h.push_response("cmd-legacy", "a1", "1|chrome|/u/b/c|d\n2|chrome|/u/b/c|d");
-    auto res = h.sink.Get(
-        "/api/v1/executions/cmd-legacy/visualization?definition_id=" + def_id);
+    auto res = h.sink.Get("/api/v1/executions/cmd-legacy/visualization?definition_id=" + def_id);
     REQUIRE(res);
     CHECK(res->status == 200);
 }
@@ -414,8 +410,8 @@ TEST_CASE("REST visualization: empty response set → 200 with empty payload",
     auto spec = R"({"type":"bar","processor":"single_series","label_field":1})";
     auto def_id = h.make_def(spec, "procfetch");
 
-    auto res = h.sink.Get(
-        "/api/v1/executions/never-dispatched/visualization?definition_id=" + def_id);
+    auto res =
+        h.sink.Get("/api/v1/executions/never-dispatched/visualization?definition_id=" + def_id);
     REQUIRE(res);
     CHECK(res->status == 200);
 
@@ -466,6 +462,9 @@ TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec a
     {
         InstructionStore store(db_path);
         REQUIRE(store.is_open());
+        // #1073: opt out of signature enforcement — this test pins
+        // visualization_spec normalisation, not the signature gate.
+        store.set_require_signed_definitions(false);
 
         // Object form (CLI converts YAML→JSON in one shot)
         nlohmann::json j;
@@ -474,7 +473,9 @@ TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec a
         j["type"] = "question";
         j["plugin"] = "procfetch";
         j["visualization_spec"] = nlohmann::json::object({
-            {"type", "pie"}, {"processor", "single_series"}, {"label_field", 1},
+            {"type", "pie"},
+            {"processor", "single_series"},
+            {"label_field", 1},
         });
         REQUIRE(store.import_definition_json(j.dump()).has_value());
         auto got = store.get_definition("def-imp-obj");

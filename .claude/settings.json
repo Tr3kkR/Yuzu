@@ -7,11 +7,9 @@
       "Bash(meson introspect:*)",
       "Bash(meson setup:*)",
       "Bash(ninja:*)",
-
       "Bash(./scripts/setup.sh:*)",
       "Bash(bash scripts/setup.sh:*)",
       "Bash(source:*)",
-
       "Bash(./tests/yuzu_agent_tests:*)",
       "Bash(./tests/yuzu_server_tests:*)",
       "Bash(./tests/yuzu_tar_tests:*)",
@@ -24,9 +22,7 @@
       "Bash(build-macos/tests/yuzu_agent_tests:*)",
       "Bash(build-macos/tests/yuzu_server_tests:*)",
       "Bash(build-macos/tests/yuzu_tar_tests:*)",
-
       "Bash(rebar3:*)",
-
       "Bash(bash scripts/run-tests.sh:*)",
       "Bash(./scripts/run-tests.sh:*)",
       "Bash(bash scripts/integration-test.sh:*)",
@@ -38,10 +34,8 @@
       "Bash(bash scripts/e2e-api-test.sh:*)",
       "Bash(bash scripts/e2e-security-test.sh:*)",
       "Bash(bash scripts/uat-command-test.sh:*)",
-
       "Bash(python3 tests/test_changelog_order.py:*)",
       "Bash(python3 tests/test_gen_proto_version.py:*)",
-
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
@@ -58,7 +52,6 @@
       "Bash(git commit:*)",
       "Bash(git restore --staged:*)",
       "Bash(git switch:*)",
-
       "Bash(gh issue list:*)",
       "Bash(gh issue view:*)",
       "Bash(gh pr list:*)",
@@ -70,7 +63,6 @@
       "Bash(gh release list:*)",
       "Bash(gh release view:*)",
       "Bash(gh api repos/:*)",
-
       "Bash(pgrep:*)",
       "Bash(pkill -0:*)",
       "Bash(ps:*)",
@@ -87,10 +79,33 @@
       "Bash(du:*)",
       "Bash(df:*)",
       "Bash(wc:*)",
-
       "Bash(grep:*)",
       "Bash(head:*)",
       "Bash(tail:*)"
+    ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "clangd-lsp@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "plugin-dev@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "hookify@claude-plugins-official": true,
+    "context7@claude-plugins-official": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/erl-dialyzer-reminder.py\"",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

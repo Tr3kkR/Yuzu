@@ -25,8 +25,8 @@ struct AuditEvent {
     std::string source_ip;
     std::string user_agent;
     std::string session_id;
-    std::string result;    // "success", "failure", "denied"
-    std::string mcp_tool;  // MCP tool name if action was MCP-initiated (empty otherwise)
+    std::string result;   // "success", "failure", "denied"
+    std::string mcp_tool; // MCP tool name if action was MCP-initiated (empty otherwise)
 };
 
 struct AuditQuery {
@@ -51,7 +51,17 @@ public:
 
     bool is_open() const;
 
-    void log(const AuditEvent& event);
+    /// Persist an audit event. Returns true iff the row was written. The
+    /// bool return is part of the SOC 2 CC6.6/CC7.2 evidence-integrity
+    /// chain: handlers that emit an audit row as their compliance evidence
+    /// for a privileged mutation MUST observe the return and surface
+    /// partial-success on the response when the persist fails — otherwise
+    /// a "200 OK" + dropped row produces fictional audit evidence. On
+    /// failure `emit_failed_` increments and the row is lost. Callers that
+    /// legitimately fire-and-forget (background tasks, denied gates that
+    /// already failed the operation) may discard the bool; the
+    /// `[[nodiscard]]` flag makes the discard locally visible.
+    [[nodiscard]] bool log(const AuditEvent& event);
     std::vector<AuditEvent> query(const AuditQuery& q = {}) const;
     std::size_t total_count() const;
 

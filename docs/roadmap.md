@@ -81,8 +81,8 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
 | **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
-| | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | Open |
-| | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
+| | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | **Done** |
+| :white_check_mark: | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Done |
 | **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
 | | 9.2 | [#257](https://github.com/Tr3kkR/Yuzu/issues/257) | Inventory Repository Model | Open |
 | | 9.3 | [#258](https://github.com/Tr3kkR/Yuzu/issues/258) | SCCM / ConfigMgr Connector | Open |
@@ -147,7 +147,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
-| 8: Visualization & Response Experience | 1 | 2 | 3 | 33% |
+| 8: Visualization & Response Experience | 2 | 1 | 3 | 67% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% |
 | 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
@@ -156,7 +156,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
 | 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
-| **Total** | **73** | **53** | **126** | **58%** |
+| **Total** | **74** | **52** | **126** | **59%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -957,28 +957,29 @@ Six demo charts ship as default examples — `content/definitions/visualization_
 
 **Files:** `server/core/src/visualization_engine.{hpp,cpp}`, `server/core/src/charts_js_bundle.cpp`, `server/core/src/instruction_store.{hpp,cpp}` (visualization_spec column + MigrationRunner v2), `server/core/src/rest_api_v1.cpp`, `server/core/src/dashboard_routes.{hpp,cpp}`, `docs/yaml-dsl-spec.md` § `spec.visualization`, `docs/user-manual/instructions.md` § Response Visualization, plus `tests/unit/server/test_visualization_engine.cpp` and `tests/unit/server/test_rest_visualization.cpp`.
 
-### Issue 8.2: Response Templates
-**Capability:** 20.6 | **Scope:** Server | **Status:** Open
+### Issue 8.2: Response Templates :white_check_mark:
+**Capability:** 20.6 | **Scope:** Server | **Status:** Done
 **Depends on:** 8.1
 
-Named response view configurations:
-- Column selection, sort order, filter presets stored per InstructionDefinition in `spec.responseTemplates`
-- Default template auto-generated from result schema
-- Template CRUD via REST API
-- Dashboard: template selector dropdown in execution results view
+Named response view configurations on `InstructionDefinition` — column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. Storage is the `response_templates_spec` JSON column on `instruction_definitions` (migration v3); a `__default__` template is synthesised on read from `spec.result.columns` (preferred) or the plugin's column schema, so the dropdown is never empty even before an operator authors anything.
 
-**Files:** `server/core/src/instruction_store.cpp`, `server/core/src/rest_api_v1.cpp`
+REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]`. Filter ops accepted: `equals`, `not_equals`, `contains`, `starts_with`, `ends_with`. Reads gated on `InstructionDefinition:Read`, mutations on `InstructionDefinition:Write`. Audit events: `response_template.create`, `response_template.update`, `response_template.delete`. Dashboard auto-applies the `equals`-op clauses to the URL filter map; other ops are honoured by REST consumers but not auto-applied client-side in this revision.
 
-### Issue 8.3: Response Offloading (Data Export Streams)
-**Capability:** 20.7 | **Scope:** Server | **Status:** Open
+**Files:** `server/core/src/response_templates_engine.{hpp,cpp}` (new), `server/core/src/instruction_store.{hpp,cpp}` (column + migration v3), `server/core/src/rest_api_v1.cpp` (5 routes), `server/core/src/dashboard_routes.{hpp,cpp}` (selector + visibility + template-driven sort/filter defaults), `docs/yaml-dsl-spec.md` § `spec.responseTemplates`, `docs/user-manual/instructions.md` § Response Templates, `docs/user-manual/rest-api.md` § Response Templates, `tests/unit/server/test_response_templates_engine.cpp`, `tests/unit/server/test_rest_response_templates.cpp`.
 
-Configure external HTTP endpoints to receive response data in real time:
-- `OffloadTarget` model: URL, auth (bearer/basic/HMAC), event filter, batch size
-- Fire-and-forget delivery on background thread (reuse WebhookStore pattern)
-- Per-instruction override: `spec.offload.target` in YAML
-- REST: `GET/POST/DELETE /api/v1/offload-targets`
+### Issue 8.3: Response Offloading (Data Export Streams) :white_check_mark:
+**Capability:** 20.7 | **Scope:** Server | **Status:** Done
+**Depends on:** 8.1
 
-**Files:** New `server/core/src/offload_target_store.cpp`, `server/core/src/rest_api_v1.cpp`
+Named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire. Built around a sibling `OffloadTargetStore` SQLite database (`offload_targets.db`) wired into `AgentServiceImpl` next to the existing webhook fan-out, so every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches.
+
+Targets carry typed auth (none / bearer / basic / hmac), a server-side batching threshold (`batch_size > 1` accumulates events into a per-target buffer and flushes on threshold), and a unique `name` so a definition can name a specific subset via `spec.offload.targets` in YAML. `auth_credential` is persisted but never returned by any REST surface (paranoia-double-check assertion in `test_rest_offload_targets.cpp`). Outgoing requests carry `X-Yuzu-Event`, `X-Yuzu-Event-Count`, and (for hmac) `X-Yuzu-Signature: sha256=<hex>` headers — receivers can share verification code with webhooks.
+
+REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{id}`, `GET /api/v1/offload-targets/{id}/deliveries`. RBAC: `Infrastructure:Read`/`Write`. Audit events: `offload_target.create` (success | denied), `offload_target.delete`.
+
+**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through `cmd_execution_ids_ → execution_id → definition_id → InstructionStore` is tracked separately so the global fan-out path lands clean first.
+
+**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (new, migration v1), `server/core/src/offload_routes.{hpp,cpp}` (new), `server/core/src/server.cpp` (DB open + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
 ---
 
@@ -1673,6 +1674,69 @@ TPM, Secure Boot, UEFI verification. Reports posture state into compliance repor
 
 ---
 
+## Phase 19: Threat Graph & Defender Posture (Proposed)
+
+*Extends the `feat/viz-engine` 11-PR ladder with the Threat Graph product vision: a single canvas where SOC analysts, defenders, and system architects see the full per-host IPC graph + cross-host network graph + per-process security posture, so they can decide where to insert hardened controls (WAF, IPS, API gateways, VxLAN separation, firewalls) and which surfaces (network parsers etc.) to harden against which vulnerability classes. Anti-Mythos framing — Yuzu is the defender's mirror of LLM-driven offensive enumeration. Source: `docs/plans/threat-graph-roadmap.md`.*
+
+### Issue 19.1: Fleet IPC Enumeration — Unix Sockets, Named Pipes, Shared Memory
+**Capability:** 28.8 | **Scope:** Agent (plugins) + server (wire) | **Status:** Proposed
+
+Four new agent plugins so the topology snapshot covers all same-host IPC channels, not just TCP loopback:
+
+- `unix_sockets` — Linux + macOS path-bound + abstract-namespace AF_UNIX enumeration, mapped to owning processes via `lsof -U` / `/proc/net/unix` cross-reference. Windows AF_UNIX (Win10 1803+) is a follow-up.
+- `named_pipes` — Windows `\\.\pipe\*` via `NtQueryDirectoryObject` + ALPC port inventory; Linux FIFO inventory (`find / -type p`) as a smaller follow-up.
+- `shared_memory` — SysV `ipcs -m` + POSIX `/dev/shm` listing + `/dev/mqueue` (Linux + macOS); Windows shared sections (`NtQuerySection`) follow.
+- `signed_binaries` — Authenticode (Windows `WinVerifyTrust`), codesign (macOS `SecCodeCheckValidity`), IMA/EVM (Linux `getxattr security.ima`). Required for the posture-glyph "signed/unsigned" check.
+
+Wire model extension: new `EdgeKind` enum on `ConnectionEdge` (`TcpLoopback`, `UnixSocket`, `NamedPipe`, `SharedMemory`, `DBus`, `ALPC`, `EbpfMap`), `socket_path` for filesystem-backed channels, `world_accessible` boolean flagging endpoints any process can join (Unix socket `0666`, abstract socket, world-rw `/dev/shm`).
+
+### Issue 19.2: Process Binary Hashing + VirusTotal Server-Side Integration
+**Capability:** 28.8 | **Scope:** Agent (`processes` extension) + server (new) | **Status:** Proposed
+
+Extend the existing `processes` plugin to emit SHA-256 of each process's binary path. Server-side **`virustotal_cache.db`** store + a rate-limited (free tier: 4 req/min) VirusTotal API client; results cached with 7-day TTL keyed by hash. Threat-mode posture envelope carries `binary.hash_sha256` + `binary.virustotal_score`. API key lives in Settings → External Integrations, server-side, never on agent.
+
+### Issue 19.3: Per-Process Posture Envelope
+**Capability:** 28.8 | **Scope:** Server | **Status:** Proposed
+
+`ProcessNode.posture` envelope synthesises vulnerability scan (existing) + AV status (existing `antivirus`) + signed-binary verification (19.1) + firewall exposure (existing `firewall`) + disk encryption (existing `bitlocker`) + VirusTotal score (19.2) into one composite indicator. Server-side aggregation; agent plugins each contribute their slice. Composite glyph rendered as Sprite-child of each process Sphere (hidden when hardened, `!`/`⚠`/`?` otherwise).
+
+### Issue 19.4: Threat-Mode Toggle on `/viz/fleet`
+**Capability:** 28.8 | **Scope:** Server (renderer) | **Status:** Proposed
+
+`?mode=threat` URL param + `T`-key shortcut + UI control, persisted in `localStorage.yuzuVizMode`. Shared camera / scene-graph / dispatch contracts with the existing Fleet mode. Threat mode adds: posture-glyph rendering, IPC-edge rendering (19.1), `world_accessible` red glow, recommendation ghost overlays (19.5). Mode-state in URL hash takes precedence over `localStorage` (shareable links).
+
+### Issue 19.5: Recommendation Store + Agentic Recommender Integration
+**Capability:** 28.9 | **Scope:** Server | **Status:** Proposed
+
+New **`recommendations.db`** store. Schema: `id`, `customer_id`, `generated_at`, `generated_by`, `kind` (insert_waf / vxlan_separate / firewall_rule / harden_parser / kill_world_socket / other), `target_node_ids` (JSON), `target_edge_keys` (JSON), `rationale`, `status` (open / accepted / dismissed / applied), `operator_note`, `yaml_source`. REST CRUD at `/api/v1/recommendations/...` + matching MCP tools. An external agentic AI worker posts recommendations using a service-scoped API token; recommendations are ghost-overlaid in Threat mode. Accept / dismiss / apply via the existing approval workflow (`workflows.db`). "Apply" calls existing plugin actions via REST `/api/v1/dispatch`.
+
+### Issue 19.6: Action Surface — Click-Through to Existing Plugins
+**Capability:** 28.8 | **Scope:** Server (renderer + REST) | **Status:** Proposed
+
+Side-panel on node / edge click in Threat mode. Buttons call existing plugin actions through REST `/api/v1/dispatch`; no new `viz.actions` API surface. Initial action menu: check binary hash against VirusTotal, re-scan vulnerabilities, view firewall rules, add firewall rule, run sockwho, run ad-hoc bash, check AV / disk encryption status, kill process, quarantine binary. Each button respects the operator's RBAC (the button greys out if `Plugin:Execute` is missing).
+
+### Issue 19.7: Cross-Platform Parity Sweep — AV, Disk Encryption, Firewall
+**Capability:** 9.x extension | **Scope:** Agent (existing plugins) | **Status:** Proposed
+
+Audit `antivirus`, `bitlocker`, `firewall` plugins for macOS + Linux coverage. Plugin skeletons already have all three platform branches; verify each branch actually reports posture (gaps suspected on macOS XProtect / third-party AV, Linux ClamAV/SentinelOne/Crowdstrike, macOS FileVault, Linux LUKS, macOS `pfctl`, Linux `nftables`). Optionally rename `bitlocker` plugin to `disk_encryption` (decision deferred — breaking API token scope strings is the cost; recommendation in roadmap doc is to keep the name and add `disk_encryption` as an action alias).
+
+### Issue 19.8: Container-Runtime Awareness — `Containerised` Edge Scope
+**Capability:** 28.8 | **Scope:** Server (topology classification) + agent (optional new plugin) | **Status:** Proposed
+
+Detect Docker / Kubernetes / Podman in the host environment (could extend `os_info` or new `container_runtime` plugin). Server-side fleet topology classifier adds a `Containerised` `EdgeScope` for inter-container traffic on private RFC1918 / Docker default ranges. New `MountedSocket` edge kind for bind-mounted host sockets (the `/var/run/docker.sock` container-escape pattern) — special render to flag boundary crossings.
+
+### Issue 19.9: D-Bus + eBPF + Windows ALPC IPC (Defence-in-Depth)
+**Capability:** 28.8 | **Scope:** Agent (new plugins) | **Status:** Proposed
+
+Lower-priority IPC channels that round out the Threat Graph:
+- `dbus` plugin — `busctl list` system + session bus enumeration on Linux.
+- `ebpf_inventory` plugin — `bpftool map list` + `prog list` (root-only).
+- `alpc_ports` plugin — Windows ALPC port enumeration via `NtAlpcQueryInformation`.
+
+Land after the foundational IPC plugins (19.1) ship and the rendering model proves stable.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -1758,7 +1822,7 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates and 8.3 Response Offloading remain.
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading done — `offload_targets.db` + REST `/api/v1/offload-targets` + global fan-out wired into `AgentServiceImpl` for `agent.registered` and `execution.completed`. Phase 8 complete.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)

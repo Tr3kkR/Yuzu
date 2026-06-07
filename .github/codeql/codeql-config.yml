@@ -50,3 +50,14 @@ paths-ignore:
   - _build/**
   - "**/*.pb.cc"
   - "**/*.pb.h"
+
+# Drop pure-style "quality" rules that carry no security signal for a C++
+# systems codebase and only generate noise. The `+security-and-quality`
+# suite (chosen in codeql.yml because most C++ quality queries ARE
+# security-adjacent — UAF, null deref, dead code hiding logic bugs) also
+# pulls in documentation-completeness checks that don't apply here: we do
+# not doc-comment every function, and that is a deliberate convention, not
+# a defect. Excluding the query is cleaner than dismissing each instance.
+query-filters:
+  - exclude:
+      id: cpp/poorly-documented-function

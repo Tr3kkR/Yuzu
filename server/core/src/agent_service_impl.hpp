@@ -29,11 +29,17 @@ namespace yuzu::server {
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;
+class AuditStore;
 class ManagementGroupStore;
 class NotificationStore;
 class WebhookStore;
+class OffloadTargetStore;
 class InventoryStore;
 class UpdateRegistry;
+class ExecutionTracker;
+class FleetTopologyStore;
+class HeartbeatIngestion;
+class GuaranteedStateStore;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -52,14 +58,79 @@ public:
                      UpdateRegistry* update_registry = nullptr);
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+    /// #1128: operator-declared multi-egress NAT/proxy CIDRs for the NAT-aware
+    /// Subscribe binding relaxation. Empty (default) keeps strict exact-match.
+    void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
+        trusted_nat_cidrs_ = std::move(cidrs);
+    }
+    /// #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. Default
+    /// false; only safe with per-agent client certs (see Config doc).
+    void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    /// W1.4 / #827: AuditStore wired for enrollment-token consume rows.
+    /// SOC 2 CC7.2/CC7.3 require attributable credential-rejection logs;
+    /// the Register handler emits one audit row per successful consume AND
+    /// one per lost-race rejection (with `already_consumed_by=<agent_id>`
+    /// detail naming the race winner). nullptr disables emission — used
+    /// by the existing test harness that doesn't construct an AuditStore.
+    /// W1.1 audit_log → bool: the handler observes the return so a
+    /// dropped audit row surfaces as a counter increment plus an
+    /// analytics-event severity escalation, never a silent loss.
+    void set_audit_store(AuditStore* store) { audit_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
+    void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+    /// Guardian (Guaranteed State) store — receives drift/remediation events
+    /// ingested from the agent `__guard__` side-channel on the Subscribe stream
+    /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
+    /// build a Guardian store.
+    void set_guaranteed_state_store(GuaranteedStateStore* store) {
+        guaranteed_state_store_ = store;
+    }
+
+    /// UAT 2026-05-12: after a fresh agent registers, the next
+    /// `/api/v1/viz/fleet/topology` call must not return a snapshot
+    /// computed before this agent was on the dispatch list. Without
+    /// this hook the cube renders as `stale, ts=0, procs=[]` for the
+    /// remainder of the 60 s TTL window, which UAT flagged as a
+    /// "this should not happen" state. nullptr disables the wiring —
+    /// used by tests that don't build a topology store.
+    ///
+    /// Plain raw pointer (not atomic): registration runs on the gRPC
+    /// dispatcher; setter runs once during server bring-up before the
+    /// dispatcher accepts traffic.
+    void set_fleet_topology_store(FleetTopologyStore* store) { fleet_topology_store_ = store; }
+
+    /// #1000 / arch-S2: HeartbeatIngestion encapsulates the shared
+    /// per-heartbeat work (health upsert, metrics, fleet_snapshot push)
+    /// so both this service and GatewayUpstreamServiceImpl funnel
+    /// through one entry point. Set after bring-up alongside the stores.
+    void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
+
+    /// UAT 2026-05-06 #8: when set, response-receipt paths (Subscribe +
+    /// process_gateway_response) call `update_agent_status` so the
+    /// executions detail drawer's per-agent KPI table populates as
+    /// responses arrive, and the SSE `agent-transition` event fires
+    /// (which the drawer client listens to for live updates without
+    /// page reload). nullptr disables the wiring — used by tests that
+    /// don't exercise the executions ladder.
+    ///
+    /// Stored atomically because `process_gateway_response` is invoked
+    /// from detached `std::thread` workers spawned by `forward_gateway
+    /// _pending` in server.cpp; those threads outlive the gRPC server's
+    /// Shutdown drain (gateway-forward is a *client* of the gateway,
+    /// not a server-side handler). Setting nullptr at shutdown lets
+    /// in-flight forwarders observe the null and short-circuit
+    /// `notify_exec_tracker` instead of dereferencing a destroyed
+    /// `ExecutionTracker` (governance UAT 2026-05-06 Gate 7 re-review).
+    void set_execution_tracker(ExecutionTracker* tracker) {
+        execution_tracker_.store(tracker, std::memory_order_release);
+    }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
@@ -80,12 +151,10 @@ public:
     /// handlers and stamped onto every StoredResponse so the executions
     /// detail drawer can correlate exactly via `query_by_execution`. Empty
     /// `execution_id` removes any existing mapping for this command_id.
-    void record_execution_id(const std::string& command_id,
-                              const std::string& execution_id);
+    void record_execution_id(const std::string& command_id, const std::string& execution_id);
 
     // Process a CommandResponse forwarded from the gateway.
-    void process_gateway_response(const std::string& agent_id,
-                                   const pb::CommandResponse& resp);
+    void process_gateway_response(const std::string& agent_id, const pb::CommandResponse& resp);
 
     // -- Server-rendered SSE row helpers ----------------------------------------
     // Parsing utilities (columns_for_plugin, split_fields, etc.) are in
@@ -93,14 +162,38 @@ public:
     // state remain here.
 
     static std::string thead_for_plugin(const std::string& plugin);
-    static std::string render_row(const std::string& agent_name,
-                                   const std::string& plugin,
-                                   const std::string& line,
-                                   const std::vector<std::string>& col_names);
+    static std::string render_row(const std::string& agent_name, const std::string& plugin,
+                                  const std::string& line,
+                                  const std::vector<std::string>& col_names);
 
-    void publish_output_rows(const std::string& agent_id,
-                              const std::string& plugin,
-                              const std::string& raw_output);
+    /// #826: extract the bare IP from a gRPC peer string. gRPC encodes
+    /// peer as `ipv4:1.2.3.4:5678` (and `ipv6:[::1]:5678`, `unix:/tmp/s`,
+    /// etc.). Subscribe's peer-mismatch check operates on IPs because the
+    /// port differs across the Register and Subscribe RPCs from the same
+    /// agent — the meaningful security check is "same network endpoint",
+    /// not "same TCP four-tuple". Returns an empty string for unparseable
+    /// inputs; the caller MUST treat empty as a mismatch (never as a wild
+    /// match) to avoid recreating the #826 skip.
+    ///
+    /// Public for unit testability — exercised in test_agent_service_impl.cpp.
+    static std::string extract_peer_ip(std::string_view peer);
+
+    /// #1128 — NAT-aware per-session peer-binding decision (pure). `exact_ok` is
+    /// the strict result (Subscribe IP == Register IP, or a trusted-gateway IP
+    /// under gateway-mode). When that fails, a mismatch is DOWNGRADED to advisory
+    /// iff a stronger accommodation applies: a matching mTLS client identity
+    /// (`client_identity_matches`), or both IPs sharing one operator-declared
+    /// trusted NAT CIDR. Anything else is reject. An empty `register_ip` or
+    /// `subscribe_ip` is always reject (#826: empty is a mismatch, never a
+    /// wildcard) regardless of accommodation. Pure + static for unit testability.
+    enum class PeerBindingOutcome { exact_ok, advisory_mtls, advisory_nat_cidr, reject };
+    static PeerBindingOutcome evaluate_peer_binding(bool exact_ok, std::string_view register_ip,
+                                                    std::string_view subscribe_ip,
+                                                    bool client_identity_matches,
+                                                    const std::vector<std::string>& trusted_nat_cidrs);
+
+    void publish_output_rows(const std::string& agent_id, const std::string& plugin,
+                             const std::string& raw_output);
 
     // -- OTA Update RPCs -------------------------------------------------------
 
@@ -168,15 +261,32 @@ private:
     std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};
     bool gateway_mode_{false};
+    // #1128: operator-declared multi-egress NAT/proxy ranges (see Config). Empty
+    // = strict exact-match peer binding (default). Set once at wiring time via
+    // set_trusted_nat_cidrs; read-only on the Subscribe path thereafter.
+    std::vector<std::string> trusted_nat_cidrs_;
+    // #1128 / gov UP-2: gate for the mTLS-identity NAT accommodation. Default
+    // false — identity-match relaxes the IP binding ONLY when the operator
+    // affirms per-agent certs. See Config::nat_trust_mtls_identity.
+    bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
+    AuditStore* audit_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};
     WebhookStore* webhook_store_{nullptr};
+    OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    HeartbeatIngestion* heartbeat_ingestion_{nullptr};
+    /// Atomic — see `set_execution_tracker` doc for why detached
+    /// gateway-forward threads require the lock-free release/acquire
+    /// pair instead of a plain raw pointer.
+    std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
 
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
@@ -185,8 +295,21 @@ private:
                                              std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);
+
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
+
+    /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
+    /// state change for the given command_id. Resolves command_id →
+    /// execution_id via cmd_execution_ids_ and calls
+    /// `ExecutionTracker::update_agent_status` with a synthesised
+    /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
+    /// No-op if the tracker isn't wired or the command_id has no
+    /// execution mapping (out-of-band dispatch). Each call publishes an
+    /// `agent-transition` SSE event the drawer's client listens to for
+    /// live-updates without a page reload.
+    void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
+                             const pb::CommandResponse& resp);
 };
 
 } // namespace yuzu::server::detail

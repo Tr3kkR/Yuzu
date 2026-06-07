@@ -43,11 +43,46 @@ first agent's terminal would leave agents 2..N stamping empty
 sweeper is filed as PR 2.x. The accepted bounded leak matches the existing
 `cmd_send_times_` / `cmd_first_seen_` shape under the same `cmd_times_mu_`.
 
+Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
+47 assertions) drives `process_gateway_response` end-to-end into a real
+`ResponseStore` and pins the no-erase rule (HF-1 fan-out across 4 agents
+with mixed terminal statuses), the RUNNING/terminal stamping branches,
+and the `__timing__|...` sentinel early-return. The
+`test_workflow_routes.cpp:814` sibling case covers the response-store
+level only.
+
 ### Server restart caveat
 
 The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
+
+### Terminal-frame finalize invariant (UAT 2026-05-06)
+
+A `CommandResponse` with `status` ∈ {`SUCCESS`,`FAILURE`,`TIMEOUT`,`REJECTED`}
+and **empty output** does NOT create a new `responses` row. Both
+`Subscribe()` and `process_gateway_response()` call
+`ResponseStore::finalize_terminal_status(instr, agent, status, err, exec_id)`,
+which UPDATEs every existing RUNNING (status=0) row scoped to
+`(instruction_id, agent_id, execution_id)`. A terminal frame WITH output
+still inserts (rare; the data is the result). A terminal frame whose
+finalize updates zero rows (no preceding RUNNING under that
+execution_id — typically a re-mapped command_id retry) falls through to
+insert.
+
+Why: pre-fix, every command produced **two** rows per agent — a RUNNING
+row carrying the streamed output, plus an empty terminal sentinel. The
+dashboard rendered both, sorted newest-first, and operators read the
+non-zero `status` enum value (1=SUCCESS, 2=FAILURE, …) on the empty row
+as a failure exit code that "happened before" the data row. Now there
+is exactly one logical response row per (instruction, agent, execution),
+carrying the data and the terminal status.
+
+Regression pins: `test_agent_service_impl.cpp` "terminal SUCCESS folds
+into existing RUNNING rows" and "terminal frame WITH output still
+inserts" cover the two branches; the re-mapping case is pinned by
+"re-mapping a command_id updates the stamp" (terminal under the new
+exec_id falls through to insert because no RUNNING row exists there).
 
 ### Partial-index planner contract
 
@@ -113,3 +148,59 @@ PR 2.5 (#670) replaced the 16-arg `WorkflowRoutes::register_routes` with a
 `WorkflowRoutes::Deps` struct. **Do not regress that signature** — adding
 new dependencies to the workflow routes goes through the struct, not new
 positional arguments.
+
+### Second consumer (sprint W5.1, 2026-05-18)
+
+`GET /api/v1/events?execution_id=<id>` is the agentic-first sibling of
+`GET /sse/executions/{id}` — both subscribe to the same per-execution
+channel from the same `ExecutionEventBus`. The dashboard route emits raw
+`ev.data` (the browser already knows the channel from the URL path); the
+agentic route wraps every event in
+`{execution_id, event_id, timestamp_ms, type, payload}` so a worker
+subscribed to one channel can still discriminate events without out-of-
+band context.
+
+**Two consumers, one bus, one set of publisher invariants** — the
+publisher list above (`update_agent_status` / `refresh_counts` /
+`mark_cancelled` → `agent-transition` / `execution-progress` /
+`execution-completed`) is the single taxonomy both routes emit. A new
+event type must be added on the bus side first; both routes pick it up
+transparently. **Do not add a route-specific event type to either
+sibling** — that would split the taxonomy and break the A3 invariant
+that a single deterministic step name appears on every channel.
+
+The agentic route's audit verb is `api.v1.events.subscribe` (separate
+from `execution.live_subscribe` so SIEM filters can distinguish browser
+vs agentic consumers). Same no-dedup deferral applies (#700 Deferred-5).
+The A3 envelope shape and the A4 error envelope live in
+`server/core/src/rest_a4_envelope.hpp` as testable contracts — future
+discovery / MCP surfaces consuming the same bus reuse the helpers there
+rather than re-implementing the envelope.
+
+**Hardening invariants (sprint W5.1 R1):** the agentic handler exposes
+ring-buffer loss and per-connection backpressure to the client rather
+than letting them go silent.
+
+- **Replay-gap signal.** If the bus's ring buffer has already evicted
+  events with id ≤ `since_id`, the handler emits a synthetic
+  `replay-gap` envelope as the first frame
+  (`{execution_id, type:"replay-gap", missing_from, missing_to}`) so the
+  worker knows state may be inconsistent rather than silently observing
+  an `event_id` jump. Counted in
+  `yuzu_server_sse_api_replay_gap_total`. The dashboard sibling does
+  NOT emit this — adding it there is a follow-up.
+- **Per-connection queue cap.** `SseSinkState::queue` is bounded at
+  `kPerConnectionQueueCapDefault=500` (event_bus.hpp) with drop-oldest
+  semantics. Drops accumulate in `SseSinkState::dropped_total` and the
+  content provider emits one `events-dropped` envelope per batch on the
+  next wake, then resets the counter. The dashboard sibling does NOT
+  enforce a cap currently — same follow-up.
+- **Restart loss.** The bus is in-process and in-memory. On server
+  restart the buffer is empty; clients that reconnect with
+  `Last-Event-ID` after a restart will not receive events that occurred
+  before the restart regardless of the `since` value. Agentic workers
+  should fall back to `GET /api/v1/executions/<id>` for terminal state
+  recovery. This is the same characteristic the dashboard drawer
+  already lives with; it is documented here for agentic-client authors
+  who write reconnect logic against the executions ladder rather than
+  the dashboard's bootstrap path.

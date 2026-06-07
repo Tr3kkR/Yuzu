@@ -53,6 +53,17 @@ reserved_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: plugin with a malformed name (#822) ────────────────────────
+# Declares a name outside the [A-Za-z0-9_] identifier set; test_plugin_loader.cpp
+# scans against it to verify the invalid-name rejection path.
+invalid_name_fixture_plugin = shared_library(
+  'invalid_name_fixture_plugin',
+  files('unit/fixtures/invalid_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -102,22 +113,25 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guard_registry.cpp',
+    'unit/test_guard_file.cpp',
+    'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
-  # Ensure the fixture plugin is built before the test runs so the lookup
-  # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
-  link_depends: reserved_name_fixture_plugin,
+  # Ensure the fixture plugins are built before the test runs so the lookups
+  # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 test(
   'agent unit tests',
   agent_test_exe,
   suite: 'agent',
   timeout: 240,
-  depends: reserved_name_fixture_plugin,
+  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
@@ -131,10 +145,13 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
+    '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -150,7 +167,14 @@ if build_server
     files(
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
+      'unit/server/test_auth_routes_mfa.cpp',
+      'unit/server/test_settings_routes_mfa.cpp',
+      'unit/server/test_totp.cpp',
+      'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_mfa_qr.cpp',
+      'unit/server/test_mfa_store.cpp',
       'unit/server/test_auto_approve.cpp',
+      'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
@@ -160,9 +184,11 @@ if build_server
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
       'unit/server/test_workflow_routes.cpp',
+      'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
+      'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -175,9 +201,24 @@ if build_server
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_result_set_store.cpp',
+      'unit/server/test_result_set_matcher.cpp',
+      'unit/server/test_rest_result_sets_async.cpp',
+      'unit/server/test_result_sets_ui.cpp',
+      'unit/server/test_scope_walking_authz.cpp',
+      'unit/server/test_scope_yaml.cpp',
+      'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
+      'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_baseline_store.cpp',
+      'unit/server/test_guardian_push_builder.cpp',
+      'unit/server/test_guardian_resilience_schema.cpp',
+      'unit/server/test_guardian_routes.cpp',
+      'unit/server/test_guardian_form_render.cpp',
+      'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
@@ -192,10 +233,15 @@ if build_server
       'unit/server/test_inventory_eval.cpp',
       'unit/server/test_execution_statistics.cpp',
       'unit/server/test_device_token_store.cpp',
+      'unit/server/test_device_token_rejection.cpp',
+      'unit/server/test_agent_registry_token_revocation.cpp',
       'unit/server/test_software_deployment_store.cpp',
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_api_events.cpp',
+      'unit/server/test_rest_software_packages.cpp',
+      'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',
       'unit/server/test_insecure_tls_gate.cpp',
@@ -205,9 +251,21 @@ if build_server
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
+      'unit/server/test_response_templates_engine.cpp',
+      'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_offload_target_store.cpp',
+      'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_fleet_topology_store.cpp',
+      'unit/server/test_viz_routes.cpp',
+      'unit/server/test_product_pack_store.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
+      # C3b cross-check: test_guardian_resilience_schema.cpp includes the agent's
+      # resilience_strategy.hpp for resilience_keys to assert the server param-spec
+      # table matches the agent parser (contract G9 drift guard). Header-only
+      # constexpr — no link to yuzu_agent_core, just the include path.
+      include_directories('../agents/core/include'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -226,7 +284,12 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
+  # 600s: the server suite has grown to ~1200 test cases (#1032 added viz-engine
+  # coverage) and ASan instrumentation slows the full run past the previous
+  # 180s cap. TSan with halt_on_error usually exits earlier, but a sanitizer-
+  # instrumented full pass easily hits 4-5 min. A real hang is still bounded
+  # by the 60-min job-level timeout in nightly.yml.
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

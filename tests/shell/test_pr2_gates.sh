@@ -15,6 +15,7 @@
 #   CH-8  — coverage __seed sentinel honored → WARN, not silent PASS
 #          (perf half removed 2026-05-03 with the perf gate's regression logic)
 #   CH-15 — empty/whitespace/traversal --run-id rejected
+#   CH-17 — direct test_db.py vivify stderr sanitizes control chars
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -22,18 +23,25 @@
 #
 # Exit codes: 0 all scenarios passed; 1 one or more failed; 2 harness error.
 #
-# The harness uses isolated fixtures under /tmp/pr2-chaos-$$ and a
-# per-harness YUZU_TEST_DB so it cannot contaminate the operator's real
-# test-runs DB.
+# The harness uses isolated fixtures under a mktemp-created /tmp/yuzu-test-pr2-chaos-* dir, a temporary
+# HOME, and a per-harness YUZU_TEST_DB so it cannot contaminate the
+# operator's real test-runs DB or log root.
 
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
-CHAOS_ROOT="/tmp/pr2-chaos-$$"
+CHAOS_ROOT="$(mktemp -d /tmp/yuzu-test-pr2-chaos-XXXXXX)"
+# A failed `mktemp` under `set -uo pipefail` (no -e) leaves CHAOS_ROOT empty,
+# which would root-anchor the paths below ($CHAOS_HOME -> /home, the per-harness
+# YUZU_TEST_DB -> /test-runs.db) and run the suite against the operator's real
+# HOME/DB. Refuse to continue unless we got a real directory (gov UP-1 / chaos CH-20).
+[[ -n "$CHAOS_ROOT" && -d "$CHAOS_ROOT" ]] || { echo "test_pr2_gates: mktemp -d failed" >&2; exit 2; }
+CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
-mkdir -p "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
+mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
+export HOME="$CHAOS_HOME"
 
 cleanup() {
     rm -rf "$CHAOS_ROOT" 2>/dev/null || true
@@ -88,7 +96,7 @@ bad() {
 
 init_db() {
     # Fresh DB per scenario so we don't see cross-pollution.
-    rm -f "$YUZU_TEST_DB"
+    rm -f "$YUZU_TEST_DB" "$YUZU_TEST_DB-wal" "$YUZU_TEST_DB-shm"
     bash "$YUZU_ROOT/scripts/test/test-db-init.sh" >/dev/null 2>&1 || return 1
 }
 
@@ -196,9 +204,10 @@ EOF
     chmod +x "$MOCKBIN/meson"
 
     local out
+    local build_dir="$CHAOS_ROOT/build-ch3"
     out=$(bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch3 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch3-baseline.json" \
         --capture-baselines 2>&1) || true
 
@@ -217,7 +226,7 @@ EOF
         ok "CH-3: gate FAIL, baseline not written, notes: $notes"
     fi
 
-    rm -rf /tmp/build-ch3 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-4: gcovr root-wrapper schema → WARN not silent 0% ────────────────
@@ -248,9 +257,10 @@ case "$1" in setup|compile) mkdir -p "${2:-}"; exit 0 ;; test) exit 0 ;; *) exit
 EOF
     chmod +x "$MOCKBIN/meson"
 
+    local build_dir="$CHAOS_ROOT/build-ch4"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch4 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch4-baseline.json" \
         --report-only >/dev/null 2>&1 || true
 
@@ -273,7 +283,7 @@ PY
         bad "CH-4" "branch=$branch (expected ~75.0 from root.branches_covered/valid)"
     fi
 
-    rm -rf /tmp/build-ch4 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-6: perf parser drift → FAIL not silent WARN ─────────────────────
@@ -349,9 +359,10 @@ case "$1" in setup|compile) mkdir -p "${2:-}"; exit 0 ;; test) exit 0 ;; *) exit
 EOF
     chmod +x "$MOCKBIN/meson"
 
+    local build_dir="$CHAOS_ROOT/build-ch8"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch8 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch8-coverage-baseline.json" >/dev/null 2>&1 || true
 
     local status notes
@@ -370,7 +381,7 @@ EOF
     # axis. CH-6 still exercises the parser-drift WARN path which is the
     # only remaining "perf gate doesn't silently green-pass" guarantee.
 
-    rm -rf /tmp/build-ch8 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-16: sec-h-1 regression — malicious --baseline path cannot inject python ──
@@ -422,9 +433,10 @@ EOF
     local sentinel="$CHAOS_ROOT/ch16-should-not-exist"
     rm -f "$sentinel"
 
+    local build_dir="$CHAOS_ROOT/build-ch16"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch16 \
+        --build-dir "$build_dir" \
         --baseline "$evil_baseline" >/dev/null 2>&1 || true
 
     # The sentinel must not have been created by injected code, AND
@@ -442,7 +454,7 @@ EOF
         bad "CH-16" "expected seed WARN, got status='$status' (gate may have failed to read apostrophed path)"
     fi
 
-    rm -rf /tmp/build-ch16 "$evil_dir" 2>/dev/null || true
+    rm -rf "$build_dir" "$evil_dir" 2>/dev/null || true
 }
 
 # ── CH-15: empty/whitespace/traversal --run-id rejected ────────────────
@@ -455,6 +467,8 @@ scenario_CH_15() {
         ""
         " "
         "../../../tmp/evil"
+        "."
+        ".."
         "foo/bar"
         $'has\nnewline'
         "has space"
@@ -482,11 +496,102 @@ scenario_CH_15() {
     if (( all_ok )); then
         ok "CH-15: all invalid run-ids rejected across 3 gates"
     fi
+
+    for gate in coverage-gate.sh perf-gate.sh sanitizer-gate.sh; do
+        local out
+        out=$(bash "$YUZU_ROOT/scripts/test/$gate" --run-id $'\e[2J' 2>&1 || true)
+        if [[ "$out" == *$'\e'* ]]; then
+            bad "CH-15" "$gate echoed raw ESC in invalid --run-id rejection"
+            return
+        fi
+    done
+    ok "CH-15: invalid run-id rejections do not echo raw ESC"
+}
+
+# ── CH-17: direct test_db.py vivify stderr sanitizes control chars ──────
+
+scenario_CH_17() {
+    echo ""
+    echo "=== CH-17: direct test_db.py rejects unsafe run_id ==="
+    init_db || { bad "CH-17" "db init failed"; return; }
+
+    local bad_ids=($'\e[2J' "." "..")
+    local rid out rc
+    for rid in "${bad_ids[@]}"; do
+        out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" gate \
+            --run-id "$rid" \
+            --phase 7 \
+            --gate Probe \
+            --status PASS \
+            --duration 0 2>&1 >/dev/null)
+        rc=$?
+        if (( rc == 0 )); then
+            bad "CH-17" "direct test_db.py accepted unsafe run_id '$rid'"
+            return
+        fi
+
+        if [[ "$out" == *$'\e'* ]]; then
+            bad "CH-17" "rejection stderr contained a raw ESC byte"
+            return
+        fi
+        if [[ "$out" != *"invalid --run-id"* ]]; then
+            bad "CH-17" "rejection stderr did not explain invalid run_id: $out"
+            return
+        fi
+    done
+
+    local stored
+    stored=$(python3 - "$YUZU_TEST_DB" <<'PY'
+import sqlite3, sys
+db = sys.argv[1]
+c = sqlite3.connect(db)
+row = c.execute("SELECT COUNT(*) FROM test_runs").fetchone()
+print(row[0])
+PY
+)
+    if [[ "$stored" != "0" ]]; then
+        bad "CH-17" "invalid run_id created test_runs rows"
+        return
+    fi
+
+    python3 - "$YUZU_TEST_DB" <<'PY'
+import sqlite3, sys, time
+db = sys.argv[1]
+c = sqlite3.connect(db)
+now = int(time.time())
+c.execute(
+    "INSERT INTO test_runs "
+    "(run_id, started_at, commit_sha, branch, mode, overall_status) "
+    "VALUES (?, ?, 'legacy', 'dev', 'manual', 'MANUAL')",
+    ("safe-keep", now),
+)
+c.execute(
+    "INSERT INTO test_runs "
+    "(run_id, started_at, commit_sha, branch, mode, overall_status) "
+    "VALUES (?, ?, 'legacy', 'dev', 'manual', 'MANUAL')",
+    # One day older than safe-keep so `--prune 1` deterministically keeps
+    # safe-keep and deletes "..". `now - 1` risked a same-second tie where
+    # SQLite's ORDER BY started_at DESC ordering is undefined, which could
+    # keep ".." instead and pass the skip-assertion vacuously (gov QA SHOULD).
+    ("..", now - 86400),
+)
+c.commit()
+PY
+
+    local prune_out
+    prune_out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" query \
+        --include-manual --prune 1 2>&1)
+    if [[ "$prune_out" != *"skipped unsafe log dir for run_id=.."* ]]; then
+        bad "CH-17" "prune did not report unsafe legacy run_id skip: $prune_out"
+        return
+    fi
+
+    ok "CH-17: direct test_db.py rejects unsafe run_ids and prune skips legacy unsafe dirs"
 }
 
 # ── Scenario dispatch ───────────────────────────────────────────────────
 
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -506,6 +611,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-8)  scenario_CH_8 ;;
         CH-15) scenario_CH_15 ;;
         CH-16) scenario_CH_16 ;;
+        CH-17) scenario_CH_17 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done

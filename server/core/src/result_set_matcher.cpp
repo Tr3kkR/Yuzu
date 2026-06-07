@@ -1,0 +1,201 @@
+#include "result_set_matcher.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <charconv>
+#include <string>
+#include <vector>
+
+namespace yuzu::server::rs_matcher {
+
+namespace {
+
+// Split `text` on '\n' into non-owning views, dropping a trailing empty
+// fragment. Bounded by the caller's output size (responses are retention-
+// capped) so no DoS surface here.
+std::vector<std::string_view> split_lines(std::string_view text) {
+    std::vector<std::string_view> out;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t nl = text.find('\n', start);
+        if (nl == std::string_view::npos) {
+            if (start < text.size())
+                out.push_back(text.substr(start));
+            break;
+        }
+        out.push_back(text.substr(start, nl - start));
+        start = nl + 1;
+    }
+    return out;
+}
+
+// Split a `|`-joined tar row into cell views.
+std::vector<std::string_view> split_cells(std::string_view line) {
+    std::vector<std::string_view> out;
+    size_t start = 0;
+    while (true) {
+        size_t bar = line.find('|', start);
+        if (bar == std::string_view::npos) {
+            out.push_back(line.substr(start));
+            break;
+        }
+        out.push_back(line.substr(start, bar - start));
+        start = bar + 1;
+    }
+    return out;
+}
+
+bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher) {
+    if (op == "exists")
+        return !cell.empty();
+    if (op == "eq") {
+        if (!matcher.contains("value") || !matcher["value"].is_string())
+            return false;
+        return cell == matcher["value"].get<std::string>();
+    }
+    if (op == "contains") {
+        if (!matcher.contains("value") || !matcher["value"].is_string())
+            return false;
+        return cell.find(matcher["value"].get<std::string>()) != std::string_view::npos;
+    }
+    if (op == "in") {
+        if (!matcher.contains("value_set") || !matcher["value_set"].is_array())
+            return false;
+        for (const auto& v : matcher["value_set"])
+            if (v.is_string() && cell == v.get<std::string>())
+                return true;
+        return false;
+    }
+    return false;
+}
+
+// Column matcher over the tar `__schema__` / row / `__total__` shape. Returns
+// true iff any data row's named column satisfies the op.
+bool tar_column_match(std::string_view output, const std::string& column, const std::string& op,
+                      const nlohmann::json& matcher) {
+    auto lines = split_lines(output);
+    int col_idx = -1;
+    for (const auto& line : lines) {
+        if (line.starts_with("__schema__")) {
+            // The schema line carries a leading `__schema__` marker cell;
+            // data rows do NOT. So a column at schema cell `i` (i≥1) lands at
+            // data-row index `i-1`.
+            auto cells = split_cells(line);
+            for (size_t i = 1; i < cells.size(); ++i)
+                if (cells[i] == column) {
+                    col_idx = static_cast<int>(i) - 1;
+                    break;
+                }
+            continue;
+        }
+        if (line.starts_with("__total__") || line.empty())
+            continue;
+        if (col_idx < 0)
+            continue; // no schema seen yet → can't resolve the column
+        auto cells = split_cells(line);
+        if (static_cast<size_t>(col_idx) >= cells.size())
+            continue;
+        if (cell_satisfies(cells[col_idx], op, matcher))
+            return true;
+    }
+    return false;
+}
+
+// Column matcher over a JSON array-of-objects output (`[{"sha256":"..."}]`).
+// Best-effort fallback for instructions that emit structured JSON rather than
+// the tar pipe format. Returns true iff any object's column satisfies the op.
+bool json_column_match(std::string_view output, const std::string& column, const std::string& op,
+                       const nlohmann::json& matcher) {
+    auto doc = nlohmann::json::parse(output, nullptr, false);
+    if (doc.is_discarded())
+        return false;
+    const nlohmann::json* rows = nullptr;
+    if (doc.is_array())
+        rows = &doc;
+    else if (doc.is_object() && doc.contains("rows") && doc["rows"].is_array())
+        rows = &doc["rows"];
+    if (!rows)
+        return false;
+    for (const auto& row : *rows) {
+        if (!row.is_object() || !row.contains(column))
+            continue;
+        const auto& field = row[column];
+        std::string cell;
+        if (field.is_string())
+            cell = field.get<std::string>();
+        else if (field.is_number_integer())
+            cell = std::to_string(field.get<long long>());
+        else if (field.is_number_float())
+            cell = std::to_string(field.get<double>());
+        else if (field.is_boolean())
+            cell = field.get<bool>() ? "true" : "false";
+        else
+            continue;
+        if (cell_satisfies(cell, op, matcher))
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+int tar_row_count(std::string_view output) {
+    if (output.starts_with("error|"))
+        return 0;
+    // Prefer the authoritative trailer the plugin emits.
+    if (auto pos = output.rfind("__total__|"); pos != std::string_view::npos) {
+        auto tail = output.substr(pos + std::string_view("__total__|").size());
+        if (auto nl = tail.find('\n'); nl != std::string_view::npos)
+            tail = tail.substr(0, nl);
+        int n = 0;
+        auto [ptr, ec] = std::from_chars(tail.data(), tail.data() + tail.size(), n);
+        if (ec == std::errc{})
+            return n;
+    }
+    // Fallback: count data lines (exclude schema/total/blank).
+    int n = 0;
+    for (const auto& line : split_lines(output)) {
+        if (line.empty() || line.starts_with("__schema__") || line.starts_with("__total__"))
+            continue;
+        ++n;
+    }
+    return n;
+}
+
+bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+    // A non-success response is never a hit, whatever the matcher says.
+    if (status != kStatusSuccess)
+        return false;
+
+    // Empty matcher → default: any SUCCESS responder qualifies.
+    if (matcher_json.empty())
+        return true;
+    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    if (m.is_discarded() || !m.is_object() || m.empty())
+        return true;
+
+    if (m.contains("kind") && m["kind"].is_string()) {
+        const auto kind = m["kind"].get<std::string>();
+        if (kind == "any_response")
+            return true;
+        if (kind == "tar_rows_ge") {
+            int need = m.value("n", 1);
+            return tar_row_count(output) >= need;
+        }
+        return false; // unknown kind → conservatively exclude
+    }
+
+    if (m.contains("column") && m["column"].is_string() && m.contains("op") && m["op"].is_string()) {
+        const auto column = m["column"].get<std::string>();
+        const auto op = m["op"].get<std::string>();
+        // Try the tar pipe shape first (its schema line is unambiguous),
+        // then the JSON array-of-objects fallback.
+        return tar_column_match(output, column, op, m) || json_column_match(output, column, op, m);
+    }
+
+    // Matcher present but not a recognised shape → fall back to default so a
+    // typo can't silently empty the set; the operator still gets responders.
+    return true;
+}
+
+} // namespace yuzu::server::rs_matcher

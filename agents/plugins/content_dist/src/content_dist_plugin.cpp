@@ -52,7 +52,8 @@ YuzuPluginContext* g_ctx = nullptr;
 fs::path staging_dir() {
     yuzu::PluginContext pctx{g_ctx};
     auto data_dir = pctx.get_config("agent.data_dir");
-    fs::path dir = data_dir.empty() ? fs::temp_directory_path() / "yuzu-staged" : fs::path{std::string{data_dir}} / "staged";
+    fs::path dir = data_dir.empty() ? fs::temp_directory_path() / "yuzu-staged"
+                                    : fs::path{std::string{data_dir}} / "staged";
     std::error_code ec;
     fs::create_directories(dir, ec);
 #ifndef _WIN32
@@ -64,13 +65,15 @@ fs::path staging_dir() {
 
 std::string sha256_file(const fs::path& path) {
     std::ifstream file(path, std::ios::binary);
-    if (!file) return {};
+    if (!file)
+        return {};
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
     DWORD hash_len = 0, result_len = 0;
-    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &result_len, 0);
+    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len),
+                      sizeof(hash_len), &result_len, 0);
     BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
     char buf[8192];
     while (file.read(buf, sizeof(buf)) || file.gcount() > 0)
@@ -80,7 +83,8 @@ std::string sha256_file(const fs::path& path) {
     BCryptDestroyHash(hash);
     BCryptCloseAlgorithmProvider(alg, 0);
     std::string hex;
-    for (auto b : digest) hex += std::format("{:02x}", b);
+    for (auto b : digest)
+        hex += std::format("{:02x}", b);
     return hex;
 #else
     auto* ctx = EVP_MD_CTX_new();
@@ -93,13 +97,15 @@ std::string sha256_file(const fs::path& path) {
     EVP_DigestFinal_ex(ctx, digest, &len);
     EVP_MD_CTX_free(ctx);
     std::string hex;
-    for (unsigned i = 0; i < len; ++i) hex += std::format("{:02x}", digest[i]);
+    for (unsigned i = 0; i < len; ++i)
+        hex += std::format("{:02x}", digest[i]);
     return hex;
 #endif
 }
 
 bool is_safe_filename(std::string_view name) {
-    if (name.empty() || name.find("..") != std::string_view::npos) return false;
+    if (name.empty() || name.find("..") != std::string_view::npos)
+        return false;
     for (char c : name) {
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_')
             return false;
@@ -143,7 +149,11 @@ bool parse_url(std::string_view url, ParsedUrl& out) {
         (bracket_pos == std::string_view::npos || colon_pos > bracket_pos)) {
         out.host = std::string(authority.substr(0, colon_pos));
         auto port_str = authority.substr(colon_pos + 1);
-        try { out.port = std::stoi(std::string(port_str)); } catch (...) { out.port = 0; }
+        try {
+            out.port = std::stoi(std::string(port_str));
+        } catch (...) {
+            out.port = 0;
+        }
     } else {
         out.host = std::string(authority);
         out.port = 0;
@@ -211,11 +221,10 @@ bool is_safe_arg(std::string_view arg) {
     // Allow alphanumeric, dash, underscore, dot, equals, colon, slash, backslash, space
     // Block: ; & | ` $ ( ) { } < > ! ~ ^ " ' # * ? [ ] \n \r
     for (char c : arg) {
-        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' ||
-            c == '(' || c == ')' || c == '{' || c == '}' || c == '<' ||
-            c == '>' || c == '!' || c == '~' || c == '^' || c == '\'' ||
-            c == '"' || c == '#' || c == '*' || c == '?' || c == '[' ||
-            c == ']' || c == '\n' || c == '\r') {
+        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' || c == '(' || c == ')' ||
+            c == '{' || c == '}' || c == '<' || c == '>' || c == '!' || c == '~' || c == '^' ||
+            c == '\'' || c == '"' || c == '#' || c == '*' || c == '?' || c == '[' || c == ']' ||
+            c == '\n' || c == '\r') {
             return false;
         }
     }
@@ -236,7 +245,8 @@ std::vector<std::string> split_args(std::string_view args) {
             current += c;
         }
     }
-    if (!current.empty()) result.push_back(std::move(current));
+    if (!current.empty())
+        result.push_back(std::move(current));
     return result;
 }
 
@@ -252,10 +262,10 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
 
     if (!args_str.empty()) {
         int len = MultiByteToWideChar(CP_UTF8, 0, args_str.data(),
-                                       static_cast<int>(args_str.size()), nullptr, 0);
+                                      static_cast<int>(args_str.size()), nullptr, 0);
         std::wstring wargs(static_cast<size_t>(len), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, args_str.data(),
-                             static_cast<int>(args_str.size()), wargs.data(), len);
+        MultiByteToWideChar(CP_UTF8, 0, args_str.data(), static_cast<int>(args_str.size()),
+                            wargs.data(), len);
         cmdline += L" " + wargs;
     }
 
@@ -279,17 +289,16 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
 
     PROCESS_INFORMATION pi{};
 
-    BOOL ok = CreateProcessW(
-        wpath.c_str(),      // application name
-        cmdline.data(),     // command line (mutable)
-        nullptr,            // process security attributes
-        nullptr,            // thread security attributes
-        TRUE,               // inherit handles
-        CREATE_NO_WINDOW,   // creation flags — no console window
-        nullptr,            // environment
-        nullptr,            // current directory
-        &si,                // startup info
-        &pi                 // process info
+    BOOL ok = CreateProcessW(wpath.c_str(),    // application name
+                             cmdline.data(),   // command line (mutable)
+                             nullptr,          // process security attributes
+                             nullptr,          // thread security attributes
+                             TRUE,             // inherit handles
+                             CREATE_NO_WINDOW, // creation flags — no console window
+                             nullptr,          // environment
+                             nullptr,          // current directory
+                             &si,              // startup info
+                             &pi               // process info
     );
 
     CloseHandle(stdout_wr); // close write end in parent
@@ -333,7 +342,8 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
     std::vector<const char*> argv;
     std::string exe_str = exe_path.string();
     argv.push_back(exe_str.c_str());
-    for (const auto& a : args) argv.push_back(a.c_str());
+    for (const auto& a : args)
+        argv.push_back(a.c_str());
     argv.push_back(nullptr);
 
     // Create pipe for stdout capture
@@ -387,24 +397,33 @@ public:
     std::string_view name() const noexcept override { return "content_dist"; }
     std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "Content staging — download, verify, execute, and manage staged files (no shell-out)";
+        return "Content staging — download, verify, execute, and manage staged files (no "
+               "shell-out)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"stage", "execute_staged", "list_staged", "cleanup",
-                                     "upload_file", nullptr};
+        static const char* acts[] = {"stage",   "execute_staged", "list_staged",
+                                     "cleanup", "upload_file",    nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& ctx) override { g_ctx = ctx.raw(); return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        g_ctx = ctx.raw();
+        return {};
+    }
     void shutdown(yuzu::PluginContext&) noexcept override { g_ctx = nullptr; }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
-        if (action == "stage")          return do_stage(ctx, params);
-        if (action == "execute_staged") return do_execute(ctx, params);
-        if (action == "list_staged")    return do_list(ctx);
-        if (action == "cleanup")        return do_cleanup(ctx, params);
-        if (action == "upload_file")    return do_upload(ctx, params);
+        if (action == "stage")
+            return do_stage(ctx, params);
+        if (action == "execute_staged")
+            return do_execute(ctx, params);
+        if (action == "list_staged")
+            return do_list(ctx);
+        if (action == "cleanup")
+            return do_cleanup(ctx, params);
+        if (action == "upload_file")
+            return do_upload(ctx, params);
         ctx.write_output(std::format("error|unknown action: {}", action));
         return 1;
     }
@@ -419,7 +438,8 @@ private:
             return 1;
         }
         if (!is_safe_filename(filename)) {
-            ctx.write_output("error|invalid filename (alphanumeric, dots, hyphens, underscores only)");
+            ctx.write_output(
+                "error|invalid filename (alphanumeric, dots, hyphens, underscores only)");
             return 1;
         }
 
@@ -434,7 +454,21 @@ private:
         if (hash != expected) {
             std::error_code ec;
             fs::remove(dest, ec);
-            ctx.write_output(std::format("error|hash mismatch: expected={}, got={}", expected, hash));
+            ctx.write_output(
+                std::format("error|hash mismatch: expected={}, got={}", expected, hash));
+            return 1;
+        }
+
+        // #808: persist the verified hash in agent KV so `do_execute` has an
+        // authoritative source of truth for re-verification. KV lives in a
+        // separate SQLite DB outside the staging directory, so an attacker
+        // who can swap a staged file (the TOCTOU window) cannot also rewrite
+        // its expected hash. Key namespace `staged_hash:<filename>`.
+        yuzu::PluginContext pctx{g_ctx};
+        if (!pctx.storage_set(std::string{"staged_hash:"} + std::string{filename}, hash)) {
+            std::error_code ec;
+            fs::remove(dest, ec);
+            ctx.write_output("error|failed to persist staged hash to agent KV");
             return 1;
         }
 
@@ -445,8 +479,14 @@ private:
 
     int do_execute(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto filename = params.get("filename");
-        if (filename.empty()) { ctx.write_output("error|missing required parameter: filename"); return 1; }
-        if (!is_safe_filename(filename)) { ctx.write_output("error|invalid filename"); return 1; }
+        if (filename.empty()) {
+            ctx.write_output("error|missing required parameter: filename");
+            return 1;
+        }
+        if (!is_safe_filename(filename)) {
+            ctx.write_output("error|invalid filename");
+            return 1;
+        }
 
         auto path = staging_dir() / std::string{filename};
         if (!fs::exists(path)) {
@@ -454,20 +494,53 @@ private:
             return 1;
         }
 
-        // Re-verify hash before execution to detect TOCTOU tampering
-        auto expected_hash = params.get("expected_hash");
-        if (!expected_hash.empty()) {
-            auto actual = sha256_file(path);
-            if (actual != expected_hash) {
-                ctx.write_output(std::format("error|hash re-verification failed: expected={}, got={}", expected_hash, actual));
-                return 1;
-            }
+        // #808: hash re-verification is MANDATORY and the expected hash MUST
+        // come from agent KV (persisted by `do_stage` at the moment of
+        // download verification). The previous design read `expected_hash`
+        // from caller-provided params and skipped verification entirely when
+        // the param was absent — a local attacker who could write to the
+        // staging directory between stage and execute would then run
+        // arbitrary code. By sourcing the hash from KV (a separate SQLite
+        // DB outside the staging tree) we eliminate both the skip path and
+        // the trust-the-caller-hash oracle.
+        yuzu::PluginContext pctx{g_ctx};
+        auto kv_key = std::string{"staged_hash:"} + std::string{filename};
+        auto trusted_hash = pctx.storage_get(kv_key);
+        if (trusted_hash.empty()) {
+            // No KV entry — either the file was placed in the staging dir by
+            // something other than `do_stage`, or KV was wiped. Either way
+            // we have no source of truth, so we refuse.
+            ctx.write_output(std::format("error|no trusted hash on record for staged file '{}'; "
+                                         "stage the file via the `stage` action first",
+                                         filename));
+            return 1;
+        }
+        auto actual = sha256_file(path);
+        if (actual != trusted_hash) {
+            ctx.write_output(
+                std::format("error|hash re-verification failed (file tampered post-stage?): "
+                            "expected={}, got={}",
+                            trusted_hash, actual));
+            return 1;
+        }
+        // Optional caller-provided `expected_hash` is still honoured if
+        // present — but only to detect orchestration drift (caller's idea of
+        // the hash diverged from what we staged). Failure here is NOT a
+        // security event, just a config mismatch.
+        auto caller_hash = params.get("expected_hash");
+        if (!caller_hash.empty() && std::string{caller_hash} != trusted_hash) {
+            ctx.write_output(
+                std::format("error|caller-provided expected_hash does not match the hash "
+                            "recorded at stage time: caller={}, staged={}",
+                            caller_hash, trusted_hash));
+            return 1;
         }
 
         auto args = params.get("args");
         // Validate args to block shell metacharacters
         if (!args.empty() && !is_safe_arg(args)) {
-            ctx.write_output("error|args contain forbidden characters (shell metacharacters blocked)");
+            ctx.write_output(
+                "error|args contain forbidden characters (shell metacharacters blocked)");
             return 1;
         }
 
@@ -476,7 +549,8 @@ private:
 
         ctx.write_output(std::format("status|{}", rc == 0 ? "ok" : "error"));
         ctx.write_output(std::format("exit_code|{}", rc));
-        if (!output.empty()) ctx.write_output(std::format("output|{}", output));
+        if (!output.empty())
+            ctx.write_output(std::format("output|{}", output));
         return rc;
     }
 
@@ -485,10 +559,12 @@ private:
         std::error_code ec;
         int count = 0;
         for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            if (!entry.is_regular_file()) continue;
+            if (!entry.is_regular_file())
+                continue;
             auto size = entry.file_size(ec);
             auto hash = sha256_file(entry.path());
-            ctx.write_output(std::format("file|{}|{}|{}", entry.path().filename().string(), size, hash));
+            ctx.write_output(
+                std::format("file|{}|{}|{}", entry.path().filename().string(), size, hash));
             ++count;
         }
         ctx.write_output(std::format("count|{}", count));
@@ -509,7 +585,8 @@ private:
             server_url = pctx.get_config("agent.server_web_url");
         }
         if (server_url.empty()) {
-            ctx.write_output("error|missing server_url parameter and agent.server_web_url not configured");
+            ctx.write_output(
+                "error|missing server_url parameter and agent.server_web_url not configured");
             return 1;
         }
 
@@ -540,8 +617,8 @@ private:
             auto base_str = canon_base.string();
             if (file_str.size() < base_str.size() ||
                 file_str.compare(0, base_str.size(), base_str) != 0 ||
-                (file_str.size() > base_str.size() &&
-                 file_str[base_str.size()] != '/' && file_str[base_str.size()] != '\\')) {
+                (file_str.size() > base_str.size() && file_str[base_str.size()] != '/' &&
+                 file_str[base_str.size()] != '\\')) {
                 ctx.write_output("error|path is outside allowed base directory");
                 return 1;
             }
@@ -550,9 +627,12 @@ private:
         auto file_size = fs::file_size(file_path, ec);
         int max_mb = 100;
         auto max_str = params.get("max_size_mb", "100");
-        try { max_mb = std::stoi(std::string{max_str}); } catch (...) {}
+        try {
+            max_mb = std::stoi(std::string{max_str});
+        } catch (...) {}
         if (file_size > static_cast<std::uintmax_t>(max_mb) * 1024 * 1024) {
-            ctx.write_output(std::format("error|file too large ({} bytes, max {} MB)", file_size, max_mb));
+            ctx.write_output(
+                std::format("error|file too large ({} bytes, max {} MB)", file_size, max_mb));
             return 1;
         }
 
@@ -569,7 +649,8 @@ private:
             ctx.write_output("error|failed to open file");
             return 1;
         }
-        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                            std::istreambuf_iterator<char>());
         ifs.close();
 
         // Parse server URL and POST the file
@@ -577,11 +658,17 @@ private:
         std::string scheme = "https";
         std::string host = url;
 
-        if (url.starts_with("https://")) { host = url.substr(8); scheme = "https"; }
-        else if (url.starts_with("http://")) { host = url.substr(7); scheme = "http"; }
+        if (url.starts_with("https://")) {
+            host = url.substr(8);
+            scheme = "https";
+        } else if (url.starts_with("http://")) {
+            host = url.substr(7);
+            scheme = "http";
+        }
 
         // Strip trailing slash
-        while (!host.empty() && host.back() == '/') host.pop_back();
+        while (!host.empty() && host.back() == '/')
+            host.pop_back();
 
         ctx.report_progress(10);
 
@@ -626,15 +713,28 @@ private:
     int do_cleanup(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto hours_str = params.get("hours");
         int hours = 24;
-        if (!hours_str.empty()) { try { hours = std::stoi(std::string{hours_str}); } catch (...) {} }
+        if (!hours_str.empty()) {
+            try {
+                hours = std::stoi(std::string{hours_str});
+            } catch (...) {}
+        }
 
         auto dir = staging_dir();
         auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(hours);
         std::error_code ec;
         int removed = 0;
+        yuzu::PluginContext pctx{g_ctx};
         for (const auto& entry : fs::directory_iterator(dir, ec)) {
             if (entry.is_regular_file() && entry.last_write_time(ec) < cutoff) {
+                auto fname = entry.path().filename().string();
                 fs::remove(entry.path(), ec);
+                // #808: also evict the staged-hash KV entry so an entry
+                // can't outlive the file it describes (would leak storage
+                // and confuse a future `do_execute` that fails on
+                // "file not staged" rather than the more useful
+                // "no trusted hash on record" message — but the file
+                // doesn't exist anyway, so either is correct).
+                pctx.storage_delete(std::string{"staged_hash:"} + fname);
                 ++removed;
             }
         }

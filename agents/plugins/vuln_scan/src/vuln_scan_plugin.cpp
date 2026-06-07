@@ -279,6 +279,24 @@ std::vector<AppInfo> get_installed_apps() {
                 apps.push_back({line.substr(0, sp), line.substr(sp + 1)});
             }
         }
+    } else if (command_exists("apk")) {
+        // Alpine: `apk info -v` prints "<name>-<pkgver>-r<pkgrel>" per line.
+        // pkgver/pkgrel never contain '-', so the last two '-'-delimited fields
+        // are the version; everything before is the (possibly hyphenated) name.
+        auto out = run_command("apk info -v 2>/dev/null");
+        std::istringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                line.pop_back();
+            auto rel_sep = line.rfind('-');
+            if (rel_sep == std::string::npos || rel_sep == 0)
+                continue;
+            auto ver_sep = line.rfind('-', rel_sep - 1);
+            if (ver_sep == std::string::npos || ver_sep == 0)
+                continue;
+            apps.push_back({line.substr(0, ver_sep), line.substr(ver_sep + 1)});
+        }
     }
 
     return apps;

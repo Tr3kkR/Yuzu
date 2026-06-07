@@ -43,24 +43,6 @@ std::string run_command(const char* cmd) {
     return result;
 }
 
-int run_command_with_exit(const char* cmd) {
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return -1;
-    std::array<char, 256> buf{};
-    // drain output
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {}
-#ifdef _WIN32
-    return _pclose(pipe);
-#else
-    return pclose(pipe);
-#endif
-}
-
 bool is_safe_host(std::string_view host) {
     if (host.empty() || host.size() > 253)
         return false;

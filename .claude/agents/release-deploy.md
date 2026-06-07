@@ -60,6 +60,8 @@ You perform a targeted review when a change:
 
 ## UAT Environment — Docker Compose Topology
 
+> Dev-rig reference (the `start-UAT.sh` / `start-viz-uat.sh` / `start-demo.sh` launchers, the port-assignment table, and the gateway command-forwarding flags) is in `docs/uat-environment.md` — routed out of `CLAUDE.md`. Read it before changing any compose file or UAT script.
+
 The UAT stack runs server, gateway, and observability in Docker containers while the agent runs natively on the host. The canonical deployment is:
 
 - **`docker-compose.uat.yml`** — Release artifact (uploaded to GitHub Releases). Uses `ghcr.io/tr3kkr/yuzu-*` images. Remote UAT testers download this single file. This is the product.

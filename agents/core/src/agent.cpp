@@ -1,11 +1,12 @@
 #ifdef _WIN32
 #include <io.h>
 #pragma section(".CRT$XCB", read)
-static void __cdecl diag_dll_static_init() {
+[[maybe_unused]] static void __cdecl diag_dll_static_init() {
     const char msg[] = "[DIAG] DLL static-init starting (before proto registration)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
+__declspec(allocate(".CRT$XCB"))
+    [[maybe_unused]] static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
@@ -27,6 +28,11 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
+#include "guaranteed_state.pb.h"
+
+// Local-only helper, exposed for unit testing.
+#include "plugin_config_sync.hpp"
+#include "local_dispatcher.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -59,6 +65,7 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 #if defined(_WIN32)
@@ -92,19 +99,21 @@ constexpr const char* kAgentArch = "x86_64";
 [[nodiscard]] std::string get_os_version() {
 #ifdef _WIN32
     HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return {};
+    if (!ntdll)
+        return {};
     using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
-    auto fn = reinterpret_cast<RtlGetVersionFn>(
-        ::GetProcAddress(ntdll, "RtlGetVersion"));
-    if (!fn) return {};
+    auto fn = reinterpret_cast<RtlGetVersionFn>(::GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!fn)
+        return {};
     RTL_OSVERSIONINFOW v{};
     v.dwOSVersionInfoSize = sizeof(v);
-    if (fn(&v) != 0) return {};
-    return std::format("{}.{}.{}", v.dwMajorVersion, v.dwMinorVersion,
-                       v.dwBuildNumber);
+    if (fn(&v) != 0)
+        return {};
+    return std::format("{}.{}.{}", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
 #else
-    struct utsname u{};
-    if (::uname(&u) != 0) return {};
+    struct utsname u {};
+    if (::uname(&u) != 0)
+        return {};
     return std::string{u.release};
 #endif
 }
@@ -196,9 +205,9 @@ private:
 
 struct PluginContextImpl {
     std::unordered_map<std::string, std::string> config;
-    KvStore* kv_store{nullptr};            // non-owning; lifetime managed by AgentImpl
+    KvStore* kv_store{nullptr};             // non-owning; lifetime managed by AgentImpl
     TriggerEngine* trigger_engine{nullptr}; // non-owning; lifetime managed by AgentImpl
-    std::string plugin_name;               // set per-plugin during init/execute for KV namespacing
+    std::string plugin_name;                // set per-plugin during init/execute for KV namespacing
 };
 
 // Per-command output is buffered and flushed in a single gRPC Write instead of
@@ -218,9 +227,52 @@ struct CommandContextImpl {
     size_t output_buffer_bytes{0};
     std::mutex buf_mu;
 
+    // PR 10 / UAT 2026-05-12 — Push-based snapshot ingestion.
+    //
+    // When `capture` is non-null, plugin output is accumulated into
+    // this string (newline-joined between calls) instead of being
+    // streamed back to the server. The snapshot-pump thread uses this
+    // path to invoke `tar.fleet_snapshot` locally and harvest the JSON
+    // payload without touching the gRPC channel. `stream` and
+    // `write_mu` are nullptr/unused in that mode; `flush_output_locked`
+    // short-circuits.
+    std::string* capture{nullptr};
+
+    // PR 10 hardening — capture-mode upper bound (UP-9). The pump
+    // ships the captured string in the next HeartbeatRequest; gRPC's
+    // default 4 MiB inbound cap is the hard server-side ceiling, but
+    // we want a tighter agent-side cap so an oversized snapshot is
+    // *truncated with a marker* rather than retained-and-failing. The
+    // 2 MiB value matches `FleetTopologyStore::kPushedSnapshotMaxBytes`
+    // on the server (in-tree convention: same constant in two places
+    // until typed proto lands and renders both moot).
+    static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
+    bool capture_truncated{false};
+
     void append_output(const char* text) {
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
+        if (capture) {
+            // Capture mode: append directly to the operator-owned buffer
+            // with a newline separator between successive writes, matching
+            // the wire format the plugin would have emitted if streamed.
+            if (capture_truncated)
+                return;
+            std::size_t prospective = capture->size() + (capture->empty() ? 0 : 1) + len;
+            if (prospective > kCaptureMaxBytes) {
+                // Truncate with a sentinel suffix so the server-side
+                // parser cleanly rejects the payload as malformed JSON
+                // rather than ingesting a half-finished structure. The
+                // pump emits a WARN; next pump cycle overwrites.
+                capture->append("\n/* TRUNCATED — exceeded kCaptureMaxBytes */");
+                capture_truncated = true;
+                return;
+            }
+            if (!capture->empty())
+                capture->push_back('\n');
+            capture->append(text, len);
+            return;
+        }
         output_buffer.emplace_back(text, len);
         output_buffer_bytes += len;
         if (output_buffer_bytes >= kOutputFlushThreshold) {
@@ -235,6 +287,11 @@ struct CommandContextImpl {
 
 private:
     void flush_output_locked() {
+        // Capture mode keeps everything in `capture` already; nothing to
+        // flush over the wire. Skipping this guard would call into
+        // `stream->Write` on a null stream and crash the pump thread.
+        if (capture)
+            return;
         if (output_buffer.empty())
             return;
 
@@ -266,6 +323,36 @@ template <typename F> struct ScopeExit {
 template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // anonymous namespace
+
+// #1001 / arch-S3 — shim used by LocalDispatcher to invoke a plugin
+// descriptor in-process with output captured into a caller-owned buffer.
+// Kept here (rather than in local_dispatcher.cpp) because CommandContextImpl
+// carries gRPC-typed streaming fields that would force local_dispatcher.cpp
+// to pull in grpcpp; this shim is the narrow boundary that contains that
+// coupling.
+int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* action,
+                          const YuzuParam* params, std::size_t param_count,
+                          std::string* capture_out, bool* truncated_out, std::size_t capture_cap) {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.command_id = "__local_dispatch__";
+    ctx_impl.start_time = std::chrono::steady_clock::now();
+    ctx_impl.capture = capture_out;
+    // CommandContextImpl currently bakes the cap into its append_output
+    // (kCaptureMaxBytes constant). LocalDispatcher::kCaptureMaxBytes
+    // tracks the same value so the externally-visible policy lives in
+    // one place; the static_assert below catches divergence at compile
+    // time if either side drifts.
+    static_assert(CommandContextImpl::kCaptureMaxBytes ==
+                  yuzu::agent::LocalDispatcher::kCaptureMaxBytes);
+    (void)capture_cap;
+
+    auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+    int rc = descriptor->execute(raw_ctx, action, params, param_count);
+    ctx_impl.flush_output(); // no-op in capture mode
+    if (truncated_out)
+        *truncated_out = ctx_impl.capture_truncated;
+    return rc;
+}
 
 // C ABI context function implementations
 
@@ -379,17 +466,57 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     return result;
 }
 
-YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/,
-                                      const char* /*trigger_type*/, const char* /*config_json*/) {
-    // Trigger registration is handled by the trigger engine at the agent level.
-    // Plugins call this to express intent; the agent wires it during init.
-    // For now, return success — the agent's init sequence reads trigger configs
-    // from the plugin's init() call and routes them to the TriggerEngine.
-    return 0;
+YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
+                                      const char* trigger_type, const char* config_json) {
+    if (!ctx || !trigger_id || !trigger_type || !config_json)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine) {
+        // The agent did not wire a TriggerEngine into this context. Without
+        // it the registration cannot take effect — fail loudly rather than
+        // returning success and silently dropping the trigger (the old
+        // stub's bug — it cost the whole interval-trigger feature).
+        spdlog::error("yuzu_register_trigger('{}'): no TriggerEngine in plugin context",
+                      trigger_id);
+        return -2;
+    }
+    // No exception may cross this C ABI boundary -- doing so is UB. Catch
+    // everything (parse_trigger_config is exception-safe, but
+    // register_trigger does map/vector insertion that can throw bad_alloc).
+    try {
+        auto cfg = yuzu::agent::parse_trigger_config(trigger_id, trigger_type, config_json);
+        if (!cfg) {
+            // parse_trigger_config already logged the specific reason.
+            return -3;
+        }
+        impl->trigger_engine->register_trigger(std::move(*cfg));
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_register_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
+    }
 }
 
-YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/) {
-    return 0;
+YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trigger_id) {
+    if (!ctx || !trigger_id)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine)
+        return -2;
+    // No exception may cross this C ABI boundary.
+    try {
+        impl->trigger_engine->unregister_trigger(trigger_id);
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
+    }
 }
 
 } // extern "C"
@@ -421,10 +548,9 @@ public:
         // operator believed enforcement was active. Refuse to start.
         // Governance hardening round 1 (UP-7).
         if (cfg_.plugin_require_signature && !signing.enabled()) {
-            spdlog::critical(
-                "--plugin-require-signature is set but --plugin-trust-bundle "
-                "is empty. Refusing to start: this combination would silently "
-                "fail-open (every plugin would load unverified).");
+            spdlog::critical("--plugin-require-signature is set but --plugin-trust-bundle "
+                             "is empty. Refusing to start: this combination would silently "
+                             "fail-open (every plugin would load unverified).");
             std::exit(EXIT_FAILURE);
         }
         auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
@@ -450,6 +576,14 @@ public:
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
         plugin_ctx_.config["agent.reconnect_count"] = "0";
+
+        // Wire the trigger engine into the master plugin context BEFORE the
+        // per-plugin contexts are snapshotted from it (the load loop copies
+        // plugin_ctx_.trigger_engine into each pctx). Plugins call
+        // ctx.register_trigger() inside their own init(), which routes
+        // through yuzu_register_trigger -> pctx->trigger_engine; if this
+        // pointer is still null at init time, every registration is dropped.
+        plugin_ctx_.trigger_engine = &trigger_engine_;
 
         // 1b. Open KV store for plugin persistent storage
         {
@@ -481,6 +615,16 @@ public:
                                .count();
         plugin_ctx_.config["agent.start_time_epoch"] = std::to_string(start_epoch);
 
+        // Module roster — every plugin file in plugin_dir is recorded here,
+        // both successful loads and load failures (signature_invalid,
+        // reserved_name, etc.). The post-load sync_master_config_to_plugins
+        // call below makes these `agent.modules.N.*` entries readable by
+        // every successfully-loaded plugin via get_config(). Operators rely
+        // on this for diagnostics (status_plugin's `do_modules` action), but
+        // it does mean every loaded plugin can read the names + reasons of
+        // plugins that were rejected. This is acceptable today (single trust
+        // domain on the agent host) but is worth revisiting if a future
+        // change introduces sandboxed / lower-trust plugin contexts.
         size_t module_index = 0;
         auto record_module = [this, &module_index](std::string_view name, std::string_view version,
                                                    std::string_view description,
@@ -502,6 +646,11 @@ public:
             std::string_view reason = "load_failed";
             if (err.reason.starts_with(yuzu::agent::kReservedNameReason)) {
                 reason = "reserved_name";
+            } else if (err.reason.starts_with(yuzu::agent::kInvalidNameReason)) {
+                // #822: a plugin declared a malformed name (empty, over-length,
+                // or outside [A-Za-z0-9_]) — distinct from a reserved-name
+                // attempt so operators can alert on crafted-name loads.
+                reason = "invalid_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
                 reason = "signature_missing";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureUntrustedReason)) {
@@ -509,12 +658,9 @@ public:
             } else if (err.reason.starts_with(yuzu::agent::kSignatureInvalidReason)) {
                 reason = "signature_invalid";
             }
-            metrics_
-                .counter("yuzu_agent_plugin_rejected_total", {{"reason", std::string{reason}}})
+            metrics_.counter("yuzu_agent_plugin_rejected_total", {{"reason", std::string{reason}}})
                 .increment();
         }
-
-        auto* raw_plugin_ctx = reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
 
         for (auto& handle : candidates) {
             const auto* descriptor = handle.descriptor();
@@ -555,23 +701,46 @@ public:
             plugin_ctx_.config[prefix + ".description"] = plugins_[i].descriptor()->description;
         }
 
+        // Per-plugin contexts were snapshotted from plugin_ctx_.config during
+        // the load loop above, so they are missing every key written after
+        // their own snapshot point: agent.plugins.count, agent.modules.count,
+        // the agent.plugins.N.* roster, and agent.modules.N.* entries for
+        // any module recorded after the plugin's own init. Re-sync the master
+        // map into every per-plugin context so calls like agent_actions:info
+        // see the complete post-load state instead of "(not set)".
+        //
+        // Plugins whose init() is *itself* reading these keys cannot observe
+        // them — init runs before this sync. agent_actions::info is dispatched
+        // post-init via execute(), so the fix is correct for that consumer.
+        // Runtime keys written AFTER this point (agent.session_id at register
+        // time, agent.reconnect_count, agent.latency_ms, agent.grpc_channel_state,
+        // agent.connected_since) do NOT propagate — see CONS-B1 follow-up.
+        //
+        // Implementation extracted to plugin_config_sync.hpp so it can be
+        // unit-tested without exposing PluginContextImpl outside this TU.
+        detail::sync_master_config_to_plugins(plugin_ctx_.config, per_plugin_ctx_);
+
         metrics_.gauge("yuzu_agent_plugins_loaded").set(static_cast<double>(plugins_.size()));
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
         // Initialize bounded thread pool for command dispatch
-        thread_pool_ = std::make_unique<ThreadPool>(
-            std::thread::hardware_concurrency());
+        thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
 
         // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
+            // Stop the trigger engine FIRST — before plugins are torn down —
+            // so an in-flight interval/file/service trigger can't dispatch
+            // into a plugin that's mid-shutdown. stop() joins the worker
+            // threads, so once it returns no further dispatch can occur.
+            trigger_engine_.stop();
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
                     // Use per-plugin context if available, fall back to shared
                     auto it = per_plugin_ctx_.find(handle.descriptor()->name);
                     auto* ctx_ptr = (it != per_plugin_ctx_.end())
-                        ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
-                        : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+                                        ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
+                                        : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
                     handle.descriptor()->shutdown(ctx_ptr);
                 }
             }
@@ -579,6 +748,44 @@ public:
             thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
+
+        // Wire trigger dispatch + start the engine. Plugins registered their
+        // triggers during init() (above); the engine has been holding them
+        // inert until now. The dispatch callback resolves the plugin by name
+        // and runs the action in-process via LocalDispatcher — the same
+        // mechanism the snapshot pump uses. start() spins up the interval /
+        // file-watch / service-watch worker threads and fires any
+        // AgentStartup triggers immediately.
+        trigger_engine_.set_dispatch([this](const std::string& plugin, const std::string& action,
+                                            const std::map<std::string, std::string>& params) {
+            const YuzuPluginDescriptor* descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == plugin) {
+                    descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (!descriptor) {
+                spdlog::warn("Trigger dispatch: plugin '{}' not loaded — skipping action '{}'",
+                             plugin, action);
+                return;
+            }
+            // Convert the param map into the C-ABI YuzuParam span. The map
+            // outlives this synchronous run() call (it's owned by the
+            // TriggerConfig snapshot in the engine's worker loop), so the
+            // c_str() views stay valid for the duration of the dispatch.
+            std::vector<YuzuParam> yparams;
+            yparams.reserve(params.size());
+            for (const auto& [k, v] : params)
+                yparams.push_back(YuzuParam{k.c_str(), v.c_str()});
+
+            LocalDispatcher dispatcher;
+            auto result = dispatcher.run(descriptor, action, yparams);
+            if (result.rc != 0) {
+                spdlog::warn("Trigger dispatch: {}.{} returned rc={}", plugin, action, result.rc);
+            }
+        });
+        trigger_engine_.start();
 
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
         grpc::ChannelArguments ch_args;
@@ -665,6 +872,69 @@ public:
             }
         }
 
+        // PR 10 / UAT 2026-05-12 — snapshot pump is spawned ONCE, not
+        // per-reconnect. The pump runs through reconnects, keeping the
+        // shared `latest_snapshot_` buffer warm; the heartbeat thread
+        // (which IS re-spawned per connection) reads from it and ships
+        // it on the next heartbeat. This means a brief disconnect does
+        // not cost us the next push — the pump kept producing while
+        // the link was down, the first reconnected heartbeat carries
+        // the latest snapshot.
+        //
+        // Pump is gated on the TAR plugin being loaded; minimal /
+        // embedded agent variants without TAR simply leave the slot
+        // empty and the server falls back to dispatch-on-get.
+        {
+            const YuzuPluginDescriptor* tar_descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == "tar") {
+                    tar_descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (tar_descriptor) {
+                snapshot_pump_thread_ = std::thread([this, tar_descriptor]() {
+                    spdlog::info("Snapshot pump started (interval=30s, action=tar.fleet_snapshot)");
+                    constexpr auto kFirstDelay = std::chrono::seconds{5};
+                    constexpr auto kInterval = std::chrono::seconds{30};
+                    auto sleep_for = [this](std::chrono::seconds total) {
+                        auto remaining = total;
+                        while (remaining.count() > 0 &&
+                               !stop_requested_.load(std::memory_order_acquire)) {
+                            auto step = std::min(remaining, std::chrono::seconds{2});
+                            std::this_thread::sleep_for(step);
+                            remaining -= step;
+                        }
+                    };
+                    sleep_for(kFirstDelay);
+                    LocalDispatcher dispatcher;
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        // #1001 / arch-S3 — local-dispatch concerns
+                        // (capture buffer, byte cap, truncation sentinel)
+                        // live in LocalDispatcher. The pump just decides
+                        // what to do with each cycle's result.
+                        auto result = dispatcher.run(tar_descriptor, "fleet_snapshot");
+                        if (result.truncated) {
+                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                         "dropping this cycle's snapshot",
+                                         result.captured.size());
+                        } else if (result.rc == 0 && !result.captured.empty()) {
+                            std::lock_guard lock(snapshot_mu_);
+                            latest_snapshot_ = std::move(result.captured);
+                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                        } else if (result.rc != 0) {
+                            spdlog::warn("Snapshot pump: tar.fleet_snapshot rc={}, captured={}B",
+                                         result.rc, result.captured.size());
+                        }
+                        sleep_for(kInterval);
+                    }
+                    spdlog::info("Snapshot pump stopped");
+                });
+            } else {
+                spdlog::info("Snapshot pump skipped: TAR plugin not loaded");
+            }
+        }
+
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
@@ -681,574 +951,711 @@ public:
                     break;
             }
 
-        {
-            grpc::ClientContext ctx;
-            pb::RegisterRequest req;
-            auto* info = req.mutable_info();
-            info->set_agent_id(cfg_.agent_id);
-            info->set_agent_version(std::string{yuzu::kFullVersionString});
-
-            // Populate Platform sub-message so the server (and the dashboard
-            // scope panel via /fragments/scope-list) can identify which OS
-            // and architecture this agent is running on. kAgentOs and
-            // kAgentArch are compile-time constants pinned per build target;
-            // get_os_version() probes the running kernel for the version
-            // string. The OTA updater also reads platform.os/arch to find
-            // matching binaries, so this fix unblocks OTA selection too.
             {
-                auto* platform = info->mutable_platform();
-                platform->set_os(kAgentOs);
-                platform->set_arch(kAgentArch);
-                platform->set_version(get_os_version());
-            }
+                grpc::ClientContext ctx;
+                pb::RegisterRequest req;
+                auto* info = req.mutable_info();
+                info->set_agent_id(cfg_.agent_id);
+                info->set_agent_version(std::string{yuzu::kFullVersionString});
 
-            // Set hostname for auto-approve hostname_glob matching
-            {
-                char host_buf[256] = {};
-                if (gethostname(host_buf, sizeof(host_buf) - 1) == 0) {
-                    info->set_hostname(host_buf);
+                // Populate Platform sub-message so the server (and the dashboard
+                // scope panel via /fragments/scope-list) can identify which OS
+                // and architecture this agent is running on. kAgentOs and
+                // kAgentArch are compile-time constants pinned per build target;
+                // get_os_version() probes the running kernel for the version
+                // string. The OTA updater also reads platform.os/arch to find
+                // matching binaries, so this fix unblocks OTA selection too.
+                {
+                    auto* platform = info->mutable_platform();
+                    platform->set_os(kAgentOs);
+                    platform->set_arch(kAgentArch);
+                    platform->set_version(get_os_version());
                 }
-            }
 
-            // Load agent tags from tags.json and populate scopable_tags
-            {
-                auto tags_path = cfg_.data_dir / "tags.json";
-                std::error_code tag_ec;
-                if (std::filesystem::exists(tags_path, tag_ec)) {
-                    std::ifstream tags_file(tags_path);
-                    if (tags_file) {
-                        try {
-                            std::string tags_content = read_file_contents(tags_path);
-                            auto* tags_map = info->mutable_scopable_tags();
-                            // Quick manual JSON parse for flat {"key":"value",...} objects
-                            size_t pos = 0;
-                            while ((pos = tags_content.find('"', pos)) != std::string::npos) {
-                                size_t key_start = pos + 1;
-                                size_t key_end = tags_content.find('"', key_start);
-                                if (key_end == std::string::npos)
-                                    break;
-                                std::string key =
-                                    tags_content.substr(key_start, key_end - key_start);
-                                pos = key_end + 1;
-                                pos = tags_content.find(':', pos);
-                                if (pos == std::string::npos)
-                                    break;
-                                pos = tags_content.find('"', pos);
-                                if (pos == std::string::npos)
-                                    break;
-                                size_t val_start = pos + 1;
-                                size_t val_end = tags_content.find('"', val_start);
-                                if (val_end == std::string::npos)
-                                    break;
-                                std::string val =
-                                    tags_content.substr(val_start, val_end - val_start);
-                                (*tags_map)[key] = val;
-                                pos = val_end + 1;
+                // Set hostname for auto-approve hostname_glob matching
+                {
+                    char host_buf[256] = {};
+                    if (gethostname(host_buf, sizeof(host_buf) - 1) == 0) {
+                        info->set_hostname(host_buf);
+                    }
+                }
+
+                // Load agent tags from tags.json and populate scopable_tags
+                {
+                    auto tags_path = cfg_.data_dir / "tags.json";
+                    std::error_code tag_ec;
+                    if (std::filesystem::exists(tags_path, tag_ec)) {
+                        std::ifstream tags_file(tags_path);
+                        if (tags_file) {
+                            try {
+                                std::string tags_content = read_file_contents(tags_path);
+                                auto* tags_map = info->mutable_scopable_tags();
+                                // Quick manual JSON parse for flat {"key":"value",...} objects
+                                size_t pos = 0;
+                                while ((pos = tags_content.find('"', pos)) != std::string::npos) {
+                                    size_t key_start = pos + 1;
+                                    size_t key_end = tags_content.find('"', key_start);
+                                    if (key_end == std::string::npos)
+                                        break;
+                                    std::string key =
+                                        tags_content.substr(key_start, key_end - key_start);
+                                    pos = key_end + 1;
+                                    pos = tags_content.find(':', pos);
+                                    if (pos == std::string::npos)
+                                        break;
+                                    pos = tags_content.find('"', pos);
+                                    if (pos == std::string::npos)
+                                        break;
+                                    size_t val_start = pos + 1;
+                                    size_t val_end = tags_content.find('"', val_start);
+                                    if (val_end == std::string::npos)
+                                        break;
+                                    std::string val =
+                                        tags_content.substr(val_start, val_end - val_start);
+                                    (*tags_map)[key] = val;
+                                    pos = val_end + 1;
+                                }
+                                if (!tags_map->empty()) {
+                                    spdlog::info("Loaded {} tags from {}", tags_map->size(),
+                                                 tags_path.string());
+                                }
+                            } catch (...) {
+                                spdlog::warn("Failed to parse tags.json");
                             }
-                            if (!tags_map->empty()) {
-                                spdlog::info("Loaded {} tags from {}", tags_map->size(),
-                                             tags_path.string());
-                            }
-                        } catch (...) {
-                            spdlog::warn("Failed to parse tags.json");
                         }
                     }
                 }
-            }
 
-            for (const auto& handle : plugins_) {
-                auto* pi = info->add_plugins();
-                pi->set_name(handle.descriptor()->name);
-                pi->set_version(handle.descriptor()->version);
-                pi->set_description(handle.descriptor()->description);
-                if (handle.descriptor()->actions) {
-                    for (const char* const* a = handle.descriptor()->actions; *a; ++a) {
-                        pi->add_capabilities(*a);
+                for (const auto& handle : plugins_) {
+                    auto* pi = info->add_plugins();
+                    pi->set_name(handle.descriptor()->name);
+                    pi->set_version(handle.descriptor()->version);
+                    pi->set_description(handle.descriptor()->description);
+                    if (handle.descriptor()->actions) {
+                        for (const char* const* a = handle.descriptor()->actions; *a; ++a) {
+                            pi->add_capabilities(*a);
+                        }
                     }
                 }
-            }
 
-            // Tier 2: Include enrollment token if provided
-            if (!cfg_.enrollment_token.empty()) {
-                req.set_enrollment_token(cfg_.enrollment_token);
-                spdlog::info("Including enrollment token in registration");
-            }
+                // Tier 2: Include enrollment token if provided
+                if (!cfg_.enrollment_token.empty()) {
+                    req.set_enrollment_token(cfg_.enrollment_token);
+                    spdlog::info("Including enrollment token in registration");
+                }
 
-            // Tier 3: Include cloud identity attestation if available
-            if (cloud_id.valid()) {
-                req.set_attestation_provider(cloud_id.provider);
-                req.set_machine_certificate(cloud_id.identity_document.data(),
-                                            cloud_id.identity_document.size());
-                spdlog::info("Including {} cloud attestation in registration", cloud_id.provider);
-            }
+                // Tier 3: Include cloud identity attestation if available
+                if (cloud_id.valid()) {
+                    req.set_attestation_provider(cloud_id.provider);
+                    req.set_machine_certificate(cloud_id.identity_document.data(),
+                                                cloud_id.identity_document.size());
+                    spdlog::info("Including {} cloud attestation in registration",
+                                 cloud_id.provider);
+                }
 
-            pb::RegisterResponse resp;
-            auto register_start = std::chrono::steady_clock::now();
-            auto status = stub->Register(&ctx, req, &resp);
-            if (!status.ok()) {
-                spdlog::error("Failed to register with server: {}", status.error_message());
-                ++reconnect_count;
-                continue; // Retry registration
-            }
-            if (!resp.accepted()) {
-                if (resp.reject_reason().find("pending") != std::string::npos) {
-                    spdlog::warn("Registration pending admin approval — retrying");
+                pb::RegisterResponse resp;
+                auto register_start = std::chrono::steady_clock::now();
+                auto status = stub->Register(&ctx, req, &resp);
+                if (!status.ok()) {
+                    spdlog::error("Failed to register with server: {}", status.error_message());
+                    ++reconnect_count;
+                    continue; // Retry registration
+                }
+                if (!resp.accepted()) {
+                    if (resp.reject_reason().find("pending") != std::string::npos) {
+                        spdlog::warn("Registration pending admin approval — retrying");
+                        ++reconnect_count;
+                        continue; // Retry until approved
+                    }
+                    spdlog::error("Server permanently rejected registration: {}",
+                                  resp.reject_reason());
+                    return; // Hard rejection — no retry
+                }
+
+                auto enrollment_status = resp.enrollment_status();
+                if (enrollment_status == "pending") {
+                    spdlog::warn("Registration pending admin approval - retrying in backoff");
                     ++reconnect_count;
                     continue; // Retry until approved
                 }
-                spdlog::error("Server permanently rejected registration: {}", resp.reject_reason());
-                return; // Hard rejection — no retry
-            }
 
-            auto enrollment_status = resp.enrollment_status();
-            if (enrollment_status == "pending") {
-                spdlog::warn("Registration pending admin approval - retrying in backoff");
-                ++reconnect_count;
-                continue; // Retry until approved
-            }
+                reconnect_count = 0; // Registration succeeded — reset backoff
 
-            reconnect_count = 0; // Registration succeeded — reset backoff
+                session_id_ = resp.session_id();
+                auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+                plugin_ctx_.config["agent.session_id"] = session_id_;
+                plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
 
-            session_id_ = resp.session_id();
-            auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          std::chrono::system_clock::now().time_since_epoch())
-                                          .count();
-            plugin_ctx_.config["agent.session_id"] = session_id_;
-            plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+                // Measure Register RPC latency
+                auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - register_start)
+                                            .count();
+                plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
 
-            // Measure Register RPC latency
-            auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - register_start)
-                                        .count();
-            plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
-
-            // Query gRPC channel state
-            if (channel) {
-                auto state = channel->GetState(false);
-                const char* state_str = "UNKNOWN";
-                switch (state) {
-                case GRPC_CHANNEL_IDLE:
-                    state_str = "IDLE";
-                    break;
-                case GRPC_CHANNEL_CONNECTING:
-                    state_str = "CONNECTING";
-                    break;
-                case GRPC_CHANNEL_READY:
-                    state_str = "READY";
-                    break;
-                case GRPC_CHANNEL_TRANSIENT_FAILURE:
-                    state_str = "TRANSIENT_FAILURE";
-                    break;
-                case GRPC_CHANNEL_SHUTDOWN:
-                    state_str = "SHUTDOWN";
-                    break;
-                }
-                plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
-            }
-            spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
-                         enrollment_status.empty() ? "enrolled" : enrollment_status);
-
-            // Mark Guardian as network-connected. PR 4 will use this hook to
-            // drain a buffered-events queue back over the command stream.
-            if (guardian_)
-                guardian_->sync_with_server();
-        }
-
-        // 3b. OTA updater: rollback check and old binary cleanup
-        {
-            updater_ = std::make_unique<Updater>(
-                UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
-                std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
-                current_executable_path());
-
-            if (updater_->rollback_if_needed()) {
-                spdlog::warn("OTA rollback was triggered - running previous binary");
-            }
-            updater_->cleanup_old_binary();
-        }
-
-        // 4. Open Subscribe bidi stream
-        {
-            grpc::ClientContext sub_ctx;
-            if (!session_id_.empty()) {
-                sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
-            }
-            subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
-
-            std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
-            if (!stream) {
-                spdlog::error("Failed to open Subscribe stream");
-                subscribe_ctx_.store(nullptr, std::memory_order_release);
-                if (!stop_requested_.load(std::memory_order_acquire)) {
-                    ++reconnect_count;
-                    spdlog::warn("Subscribe failed — will attempt reconnect");
-                    continue;
-                }
-                break;
-            }
-            spdlog::info("Subscribe stream opened - waiting for commands");
-
-            // 4b. Spawn OTA update check thread
-            if (cfg_.auto_update && updater_) {
-                auto* raw_stub = static_cast<void*>(stub.get());
-                update_thread_ = std::thread([this, raw_stub]() {
-                    spdlog::info("OTA update checker started (interval={}s)",
-                                 cfg_.update_check_interval.count());
-                    while (!stop_requested_.load(std::memory_order_acquire)) {
-                        auto result = updater_->check_and_apply(raw_stub);
-                        if (result.has_value() && result.value()) {
-                            spdlog::info("OTA update applied - agent will restart");
-                            stop();
-                            return;
-                        }
-                        if (!result.has_value()) {
-                            spdlog::warn("OTA update check failed: {}", result.error().message);
-                        }
-                        // Sleep in small increments so we can respond to stop quickly
-                        auto remaining = cfg_.update_check_interval;
-                        while (remaining.count() > 0 &&
-                               !stop_requested_.load(std::memory_order_acquire)) {
-                            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-                            std::this_thread::sleep_for(sleep_time);
-                            remaining -= sleep_time;
-                        }
-                    }
-                });
-            }
-
-            // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
-            {
-                heartbeat_stop_.store(false, std::memory_order_release);
-                auto hb_stub = pb::AgentService::NewStub(channel);
-                heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
-                    spdlog::info("Heartbeat thread started (interval={}s)",
-                                 cfg_.heartbeat_interval.count());
-                    auto should_stop = [this]() {
-                        return stop_requested_.load(std::memory_order_acquire) ||
-                               heartbeat_stop_.load(std::memory_order_acquire);
-                    };
-                    while (!should_stop()) {
-                        // Sleep in small increments for responsive shutdown
-                        auto remaining = cfg_.heartbeat_interval;
-                        while (remaining.count() > 0 && !should_stop()) {
-                            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-                            std::this_thread::sleep_for(sleep_time);
-                            remaining -= sleep_time;
-                        }
-                        if (should_stop())
-                            break;
-
-                        // Build heartbeat with piggybacked metrics
-                        grpc::ClientContext ctx;
-                        heartbeat_ctx_.store(&ctx, std::memory_order_release);
-                        pb::HeartbeatRequest req;
-                        req.set_session_id(session_id_);
-                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          std::chrono::system_clock::now().time_since_epoch())
-                                          .count();
-                        req.mutable_sent_at()->set_millis_epoch(now_ms);
-
-                        auto& tags = *req.mutable_status_tags();
-                        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-                                          std::chrono::steady_clock::now() - start_time_)
-                                          .count();
-                        tags["yuzu.uptime_s"] = std::to_string(uptime);
-                        tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
-                            metrics_.counter("yuzu_agent_commands_executed_total").value()));
-                        tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
-                        tags["yuzu.os"] = kAgentOs;
-                        tags["yuzu.arch"] = kAgentArch;
-                        tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
-                        tags["yuzu.healthy"] = "1";
-
-                        pb::HeartbeatResponse resp;
-                        auto status = hb_stub->Heartbeat(&ctx, req, &resp);
-                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
-                        if (!status.ok()) {
-                            spdlog::warn("Heartbeat failed: {}", status.error_message());
-                        } else {
-                            spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
-                        }
-                    }
-                    heartbeat_ctx_.store(nullptr, std::memory_order_release);
-                    spdlog::info("Heartbeat thread stopped");
-                });
-            }
-
-            // 5. Read commands from server and dispatch to plugins
-            dedup_current_.clear();  // Fresh dedup sets per connection
-            dedup_previous_.clear();
-            bool update_verified = false;
-            pb::CommandRequest cmd;
-            while (stream->Read(&cmd)) {
-                if (stop_requested_.load(std::memory_order_acquire))
-                    break;
-
-                // Command replay protection: reject duplicate command_ids
-                if (cmd.command_id().empty()) {
-                    spdlog::warn("Received command with empty command_id — replay "
-                                 "protection cannot apply");
-                } else {
-                    if (dedup_current_.count(cmd.command_id()) ||
-                        dedup_previous_.count(cmd.command_id())) {
-                        spdlog::warn("Replay detected: duplicate command_id={} — rejecting",
-                                     cmd.command_id());
-                        pb::CommandResponse replay_resp;
-                        replay_resp.set_command_id(cmd.command_id());
-                        replay_resp.set_status(pb::CommandResponse::REJECTED);
-                        replay_resp.set_output("command replay rejected: duplicate command_id");
-                        std::lock_guard lock(stream_write_mu_);
-                        stream->Write(replay_resp, grpc::WriteOptions());
-                        continue;
-                    }
-                    // Double-buffer rotation: when current fills, discard previous,
-                    // swap current → previous, start fresh current.
-                    if (dedup_current_.size() >= kMaxDedupEntries) {
-                        spdlog::debug("Dedup buffer rotation ({} entries)", kMaxDedupEntries);
-                        dedup_previous_ = std::move(dedup_current_);
-                        dedup_current_.clear();
-                    }
-                    dedup_current_.insert(cmd.command_id());
-                }
-
-                // Write health marker after first successful read (OTA rollback guard)
-                if (!update_verified) {
-                    update_verified = true;
-                    auto marker = current_executable_path().parent_path() / ".yuzu-update-verified";
-                    std::ofstream{marker} << "ok";
-                    spdlog::debug("Wrote update verification marker: {}", marker.string());
-                }
-
-                spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),
-                             cmd.action(), cmd.command_id());
-
-                // Reserved-name dispatch — must run before the plugin match
-                // loop so a third-party plugin cannot shadow Guardian (the
-                // load-time check in plugin_loader.cpp also rejects reserved
-                // names, but defence-in-depth keeps both halves explicit).
-                // See docs/yuzu-guardian-design-v1.1.md §7.2.
-                if (cmd.plugin() == "__guard__") {
-                    pb::CommandResponse resp;
-                    resp.set_command_id(cmd.command_id());
-                    auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count();
-                    resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
-                    if (!guardian_) {
-                        resp.set_status(pb::CommandResponse::FAILURE);
-                        resp.set_exit_code(1);
-                        resp.set_output("guardian engine not initialised");
-                    } else {
-                        auto dr = guardian_->dispatch(cmd);
-                        resp.set_status(dr.exit_code == 0 ? pb::CommandResponse::SUCCESS
-                                                          : pb::CommandResponse::FAILURE);
-                        resp.set_exit_code(dr.exit_code);
-                        resp.set_output(std::move(dr.output));
-                    }
-                    metrics_.counter("yuzu_agent_commands_executed_total",
-                                     {{"plugin", "__guard__"}})
-                        .increment();
-                    std::lock_guard lock(stream_write_mu_);
-                    stream->Write(resp, grpc::WriteOptions());
-                    continue;
-                }
-
-                // Find the matching plugin
-                const YuzuPluginDescriptor* target = nullptr;
-                for (const auto& handle : plugins_) {
-                    if (cmd.plugin() == handle.descriptor()->name) {
-                        target = handle.descriptor();
+                // Query gRPC channel state
+                if (channel) {
+                    auto state = channel->GetState(false);
+                    const char* state_str = "UNKNOWN";
+                    switch (state) {
+                    case GRPC_CHANNEL_IDLE:
+                        state_str = "IDLE";
+                        break;
+                    case GRPC_CHANNEL_CONNECTING:
+                        state_str = "CONNECTING";
+                        break;
+                    case GRPC_CHANNEL_READY:
+                        state_str = "READY";
+                        break;
+                    case GRPC_CHANNEL_TRANSIENT_FAILURE:
+                        state_str = "TRANSIENT_FAILURE";
+                        break;
+                    case GRPC_CHANNEL_SHUTDOWN:
+                        state_str = "SHUTDOWN";
                         break;
                     }
+                    plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
+                }
+                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                             enrollment_status.empty() ? "enrolled" : enrollment_status);
+
+                // Mark Guardian as network-connected. PR 4 will use this hook to
+                // drain a buffered-events queue back over the command stream.
+                if (guardian_)
+                    guardian_->sync_with_server();
+            }
+
+            // 3b. OTA updater: rollback check and old binary cleanup
+            {
+                updater_ = std::make_unique<Updater>(
+                    UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
+                    std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
+                    current_executable_path());
+
+                if (updater_->rollback_if_needed()) {
+                    spdlog::warn("OTA rollback was triggered - running previous binary");
+                }
+                updater_->cleanup_old_binary();
+            }
+
+            // 4. Open Subscribe bidi stream
+            {
+                grpc::ClientContext sub_ctx;
+                if (!session_id_.empty()) {
+                    sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
+                }
+                subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
+
+                std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
+                if (!stream) {
+                    spdlog::error("Failed to open Subscribe stream");
+                    subscribe_ctx_.store(nullptr, std::memory_order_release);
+                    if (!stop_requested_.load(std::memory_order_acquire)) {
+                        ++reconnect_count;
+                        spdlog::warn("Subscribe failed — will attempt reconnect");
+                        continue;
+                    }
+                    break;
+                }
+                spdlog::info("Subscribe stream opened - waiting for commands");
+
+                // Step 4: publish this stream as the Guardian sink target and wire
+                // the event-sink now the stream is up and BEFORE any push arrives, so
+                // a guard started by a push has a live sink. Drift events ship as a
+                // self-describing CommandResponse{plugin:"__guard__", action:"event",
+                // payload}. The sink captures only `this` and writes through
+                // guardian_sink_stream_ (H4 / #1209): a guard worker fires
+                // asynchronously and outlives any single stream, so capturing a
+                // specific `stream` would let it write to a cancelled stream across a
+                // reconnect. The holder is reset on read-loop exit, under the same
+                // mutex, before the stream is torn down.
+                if (guardian_) {
+                    {
+                        std::lock_guard lock(stream_write_mu_);
+                        guardian_sink_stream_ = stream;
+                    }
+                    guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
+                        pb::CommandResponse resp;
+                        resp.set_plugin("__guard__");
+                        resp.set_action("event");
+                        resp.set_status(pb::CommandResponse::SUCCESS);
+                        resp.set_payload(ev.SerializeAsString());
+                        std::lock_guard lock(stream_write_mu_);
+                        if (guardian_sink_stream_)
+                            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+                        // else: link is down between reconnects — event dropped
+                        // (durable event buffering is Guardian A3).
+                    });
                 }
 
-                if (!target) {
-                    spdlog::warn("No plugin '{}' found", cmd.plugin());
-                    pb::CommandResponse resp;
-                    resp.set_command_id(cmd.command_id());
-                    resp.set_status(pb::CommandResponse::REJECTED);
-                    resp.set_output("plugin not found: " + cmd.plugin());
-                    std::lock_guard lock(stream_write_mu_);
-                    stream->Write(resp, grpc::WriteOptions());
-                    continue;
+                // 4b. Spawn OTA update check thread
+                if (cfg_.auto_update && updater_) {
+                    auto* raw_stub = static_cast<void*>(stub.get());
+                    update_thread_ = std::thread([this, raw_stub]() {
+                        spdlog::info("OTA update checker started (interval={}s)",
+                                     cfg_.update_check_interval.count());
+                        while (!stop_requested_.load(std::memory_order_acquire)) {
+                            auto result = updater_->check_and_apply(raw_stub);
+                            if (result.has_value() && result.value()) {
+                                spdlog::info("OTA update applied - agent will restart");
+                                stop();
+                                return;
+                            }
+                            if (!result.has_value()) {
+                                spdlog::warn("OTA update check failed: {}", result.error().message);
+                            }
+                            // Sleep in small increments so we can respond to stop quickly
+                            auto remaining = cfg_.update_check_interval;
+                            while (remaining.count() > 0 &&
+                                   !stop_requested_.load(std::memory_order_acquire)) {
+                                auto sleep_time = std::min(remaining, std::chrono::seconds{5});
+                                std::this_thread::sleep_for(sleep_time);
+                                remaining -= sleep_time;
+                            }
+                        }
+                    });
                 }
 
-                // Dispatch execute() via bounded thread pool.
-                // chargen_start blocks until chargen_stop sets the atomic flag,
-                // so concurrent dispatch is required.
-                // Each task captures the shared_ptr to guarantee the stream
-                // outlives all writers (fixes use-after-free risk from #66).
-                bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
-                    // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
-                    const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
-                    const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});      // cap 5 min
-                    if (stagger_s > 0 || delay_s > 0) {
-                        int32_t random_stagger = 0;
-                        if (stagger_s > 0) {
-                            std::random_device rd;
-                            std::mt19937 gen(rd());
-                            std::uniform_int_distribution<int32_t> dist(0, stagger_s);
-                            random_stagger = dist(gen);
-                        }
-                        const int32_t total_delay = std::min((delay_s > 0 ? delay_s : 0) + random_stagger, int32_t{600});
-                        spdlog::debug("Command {} stagger {}s + delay {}s = {}s",
-                                      cmd.command_id(), random_stagger, delay_s, total_delay);
+                // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
+                {
+                    heartbeat_stop_.store(false, std::memory_order_release);
+                    auto hb_stub = pb::AgentService::NewStub(channel);
+                    heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
+                        spdlog::info("Heartbeat thread started (interval={}s)",
+                                     cfg_.heartbeat_interval.count());
+                        auto should_stop = [this]() {
+                            return stop_requested_.load(std::memory_order_acquire) ||
+                                   heartbeat_stop_.load(std::memory_order_acquire);
+                        };
+                        // PR 10: per-thread last-shipped snapshot generation.
+                        // Stays inside the heartbeat lambda so reconnects
+                        // see seq=0 first and re-ship whatever the pump
+                        // last produced — important so a flapping link
+                        // doesn't leave the server reading a stale slot.
+                        uint64_t last_attached_seq = 0;
+                        while (!should_stop()) {
+                            // Sleep in small increments for responsive shutdown
+                            auto remaining = cfg_.heartbeat_interval;
+                            while (remaining.count() > 0 && !should_stop()) {
+                                auto sleep_time = std::min(remaining, std::chrono::seconds{5});
+                                std::this_thread::sleep_for(sleep_time);
+                                remaining -= sleep_time;
+                            }
+                            if (should_stop())
+                                break;
 
-                        if (total_delay > 0) {
-                            std::this_thread::sleep_for(std::chrono::seconds(total_delay));
-                        }
-
-                        // Check expiration after the delay — skip stale commands
-                        if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+                            // Build heartbeat with piggybacked metrics
+                            grpc::ClientContext ctx;
+                            heartbeat_ctx_.store(&ctx, std::memory_order_release);
+                            pb::HeartbeatRequest req;
+                            req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
-                            if (now_ms > cmd.expires_at().millis_epoch()) {
-                                spdlog::warn("Command {} expired after stagger/delay (expired_at={}, now={})",
-                                             cmd.command_id(), cmd.expires_at().millis_epoch(), now_ms);
-                                pb::CommandResponse expired_resp;
-                                expired_resp.set_command_id(cmd.command_id());
-                                expired_resp.set_status(pb::CommandResponse::REJECTED);
-                                expired_resp.set_output("command expired after stagger/delay");
-                                auto epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                 std::chrono::system_clock::now().time_since_epoch())
-                                                 .count();
-                                expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
+                            req.mutable_sent_at()->set_millis_epoch(now_ms);
 
-                                std::lock_guard lock(stream_write_mu_);
-                                stream->Write(expired_resp, grpc::WriteOptions());
-                                return;
+                            auto& tags = *req.mutable_status_tags();
+                            auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                                              std::chrono::steady_clock::now() - start_time_)
+                                              .count();
+                            tags["yuzu.uptime_s"] = std::to_string(uptime);
+                            tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_commands_executed_total").value()));
+                            tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                            tags["yuzu.os"] = kAgentOs;
+                            tags["yuzu.arch"] = kAgentArch;
+                            tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
+                            tags["yuzu.healthy"] = "1";
+                            // Guardian policy generation (M5 / #1209): lets the
+                            // server detect an agent that missed a push (offline at
+                            // push time, or reconnected) and re-push it without a
+                            // manual operator action. Always emitted — including
+                            // generation 0 — so an agent that has never received a
+                            // push still converges once rules exist server-side.
+                            if (guardian_)
+                                tags["yuzu.guardian_generation"] =
+                                    std::to_string(guardian_->policy_generation());
+
+                            // PR 10: attach pushed fleet snapshot if the
+                            // pump produced something newer than what
+                            // we last shipped. `last_attached_seq` is a
+                            // per-heartbeat-thread local; the pump's
+                            // monotonic counter is the source of truth.
+                            // Empty attach when no new snapshot is
+                            // available — keeps quiescent heartbeats at
+                            // their pre-PR-10 size.
+                            {
+                                const auto cur_seq =
+                                    latest_snapshot_seq_.load(std::memory_order_acquire);
+                                if (cur_seq > last_attached_seq) {
+                                    std::lock_guard lock(snapshot_mu_);
+                                    if (!latest_snapshot_.empty()) {
+                                        req.set_fleet_snapshot_json(latest_snapshot_);
+                                        last_attached_seq = cur_seq;
+                                    }
+                                }
                             }
+
+                            pb::HeartbeatResponse resp;
+                            auto status = hb_stub->Heartbeat(&ctx, req, &resp);
+                            heartbeat_ctx_.store(nullptr, std::memory_order_release);
+                            if (!status.ok()) {
+                                spdlog::warn("Heartbeat failed: {}", status.error_message());
+                            } else {
+                                spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
+                            }
+                        }
+                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
+                        spdlog::info("Heartbeat thread stopped");
+                    });
+                }
+
+                // 5. Read commands from server and dispatch to plugins
+                dedup_current_.clear(); // Fresh dedup sets per connection
+                dedup_previous_.clear();
+                bool update_verified = false;
+                pb::CommandRequest cmd;
+                while (stream->Read(&cmd)) {
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+
+                    // Command replay protection: reject duplicate command_ids
+                    if (cmd.command_id().empty()) {
+                        spdlog::warn("Received command with empty command_id — replay "
+                                     "protection cannot apply");
+                    } else {
+                        if (dedup_current_.count(cmd.command_id()) ||
+                            dedup_previous_.count(cmd.command_id())) {
+                            spdlog::warn("Replay detected: duplicate command_id={} — rejecting",
+                                         cmd.command_id());
+                            pb::CommandResponse replay_resp;
+                            replay_resp.set_command_id(cmd.command_id());
+                            replay_resp.set_status(pb::CommandResponse::REJECTED);
+                            replay_resp.set_output("command replay rejected: duplicate command_id");
+                            std::lock_guard lock(stream_write_mu_);
+                            stream->Write(replay_resp, grpc::WriteOptions());
+                            continue;
+                        }
+                        // Double-buffer rotation: when current fills, discard previous,
+                        // swap current → previous, start fresh current.
+                        if (dedup_current_.size() >= kMaxDedupEntries) {
+                            spdlog::debug("Dedup buffer rotation ({} entries)", kMaxDedupEntries);
+                            dedup_previous_ = std::move(dedup_current_);
+                            dedup_current_.clear();
+                        }
+                        dedup_current_.insert(cmd.command_id());
+                    }
+
+                    // Write health marker after first successful read (OTA rollback guard)
+                    if (!update_verified) {
+                        update_verified = true;
+                        auto marker =
+                            current_executable_path().parent_path() / ".yuzu-update-verified";
+                        std::ofstream{marker} << "ok";
+                        spdlog::debug("Wrote update verification marker: {}", marker.string());
+                    }
+
+                    spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),
+                                 cmd.action(), cmd.command_id());
+
+                    // Reserved-name dispatch — must run before the plugin match
+                    // loop so a third-party plugin cannot shadow Guardian (the
+                    // load-time check in plugin_loader.cpp also rejects reserved
+                    // names, but defence-in-depth keeps both halves explicit).
+                    // See docs/yuzu-guardian-design-v1.1.md §7.2.
+                    if (cmd.plugin() == "__guard__") {
+                        pb::CommandResponse resp;
+                        resp.set_command_id(cmd.command_id());
+                        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                        resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
+                        if (!guardian_) {
+                            resp.set_status(pb::CommandResponse::FAILURE);
+                            resp.set_exit_code(1);
+                            resp.set_output("guardian engine not initialised");
+                        } else {
+                            auto dr = guardian_->dispatch(cmd);
+                            resp.set_status(dr.exit_code == 0 ? pb::CommandResponse::SUCCESS
+                                                              : pb::CommandResponse::FAILURE);
+                            resp.set_exit_code(dr.exit_code);
+                            resp.set_output(std::move(dr.output));
+                        }
+                        // Stamp the response so the server routes it via the Guardian
+                        // ingest branch (plugin=="__guard__") and skips the response
+                        // store / executions drawer. action mirrors the request.
+                        resp.set_plugin("__guard__");
+                        resp.set_action(cmd.action());
+                        metrics_
+                            .counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", "__guard__"}})
+                            .increment();
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(resp, grpc::WriteOptions());
+                        continue;
+                    }
+
+                    // Find the matching plugin
+                    const YuzuPluginDescriptor* target = nullptr;
+                    for (const auto& handle : plugins_) {
+                        if (cmd.plugin() == handle.descriptor()->name) {
+                            target = handle.descriptor();
+                            break;
                         }
                     }
 
-                    metrics_
-                        .counter("yuzu_agent_commands_executed_total", {{"plugin", cmd.plugin()}})
-                        .increment();
-                    CommandContextImpl ctx_impl{
-                        .stream = stream,
-                        .write_mu = &stream_write_mu_,
-                        .command_id = cmd.command_id(),
-                        .start_time = std::chrono::steady_clock::now(),
-                    };
-                    auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
-
-                    // Convert protobuf parameter map -> C ABI YuzuParam array
-                    // Direct construction: single vector of YuzuParam pointing at proto map
-                    // entries (no intermediate string copies — proto owns the data).
-                    const auto& proto_params = cmd.parameters();
-                    std::vector<YuzuParam> params;
-                    params.reserve(proto_params.size());
-                    for (const auto& [k, v] : proto_params) {
-                        params.push_back(YuzuParam{k.c_str(), v.c_str()});
-                    }
-
-                    int rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
-                                             params.size());
-
-                    // Flush any buffered output before sending timing/status
-                    ctx_impl.flush_output();
-
-                    auto end_time = std::chrono::steady_clock::now();
-                    auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       end_time - ctx_impl.start_time)
-                                       .count();
-
-                    // Send timing metadata before the final status
-                    {
-                        pb::CommandResponse timing_resp;
-                        timing_resp.set_command_id(cmd.command_id());
-                        timing_resp.set_status(pb::CommandResponse::RUNNING);
-                        timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
-
+                    if (!target) {
+                        spdlog::warn("No plugin '{}' found", cmd.plugin());
+                        pb::CommandResponse resp;
+                        resp.set_command_id(cmd.command_id());
+                        resp.set_status(pb::CommandResponse::REJECTED);
+                        resp.set_output("plugin not found: " + cmd.plugin());
                         std::lock_guard lock(stream_write_mu_);
-                        stream->Write(timing_resp, grpc::WriteOptions());
+                        stream->Write(resp, grpc::WriteOptions());
+                        continue;
                     }
 
-                    // Send final status
-                    {
-                        pb::CommandResponse final_resp;
-                        final_resp.set_command_id(cmd.command_id());
-                        final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
-                                                      : pb::CommandResponse::FAILURE);
-                        final_resp.set_exit_code(rc);
+                    // Dispatch execute() via bounded thread pool.
+                    // chargen_start blocks until chargen_stop sets the atomic flag,
+                    // so concurrent dispatch is required.
+                    // Each task captures the shared_ptr to guarantee the stream
+                    // outlives all writers (fixes use-after-free risk from #66).
+                    bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
+                        // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
+                        const int32_t stagger_s =
+                            std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
+                        const int32_t delay_s =
+                            std::min(cmd.delay_seconds(), int32_t{300}); // cap 5 min
+                        if (stagger_s > 0 || delay_s > 0) {
+                            int32_t random_stagger = 0;
+                            if (stagger_s > 0) {
+                                std::random_device rd;
+                                std::mt19937 gen(rd());
+                                std::uniform_int_distribution<int32_t> dist(0, stagger_s);
+                                random_stagger = dist(gen);
+                            }
+                            const int32_t total_delay = std::min(
+                                (delay_s > 0 ? delay_s : 0) + random_stagger, int32_t{600});
+                            spdlog::debug("Command {} stagger {}s + delay {}s = {}s",
+                                          cmd.command_id(), random_stagger, delay_s, total_delay);
 
-                        auto now_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                        final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
+                            if (total_delay > 0) {
+                                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+                            }
 
+                            // Check expiration after the delay — skip stale commands
+                            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+                                auto now_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                                if (now_ms > cmd.expires_at().millis_epoch()) {
+                                    spdlog::warn("Command {} expired after stagger/delay "
+                                                 "(expired_at={}, now={})",
+                                                 cmd.command_id(), cmd.expires_at().millis_epoch(),
+                                                 now_ms);
+                                    pb::CommandResponse expired_resp;
+                                    expired_resp.set_command_id(cmd.command_id());
+                                    expired_resp.set_status(pb::CommandResponse::REJECTED);
+                                    expired_resp.set_output("command expired after stagger/delay");
+                                    auto epoch =
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
+
+                                    std::lock_guard lock(stream_write_mu_);
+                                    stream->Write(expired_resp, grpc::WriteOptions());
+                                    return;
+                                }
+                            }
+                        }
+
+                        metrics_
+                            .counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", cmd.plugin()}})
+                            .increment();
+                        CommandContextImpl ctx_impl{
+                            .stream = stream,
+                            .write_mu = &stream_write_mu_,
+                            .command_id = cmd.command_id(),
+                            .start_time = std::chrono::steady_clock::now(),
+                        };
+                        auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+
+                        // Convert protobuf parameter map -> C ABI YuzuParam array
+                        // Direct construction: single vector of YuzuParam pointing at proto map
+                        // entries (no intermediate string copies — proto owns the data).
+                        const auto& proto_params = cmd.parameters();
+                        std::vector<YuzuParam> params;
+                        params.reserve(proto_params.size());
+                        for (const auto& [k, v] : proto_params) {
+                            params.push_back(YuzuParam{k.c_str(), v.c_str()});
+                        }
+
+                        // Defence-in-depth: wrap the plugin's execute() so a
+                        // thrown C++ exception cannot propagate up into the
+                        // command-dispatch thread and terminate() the whole
+                        // agent process. Plugins are expected to convert
+                        // failures into a non-zero `rc`; this is the safety
+                        // net for the cases they miss. Observed 2026-05-12:
+                        // agent_logging.get_log threw filesystem_error from
+                        // fs::exists on EACCES and brought the agent down
+                        // mid-test. The plugin bug is fixed separately;
+                        // this catch is so the next plugin's mistake
+                        // doesn't have the same blast radius.
+                        int rc;
+                        try {
+                            rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
+                                                 params.size());
+                        } catch (const std::exception& e) {
+                            spdlog::error("Plugin {} action {} threw std::exception: {}",
+                                          cmd.plugin(), cmd.action(), e.what());
+                            std::string msg = "plugin threw exception: ";
+                            msg += e.what();
+                            ctx_impl.append_output(msg.c_str());
+                            rc = 1;
+                        } catch (...) {
+                            spdlog::error("Plugin {} action {} threw non-std exception",
+                                          cmd.plugin(), cmd.action());
+                            ctx_impl.append_output("plugin threw non-std exception");
+                            rc = 1;
+                        }
+
+                        // Flush any buffered output before sending timing/status
+                        ctx_impl.flush_output();
+
+                        auto end_time = std::chrono::steady_clock::now();
+                        auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           end_time - ctx_impl.start_time)
+                                           .count();
+
+                        // Send timing metadata before the final status
+                        {
+                            pb::CommandResponse timing_resp;
+                            timing_resp.set_command_id(cmd.command_id());
+                            timing_resp.set_status(pb::CommandResponse::RUNNING);
+                            timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
+
+                            std::lock_guard lock(stream_write_mu_);
+                            stream->Write(timing_resp, grpc::WriteOptions());
+                        }
+
+                        // Send final status
+                        {
+                            pb::CommandResponse final_resp;
+                            final_resp.set_command_id(cmd.command_id());
+                            final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
+                                                          : pb::CommandResponse::FAILURE);
+                            final_resp.set_exit_code(rc);
+
+                            auto now_epoch =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
+
+                            std::lock_guard lock(stream_write_mu_);
+                            stream->Write(final_resp, grpc::WriteOptions());
+                        }
+
+                        spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
+                                     exec_ms);
+                    });
+
+                    if (!submitted) {
+                        spdlog::warn("Thread pool queue full — rejecting command {}",
+                                     cmd.command_id());
+                        pb::CommandResponse reject_resp;
+                        reject_resp.set_command_id(cmd.command_id());
+                        reject_resp.set_status(pb::CommandResponse::REJECTED);
+                        reject_resp.set_output("agent overloaded: command queue full");
                         std::lock_guard lock(stream_write_mu_);
-                        stream->Write(final_resp, grpc::WriteOptions());
+                        stream->Write(reject_resp, grpc::WriteOptions());
                     }
+                }
 
-                    spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
-                                 exec_ms);
-                });
+                subscribe_ctx_.store(nullptr, std::memory_order_release);
 
-                if (!submitted) {
-                    spdlog::warn("Thread pool queue full — rejecting command {}", cmd.command_id());
-                    pb::CommandResponse reject_resp;
-                    reject_resp.set_command_id(cmd.command_id());
-                    reject_resp.set_status(pb::CommandResponse::REJECTED);
-                    reject_resp.set_output("agent overloaded: command queue full");
+                // Detach the Guardian event-sink from this (now broken) stream BEFORE
+                // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
+                // in-flight sink Write to finish, then nulls the holder so a guard
+                // worker firing during teardown drops the event instead of writing to
+                // a cancelled stream. Guards keep running across the reconnect; the
+                // next iteration republishes the new stream and the heartbeat reconcile
+                // (M5) catches up any generation missed while the link was down.
+                {
                     std::lock_guard lock(stream_write_mu_);
-                    stream->Write(reject_resp, grpc::WriteOptions());
+                    guardian_sink_stream_.reset();
                 }
-            }
 
-            subscribe_ctx_.store(nullptr, std::memory_order_release);
+                // Destroy thread pool BEFORE stream goes out of scope — this drains
+                // the queue, waits for in-flight tasks, and joins all worker threads,
+                // ensuring no task holds a dangling stream pointer.
+                thread_pool_.reset();
 
-            // Destroy thread pool BEFORE stream goes out of scope — this drains
-            // the queue, waits for in-flight tasks, and joins all worker threads,
-            // ensuring no task holds a dangling stream pointer.
-            thread_pool_.reset();
+                // Stop and join the OTA update thread
+                if (updater_) {
+                    updater_->stop();
+                }
+                if (update_thread_.joinable()) {
+                    update_thread_.join();
+                }
 
-            // Stop and join the OTA update thread
-            if (updater_) {
-                updater_->stop();
-            }
-            if (update_thread_.joinable()) {
-                update_thread_.join();
-            }
+                // Signal heartbeat thread to exit and cancel any in-flight RPC
+                heartbeat_stop_.store(true, std::memory_order_release);
+                if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
+                    hctx->TryCancel();
+                }
+                if (heartbeat_thread_.joinable()) {
+                    heartbeat_thread_.join();
+                }
+                // PR 10: the snapshot pump is intentionally NOT joined
+                // here. It is a Run()-lifetime thread that survives
+                // reconnects, so the heartbeat thread of the next
+                // connection cycle finds a warm latest_snapshot_ and
+                // ships it immediately. The pump joins only at final
+                // shutdown, below — see the Run()-exit cleanup.
 
-            // Signal heartbeat thread to exit and cancel any in-flight RPC
-            heartbeat_stop_.store(true, std::memory_order_release);
-            if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-                hctx->TryCancel();
-            }
-            if (heartbeat_thread_.joinable()) {
-                heartbeat_thread_.join();
-            }
-
-            // Only shutdown plugins on final exit — keep them loaded for reconnect
-            if (stop_requested_.load(std::memory_order_acquire)) {
-                for (auto& handle : plugins_) {
-                    if (handle.descriptor()->shutdown) {
-                        auto it = per_plugin_ctx_.find(handle.descriptor()->name);
-                        auto* ctx_ptr = (it != per_plugin_ctx_.end())
-                            ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
-                            : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
-                        handle.descriptor()->shutdown(ctx_ptr);
+                // Only shutdown plugins on final exit — keep them loaded for reconnect
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    for (auto& handle : plugins_) {
+                        if (handle.descriptor()->shutdown) {
+                            auto it = per_plugin_ctx_.find(handle.descriptor()->name);
+                            auto* ctx_ptr =
+                                (it != per_plugin_ctx_.end())
+                                    ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
+                                    : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+                            handle.descriptor()->shutdown(ctx_ptr);
+                        }
                     }
+                    plugins_.clear(); // Prevent ScopeExit from calling shutdown again
                 }
-                plugins_.clear(); // Prevent ScopeExit from calling shutdown again
+
+                spdlog::info("Subscribe stream ended");
+
+                // Re-create thread pool for next connection cycle
+                thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+
+                if (!stop_requested_.load(std::memory_order_acquire)) {
+                    ++reconnect_count;
+                    metrics_.counter("yuzu_agent_reconnections_total").increment();
+                    spdlog::warn("Connection lost — will attempt reconnect");
+                    continue; // Back to reconnect loop
+                }
             }
+            break; // stop_requested
+        }          // end while (reconnect loop)
 
-            spdlog::info("Subscribe stream ended");
-
-            // Re-create thread pool for next connection cycle
-            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
-
-            if (!stop_requested_.load(std::memory_order_acquire)) {
-                ++reconnect_count;
-                metrics_.counter("yuzu_agent_reconnections_total").increment();
-                spdlog::warn("Connection lost — will attempt reconnect");
-                continue; // Back to reconnect loop
-            }
+        // PR 10: snapshot pump joined here, post reconnect loop. The
+        // pump observes `stop_requested_` (set in stop() above) and
+        // exits at the next 2 s slice boundary; joining at final
+        // shutdown means the thread is collected before Run() returns
+        // and the AgentImpl dtor sees a default-constructed thread.
+        if (snapshot_pump_thread_.joinable()) {
+            snapshot_pump_thread_.join();
         }
-        break; // stop_requested
-        } // end while (reconnect loop)
     }
 
     void stop() noexcept override {
@@ -1280,7 +1687,12 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
-    std::unique_ptr<GuardianEngine> guardian_;
+    // Drives interval / file-change / service-status triggers that plugins
+    // register during init(). Owned here; a non-owning pointer is handed to
+    // every per-plugin context so yuzu_register_trigger can reach it.
+    // start() is called once plugins are loaded; stop() runs before plugin
+    // shutdown so a trigger never fires into a half-torn-down plugin.
+    TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
@@ -1291,10 +1703,40 @@ private:
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
+    // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
+    // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
+    // and fire asynchronously, so the sink must NOT capture a specific stream: it
+    // reads this holder under the lock and drops the event if it is null (link down
+    // between reconnects). Set on stream open, reset on read-loop exit BEFORE the
+    // stream is torn down, so a guard firing mid-teardown can never write to a
+    // cancelled stream.
+    std::shared_ptr<SubscribeStream> guardian_sink_stream_;
+    // Declared AFTER stream_write_mu_ + guardian_sink_stream_ so it is DESTROYED
+    // FIRST (reverse declaration order): ~GuardianEngine joins the guard worker
+    // threads, which must happen while the mutex + sink-stream holder those
+    // workers write through are still alive (H4 / #1209). Body-initialized in the
+    // ctor (after kv_store_), so the later declaration does not affect construction.
+    std::unique_ptr<GuardianEngine> guardian_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;
+
+    // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
+    //
+    // `snapshot_pump_thread_` runs `tar.fleet_snapshot` locally on a
+    // 30 s interval, captures the JSON, and stashes it under
+    // `snapshot_mu_`. The heartbeat thread reads `latest_snapshot_`
+    // each iteration; if `latest_snapshot_seq_` advanced since the
+    // heartbeat's `last_attached_snapshot_seq_`, the snapshot rides
+    // out on the next HeartbeatRequest.fleet_snapshot_json field.
+    // Together they replace the previous dispatch-on-get path for
+    // /api/v1/viz/fleet/topology, so the renderer reads from
+    // per-agent slots that the agents themselves keep current.
+    std::thread snapshot_pump_thread_;
+    std::mutex snapshot_mu_;
+    std::string latest_snapshot_;                  // last JSON produced by pump
+    std::atomic<uint64_t> latest_snapshot_seq_{0}; // monotonically increases on each new snapshot
 
     // M8: Command replay protection — double-buffer dedup of command IDs.
     // Two sets: "current" and "previous". When current fills, previous is

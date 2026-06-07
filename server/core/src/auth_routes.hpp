@@ -14,10 +14,13 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -34,23 +37,17 @@ struct Config;
 /// SettingsRoutes, and its own remaining route handlers.
 class AuthRoutes {
 public:
-    AuthRoutes(Config& cfg,
-               auth::AuthManager& auth_mgr,
-               RbacStore* rbac_store,
-               ApiTokenStore* api_token_store,
-               AuditStore* audit_store,
-               ManagementGroupStore* mgmt_group_store,
-               TagStore* tag_store,
-               AnalyticsEventStore* analytics_store,
-               std::shared_mutex& oidc_mu,
+    AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac_store,
+               ApiTokenStore* api_token_store, AuditStore* audit_store,
+               ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+               AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
                std::unique_ptr<oidc::OidcProvider>& oidc_provider);
 
     // -- Auth helpers (called by server.cpp to create callbacks for other modules) --
 
     /// Validate session cookie, Bearer token, or X-Yuzu-Token header.
     /// Returns a Session on success, or sets 401 and returns nullopt.
-    std::optional<auth::Session> require_auth(const httplib::Request& req,
-                                              httplib::Response& res);
+    std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res);
 
     /// Resolve the authenticated session from a request without writing a response.
     /// Tries cookie, then `Authorization: Bearer`, then `X-Yuzu-Token`. Returns
@@ -70,24 +67,48 @@ public:
 
     /// Scoped RBAC-aware permission check for device-specific operations.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
-                                   const std::string& securable_type,
-                                   const std::string& operation,
+                                   const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
 
     /// Build a synthetic session from a validated API token.
     auth::Session synthesize_token_session(const ApiToken& api_token);
 
-    /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional "; Secure".
+    /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional ";
+    /// Secure".
     std::string session_cookie_attrs() const;
 
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
                                 const std::string& result);
 
-    /// Write an audit event to the audit store.
-    void audit_log(const httplib::Request& req, const std::string& action,
+    /// Write an audit event to the audit store. Returns true iff the row
+    /// was persisted; returns true (no-op success) when no AuditStore is
+    /// configured (operator-chosen audit-off mode). Returns false on a
+    /// silent persist failure (audit DB locked / disk full / corruption).
+    /// SOC 2 CC6.6 evidence-emitting handlers MUST capture the return so
+    /// they can surface partial-success on the response (HIGH-2 on PR #883,
+    /// UP-H1 on PR W1.1). The bool is [[nodiscard]] on the AuditStore
+    /// primitive but not on this wrapper — most call sites legitimately
+    /// fire-and-forget.
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {});
+
+    /// Variant that stamps `principal` + `principal_role` explicitly
+    /// rather than resolving from `resolve_session(req)`. Used at the
+    /// three "mint a fresh session" sites (`POST /login` no-MFA,
+    /// `POST /login/mfa` TOTP/recovery success, OIDC `/auth/callback`)
+    /// where the request itself carries no session cookie yet but the
+    /// authenticating principal IS known to the handler. Without this,
+    /// `make_audit_event` writes an empty `principal` and the SOC 2
+    /// CC6.6 query "every privileged session-creation row names the
+    /// principal" returns false negatives (Gate 4 consistency B3).
+    bool audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                 const std::string& result, const std::string& principal,
+                                 const std::string& principal_role,
+                                 const std::string& target_type = {},
+                                 const std::string& target_id = {},
+                                 const std::string& detail = {});
 
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -96,9 +117,20 @@ public:
 
     // -- Route registration ---------------------------------------------------
 
-    /// Register auth-related routes: GET/POST /login, POST /logout,
-    /// GET /auth/oidc/start, GET /auth/callback.
+    /// Register auth-related routes: GET/POST /login, POST /login/mfa,
+    /// POST /logout, GET /auth/oidc/start, GET /auth/callback.
+    ///
+    /// Production callers use this overload; it constructs an
+    /// `HttplibRouteSink` over `svr` and delegates to the sink-based
+    /// overload below. Same handlers, same lambdas, same behaviour.
     void register_routes(httplib::Server& svr);
+
+    /// Sink-based overload — used by tests to register routes against an
+    /// in-process `TestRouteSink` and dispatch synthesized requests
+    /// directly, avoiding `httplib::Server`'s TSan-hostile acceptor
+    /// thread (#438). Matches the pattern already in use by
+    /// `SettingsRoutes::register_routes`.
+    void register_routes(class HttpRouteSink& sink);
 
     // -- Static utilities (also used by server.cpp pre-routing handler) --------
 
@@ -122,6 +154,69 @@ private:
     AnalyticsEventStore* analytics_store_;
     std::shared_mutex& oidc_mu_;
     std::unique_ptr<oidc::OidcProvider>& oidc_provider_;
+
+    /// Pending MFA challenge issued after a successful password verify on
+    /// /login when the user has TOTP enrolled. Keyed by an opaque random
+    /// `mfa_pending_token` returned to the browser; resolved by the
+    /// matching POST /login/mfa request. Expires after
+    /// `cfg.mfa_login_pending_secs`; entries are reaped lazily on every
+    /// access. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
+    ///
+    /// `attempts` caps online TOTP guessing per challenge to
+    /// `kMfaMaxAttemptsPerPending` (default 5). Once exceeded the entry
+    /// is erased and the operator must restart with a fresh password
+    /// submission. Closes Gate 2 H1 + unhappy-path UP-11 (rate-limit
+    /// gap → CPU DoS via PBKDF2 amplification).
+    /// Discriminates the two pending-token flavours that share the
+    /// `mfa_pending_` map (PR3). An enum rather than a bool so a third kind
+    /// (e.g. a future password-reset or WebAuthn challenge) is an additive
+    /// variant rather than a second bool — and so the cross-endpoint guards
+    /// read as `kind != PendingKind::enrollment` (self-documenting).
+    enum class PendingKind {
+        /// Login challenge for an already-enrolled user, resolved by
+        /// POST /login/mfa (verify a TOTP/recovery code vs the live secret).
+        login_challenge,
+        /// Enrollment challenge issued when `mfa_enforcement` blocks an
+        /// un-enrolled login, resolved by POST /login/mfa/enroll (confirm the
+        /// provisional secret's first code, then mint the session).
+        enrollment,
+    };
+
+    struct MfaPending {
+        std::string username;
+        auth::Role role{auth::Role::user};
+        std::chrono::steady_clock::time_point expires_at{};
+        int attempts{0};
+        /// Default is a login challenge. Each endpoint rejects the other's
+        /// kind, so an enrollment token can't be replayed at the
+        /// login-challenge endpoint or vice versa.
+        PendingKind kind{PendingKind::login_challenge};
+    };
+    static constexpr int kMfaMaxAttemptsPerPending = 5;
+    /// Hard cap on the in-memory pending-token map. `reap_mfa_pending_locked`
+    /// is an O(n) scan held under `mfa_pending_mu_`, so an unbounded map
+    /// turns a distributed /login flood (many IPs, each bypassing the per-IP
+    /// login rate-limiter) into an O(n²) lock-contention / CPU DoS that
+    /// serialises all logins (Hermes adversarial H-2). At the cap, new
+    /// challenges are load-shed with a 503 rather than growing the map.
+    /// 50k entries × ~120 s TTL tolerates a very large legitimate burst.
+    static constexpr std::size_t kMaxPendingTokens = 50'000;
+
+public:
+    /// Lower the pending-token cap for tests (the production default 50k is
+    /// impractical to fill in a unit test). Test-only seam — governance
+    /// qe-B: the load-shed branch must be exercised.
+    void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
+
+private:
+    std::size_t mfa_pending_cap_{kMaxPendingTokens};
+    mutable std::mutex mfa_pending_mu_;
+    std::unordered_map<std::string, MfaPending> mfa_pending_;
+
+    /// Drop every pending row whose deadline has passed. Called under
+    /// `mfa_pending_mu_` from each insert/lookup; constant-time on an
+    /// empty map and bounded by the configured rate limit.
+    void reap_mfa_pending_locked();
 };
 
 } // namespace yuzu::server

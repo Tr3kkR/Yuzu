@@ -47,6 +47,14 @@
 
 set -uo pipefail
 
+# Bash 4+ required: `declare -A` is used for the metric→value map below.
+# macOS /bin/bash is 3.2; `#!/usr/bin/env bash` picks up Homebrew bash 5.
+# Fail loudly with a recovery hint rather than a parse error mid-script.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "perf-gate needs bash 4+ (got $BASH_VERSION) — install GNU bash via brew or apt" >&2
+    exit 2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -102,8 +110,8 @@ if [[ -z "$RUN_ID" ]]; then
 fi
 
 # Validate RUN_ID before it's interpolated into filesystem paths.
-if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "perf-gate: invalid --run-id '$RUN_ID' (allowed: A-Z a-z 0-9 . _ -)" >&2
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ || "$RUN_ID" == "." || "$RUN_ID" == ".." ]]; then
+    echo "perf-gate: invalid --run-id (allowed: A-Z a-z 0-9 . _ -)" >&2
     exit 2
 fi
 
@@ -112,6 +120,11 @@ mkdir -p "$LOG_DIR"
 
 GATE_LOG="$LOG_DIR/perf.log"
 : > "$GATE_LOG"
+
+# Cross-platform helpers (port_listening, loadavg_1m, cpu_brand, mem_total_gb).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/test/_portable.sh
+. "$HERE/_portable.sh"
 
 echo ""
 echo "Phase 7 — Perf (run $RUN_ID, measure-and-report)"
@@ -175,23 +188,10 @@ QUIET_PORTS=(
 )
 
 ports_in_use() {
-    if ! command -v ss >/dev/null 2>&1; then
-        return 0  # no ss → cannot prove busy; assume quiet
-    fi
-    local -a busy=()
-    local listeners
-    listeners=$(ss -tnlH 2>/dev/null || true)
-    for port in "${QUIET_PORTS[@]}"; do
-        if echo "$listeners" | awk '{print $4}' | grep -qE ":${port}$"; then
-            busy+=("$port")
-        fi
-    done
-    if [[ ${#busy[@]} -eq 0 ]]; then
-        echo ""
-    else
-        local IFS=,
-        echo "${busy[*]}"
-    fi
+    # Portable port-listen probe via _portable.sh (lsof on macOS/Linux,
+    # ss fallback if lsof missing). Returns "" if all quiet, else
+    # comma-separated list of busy ports.
+    listening_ports_among "${QUIET_PORTS[@]}"
 }
 
 if [[ "$ALLOW_BUSY" == "0" ]]; then
@@ -200,7 +200,7 @@ if [[ "$ALLOW_BUSY" == "0" ]]; then
         cat <<EOF | tee -a "$GATE_LOG" >&2
 perf-gate: refusing to run — UAT stack appears to be up (ports: $BUSY_PORTS)
   Perf measurements are too sensitive to CPU/scheduler contention to coexist
-  with a running stack. Run \`bash scripts/linux-start-UAT.sh stop\` first,
+  with a running stack. Run \`bash scripts/start-UAT.sh stop\` first,
   or pass --allow-busy if you understand the numbers will be contended.
 EOF
         write_gate FAIL 0 "refused: UAT ports listening ($BUSY_PORTS)"
@@ -208,20 +208,13 @@ EOF
     fi
 fi
 
-LOADAVG_PRE=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")
+LOADAVG_PRE=$(loadavg_1m)
 echo "perf-gate: loadavg pre=$LOADAVG_PRE" | tee -a "$GATE_LOG"
 
 # ── Hardware fingerprint ────────────────────────────────────────────────
 
 fingerprint() {
-    local cpu mem
-    cpu=$(grep -m1 "^model name" /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || echo "unknown")
-    if [[ -r /proc/meminfo ]]; then
-        mem=$(awk '/^MemTotal:/ {printf "%dGB", $2/1024/1024}' /proc/meminfo)
-    else
-        mem="unknown"
-    fi
-    echo "${cpu} | ${mem}"
+    echo "$(cpu_brand) | $(mem_total_gb)"
 }
 
 HW_FINGERPRINT=$(fingerprint)
@@ -250,7 +243,7 @@ CT_RC=0
 
 echo "perf-gate: rebar3 ct exit=$CT_RC" | tee -a "$GATE_LOG"
 
-LOADAVG_POST=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")
+LOADAVG_POST=$(loadavg_1m)
 echo "perf-gate: loadavg post=$LOADAVG_POST" | tee -a "$GATE_LOG"
 write_metric "perf_loadavg_pre" "$LOADAVG_PRE" "load"
 write_metric "perf_loadavg_post" "$LOADAVG_POST" "load"

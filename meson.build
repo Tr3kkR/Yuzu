@@ -5,7 +5,11 @@ project(
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++23',
+    # cpp_std is set per-compiler below: '/std:c++latest' for MSVC (meson's
+    # cpp_std validation list has no 'vc++23' / 'c++23' entry for MSVC since
+    # toolset 14.40 / meson 1.9), '-std=c++23' for GCC 13+ / Clang 18+ /
+    # Apple Clang 15+. Setting cpp_std here makes `meson setup` fail on
+    # Windows MSVC before per-compiler add_project_arguments runs.
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -19,13 +23,14 @@ host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
 if cxx.get_id() == 'msvc'
   add_project_arguments(
-    '/std:c++latest',           # upgrade beyond c++23 default for MSVC
+    '/std:c++latest',           # meson's cpp_std has no MSVC c++23 option
     '/wd4251', '/wd4127', '/wd4275',
     '/permissive-', '/Zc:__cplusplus', '/utf-8',
     language: 'cpp',
   )
 else
   add_project_arguments(
+    '-std=c++23',
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
     '-fstack-protector-strong',
@@ -386,11 +391,18 @@ if _rebar3.found()
   # isolation fix applies unconditionally so the race can't come
   # back if Linux kernel semantics ever change. `test_gateway.py`
   # honors REBAR_BASE_DIR when computing the ebin wipe path.
+  # Timeout 600s — upper-bound safety net for the nightly Coverage and
+  # sanitizer jobs on slower cloud runners (scw-eager-lumiere) where
+  # parallel meson test execution can starve the eunit job of CPU.
+  # Healthy runs finish in ~30-90s on a fast runner and are unaffected
+  # by the upper bound. The previous 120s landed at exactly 120.03s on
+  # nightly Coverage and killed the suite by SIGTERM; gateway eunit is
+  # only reached during nightly anyway, so a generous bound is free.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
-    timeout: 120,
+    timeout: 600,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
   test('gateway ct',

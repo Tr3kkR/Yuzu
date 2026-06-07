@@ -37,6 +37,12 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
+# Cross-platform helpers: port_listening, disk_free_gb, host_os,
+# docker_available, ensure_docker_path. See _portable.sh for the contract.
+# shellcheck source=scripts/test/_portable.sh
+. "$HERE/_portable.sh"
+HOST_OS=$(host_os)
+
 # --- output helpers -------------------------------------------------------
 
 if [ -t 1 ]; then
@@ -122,7 +128,21 @@ if ! skipped toolchains; then
     require_tool python3
     require_tool meson
     require_tool ninja
-    require_tool docker
+    if [[ "$HOST_OS" == "darwin" ]]; then
+        # On macOS the docker CLI usually ships with OrbStack / Docker
+        # Desktop and may not be on PATH until first launch. Probe known
+        # locations before declaring it missing; if still absent, soft-fail
+        # — phases that need docker (Phase 2 upgrade test, Phase 1 image
+        # build) will SKIP with a helpful note rather than fail the run.
+        if ensure_docker_path 2>/dev/null && command -v docker >/dev/null 2>&1; then
+            ok "docker → $(command -v docker)"
+        else
+            warn "docker not on PATH — Phase 1 image build + Phase 2 upgrade test will SKIP"
+            warn "    install OrbStack or Docker Desktop, then run it once to populate ~/.orbstack/bin"
+        fi
+    else
+        require_tool docker
+    fi
     require_tool curl
     soft_tool   gh       "Phase 3 OTA + Phase 6 sanitizer dispatch will WARN"
     soft_tool   jq       "synthetic UAT test parsing falls back to python"
@@ -140,12 +160,20 @@ fi
 
 if ! skipped docker; then
     info "docker"
-    if ! docker info >/dev/null 2>&1; then
-        fail "docker info failed (daemon not reachable)"
+    if ! docker_available; then
+        if [[ "$HOST_OS" == "darwin" ]]; then
+            warn "docker daemon not reachable — start OrbStack/Docker Desktop to enable Phase 2"
+        else
+            fail "docker info failed (daemon not reachable)"
+        fi
     else
         ok "docker daemon reachable"
         ctx=$(docker context show 2>/dev/null || echo "?")
-        if [[ "$ctx" == "desktop-linux" ]]; then
+        # Native dockerd is the convention on Linux (CLAUDE.md memory).
+        # On macOS, OrbStack and Docker Desktop both expose themselves via
+        # `desktop-linux` or `orbstack` contexts — that's the only sensible
+        # local option, so don't flag it as suspicious.
+        if [[ "$ctx" == "desktop-linux" && "$HOST_OS" == "linux" ]]; then
             warn "docker context is '$ctx' — CLAUDE.md memory says native dockerd, not Docker Desktop"
         else
             ok "docker context: $ctx"
@@ -167,7 +195,12 @@ if ! skipped containers; then
         FILTER_NAME="yuzu-test-"
     fi
 
-    mapfile -t dangling_arr < <(docker ps -a --filter "name=$FILTER_NAME" --format "{{.Names}}" 2>/dev/null || true)
+    if ! command -v docker >/dev/null 2>&1; then
+        ok "docker missing — no test containers to inventory"
+        dangling_arr=()
+    else
+        mapfile -t dangling_arr < <(docker ps -a --filter "name=$FILTER_NAME" --format "{{.Names}}" 2>/dev/null || true)
+    fi
     if [[ ${#dangling_arr[@]} -gt 0 ]]; then
         if [[ $FORCE_CLEANUP -eq 1 ]]; then
             if [[ -z "$FORCE_CLEANUP_RUN_ID" ]]; then
@@ -187,7 +220,11 @@ if ! skipped containers; then
     fi
 
     # Same scoping for dangling volumes
-    mapfile -t dangling_vols_arr < <(docker volume ls --filter "name=$FILTER_NAME" --format "{{.Name}}" 2>/dev/null || true)
+    if ! command -v docker >/dev/null 2>&1; then
+        dangling_vols_arr=()
+    else
+        mapfile -t dangling_vols_arr < <(docker volume ls --filter "name=$FILTER_NAME" --format "{{.Name}}" 2>/dev/null || true)
+    fi
     if [[ ${#dangling_vols_arr[@]} -gt 0 ]]; then
         if [[ $FORCE_CLEANUP -eq 1 ]]; then
             for v in "${dangling_vols_arr[@]}"; do
@@ -207,12 +244,12 @@ if ! skipped ports; then
     PORTS=(8080 50051 50052 50054 50055 50063 8081 9568)
     busy=()
     for p in "${PORTS[@]}"; do
-        if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$"; then
+        if port_listening "$p"; then
             busy+=("$p")
         fi
     done
     if [[ ${#busy[@]} -gt 0 ]]; then
-        fail "ports in use: ${busy[*]} — stop the prior stack with 'bash scripts/linux-start-UAT.sh stop'"
+        fail "ports in use: ${busy[*]} — stop the prior stack with 'bash scripts/start-UAT.sh stop'"
     else
         ok "ports free: ${PORTS[*]}"
     fi
@@ -222,12 +259,20 @@ fi
 
 if ! skipped disk; then
     info "disk free (need ${DISK_MIN_GB} GB on each)"
-    for path in "$HOME" /tmp /var/lib/docker; do
+    # /var/lib/docker is the native dockerd image+volume root on Linux.
+    # On macOS Docker Desktop and OrbStack put their image cache inside a
+    # private VM image (~/Library/Containers/...); the host filesystem
+    # check is meaningless there, so skip the docker path on Darwin.
+    paths=("$HOME" /tmp)
+    if [[ "$HOST_OS" == "linux" ]]; then
+        paths+=(/var/lib/docker)
+    fi
+    for path in "${paths[@]}"; do
         if [[ ! -d "$path" ]]; then
             warn "$path does not exist (skipped)"
             continue
         fi
-        free_gb=$(df -BG "$path" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4}')
+        free_gb=$(disk_free_gb "$path")
         if [[ -z "$free_gb" ]]; then
             warn "could not determine free space on $path"
             continue

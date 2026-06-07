@@ -964,10 +964,16 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 ```json
 {
   "command_id": "filesystem-a1b2c3",
+  "execution_id": "exec-d4e5f6",
   "agents_reached": 3,
   "definition_id": "filesystem.exists"
 }
 ```
+
+- `command_id` — legacy correlation token; pair with `query_responses` to poll individual agent results.
+- `execution_id` — per-run identifier required by `GET /api/v1/events` (live JSON SSE stream) and `GET /api/v1/executions/{id}` (final state lookup). Agentic workers should subscribe to the events stream with `?execution_id=<execution_id>` immediately after dispatch to watch progress in real time. Empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
+- `agents_reached` — number of agents the command was actually sent to (may be smaller than the targeted set if some are offline).
+- `definition_id` — echoes the path parameter.
 
 ```bash
 curl -s -b cookies.txt \
@@ -1233,7 +1239,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, relative time with the full ISO-8601 UTC timestamp on hover, and — on failed rows — an 80-character preview of the most recent agent error. Click any row to expand an inline drawer showing a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a collapsed responses section. The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. |
 
@@ -1307,6 +1313,30 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 Then dispatch any of the six from the dashboard "Send" panel — the chart deck auto-renders above the results table.
+
+### Response Templates (saved views)
+
+A response template is a named bundle of *column subset + sort order + filter presets* attached to an `InstructionDefinition`. When the operator opens the execution results view for a definition, the filter bar's **View** dropdown lists every available template; selecting one re-renders the table with the chosen columns visible, the chosen sort applied, and any equals-op filters auto-populated.
+
+**Synthesised default.** Every definition has at least one template — the engine synthesises a `__default__` view from `spec.result.columns` (or, when omitted, from the plugin's hard-coded column schema) so the dropdown is never empty. The synthesised default lists all columns, applies no sort, and applies no filters — i.e. it matches the legacy "show everything" behaviour.
+
+**Authoring.** Operators can author additional templates either by including a `spec.responseTemplates` array in the YAML definition (see `docs/yaml-dsl-spec.md` § `spec.responseTemplates`) or via the REST CRUD surface:
+
+| Verb | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/definitions/{id}/response-templates` | List, with the synthesised default auto-prepended when no operator default is set |
+| `GET` | `/api/v1/definitions/{id}/response-templates/{tid}` | Fetch one |
+| `POST` | `/api/v1/definitions/{id}/response-templates` | Create (auto-assigns id when absent) |
+| `PUT` | `/api/v1/definitions/{id}/response-templates/{tid}` | Replace in place |
+| `DELETE` | `/api/v1/definitions/{id}/response-templates/{tid}` | Remove. Rejects `__default__` |
+
+Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefinition:Write`.
+
+**Limitations operators should expect:**
+
+- **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
+- **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
 
 ---
 

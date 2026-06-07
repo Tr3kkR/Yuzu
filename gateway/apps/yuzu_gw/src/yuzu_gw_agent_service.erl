@@ -46,9 +46,13 @@ register(Ctx, RegisterReq) ->
             AgentId = extract_agent_id(AgentInfo),
 
             %% Store pending registration for Subscribe matching.
+            %% register_req is the verbatim RegisterRequest; it is carried
+            %% through to the agent process so the registry can stash it
+            %% for upstream-reconnect replay.
             yuzu_gw_registry:store_pending(SessionId,
                                 #{agent_id  => AgentId,
                                   agent_info => AgentInfo,
+                                  register_req => RegisterReq,
                                   peer_addr  => PeerAddr,
                                   registered_at => erlang:system_time(millisecond)}),
 
@@ -94,16 +98,22 @@ subscribe(Ref, State) ->
                                         <<"No pending registration for session">>}});
 
                 #{agent_id := AgentId, agent_info := AgentInfo,
-                  peer_addr := PeerAddr} ->
+                  peer_addr := PeerAddr} = Pending ->
+
+                    %% register_req carries the verbatim RegisterRequest.
+                    %% maps:get/3 (not a match clause) so a pending entry
+                    %% written by a pre-upgrade Register still resolves.
+                    RegisterReq = maps:get(register_req, Pending, #{}),
 
                     %% Spawn the agent process — it owns this stream.
                     %% We pass stream_pid=self() so the agent process sends
                     %% commands back to us via {send_command, Cmd} messages.
-                    Args = #{agent_id   => AgentId,
-                             session_id => SessionId,
-                             stream_pid => self(),
-                             agent_info => AgentInfo,
-                             peer_addr  => PeerAddr},
+                    Args = #{agent_id     => AgentId,
+                             session_id   => SessionId,
+                             stream_pid   => self(),
+                             agent_info   => AgentInfo,
+                             register_req => RegisterReq,
+                             peer_addr    => PeerAddr},
 
                     case yuzu_gw_agent_sup:start_agent(Args) of
                         {ok, AgentPid} ->

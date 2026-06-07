@@ -30,6 +30,18 @@ service GatewayUpstream {
   // stream connects or disconnects at the gateway.
   rpc NotifyStreamStatus(StreamStatusNotification)
       returns (StreamStatusAck);
+
+  // ForwardGuardianMessage relays an unsolicited Guardian side-channel
+  // CommandResponse (plugin="__guard__") from a gateway-connected agent up
+  // to the control plane. A Guardian drift event carries no command_id — it
+  // is NOT a reply to any SendCommand, so it cannot ride the SendCommand
+  // response stream and would otherwise be dropped as an orphaned response
+  // at the gateway. agent_id is gateway-asserted from the agent's bound
+  // Subscribe-stream identity, never from the frame. Best-effort: dropped
+  // if the upstream circuit is open (durable buffering is Guardian A3).
+  // Half B, Guardian gateway fix. See docs/guardian-mvp-contract.md.
+  rpc ForwardGuardianMessage(ForwardGuardianRequest)
+      returns (ForwardGuardianAck);
 }
 
 message BatchHeartbeatRequest {
@@ -60,5 +72,24 @@ message StreamStatusNotification {
 }
 
 message StreamStatusAck {
+  bool acknowledged = 1;
+}
+
+message ForwardGuardianRequest {
+  // Gateway-asserted agent identity — the agent's bound Subscribe-stream id
+  // as held by the gateway's per-agent process, NOT a value carried in the
+  // forwarded frame. Prevents a compromised/buggy agent from attributing a
+  // drift event to another agent.
+  string agent_id = 1;
+
+  // The verbatim Guardian side-channel CommandResponse
+  // (plugin="__guard__", action="event"|..., payload = serialized
+  // GuaranteedStateEvent). Re-marshalled through gateway_pb on this hop, so
+  // CommandResponse fields plugin=7/action=8/payload=9 must exist in the
+  // gateway's vendored agent.proto or gpb silently strips them in transit.
+  yuzu.agent.v1.CommandResponse response = 2;
+}
+
+message ForwardGuardianAck {
   bool acknowledged = 1;
 }

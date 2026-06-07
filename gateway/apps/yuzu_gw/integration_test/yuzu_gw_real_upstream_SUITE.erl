@@ -57,18 +57,35 @@ init_per_suite(Config) ->
     end.
 
 do_init_per_suite(Config) ->
-    %% Start dependencies.
+    %% Start dependencies. ORDER MATTERS: grpcbox reads its client
+    %% channels config at application start (`grpcbox_client_sup` builds
+    %% the channel registry once); subsequent `application:set_env`
+    %% changes are NOT observed. Set the client env BEFORE starting
+    %% grpcbox, otherwise `default_channel` is never registered and
+    %% every `proxy_register` call blocks the gen_server:call until its
+    %% 30s timeout fires (manifests as 6/7 tests failing with
+    %% `{timeout, {gen_server,call, ...}}`).
     ok = ensure_started(ctx),
     ok = ensure_started(gproc),
-    ok = ensure_started(grpcbox),
 
-    %% Configure grpcbox client channel to point at the real server.
+    %% Configure grpcbox client channel to point at the real server
+    %% BEFORE starting the application.
     application:set_env(grpcbox, client,
         #{channels => [
             {default_channel,
              [{http, ?UPSTREAM_HOST, ?UPSTREAM_PORT, []}],
              #{}}
         ]}),
+
+    %% If grpcbox is already started (e.g. from a prior suite in the
+    %% same CT run), stop it so the new client env takes effect on the
+    %% next start. application:set_env on an already-started app does
+    %% not retroactively reconfigure its supervision tree.
+    case lists:keyfind(grpcbox, 1, application:which_applications()) of
+        false -> ok;
+        _ -> ok = application:stop(grpcbox)
+    end,
+    ok = ensure_started(grpcbox),
 
     %% Start the gateway process group.
     case whereis(yuzu_gw) of
@@ -400,16 +417,24 @@ make_register_req(AgentId) ->
                 {ok, Bin} -> string:trim(Bin);
                 {error, _} ->
                     ct:fail("No enrollment token: set YUZU_GW_TEST_TOKEN or "
-                            "run scripts/linux-start-UAT.sh first")
+                            "run scripts/start-UAT.sh first")
             end;
         Val -> list_to_binary(Val)
     end,
+    %% RegisterRequest has a nested AgentInfo field (proto/yuzu/agent/v1/
+    %% agent.proto: `AgentInfo info = 1`). A flat map of agent_id/hostname/
+    %% etc. at the top level marshals to a RegisterRequest with `info`
+    %% unset; the server then reads `info.agent_id()` as empty and
+    %% rejects with INVALID_ARGUMENT "agent_id length exceeds 256 chars
+    %% or empty". Nest everything except enrollment_token under `info`.
     #{
-        agent_id         => AgentId,
-        hostname         => <<"real-upstream-test-host">>,
-        platform         => #{os => <<"LINUX">>, arch => <<"x86_64">>},
-        plugins          => [#{name => <<"system_info">>, version => <<"1.0.0">>}],
-        agent_version    => <<"0.1.0">>,
+        info => #{
+            agent_id      => AgentId,
+            hostname      => <<"real-upstream-test-host">>,
+            platform      => #{os => <<"LINUX">>, arch => <<"x86_64">>},
+            agent_version => <<"0.1.0">>,
+            plugins       => [#{name => <<"system_info">>, version => <<"1.0.0">>}]
+        },
         enrollment_token => Token
     }.
 

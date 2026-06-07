@@ -36,6 +36,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -147,6 +148,7 @@ VALID_STATUS = {"PASS", "FAIL", "WARN", "SKIP", "RUNNING", "ABORTED"}
 VALID_CI_CONCLUSIONS = {
     "success", "failure", "cancelled", "skipped", "timed_out", "neutral", "action_required",
 }
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 # --- DB plumbing ----------------------------------------------------------
@@ -161,6 +163,32 @@ def db_path() -> Path:
 
 def log_root() -> Path:
     return db_path().parent / "test-runs"
+
+
+def validate_run_id(run_id: str) -> bool:
+    return bool(RUN_ID_RE.fullmatch(run_id)) and run_id not in {".", ".."}
+
+
+def display_run_id(run_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "?", run_id)
+
+
+def safe_run_log_dir(run_id: str) -> Optional[Path]:
+    """Return the per-run log dir for run_id, or None if it would escape log_root.
+
+    The returned Path is always fully resolved (``.resolve()``), which is what the
+    containment check below compares against. Callers must not mix the return
+    value with an unresolved ``log_root() / run_id`` string: on macOS the two
+    differ (``/tmp`` vs ``/private/tmp``), though they reference the same dir via
+    the platform symlink.
+    """
+    if not validate_run_id(run_id):
+        return None
+    root = log_root().resolve()
+    candidate = (root / run_id).resolve()
+    if candidate == root or root not in candidate.parents:
+        return None
+    return candidate
 
 
 @contextlib.contextmanager
@@ -271,6 +299,19 @@ def _hardware_fingerprint() -> str:
 
 
 def cmd_run_start(args: argparse.Namespace) -> int:
+    # Resolve the per-run log dir up front — before the INSERT — so path
+    # containment is enforced at the construction site (not only by the main()
+    # arg-validation gate), and so a refusal can never leave an orphan test_runs
+    # row with no dir (gov consistency SHOULD-1 / chaos CH-25). run-start is in
+    # main()'s validated set, so for any id reaching here this returns a real
+    # path; the None branch is belt-and-suspenders against a future caller.
+    run_dir = safe_run_log_dir(args.run_id)
+    if run_dir is None:
+        print(
+            f"test_db: refusing unsafe run_id={display_run_id(args.run_id)}",
+            file=sys.stderr,
+        )
+        return 2
     with connect(create_dirs=True) as conn:
         _ensure_schema_initialized(conn)
         conn.execute(
@@ -291,8 +332,8 @@ def cmd_run_start(args: argparse.Namespace) -> int:
                 args.notes or "",
             ),
         )
-        # Create the per-run log directory.
-        (log_root() / args.run_id).mkdir(parents=True, exist_ok=True)
+        # Create the per-run log directory (containment-checked above).
+        run_dir.mkdir(parents=True, exist_ok=True)
     print(f"test_db: started run {args.run_id}")
     return 0
 
@@ -439,8 +480,9 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
         # run with mode='manual' rows. Operator-capture paths
         # (--run-id manual) will see this on first call per DB and
         # never again.
+        run_id_safe = display_run_id(run_id)
         print(
-            f"test_db: vivified stub test_runs row for run_id={run_id} "
+            f"test_db: vivified stub test_runs row for run_id={run_id_safe} "
             f"(mode='manual') — if this is a /test pipeline run, "
             f"check that run-start succeeded",
             file=sys.stderr,
@@ -949,7 +991,7 @@ def cmd_query(args: argparse.Namespace) -> int:
             if args.dry_run:
                 print(f"--dry-run: would delete {len(to_delete)} runs:")
                 for rid in to_delete:
-                    print(f"  {rid}")
+                    print(f"  {display_run_id(rid)}")
                 return 0
             with conn:
                 placeholders = ",".join(["?"] * len(to_delete))
@@ -961,7 +1003,13 @@ def cmd_query(args: argparse.Namespace) -> int:
             # Also reap the per-run log directories.
             removed_dirs = 0
             for rid in to_delete:
-                d = log_root() / rid
+                d = safe_run_log_dir(rid)
+                if d is None:
+                    print(
+                        f"test_db: skipped unsafe log dir for run_id={display_run_id(rid)}",
+                        file=sys.stderr,
+                    )
+                    continue
                 if d.exists():
                     for p in sorted(d.rglob("*"), reverse=True):
                         try:
@@ -1002,7 +1050,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_run_start.add_argument("--run-id", required=True)
     p_run_start.add_argument("--commit", required=True)
     p_run_start.add_argument("--branch", required=True)
-    p_run_start.add_argument("--mode", required=True, choices=["quick", "default", "full"])
+    p_run_start.add_argument("--mode", required=True,
+                              choices=["quick", "default", "full", "instructions"])
     p_run_start.add_argument("--notes", default=None)
     p_run_start.set_defaults(func=cmd_run_start)
 
@@ -1123,6 +1172,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_query.set_defaults(func=cmd_query)
 
     args = parser.parse_args(argv)
+    if getattr(args, "cmd", None) in {"run-start", "run-finish", "gate", "timing", "metric"}:
+        if not validate_run_id(args.run_id):
+            print(
+                "test_db: invalid --run-id "
+                "(allowed: A-Z a-z 0-9 . _ -)",
+                file=sys.stderr,
+            )
+            return 2
     return args.func(args)
 
 

@@ -56,7 +56,8 @@ services:
     volumes:
       - ${UAT_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
-      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+      # InstructionDefinitions are embedded into yuzu-server at build time
+      # (server/core/scripts/embed_content.py); no host mount required.
     depends_on:
       clickhouse:
         condition: service_started
@@ -68,6 +69,8 @@ services:
     container_name: yuzu-uat-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
+      # #659: ephemeral UAT stack — accept the default cookie (single gateway, no clustering).
+      - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"   # gRPC (agent-facing — agents connect here)
       - "50063:50063"   # gRPC (management/command forwarding)

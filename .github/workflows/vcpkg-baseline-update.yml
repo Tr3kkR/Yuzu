@@ -27,6 +27,8 @@ jobs:
       pull-requests: write    # peter-evans/create-pull-request: open/update PR
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Resolve latest vcpkg master SHA
         id: latest
@@ -52,9 +54,12 @@ jobs:
 
       - name: Short-circuit if up to date
         id: check
+        env:
+          LATEST_SHA: ${{ steps.latest.outputs.sha }}
+          CURRENT_SHA: ${{ steps.current.outputs.sha }}
         run: |
-          if [[ "${{ steps.latest.outputs.sha }}" == "${{ steps.current.outputs.sha }}" ]]; then
-            echo "vcpkg baseline already at ${{ steps.latest.outputs.sha }} — nothing to do."
+          if [[ "$LATEST_SHA" == "$CURRENT_SHA" ]]; then
+            echo "vcpkg baseline already at $LATEST_SHA — nothing to do."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -62,16 +67,18 @@ jobs:
 
       - name: Apply bump
         if: steps.check.outputs.changed == 'true'
+        env:
+          CURRENT_SHA: ${{ steps.current.outputs.sha }}
+          LATEST_SHA: ${{ steps.latest.outputs.sha }}
         run: |
           set -euo pipefail
-          old="${{ steps.current.outputs.sha }}"
-          new="${{ steps.latest.outputs.sha }}"
+          old="$CURRENT_SHA"
+          new="$LATEST_SHA"
           # Every tracked reference of the baseline SHA. Keep in sync with
           # the "grep -rl" check at the bottom of docs/dependency-updates.md.
           files=(
             vcpkg.json
             vcpkg-configuration.json
-            qodana.yaml
             CLAUDE.md
             .github/workflows/ci.yml
             .github/workflows/release.yml
@@ -112,7 +119,6 @@ jobs:
             Updates every tracked reference of the baseline SHA:
             - `vcpkg.json` `builtin-baseline`
             - `vcpkg-configuration.json` default registry `baseline`
-            - `qodana.yaml` vcpkg fetch step
             - `CLAUDE.md` vcpkg documentation line
             - `.github/workflows/ci.yml` `VCPKG_COMMIT`
             - `.github/workflows/release.yml` `VCPKG_COMMIT`

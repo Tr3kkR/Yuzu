@@ -30,10 +30,6 @@
   #define BuildDir "..\..\..\build-windows"
 #endif
 
-#ifndef ContentDir
-  #define ContentDir "..\..\..\content"
-#endif
-
 [Setup]
 AppId={{A1E3B7F2-4C9D-6F4A-2E8B-3D1C7A5F0E9B}
 AppName=Yuzu Server
@@ -68,8 +64,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#BuildDir}\server\core\yuzu-server.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#BuildDir}\server\core\*.dll"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
 
-; --- Content definitions ---
-Source: "{#ContentDir}\definitions\*.yaml"; DestDir: "{app}\content\definitions"; Flags: ignoreversion skipifsourcedoesntexist
+; InstructionDefinitions are embedded into yuzu-server.exe at build time
+; (server/core/scripts/embed_content.py); the runtime never reads them
+; from disk. No content\definitions\ directory shipped.
 
 ; --- Config generator (temporary, removed after install) ---
 Source: "generate-config.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall

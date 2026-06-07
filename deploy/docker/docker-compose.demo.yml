@@ -1,0 +1,144 @@
+# Yuzu — Cedar & Vale demo stack
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SALES DEMO — REPEATABLE, RELEASE-PINNED. NOT A PRODUCTION DEPLOYMENT.    ║
+# ║  Runs --no-tls --no-https --metrics-no-auth with a baked admin password.  ║
+# ║  None of those belong in production. See docs/demo-environment.md.        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# Three-tier demo: chiselled Ubuntu 26.04 server + gateway, and a fleet of the
+# smallest chiselled Ubuntu 26.04 aarch64 agents acting as clients.
+#
+# STABILITY CONTRACT: every image is pinned to ${YUZU_VERSION}. The stack only
+# changes when you bump that version to a newly-released, immutable GHCR image
+# digest — never from an underlying source edit. There is intentionally NO
+# `build:` section here; images are pulled (steady state) or pre-built and
+# tagged locally by scripts/start-demo.sh (bootstrap, before the images are
+# published). check-compose-versions.sh enforces the ${YUZU_VERSION:-X.Y.Z}
+# pin at release time.
+#
+# Entry point is the launcher, which handles config + the two-phase enrollment:
+#   bash scripts/start-demo.sh            # build-or-pull, start, enroll N agents
+#   bash scripts/start-demo.sh status
+#   bash scripts/start-demo.sh stop
+#
+# Topology:
+#   Agent(s) --> Gateway(:50051) --> Server(:50055)   registration + heartbeats
+#   Server   --> Gateway(:50063) --> Agent            command fanout
+#   Operator --> Server(:8080)                        dashboard + REST API
+
+services:
+  # ── Tier 1: Yuzu Server (chiselled Ubuntu 26.04) ───────────────────────
+  server:
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-server-chisel:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-demo-server
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--log-level"
+      - "info"
+      - "--metrics-no-auth"
+      # Deterministic + offline: no live NVD pull, no OTA. Analytics stay ON so
+      # the dashboard populates for the demo.
+      - "--no-nvd-sync"
+      - "--no-ota"
+      - "--config"
+      - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
+    environment:
+      # OrbStack / Docker Desktop on macOS inject HTTP(S)_PROXY into containers;
+      # gRPC honours them and breaks cross-container bidi RPC. Force-bypass.
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "8080:8080"     # Dashboard + REST API (operator-facing)
+    volumes:
+      - ${DEMO_SERVER_CONFIG:?Set DEMO_SERVER_CONFIG to an absolute path -- start-demo.sh handles this}:/etc/yuzu/yuzu-server.cfg:ro
+      - server-data:/var/lib/yuzu
+    healthcheck:
+      # No shell or curl in the chiselled image — use the bundled static busybox.
+      test: ["CMD", "/bin/busybox", "wget", "--spider", "-q", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
+  gateway:
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-gateway-chisel:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-demo-gateway
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+      # #659 boot guard: the gateway refuses to boot (fail-closed) when it sees
+      # the default Erlang distribution cookie. This single-node, ephemeral demo
+      # has no clustering, so accept the default — exactly as the viz/full/
+      # sanitizer UAT composes do. Without it the gateway crash-loops and the
+      # whole stack never comes up. Demo-only — never set this in production.
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
+    ports:
+      - "8081:8081"     # Health/readiness
+      - "9568:9568"     # Prometheus metrics
+      - "50051:50051"   # Agent-facing gRPC — exposed so external/native agents
+                        # (e.g. a laptop or VM) can also join the demo fleet.
+    volumes:
+      - ${DEMO_GATEWAY_CONFIG:?Set DEMO_GATEWAY_CONFIG to an absolute path -- start-demo.sh handles this}:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "--spider", "-q", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Tier 3: Yuzu Agents — the smallest aarch64 clients ─────────────────
+  # Scaled to DEMO_AGENT_COUNT (default 10). Each replica mounts its own tmpfs
+  # data-dir so the persistent agent UUID (identity_store) is unique per
+  # container and the fleet shows N distinct agents, not one. tmpfs also makes
+  # every agent ephemeral — a restart yields a clean, identical fleet.
+  agent:
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-agent-chisel:${YUZU_VERSION:-0.12.0}
+    command:
+      - "--server"
+      - "gateway:50051"
+      - "--no-tls"
+      - "--plugin-dir"
+      - "/usr/lib/yuzu/plugins"
+      - "--data-dir"
+      - "/var/lib/yuzu-agent"
+      - "--log-level"
+      - "info"
+      - "--enrollment-token"
+      - "${YUZU_ENROLLMENT_TOKEN:?start-demo.sh sets this after issuing a token}"
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+    tmpfs:
+      # size-capped so a large --agents N can't exhaust host memory (each replica
+      # gets its own in-kernel tmpfs); 64m is ample for the agent KV/identity DB.
+      - /var/lib/yuzu-agent:mode=1777,size=64m
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      replicas: ${DEMO_AGENT_COUNT:-10}
+    restart: unless-stopped
+
+volumes:
+  server-data:

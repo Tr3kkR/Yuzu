@@ -1,0 +1,28 @@
+# CODEOWNERS — GitHub auto-requests review from the listed owners when a PR
+# touches a matching path. Owners must have write access to the repo, or the
+# entry is silently ignored. The LAST matching pattern wins, so if a broad
+# catch-all is ever added, keep these auth rules below it.
+
+# Auth / identity control plane — owner @fjarvis
+/server/core/src/auth*                       @fjarvis
+/server/core/src/rbac_*                      @fjarvis
+/server/core/src/oidc_*                      @fjarvis
+/server/core/src/api_token_*                 @fjarvis
+/server/core/src/device_token_*              @fjarvis
+/server/core/src/enrollment_*                @fjarvis
+/server/core/src/secure_random.*             @fjarvis
+/server/core/include/yuzu/server/auth.hpp    @fjarvis
+/docs/auth-architecture.md                   @fjarvis
+
+# System Guardian / Guaranteed State — owner @FortitudeEtc
+# Desired-state enforcement subsystem; design in docs/yuzu-guardian-design-v1.1.md.
+# (Excludes .claude/agents/security-guardian.md — that's the governance reviewer, not this feature.)
+/agents/core/src/guardian_*                          @FortitudeEtc
+/agents/core/include/yuzu/agent/guardian_*           @FortitudeEtc
+/server/core/src/guaranteed_state*                   @FortitudeEtc
+/proto/yuzu/guardian/                                @FortitudeEtc
+/docs/yuzu-guardian-*                                @FortitudeEtc
+/docs/user-manual/guaranteed-state.md                @FortitudeEtc
+/tests/unit/test_guardian_*                          @FortitudeEtc
+/tests/unit/server/test_guaranteed_state*            @FortitudeEtc
+/tests/unit/server/test_rest_guaranteed*             @FortitudeEtc

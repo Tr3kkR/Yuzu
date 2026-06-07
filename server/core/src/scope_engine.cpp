@@ -417,6 +417,28 @@ private:
             return Expression{std::move(cond)};
         }
 
+        // from_result_set:<id-or-alias> — composable-scope short-circuit
+        // (scope walking, capability §30). A bare atom with no operator; it is
+        // lowered to an EXISTS condition on the synthetic attribute, and the
+        // AgentRegistry resolver answers per-device membership against the
+        // result_set_store. Composes with attribute predicates via AND/OR/NOT.
+        if (tok.type == TokenType::Ident && tok.value.starts_with("from_result_set:")) {
+            // Bound the reference length (review finding K): previously any
+            // suffix up to the 4096-char token cap was accepted — a bounded DoS.
+            // Bound length only, NOT charset — the grammar accepts a canonical
+            // rs_<hex> id OR a per-operator alias (design §4.1), and a reference
+            // the resolver doesn't own/recognise simply no-matches downstream.
+            const std::string suffix = tok.value.substr(16);
+            if (suffix.empty() || suffix.size() > 128)
+                return std::unexpected(std::format(
+                    "from_result_set: id or alias must be 1-128 chars at position {}", tok.pos));
+            tokenizer_.next(); // consume the atom
+            Condition cond;
+            cond.attribute = tok.value;
+            cond.op = CompOp::Exists;
+            return Expression{std::move(cond)};
+        }
+
         return parse_condition();
     }
 
@@ -565,8 +587,8 @@ bool try_numeric_compare(std::string_view a, std::string_view b, CompOp op) {
     double da = 0, db = 0;
 
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-    auto [pa, eca] = std::from_chars(a.data(), a.data() + a.size(), da);
-    auto [pb, ecb] = std::from_chars(b.data(), b.data() + b.size(), db);
+    [[maybe_unused]] auto [pa, eca] = std::from_chars(a.data(), a.data() + a.size(), da);
+    [[maybe_unused]] auto [pb, ecb] = std::from_chars(b.data(), b.data() + b.size(), db);
     if (eca != std::errc{} || ecb != std::errc{}) {
 #else
     // Apple libc++ does not support std::from_chars for floating-point types,

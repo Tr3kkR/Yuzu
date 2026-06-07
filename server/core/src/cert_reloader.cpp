@@ -26,13 +26,13 @@ namespace yuzu::server {
 void CertReloader::log_audit(const std::string& detail, const std::string& result) {
     if (!params_.audit_store)
         return;
-    params_.audit_store->log({.principal = "system",
-                               .principal_role = "system",
-                               .action = "cert.reload",
-                               .target_type = "TlsCertificate",
-                               .target_id = params_.cert_path.string(),
-                               .detail = detail,
-                               .result = result});
+    (void)params_.audit_store->log({.principal = "system",
+                                    .principal_role = "system",
+                                    .action = "cert.reload",
+                                    .target_type = "TlsCertificate",
+                                    .target_id = params_.cert_path.string(),
+                                    .detail = detail,
+                                    .result = result});
 }
 
 // ── Constructor / lifecycle ──────────────────────────────────────────────────
@@ -52,13 +52,13 @@ CertReloader::CertReloader(Params params) : params_(std::move(params)) {
     ec.clear();
     last_cert_mtime_ = std::filesystem::last_write_time(params_.cert_path, ec);
     if (ec)
-        spdlog::warn("cert-reload: cannot read initial mtime for {}: {}", params_.cert_path.string(),
-                      ec.message());
+        spdlog::warn("cert-reload: cannot read initial mtime for {}: {}",
+                     params_.cert_path.string(), ec.message());
     ec.clear();
     last_key_mtime_ = std::filesystem::last_write_time(params_.key_path, ec);
     if (ec)
         spdlog::warn("cert-reload: cannot read initial mtime for {}: {}", params_.key_path.string(),
-                      ec.message());
+                     ec.message());
 }
 
 CertReloader::~CertReloader() {
@@ -90,9 +90,8 @@ void CertReloader::run_loop() {
         // stop was requested). Returns false if the timeout elapsed without
         // stop, which is our cue to poll the cert files.
         std::unique_lock<std::mutex> lk(stop_mu_);
-        if (stop_cv_.wait_for(lk, std::chrono::seconds{interval_secs}, [this] {
-                return stop_requested_.load(std::memory_order_acquire);
-            })) {
+        if (stop_cv_.wait_for(lk, std::chrono::seconds{interval_secs},
+                              [this] { return stop_requested_.load(std::memory_order_acquire); })) {
             break;
         }
         lk.unlock();
@@ -166,7 +165,8 @@ bool CertReloader::try_reload() {
 
     // Step 4: Validate PEM pair (cert matches key)
     if (!validate_pem_pair(cert_pem, key_pem)) {
-        spdlog::error("cert-reload: certificate/key validation failed; keeping current certificate");
+        spdlog::error(
+            "cert-reload: certificate/key validation failed; keeping current certificate");
         ++failure_count_;
         yuzu::secure_zero(key_pem);
         yuzu::secure_zero(cert_pem);
@@ -226,7 +226,8 @@ bool CertReloader::try_reload() {
         auto* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
         if (!x509 || SSL_CTX_use_certificate(test_ctx, x509) != 1)
             test_ok = false;
-        if (x509) X509_free(x509);
+        if (x509)
+            X509_free(x509);
 
         // Load chain certs
         if (bio && test_ok) {
@@ -239,7 +240,8 @@ bool CertReloader::try_reload() {
             }
             ERR_clear_error();
         }
-        if (bio) BIO_free(bio);
+        if (bio)
+            BIO_free(bio);
     }
 
     // Load key into test context
@@ -248,8 +250,10 @@ bool CertReloader::try_reload() {
         auto* pkey = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
         if (!pkey || SSL_CTX_use_PrivateKey(test_ctx, pkey) != 1)
             test_ok = false;
-        if (pkey) EVP_PKEY_free(pkey);
-        if (bio) BIO_free(bio);
+        if (pkey)
+            EVP_PKEY_free(pkey);
+        if (bio)
+            BIO_free(bio);
     }
 
     // Verify cert/key match in the test context
@@ -275,12 +279,13 @@ bool CertReloader::try_reload() {
     // succeed. Using file paths avoids holding BIO objects across the live
     // context and matches httplib's own initialization pattern.
     int cert_rc = SSL_CTX_use_certificate_chain_file(ctx, params_.cert_path.string().c_str());
-    int key_rc = SSL_CTX_use_PrivateKey_file(ctx, params_.key_path.string().c_str(), SSL_FILETYPE_PEM);
+    int key_rc =
+        SSL_CTX_use_PrivateKey_file(ctx, params_.key_path.string().c_str(), SSL_FILETYPE_PEM);
     ERR_clear_error();
 
     if (cert_rc != 1 || key_rc != 1) {
-        spdlog::error("cert-reload: live SSL_CTX update failed (cert_rc={}, key_rc={})",
-                      cert_rc, key_rc);
+        spdlog::error("cert-reload: live SSL_CTX update failed (cert_rc={}, key_rc={})", cert_rc,
+                      key_rc);
         ++failure_count_;
         yuzu::secure_zero(key_pem);
         yuzu::secure_zero(cert_pem);
@@ -319,8 +324,7 @@ bool CertReloader::validate_pem_pair(const std::string& cert_pem, const std::str
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     // Parse certificate
-    auto* cert_bio =
-        BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+    auto* cert_bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
     if (!cert_bio)
         return false;
 
@@ -333,8 +337,7 @@ bool CertReloader::validate_pem_pair(const std::string& cert_pem, const std::str
     }
 
     // Parse private key
-    auto* key_bio =
-        BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+    auto* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
     if (!key_bio) {
         X509_free(cert);
         return false;

@@ -52,7 +52,7 @@ std::vector<int64_t> parse_version_segments(std::string_view ver) {
         auto dot = ver.find('.');
         auto part = ver.substr(0, dot);
         int64_t num = 0;
-        auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), num);
+        [[maybe_unused]] auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), num);
         if (ec != std::errc{}) {
             num = 0;
         }
@@ -133,8 +133,8 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     double rhs = 0.0;
     bool lhs_ok = false, rhs_ok = false;
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-    auto [lp, le] = std::from_chars(val_str.data(), val_str.data() + val_str.size(), lhs);
-    auto [rp, re] = std::from_chars(cond.value.data(), cond.value.data() + cond.value.size(), rhs);
+    [[maybe_unused]] auto [lp, le] = std::from_chars(val_str.data(), val_str.data() + val_str.size(), lhs);
+    [[maybe_unused]] auto [rp, re] = std::from_chars(cond.value.data(), cond.value.data() + cond.value.size(), rhs);
     lhs_ok = (le == std::errc{});
     rhs_ok = (re == std::errc{});
 #else

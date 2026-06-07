@@ -23,6 +23,24 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
+  The TSan leg preloads `/tmp/libgai_sync_shim.so` (built inline from a
+  ~30-line C file at job start) to replace glibc's `getaddrinfo_a()` async
+  DNS path with synchronous `getaddrinfo()` on the calling thread. Required
+  because cpp-httplib enables `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON`
+  by default (vcpkg port), which makes glibc spawn an async-DNS helper
+  thread via `clone3` directly — bypassing TSan's `pthread_create`
+  interceptor — so the helper's per-thread allocator state is never
+  initialised and the first `malloc()` from it segfaults inside
+  `__tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8)` (#438).
+  Scoped to the TSan job via step-level `env: LD_PRELOAD`; production
+  keeps the non-blocking-DNS behaviour. The same shim is mirrored into
+  `sanitizer-tests.yml` so `/test --full` benefits identically.
+
+  On Test failure, the TSan job's `Capture stack trace under gdb`
+  diagnostic re-runs `yuzu_server_tests` under `gdb -batch` with the
+  Catch2 seed replayed, dumps `thread apply all bt full` + `info
+  registers`, and rides the existing `meson-testlog-tsan` artifact.
+
 `workflow_dispatch` only works once a workflow file exists on the **default
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
@@ -103,6 +121,28 @@ the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
 old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
+Also sweeps the buildx local cache the chisel images write
+(`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
+built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+
+## Chiselled demo images + agent bundle (release-time)
+
+`docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
+`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
+— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
+compile can hold that single runner slot up to its 360-min timeout, so the
+job carries a `cancel-in-progress: true` concurrency group (a re-tagged
+release supersedes a stale build instead of queueing behind it). It is
+**not** in the `release` job's `needs:`, so a slow/failed demo-image build
+never blocks the actual release. The sustainable fix for the QEMU cost is a
+native arm64 runner — the open decision tracked in `docs/demo-environment.md`
+("Publishing").
+
+`docker-publish-agent-bundle` runs **after** `release` (it repackages the
+release's own signed agent archives) on a GitHub-hosted runner — no
+compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
+attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
+jobs.
 
 ## vcpkg state corruption — recovery path
 

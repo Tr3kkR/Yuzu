@@ -67,13 +67,13 @@ curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
   }'
 ```
 
-The response includes a `token` field (prefixed `yzt_`). Copy it immediately --
+The response includes a `token` field (prefixed `yuzu_`). Copy it immediately --
 it is shown exactly once.
 
 ```json
 {
   "data": {
-    "token": "yzt_a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678",
+    "token": "yuzu_a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678",
     "name": "Claude Desktop - readonly"
   },
   "meta": { "api_version": "v1" }
@@ -90,7 +90,7 @@ In Claude Desktop, add the following to your MCP server configuration:
     "yuzu": {
       "url": "https://your-yuzu-server:8080/mcp/v1/",
       "headers": {
-        "Authorization": "Bearer yzt_a1b2c3d4e5f67890..."
+        "Authorization": "Bearer yuzu_a1b2c3d4e5f67890..."
       }
     }
   }
@@ -219,7 +219,7 @@ curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
 
 ### Token format
 
-MCP tokens use the same `yzt_` prefix as standard API tokens. They are
+MCP tokens use the same `yuzu_` prefix as standard API tokens. They are
 authenticated the same way -- via `Authorization: Bearer <token>` or
 `X-Yuzu-Token: <token>` headers.
 
@@ -267,12 +267,20 @@ for the tool to execute.
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
-| 23 | `execute_instruction` | Execute a plugin action on agents. Returns a `command_id`; poll results with `query_responses`. | `Execution:Execute` |
+| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.
 > - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
 > - `supervised` tier: not yet implemented (returns an error). Use the REST API or dashboard for supervised-tier execution until the approval re-dispatch path is built.
+
+> **`execute_instruction` response — agentic-first bridging (#1088):**
+> The response includes BOTH `command_id` (legacy correlation token for `query_responses`) and `execution_id` (the per-run identifier required by the REST `GET /api/v1/events` SSE endpoint and the `get_execution_status` / `list_executions` MCP tools). An agentic worker that dispatches via `execute_instruction` and wants to observe progress in real time:
+> 1. Call `execute_instruction` → receive `execution_id` in the response.
+> 2. Open `GET /api/v1/events?execution_id=<execution_id>` with `Accept: text/event-stream`.
+> 3. Stream JSON envelopes until the `execution-completed` event arrives.
+>
+> `execution_id` is an empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
 
 ### Tool parameters
 
@@ -587,7 +595,7 @@ Test with curl:
 
 ```bash
 curl -s -X POST https://your-server:8080/mcp/v1/ \
-  -H "Authorization: Bearer yzt_..." \
+  -H "Authorization: Bearer yuzu_..." \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"ping","id":1}'
 ```

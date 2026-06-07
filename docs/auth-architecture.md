@@ -18,10 +18,51 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
 - **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+- **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
+  - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
+  - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
+  - Both wrap `AuthManager::invalidate_user_sessions`, which performs the dual-write (AuthDB DELETE first outside `mu_`, then in-memory `sessions_` erase under `mu_`) and returns `RevokeResult { count, db_persisted }`. In-memory wipe runs even if the DB write fails (operator's "stop NOW" intent), but `db_persisted=false` surfaces up so the REST handler audits `result="partial"` with `detail` carrying `db_error=true`. Defence-in-depth: the AuthDB primitive itself validates username (matches sibling `add_user` / `update_role`).
+  - Audit actions split for SIEM correlation: `session.revoke_all` (cross-user) vs `session.revoke_all.self` (self via either route, including admin self-target through the admin path). Both use `target_type=User` (project PascalCase convention). `result` ∈ {`success`, `partial`, `denied`}.
+  - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
+  - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
+
+## MFA / TOTP (v0.12+, SOC 2 CC6.6)
+
+Full design: `docs/auth-mfa-design.md`. Summary:
+
+- **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
+  replay protection). 10 single-use base32 recovery codes per
+  enrollment, PBKDF2-SHA256 hashed.
+- **Self-service enrollment** via Settings → Multi-Factor Authentication.
+  One-time `otpauth://` reveal in the same `<div class="token-reveal">`
+  pattern as API-token issuance.
+- **Login challenge** — `POST /login` returns HTTP 202 +
+  `mfa_pending_token` (opaque, in-process, `cfg.mfa_login_pending_secs`
+  TTL) when the user has TOTP enrolled; browser swaps to a TOTP form
+  and posts to `POST /login/mfa`. Recovery codes share the same
+  endpoint.
+- **Storage** — TOTP secret as raw 20-byte BLOB in `users.mfa_totp_secret`,
+  protected by the same 0600 file mode that backs `password_hash`.
+  Encryption-at-rest (AES-256-GCM with key in `auth_kv`) is a follow-up;
+  the `auth_kv` table is provisioned empty.
+- **CLI flags / Config** — `--mfa-enforcement <optional|admin-only|required>`
+  (PR 1 honours `optional` only), `--mfa-step-up-window-secs` (default
+  300), `--mfa-login-pending-secs` (default 120).
+- **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
+  default) controls how long after a TOTP proof high-risk endpoints
+  accept the session as "stepped up." PR 2 wires the 11 step-up sites
+  (user delete, role change, token create/revoke, session revoke,
+  Guardian rule write / push, software-package write, software-deploy
+  execute, file-retrieval upload) and the `/login/mfa/stepup` route.
+- **OIDC `amr` short-circuit** (PR 3) — `IdTokenClaims.amr` parsing so
+  IdP-asserted MFA skips the local TOTP step.
+
+Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
+do not regress them when shipping PR 2 / PR 3.
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 14 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -37,6 +78,66 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
 - **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+
+## Per-session peer binding and NAT-aware relaxation
+
+`Register` and `Subscribe` are separate gRPC connections correlated by a
+`session_id`. To stop a sniffed `session_id` from being replayed from another
+host, Subscribe is bound to the Register connection by **two layers**:
+
+- **Peer-IP binding (#826, hardened #1058/#1059)** — Subscribe's source IP must
+  equal the IP recorded at Register (or, under `--gateway-mode`, a trusted
+  gateway IP). A mismatch increments
+  `yuzu_grpc_subscribe_peer_mismatch_total{event="security"}` and emits a
+  `session.peer_mismatch` audit row (`result="denied"`).
+- **Identity binding (authoritative)** — the `agent_id`↔session binding (#827)
+  and, under mTLS, the client-identity binding (#1118,
+  `yuzu_grpc_subscribe_identity_mismatch_total`). These are *stronger* than
+  source IP.
+
+**NAT-aware relaxation (#1128).** Exact-IP binding false-rejects a legitimate
+agent whose Register and Subscribe egress *different* public IPs (multi-egress
+NAT, proxy pool, CG-NAT, SD-WAN). Strict exact-match is the **default**; two
+**opt-in** accommodations downgrade a mismatch to *advisory* (audit + metric, no
+reject) instead:
+
+1. **mTLS-advisory — `--nat-trust-mtls-identity`** (`Config::nat_trust_mtls_identity`,
+   **default off**) — when enabled, a verified client identity matching the one
+   bound at Register treats the IP as defence-in-depth only, so the mismatch is
+   tolerated. **Opt-in because it is safe ONLY with per-agent client certs:** a
+   shared/fleet-wide cert makes every identity "match", which would let an
+   insider agent replay another agent's session from its own IP (gov UP-2). Off
+   by default — identity-match never relaxes the IP binding unless the operator
+   affirms per-agent certs via this flag.
+2. **`--trusted-nat-cidr <cidr>[,…]`** (`Config::trusted_nat_cidrs`) — when the
+   Register *and* Subscribe IPs both fall inside one operator-declared range
+   (analogous to `--gateway-mode`, but for direct-connect NAT). Declaring a
+   range asserts the hosts in it are mutually trusted not to replay each other's
+   sessions — keep ranges narrow (never `0.0.0.0/0`). Malformed entries are
+   logged and ignored at startup.
+
+A mismatch *outside* both accommodations is still a hard reject — the replay
+guard is intact, and an empty/malformed extracted IP is always reject (#826:
+empty is a mismatch, never a wildcard). A tolerated mismatch emits
+`yuzu_grpc_subscribe_peer_advisory_total{event="security",reason=…}` plus a
+`session.peer_mismatch` audit row with `result="ok" outcome=advisory`. The pure
+decision lives in `AgentServiceImpl::evaluate_peer_binding` (unit-tested);
+CIDR containment in `cidr_match.{hpp,cpp}`.
+
+**Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
+the server's transport peer is the *gateway's* IP, so audit rows would
+mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
+(an optional, gateway-authoritative, transport-agnostic field — survives the
+planned gRPC→QUIC move) carries the agent's origin IP; the server records
+`source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
+gateway IP (`origin_observed=false`) when absent. The *direct* Register path
+ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
+defence against a compromised gateway (which is inside the trust boundary and
+can set any value) — both `source_ip` and the gateway's `gateway_ip` are
+recorded so an auditor can cross-check. **Server-side consumption ships now; the
+gateway-side population is a follow-up** — today's grpcbox transport can only
+source it from `x-forwarded-for` (proxied deployments), and the durable
+direct-mode source arrives with the QUIC transport (#376) that owns its socket.
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -88,4 +189,4 @@ The hard invariants for AuthDB-touching changes (file-mode, migration
 pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
 cleanup cadence, snapshot-and-release publishing) live in
 `.claude/agents/authdb.md` — the AuthDB review agent loads them on any
-change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth_manager.cpp`.
+change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth.{hpp,cpp}`.

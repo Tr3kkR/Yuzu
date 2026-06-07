@@ -1,0 +1,266 @@
+---
+/**
+ * Search.astro — Pagefind-backed command-palette search for the reading room.
+ *
+ * The Pagefind *index* is produced by `npm run build` (`pagefind --site dist`);
+ * its UI bundle (`pagefind/pagefind-ui.{js,css}`) is loaded lazily on first open
+ * so `astro dev` (no index) stays fast and degrades to a friendly note. The
+ * trigger lives in the sidebar; a native <dialog> supplies focus-trapping,
+ * Escape-to-close, and focus restoration for free. Themed entirely via the
+ * Pagefind UI CSS custom properties + a few overrides, all from design tokens.
+ */
+const base = import.meta.env.BASE_URL; // ends with '/'
+const dev = import.meta.env.DEV;       // true under `astro dev` — no Pagefind index
+---
+<div class="docsearch">
+  <button
+    type="button"
+    id="ds-open"
+    class="ds-trigger"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-label="Search the manual"
+  >
+    <svg class="ds-glyph" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="10.5" cy="10.5" r="7" fill="none" stroke="currentColor" stroke-width="2" />
+      <line x1="15.6" y1="15.6" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+    </svg>
+    <span class="ds-label">Search docs…</span>
+    <kbd class="ds-kbd">/</kbd>
+  </button>
+
+  <dialog id="ds-modal" class="ds-modal" aria-label="Search the manual">
+    <div class="ds-panel">
+      <div class="ds-head">
+        <span class="ds-eyebrow">// search the manual</span>
+        <button type="button" id="ds-close" class="ds-close" aria-label="Close search">esc</button>
+      </div>
+      <div id="ds-ui" class="ds-ui"></div>
+      <p id="ds-fallback" class="ds-fallback" hidden>
+        Live search runs on the built site. Run <code>npm run build</code> then
+        <code>npm run preview</code> to exercise it locally.
+      </p>
+    </div>
+  </dialog>
+</div>
+
+<script is:inline define:vars={{ base, dev }}>
+  (() => {
+    const modal = document.getElementById('ds-modal');
+    const openBtn = document.getElementById('ds-open');
+    const closeBtn = document.getElementById('ds-close');
+    const fallback = document.getElementById('ds-fallback');
+    if (!modal || !openBtn) return;
+
+    let loadPromise = null;
+    let instantiated = false;
+
+    function loadAssets() {
+      if (loadPromise) return loadPromise;
+      loadPromise = new Promise((resolve, reject) => {
+        const css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = base + 'pagefind/pagefind-ui.css';
+        document.head.appendChild(css);
+        const js = document.createElement('script');
+        js.src = base + 'pagefind/pagefind-ui.js';
+        js.onload = () =>
+          window.PagefindUI ? resolve(window.PagefindUI) : reject(new Error('PagefindUI missing'));
+        js.onerror = () => reject(new Error('Pagefind index not built'));
+        document.head.appendChild(js);
+      });
+      return loadPromise;
+    }
+
+    function showFallback() {
+      if (fallback) fallback.hidden = false;
+    }
+
+    async function ensureUI() {
+      if (instantiated) return true;
+      if (dev) {
+        showFallback();
+        return false;
+      }
+      try {
+        const PagefindUI = await loadAssets();
+        new PagefindUI({
+          element: '#ds-ui',
+          bundlePath: base + 'pagefind/',
+          showSubResults: true,
+          showImages: false,
+          excerptLength: 18,
+          autofocus: true,
+          focusOnSlash: false,
+        });
+        instantiated = true;
+        return true;
+      } catch (_e) {
+        showFallback();
+        return false;
+      }
+    }
+
+    function focusInput() {
+      const input = modal.querySelector('.pagefind-ui__search-input');
+      if (input) input.focus();
+    }
+
+    async function open() {
+      if (modal.open) return;
+      modal.showModal();
+      openBtn.setAttribute('aria-expanded', 'true');
+      const ok = await ensureUI();
+      if (ok) focusInput();
+    }
+
+    function close() {
+      if (modal.open) modal.close();
+    }
+
+    openBtn.addEventListener('click', open);
+    if (closeBtn) closeBtn.addEventListener('click', close);
+
+    // Backdrop click: the dialog box fills the viewport (transparent); the visible
+    // card is .ds-panel, so a click whose target is the dialog itself is the backdrop.
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) close();
+    });
+
+    // Native <dialog> already handles Escape; keep aria-expanded in sync on close.
+    modal.addEventListener('close', () => {
+      openBtn.setAttribute('aria-expanded', 'false');
+    });
+
+    function isTypingTarget(el) {
+      if (!el) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        modal.open ? close() : open();
+      } else if (e.key === '/' && !modal.open && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        open();
+      }
+    });
+  })();
+</script>
+
+<style>
+  /* ---- trigger ---------------------------------------------------------- */
+  .ds-trigger{
+    display:flex; align-items:center; gap:9px;
+    margin:0 18px 22px; padding:8px 11px;
+    border:1px solid var(--line-1); border-radius:var(--rad);
+    background:rgba(10,18,33,.55); color:var(--ink-3);
+    font-family:var(--font-body); font-size:13px; cursor:pointer;
+    transition:.18s ease; width:auto;
+  }
+  .ds-trigger:hover{
+    border-color:var(--cyan); color:var(--ink-2);
+    box-shadow:0 0 0 1px rgba(0,188,235,.15), var(--glow-cyan);
+  }
+  .ds-trigger:focus-visible{ outline:2px solid var(--cyan-bright); outline-offset:2px; }
+  .ds-glyph{ color:var(--cyan); flex:none; }
+  .ds-label{ flex:1; text-align:left; }
+  .ds-kbd{
+    font-family:var(--font-mono); font-size:11px; line-height:1;
+    color:var(--ink-4); border:1px solid var(--line-1); border-radius:3px;
+    padding:3px 6px; background:rgba(20,34,59,.6);
+  }
+
+  /* ---- modal shell ------------------------------------------------------ */
+  .ds-modal{
+    margin:0; padding:0; border:0; background:transparent;
+    width:100%; height:100%; max-width:100vw; max-height:100dvh; inset:0;
+    overflow:hidden; color:var(--ink-2);
+  }
+  .ds-modal:not([open]){ display:none; }
+  .ds-modal[open]{ display:flex; justify-content:center; align-items:flex-start; }
+  .ds-modal::backdrop{
+    background:rgba(3,7,15,.62);
+    -webkit-backdrop-filter:blur(7px) saturate(120%);
+            backdrop-filter:blur(7px) saturate(120%);
+  }
+  .ds-panel{
+    margin-top:11vh; width:min(640px, 92vw);
+    display:flex; flex-direction:column; max-height:74vh;
+    background:linear-gradient(180deg, rgba(20,34,59,.97), rgba(14,26,45,.98));
+    border:1px solid var(--line-2); border-radius:8px;
+    box-shadow:0 40px 120px -36px rgba(0,0,0,.92),
+               0 0 0 1px rgba(0,188,235,.08),
+               inset 0 1px 0 rgba(143,163,189,.07);
+    overflow:hidden;
+  }
+  .ds-head{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:11px 14px; border-bottom:1px solid var(--line-1);
+    background:rgba(10,18,33,.5);
+  }
+  .ds-eyebrow{
+    font-family:var(--font-mono); font-size:11px; letter-spacing:.18em;
+    text-transform:uppercase; color:var(--cyan);
+  }
+  .ds-close{
+    font-family:var(--font-mono); font-size:11px; letter-spacing:.06em;
+    color:var(--ink-4); background:rgba(20,34,59,.6);
+    border:1px solid var(--line-1); border-radius:3px; padding:3px 8px;
+    cursor:pointer; transition:.18s;
+  }
+  .ds-close:hover{ color:var(--ink-2); border-color:var(--cyan); }
+  .ds-close:focus-visible{ outline:2px solid var(--cyan-bright); outline-offset:2px; }
+  .ds-fallback{
+    margin:0; padding:22px 18px 26px; color:var(--ink-3); font-size:14px;
+  }
+  .ds-fallback code{
+    font-family:var(--font-mono); font-size:.85em; color:var(--violet);
+    background:rgba(183,147,230,.1); padding:.1em .4em; border-radius:3px;
+    border:1px solid rgba(183,147,230,.2);
+  }
+
+  /* ---- Pagefind UI, themed to the tokens -------------------------------- */
+  .ds-ui{
+    --pagefind-ui-scale:.85;
+    --pagefind-ui-primary:var(--cyan-bright);
+    --pagefind-ui-text:var(--ink-2);
+    --pagefind-ui-background:transparent;
+    --pagefind-ui-border:var(--line-1);
+    --pagefind-ui-tag:var(--panel-2);
+    --pagefind-ui-border-width:1px;
+    --pagefind-ui-border-radius:4px;
+    --pagefind-ui-font:var(--font-body);
+    padding:14px;
+    display:flex; flex-direction:column; min-height:0;
+  }
+  .ds-ui :global(.pagefind-ui__form){ position:relative; }
+  .ds-ui :global(.pagefind-ui__search-input){
+    background:rgba(7,13,24,.7); color:var(--ink); font-size:15px;
+    border:1px solid var(--line-1);
+  }
+  .ds-ui :global(.pagefind-ui__search-input::placeholder){ color:var(--ink-4); }
+  .ds-ui :global(.pagefind-ui__search-input:focus){
+    outline:none; border-color:var(--cyan); box-shadow:var(--glow-cyan);
+  }
+  .ds-ui :global(.pagefind-ui__search-clear){ color:var(--ink-3); background:transparent; }
+  .ds-ui :global(.pagefind-ui__results-area){ overflow:auto; min-height:0; }
+  .ds-ui :global(.pagefind-ui__message){
+    font-family:var(--font-mono); font-size:11px; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--ink-4);
+  }
+  .ds-ui :global(.pagefind-ui__result){ border-top:1px solid var(--line-1); }
+  .ds-ui :global(.pagefind-ui__result-link){ color:var(--cyan-bright); font-weight:600; }
+  .ds-ui :global(.pagefind-ui__result-link:hover){ color:#fff; text-decoration:underline; }
+  .ds-ui :global(.pagefind-ui__result-excerpt){ color:var(--ink-3); font-size:13.5px; }
+  .ds-ui :global(.pagefind-ui__result-nested .pagefind-ui__result-link){
+    color:var(--ink-2); font-weight:500;
+  }
+  .ds-ui :global(mark){ background:rgba(0,188,235,.22); color:#eafaff; border-radius:2px; }
+
+  @media (prefers-reduced-motion: reduce){
+    .ds-modal::backdrop{ -webkit-backdrop-filter:none; backdrop-filter:none; }
+  }
+</style>
