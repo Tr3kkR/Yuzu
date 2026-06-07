@@ -14,6 +14,8 @@
 #include "../test_helpers.hpp"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -261,4 +263,137 @@ TEST_CASE("CaStore: revocation round-trip against a real issued leaf", "[ca_stor
     REQUIRE(store.is_revoked(parsed->serial_hex));
     // Idempotent: a second revoke of an already-revoked serial returns false.
     REQUIRE_FALSE(store.revoke(issued->serial_hex, "again"));
+}
+
+// ── Serial normalisation (Tr3kkR #1237 review) ──────────────────────────────
+
+TEST_CASE("CaStore: normalize_serial_hex canonicalises + fails closed", "[ca_store][serial]") {
+    REQUIRE(normalize_serial_hex("ab:cd:ef") == "ABCDEF"); // lowercase + colons
+    REQUIRE(normalize_serial_hex("ABCDEF") == "ABCDEF");    // already canonical
+    REQUIRE(normalize_serial_hex(" aa bb\t") == "AABB");    // whitespace stripped
+    // Leading zeros stripped → matches BN_bn2hex's value form (so a zero-padded
+    // operator serial still resolves to the stored one).
+    REQUIRE(normalize_serial_hex("00ab") == "AB");
+    REQUIRE(normalize_serial_hex("0A") == "A");
+    REQUIRE(normalize_serial_hex("0000") == "0"); // all-zero value → single "0"
+    REQUIRE(normalize_serial_hex("0") == "0");
+    REQUIRE_FALSE(normalize_serial_hex(""));                  // empty
+    REQUIRE_FALSE(normalize_serial_hex(":::"));               // separators only → empty
+    REQUIRE_FALSE(normalize_serial_hex("12xy"));              // non-hex
+    REQUIRE_FALSE(normalize_serial_hex("-1"));                // sign char is non-hex
+    REQUIRE_FALSE(normalize_serial_hex(std::string(300, 'a'))); // length cap
+}
+
+TEST_CASE("CaStore: revoke/is_revoked match across case + colon variance",
+          "[ca_store][serial][revoke][security]") {
+    // The engine stores uppercase, colon-free serials; a PR4 operator/REST serial
+    // may arrive lowercase or colon-decorated. Without boundary normalisation that
+    // would silently miss the row — a revoked cert that keeps validating.
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    REQUIRE(store.record_issued(sample_issued("ABCD12"))); // stored canonical
+    REQUIRE(store.revoke("ab:cd:12", "operator typed colons + lowercase"));
+    REQUIRE(store.is_revoked("ABCD12"));
+    REQUIRE(store.is_revoked("abcd12"));
+    REQUIRE(store.is_revoked("AB:CD:12"));
+    REQUIRE(store.is_revoked("00ABCD12")); // zero-padded form still matches
+    REQUIRE_FALSE(store.revoke("ABCD12", "again")); // idempotent across forms
+}
+
+TEST_CASE("CaStore: record_issued normalises + is_revoked fails closed on non-hex",
+          "[ca_store][serial][negative][security]") {
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    REQUIRE(store.record_issued(sample_issued("aa:bb"))); // stored as AABB
+    REQUIRE(store.get_issued("AABB"));
+    REQUIRE(store.get_issued("aa:bb")); // queried in any form
+    REQUIRE_FALSE(store.record_issued(sample_issued("zz-not-hex"))); // refused
+    // is_revoked treats an un-normalisable serial as revoked (reject), not "clean".
+    REQUIRE(store.is_revoked("not-a-serial"));
+}
+
+TEST_CASE("CaStore: issuer_fingerprint provenance round-trips (issued + CRL)",
+          "[ca_store][provenance]") {
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    auto rec = sample_issued("FACE01");
+    rec.issuer_fingerprint = "AA:BB:CC:DD";
+    REQUIRE(store.record_issued(rec));
+    auto got = store.get_issued("FACE01");
+    REQUIRE(got);
+    REQUIRE(got->issuer_fingerprint == "AA:BB:CC:DD");
+
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x00};
+    crl.this_update = now_s();
+    crl.next_update = now_s() + 86400;
+    crl.issuer_fingerprint = "AA:BB:CC:DD";
+    REQUIRE(store.record_crl(crl));
+    auto latest = store.latest_crl();
+    REQUIRE(latest);
+    REQUIRE(latest->issuer_fingerprint == "AA:BB:CC:DD");
+}
+
+// ── Atomic CRL-number allocation (Tr3kkR #1237 review) ──────────────────────
+
+TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically",
+          "[ca_store][crl]") {
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    REQUIRE(store.record_issued(sample_issued("DEAD")));
+    REQUIRE(store.revoke("DEAD", "x"));
+
+    uint64_t seen_number = 0;
+    std::size_t seen_revoked = 0;
+    auto build = [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked) {
+        seen_number = n;
+        seen_revoked = revoked.size();
+        const std::string s = "CRL#" + std::to_string(n); // pretend-DER carrying n
+        return std::vector<uint8_t>(s.begin(), s.end());
+    };
+
+    auto v1 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    REQUIRE(v1);
+    REQUIRE(v1->version == 1);
+    REQUIRE(seen_number == 1);          // built for the allocated number
+    REQUIRE(seen_revoked == 1);         // build saw the revoked DEAD cert (lock-safe)
+    REQUIRE(v1->issuer_fingerprint == "FP1");
+
+    auto v2 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    REQUIRE(v2);
+    REQUIRE(v2->version == 2);          // monotonic
+    REQUIRE(seen_number == 2);
+    REQUIRE(store.next_crl_number() == 3);
+
+    auto latest = store.latest_crl();
+    REQUIRE(latest);
+    REQUIRE(latest->version == 2);
+
+    // A build that aborts (empty DER) inserts nothing and does NOT consume a
+    // number — the next allocation is still 3.
+    auto none = store.publish_next_crl(
+        [](uint64_t, const std::vector<IssuedCertRecord>&) { return std::vector<uint8_t>{}; },
+        now_s(), now_s() + 7 * 86400);
+    REQUIRE_FALSE(none);
+    REQUIRE(store.next_crl_number() == 3);
+}
+
+TEST_CASE("CaStore: record_crl rejects version < 1 and silent-clobber duplicates",
+          "[ca_store][crl][negative]") {
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    CrlVersionRecord r;
+    r.version = 0;
+    r.der = {0x30, 0x00};
+    r.this_update = now_s();
+    r.next_update = now_s() + 86400;
+    REQUIRE_FALSE(store.record_crl(r)); // version < 1 rejected
+    r.version = 1;
+    REQUIRE(store.record_crl(r));
+    r.der = {0x30, 0x01};               // a different CRL claiming the same number
+    REQUIRE_FALSE(store.record_crl(r)); // duplicate version rejected, not clobbered
+    auto latest = store.latest_crl();
+    REQUIRE(latest);
+    REQUIRE(latest->der == std::vector<uint8_t>{0x30, 0x00}); // original preserved
 }

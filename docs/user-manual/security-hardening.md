@@ -4,6 +4,17 @@ This guide covers hardening Yuzu for production enterprise deployments.
 
 ## mTLS Setup
 
+> **Default certificates are convenience, not production.** A fresh install
+> generates a per-install CA + server leaves on first boot so it is encrypted
+> with zero configuration — but those leaves are 10-year, do not auto-renew, and
+> carry SANs for `localhost`/loopback/hostname only. **Replace them before a
+> production rollout** with operator-provided or organisation-CA certs (below),
+> or root the built-in CA in your enterprise CA (subordinate mode, roadmap). The
+> server warns loudly while on default certs (startup banner, audit
+> `server.default_certs_in_use`, the `yuzu_server_default_certs_active` gauge).
+> Back up `--ca-dir` (esp. `default-ca.key`) and `ca.db` — losing the CA key
+> forces a full fleet re-enrollment.
+
 All agent-to-server communication should use mutual TLS. Create a private CA, server certificate, and per-agent certificates.
 
 ### 1. Create Certificate Authority

@@ -61,6 +61,13 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
 | `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
 
+## Internal-CA / default-certificate metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
+
 ## Fleet visualization metrics
 
 The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
