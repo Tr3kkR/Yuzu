@@ -113,6 +113,49 @@ TEST_CASE("build_agent_push: spec_json round-trips into typed proto blocks",
     CHECK(pr.remediation().type() == "alert-only");
 }
 
+TEST_CASE("build_agent_push: a service guard reaches an agent ONLY via a deployed Baseline",
+          "[guardian_push_builder][service][baseline]") {
+    // Post-#1281 delivery model: a Guard reaches an agent only as a member of a
+    // *deployed* Baseline, and filter_deployed_members is that gate. A standalone
+    // service guard pushed with no deployed Baseline silently never armed — caught in
+    // Windows UAT, not by the per-type unit tests. This pins a service guard end-to-end
+    // through the deployed-member gate AND the spec_json -> proto marshal.
+    GuaranteedStateRuleRow svc;
+    svc.rule_id = "svc-spooler";
+    svc.name = "Spooler running";
+    svc.enabled = true;
+    svc.enforcement_mode = "enforce";
+    svc.os_target = "windows";
+    svc.scope_expr = "";
+    svc.version = 1;
+    svc.spec_json =
+        R"({"spark":{"type":"service-status-change","params":{}},)"
+        R"("assertion":{"type":"service-running","params":{"service_name":"Spooler"}},)"
+        R"("remediation":{"type":"enforce","params":{}}})";
+    const std::vector<GuaranteedStateRuleRow> all{svc};
+
+    SECTION("NOT in any deployed Baseline -> gated out, never reaches the push") {
+        auto deployed = guardian::filter_deployed_members(all, /*deployed_rule_ids=*/{});
+        CHECK(deployed.empty());
+        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope, true, 1);
+        CHECK(push.rules_size() == 0);
+    }
+    SECTION("member of a deployed Baseline -> included, service spark/assertion intact") {
+        auto deployed = guardian::filter_deployed_members(all, {"svc-spooler"});
+        REQUIRE(deployed.size() == 1);
+        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope, true, 1);
+        REQUIRE(push.rules_size() == 1);
+        const auto& pr = push.rules(0);
+        CHECK(pr.rule_id() == "svc-spooler");
+        CHECK(pr.spark().type() == "service-status-change");
+        CHECK(pr.assertion().type() == "service-running");
+        REQUIRE(pr.assertion().params().contains("service_name"));
+        CHECK(pr.assertion().params().at("service_name") == "Spooler");
+        CHECK(pr.remediation().type() == "enforce");
+        CHECK(pr.enforcement_mode() == "enforce");
+    }
+}
+
 TEST_CASE("build_agent_push: legacy rule with empty spec_json is header-only",
           "[guardian_push_builder]") {
     GuaranteedStateRuleRow legacy;

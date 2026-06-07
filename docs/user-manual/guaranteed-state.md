@@ -95,6 +95,8 @@ The full type catalog — including these file types and the `expected_hash` for
 
 A `service-status-change` spark watches one Windows service via `NotifyServiceStatusChange` — kernel-notified by the Service Control Manager, **no polling**, so a stop or start is detected in ~0 ms. The watch is resilient: it survives the service being deleted and recreated, and re-arms automatically. The assertion *type* encodes the desired run state; the only param is the service (key) name:
 
+Like every Guard, a service Guard reaches an agent — and therefore enforces — **only as a member of a [deployed Baseline](#baselines--how-guards-reach-agents)**; authoring one alone does nothing on any endpoint.
+
 | Assertion | Drift when | Key params |
 |---|---|---|
 | `service-running` | the service is not Running (stopped, paused, or absent) | `service_name` (required) — the SCM **key** name, e.g. `Spooler`, not the display name |
