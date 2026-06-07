@@ -66,6 +66,81 @@ inline int compare_versions(std::string_view a, std::string_view b) {
     return 0;
 }
 
+// ── Normalized version comparison ─────────────────────────────────────────
+// Handles real-world package version formats that compare_versions() misses:
+//   Debian epoch prefix  "2:1.0.1f"  (epoch 2 beats any non-epoch version)
+//   RPM/Alpine release   "1.0.1g-1.el8", "9.7p1-r3"  (strip distro suffix)
+//   semver pre-release   "3.0.6-rc1" < "3.0.6"
+
+inline std::pair<long long, std::string_view> split_epoch(std::string_view v) {
+    auto colon = v.find(':');
+    if (colon == std::string_view::npos)
+        return {0, v};
+    std::string_view epoch_str = v.substr(0, colon);
+    long long epoch = 0;
+    for (char c : epoch_str) {
+        if (c < '0' || c > '9')
+            return {0, v};
+        // Bounds check: prevent integer overflow on unreasonable epoch values (>99)
+        if (epoch > 9)
+            return {0, v};
+        epoch = epoch * 10 + (c - '0');
+    }
+    return {epoch, v.substr(colon + 1)};
+}
+
+// Strip distro release suffix (e.g. -1.el8, -r3) but NOT pre-release markers
+// (-rc1, -alpha, -beta) which must be preserved for ordering.
+inline std::string_view strip_distro_release(std::string_view v) {
+    auto last_dash = v.rfind('-');
+    if (last_dash == std::string_view::npos)
+        return v;
+    auto suffix = v.substr(last_dash + 1);
+    bool has_leading_digit = !suffix.empty() && suffix[0] >= '0' && suffix[0] <= '9';
+    bool has_letter = suffix.find_first_of("abcdefghijklmnopqrstuvwxyz") != std::string_view::npos;
+    bool is_prerelease = (suffix.find("rc")    != std::string_view::npos ||
+                          suffix.find("alpha") != std::string_view::npos ||
+                          suffix.find("beta")  != std::string_view::npos);
+    if (has_leading_digit && has_letter && !is_prerelease)
+        return v.substr(0, last_dash);
+    return v;
+}
+
+// Returns <0 if a<b, 0 if a==b, >0 if a>b.
+inline int compare_versions_normalized(std::string_view a, std::string_view b) {
+    auto [ea, ra] = split_epoch(a);
+    auto [eb, rb] = split_epoch(b);
+    if (ea != eb)
+        return ea < eb ? -1 : 1;
+    ra = strip_distro_release(ra);
+    rb = strip_distro_release(rb);
+
+    // Semver pre-release semantics: -rcN/-alphaN/-betaN sorts below release.
+    // Split each version into (base, pre-release-suffix) and compare in two stages.
+    auto split_prerel = [](std::string_view v)
+            -> std::pair<std::string_view, std::string_view> {
+        auto dash = v.rfind('-');
+        if (dash == std::string_view::npos) return {v, {}};
+        auto suf = v.substr(dash + 1);
+        if (suf.find("rc")    != std::string_view::npos ||
+            suf.find("alpha") != std::string_view::npos ||
+            suf.find("beta")  != std::string_view::npos)
+            return {v.substr(0, dash), suf};
+        return {v, {}};
+    };
+
+    auto [base_a, pre_a] = split_prerel(ra);
+    auto [base_b, pre_b] = split_prerel(rb);
+    int base_cmp = compare_versions(base_a, base_b);
+    if (base_cmp != 0) return base_cmp;
+    // Equal bases: pre-release < release
+    if (!pre_a.empty() && pre_b.empty()) return -1;
+    if (pre_a.empty() && !pre_b.empty()) return 1;
+    if (!pre_a.empty())
+        return compare_versions(pre_a, pre_b);
+    return 0;
+}
+
 // ── Bundled CVE rules ──────────────────────────────────────────────────────
 // High-profile CVEs across common software. Updated with plugin releases.
 
@@ -185,5 +260,63 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
     {"CVE-2024-4577", "php", "8.3.8", "8.3.8", "CRITICAL", "CGI argument injection on Windows"},
     {"CVE-2024-2756", "php", "8.3.4", "8.3.4", "MEDIUM", "Cookie __Host-/__Secure- prefix bypass"},
 });
+
+// ── Runtime-loaded CVE rules ───────────────────────────────────────────────
+// Loaded from <data_dir>/staged/cve_rules.json at plugin init().
+// Supplements kCveRules without replacing them (compiled-in set is always active).
+// Omitted when YUZU_NO_DYNAMIC_RULES is defined.
+
+#ifndef YUZU_NO_DYNAMIC_RULES
+
+struct CveRuleDynamic {
+    std::string cve_id;
+    std::string product;
+    std::string affected_below;
+    std::string fixed_in;
+    std::string severity;
+    std::string description;
+};
+
+static constexpr int kRuleSchemaVersion = 1;
+
+/// Load rules from a JSON file. Returns empty string on success, error on failure.
+/// Does NOT throw — all exceptions are caught and converted to error strings.
+inline std::string load_rules_from_json(const std::string& path,
+                                        std::vector<CveRuleDynamic>& out) {
+    std::ifstream f(path);
+    if (!f.is_open())
+        return "cannot open " + path;
+
+    nlohmann::json j;
+    try {
+        f >> j;
+
+        // Validate schema_version (can throw type_error if not an int)
+        if (!j.contains("schema_version") ||
+            j["schema_version"].get<int>() != kRuleSchemaVersion)
+            return "unsupported or missing schema_version (expected 1)";
+
+        if (!j.contains("rules") || !j["rules"].is_array())
+            return "missing or invalid 'rules' array";
+
+        out.clear();
+        for (const auto& r : j["rules"]) {
+            CveRuleDynamic rule;
+            rule.cve_id         = r.value("cve_id",         "");
+            rule.product        = r.value("product",         "");
+            rule.affected_below = r.value("affected_below",  "");
+            rule.fixed_in       = r.value("fixed_in",        "");
+            rule.severity       = r.value("severity",        "MEDIUM");
+            rule.description    = r.value("description",     "");
+            if (!rule.cve_id.empty() && !rule.product.empty() && !rule.affected_below.empty())
+                out.push_back(std::move(rule));
+        }
+        return {};
+    } catch (const nlohmann::json::exception& e) {
+        return std::string("JSON error: ") + e.what();
+    }
+}
+
+#endif // YUZU_NO_DYNAMIC_RULES
 
 } // namespace yuzu::vuln

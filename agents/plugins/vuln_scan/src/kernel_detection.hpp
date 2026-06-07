@@ -83,14 +83,33 @@ inline DWORD read_reg_dword(HKEY root, const char* subkey,
     RegCloseKey(h);
     return r;
 }
+
+inline std::string read_reg_string(HKEY root, const char* subkey,
+                                    const char* value, const std::string& def) {
+    HKEY h{};
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &h) != ERROR_SUCCESS)
+        return def;
+    char buf[256]{};
+    DWORD sz = sizeof(buf) - 1, type = 0;
+    std::string r = def;
+    if (RegQueryValueExA(h, value, nullptr, &type,
+                         reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS &&
+        type == REG_SZ)
+        r = buf;
+    RegCloseKey(h);
+    return r;
+}
 } // namespace detail_kernel
 
 inline KernelInfo get_kernel_info() {
     KernelInfo k;
     k.platform = "windows";
     static const char* kKey = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
-    int build = static_cast<int>(
-        detail_kernel::read_reg_dword(HKEY_LOCAL_MACHINE, kKey, "CurrentBuildNumber", 0));
+    // CurrentBuildNumber is REG_SZ (string), not REG_DWORD
+    auto build_str = detail_kernel::read_reg_string(HKEY_LOCAL_MACHINE, kKey, "CurrentBuildNumber", "0");
+    int build = 0;
+    try { build = std::stoi(build_str); } catch (...) { build = 0; }
+    // UBR is REG_DWORD
     int ubr = static_cast<int>(
         detail_kernel::read_reg_dword(HKEY_LOCAL_MACHINE, kKey, "UBR", 0));
     k.major = 10;
