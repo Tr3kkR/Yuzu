@@ -83,6 +83,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Internal CA engine + `ca.db` issuance store (PKI PR1).** New pure-OpenSSL
+  PKI engine (`x509_ca`: EC keygen, self-signed root, CSR signing with
+  proof-of-possession, leaf issuance, CRL build, chain verify, SHA-256
+  fingerprint), a `KeyProvider` seam (`FileKeyProvider`: `0600`/`O_EXCL` key
+  custody, HSM/PKCS#11-ready), and the `ca.db` metadata store (`CaStore`: root,
+  issued-cert inventory, CRL versions). The root **private key never enters the
+  database** — only an opaque `key_ref`. Serials are normalised (uppercase,
+  colon-free) at the store boundary so a later operator-supplied serial cannot
+  miss `revoke()`/`is_revoked()`; CRL-number allocation is atomic
+  (`publish_next_crl`, monotonic per RFC 5280 §5.2.3); the inventory carries an
+  `issuer_fingerprint` provenance link to the signing root. Engine only — the
+  first-boot wiring lands in PR2.
+
 - **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
   Settings panel and the login-time enrollment-bootstrap form — now render
   a scannable QR code (server-side inline SVG via the vendored Nayuki
