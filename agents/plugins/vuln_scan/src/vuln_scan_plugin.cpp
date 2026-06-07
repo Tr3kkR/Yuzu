@@ -47,6 +47,7 @@
 #include "config_checks.hpp"
 #include "cve_rules.hpp"
 #include "kernel_detection.hpp"
+#include "pkg_scan.hpp"
 
 namespace {
 
@@ -444,6 +445,50 @@ std::vector<Finding> do_config_scan_impl() {
     return findings;
 }
 
+// ── Language package scan (npm, pip, cargo, gem, NuGet) ─────────────────────
+
+std::vector<Finding> do_pkg_scan_impl() {
+    std::vector<Finding> findings;
+    auto pkgs = yuzu::vuln::get_lang_packages();
+
+    // Safely copy dynamic rules ptr while holding lock
+    auto dynamic = [&]() {
+        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+        return g_dynamic_rules;
+    }();
+    if (!dynamic)
+        return findings;
+
+    // Match language packages against ecosystem-tagged rules
+    for (const auto& pkg : pkgs) {
+        for (const auto& rule : *dynamic) {
+            // Skip rules without an ecosystem (those are OS-native, handled by cve_scan)
+            if (rule.ecosystem.empty())
+                continue;
+
+            // Only match if ecosystems agree
+            if (pkg.ecosystem != rule.ecosystem)
+                continue;
+
+            // Case-insensitive substring match on package name
+            if (!icontains(pkg.name, rule.product) || pkg.version.empty())
+                continue;
+
+            // Version comparison
+            if (yuzu::vuln::compare_versions_normalized(pkg.version,
+                                                        rule.affected_below) < 0) {
+                findings.push_back(
+                    {rule.severity, "cve",
+                     std::format("{}: {}", rule.cve_id, rule.description),
+                     std::format("{} {} {} (fixed in {})", rule.ecosystem, pkg.name, pkg.version,
+                                 rule.fixed_in)});
+            }
+        }
+    }
+
+    return findings;
+}
+
 // ── Output helpers ────────────────────────────────────────────────────────
 
 void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings) {
@@ -500,7 +545,7 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"scan",        "cve_scan",   "config_scan",
                                      "summary",     "inventory",  "update_rules",
-                                     "kernel_scan", "binary_scan", nullptr};
+                                     "kernel_scan", "binary_scan", "pkg_scan", nullptr};
         return acts;
     }
 
@@ -532,12 +577,15 @@ public:
             ctx.report_progress(0);
             auto cve_findings = do_cve_scan_impl();
             ctx.report_progress(50);
+            auto pkg_findings = do_pkg_scan_impl();
+            ctx.report_progress(70);
             auto config_findings = do_config_scan_impl();
             ctx.report_progress(90);
 
             std::vector<Finding> all;
-            all.reserve(cve_findings.size() + config_findings.size());
+            all.reserve(cve_findings.size() + pkg_findings.size() + config_findings.size());
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
+            all.insert(all.end(), pkg_findings.begin(), pkg_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_findings(ctx, all);
@@ -663,6 +711,13 @@ public:
                     match_rule(r.product, r.affected_below, r.severity,
                                r.cve_id, r.description, r.fixed_in);
             }
+            output_findings(ctx, findings);
+            return 0;
+        }
+
+        if (action == "pkg_scan") {
+            ctx.write_output("INFO|scan|Starting language package scan|");
+            auto findings = do_pkg_scan_impl();
             output_findings(ctx, findings);
             return 0;
         }
