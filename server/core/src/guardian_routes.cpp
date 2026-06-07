@@ -131,12 +131,6 @@ std::string status_badge(const std::string& status) {
     return "<span class=\"gs-badge gs-" + status + "\">" + label + "</span>";
 }
 
-std::string stat_card(int n, const char* label, const char* tone) {
-    return "<div class=\"stat-card\"><div class=\"stat-num " + std::string(tone) +
-           "\">" + std::to_string(n) + "</div><div class=\"stat-label\">" +
-           label + "</div></div>";
-}
-
 // ── Honest-state helpers (M2 / #1209) ────────────────────────────────────────
 // Contract-shaped MOCK fixtures render ONLY when no Guardian backend is present
 // (store null / not open) — a pure UI-development fallback. When the store is
@@ -2084,8 +2078,8 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // hx-gets on load gates on GuaranteedState:Read. The id is already restricted
     // by the route's char class (the allowlist), so the {{FRAGMENT}}/{{TITLE}}
     // token substitution is safe — same approach as Fleet-Viz /viz/host/<id>.
-    auto serve_detail_page = [this](httplib::Response& res, const char* title,
-                                    const std::string& fragment) {
+    auto serve_detail_page = [](httplib::Response& res, const char* title,
+                                const std::string& fragment) {
         std::string html(kGuardianDetailPageHtml);
         auto sub = [&](const std::string& tok, const std::string& val) {
             for (auto p = html.find(tok); p != std::string::npos; p = html.find(tok, p + val.size()))
