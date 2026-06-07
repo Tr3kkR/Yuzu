@@ -432,6 +432,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | `config_scan` | Audit system configuration against security baselines (CIS Level 1 controls). |
 | `kernel_scan` | Detect CVEs in the running kernel (Linux `uname`, Windows build number, macOS `sw_vers`). Returns findings by severity. |
 | `binary_scan` | Read version information from binary files (PE VERSIONINFO on Windows, Info.plist on macOS, dpkg epoch/rpm release on Linux) and match against CVE rules. Accepts a `paths` parameter (comma-separated list of absolute paths to scan). |
+| `pkg_scan` | Detect globally installed language packages (npm, pip, cargo, gem, NuGet) and match offline against ecosystem-tagged CVE rules. Requires a v2 rules file with `ecosystem` field populated by the OSV rule generator. Returns findings by severity. |
 | `update_rules` | Reload CVE rules from the staged file at `<data_dir>/staged/cve_rules.json`. The critical-CVE fallback bundle remains active until the staged file is verified. Requires `endpoint-admin` or `security-admin` role. |
 | `inventory` | Enumerate installed software for NVD CPE matching. Returns package name, version, and source (registry/dpkg/rpm/brew). |
 | `summary` | Return counts of critical, high, medium, and low findings. |
