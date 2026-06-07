@@ -501,7 +501,7 @@ std::vector<Finding> do_pkg_scan_impl() {
             if (yuzu::vuln::compare_versions_normalized(pkg.version,
                                                         rule.affected_below) < 0) {
                 findings.push_back(
-                    {rule.severity, "cve",
+                    {rule.severity, "lang-pkg",
                      std::format("{}: {}", rule.cve_id, rule.description),
                      std::format("{} {} {} (fixed in {})", rule.ecosystem, pkg.name, pkg.version,
                                  rule.fixed_in)});
@@ -645,11 +645,13 @@ public:
 
         if (action == "summary") {
             auto cve_findings = do_cve_scan_impl();
+            auto pkg_findings = do_pkg_scan_impl();
             auto config_findings = do_config_scan_impl();
 
             std::vector<Finding> all;
-            all.reserve(cve_findings.size() + config_findings.size());
+            all.reserve(cve_findings.size() + pkg_findings.size() + config_findings.size());
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
+            all.insert(all.end(), pkg_findings.begin(), pkg_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_summary(ctx, all);
