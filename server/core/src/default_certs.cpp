@@ -234,7 +234,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     // root) or removes ca.db too for a deliberate clean re-root. We refuse on ANY
     // existing root (not only a fingerprint mismatch): the regen path always mints
     // a brand-new CA, so proceeding would re-root regardless.
-    if (ca_store && ca_store->has_root()) {
+    if (ca_store && ca_store->is_open() && ca_store->has_root()) {
         const auto root = ca_store->get_root();
         const std::string on_disk = file_present(out.ca_cert)
                                         ? ("on-disk CA " + pki::fingerprint_sha256(
@@ -267,9 +267,13 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
 
     // On regeneration, purge any prior default-cert inventory rows so ca.db
     // reflects only the live set (no orphan leaves referencing a replaced root;
-    // set_root REPLACEs the single root row separately).
-    if (ca_store)
-        ca_store->delete_issued_by("system:default-certs");
+    // set_root REPLACEs the single root row separately). After B-2 this path is
+    // only reached with an EMPTY ca.db (regen against a populated root is now
+    // refused), so this normally deletes nothing — but a failed purge would leave
+    // stale rows, so surface it (#1238 should-fix: don't silently ignore the rc).
+    if (ca_store && !ca_store->delete_issued_by("system:default-certs"))
+        spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
+                     "(stale rows may remain) — continuing");
 
     auto ca_key_pem = pki::generate_private_key(pki::KeyAlgo::EcP384);
     if (!ca_key_pem)

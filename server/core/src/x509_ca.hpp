@@ -67,9 +67,10 @@ struct Validity {
 };
 
 // Validity-window helpers. NOTE (SRE): leaf/CA expiry must be alerted on before
-// it bites the fleet — root warn @365d / crit @90d; server leaf warn @30d /
-// crit @7d. A follow-up PR wires the `yuzu_server_ca_*_expiry_seconds` gauges + alert
-// rules. Assumes a 64-bit time_t (true for every current build target).
+// it bites the fleet. PR2 publishes the default set's notAfter as
+// `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` at bootstrap,
+// and the yuzu-tls alert rules (warn @7d / crit @1d, docs/prometheus/yuzu-alerts.yml)
+// fire on it. Assumes a 64-bit time_t (true for every current build target).
 [[nodiscard]] Validity validity_years_from_now(int years);
 [[nodiscard]] Validity validity_days_from_now(int days);
 

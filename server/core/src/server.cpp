@@ -230,6 +230,10 @@ public:
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
+        metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
+                          "Unix timestamp (seconds) at which a server certificate expires, by "
+                          "cert label. The yuzu-tls alert rules fire on (value - time()) < window.",
+                          "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
         metrics_.describe("yuzu_commands_dispatched_total",
@@ -1639,17 +1643,40 @@ public:
             // privilege management or gateway-upstream planes — those stay STRICT
             // even in default mode (see run() #1238 H-1). An operator-supplied
             // agent surface keeps the strict REQUIRE posture.
+            // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
+            // inside this `if (https_needs/agent_needs)` block, only after
+            // using_default_certs is set above). The /healthz ca-store check keys on
+            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // surface is active); the listener relaxation keys on the agent-specific
+            // flag. Keep them in sync if a future mixed-mode is introduced.
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
+        // so their eventual expiry is otherwise a silent outage. Publish the
+        // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
+        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
+        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
+            const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
+                                    default_cert_set_.ca_expires_at.time_since_epoch())
+                                    .count();
+            metrics_.gauge("yuzu_server_cert_expiry_timestamp_seconds", {{"cert", "default-ca"}})
+                .set(static_cast<double>(exp_ts));
+        }
         if (default_cert_set_.freshly_generated && audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
                                      .principal = "system",
                                      .principal_role = "system",
                                      .action = "server.default_certs_generated",
                                      .target_type = "server",
-                                     .target_id = default_cert_set_.ca_fingerprint_sha256,
-                                     .detail = "Generated per-install default CA + server leaves",
+                                     // #1238 should-fix: startup-posture rows key
+                                     // target_id on the feature, not a value, to
+                                     // match sibling rows; fingerprint goes in detail.
+                                     .target_id = "default-certs",
+                                     .detail = "Generated per-install default CA + server leaves; "
+                                               "ca_fingerprint=" +
+                                               default_cert_set_.ca_fingerprint_sha256,
                                      .result = "warning"});
         }
         const std::time_t exp =
