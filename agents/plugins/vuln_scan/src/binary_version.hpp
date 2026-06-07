@@ -69,9 +69,14 @@ inline std::string get_bundle_version(const std::string& app_path) {
     CFRelease(path_ref);
     if (!url)
         return {};
-    CFPropertyListRef plist_ref = CFPropertyListCreateWithURL(
-        nullptr, url, kCFPropertyListImmutable, nullptr, nullptr);
+    // Read file data from URL
+    CFDataRef data = CFDataCreateContentsOfURL(url, nullptr);
     CFRelease(url);
+    if (!data)
+        return {};
+    CFPropertyListRef plist_ref = CFPropertyListCreateWithData(
+        nullptr, data, kCFPropertyListImmutable, nullptr, nullptr);
+    CFRelease(data);
     if (!plist_ref)
         return {};
 
