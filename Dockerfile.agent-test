@@ -1,0 +1,27 @@
+# Minimal agent build for testing hardened vuln_scan
+FROM ghcr.io/tr3kkr/yuzu-builder:0.12.0 AS builder
+
+WORKDIR /src
+
+# Copy the hardened source code
+COPY . .
+
+# Build the agent with the hardened vuln_scan plugin
+RUN meson setup build-docker --buildtype=debug && \
+    meson compile -C build-docker yuzu-agent
+
+# Runtime stage
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/build-docker/agents/core/yuzu-agent /usr/local/bin/
+COPY --from=builder /src/build-docker/agents/core/plugins/*.so /opt/yuzu/plugins/
+
+RUN chmod +x /usr/local/bin/yuzu-agent
+
+# Connect to server on the Docker network
+ENTRYPOINT ["/usr/local/bin/yuzu-agent", "--server", "server:50051", "--no-tls"]
