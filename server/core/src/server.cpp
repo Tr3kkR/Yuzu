@@ -1633,9 +1633,12 @@ public:
             cfg_.tls_server_key = default_cert_set_.server_key;
             if (cfg_.tls_ca_cert.empty())
                 cfg_.tls_ca_cert = default_cert_set_.ca_cert;
-            // ONLY the agent surface being on default certs relaxes the agent
-            // listener to request-but-don't-require (per-agent mTLS is PR3). An
-            // operator-supplied agent surface keeps the strict REQUIRE posture.
+            // This flag relaxes ONLY the agent listener to request-but-don't-
+            // require on default certs, so an unenrolled agent can bootstrap before
+            // PR3 mints per-agent client certs. It does NOT relax the higher-
+            // privilege management or gateway-upstream planes — those stay STRICT
+            // even in default mode (see run() #1238 H-1). An operator-supplied
+            // agent surface keeps the strict REQUIRE posture.
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
@@ -1651,7 +1654,13 @@ public:
         }
         const std::time_t exp =
             std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
-        std::string exp_str = std::ctime(&exp);
+        // std::ctime returns nullptr on an out-of-range time_t (reachable with a
+        // 10-year expiry on a 32-bit time_t build) — constructing a std::string
+        // from nullptr is UB and would crash AFTER certs are generated. Guard it.
+        // (The banner runs once at startup, single-threaded, so ctime's shared
+        // static buffer is not a reentrancy concern here.)
+        const char* exp_c = std::ctime(&exp);
+        std::string exp_str = exp_c ? exp_c : "unknown";
         if (!exp_str.empty() && exp_str.back() == '\n')
             exp_str.pop_back();
         spdlog::error("**********************************************************************");
@@ -1717,7 +1726,31 @@ public:
                     return;
                 }
                 mgmt_creds = std::move(mgmt_tls);
+            } else if (cfg_.using_default_agent_certs) {
+                // H-1 (#1238 review): on default certs the AGENT listener relaxes
+                // to request-but-don't-require so an unenrolled agent can bootstrap
+                // before PR3 mints per-agent client certs. The management and
+                // gateway-upstream planes are higher-privilege — do NOT inherit
+                // that relaxation. Build a STRICT (require-client-cert) credential
+                // from the same default server cert/key/CA. In M1 the gRPC mgmt
+                // service is a placeholder so this locks out no real workflow; it
+                // stops the privileged plane silently accepting unauthenticated
+                // peers. A gateway (PR5) presents the default-gateway client leaf,
+                // so the gateway-upstream listener still connects.
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
+                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                if (!mgmt_tls) {
+                    spdlog::error("Management TLS credentials (strict, default certs) are invalid; "
+                                  "refusing to start");
+                    startup_failed_ = true;
+                    return;
+                }
+                mgmt_creds = std::move(mgmt_tls);
             } else {
+                // Operator-supplied agent certs: agent_creds is already strict
+                // (require_client_cert = !using_default_agent_certs = true), so the
+                // management plane safely reuses it.
                 mgmt_creds = agent_creds;
             }
         }
@@ -2912,10 +2945,16 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // (issuance / revocation / CRL). It was wired into /readyz but missing
+            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // the /readyz conjunction; trivially true when not on default certs
+            // (the operator brought their own, so ca.db isn't required).
+            bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && offload_target_ok;
+                                 guaranteed_state_ok && offload_target_ok && ca_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -2928,7 +2967,8 @@ private:
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
-                  {"offload_target", offload_target_ok ? "ok" : "error"}}},
+                  {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"ca", ca_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
