@@ -17,12 +17,39 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server::pki;
 
 namespace {
+
+// Flip one base64 char in the SIGNATURE TAIL of a CSR PEM. The signature is the
+// final DER element, so corrupting a tail content byte keeps the ASN.1 structure
+// parseable (no length byte is touched) but breaks the self-signature — so it
+// exercises sign_csr's proof-of-possession verify (X509_REQ_verify), a distinct
+// code path from the PEM-parse rejection the garbage-blob test covers.
+std::string tamper_csr_sig(std::string pem) {
+    const auto body_begin = pem.find('\n', pem.find("BEGIN"));
+    const auto body_end = pem.rfind("-----END");
+    REQUIRE(body_begin != std::string::npos);
+    REQUIRE(body_end != std::string::npos);
+    auto is_b64 = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '+' || c == '/';
+    };
+    std::vector<std::size_t> body_b64;
+    for (std::size_t i = body_begin; i < body_end; ++i)
+        if (is_b64(pem[i]))
+            body_b64.push_back(i);
+    REQUIRE(body_b64.size() > 16);
+    // ~6 base64 chars (~4-5 bytes) before the end → inside the signature value.
+    const std::size_t pos = body_b64[body_b64.size() - 6];
+    pem[pos] = (pem[pos] == 'A') ? 'B' : 'A';
+    return pem;
+}
 
 struct TestCa {
     std::string key;
@@ -272,6 +299,45 @@ TEST_CASE("x509_ca: build_crl fails closed on a bad serial", "[pki][crl][securit
     REQUIRE_FALSE(build_crl(ca.cert, ca.key, bad, validity_days_from_now(7), 3));
     std::vector<CrlRevocation> empty_serial = {{"", std::chrono::system_clock::now()}};
     REQUIRE_FALSE(build_crl(ca.cert, ca.key, empty_serial, validity_days_from_now(7), 4));
+}
+
+TEST_CASE("x509_ca: verify_chain rejects an expired leaf", "[pki][verify][negative][security]") {
+    // verify_chain must enforce the validity window (it backs the mTLS-accept
+    // gate). Issue a leaf entirely in the past and confirm it does NOT verify,
+    // even though it chains to and was signed by the CA.
+    auto ca = make_test_ca();
+    LeafParams lp;
+    lp.subject = {"agent-expired", "Yuzu"};
+    lp.usage.client_auth = true;
+    const auto now = std::chrono::system_clock::now();
+    lp.validity = Validity{now - std::chrono::hours(24 * 800), now - std::chrono::hours(24 * 400)};
+    auto kc = issue_leaf(ca.cert, ca.key, KeyAlgo::EcP256, lp);
+    REQUIRE(kc); // a past-dated leaf still issues (notAfter < CA notAfter)...
+    REQUIRE_FALSE(verify_chain(kc->cert_pem, ca.cert)); // ...but must not verify (expired)
+}
+
+TEST_CASE("x509_ca: sign_csr rejects a tampered CSR signature",
+          "[pki][leaf][negative][security]") {
+    // Proof-of-possession: a CSR whose self-signature does not match its key must
+    // be refused. This hits X509_REQ_verify — distinct from the garbage-blob test
+    // (which fails at PEM parse). The pristine CSR signs fine; flipping one byte
+    // of its signature tail (still parseable) must flip the result to rejected.
+    auto ca = make_test_ca();
+    auto key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(key);
+    CsrParams cp;
+    cp.subject = {"agent-pop", "Yuzu"};
+    auto csr = make_csr(*key, cp);
+    REQUIRE(csr);
+
+    LeafParams lp;
+    lp.subject = {"agent-pop", "Yuzu"};
+    lp.validity = validity_days_from_now(30);
+    REQUIRE(sign_csr(*csr, ca.cert, ca.key, lp)); // pristine: POP holds
+
+    const std::string tampered = tamper_csr_sig(*csr);
+    REQUIRE(tampered != *csr);
+    REQUIRE_FALSE(sign_csr(tampered, ca.cert, ca.key, lp)); // tampered: POP fails
 }
 
 TEST_CASE("x509_ca: fingerprint/parse reject non-cert input", "[pki][negative]") {
