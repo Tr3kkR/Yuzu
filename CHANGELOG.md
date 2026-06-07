@@ -103,16 +103,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent must present its leaf on the data plane, while a not-yet-provisioned or
   pre-PR3 agent keeps connecting on the prior session + peer-IP binding rather
   than being rejected. Revoked agent leaves are refused at `Subscribe`,
-  `Heartbeat`, and `DownloadUpdate` (new `yuzu_grpc_revoked_cert_total{rpc}`);
-  issuance is counted (`yuzu_server_ca_cert_issued_total`) and audited
-  (`ca.cert.issued`). New agent flags **`--cert-dir`** and
-  **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`); leaves auto-renew at
-  2/3 of their lifetime (evaluated at agent start). Built entirely on OpenSSL
-  3.x — no new cryptographic primitives. **Upgrade:** no special order is
-  required thanks to gradual enforcement; once a fleet is fully provisioned, a
-  future `--require-agent-identity` flag will be able to harden the data plane to
-  reject any agent without a per-agent cert. See `docs/auth-architecture.md`
-  "Per-agent mTLS".
+  `Heartbeat`, `DownloadUpdate`, **and `CheckForUpdate`** (new
+  `yuzu_grpc_revoked_cert_total{rpc}`), and a periodic server-side **revocation
+  sweep** tears down any *already-open* `Subscribe` stream whose leaf is revoked
+  after it connected (`rpc=stream_sweep`, audited `session.cert_revoked`
+  `source=stream_sweep`) so revocation stops an active agent without waiting for a
+  voluntary reconnect. A revoked agent also cannot silently resurrect its identity:
+  `sign_agent_csr` refuses to re-issue to an `agent_id` that has a revoked,
+  non-expired cert (audit `ca.cert.reissue_blocked`, metric
+  `yuzu_server_ca_reissue_blocked_total`), so deleting the local key and
+  re-enrolling does not bypass revocation. Every issued leaf's `notBefore` is
+  backdated 5 min so a freshly-provisioned agent with a slightly-behind clock can
+  still present its cert on the immediate reconnect. Issuance is counted
+  (`yuzu_server_ca_cert_issued_total`) and audited (`ca.cert.issued`). New agent
+  flags **`--cert-dir`** and **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`);
+  leaves auto-renew at 2/3 of their lifetime (evaluated at agent start). Built
+  entirely on OpenSSL 3.x — no new cryptographic primitives. **Known limitation:**
+  per-agent revocation is enforced on direct-connect agents only; a
+  gateway-proxied agent presents its leaf to the gateway, not the server, so
+  revoking it does not by itself cut it off the data plane until the QUIC
+  through-gateway-identity migration (#376) — disconnect at the gateway too. See
+  `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
+  **Upgrade:** no special order is required thanks to gradual enforcement; once a
+  fleet is fully provisioned, a future `--require-agent-identity` flag will be
+  able to harden the data plane to reject any agent without a per-agent cert. See
+  `docs/auth-architecture.md` "Per-agent mTLS".
 
 - **Internal CA engine + `ca.db` issuance store (PKI PR1).** New pure-OpenSSL
   PKI engine (`x509_ca`: EC keygen, self-signed root, CSR signing with

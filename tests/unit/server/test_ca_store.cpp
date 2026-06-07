@@ -335,6 +335,43 @@ TEST_CASE("CaStore: issuer_fingerprint provenance round-trips (issued + CRL)",
     REQUIRE(latest->issuer_fingerprint == "AA:BB:CC:DD");
 }
 
+TEST_CASE("CaStore: list_revoked surfaces a revoked agent cert by BARE agent_id (re-issue guard)",
+          "[ca_store][revoke][security]") {
+    // Pins the PR3 HIGH-2 guard contract (#1239): sign_agent_csr refuses to
+    // re-issue to an agent_id that has a revoked, non-expired cert by scanning
+    // list_revoked() for `rev.subject == agent_id`. CRUCIAL: sign_agent_csr stores
+    // the BARE agent_id in ca_issued.subject (server.cpp `rec.subject = agent_id;`),
+    // NOT a "CN=..." DN — so the guard's bare-vs-bare comparison matches. This test
+    // mirrors that exact storage form (the generic sample_issued helper uses a
+    // "CN=agent-..." subject, which would NOT reflect how agent certs are stored).
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    const std::string agent_id = "agent-7f3c";       // bare, as sign_agent_csr stores
+    const std::string other_id = "agent-other";
+
+    auto mk = [&](const std::string& serial, const std::string& subject) {
+        IssuedCertRecord r;
+        r.serial_hex = serial;
+        r.subject = subject; // BARE agent_id for agent certs
+        r.purpose = "agent";
+        r.not_after = now_s() + 365 * 86400; // non-expired
+        r.issued_at = now_s();
+        return r;
+    };
+    REQUIRE(store.record_issued(mk("A1", agent_id)));
+    REQUIRE(store.record_issued(mk("B2", other_id))); // different agent, left active
+    REQUIRE(store.revoke("A1", "compromised"));
+
+    const auto revoked = store.list_revoked();
+    REQUIRE(revoked.size() == 1);
+    // The exact predicate the guard evaluates (rev.subject == agent_id) is TRUE
+    // for the bare id, and the cert is non-expired → re-issue is blocked.
+    REQUIRE(revoked.front().subject == agent_id);
+    REQUIRE(revoked.front().not_after > now_s());
+    // A different, non-revoked agent_id does NOT match → its re-provision proceeds.
+    REQUIRE(revoked.front().subject != other_id);
+}
+
 // ── Atomic CRL-number allocation (Tr3kkR #1237 review) ──────────────────────
 
 TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically",

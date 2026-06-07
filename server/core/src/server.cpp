@@ -1926,6 +1926,38 @@ public:
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
+                // PR3 H-1: tear down any live Subscribe stream whose agent leaf
+                // has since been revoked. The Subscribe establishment gate runs
+                // once; without this sweep a revoked/compromised agent keeps
+                // receiving dispatched commands until it voluntarily reconnects.
+                // ~15s cadence (this thread) is well inside CRL validity windows;
+                // PR4's operator-revoke handler calls the same sweep immediately
+                // for prompt teardown. No-op unless the internal CA is active.
+                if (ca_store_ && ca_store_->is_open()) {
+                    const auto swept = registry_.sweep_revoked(
+                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
+                    if (!swept.empty()) {
+                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                     swept.size());
+                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                        // The sweep is low-frequency (fires only on actual revocations),
+                        // so a WAL row per cancelled stream is not a flood risk.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            for (const auto& aid : swept) {
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "agent:" + aid,
+                                     .principal_role = "agent",
+                                     .action = "session.cert_revoked",
+                                     .target_type = "Session",
+                                     .target_id = aid,
+                                     .detail = "reason=revoked_client_cert source=stream_sweep",
+                                     .result = "denied"});
+                            }
+                        }
+                    }
+                }
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {
                     metrics_.gauge("yuzu_server_cert_reloads_total")
@@ -2221,6 +2253,15 @@ public:
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
 
+        // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
+        // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
+        // drain above guarantees no handler is mid-invocation; null them for the
+        // same belt-and-braces reason as the tracker so a stray late call cannot
+        // touch released CA state.
+        agent_service_.set_agent_cert_signer(nullptr);
+        agent_service_.set_revocation_checker(nullptr);
+        agent_service_.set_peer_cert_recognizer(nullptr);
+
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -2376,6 +2417,52 @@ private:
             spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
             return std::nullopt;
         }
+
+        // HIGH-2 (#1239 Hermes): block revocation bypass via re-enrollment. A
+        // compromised endpoint whose leaf was revoked could otherwise delete its
+        // local key, reconnect, and trigger this CSR flow to obtain a FRESH leaf
+        // with a new serial — silently resurrecting a revoked identity. If this
+        // agent_id has a revoked, non-expired cert on record, refuse to auto-issue:
+        // clearing a revocation must be a deliberate operator action, not an
+        // automatic side effect of the agent dropping its key. A non-revoked
+        // orphan (benign key loss) is unaffected — only an ACTIVE revocation
+        // blocks re-provisioning. (sign_agent_csr is rate-limited and only runs at
+        // enrollment/renewal, so the list_revoked scan is off the hot path.)
+        //
+        // CONTRACT: ca_issued.subject for an agent cert is the BARE agent_id (set
+        // below at `rec.subject = agent_id`), NOT a "CN=..." DN — so the bare-vs-bare
+        // compare below is correct. Do NOT "fix" this into a DN parse without also
+        // changing the issuance site. Residuals (tracked, narrow): a revoke landing
+        // between this scan and signing still issues (TOCTOU — operator re-revokes;
+        // the sweep then tears it down), and list_revoked() is an O(revoked) scan
+        // (fine at realistic revocation counts; a subject-indexed query is the
+        // follow-up if it ever grows).
+        {
+            const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
+            for (const auto& rev : ca_store_->list_revoked()) {
+                if (rev.subject == agent_id && rev.not_after > now_epoch) {
+                    spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
+                                 "non-expired cert (serial {}) exists; an operator must clear "
+                                 "the revocation before this agent can re-provision",
+                                 agent_id, rev.serial_hex);
+                    metrics_
+                        .counter("yuzu_server_ca_reissue_blocked_total",
+                                 {{"reason", "revoked_identity"}})
+                        .increment();
+                    if (audit_store_ && audit_store_->is_open()) {
+                        (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                 .principal = "agent:" + agent_id,
+                                                 .principal_role = "agent",
+                                                 .action = "ca.cert.reissue_blocked",
+                                                 .target_type = "AgentCertificate",
+                                                 .target_id = rev.serial_hex,
+                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .result = "denied"});
+                    }
+                    return std::nullopt;
+                }
+            }
+        }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
         // enrollment credential could otherwise spam Register-with-CSR, each call
         // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
@@ -2432,7 +2519,11 @@ private:
 
         pki::LeafParams lp;
         lp.subject = {agent_id, "Yuzu"}; // CN=agent_id → #1118 identity match
-        lp.validity = {now, not_after};
+        // H-2: backdate not_before by the clock-skew allowance so an agent whose
+        // clock lags the server can still present this leaf on its immediate
+        // reconnect (a not-yet-valid leaf fails the handshake and the agent does
+        // not recover from clock skew). Mirrors the validity_* helpers.
+        lp.validity = {now - pki::kClockSkewBackdate, not_after};
         lp.usage = pki::LeafUsage{.client_auth = true};
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install

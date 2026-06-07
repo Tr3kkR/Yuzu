@@ -31,12 +31,14 @@ Validity validity_years_from_now(int years) {
     // of the wall-clock decade; the ±1d test tolerance in test_x509_ca absorbs
     // the leap-day rounding.
     const auto span = std::chrono::seconds(static_cast<int64_t>(years) * 31557600LL);
-    return Validity{now, now + span};
+    // not_before backdated by kClockSkewBackdate (H-2) so a slightly-behind peer
+    // can still validate a just-issued cert.
+    return Validity{now - kClockSkewBackdate, now + span};
 }
 
 Validity validity_days_from_now(int days) {
     const auto now = std::chrono::system_clock::now();
-    return Validity{now, now + std::chrono::hours(24 * days)};
+    return Validity{now - kClockSkewBackdate, now + std::chrono::hours(24 * days)};
 }
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT

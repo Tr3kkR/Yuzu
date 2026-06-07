@@ -102,6 +102,31 @@ TEST_CASE("x509_ca: self-signed CA shape and validity", "[pki][ca]") {
     REQUIRE(std::abs(span - ten_years) < 86400); // within a day
 }
 
+TEST_CASE("x509_ca: notBefore is backdated by the clock-skew allowance (H-2)",
+          "[pki][validity]") {
+    using namespace std::chrono;
+    // The CA (minted via validity_years_from_now) backdates notBefore by
+    // kClockSkewBackdate (300s) so a slightly-behind peer can still validate a
+    // just-issued chain. now() is captured AFTER minting, so now - notBefore >= 300s.
+    auto ca = make_test_ca("Yuzu Skew CA");
+    auto d = parse_certificate(ca.cert);
+    REQUIRE(d);
+    const auto now = system_clock::now();
+    REQUIRE(d->not_before <= now - seconds(280)); // backdated (280 leaves test-exec slack)
+    REQUIRE(d->not_before >= now - seconds(900)); // but not absurdly far back
+
+    // A leaf minted via validity_days_from_now is backdated too (covers both helpers).
+    LeafParams lp;
+    lp.subject = {"skew-leaf", "Yuzu"};
+    lp.validity = validity_days_from_now(365);
+    lp.usage.client_auth = true;
+    auto leaf = issue_leaf(ca.cert, ca.key, KeyAlgo::EcP256, lp);
+    REQUIRE(leaf);
+    auto ld = parse_certificate(leaf->cert_pem);
+    REQUIRE(ld);
+    REQUIRE(ld->not_before <= now - seconds(280));
+}
+
 TEST_CASE("x509_ca: sign CSR produces a verifiable leaf", "[pki][leaf]") {
     auto ca = make_test_ca();
     auto leaf_key = generate_private_key(KeyAlgo::EcP256);
