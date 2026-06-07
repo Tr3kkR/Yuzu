@@ -50,6 +50,12 @@ const char* event_state_from_type(const std::string& t) {
         return "compliant";
     if (t == "drift.detected")
         return "drifted";
+    // Slice-B collapse (deliberate): guardian-mvp-contract.md §4/decision-5 lists
+    // `remediation_failed` as a state DISTINCT from `errored`, but the Slice-B census
+    // exposes only compliant/drifted/errored and both render red in the worst-of badge.
+    // No fidelity is lost today because Slice C (remediate) does not yet EMIT
+    // remediation.failed. When it does, give it its own census state rather than
+    // reusing "errored" (tracked as a Slice-C follow-up).
     if (t == "remediation.failed" || t == "guard.unhealthy")
         return "errored";
     return nullptr; // guard.armed, resilience.escalated, … — no census change

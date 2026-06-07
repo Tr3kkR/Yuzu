@@ -489,13 +489,27 @@ TEST_CASE("guard /page escapes a hostile severity in the class attribute",
 // The agent-side Guardian arms guards on Windows only today; an operator must never
 // read a connected Mac as compliant/protected when it enforces nothing.
 
+// Deploy `guard_id` via a fresh Baseline so it actually reaches the fleet — the
+// not-implemented surfaces are gated on deployment (a draft Guard reaches no device).
+namespace {
+void deploy_via_baseline(Harness& h, const std::string& guard_id, const std::string& bid = "bl1") {
+    h.seed_baseline(bid, bid, {guard_id});
+    auto dep = h.sink.dispatch("POST", "/fragments/guardian/baseline/" + bid + "/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(dep != nullptr);
+    REQUIRE(dep->status == 200);
+}
+} // namespace
+
 TEST_CASE("overview reports macOS agents as not-implemented, never compliant",
           "[guardian_routes][platform][notimpl]") {
     Harness h;
-    // A Guard that targets ALL OSes (empty os_target) so it also targets the Mac.
+    // A Guard that targets ALL OSes (empty os_target) so it also targets the Mac,
+    // delivered by a DEPLOYED Baseline (not-implemented is gated on deployment).
     auto rule = make_rule("g1", "GuardOne");
     rule.os_target = "";
     REQUIRE(h.store->create_rule(rule));
+    deploy_via_baseline(h, "g1");
     // One connected macOS agent (the agent reports os="darwin"); no Windows agents.
     h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
 
@@ -523,16 +537,41 @@ TEST_CASE("overview reports macOS agents as not-implemented, never compliant",
     }
 }
 
-TEST_CASE("a Windows-only Guard does not list connected macOS agents at all",
+TEST_CASE("an UNDEPLOYED all-OS Guard does not inflate the not-implemented census",
+          "[guardian_routes][platform][notimpl]") {
+    Harness h;
+    auto rule = make_rule("g1", "GuardOne");
+    rule.os_target = "";  // targets macOS…
+    REQUIRE(h.store->create_rule(rule));
+    // …but it is a member of no deployed Baseline, so it reaches no device.
+    h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+
+    SECTION("fleet census shows no not-implemented class for the undeployed guard") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        // The capability banner still notes the connected Mac…
+        CHECK(res->body.find("Windows only") != std::string::npos);
+        // …but the per-device-guard census has no not-implemented pairs (nothing deployed).
+        CHECK(res->body.find("Not implemented") == std::string::npos);
+    }
+    SECTION("per-device drill-down lists no devices for the undeployed guard") {
+        auto res = h.sink.Get("/fragments/guardian/guard/g1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") == std::string::npos);
+        CHECK(res->body.find("macbook") == std::string::npos);
+    }
+}
+
+TEST_CASE("a deployed Windows-only Guard does not list connected macOS agents",
           "[guardian_routes][platform][notimpl]") {
     Harness h;
     auto rule = make_rule("g1", "WinGuard");  // make_rule sets os_target = "windows"
     REQUIRE(h.store->create_rule(rule));
+    deploy_via_baseline(h, "g1");
     h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
 
-    // The guard targets Windows only, so the Mac is out of scope — it is neither
-    // listed as a device nor flagged not-implemented (it isn't a deployed-but-unarmed
-    // pair; the guard was never meant for it).
+    // Even deployed, the guard targets Windows only, so the Mac is out of scope — not
+    // listed as a device and not flagged not-implemented (os_target excludes it).
     auto res = h.sink.Get("/fragments/guardian/guard/g1/page");
     REQUIRE(res != nullptr);
     CHECK(res->body.find("not yet implemented") == std::string::npos);

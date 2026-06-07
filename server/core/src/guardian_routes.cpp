@@ -230,26 +230,12 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
 // By-Guard/By-Baseline "N not impl" tags, and the per-device drill-down.
 constexpr const char* kNotImplColor = "#a78bfa";  // violet
 
-// Currently-connected agent_ids, parsed from the registry JSON (registry_.to_json()).
-// Used to fold liveness: a status row whose agent is NOT here is "unknown" (offline →
-// can't verify). The count of online agents is just the set size.
-std::unordered_set<std::string> parse_online_agents(const std::string& agents_json) {
-    std::unordered_set<std::string> online;
-    auto j = nlohmann::json::parse(agents_json, nullptr, false);
-    const nlohmann::json* arr =
-        j.is_array() ? &j
-        : (j.is_object() && j.contains("agents") && j["agents"].is_array()) ? &j["agents"] : nullptr;
-    if (arr)
-        for (const auto& a : *arr)
-            if (a.contains("agent_id") && a["agent_id"].is_string())
-                online.insert(a["agent_id"].get<std::string>());
-    return online;
-}
-
 // agent_id -> raw platform token ("windows"|"linux"|"darwin"|...) for currently-
-// connected agents, from the same registry JSON. Used to flag agents on platforms
-// the agent-side Guardian does not arm yet (macOS/Linux) so they are reported
-// "not yet implemented" rather than silently looking compliant/unknown.
+// connected agents, parsed from the registry JSON (registry_.to_json()). Used both to
+// fold liveness (a status row whose agent_id is absent is "unknown" — offline, can't
+// verify) and to flag agents on platforms the agent-side Guardian does not arm yet
+// (macOS/Linux), so they are reported "not yet implemented" rather than silently
+// looking compliant/unknown. Callers derive the online-id set from its keys.
 std::unordered_map<std::string, std::string> parse_online_agent_os(const std::string& agents_json) {
     std::unordered_map<std::string, std::string> m;
     auto j = nlohmann::json::parse(agents_json, nullptr, false);
@@ -320,24 +306,32 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
 
     const auto rules = store_->list_rules();
     auto by_rule = rollup_by_rule(store_->agent_rule_statuses(), online);
-    // Fold "not yet implemented": for each live rule, every ONLINE agent the rule
-    // targets whose platform Guardian cannot arm (macOS/Linux today) is a deployed-
-    // but-unenforced (agent, rule) pair. Counted here so the census, the By-Guard /
-    // By-Baseline "state now" cells, and the fleet rollup all reflect it — never as
-    // compliant, never as offline-unknown. (Unsupported agents emit no compliance
-    // events, so they own no status row and cannot be double-counted.)
-    for (const auto& r : rules)
-        for (const auto& [aid, aos] : online_os)
-            if (!guardian::guardian_enforced_on_platform(aos) &&
-                guardian::os_target_matches(r.os_target, aos))
-                ++by_rule[r.rule_id].notimpl;
 
-    // Deployed Baselines per rule (coverage + per-Guard "deployed").
+    // Deployed Baselines per rule (coverage + per-Guard "deployed"). Computed BEFORE
+    // the not-implemented fold because the fold is gated on deployment (below).
     std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> deployed_by_rule;
     if (baseline_store_ && baseline_store_->is_open())
         for (const auto& b : baseline_store_->list_deployed_baselines())
             for (const auto& rid : baseline_store_->get_members(b.baseline_id))
                 deployed_by_rule[rid].emplace_back(b.baseline_id, b.name);
+
+    // Fold "not yet implemented": for each rule that is a member of a DEPLOYED
+    // Baseline, every ONLINE agent the rule targets whose platform Guardian cannot
+    // arm (macOS/Linux today) is a deployed-but-unenforced (agent, rule) pair.
+    // Counted here so the census, the By-Guard / By-Baseline "state now" cells, and
+    // the fleet rollup all reflect it — never as compliant, never as offline-unknown.
+    // GATED ON DEPLOYMENT (matching the coverage cards): a draft Guard in no deployed
+    // Baseline reaches no device, so it owns no device-guard pairs and must not
+    // inflate the census denominator / depress the headline % compliant. (Unsupported
+    // agents emit no compliance events, so they own no status row — no double-count.)
+    for (const auto& r : rules) {
+        if (!deployed_by_rule.count(r.rule_id))
+            continue;
+        for (const auto& [aid, aos] : online_os)
+            if (!guardian::guardian_enforced_on_platform(aos) &&
+                guardian::os_target_matches(r.os_target, aos))
+                ++by_rule[r.rule_id].notimpl;
+    }
 
     auto sech = [](const std::string& t) {
         return "<div style=\"font-size:0.66rem;text-transform:uppercase;letter-spacing:0.06em;"
@@ -1525,6 +1519,23 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
                              ? rollup_by_rule(store_->agent_rule_statuses(), online)
                              : std::unordered_map<std::string, StateRollup>{};
 
+    // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
+    // the member labels below) so the page does not issue a get_rule() per member.
+    std::unordered_map<std::string, GuaranteedStateRuleRow> rule_by_id;
+    if (store_ && store_->is_open())
+        for (auto& r : store_->list_rules()) {
+            const std::string id = r.rule_id;
+            rule_by_id.emplace(id, std::move(r));
+        }
+    // Rules delivered by at least one DEPLOYED Baseline — the not-implemented count is
+    // gated on this (the same deployment gate as the fleet census), so a draft member
+    // never inflates the chip and this page can never disagree with the By-Baseline row.
+    std::unordered_set<std::string> deployed_rules;
+    if (baseline_store_ && baseline_store_->is_open())
+        for (const auto& db : baseline_store_->list_deployed_baselines())
+            for (const auto& mid : baseline_store_->get_members(db.baseline_id))
+                deployed_rules.insert(mid);
+
     StateRollup total;
     int64_t det = 0, rem = 0, fail = 0;
     int guards_drifting = 0, guards_ok = 0, enforce_members = 0;
@@ -1538,16 +1549,17 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         if (auto it = act.find(rid); it != act.end()) {
             det += it->second->detected; rem += it->second->remediated; fail += it->second->failed;
         }
-        if (store_ && store_->is_open())
-            if (auto r = store_->get_rule(rid)) {
-                if (r->enforcement_mode == "enforce") ++enforce_members;
-                // Member guards targeting ONLINE agents on a platform Guardian can't
-                // arm yet (macOS/Linux) → not-implemented, never compliant (acb332a parity).
+        if (auto it = rule_by_id.find(rid); it != rule_by_id.end()) {
+            if (it->second.enforcement_mode == "enforce") ++enforce_members;
+            // Member guards (delivered by a deployed Baseline) targeting ONLINE agents
+            // on a platform Guardian can't arm yet (macOS/Linux) → not-implemented,
+            // never compliant (acb332a parity), gated on deployment like the census.
+            if (deployed_rules.count(rid))
                 for (const auto& [aid, aos] : online_os)
                     if (!guardian::guardian_enforced_on_platform(aos) &&
-                        guardian::os_target_matches(r->os_target, aos))
+                        guardian::os_target_matches(it->second.os_target, aos))
                         ++total.notimpl;
-            }
+        }
     }
     const int64_t obs_total = total.total();  // includes notimpl
     const int pct = obs_total > 0 ? static_cast<int>((total.ok * 100) / obs_total) : 0;
@@ -1655,12 +1667,11 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         for (const auto& rid : members) {
             std::string name = rid, sev;
             bool enf = false;
-            if (store_ && store_->is_open())
-                if (auto r = store_->get_rule(rid)) {
-                    if (!r->name.empty()) name = r->name;
-                    sev = r->severity;
-                    enf = (r->enforcement_mode == "enforce");
-                }
+            if (auto it = rule_by_id.find(rid); it != rule_by_id.end()) {
+                if (!it->second.name.empty()) name = it->second.name;
+                sev = it->second.severity;
+                enf = (it->second.enforcement_mode == "enforce");
+            }
             StateRollup c;
             if (auto it = by_rule.find(rid); it != by_rule.end()) c = it->second;
             std::string rowstate, state;
@@ -1698,7 +1709,8 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
             for (const auto& e : store_->query_events(q)) {
                 if (!member_set.count(e.rule_id)) continue;
                 std::string gname = e.rule_id;
-                if (auto r = store_->get_rule(e.rule_id); r && !r->name.empty()) gname = r->name;
+                if (auto it = rule_by_id.find(e.rule_id); it != rule_by_id.end() && !it->second.name.empty())
+                    gname = it->second.name;
                 evs += "<div class=\"gp-ev\"><span class=\"t\">" + html_escape(e.timestamp.substr(0, 19)) +
                        "</span><span class=\"gp-badge\">" + html_escape(e.event_type) + "</span><span>" +
                        html_escape(gname) + " &middot; <b>" + html_escape(e.agent_id.substr(0, 12)) +
@@ -1810,20 +1822,23 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         }
         // Connected agents this guard targets but whose platform Guardian cannot arm
         // yet (macOS/Linux) — they own no status row; surface them as "not implemented"
-        // so a Mac never silently looks compliant or is omitted (acb332a parity).
-        for (const auto& [aid, aos] : agent_os) {
-            if (seen.count(aid)) continue;
-            if (guardian::guardian_enforced_on_platform(aos)) continue;
-            if (!guardian::os_target_matches(os_target_raw, aos)) continue;
-            DevRow d;
-            d.online = true;
-            d.agent_id = aid;
-            d.host = !hostname[aid].empty() ? hostname[aid] : aid.substr(0, 12);
-            d.state = "not-implemented";
-            d.updated = guardian::platform_display_name(aos);  // platform name in the "As of" slot
-            ++d_notimpl;
-            devs.push_back(std::move(d));
-        }
+        // so a Mac never silently looks compliant or is omitted (acb332a parity). Gated
+        // on the guard being DEPLOYED (baseline_count > 0): a draft Guard reaches no
+        // device, so it has no not-implemented device-guard pairs to show.
+        if (baseline_count > 0)
+            for (const auto& [aid, aos] : agent_os) {
+                if (seen.count(aid)) continue;
+                if (guardian::guardian_enforced_on_platform(aos)) continue;
+                if (!guardian::os_target_matches(os_target_raw, aos)) continue;
+                DevRow d;
+                d.online = true;
+                d.agent_id = aid;
+                d.host = !hostname[aid].empty() ? hostname[aid] : aid.substr(0, 12);
+                d.state = "not-implemented";
+                d.updated = guardian::platform_display_name(aos);  // platform name in the "As of" slot
+                ++d_notimpl;
+                devs.push_back(std::move(d));
+            }
         auto rank = [](const std::string& st) {
             return st == "drifted" ? 0 : st == "errored" ? 1 : st == "compliant" ? 2
                    : st == "not-implemented" ? 3 : 4;
