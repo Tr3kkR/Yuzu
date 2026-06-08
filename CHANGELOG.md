@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Compliance policies now actually evaluate (check → verdict pipeline).**
+  Authored policies + fragments could be created, but nothing evaluated them —
+  `PolicyStore::update_agent_status` had no caller and no trigger fired, so
+  `get_fleet_compliance` / `get_compliance_summary` always read 0%. A new
+  background `PolicyEvaluator` (`server/core/src/policy_evaluator.{hpp,cpp}`)
+  closes the gap: on a cadence it finds enabled policies whose interval has
+  elapsed, resolves scope/management-groups to agents, dispatches the fragment's
+  `check` instruction (via the shared command-dispatch path), then collects each
+  agent's response, evaluates the CEL `check_compliance`, and writes
+  `compliant` / `non_compliant` / `unknown` / `error` per agent. Two new
+  operator-gated endpoints: `POST /api/policies/{id}/evaluate` (force an
+  immediate check) and `POST /api/policies/{id}/remediate` (manual, opt-in
+  remediation — dispatches the fragment's `fix`, then verifies via `postCheck`;
+  only available when the fragment defines a `fix` instruction, surfaced as
+  `remediation_available` on the policy detail). Remediation is never automatic.
+  Audit actions `policy.evaluate` / `policy.remediate`. Hardening from the
+  governance pass: an empty `check_compliance` is scored `error` (never a false
+  `compliant`); a fresh verdict invalidates the 60s fleet-compliance cache so it
+  surfaces promptly; the evaluator's `polchk-*` correlation ids are skipped by
+  the execution-tracker notifier (no phantom executions / SSE — compliance is
+  not in the executions drawer); stranded `fixing` rows are reset to `unknown`
+  on restart; the background dispatch never holds the evaluator lock across the
+  (blocking) command dispatch; the interval is clamped to a ≥60s floor; the
+  evaluation thread is exception-isolated and joined before stores tear down
+  (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
+  intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
+  / `yuzu_server_policy_eval_errors_total` metrics.
+
 - **`vuln_scan` kernel CVE detection (`kernel_scan` action)** — Detects CVEs
   targeting the running kernel via `uname -r` (Linux), registry CurrentBuildNumber
   (Windows), or `sw_vers` (macOS). Findings returned by severity.
@@ -57,12 +85,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
+  responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
+  agent/device selector panel (`.scope`) on any browser window 1280px wide or
+  narrower — a common laptop resolution — making connected agents invisible
+  until the operator widened the window past ~1400px. The rule was inherited
+  from an unrelated `.main-grid` layout. Now only the optional history rail is
+  hidden at that breakpoint; the scope panel reflows to a two-column layout and
+  stays fully accessible. The 1281–1440px band also received grid hardening
+  (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
+  minimum content size can no longer push the panel off-screen.
+
 - **Version comparison correctness for Debian epochs, RPM/Alpine suffixes, and
   semver pre-release strings** — The CVE matching engine now correctly handles
   version strings like `2:1.0.1-2ubuntu3` (Debian epoch override), `1.0.1-1.el8`
   (RPM release suffix), `9.7p1-r3` (Alpine), and `3.0.6-rc1` (semver pre-release).
   Epochs are authoritative (`2:1.0.0 > 1.99.99`); release suffixes and pre-release
   qualifiers do not affect ordering.
+
+### Tests
+
+- `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
+  `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
+  → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
+  eval-error → `error`, empty-CEL → `error` (no false compliant), interval
+  throttling, remediation fix→verify→compliant, remediation rejected without a
+  `fix`, the 3-attempt remediation cap → `error`, and verify-dispatch-failure →
+  `error`. Real stores on `TempDbFile`, a static management group for targets, a
+  fake dispatch that seeds canned responses, and an injectable clock.
 
 ## [0.12.0] - 2026-05-03
 
