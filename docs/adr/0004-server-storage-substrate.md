@@ -53,6 +53,15 @@ paths don't need a graph-native store).
 - **Secrets caveat (load-bearing):** "off-box durable state" ≠ "secrets in a Postgres
   column." Secrets require envelope encryption / KMS / `pgcrypto`, a separate decision and a
   `security-guardian` review. Do not let this ADR quietly become "we put secrets in a table."
+- **Auth/CA stores stay SQLite (scope fence, load-bearing):** the identity and credential
+  stores — `auth.db` (AuthDB invariants: file-mode, migration, lifetime, seed-vs-live) and
+  `ca.db` (`CaStore` + the PKI `key_ref` / `KeyProvider` seam, where the CA root private key
+  is *never* in the DB) — are **explicitly out of scope** for this substrate. This ADR covers
+  the *derived scored graph + offline-state*, not identity or credentials. Any move of
+  `auth.db`/`ca.db` to Postgres is a **separate decision** requiring `authdb` +
+  `security-guardian` + PKI review. The "secrets want an off-box home" driver in the Context
+  motivates Postgres for the graph; it must **not** be read as license to migrate the auth/CA
+  stores by the side door.
 - Federated-pull + offline-answering tension is resolved here: the server persists
   **last-known summaries** so offline hosts still appear (stale-flagged); fresh detail is
   online-only.
