@@ -325,6 +325,42 @@ approval workflow. Full cryptographic agent-to-gateway identity (so the gateway
 can't forge an agent) arrives with the through-gateway attestation work gated on
 PR5d / the QUIC migration (#376).
 
+#### End-to-end enablement runbook (manual / interim)
+
+The shipped composes are still plaintext (the automated flip is tracked in
+issue **#1289**). To stand up an **encrypted** agent↔gateway↔server stack from the
+current artifacts today, wire it by hand in this order:
+
+```bash
+# 0. Server first boot generates the install CA + default-gateway leaf under the
+#    cert dir. If agents reach the gateway by a name/VIP, mint the leaf with that
+#    SAN so SNI verification passes:
+yuzu-server --cert-san dns:gateway --cert-san dns:gw.corp.example
+#    (repeatable; dns:/ip: prefixes, or a bare value auto-classified. Copy the
+#    issuing CA out for step 2:)
+cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
+
+# 1. Point the gateway's upstream at the server over mutual TLS (PR5) and turn on
+#    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
+#      {grpcbox,[{client,...,{https,...,[{ssl_options,...}]}}]}   % upstream mTLS
+#      listener transport_opts => #{ssl=>true, certfile, keyfile, cacertfile,
+#                                   verify=>verify_none, fail_if_no_peer_cert=>false}
+#    (needs the vendored _checkouts/grpcbox — the image build asserts it.)
+
+# 2. Distribute install-ca.pem to every agent and have them dial the gateway over
+#    TLS, verifying that CA:
+yuzu-agent --server gateway:50051 --ca-cert /etc/yuzu/install-ca.pem \
+           --enrollment-token "$TOKEN"
+
+# 3. ONLY after every agent has the CA + dials TLS, flip the listener live
+#    (restart the gateway). Enabling it ahead of step 2 disconnects the fleet.
+```
+
+Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
+connects and enrolls; `openssl s_client -connect gateway:50051` presents the
+`default-gateway` leaf. Direct agent→server (no gateway) is already full mTLS and
+needs none of this.
+
 ### Distribution Cookie (Required in Production)
 
 The gateway enables Erlang distribution (`-name` in `config/vm.args.src`) for

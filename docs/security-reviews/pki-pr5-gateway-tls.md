@@ -50,7 +50,7 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
 
 | ID | Risk | Likelihood | Impact | Compensating control | Remediation |
 |---|---|---|---|---|---|
-| **R-1** | **Plaintext agent↔gateway listener (`:50051`).** On an untrusted-network-exposed gateway, an on-path attacker can inject `CommandRequest`s (fleet RCE), read inventory, or impersonate the gateway. No transport auth/confidentiality on that hop. | Med (deployment-dependent) | **Critical** | Deployment-layer: TLS-terminating proxy in front of `:50051`, or keep on a trusted network (VPN/private subnet/mesh). Documented in `gateway.md`, `security-hardening.md`, `sys.config.prod`, CHANGELOG. Direct agent→server is full mTLS. | **PR5c SHIPPED the native fix's capability** — a vendored+patched grpcbox (`_checkouts/grpcbox`) enables one-way (server-authenticated) TLS on the agent listener (encrypted + gateway-authenticated, no client cert, bootstrap-safe), turned on in `sys.config.prod`. Residual: live-wiring + CA-to-agent distribution in **PR5b** (shipped composes plaintext until then → the deployment mitigation still applies). QUIC (#376) is the longer-term path. |
+| **R-1** | **Plaintext agent↔gateway listener (`:50051`).** On an untrusted-network-exposed gateway, an on-path attacker can inject `CommandRequest`s (fleet RCE), read inventory, or impersonate the gateway. No transport auth/confidentiality on that hop. | Med (deployment-dependent) | **Critical** | Deployment-layer: TLS-terminating proxy in front of `:50051`, or keep on a trusted network (VPN/private subnet/mesh). Documented in `gateway.md`, `security-hardening.md`, `sys.config.prod`, CHANGELOG. Direct agent→server is full mTLS. | **PR5c SHIPPED the capability** — a vendored+patched grpcbox (`_checkouts/grpcbox`) enables one-way (server-authenticated) TLS on the agent listener (encrypted + gateway-authenticated, no client cert, bootstrap-safe), turned on in `sys.config.prod`. **R-1 stays OPEN:** the actual *live flip* (compose `--no-tls` removal + shared cert volume + CA-to-agent distribution + the agent fail-closed guard) is **NOT delivered by any merged PR** — PR5b shipped only `--cert-san` + the container cert-dir fix, not the flip. Owned by **#1289**; the deployment-layer mitigation is mandatory until it lands. QUIC (#376) is the longer-term path. |
 | **R-2** | **`YUZU_GW_TLS_*` env vars are inert** — they set an advisory `yuzu_gw` env nothing consumes; an operator may believe they enabled TLS. | Low | Med (plaintext upstream by surprise) | `log_tls_state/0` warns unconditionally when the env is set; fail-closed guard catches the resulting `unverified`/plaintext on the upstream. | Env-substituted `sys.config.src` so `YUZU_GW_TLS_*` drive grpcbox cert paths (P1 before any gateway-enabled enterprise deployment guide). |
 | **R-3** | **Upstream-TLS failures are not distinctly observable** — expired/wrong-SAN cert / missing volume collapse to a generic circuit-open; an operator can't tell "cert broke" from "server down". | Med | Med (extended incident / MTTR) | Existing circuit-breaker telemetry + `/readyz` 503; startup posture log. | Dedicated `yuzu_gw_upstream_tls_handshake_failures_total` counter + runtime posture gauge (follow-up F-1). |
 | **R-4** | **Cert-SAN ↔ dial-name** mismatch silently strands a cross-host gateway (OTP enforces SNI under `verify_peer`). | Med | Med | Documented SAN/`hostname:` requirement in `sys.config.prod` + `pki-architecture.md`. | `--cert-san` flag to add SANs to default certs — **SHIPPED (PR5b)**. |
@@ -69,17 +69,19 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
 > by Yuzu's internal CA). When the optional Erlang gateway scale-out plane is deployed,
 > the gateway-to-server upstream is also mutual TLS. The gateway agent listener now
 > supports server-authenticated (one-way) TLS (PKI PR5c — capability shipped in
-> `sys.config.prod` via a vendored patched grpcbox); distributing the CA to agents and
-> wiring the deployed composes is PR5b. Until PR5b, any internet-exposed gateway
-> deployment must protect that hop at the network layer (TLS-terminating proxy or
-> private/VPN network). Direct-connect deployments (no gateway) are fully encrypted
+> `sys.config.prod` via a vendored patched grpcbox). Distributing the CA to agents
+> and flipping the deployed composes to TLS is **not yet shipped** (tracked in
+> issue #1289). Until it lands, any internet-exposed gateway deployment must
+> protect that hop at the network layer (TLS-terminating proxy or private/VPN
+> network). Direct-connect deployments (no gateway) are fully encrypted
 > end-to-end.
 
 ## Verdict
 
 Net security improvement; no CRITICAL/HIGH unresolved. R-1's native fix **capability shipped
-in PR5c** (one-way TLS on the agent listener); the residual until **PR5b** wires it live +
-distributes the CA is a **documented, deployment-mitigated** risk, acceptable for M1 provided
-the network-layer mitigation is enforced for any exposed gateway. The shipped reference config
+in PR5c** (one-way TLS on the agent listener); the residual until the live flip + CA
+distribution lands (**tracked in #1289 — owned, not orphaned**) is a **documented,
+deployment-mitigated** risk, acceptable for M1 provided the network-layer mitigation is
+enforced for any exposed gateway. The shipped reference config
 + proto fix are unit-proven (PR5: 194 eunit; PR5c: 200 eunit, dialyzer clean, real EC mutual-
 and one-way-TLS handshakes).
