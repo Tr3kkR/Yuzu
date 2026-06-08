@@ -954,6 +954,54 @@ bool cert_is_ca(std::string_view cert_pem) {
     return X509_check_ca(cert.get()) == 1;
 }
 
+bool verify_chain_to_bundle(std::string_view cert_pem, std::string_view bundle_pem) {
+    X509_ptr target = load_cert(cert_pem);
+    if (!target) {
+        log_ssl_errors("verify_chain_to_bundle load target");
+        return false;
+    }
+    BIO_ptr bio = make_mem_bio(bundle_pem);
+    if (!bio)
+        return false;
+    X509_STORE_ptr store{X509_STORE_new()};
+    if (!store) {
+        log_ssl_errors("verify_chain_to_bundle store");
+        return false;
+    }
+    // Add EVERY cert in the bundle as a trust anchor so a parent chain of any
+    // depth (enterprise root [+ intermediates]) that roots `target` validates.
+    // The operator is Security:Write-authorised and chose this hierarchy; this
+    // check confirms the uploaded material is self-consistent and actually signs
+    // our intermediate, not that any particular cert is independently trusted.
+    int added = 0;
+    for (;;) {
+        X509_ptr c{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
+        if (!c)
+            break; // no more certs (or a parse boundary) — stop
+        if (X509_STORE_add_cert(store.get(), c.get()) == 1)
+            ++added;
+    }
+    // Clear the benign "no start line" EOF error PEM_read_bio_X509 leaves when it
+    // runs off the end of the bundle, so it doesn't masquerade as a real failure.
+    ERR_clear_error();
+    if (added == 0) {
+        spdlog::warn("x509_ca: verify_chain_to_bundle — no certs parsed from bundle");
+        return false;
+    }
+    X509_STORE_CTX_ptr ctx{X509_STORE_CTX_new()};
+    if (!ctx || X509_STORE_CTX_init(ctx.get(), store.get(), target.get(), nullptr) != 1) {
+        log_ssl_errors("verify_chain_to_bundle ctx");
+        return false;
+    }
+    const int rc = X509_verify_cert(ctx.get());
+    if (rc != 1) {
+        const int err = X509_STORE_CTX_get_error(ctx.get());
+        spdlog::warn("x509_ca: verify_chain_to_bundle failed: {}",
+                     X509_verify_cert_error_string(err));
+    }
+    return rc == 1;
+}
+
 #else // !CPPHTTPLIB_OPENSSL_SUPPORT — stubs
 
 static std::optional<std::string> unavailable() {
@@ -994,6 +1042,10 @@ bool cert_matches_key(std::string_view, std::string_view) {
     return false;
 }
 bool cert_is_ca(std::string_view) {
+    (void)unavailable();
+    return false;
+}
+bool verify_chain_to_bundle(std::string_view, std::string_view) {
     (void)unavailable();
     return false;
 }

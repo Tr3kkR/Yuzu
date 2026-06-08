@@ -2673,7 +2673,121 @@ private:
                                      // catches issuance alongside revoke/publish.
                                      .result = "success"});
         }
-        return std::make_pair(issued->cert_pem, root->cert_pem);
+        // The issued chain is our issuing cert PLUS, in subordinate mode (PR6),
+        // the parent chain above it — so the agent receives a full path to the
+        // corporate trust anchor. chain_pem is empty in Builtin mode, leaving the
+        // M1 single-cert behaviour unchanged.
+        return std::make_pair(issued->cert_pem, root->cert_pem + root->chain_pem);
+    }
+
+    /// PR6 subordinate-CA: export the install CA's CSR (PKCS#10 PEM) over its
+    /// EXISTING key, with the CA's own subject, for an enterprise root to sign
+    /// into a subordinate-CA intermediate. Returns nullopt on no-CA / key-load /
+    /// CSR-build failure. The CA key is loaded transiently and zeroed on every
+    /// exit path (same custody discipline as sign_agent_csr).
+    std::optional<std::string> export_ca_csr() {
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root) {
+            spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
+            return std::nullopt;
+        }
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — CSR not exported");
+            return std::nullopt;
+        }
+        struct KeyZero {
+            std::string& s;
+            ~KeyZero() { yuzu::secure_zero(s); }
+        } ca_key_zero{*ca_key};
+
+        // Subject = our CA's existing subject so the signed intermediate keeps the
+        // same DN (authorityKeyIdentifier on previously-issued leaves is derived
+        // from the issuer KEY, which is unchanged, so they keep validating; the
+        // matching DN keeps the human-facing identity stable too).
+        auto details = pki::parse_certificate(root->cert_pem);
+        pki::CsrParams cp;
+        cp.subject = details ? details->subject
+                             : pki::DistinguishedName{"Yuzu Internal CA", "Yuzu"};
+        return pki::make_csr(*ca_key, cp);
+    }
+
+    /// PR6 subordinate-CA: validate an enterprise-signed intermediate and, on
+    /// success, switch the issuing identity to subordinate mode. The validation is
+    /// the security crux — an operator could otherwise re-root the install at an
+    /// attacker-chosen hierarchy or an issuing cert whose key we don't hold:
+    ///   1. parseable cert,
+    ///   2. is a CA (basicConstraints CA:TRUE) — else it cannot sign leaves,
+    ///   3. carries OUR CA public key — proof the enterprise signed the CSR we
+    ///      exported, and that we still hold the matching private key, and
+    ///   4. verifies up to the uploaded parent chain.
+    /// Only then does it set_root (cert=intermediate, chain=parent, mode=
+    /// Subordinate); the issuing KEY (key_ref) is unchanged.
+    CaRoutes::ImportOutcome import_subordinate_chain(const std::string& intermediate_pem,
+                                                     const std::string& parent_chain_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return CaRoutes::ImportOutcome::StoreError;
+        auto root = ca_store_->get_root();
+        if (!root)
+            return CaRoutes::ImportOutcome::NoRoot;
+
+        auto details = pki::parse_certificate(intermediate_pem);
+        if (!details)
+            return CaRoutes::ImportOutcome::BadIntermediate;
+        if (!pki::cert_is_ca(intermediate_pem))
+            return CaRoutes::ImportOutcome::NotCa;
+
+        // Load the CA key transiently (zeroed on exit) to prove the intermediate
+        // carries our public key.
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — subordinate import refused");
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        struct KeyZero {
+            std::string& s;
+            ~KeyZero() { yuzu::secure_zero(s); }
+        } ca_key_zero{*ca_key};
+
+        if (!pki::cert_matches_key(intermediate_pem, *ca_key))
+            return CaRoutes::ImportOutcome::KeyMismatch;
+        if (!pki::verify_chain_to_bundle(intermediate_pem, parent_chain_pem))
+            return CaRoutes::ImportOutcome::ChainInvalid;
+
+        auto fp = pki::fingerprint_sha256(intermediate_pem);
+        if (!fp)
+            return CaRoutes::ImportOutcome::BadIntermediate;
+
+        // Switch the issuing identity. Keep key_ref + algo (the key is unchanged);
+        // adopt the intermediate's validity window and our new parent chain.
+        CaRoot updated = *root;
+        updated.cert_pem = intermediate_pem;
+        updated.chain_pem = parent_chain_pem;
+        updated.mode = CaMode::Subordinate;
+        updated.fingerprint_sha256 = *fp;
+        updated.not_before = std::chrono::duration_cast<std::chrono::seconds>(
+                                 details->not_before.time_since_epoch())
+                                 .count();
+        updated.not_after = std::chrono::duration_cast<std::chrono::seconds>(
+                                details->not_after.time_since_epoch())
+                                .count();
+        if (!ca_store_->set_root(updated)) {
+            spdlog::error("PKI: subordinate import validated but set_root failed");
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
+                     "to an enterprise root",
+                     *fp);
+        metrics_.counter("yuzu_server_ca_subordinate_imported_total", {}).increment();
+        return CaRoutes::ImportOutcome::Ok;
     }
 
     /// True iff the presented client leaf is one of OURS and its serial is revoked
@@ -7434,7 +7548,14 @@ private:
         ca_routes_ = std::make_unique<CaRoutes>();
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
-            [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); });
+            [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
+            // PR6 subordinate-CA: export our CA CSR / import an enterprise-signed
+            // intermediate. Both need the CA key + dir, so they live in ServerImpl.
+            [this]() -> std::optional<std::string> { return export_ca_csr(); },
+            [this](const std::string& intermediate_pem,
+                   const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
+                return import_subordinate_chain(intermediate_pem, parent_chain_pem);
+            });
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 

@@ -54,13 +54,41 @@ public:
     /// of crypto deps.
     using PublishCrlFn = std::function<std::optional<std::vector<std::uint8_t>>()>;
 
+    // ── Subordinate-CA (PR6) ──────────────────────────────────────────────────
+
+    /// Export the install CA's CSR (PKCS#10 PEM) over its EXISTING key, for an
+    /// enterprise root to sign into a subordinate-CA intermediate. nullopt on no
+    /// CA / key-load failure. Implemented by ServerImpl (holds the CA key).
+    using ExportCsrFn = std::function<std::optional<std::string>()>;
+
+    /// Outcome of an import-chain attempt. The handler maps these to HTTP status
+    /// + audit detail; the ServerImpl impl performs the crypto validation and the
+    /// `set_root` swap.
+    enum class ImportOutcome {
+        Ok,              ///< Validated + issuing identity switched to subordinate.
+        NoRoot,          ///< No existing CA to subordinate (generate defaults first).
+        BadIntermediate, ///< Intermediate PEM unparseable.
+        NotCa,           ///< Intermediate lacks basicConstraints CA:TRUE.
+        KeyMismatch,     ///< Intermediate does not carry OUR CA public key.
+        ChainInvalid,    ///< Intermediate does not verify to the uploaded parent chain.
+        StoreError,      ///< Validated but persistence (set_root) failed.
+    };
+
+    /// Validate an enterprise-signed intermediate (carries our key + is a CA +
+    /// chains to `parent_chain_pem`) and, on success, switch the issuing identity
+    /// to subordinate mode. Implemented by ServerImpl (holds the CA key + dir).
+    using ImportChainFn = std::function<ImportOutcome(const std::string& intermediate_pem,
+                                                      const std::string& parent_chain_pem)>;
+
     /// Production overload — wraps `svr` in an HttplibRouteSink and delegates.
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         CaStore* ca_store, PublishCrlFn publish_crl_fn);
+                         CaStore* ca_store, PublishCrlFn publish_crl_fn,
+                         ExportCsrFn export_csr_fn = {}, ImportChainFn import_chain_fn = {});
 
     /// Testable overload — register against an in-process sink (no socket).
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         CaStore* ca_store, PublishCrlFn publish_crl_fn);
+                         CaStore* ca_store, PublishCrlFn publish_crl_fn,
+                         ExportCsrFn export_csr_fn = {}, ImportChainFn import_chain_fn = {});
 };
 
 } // namespace yuzu::server

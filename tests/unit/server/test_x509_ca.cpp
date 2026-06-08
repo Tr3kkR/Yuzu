@@ -481,3 +481,35 @@ TEST_CASE("x509_ca: subordinate-CA import primitives reject each bad input indep
     REQUIRE(cert_is_ca(install.cert));
     REQUIRE(verify_chain(install.cert, install.cert));
 }
+
+TEST_CASE("x509_ca: verify_chain_to_bundle finds the anchor among several certs",
+          "[pki][subordinate]") {
+    auto ca_a = make_test_ca("CA A");
+    auto ca_b = make_test_ca("CA B");
+
+    // A leaf signed by CA A.
+    auto leaf_key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key);
+    CsrParams cp;
+    cp.subject = {"leaf", "Yuzu"};
+    auto csr = make_csr(*leaf_key, cp);
+    REQUIRE(csr);
+    LeafParams lp;
+    lp.subject = {"leaf", "Yuzu"};
+    lp.validity = validity_days_from_now(30);
+    lp.usage = LeafUsage{.client_auth = true};
+    auto leaf = sign_csr(*csr, ca_a.cert, ca_a.key, lp);
+    REQUIRE(leaf);
+
+    // Single-cert bundle = the real signer → verifies (parity with verify_chain).
+    REQUIRE(verify_chain_to_bundle(leaf->cert_pem, ca_a.cert));
+    // Multi-cert bundle where the real signer is one of several → still verifies
+    // (the anchor is found among the bundle, the point of the bundle variant).
+    REQUIRE(verify_chain_to_bundle(leaf->cert_pem, ca_b.cert + ca_a.cert));
+    REQUIRE(verify_chain_to_bundle(leaf->cert_pem, ca_a.cert + ca_b.cert));
+    // Bundle WITHOUT the real signer → fails.
+    REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, ca_b.cert));
+    // Empty / garbage bundle → fails (fail closed), never throws.
+    REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, ""));
+    REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, "not a cert"));
+}

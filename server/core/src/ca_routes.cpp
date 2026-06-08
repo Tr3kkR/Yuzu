@@ -22,6 +22,10 @@ using detail::make_correlation_id;
 
 constexpr const char* kJson = "application/json";
 constexpr std::size_t kMaxRevokeBody = 64 * 1024; // bound the revoke POST body
+// Bound the subordinate-CA import body before parsing. A realistic intermediate
+// + parent chain is a few KB; 256 KiB is generous headroom while still refusing
+// a multi-MB POST on this privileged trust-root-switching endpoint (PR6).
+constexpr std::size_t kMaxImportBody = 256 * 1024;
 
 int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
     auto it = req.params.find(key);
@@ -97,6 +101,10 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "<div><strong>SHA-256:</strong> <code style=\"font-size:0.7rem\">" +
             html_escape(root->fingerprint_sha256) + "</code></div>"
             "<div><strong>Expires:</strong> " + fmt_epoch(root->not_after) + " UTC</div>"
+            "<div><strong>Trust mode:</strong> <span class=\"role-badge " +
+            (root->mode == CaMode::Subordinate ? "role-admin\">Subordinate (enterprise-rooted)"
+                                               : "role-user\">Built-in (self-signed root)") +
+            "</span></div>"
             "</div>"
             "<div style=\"margin-bottom:1rem;display:flex;gap:0.5rem;flex-wrap:wrap\">"
             "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
@@ -104,6 +112,46 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
             "href=\"/api/v1/ca/crl\">Download CRL</a>"
             "</div>";
+
+    // ── Subordinate-CA (PR6) ──────────────────────────────────────────────────
+    // Builtin: offer the CSR export + an import form so an operator can re-root
+    // this CA under their enterprise PKI. Subordinate: state it's done. The form
+    // posts to the CSRF-gated settings wrapper (same pattern as revoke). No
+    // operator-controlled value is echoed back into this fragment, so there is no
+    // injection surface here (the PEMs go to the wrapper, not into the HTML).
+    if (root->mode == CaMode::Subordinate) {
+        html += "<details style=\"margin-bottom:1rem;font-size:0.78rem\">"
+                "<summary style=\"cursor:pointer\">Enterprise subordination</summary>"
+                "<p style=\"color:var(--mds-color-theme-text-tertiary);margin:0.4rem 0\">"
+                "This issuing CA is an intermediate signed by your enterprise root; issued "
+                "certificates chain to that root. To re-subordinate, export a fresh CSR below and "
+                "import the newly signed intermediate.</p>";
+    } else {
+        html += "<details style=\"margin-bottom:1rem;font-size:0.78rem\">"
+                "<summary style=\"cursor:pointer\">Subordinate this CA to your enterprise root "
+                "(optional)</summary>"
+                "<p style=\"color:var(--mds-color-theme-text-tertiary);margin:0.4rem 0\">"
+                "Export this CA's signing request, have your enterprise root sign it as a "
+                "subordinate CA (basicConstraints CA:TRUE), then import the signed intermediate "
+                "plus the parent chain. The signing key is unchanged, so already-issued "
+                "certificates keep working.</p>";
+    }
+    html += "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem;margin-bottom:0.5rem;"
+            "display:inline-block\" href=\"/api/v1/ca/root-csr\">Download CA signing request "
+            "(CSR)</a>"
+            "<form hx-post=\"/api/settings/ca/import-chain\" hx-target=\"#ca-section\" "
+            "hx-swap=\"innerHTML\" "
+            "hx-confirm=\"Switch this CA's trust root to the imported enterprise chain?\">"
+            "<textarea name=\"intermediate_pem\" rows=\"4\" "
+            "placeholder=\"-----BEGIN CERTIFICATE----- (enterprise-signed intermediate over THIS "
+            "CA's key)\" style=\"width:100%;font-family:monospace;font-size:0.68rem;"
+            "margin-bottom:0.3rem\"></textarea>"
+            "<textarea name=\"chain_pem\" rows=\"4\" "
+            "placeholder=\"-----BEGIN CERTIFICATE----- (parent chain: enterprise root [+ "
+            "intermediates])\" style=\"width:100%;font-family:monospace;font-size:0.68rem;"
+            "margin-bottom:0.3rem\"></textarea>"
+            "<button class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+            "type=\"submit\">Import signed chain</button></form></details>";
 
     constexpr int kPanelLimit = 500;
     auto issued = ca_store->list_issued(kPanelLimit, 0);
@@ -175,14 +223,16 @@ std::string render_ca_fragment(CaStore* ca_store) {
 } // namespace
 
 void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                               CaStore* ca_store, PublishCrlFn publish_crl_fn) {
+                               CaStore* ca_store, PublishCrlFn publish_crl_fn,
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), ca_store,
-                    std::move(publish_crl_fn));
+                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn));
 }
 
 void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                               CaStore* ca_store, PublishCrlFn publish_crl_fn) {
+                               CaStore* ca_store, PublishCrlFn publish_crl_fn,
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
     (void)auth_fn; // principal is resolved inside audit_fn/perm_fn from the request
     spdlog::info("CA routes: registering /api/v1/ca/* + Settings CA panel");
 
@@ -411,6 +461,144 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         res.set_content(out.dump(), kJson);
     });
 
+    // ── GET /api/v1/ca/root-csr ── Security:Read: export the install CA's CSR ──
+    // (PR6) for an enterprise root to sign into a subordinate-CA intermediate.
+    // The CSR carries only our CA public key + subject — no secret, and the key
+    // is already public via GET /ca/root — but generating it requires the CA key,
+    // done by the injected export_csr_fn (this module links no crypto). Read-only
+    // (no state change); audited as a notable subordinate-setup admin action.
+    sink.Get("/api/v1/ca/root-csr", [perm_fn, audit_fn, ca_store, export_csr_fn](
+                                        const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Security", "Read"))
+            return;
+        if (!ca_store || !ca_store->is_open() || !export_csr_fn) {
+            res.status = 503;
+            res.set_content(error_json_a4(503, "CA not available", make_correlation_id()), kJson);
+            return;
+        }
+        auto csr = export_csr_fn();
+        if (!csr) {
+            (void)audit_fn(req, "ca.root_csr.exported", "failure", "CaRoot", "root", "");
+            res.status = 500;
+            res.set_content(error_json_a4(500, "could not generate CA CSR", make_correlation_id()),
+                            kJson);
+            return;
+        }
+        if (!audit_fn(req, "ca.root_csr.exported", "success", "CaRoot", "root", ""))
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_header("Content-Disposition", "attachment; filename=\"yuzu-ca.csr\"");
+        res.set_content(*csr, "application/pkcs10");
+    });
+
+    // ── POST /api/v1/ca/import-chain ── Security:Write: subordinate-CA import ──
+    // (PR6). Body: {"intermediate_pem","chain_pem"}. The intermediate is OUR CA
+    // key signed by the enterprise (CA:TRUE); chain_pem is the parent chain
+    // (enterprise root [+ intermediates]). import_chain_fn (ServerImpl, holds the
+    // CA key) validates our-key + is-CA + chains-to-parent, then switches the
+    // issuing identity to subordinate mode. A failed validation is a "denied"
+    // security event — an operator attempting to switch the trust root with bad
+    // material is exactly what the audit chain must capture (SOC 2 CC6.1/CC7.2).
+    sink.Post(
+        "/api/v1/ca/import-chain",
+        [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn](const httplib::Request& req,
+                                                                       httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
+                res.status = 503;
+                res.set_content(error_json_a4(503, "CA not available", make_correlation_id()), kJson);
+                return;
+            }
+            if (req.body.size() > kMaxImportBody) {
+                res.status = 413;
+                res.set_content(error_json_a4(413, "request body too large", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            std::string intermediate, chain;
+            try {
+                const auto j = nlohmann::json::parse(req.body);
+                intermediate = j.value("intermediate_pem", "");
+                chain = j.value("chain_pem", "");
+            } catch (...) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (intermediate.empty() || chain.empty()) {
+                res.status = 400;
+                res.set_content(
+                    error_json_a4(400, "intermediate_pem and chain_pem are required",
+                                  make_correlation_id()),
+                    kJson);
+                return;
+            }
+            const auto outcome = import_chain_fn(intermediate, chain);
+            int status = 200;
+            std::string msg;
+            std::string detail = "mode=subordinate";
+            // Audit vocab (#1240): success = applied; denied = caller's material
+            // rejected (reject-without-state-change); failure = authorized but the
+            // server errored. StoreError is the only "failure" here.
+            std::string result = "denied";
+            bool ok = false;
+            switch (outcome) {
+            case CaRoutes::ImportOutcome::Ok:
+                ok = true;
+                result = "success";
+                break;
+            case CaRoutes::ImportOutcome::NoRoot:
+                status = 409;
+                msg = "no CA root to subordinate (generate default certs first)";
+                detail = "reason=no_root";
+                break;
+            case CaRoutes::ImportOutcome::BadIntermediate:
+                status = 400;
+                msg = "intermediate_pem is not a valid certificate";
+                detail = "reason=bad_intermediate";
+                break;
+            case CaRoutes::ImportOutcome::NotCa:
+                status = 422;
+                msg = "intermediate is not a CA certificate (basicConstraints CA:TRUE required)";
+                detail = "reason=not_ca";
+                break;
+            case CaRoutes::ImportOutcome::KeyMismatch:
+                status = 422;
+                msg = "intermediate does not carry this CA's public key";
+                detail = "reason=key_mismatch";
+                break;
+            case CaRoutes::ImportOutcome::ChainInvalid:
+                status = 422;
+                msg = "intermediate does not verify to the provided parent chain";
+                detail = "reason=chain_invalid";
+                break;
+            case CaRoutes::ImportOutcome::StoreError:
+                status = 500;
+                msg = "failed to persist the imported chain";
+                detail = "reason=store_error";
+                result = "failure";
+                break;
+            }
+            const bool audit_ok =
+                audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            if (!ok) {
+                res.status = status;
+                res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
+                return;
+            }
+            // Re-publish the CRL so the served CRL is signed under the new issuing
+            // cert's identity (issuer_fingerprint refresh after the re-key).
+            const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+            nlohmann::json out = {{"imported", true},
+                                  {"mode", "subordinate"},
+                                  {"crl_republished", crl_ok},
+                                  {"meta", {{"api_version", "v1"}}}};
+            res.set_content(out.dump(), kJson);
+        });
+
     // ── GET /fragments/settings/ca ── Settings → Internal CA panel (PR4b). ────
     // Server-rendered HTMX fragment (admin reaches /settings; the fragment itself
     // gates on Security:Read for RBAC parity with GET /ca/issued). Dark-theme
@@ -485,6 +673,103 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             res.set_header("Sec-Audit-Failed", "true");
         res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
     });
+
+    // ── POST /api/settings/ca/import-chain ── dashboard subordinate import (PR6).
+    // Form-encoded (HTMX); Security:Write. SAME CSRF gate as revoke — a forged
+    // trust-root switch would be catastrophic (re-root the install), so run it
+    // FIRST, before perm_fn, and treat both-headers-absent as cross-site too.
+    // Shares import_chain_fn with the JSON REST endpoint; re-renders the panel so
+    // the new Trust mode badge shows. The submitted PEMs are NEVER echoed back
+    // into the fragment, so this wrapper adds no HTML-injection surface.
+    sink.Post("/api/settings/ca/import-chain",
+              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn](
+                  const httplib::Request& req, httplib::Response& res) {
+                  const std::string origin = req.get_header_value("Origin");
+                  const std::string referer = req.get_header_value("Referer");
+                  const bool same_site =
+                      !(origin.empty() && referer.empty()) &&
+                      origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                  if (!same_site) {
+                      if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.import-chain",
+                                    "cross-origin or header-less dashboard CA import refused"))
+                          res.set_header("Sec-Audit-Failed", "true");
+                      res.status = 403;
+                      res.set_content(
+                          "<span style=\"color:#f85149\">Cross-origin request refused.</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  if (!perm_fn(req, res, "Security", "Write"))
+                      return;
+                  auto error_panel = [&](int status, const std::string& msg) {
+                      res.status = status;
+                      res.set_content(
+                          "<div class=\"alert alert-danger\" style=\"margin-bottom:0.75rem\">" +
+                              html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
+                          "text/html; charset=utf-8");
+                  };
+                  if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
+                      error_panel(503, "Certificate authority unavailable.");
+                      return;
+                  }
+                  const std::string intermediate = req.get_param_value("intermediate_pem");
+                  const std::string chain = req.get_param_value("chain_pem");
+                  if (intermediate.empty() || chain.empty()) {
+                      error_panel(
+                          400, "Both the signed intermediate and the parent chain are required.");
+                      return;
+                  }
+                  const auto outcome = import_chain_fn(intermediate, chain);
+                  std::string result = "denied";
+                  std::string emsg;
+                  int status = 200;
+                  bool ok = false;
+                  switch (outcome) {
+                  case CaRoutes::ImportOutcome::Ok:
+                      ok = true;
+                      result = "success";
+                      break;
+                  case CaRoutes::ImportOutcome::NoRoot:
+                      status = 409;
+                      emsg = "No CA root to subordinate.";
+                      break;
+                  case CaRoutes::ImportOutcome::BadIntermediate:
+                      status = 400;
+                      emsg = "The intermediate is not a valid certificate.";
+                      break;
+                  case CaRoutes::ImportOutcome::NotCa:
+                      status = 422;
+                      emsg = "The intermediate is not a CA certificate (CA:TRUE required).";
+                      break;
+                  case CaRoutes::ImportOutcome::KeyMismatch:
+                      status = 422;
+                      emsg = "The intermediate does not carry this CA's public key.";
+                      break;
+                  case CaRoutes::ImportOutcome::ChainInvalid:
+                      status = 422;
+                      emsg = "The intermediate does not verify to the provided parent chain.";
+                      break;
+                  case CaRoutes::ImportOutcome::StoreError:
+                      status = 500;
+                      result = "failure";
+                      emsg = "Failed to persist the imported chain.";
+                      break;
+                  }
+                  const bool audit_ok =
+                      audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root",
+                               ok ? "mode=subordinate via=dashboard" : "via=dashboard");
+                  if (!ok) {
+                      if (!audit_ok)
+                          res.set_header("Sec-Audit-Failed", "true");
+                      error_panel(status, emsg);
+                      return;
+                  }
+                  // Refresh the CRL under the new issuing cert (issuer_fingerprint).
+                  (void)(publish_crl_fn && publish_crl_fn().has_value());
+                  if (!audit_ok)
+                      res.set_header("Sec-Audit-Failed", "true");
+                  res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
+              });
 }
 
 } // namespace yuzu::server

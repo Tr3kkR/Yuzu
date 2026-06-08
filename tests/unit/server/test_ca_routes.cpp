@@ -49,6 +49,16 @@ struct Harness {
     int crl_calls{0};
     std::string last_perm_type; // captured (securable, op) of the last perm check
     std::string last_perm_op;
+    // PR6 subordinate-CA fakes. export_csr_result==nullopt → export 500; the
+    // import fn records its args and returns the configurable import_outcome (the
+    // crypto validation itself is unit-tested at the engine level — this exercises
+    // the handler's body-validation, outcome→status mapping, and audit).
+    std::optional<std::string> export_csr_result{
+        "-----BEGIN CERTIFICATE REQUEST-----\nFAKECSR\n-----END CERTIFICATE REQUEST-----\n"};
+    CaRoutes::ImportOutcome import_outcome{CaRoutes::ImportOutcome::Ok};
+    std::string last_import_intermediate;
+    std::string last_import_chain;
+    int import_calls{0};
 
     void wire(bool null_store = false) {
         CaRoutes routes;
@@ -79,7 +89,16 @@ struct Harness {
                 return std::nullopt;
             return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
         };
-        routes.register_routes(sink, auth, perm, audit, null_store ? nullptr : store.get(), crl);
+        CaRoutes::ExportCsrFn export_csr = [this]() { return export_csr_result; };
+        CaRoutes::ImportChainFn import_chain = [this](const std::string& im,
+                                                      const std::string& ch) {
+            ++import_calls;
+            last_import_intermediate = im;
+            last_import_chain = ch;
+            return import_outcome;
+        };
+        routes.register_routes(sink, auth, perm, audit, null_store ? nullptr : store.get(), crl,
+                               export_csr, import_chain);
     }
 };
 
@@ -466,7 +485,8 @@ TEST_CASE("ca_routes: /ca/issued reports has_more + next_offset across pages",
 TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
     Harness h;
     h.wire(/*null_store=*/true);
-    for (const char* path : {"/api/v1/ca/root", "/api/v1/ca/crl", "/api/v1/ca/issued"}) {
+    for (const char* path : {"/api/v1/ca/root", "/api/v1/ca/crl", "/api/v1/ca/issued",
+                             "/api/v1/ca/root-csr"}) {
         auto r = h.sink.Get(path);
         REQUIRE(r);
         REQUIRE(r->status == 503);
@@ -474,6 +494,186 @@ TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
     auto rev = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
     REQUIRE(rev);
     REQUIRE(rev->status == 503);
+    auto imp = h.sink.Post("/api/v1/ca/import-chain",
+                           R"({"intermediate_pem":"x","chain_pem":"y"})");
+    REQUIRE(imp);
+    REQUIRE(imp->status == 503);
+}
+
+// ── PR6 subordinate-CA REST ─────────────────────────────────────────────────
+
+TEST_CASE("ca_routes: GET /ca/root-csr exports a CSR, gated Security:Read, audited",
+          "[ca_routes][pki][subordinate][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    auto ok = h.sink.Get("/api/v1/ca/root-csr");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(ok->get_header_value("Content-Type") == "application/pkcs10");
+    REQUIRE(ok->body.find("CERTIFICATE REQUEST") != std::string::npos);
+    REQUIRE(h.last_perm_type == "Security");
+    REQUIRE(h.last_perm_op == "Read");
+    bool saw_export = false;
+    for (const auto& a : h.audits)
+        if (a.action == "ca.root_csr.exported" && a.result == "success")
+            saw_export = true;
+    REQUIRE(saw_export);
+
+    // export fn returning nullopt → 500.
+    h.export_csr_result = std::nullopt;
+    auto err = h.sink.Get("/api/v1/ca/root-csr");
+    REQUIRE(err);
+    REQUIRE(err->status == 500);
+
+    // Security:Read gate.
+    h.perm_allow = false;
+    auto denied = h.sink.Get("/api/v1/ca/root-csr");
+    REQUIRE(denied);
+    REQUIRE(denied->status == 403);
+}
+
+TEST_CASE("ca_routes: POST /ca/import-chain validates body + maps outcomes + audits",
+          "[ca_routes][pki][subordinate][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    // Happy path: Ok outcome → 200, forwards the parsed PEMs, republishes CRL.
+    h.import_outcome = CaRoutes::ImportOutcome::Ok;
+    auto ok = h.sink.Post("/api/v1/ca/import-chain",
+                          R"({"intermediate_pem":"INT","chain_pem":"PARENT"})");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(h.last_perm_type == "Security");
+    REQUIRE(h.last_perm_op == "Write"); // import is a mutation
+    REQUIRE(h.last_import_intermediate == "INT");
+    REQUIRE(h.last_import_chain == "PARENT");
+    auto j = json::parse(ok->body);
+    REQUIRE(j["imported"] == true);
+    REQUIRE(j["mode"] == "subordinate");
+    REQUIRE(j["crl_republished"] == true); // CRL refreshed under the new issuer
+    REQUIRE(h.crl_calls == 1);
+    bool saw_import = false;
+    for (const auto& a : h.audits)
+        if (a.action == "ca.subordinate.imported" && a.result == "success")
+            saw_import = true;
+    REQUIRE(saw_import);
+
+    // Body validation: invalid JSON → 400; missing fields → 400.
+    auto badjson = h.sink.Post("/api/v1/ca/import-chain", "{not json");
+    REQUIRE(badjson);
+    REQUIRE(badjson->status == 400);
+    auto missing = h.sink.Post("/api/v1/ca/import-chain", R"({"intermediate_pem":"INT"})");
+    REQUIRE(missing);
+    REQUIRE(missing->status == 400);
+
+    // Oversized body → 413 (bounded before the JSON parser).
+    std::string big(300 * 1024, 'A');
+    auto toobig = h.sink.Post("/api/v1/ca/import-chain", big);
+    REQUIRE(toobig);
+    REQUIRE(toobig->status == 413);
+
+    // Outcome → status mapping, each a "denied" security event (StoreError =
+    // "failure"). Validation rejections must NOT change state.
+    struct Case {
+        CaRoutes::ImportOutcome outcome;
+        int status;
+        const char* result;
+    };
+    const Case cases[] = {
+        {CaRoutes::ImportOutcome::NoRoot, 409, "denied"},
+        {CaRoutes::ImportOutcome::BadIntermediate, 400, "denied"},
+        {CaRoutes::ImportOutcome::NotCa, 422, "denied"},
+        {CaRoutes::ImportOutcome::KeyMismatch, 422, "denied"},
+        {CaRoutes::ImportOutcome::ChainInvalid, 422, "denied"},
+        {CaRoutes::ImportOutcome::StoreError, 500, "failure"},
+    };
+    for (const auto& c : cases) {
+        h.audits.clear();
+        h.import_outcome = c.outcome;
+        auto r = h.sink.Post("/api/v1/ca/import-chain",
+                             R"({"intermediate_pem":"INT","chain_pem":"PARENT"})");
+        REQUIRE(r);
+        REQUIRE(r->status == c.status);
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.subordinate.imported" && a.result == c.result)
+                saw = true;
+        REQUIRE(saw);
+    }
+
+    // Security:Write gate.
+    h.perm_allow = false;
+    auto denied = h.sink.Post("/api/v1/ca/import-chain",
+                              R"({"intermediate_pem":"INT","chain_pem":"PARENT"})");
+    REQUIRE(denied);
+    REQUIRE(denied->status == 403);
+}
+
+TEST_CASE("ca_routes: dashboard fragment shows trust mode + subordinate controls (PR6)",
+          "[ca_routes][pki][subordinate]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root())); // builtin
+    h.wire();
+    auto frag = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    REQUIRE(frag->body.find("Built-in") != std::string::npos);
+    REQUIRE(frag->body.find("/api/v1/ca/root-csr") != std::string::npos);          // CSR export link
+    REQUIRE(frag->body.find("/api/settings/ca/import-chain") != std::string::npos); // import form
+    REQUIRE(frag->body.find("intermediate_pem") != std::string::npos);
+}
+
+TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (PR6)",
+          "[ca_routes][pki][subordinate][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+
+    // Same-origin + Ok outcome → 200 HTML, import_chain_fn received the form PEMs.
+    h.import_outcome = CaRoutes::ImportOutcome::Ok;
+    auto ok = h.sink.dispatch("POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
+                              "", "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(ok->get_header_value("Content-Type").find("text/html") != std::string::npos);
+    REQUIRE(h.last_import_intermediate == "INT");
+    REQUIRE(h.last_import_chain == "PAR");
+
+    // Cross-origin → 403 + csrf.denied, and import_chain_fn must NOT be called.
+    const int calls_before = h.import_calls;
+    const std::unordered_map<std::string, std::string> cross = {
+        {"Host", "yuzu.example"}, {"Origin", "https://evil.example"}};
+    auto xo = h.sink.dispatch("POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
+                              "", "application/x-www-form-urlencoded", cross);
+    REQUIRE(xo);
+    REQUIRE(xo->status == 403);
+    REQUIRE(h.import_calls == calls_before); // gate ran before the import fn
+    bool saw_csrf = false;
+    for (const auto& a : h.audits)
+        if (a.action == "csrf.denied" && a.result == "denied")
+            saw_csrf = true;
+    REQUIRE(saw_csrf);
+
+    // Both Origin AND Referer absent → also refused (header-stripping proxy/WebView).
+    auto noh = h.sink.dispatch("POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
+                               "", "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"}});
+    REQUIRE(noh);
+    REQUIRE(noh->status == 403);
+
+    // Same-origin but a validation rejection (KeyMismatch) → 422 with the panel
+    // re-rendered (not a bare span).
+    h.import_outcome = CaRoutes::ImportOutcome::KeyMismatch;
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
+                               "", "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(bad);
+    REQUIRE(bad->status == 422);
+    REQUIRE(bad->body.find("<table") != std::string::npos); // full fragment re-rendered
 }
 
 // ── PR4b dashboard panel (#1241) ────────────────────────────────────────────

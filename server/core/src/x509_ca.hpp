@@ -251,4 +251,15 @@ struct CertDetails {
 /// yet be unable to issue. Returns false on parse failure.
 [[nodiscard]] bool cert_is_ca(std::string_view cert_pem);
 
+/// True iff `cert_pem` verifies to a trust anchor found within `bundle_pem` — a
+/// PEM concatenation of one or more parent certs (the enterprise root and any
+/// intermediates above ours). Generalises `verify_chain` (single anchor) to the
+/// multi-tier parent chain an operator uploads at subordinate-CA import. Every
+/// cert in the bundle is added to the trust store, so a chain of any depth that
+/// roots `cert_pem` validates. Returns false on an empty/garbage bundle or any
+/// verification failure (fail closed). Like verify_chain it does NOT consult
+/// revocation — it answers only "does the uploaded parent material actually sign
+/// our intermediate".
+[[nodiscard]] bool verify_chain_to_bundle(std::string_view cert_pem, std::string_view bundle_pem);
+
 } // namespace yuzu::server::pki
