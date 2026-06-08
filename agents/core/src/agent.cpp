@@ -13,6 +13,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/crash_observer.hpp>
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -33,6 +34,7 @@ __declspec(allocate(".CRT$XCB"))
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
+#include "crash_event.hpp" // CrashObservation -> GuaranteedStateEvent mapping (proto-aware)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -609,6 +611,29 @@ public:
                          r.error());
         }
 
+        // 1c-bis. Fleet-wide crash recorder (Guardian DEX, slice 1). A RULELESS
+        // observation — records ANY process crashing, independent of any rule.
+        // No-op off Windows. Armed pre-network; emit_guardian_event() self-guards
+        // on the Subscribe stream being up, so crashes before first connect are
+        // dropped (like guard events pre-sink; durable buffering is A3).
+        crash_observer_ = make_crash_observer();
+        if (!crash_observer_->start([this](const CrashObservation& obs) {
+                const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                const auto seq = crash_seq_.fetch_add(1, std::memory_order_relaxed);
+                // Include agent_id: the at-least-once event_id is a GLOBAL primary key
+                // server-side, so two agents crashing in the same ms (e.g. a bad
+                // fleet-wide deploy) would otherwise mint identical ids and all but one
+                // would be dropped at ingest — losing crashes exactly when they matter.
+                const std::string event_id = std::string(kObservationRuleSentinel) + "-" +
+                                             cfg_.agent_id + "-" + std::to_string(now_ms) + "-" +
+                                             std::to_string(seq);
+                emit_guardian_event(crash_observation_to_event(obs, event_id));
+            })) {
+            spdlog::debug("crash_observer: not armed on this platform — crash DEX disabled");
+        }
+
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -1175,18 +1200,8 @@ public:
                         std::lock_guard lock(stream_write_mu_);
                         guardian_sink_stream_ = stream;
                     }
-                    guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
-                        pb::CommandResponse resp;
-                        resp.set_plugin("__guard__");
-                        resp.set_action("event");
-                        resp.set_status(pb::CommandResponse::SUCCESS);
-                        resp.set_payload(ev.SerializeAsString());
-                        std::lock_guard lock(stream_write_mu_);
-                        if (guardian_sink_stream_)
-                            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
-                        // else: link is down between reconnects — event dropped
-                        // (durable event buffering is Guardian A3).
-                    });
+                    guardian_->set_event_sink(
+                        [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
                 }
 
                 // 4b. Spawn OTA update check thread
@@ -1663,6 +1678,11 @@ public:
         heartbeat_stop_.store(true, std::memory_order_release);
         if (guardian_)
             guardian_->stop();
+        // Stop (join) the crash observer BEFORE cancelling the Subscribe stream
+        // below: its worker emits through emit_guardian_event, so the stream +
+        // mutex must still be live while we join it.
+        if (crash_observer_)
+            crash_observer_->stop();
         if (updater_)
             updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
@@ -1680,6 +1700,21 @@ public:
     std::vector<std::string> loaded_plugins() const override { return plugin_names_; }
 
 private:
+    // Serialize a Guardian event into the __guard__/event CommandResponse and write
+    // it through the current Subscribe stream. Shared by the GuardianEngine drift
+    // sink and the (ruleless) crash observer. Drops the event if the link is down
+    // between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
+    void emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        pb::CommandResponse resp;
+        resp.set_plugin("__guard__");
+        resp.set_action("event");
+        resp.set_status(pb::CommandResponse::SUCCESS);
+        resp.set_payload(ev.SerializeAsString());
+        std::lock_guard lock(stream_write_mu_);
+        if (guardian_sink_stream_)
+            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+    }
+
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -1717,6 +1752,15 @@ private:
     // workers write through are still alive (H4 / #1209). Body-initialized in the
     // ctor (after kv_store_), so the later declaration does not affect construction.
     std::unique_ptr<GuardianEngine> guardian_;
+    // Fleet-wide crash recorder (DEX slice 1). Declared AFTER stream_write_mu_ +
+    // guardian_sink_stream_ (same reasoning as guardian_): its OS-callback emits
+    // through emit_guardian_event(), so its dtor (which stop()s the subscription +
+    // drains in-flight callbacks) must run while the mutex + sink-stream holder are
+    // still alive. crash_seq_ disambiguates the at-least-once event_id for same-agent
+    // bursts within one millisecond; agent_id (folded into the id) disambiguates
+    // ACROSS agents so a fleet-wide crash wave doesn't collide on the global PK.
+    std::atomic<std::uint64_t> crash_seq_{0};
+    std::unique_ptr<ICrashObserver> crash_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;

@@ -58,6 +58,13 @@ message GuaranteedStatePush {
 }
 
 message GuaranteedStateEvent {
+  // Normally the id of the Guardian rule that produced this event. The reserved
+  // sentinel "__observation__" marks a RULELESS DEX observation (e.g. a process
+  // crash) not tied to any rule: such an event is distinguished from rule-bound
+  // drift by this sentinel + `event_type` (the DEX discriminator — there is
+  // deliberately no separate category field). Server ingest finds no rule for the
+  // sentinel, so its severity-enrich is a no-op and the per-(agent,rule) census is
+  // untouched (the event_type is not a compliance state). See agent crash_event.hpp.
   string rule_id = 1;
   string rule_name = 2;
   string event_type = 3;        // e.g. "drift.detected" | "drift.remediated"

@@ -114,11 +114,13 @@ agent_test_exe = executable(
     'unit/test_guardian_engine.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
+    'unit/test_crash_observer.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/core/src'),               # crash_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups

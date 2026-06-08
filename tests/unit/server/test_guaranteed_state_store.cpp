@@ -277,6 +277,47 @@ TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store
     CHECK(by_sev[0].event_id == "evt-2");
 }
 
+TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
+          "[guaranteed_state_store][events][crash]") {
+    // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel
+    // rule_id "__observation__" + event_type "process.crashed". It must insert
+    // (rule_id is NOT NULL — the sentinel satisfies it), keep its agent-set
+    // severity verbatim, and NOT create a per-(agent,rule) compliance census row
+    // (process.crashed is not a compliance state). A normal drift event in the
+    // same store still updates the census — proving the skip is crash-specific.
+    // Pins the ruleless path the agent crash recorder relies on.
+    GuaranteedStateStore store(":memory:");
+
+    // A normal rule-bound drift (drift.remediated) -> updates the census.
+    REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
+
+    // A ruleless crash observation.
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-1718000000000-0";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-A";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.guard_type = "process";
+    crash.guard_category = ""; // ruleless-ness + event_type IS the discriminator
+    crash.detected_value = "notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+    REQUIRE(store.insert_event(crash));
+
+    // The crash is stored and keeps its severity verbatim (no rule to enrich from).
+    GuaranteedStateEventQuery q;
+    q.rule_id = "__observation__";
+    auto crashes = store.query_events(q);
+    REQUIRE(crashes.size() == 1);
+    CHECK(crashes[0].event_type == "process.crashed");
+    CHECK(crashes[0].severity == "info");
+    CHECK(crashes[0].guard_category.empty());
+
+    // The census has the drift's (agent,rule) row but NONE for the sentinel.
+    CHECK(store.agent_rule_statuses().size() == 1);
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+}
+
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");
