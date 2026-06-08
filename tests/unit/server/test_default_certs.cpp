@@ -137,7 +137,7 @@ TEST_CASE("default_certs: --cert-san input validation is robust (no boot-fail on
         "foo/bar.example",     // bad charset (slash, a templating mistake) → dropped
         std::string("ctl\twith\ttabs"), // control chars → dropped
         overlong_label,        // over-length DNS → dropped
-        "*.corp.example",      // wildcard → accepted (with warning)
+        "*.corp.example",      // wildcard → REJECTED (#1271 UP-10/11; fleet-trusted CA)
         "",                    // empty → skipped
         "   ",                 // whitespace-only → skipped
     };
@@ -154,8 +154,9 @@ TEST_CASE("default_certs: --cert-san input validation is robust (no boot-fail on
     REQUIRE_FALSE(contains(c->san.ips, "1.2.3.4.5"));
     // Valid bare IPv4 landed in ips.
     REQUIRE(contains(c->san.ips, "9.9.9.9"));
-    // Wildcard accepted.
-    REQUIRE(contains(c->san.dns, "*.corp.example"));
+    // Wildcard REJECTED (#1271 UP-10/11): the install CA is distributed fleet-wide,
+    // so a wildcard default leaf is not allowed — bring your own cert for that.
+    REQUIRE_FALSE(contains(c->san.dns, "*.corp.example"));
     // Over-length label and bad-charset values dropped from both sets.
     REQUIRE_FALSE(contains(c->san.dns, overlong_label));
     REQUIRE_FALSE(contains(c->san.dns, "with space"));
@@ -191,6 +192,24 @@ TEST_CASE("default_certs: --cert-san total count is capped", "[default_certs]") 
     // base (localhost + h) + at most 64 extras; nowhere near 200.
     REQUIRE(c->san.dns.size() <= 2 + 64);
     REQUIRE(c->san.dns.size() > 2); // but some extras did land
+}
+
+TEST_CASE("default_certs: a --cert-san invalid-piece flood is bounded, not boot-fatal (#1271 UP-9)",
+          "[default_certs]") {
+    // The accepted-name cap counts only valid names; a flood of INVALID
+    // comma-separated pieces (each dropped-with-warning) must still be bounded so
+    // boot can't be CPU/log-flooded. One raw entry packed with thousands of bad
+    // pieces must complete and still yield a valid cert set.
+    TempDir dir;
+    DefaultCertSet set;
+    std::string flood = "with space"; // invalid (never accepted)
+    for (int i = 0; i < 5000; ++i)
+        flood += ",with space"; // 5001 invalid pieces in one raw entry
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, {flood}));
+    REQUIRE(set.freshly_generated); // bounded + non-fatal
+    auto c = pki::parse_certificate(read_file(set.gateway_cert));
+    REQUIRE(c);
+    REQUIRE_FALSE(contains(c->san.dns, "with space")); // none of the junk landed
 }
 
 TEST_CASE("default_certs: no --cert-san leaves the base SAN set unchanged", "[default_certs]") {

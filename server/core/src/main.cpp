@@ -120,6 +120,11 @@ int main(int argc, char* argv[]) {
                    "https/agent/gateway default leaves so they validate for a deployment "
                    "hostname or IP (e.g. 'dns:gateway'). Ignored when operator certs are "
                    "supplied or --no-default-certs is set.")
+        // #1271 cpp-expert: comma-splitting is done ONCE, in parse_extra_sans
+        // (default_certs.cpp), NOT here — do NOT add CLI11 `->delimiter(',')`, or a
+        // comma-separated value would be split twice (CLI11 tokens × the parser's
+        // own comma loop) and mangle entries. Each CLI/env token reaches the parser
+        // whole; the parser owns the comma semantics.
         ->envname("YUZU_CERT_SAN");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
