@@ -286,7 +286,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 }
                 const int limit = clamp_int(req, "limit", 200, 1, 1000);
                 const int offset = clamp_int(req, "offset", 0, 0, 1000000);
-                auto records = ca_store->list_issued(limit, offset);
+                // Probe one extra row to derive a precise has_more without a
+                // separate COUNT query (agentic-first A1: a paginating client must
+                // be able to tell when to stop, not guess from count<limit). The
+                // probe row is trimmed before render. list_issued clamps at 10000,
+                // so limit+1 (<=1001) is always in range.
+                auto records = ca_store->list_issued(limit + 1, offset);
+                const bool has_more = static_cast<int>(records.size()) > limit;
+                if (has_more)
+                    records.resize(static_cast<std::size_t>(limit));
                 nlohmann::json items = nlohmann::json::array();
                 for (const auto& r : records) {
                     items.push_back({
@@ -302,9 +310,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                         {"issued_by", r.issued_by},
                     });
                 }
+                nlohmann::json meta = {{"api_version", "v1"},
+                                       {"limit", limit},
+                                       {"offset", offset},
+                                       {"has_more", has_more}};
+                if (has_more)
+                    meta["next_offset"] = offset + limit;
                 nlohmann::json out = {{"items", std::move(items)},
                                       {"count", records.size()},
-                                      {"meta", {{"api_version", "v1"}}}};
+                                      {"meta", std::move(meta)}};
                 res.set_content(out.dump(), kJson);
             });
 
