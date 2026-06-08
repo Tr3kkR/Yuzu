@@ -185,6 +185,80 @@ servers_have_tls_false_for_plaintext_listeners_test() ->
     ?assertNot(yuzu_gw_app:servers_have_tls(Servers)),
     ?assertNot(yuzu_gw_app:servers_have_tls(undefined)).
 
+%% listener_tls_traps/1: cert material present but `ssl => true` absent is the
+%% silent-plaintext footgun (#1244) — grpcbox serves plaintext despite the
+%% cert config. The detector must flag it and report the port.
+listener_tls_trap_flags_cert_material_without_ssl_test() ->
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => #{certfile => "c", keyfile => "k",
+                                     cacertfile => "ca"}}],
+    ?assertEqual([50051], yuzu_gw_app:listener_tls_traps(Servers)).
+
+listener_tls_trap_flags_partial_cert_material_test() ->
+    %% even a single cert key (here just keyfile) without ssl=>true is a trap.
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50063},
+                 transport_opts => #{keyfile => "k"}}],
+    ?assertEqual([50063], yuzu_gw_app:listener_tls_traps(Servers)).
+
+listener_tls_trap_clear_when_ssl_true_test() ->
+    %% a correctly-configured TLS listener (ssl=>true) is NOT a trap.
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => #{ssl => true, certfile => "c", keyfile => "k",
+                                     cacertfile => "ca"}}],
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(Servers)).
+
+listener_tls_trap_clear_for_plaintext_listener_test() ->
+    %% a deliberately-plaintext listener (no transport_opts / no cert material)
+    %% is NOT a trap — only "cert material but no ssl" is.
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(
+                       [#{grpc_opts => #{}, listen_opts => #{port => 50051}}])),
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(
+                       [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                          transport_opts => #{}}])),
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(undefined)).
+
+listener_tls_trap_reports_only_misconfigured_of_many_test() ->
+    %% a mixed listener set reports ONLY the trapped port, leaving the correct
+    %% TLS and the intentional-plaintext listeners out.
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => #{ssl => true, certfile => "c", keyfile => "k",
+                                     cacertfile => "ca"}},
+               #{grpc_opts => #{}, listen_opts => #{port => 50063},
+                 transport_opts => #{certfile => "c", keyfile => "k"}},
+               #{grpc_opts => #{}, listen_opts => #{port => 50099}}],
+    ?assertEqual([50063], yuzu_gw_app:listener_tls_traps(Servers)).
+
+%% Hermes pass-1 HIGH: a PROPLIST transport_opts (wrong container — grpcbox wants
+%% a map, so it yields plaintext) carrying cert material is still a trap.
+listener_tls_trap_flags_proplist_transport_opts_test() ->
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => [{certfile, "c"}, {keyfile, "k"}]}],
+    ?assertEqual([50051], yuzu_gw_app:listener_tls_traps(Servers)).
+
+%% Hermes pass-1 HIGH: inline-DER ssl material keys (cert/key/cacert), not just
+%% the *file path forms, count as cert material.
+listener_tls_trap_flags_inline_der_material_test() ->
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => #{cert => <<"der">>}}],
+    ?assertEqual([50051], yuzu_gw_app:listener_tls_traps(Servers)).
+
+%% Hermes pass-1 INFO: `ssl` set to a non-true value (e.g. verify_peer) is NOT
+%% the same as `ssl => true` — grpcbox still runs plaintext, so it is a trap.
+listener_tls_trap_flags_ssl_set_to_non_true_test() ->
+    Servers = [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                 transport_opts => #{ssl => verify_peer, certfile => "c"}}],
+    ?assertEqual([50051], yuzu_gw_app:listener_tls_traps(Servers)).
+
+%% Hermes pass-1 MEDIUM: a placeholder cert key with an undefined/empty value
+%% must NOT trigger the warning (avoids training operators to ignore it).
+listener_tls_trap_ignores_empty_placeholder_values_test() ->
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(
+                       [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                          transport_opts => #{certfile => undefined}}])),
+    ?assertEqual([], yuzu_gw_app:listener_tls_traps(
+                       [#{grpc_opts => #{}, listen_opts => #{port => 50051},
+                          transport_opts => #{certfile => "", keyfile => <<>>}}])).
+
 %%%===================================================================
 %%% 3. Real EC mutual-TLS handshake (the option shape grpcbox uses)
 %%%===================================================================
