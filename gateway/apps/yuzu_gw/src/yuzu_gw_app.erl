@@ -14,7 +14,7 @@
 -export([start/2, stop/1]).
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
--export([evaluate_upstream_posture/2]).                                  %% for testing
+-export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -276,6 +276,20 @@ log_tls_state() ->
                            "{verify,verify_peer} + {cacertfile,...}.");
         verified -> ok
     end,
+    %% Listener footgun: cert material in transport_opts but no `ssl => true`
+    %% means grpcbox serves PLAINTEXT on that port despite the cert config — the
+    %% operator believes the agent/mgmt hop is encrypted, it is not. Warn loudly
+    %% (same "looks secure, isn't" class the upstream `unverified` guard refuses).
+    case listener_tls_traps(application:get_env(grpcbox, servers, undefined)) of
+        [] -> ok;
+        TrapPorts ->
+            logger:warning("Gateway listener(s) on port(s) ~p carry TLS cert material in "
+                           "transport_opts but `ssl` is not set to `true` (missing, or set "
+                           "to another value like verify_peer) — grpcbox runs PLAINTEXT on "
+                           "these ports despite the cert config (silent downgrade). "
+                           "transport_opts must be a MAP with `ssl => true`. See "
+                           "config/sys.config.prod.", [TrapPorts])
+    end,
     %% Advisory-env footgun: an operator who set YUZU_GW_TLS_* populated only the
     %% unconsumed yuzu_gw `tls` env; it does NOT configure grpcbox, REGARDLESS of
     %% the actual upstream posture. Warn whenever it is set so the misconception is
@@ -386,3 +400,62 @@ servers_have_tls(Servers) when is_list(Servers) ->
               end, Servers);
 servers_have_tls(_) ->
     false.
+
+%% @doc Listener TLS footgun detector: returns the listen ports of any grpcbox
+%% server whose `transport_opts` carries cert material (certfile/keyfile/
+%% cacertfile) but is MISSING `ssl => true`. grpcbox_pool enables TLS ONLY on
+%% `ssl => true`, so such a listener serves PLAINTEXT despite the cert config —
+%% the silent-downgrade "looks secure, isn't" middle state. Pure; exported for
+%% testing. Mirrors the upstream `unverified` detection on the listener side.
+-spec listener_tls_traps(term()) -> [term()].
+listener_tls_traps(Servers) when is_list(Servers) ->
+    lists:filtermap(fun(S) when is_map(S) ->
+                            case is_tls_trap(maps:get(transport_opts, S, #{})) of
+                                true  -> {true, listener_port(S)};
+                                false -> false
+                            end;
+                       (_) -> false
+                    end, Servers);
+listener_tls_traps(_) ->
+    [].
+
+%% @private cert material present but `ssl` not exactly `true`. Handles BOTH the
+%% grpcbox map form (`#{ssl => true, certfile => ...}`) AND a proplist
+%% (`[{certfile, ...}]`): a proplist is itself a misconfiguration — grpcbox
+%% expects a map and yields plaintext — so flagging it is correct. Keys with an
+%% undefined/empty value don't count as material (avoids warning on placeholders).
+%% The material key set covers both file-path (certfile/keyfile/cacertfile/dhfile)
+%% and inline-DER (cert/key/cacert) ssl options.
+-spec is_tls_trap(term()) -> boolean().
+is_tls_trap(T) when is_map(T); is_list(T) ->
+    HasCertMaterial = lists:any(fun(K) -> has_material(K, T) end,
+                                [certfile, keyfile, cacertfile, dhfile,
+                                 cert, key, cacert]),
+    SslOn = opt_value(ssl, T) =:= true,
+    HasCertMaterial andalso not SslOn;
+is_tls_trap(_) ->
+    false.
+
+%% @private fetch an option value from a map or a proplist; undefined if absent.
+-spec opt_value(atom(), map() | list()) -> term().
+opt_value(K, Opts) when is_map(Opts) -> maps:get(K, Opts, undefined);
+opt_value(K, Opts) when is_list(Opts) -> proplists:get_value(K, Opts, undefined);
+opt_value(_, _) -> undefined.
+
+%% @private true if the key carries a non-empty value (undefined/""/<<>> don't
+%% count — a placeholder shouldn't trigger the trap warning).
+-spec has_material(atom(), map() | list()) -> boolean().
+has_material(K, Opts) ->
+    case opt_value(K, Opts) of
+        undefined -> false;
+        ""        -> false;
+        <<>>      -> false;
+        _         -> true
+    end.
+
+-spec listener_port(map()) -> term().
+listener_port(S) ->
+    case maps:get(listen_opts, S, #{}) of
+        #{port := P} -> P;
+        _            -> unknown
+    end.
