@@ -76,8 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Timeout: 120 seconds.
 
 - **`vuln_scan` runtime rule reload (`update_rules` action)** — Reloads CVE
-  rules from `<data_dir>/staged/cve_rules.json` without agent restart. Rules
-  are SHA-256 verified before loading.
+  rules from `<data_dir>/staged/cve_rules.json` without agent restart. The
+  staged file's SHA-256 is verified against its sidecar before loading (a
+  corruption/integrity check — see `docs/user-manual/server-admin.md`); on any
+  failure the previously-active ruleset is retained.
 
 - **NVD CVE rule generator script** (`scripts/generate-cve-rules.py`) — Standalone
   Python tool to build `cve_rules.json` from NIST NVD API v2. Fetches 31 product

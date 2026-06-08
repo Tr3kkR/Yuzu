@@ -14,6 +14,14 @@
 /server/core/include/yuzu/server/auth.hpp    @fjarvis
 /docs/auth-architecture.md                   @fjarvis
 
+# Vulnerability scanning — the CVE detection ruleset is auto-generated from the
+# NVD by .github/workflows/update-cve-rules.yml and PR'd to dev. Requiring a
+# code-owner review forces a human gate before externally-sourced content enters
+# the fleet detection path (SOC 2 CC7.2 change management / CC9.2 third-party).
+/content/cve_rules.json                              @Tr3kkR
+/content/cve_rules.json.sha256                       @Tr3kkR
+/agents/plugins/vuln_scan/                           @Tr3kkR
+
 # System Guardian / Guaranteed State — owner @FortitudeEtc
 # Desired-state enforcement subsystem; design in docs/yuzu-guardian-design-v1.1.md.
 # (Excludes .claude/agents/security-guardian.md — that's the governance reviewer, not this feature.)

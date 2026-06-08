@@ -6,6 +6,7 @@
  */
 
 #include "cve_rules.hpp"
+#include "rules_integrity.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -66,6 +67,21 @@ TEST_CASE("compare_versions: empty strings", "[vuln][version]") {
     CHECK(compare_versions("", "") == 0);
     CHECK(compare_versions("1.0", "") > 0);
     CHECK(compare_versions("", "1.0") < 0);
+}
+
+TEST_CASE("compare_versions: over-long numeric segments do not overflow", "[vuln][version]") {
+    // A >18-digit segment exceeds long long. The comparator must fall back to a
+    // lexical compare rather than wrapping to a bogus numeric verdict (and must
+    // be UB-free under UBSan).
+    const std::string huge20 = "99999999999999999999"; // 20 digits
+    CHECK(compare_versions(huge20, huge20) == 0);       // equal via lexical fallback
+    // 18-digit values remain within range and compare numerically.
+    CHECK(compare_versions("100000000000000000", "999999999999999999") < 0);
+    // Mixed huge-vs-small is deterministic (lexical fallback), never a wrap.
+    CHECK(compare_versions("1.0." + huge20, "1.0.0") > 0);
+    // Distinct over-long segments must NOT collapse to equal — guards against a
+    // regression where the guard fires but the fallback returns 0 for everything.
+    CHECK(compare_versions("1.0." + huge20, "1.0.99999999999999999998") != 0);
 }
 
 TEST_CASE("compare_versions: real-world OpenSSL versions", "[vuln][version]") {
@@ -312,4 +328,71 @@ TEST_CASE("load_rules_from_json returns error for missing file", "[vuln][json_ru
     std::vector<CveRuleDynamic> rules;
     auto err = load_rules_from_json("/nonexistent/path/cve_rules.json", rules);
     REQUIRE(!err.empty());
+}
+
+// ── rules integrity (real SHA-256) ──────────────────────────────────────────
+
+TEST_CASE("sha256_file_hex: known-answer vector for 'abc'", "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("sha_abc");
+    { std::ofstream f(tmp, std::ios::binary); f << "abc"; }
+    std::string hex;
+    REQUIRE(sha256_file_hex(tmp.string(), hex));
+    CHECK(hex == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST_CASE("verify_rules_sha256: accepts a matching digest", "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("rules_ok");
+    tmp += ".json";
+    { std::ofstream f(tmp, std::ios::binary); f << R"({"schema_version":1,"rules":[]})"; }
+    std::string hex;
+    REQUIRE(sha256_file_hex(tmp.string(), hex));
+    { std::ofstream s(tmp.string() + ".sha256"); s << hex << "  cve_rules.json\n"; }
+    CHECK(verify_rules_sha256(tmp.string()));
+}
+
+TEST_CASE("verify_rules_sha256: rejects a mismatched (tampered) digest", "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("rules_tamper");
+    tmp += ".json";
+    { std::ofstream f(tmp, std::ios::binary); f << R"({"schema_version":1,"rules":[]})"; }
+    // Well-formed 64-char digest that does not match the file.
+    { std::ofstream s(tmp.string() + ".sha256"); s << std::string(64, '0') << "  cve_rules.json\n"; }
+    CHECK_FALSE(verify_rules_sha256(tmp.string()));
+}
+
+TEST_CASE("hex_digest_equal: case-insensitive, length-guarded", "[vuln][integrity]") {
+    CHECK(hex_digest_equal("abcdef", "ABCDEF"));
+    CHECK(hex_digest_equal("0123456789abcdef", "0123456789ABCDEF"));
+    CHECK(hex_digest_equal("", ""));
+    CHECK_FALSE(hex_digest_equal("abcdef", "abcdee")); // one nibble differs
+    CHECK_FALSE(hex_digest_equal("abcdef", "abcde"));  // length mismatch
+}
+
+TEST_CASE("verify_rules_sha256: rejects a wrong-length digest token", "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("rules_badlen");
+    tmp += ".json";
+    { std::ofstream f(tmp, std::ios::binary); f << R"({"schema_version":1,"rules":[]})"; }
+    // Structurally valid sidecar (token + 2 spaces + filename) but 63-char digest.
+    { std::ofstream s(tmp.string() + ".sha256"); s << std::string(63, 'a') << "  cve_rules.json\n"; }
+    CHECK_FALSE(verify_rules_sha256(tmp.string()));
+}
+
+TEST_CASE("verify_rules_sha256: rejects a missing sidecar", "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("rules_nosidecar");
+    tmp += ".json";
+    { std::ofstream f(tmp, std::ios::binary); f << R"({"schema_version":1,"rules":[]})"; }
+    CHECK_FALSE(verify_rules_sha256(tmp.string()));
+}
+
+TEST_CASE("verify_rules_sha256: rejects a file corrupted after the sidecar was written",
+          "[vuln][integrity]") {
+    auto tmp = yuzu::test::unique_temp_path("rules_corrupt");
+    tmp += ".json";
+    { std::ofstream f(tmp, std::ios::binary); f << R"({"schema_version":1,"rules":[]})"; }
+    std::string hex;
+    REQUIRE(sha256_file_hex(tmp.string(), hex));
+    { std::ofstream s(tmp.string() + ".sha256"); s << hex << "  cve_rules.json\n"; }
+    // Mutate the file; the recorded digest no longer matches.
+    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+      f << R"({"schema_version":1,"rules":[],"tampered":true})"; }
+    CHECK_FALSE(verify_rules_sha256(tmp.string()));
 }

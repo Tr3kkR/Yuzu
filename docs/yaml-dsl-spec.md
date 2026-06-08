@@ -121,6 +121,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 | `concurrency` | string | No | `per-device` | Concurrency mode. Values: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. See [Section 12](#12-concurrency-model). |
 | `stagger` | object | No | -- | Stagger configuration for large-fleet dispatch. |
 | `minSuccessPercent` | integer | No | `100` | Minimum percentage of agents that must succeed. `0` = best-effort, `100` = all must succeed. |
+| `timeoutSeconds` | integer | No | plugin default | Per-execution wall-clock deadline in seconds. The agent terminates the action and reports a timeout if exceeded. Used by long-running scan actions (e.g. `vuln_scan.binary_scan` uses `120`). |
 
 #### `spec.execution.stagger`
 

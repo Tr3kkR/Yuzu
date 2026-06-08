@@ -12,6 +12,11 @@
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <system_error>
 #endif
 
 namespace yuzu::vuln {
@@ -33,7 +38,18 @@ inline std::string strip_linux_pkg_epoch(std::string_view v) {
 // Returns "MAJOR.MINOR.PATCH.BUILD" from a PE binary's VERSIONINFO resource,
 // or "" on failure. Requires linking version.lib.
 inline std::string get_pe_file_version(const std::string& path) {
-    std::wstring wpath(path.begin(), path.end());
+    // Convert the UTF-8 path to UTF-16 properly (a byte-wise widening would
+    // corrupt any multibyte character).
+    std::wstring wpath;
+    if (!path.empty()) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                                    static_cast<int>(path.size()), nullptr, 0);
+        if (n <= 0)
+            return {};
+        wpath.resize(static_cast<size_t>(n));
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                            static_cast<int>(path.size()), wpath.data(), n);
+    }
     DWORD dummy = 0;
     DWORD size = GetFileVersionInfoSizeW(wpath.c_str(), &dummy);
     if (size == 0)
@@ -60,18 +76,31 @@ inline std::string get_pe_file_version(const std::string& path) {
 // or "" on failure. Uses CoreFoundation only — no subprocess.
 inline std::string get_bundle_version(const std::string& app_path) {
     std::string plist = app_path + "/Contents/Info.plist";
-    CFStringRef path_ref = CFStringCreateWithCString(
-        nullptr, plist.c_str(), kCFStringEncodingUTF8);
-    if (!path_ref)
+
+    // Bound the read: skip a missing, empty, or implausibly large plist so a
+    // crafted path cannot drive an unbounded allocation.
+    std::error_code ec;
+    auto fsize = std::filesystem::file_size(plist, ec);
+    if (ec || fsize == 0 || fsize > (16u * 1024u * 1024u))
         return {};
-    CFURLRef url = CFURLCreateWithFileSystemPath(
-        nullptr, path_ref, kCFURLPOSIXPathStyle, false);
-    CFRelease(path_ref);
-    if (!url)
+
+    std::ifstream f(plist, std::ios::binary);
+    if (!f)
         return {};
-    CFPropertyListRef plist_ref = CFPropertyListCreateWithURL(
-        nullptr, url, kCFPropertyListImmutable, nullptr, nullptr);
-    CFRelease(url);
+    std::string bytes((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    if (bytes.empty())
+        return {};
+
+    // CFPropertyListCreateWithData parses both XML and binary plists.
+    CFDataRef data = CFDataCreate(
+        nullptr, reinterpret_cast<const UInt8*>(bytes.data()),
+        static_cast<CFIndex>(bytes.size()));
+    if (!data)
+        return {};
+    CFPropertyListRef plist_ref = CFPropertyListCreateWithData(
+        nullptr, data, kCFPropertyListImmutable, nullptr, nullptr);
+    CFRelease(data);
     if (!plist_ref)
         return {};
 

@@ -429,14 +429,22 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 > **Gap:** No macOS FileVault or Linux LUKS coverage.
 
-### 9.4 Vulnerability Scanning :white_check_mark: `T1`
+### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
-`vuln_scan` plugin with three sub-capabilities:
-- **Installed Software CVE Matching** (`cve_scan`) — checks installed packages (dpkg, rpm, brew, Windows registry) against NVD ruleset with dynamic rule loading and SHA-256 verification.
-- **Kernel CVE Detection** (`kernel_scan`) — detects CVEs in running kernel version (Linux uname, Windows CurrentBuildNumber, macOS sw_vers).
-- **Binary File Scanning** (`binary_scan`) — reads version from PE VERSIONINFO, Info.plist, or ELF binaries to detect version drift from package manager.
-- **Runtime Rule Updates** (`update_rules`) — reloads `cve_rules.json` from staged location without agent restart.
-- **NVD Auto-Update Pipeline** — GitHub Actions workflow regenerates `cve_rules.json` weekly from NVD API v2, opens PR for review.
+> **Early-stage / heuristic matcher — not yet a modern vulnerability engine.**
+> The `vuln_scan` plugin matches installed-software versions against a CVE rule
+> list using a product-name **substring** match and a single `version < threshold`
+> comparison. It has **no CPE/PURL identity, no NVD version-range semantics, and
+> no distro/backport awareness**, so it over-reports on patched (especially
+> Linux) fleets and should not be relied on for compliance evidence yet. The
+> target architecture and the roadmap to a trustworthy engine (server-side
+> correlation + OVAL/distro advisories + CVSS/EPSS/KEV) are in
+> **`docs/vuln-scan-engine-design.md`**.
+
+What exists today:
+- **Installed Software CVE Matching** (`cve_scan`) — substring + version-threshold match of package-manager inventory (dpkg, rpm, pacman, apk, brew, Windows registry) against the CVE rule list.
+- **Kernel / Binary heuristics** (`kernel_scan`, `binary_scan`) — kernel-version and file-level (PE VERSIONINFO / `.app` Info.plist) version checks. *Coverage is thin: the bundled NVD-generated ruleset currently yields rules for ~10 server packages only — kernel and Windows rule sets are empty (see the design doc appendix).*
+- **Plumbing (the proven part)** — runtime rule reload (`update_rules`, SHA-256-verified staged delivery), the `inventory` action (the seed of server-side correlation), and a weekly NVD-regeneration workflow. This is the reusable foundation the modern engine builds on.
 
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 

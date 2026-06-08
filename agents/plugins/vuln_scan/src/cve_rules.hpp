@@ -48,6 +48,11 @@ inline int compare_versions(std::string_view a, std::string_view b) {
     auto to_num = [](std::string_view seg) -> std::pair<bool, long long> {
         if (seg.empty())
             return {true, 0};
+        // Cap digit count so val*10 cannot overflow long long (max 19 digits).
+        // An over-long numeric segment is treated as non-numeric so the caller
+        // falls back to a lexical comparison instead of wrapping to garbage.
+        if (seg.size() > 18)
+            return {false, 0};
         long long val = 0;
         for (char c : seg) {
             if (c < '0' || c > '9')

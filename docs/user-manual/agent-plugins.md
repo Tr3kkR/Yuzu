@@ -428,12 +428,12 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | Action | Description |
 |---|---|
 | `scan` | Run a full vulnerability scan (installed software against known CVE data). |
-| `cve_scan` | Check for a specific CVE by ID. |
+| `cve_scan` | Match all installed software against the CVE ruleset (compiled-in + dynamically loaded). Returns one finding per matched CVE. Returns an error (not a clean result) if the host has no supported software-enumeration mechanism. |
 | `config_scan` | Audit system configuration against security baselines (CIS Level 1 controls). |
 | `kernel_scan` | Detect CVEs in the running kernel (Linux `uname`, Windows build number, macOS `sw_vers`). Returns findings by severity. |
-| `binary_scan` | Read version information from binary files (PE VERSIONINFO on Windows, Info.plist on macOS, dpkg epoch/rpm release on Linux) and match against CVE rules. Accepts a `paths` parameter (comma-separated list of absolute paths to scan). |
+| `binary_scan` | Match software versions against CVE rules. With a `paths` parameter (comma-separated absolute paths), reads file-level version metadata directly — PE VERSIONINFO on Windows, `.app` Info.plist on macOS — and reports an error if no supplied path yields a version. Without `paths`, and on Linux (ELF binaries carry no embedded version), it matches package-manager versions (Debian epoch stripped). Execution timeout: 120 seconds. |
 | `update_rules` | Reload CVE rules from the staged file at `<data_dir>/staged/cve_rules.json`. The critical-CVE fallback bundle remains active until the staged file is verified. Requires `endpoint-admin` or `security-admin` role. |
-| `inventory` | Enumerate installed software for NVD CPE matching. Returns package name, version, and source (registry/dpkg/rpm/brew). |
+| `inventory` | Enumerate installed software for NVD CPE matching. Returns `name\|version` per package (sourced from registry/dpkg/rpm/pacman/apk/brew). Errors if no supported package manager is present. |
 | `summary` | Return counts of critical, high, medium, and low findings. |
 
 ### certificates

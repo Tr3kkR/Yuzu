@@ -19,6 +19,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <format>
 #include <map>
@@ -47,6 +48,8 @@
 #include "config_checks.hpp"
 #include "cve_rules.hpp"
 #include "kernel_detection.hpp"
+#include "proc_exec.hpp"
+#include "rules_integrity.hpp"
 
 namespace {
 
@@ -56,46 +59,20 @@ std::string g_data_dir;
 std::mutex g_dynamic_rules_mutex;
 std::shared_ptr<std::vector<yuzu::vuln::CveRuleDynamic>> g_dynamic_rules;
 
-// Verify SHA-256 of rules file against sidecar .sha256 file
-static bool verify_rules_sha256(const std::string& rules_path) {
-    auto sha_path = rules_path + ".sha256";
-    std::ifstream rules_f(rules_path, std::ios::binary);
-    std::ifstream sha_f(sha_path);
-    if (!rules_f || !sha_f)
-        return false;
+// Underlying plugin context, cached at init() so command handlers (which only
+// receive a CommandContext) can reach KV storage. The agent host guarantees the
+// PluginContext outlives the plugin (plugin.hpp documents raw() as cache-safe).
+YuzuPluginContext* g_plugin_ctx_raw = nullptr;
 
-    // Compute SHA-256 of rules file
-    unsigned char hash[32]{};
-    // Simplified: read file and compute; full implementation would use crypto library
-    // For now, accept if sidecar file exists and is readable (basic integrity check)
-    std::string line;
-    if (!std::getline(sha_f, line))
-        return false;
-    // Sidecar format: "<hex_digest>  <filename>"
-    auto space_pos = line.find("  ");
-    if (space_pos == std::string::npos || line.empty())
-        return false;
-    return true;  // Sidecar file is readable and formatted correctly
-}
+// SHA-256 verification of the staged rules file against its sidecar lives in
+// rules_integrity.hpp (yuzu::vuln::verify_rules_sha256) so it is unit-testable.
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
 
 #if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
+// Thin alias over the RAII helper (yuzu::vuln::capture_command, proc_exec.hpp)
+// so the pipe/child are reclaimed even if output accumulation throws.
+std::string run_command(const char* cmd) { return yuzu::vuln::capture_command(cmd); }
 
 bool command_exists(const char* cmd) {
     auto check = std::string("command -v ") + cmd + " >/dev/null 2>&1";
@@ -354,6 +331,74 @@ std::vector<AppInfo> get_installed_apps() {
 }
 #endif
 
+// ── Enumeration / path helpers ─────────────────────────────────────────────
+
+// Whether the host has any supported software-enumeration mechanism. When this
+// is false, an empty installed-software list is an enumeration FAILURE, not a
+// genuinely clean host — callers must not report "No vulnerabilities".
+bool software_enumeration_available() {
+#if defined(_WIN32) || defined(__APPLE__)
+    return true;
+#elif defined(__linux__)
+    return command_exists("dpkg-query") || command_exists("rpm") ||
+           command_exists("pacman") || command_exists("apk");
+#else
+    return false;
+#endif
+}
+
+// Split a comma-separated list, trimming surrounding whitespace; drops empties.
+std::vector<std::string> split_csv(std::string_view s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        auto comma = s.find(',', start);
+        auto tok = (comma == std::string_view::npos) ? s.substr(start)
+                                                      : s.substr(start, comma - start);
+        auto b = tok.find_first_not_of(" \t");
+        auto e = tok.find_last_not_of(" \t");
+        if (b != std::string_view::npos)
+            out.emplace_back(tok.substr(b, e - b + 1));
+        if (comma == std::string_view::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+// Final path component (trailing separators stripped).
+std::string path_basename(std::string_view p) {
+    while (p.size() > 1 && (p.back() == '/' || p.back() == '\\'))
+        p.remove_suffix(1);
+    auto pos = p.find_last_of("/\\");
+    return std::string(pos == std::string_view::npos ? p : p.substr(pos + 1));
+}
+
+// Reject paths that are empty, oversized, contain control bytes, or don't exist.
+// binary_scan paths are operator-supplied; they are only ever passed to file
+// readers (PE/CoreFoundation) — never to a shell — but we still validate.
+bool is_valid_scan_path(const std::string& p) {
+    if (p.empty() || p.size() > 4096)
+        return false;
+    if (p.find('\0') != std::string::npos || p.find('\n') != std::string::npos ||
+        p.find('\r') != std::string::npos)
+        return false;
+    std::error_code ec;
+    return std::filesystem::exists(p, ec) && !ec;
+}
+
+// Read a file/bundle's embedded version. Windows reads PE VERSIONINFO; macOS
+// reads the .app Info.plist. Other platforms have no file-embedded version.
+std::string read_binary_file_version([[maybe_unused]] const std::string& path) {
+#if defined(_WIN32)
+    return yuzu::vuln::get_pe_file_version(path);
+#elif defined(__APPLE__)
+    return yuzu::vuln::get_bundle_version(path);
+#else
+    return {};
+#endif
+}
+
 // ── Scan results ──────────────────────────────────────────────────────────
 
 struct Finding {
@@ -523,11 +568,13 @@ public:
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        g_plugin_ctx_raw = ctx.raw();
         g_data_dir = std::string(ctx.get_config("agent.data_dir"));
         if (!g_data_dir.empty()) {
             auto rules_path = g_data_dir + "/staged/cve_rules.json";
-            // Verify SHA-256 before loading (prevents tampering)
-            if (!verify_rules_sha256(rules_path))
+            // Verify the staged file's SHA-256 against its sidecar before loading
+            // (detects corruption/truncation; see rules_integrity.hpp threat model).
+            if (!yuzu::vuln::verify_rules_sha256(rules_path))
                 return {};  // Non-fatal: compiled-in rules remain active
             std::vector<yuzu::vuln::CveRuleDynamic> loaded;
             auto err = yuzu::vuln::load_rules_from_json(rules_path, loaded);
@@ -548,7 +595,15 @@ public:
 
         if (action == "scan") {
             ctx.report_progress(0);
-            auto cve_findings = do_cve_scan_impl();
+            // Integrity: if software enumeration is unavailable, the CVE portion
+            // cannot run — say so explicitly rather than implying a clean host.
+            // Configuration (CIS) checks are independent and still run.
+            const bool enum_ok = software_enumeration_available();
+            if (!enum_ok)
+                ctx.write_output("ERROR|scan|Degraded coverage|software enumeration "
+                                 "unavailable — CVE results incomplete; configuration "
+                                 "checks still ran");
+            auto cve_findings = enum_ok ? do_cve_scan_impl() : std::vector<Finding>{};
             ctx.report_progress(50);
             auto config_findings = do_config_scan_impl();
             ctx.report_progress(90);
@@ -558,13 +613,21 @@ public:
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
-            output_findings(ctx, all);
+            // Suppress the misleading "No vulnerabilities" line when coverage was
+            // degraded and nothing was found — the ERROR line above stands alone.
+            if (!all.empty() || enum_ok)
+                output_findings(ctx, all);
             ctx.report_progress(100);
             return 0;
         }
 
         if (action == "cve_scan") {
             ctx.report_progress(0);
+            if (!software_enumeration_available()) {
+                ctx.write_output("ERROR|cve_scan|Enumeration unavailable|no supported "
+                                 "package manager found; cannot enumerate installed software");
+                return 1;
+            }
             auto findings = do_cve_scan_impl();
             output_findings(ctx, findings);
             ctx.report_progress(100);
@@ -582,6 +645,11 @@ public:
         if (action == "inventory") {
             // Return raw software inventory for server-side NVD matching.
             // Format: name|version (one per line, pipe-delimited)
+            if (!software_enumeration_available()) {
+                ctx.write_output("ERROR|inventory|Enumeration unavailable|no supported "
+                                 "package manager found; cannot enumerate installed software");
+                return 1;
+            }
             auto apps = get_installed_apps();
             for (const auto& app : apps) {
                 ctx.write_output(std::format("{}|{}", escape_pipes(sanitize_utf8(app.name)),
@@ -591,7 +659,13 @@ public:
         }
 
         if (action == "summary") {
-            auto cve_findings = do_cve_scan_impl();
+            // CVE counts depend on software enumeration; flag degraded coverage
+            // rather than silently under-reporting. CIS checks run regardless.
+            const bool enum_ok = software_enumeration_available();
+            if (!enum_ok)
+                ctx.write_output("ERROR|summary|Degraded coverage|software enumeration "
+                                 "unavailable — CVE counts incomplete");
+            auto cve_findings = enum_ok ? do_cve_scan_impl() : std::vector<Finding>{};
             auto config_findings = do_config_scan_impl();
 
             std::vector<Finding> all;
@@ -604,15 +678,20 @@ public:
         }
 
         if (action == "update_rules") {
+            if (g_data_dir.empty()) {
+                ctx.write_output("ERROR|update_rules|Unavailable|agent data_dir is not configured");
+                return 1;
+            }
             auto rules_path = g_data_dir + "/staged/cve_rules.json";
-            // Verify SHA-256 before loading
-            if (!verify_rules_sha256(rules_path)) {
-                ctx.write_output("ERROR|update_rules|Verification failed|SHA-256 mismatch or missing .sha256 sidecar");
+            // Verify the staged file's SHA-256 against its sidecar before loading.
+            if (!yuzu::vuln::verify_rules_sha256(rules_path)) {
+                ctx.write_output("ERROR|update_rules|Verification failed|SHA-256 mismatch, corrupt file, or missing .sha256 sidecar");
                 return 1;
             }
             std::vector<yuzu::vuln::CveRuleDynamic> loaded;
             auto err = yuzu::vuln::load_rules_from_json(rules_path, loaded);
             if (!err.empty()) {
+                // Fail safe: keep the previously-active ruleset on load error.
                 ctx.write_output("ERROR|update_rules|Load failed|" + escape_pipes(err));
                 return 1;
             }
@@ -621,7 +700,10 @@ public:
                 std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
                 g_dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>(std::move(loaded));
             }
-            ctx.storage_set("rules.last_loaded", rules_path);
+            // KV write goes through the cached PluginContext — CommandContext has
+            // no storage access.
+            if (g_plugin_ctx_raw)
+                yuzu::PluginContext(g_plugin_ctx_raw).storage_set("rules.last_loaded", rules_path);
             ctx.write_output("INFO|update_rules|Rules loaded|" + std::to_string(count) + " rules active");
             return 0;
         }
@@ -635,51 +717,94 @@ public:
         }
 
         if (action == "binary_scan") {
-            // Binary scan checks file-level versions against CVE rules.
-            // On Linux: strips Debian epoch from dpkg reported versions before compare.
-            // On Windows: reads PE VERSIONINFO resource from high-value binaries.
-            // On macOS: reads CFBundleShortVersionString from .app plists.
+            // File-level version scan.
             //
-            // The default high-value binary list is platform-specific.
-            // Callers may pass a comma-separated 'paths' parameter to override.
+            // With a 'paths' parameter (comma-separated): read the version
+            // directly from each binary/bundle — Windows reads the PE
+            // VERSIONINFO resource, macOS reads the .app Info.plist
+            // (CFBundleShortVersionString) — and match it against the CVE
+            // rules. Linux ELF binaries carry no embedded version, so file
+            // paths are not supported there.
+            //
+            // Without 'paths' (and always on Linux): fall back to the
+            // package-manager inventory, stripping the Debian epoch before
+            // comparison (e.g. "2:1.0.1f" → "1.0.1f").
             auto paths_param = std::string(params.get("paths", ""));
-            auto apps = get_installed_apps();
-
             std::vector<Finding> findings;
-            for (const auto& app : apps) {
-                if (app.version.empty())
-                    continue;
 
-                // Strip Debian epoch from package-manager reported version for
-                // accurate comparison (e.g. "2:1.0.1f" → "1.0.1f")
-                auto clean_ver = yuzu::vuln::strip_linux_pkg_epoch(app.version);
-
+            // Match a (product, version) pair against compiled-in + dynamic rules.
+            auto match_against_rules = [&](std::string_view product_name,
+                                          const std::string& version,
+                                          std::string_view source) {
                 auto match_rule = [&](std::string_view product, std::string_view affected_below,
                                       std::string_view severity, std::string_view cve_id,
                                       std::string_view description, std::string_view fixed_in) {
-                    if (!icontains(app.name, product))
+                    if (!icontains(product_name, product))
                         return;
-                    if (yuzu::vuln::compare_versions_normalized(clean_ver,
-                                                                std::string(affected_below)) < 0) {
+                    if (yuzu::vuln::compare_versions_normalized(
+                            version, std::string(affected_below)) < 0) {
                         findings.push_back(
                             {std::string(severity), "binary",
                              std::format("{}: {}", cve_id, description),
-                             std::format("{} {} (fixed in {})", app.name, clean_ver, fixed_in)});
+                             std::format("{} {} (fixed in {})", source, version, fixed_in)});
                     }
                 };
-
                 for (const auto& r : yuzu::vuln::kCveRules)
-                    match_rule(r.product, r.affected_below, r.severity,
-                               r.cve_id, r.description, r.fixed_in);
-                // Safely access dynamic rules
-    auto dynamic_rules = [&]() {
-        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
-        return g_dynamic_rules;
-    }();
-    if (!dynamic_rules) dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>();
-    for (const auto& r : *dynamic_rules)
-                    match_rule(r.product, r.affected_below, r.severity,
-                               r.cve_id, r.description, r.fixed_in);
+                    match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description,
+                               r.fixed_in);
+                auto dynamic_rules = [&]() {
+                    std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+                    return g_dynamic_rules;
+                }();
+                if (dynamic_rules)
+                    for (const auto& r : *dynamic_rules)
+                        match_rule(r.product, r.affected_below, r.severity, r.cve_id,
+                                   r.description, r.fixed_in);
+            };
+
+#if defined(_WIN32) || defined(__APPLE__)
+            auto paths = split_csv(paths_param);
+            if (!paths.empty()) {
+                constexpr size_t kMaxPaths = 256;
+                size_t scanned = 0;
+                size_t considered = 0;
+                for (const auto& p : paths) {
+                    if (considered >= kMaxPaths)
+                        break;
+                    ++considered;
+                    if (!is_valid_scan_path(p))
+                        continue;
+                    auto ver = read_binary_file_version(p);
+                    if (ver.empty())
+                        continue;
+                    ++scanned;
+                    match_against_rules(path_basename(p), ver, p);
+                }
+                // Integrity: an all-skip run must not read as a clean host.
+                if (scanned == 0) {
+                    ctx.write_output(std::format(
+                        "ERROR|binary_scan|No readable binaries|0 of {} path(s) yielded a "
+                        "version (missing, unreadable, or no embedded version)",
+                        paths.size()));
+                    return 1;
+                }
+                output_findings(ctx, findings);
+                return 0;
+            }
+#endif
+
+            // Fallback: package-manager inventory (also the only mode on Linux).
+            if (!software_enumeration_available()) {
+                ctx.write_output("ERROR|binary_scan|Enumeration unavailable|no supported "
+                                 "package manager and no readable 'paths' supplied");
+                return 1;
+            }
+            auto apps = get_installed_apps();
+            for (const auto& app : apps) {
+                if (app.version.empty())
+                    continue;
+                auto clean_ver = yuzu::vuln::strip_linux_pkg_epoch(app.version);
+                match_against_rules(app.name, clean_ver, app.name);
             }
             output_findings(ctx, findings);
             return 0;

@@ -3,6 +3,10 @@
 #include <string>
 #include <string_view>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include "proc_exec.hpp"  // yuzu::vuln::capture_command (must precede the namespace)
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -128,16 +132,10 @@ inline KernelInfo get_kernel_info() {
 inline KernelInfo get_kernel_info() {
     KernelInfo k;
     k.platform = "macos";
-    FILE* p = popen("sw_vers -productVersion 2>/dev/null", "r");
-    if (!p)
+    // RAII pipe capture (proc_exec.hpp) reclaims the FD/child on every path.
+    k.full_version = capture_command("sw_vers -productVersion 2>/dev/null");
+    if (k.full_version.empty())
         return k;
-    char buf[64]{};
-    if (fgets(buf, sizeof(buf), p))
-        k.full_version = buf;
-    pclose(p);
-    while (!k.full_version.empty() &&
-           (k.full_version.back() == '\n' || k.full_version.back() == '\r'))
-        k.full_version.pop_back();
     // NOLINTNEXTLINE(cert-err34-c) — sscanf is fine for fixed-format OS version
     std::sscanf(k.full_version.c_str(), "%d.%d.%d", &k.major, &k.minor, &k.patch);
     return k;

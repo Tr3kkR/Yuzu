@@ -715,7 +715,14 @@ Once you have a new `cve_rules.json`:
    Action: update_rules
    ```
 
-3. After ~30 seconds, the new rules are active on all target endpoints. The plugin verifies the SHA-256 before loading to prevent tampering.
+3. After ~30 seconds, the new rules are active on all target endpoints. Before
+   loading, the plugin computes the staged file's SHA-256 and compares it to the
+   digest in the adjacent `cve_rules.json.sha256` sidecar. This is an integrity
+   check — it detects a corrupted or truncated file and refuses to load it. It is
+   not, on its own, a tamper-proof control: the sidecar is co-located with the
+   data, so end-to-end tamper resistance comes from the `content_dist` delivery
+   path, which verifies the download against an operator-supplied hash held in a
+   separate store before staging.
 
 **Built-in fallback:** If the staged JSON file is unavailable or fails verification, endpoints retain their compiled-in critical CVE ruleset, ensuring continuous protection.
 

@@ -425,11 +425,11 @@ metadata:
   displayName: Binary File Version Scan
   version: 1.0.0
   description: >
-    Reads version information directly from installed binary files — PE
-    VERSIONINFO resources on Windows, Info.plist on macOS, epoch-stripped
-    dpkg/rpm versions on Linux — and compares against CVE rules. Detects
-    drift when an admin manually installs a version that differs from what
-    the package manager recorded.
+    Matches software versions against CVE rules. When given a list of paths,
+    reads the file-level version directly — PE VERSIONINFO on Windows, .app
+    Info.plist on macOS — to catch drift from a manually-installed binary.
+    Without paths, and on Linux (ELF carries no embedded version), it matches
+    the package manager's recorded versions (Debian epoch stripped).
   tags: [security, vulnerability, binary]
 
 spec:
@@ -449,8 +449,9 @@ spec:
         type: string
         displayName: Binary paths
         description: >
-          Comma-separated list of binary paths to inspect. Leave empty to
-          use the default high-value binary list for the current platform.
+          Comma-separated absolute paths to inspect (Windows .exe/.dll,
+          macOS .app bundles). Leave empty to match package-manager versions
+          instead. File-level reads apply on Windows and macOS only.
         default: ""
 
   result:

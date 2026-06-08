@@ -96,6 +96,18 @@ endif
 # depend on `openssl(1)` at runtime or pre-baked .pem files that drift.
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
+# test_vuln_scan.cpp / test_vuln_rules.cpp include the vuln_scan plugin headers:
+# binary_version.hpp pulls CoreFoundation on macOS and version.lib on Windows;
+# rules_integrity.hpp pulls OpenSSL (covered by agent_test_openssl_dep above).
+# The plugin .so links these itself, but the test executable does not inherit
+# that, so declare the platform frameworks/libs here or the link fails.
+agent_test_platform_deps = []
+if host_machine.system() == 'darwin'
+  agent_test_platform_deps += dependency('appleframeworks', modules: ['CoreFoundation'])
+elif host_machine.system() == 'windows'
+  agent_test_platform_deps += meson.get_compiler('cpp').find_library('version')
+endif
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -121,7 +133,7 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep] + agent_test_platform_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
