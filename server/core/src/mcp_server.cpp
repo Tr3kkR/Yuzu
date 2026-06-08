@@ -1853,7 +1853,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 int offset = args.value("offset", 0);
                 limit = std::clamp(limit, 1, 1000);
                 offset = std::clamp(offset, 0, 1000000);
-                auto records = ca_store->list_issued(limit, offset);
+                // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
+                // precise has_more so an agentic client can paginate deterministically.
+                auto records = ca_store->list_issued(limit + 1, offset);
+                const bool has_more = static_cast<int>(records.size()) > limit;
+                if (has_more)
+                    records.resize(static_cast<std::size_t>(limit));
                 nlohmann::json items = nlohmann::json::array();
                 for (const auto& r : records) {
                     items.push_back({{"serial_hex", r.serial_hex},
@@ -1867,7 +1872,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                      {"revocation_reason", r.revocation_reason},
                                      {"issued_by", r.issued_by}});
                 }
-                nlohmann::json payload = {{"items", std::move(items)}, {"count", records.size()}};
+                nlohmann::json payload = {{"items", std::move(items)},
+                                          {"count", records.size()},
+                                          {"limit", limit},
+                                          {"offset", offset},
+                                          {"has_more", has_more}};
+                if (has_more)
+                    payload["next_offset"] = offset + limit;
                 auto result = JObj()
                                   .raw("content", JArr()
                                                       .add(JObj().add("type", "text").add(

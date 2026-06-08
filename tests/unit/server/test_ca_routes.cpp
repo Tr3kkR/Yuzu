@@ -350,6 +350,47 @@ TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca
     }
 }
 
+TEST_CASE("ca_routes: /ca/issued reports has_more + next_offset across pages",
+          "[ca_routes][pki]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    // Three distinct issued certs; page through them two at a time.
+    REQUIRE(h.store->record_issued(sample_issued("AA01")));
+    REQUIRE(h.store->record_issued(sample_issued("AA02")));
+    REQUIRE(h.store->record_issued(sample_issued("AA03")));
+    h.wire();
+
+    // Page 1: limit=2 of 3 → has_more=true, next_offset=2, exactly 2 items
+    // returned (the probe row must be trimmed, not leaked into the page).
+    auto p1 = h.sink.Get("/api/v1/ca/issued?limit=2");
+    REQUIRE(p1);
+    REQUIRE(p1->status == 200);
+    auto j1 = json::parse(p1->body);
+    REQUIRE(j1["items"].size() == 2);
+    REQUIRE(j1["count"] == 2);
+    REQUIRE(j1["meta"]["has_more"] == true);
+    REQUIRE(j1["meta"]["next_offset"] == 2);
+    REQUIRE(j1["meta"]["limit"] == 2);
+    REQUIRE(j1["meta"]["offset"] == 0);
+
+    // Page 2: offset=2 → the last record, has_more=false, no next_offset.
+    auto p2 = h.sink.Get("/api/v1/ca/issued?limit=2&offset=2");
+    REQUIRE(p2);
+    REQUIRE(p2->status == 200);
+    auto j2 = json::parse(p2->body);
+    REQUIRE(j2["items"].size() == 1);
+    REQUIRE(j2["meta"]["has_more"] == false);
+    REQUIRE(j2["meta"].contains("next_offset") == false);
+
+    // Exactly at the boundary: limit==total → has_more=false (the probe found
+    // no extra row), no spurious extra page.
+    auto exact = h.sink.Get("/api/v1/ca/issued?limit=3");
+    REQUIRE(exact);
+    auto je = json::parse(exact->body);
+    REQUIRE(je["items"].size() == 3);
+    REQUIRE(je["meta"]["has_more"] == false);
+}
+
 TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
     Harness h;
     h.wire(/*null_store=*/true);

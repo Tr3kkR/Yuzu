@@ -897,8 +897,12 @@ openssl crl -inform DER -in yuzu.crl -noout -text
 #### `GET /api/v1/ca/issued`
 
 List certificates issued by the internal CA. **Permission:** `Security:Read`.
-Query params `limit` (1–1000, default 200) and `offset`. The full certificate PEM
-and enrollment reference are intentionally omitted.
+Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
+certificate PEM and enrollment reference are intentionally omitted.
+
+`meta.has_more` is `true` when more rows exist beyond the current page; when it is,
+`meta.next_offset` carries the `offset` to pass for the next page. Iterate until
+`has_more` is `false` (do **not** infer end-of-list from `count < limit`).
 
 ```json
 {
@@ -915,9 +919,11 @@ and enrollment reference are intentionally omitted.
     }
   ],
   "count": 1,
-  "meta": { "api_version": "v1" }
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
 }
 ```
+
+The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
 
 #### `POST /api/v1/ca/revoke`
 
