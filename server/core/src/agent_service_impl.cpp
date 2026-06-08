@@ -537,7 +537,20 @@ enrolled:
     // it and reconnects with mutual TLS. Signing failure is non-fatal — the agent
     // stays on the bootstrap (request-but-don't-require) posture and can retry.
     if (!request->csr_pem().empty() && agent_cert_signer_) {
-        if (auto issued = agent_cert_signer_(request->csr_pem(), info.agent_id())) {
+        // #1273 B-2: contain any exception out of the signer — it runs in this sync
+        // handler; a throw would terminate the server. Degrade to no-cert (the
+        // agent stays on the bootstrap posture), same as a nullopt return. Mirrors
+        // the gateway ProxyRegister path so both issuance sites are crash-safe.
+        std::optional<std::pair<std::string, std::string>> issued;
+        try {
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+        } catch (const std::exception& e) {
+            spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
+        } catch (...) {
+            spdlog::error("Register: signer threw a non-std exception for agent {}",
+                          info.agent_id());
+        }
+        if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("Issued per-agent client cert for {}", info.agent_id());

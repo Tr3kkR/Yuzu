@@ -40,8 +40,13 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
   forgery); or (UP-2) strip `csr_pem` to silently downgrade the agent to no-mTLS forever.
   **R-6 (hard gate on PR5d):** the gateway must add agent-identity *attestation* — not
   just transport mTLS — before it forwards enrollment. Tracked in
-  `docs/pki-architecture.md` deferred follow-ups. In PR5 today the agent↔gateway hop is
-  plaintext (R-1) and signing is absent, so neither UP-1 nor UP-2 is live yet.
+  `docs/pki-architecture.md` deferred follow-ups. In PR5 itself the agent↔gateway hop is
+  plaintext (R-1) and signing is absent, so neither UP-1 nor UP-2 was live yet.
+  **UPDATE (PR5d):** PR5d shipped the gateway-path signing **without** the attestation
+  gate, so UP-1 (CSR-swap identity forgery) is now a **live, bounded, accepted residual**
+  — see **R-5** in the register below for the full analysis + compensating controls. The
+  gateway is a trusted upstream-mTLS-authenticated component and every forged leaf is
+  recorded + revocable, which is why this is acceptable for M1 rather than a blocker.
 - **Proto field-drop in transit.** Was the live bug (gpb self-contained modules); fixed by
   regenerating all three embedding modules + per-module roundtrip tests. CI codegen-guard
   is follow-up F-3.
@@ -54,13 +59,14 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
 | **R-2** | **`YUZU_GW_TLS_*` env vars are inert** — they set an advisory `yuzu_gw` env nothing consumes; an operator may believe they enabled TLS. | Low | Med (plaintext upstream by surprise) | `log_tls_state/0` warns unconditionally when the env is set; fail-closed guard catches the resulting `unverified`/plaintext on the upstream. | Env-substituted `sys.config.src` so `YUZU_GW_TLS_*` drive grpcbox cert paths (P1 before any gateway-enabled enterprise deployment guide). |
 | **R-3** | **Upstream-TLS failures are not distinctly observable** — expired/wrong-SAN cert / missing volume collapse to a generic circuit-open; an operator can't tell "cert broke" from "server down". | Med | Med (extended incident / MTTR) | Existing circuit-breaker telemetry + `/readyz` 503; startup posture log. | Dedicated `yuzu_gw_upstream_tls_handshake_failures_total` counter + runtime posture gauge (follow-up F-1). |
 | **R-4** | **Cert-SAN ↔ dial-name** mismatch silently strands a cross-host gateway (OTP enforces SNI under `verify_peer`). | Med | Med | Documented SAN/`hostname:` requirement in `sys.config.prod` + `pki-architecture.md`. | `--cert-san` flag to add SANs to default certs — **SHIPPED (PR5b)**. |
+| **R-5** | **Gateway CSR-swap identity forgery (PR5d signing makes this LIVE — bounded).** Now that `ProxyRegister` signs, a compromised/on-path gateway relays both `agent_id` and `csr_pem`; `X509_REQ_verify` proves only *key*-ownership, not *identity*-ownership, so the gateway can substitute its own keypair's CSR and obtain a **CA-signed leaf for any `agent_id` it relays**. There is **no per-gateway scoping** — any upstream-mTLS-authenticated gateway can request a leaf for **any `agent_id` in the fleet**, so a single compromised gateway's blast radius is *universal device impersonation*, not a subset. The forged leaf is valid for **persistent direct (gateway-bypassing) mTLS reconnect** — impersonation that survives gateway eviction. **Scope:** this forges a *device/agent* identity (receive + execute commands as, and report as, that agent, incl. any management-group scope it sits in); an agent is **not** an operator/RBAC principal, so this is device impersonation, **not** operator-role/admin escalation. (Supersedes the "not exploitable" framing in "Threats considered" above, which held only while the gateway was a passive forwarder.) | Low–Med (requires a compromised/on-path gateway) | High (universal per-agent/device impersonation from one compromised gateway) | The gateway is a **trusted, upstream-mTLS-authenticated** component (not anonymous); every forged leaf is recorded in `ca_issued` (inventoried + **revocable**), and once revoked the #1239 HIGH-2 re-issue guard (present in this stack — #1239 merges below PR5d) blocks re-issuance for that `agent_id`; the on-path (non-compromised-gateway) variant is mitigated by PR5c one-way TLS. *(Lineage caveat: the `ca.cert.issued` audit row does not yet carry a `via=gateway_proxy` discriminator — F-4/#1290 — so post-compromise triage must currently scope by other signals; the certs are still fully inventoried + revocable.)* **Accepted residual for M1.** | Gateway agent-identity **attestation** + **per-gateway agent_id scoping** (a gateway may only relay/obtain leaves for agents registered through it) before forwarding enrollment (R-6) — needs through-gateway cryptographic identity (gateway-mTLS / QUIC #376) M1 does not have. Pair revoke with **deny** meanwhile. |
 
 ## Tracked follow-ups
 
 - **F-1** — `yuzu_gw_upstream_tls_handshake_failures_total` counter (classify `tls_alert`/`handshake_failure` in `do_rpc`) + a runtime TLS-posture gauge (R-3, sre).
 - **F-2** — message-size cap (`max_recv_message_length`) on the gateway listener so an oversized `csr_pem`/any field can't pressure memory (pre-existing for all fields). *(PR5d: a 16 KiB CSR-size cap is now enforced at the shared `sign_agent_csr` chokepoint, applying to both the direct and gateway paths — so the `csr_pem` sub-concern is closed. A broader listener-level cap for all other fields remains open.)*
 - **F-3** — CI guard: regenerate all gateway `_pb.erl` from the vendored protos + diff against committed, and assert every multi-module-embedded message has an identical `{name,fnum,type}` set matching canonical (would convert R-of-drift into a hard CI failure).
-- **F-4** — `via=gateway_proxy` in the server's `ca.cert.issued` audit `detail` when signing arrives via `ProxyRegister` (direct vs proxied issuance traceability).
+- **F-4** — `via=gateway_proxy` in the server's `ca.cert.issued` audit `detail` when signing arrives via `ProxyRegister` (direct vs proxied issuance traceability). **Filed as #1290** — the forensic lineage for the R-5 residual (scope/triage/bulk-revoke the gateway-issued population after a gateway compromise). Targeted for M1 enterprise-readiness.
 - **F-5** — CAIQ/security-questionnaire answer for "is all agent traffic encrypted in transit?" (see "Customer assurance" below).
 
 ## Customer assurance (questionnaire answer)
@@ -78,10 +84,15 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
 
 ## Verdict
 
-Net security improvement; no CRITICAL/HIGH unresolved. R-1's native fix **capability shipped
-in PR5c** (one-way TLS on the agent listener); the residual until the live flip + CA
-distribution lands (**tracked in #1289 — owned, not orphaned**) is a **documented,
-deployment-mitigated** risk, acceptable for M1 provided the network-layer mitigation is
-enforced for any exposed gateway. The shipped reference config
+Net security improvement; **no *uncontrolled* CRITICAL/HIGH**. Two High-impact residuals
+are explicitly **accepted with live compensating controls**, not unmanaged: **R-1**
+(plaintext agent↔gateway edge — PR5c shipped the one-way-TLS *capability*; the live flip +
+CA distribution is owned by **#1289**; deployment-layer mitigation mandatory meanwhile) and
+**R-5** (PR5d gateway-path signing makes the confused-deputy CSR-swap forgery live + bounded
+— compensated by `ca_issued` inventory + revocation + the #1239 re-issue block + PR5c
+one-way TLS for the on-path variant; durable fix is gateway attestation / per-gateway
+scoping, R-6 / QUIC #376; lineage follow-up F-4/#1290). Both are acceptable for M1 provided
+the network-layer mitigation is enforced for any exposed gateway and gateway revocation is
+paired with **deny**. The shipped reference config
 + proto fix are unit-proven (PR5: 194 eunit; PR5c: 200 eunit, dialyzer clean, real EC mutual-
 and one-way-TLS handshakes).

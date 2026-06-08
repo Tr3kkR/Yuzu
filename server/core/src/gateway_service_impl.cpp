@@ -399,7 +399,24 @@ gw_enrolled:
     // (sign_agent_csr) carries the per-agent rate-limit + CSR-size cap, so both
     // paths share one issuance chokepoint and cannot drift.
     if (!request->csr_pem().empty() && agent_cert_signer_) {
-        if (auto issued = agent_cert_signer_(request->csr_pem(), info.agent_id())) {
+        // #1273 B-2: the signer (sign_agent_csr) runs INSIDE this synchronous gRPC
+        // handler and is now reachable over the one-way-TLS gateway edge. An
+        // exception out of it (OpenSSL error, bad_alloc, …) would propagate out of
+        // the sync handler and terminate the server. Contain it and degrade to
+        // no-cert (identical to a nullopt return — the agent stays on bootstrap).
+        std::optional<std::pair<std::string, std::string>> issued;
+        try {
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+        } catch (const std::exception& e) {
+            spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}",
+                          info.agent_id(), e.what());
+        } catch (...) {
+            // Non-std throw (foreign exception across a plugin/.so boundary, etc.)
+            // must not escape the sync handler either (gov #1273 Hermes).
+            spdlog::error("[gateway] ProxyRegister: signer threw a non-std exception for agent {}",
+                          info.agent_id());
+        }
+        if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("[gateway] Issued per-agent client cert for {}", info.agent_id());

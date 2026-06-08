@@ -1031,6 +1031,91 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
     CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
 }
 
+TEST_CASE("ProxyRegister: the signer is called with the RELAYED agent_id, never the CSR subject "
+          "(confused-deputy identity-binding defense, #1273 B-2)",
+          "[agent_service][register][gateway][pki][pr5d][security]") {
+    // The confused-deputy defense: identity is set from the authenticated
+    // enrollment (`info.agent_id()`), NOT from anything in the attacker-relayed
+    // CSR. A CSR whose bytes "claim" a different agent must still cause the signer
+    // to be called with the registering agent_id — so the issued leaf binds to the
+    // enrolled id, not the CSR's. (X509_REQ_verify proves key-ownership only; this
+    // pins that the service layer ignores CSR-asserted identity.)
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    std::string seen_id;
+    gateway_svc.set_agent_cert_signer(
+        [&](const std::string&, const std::string& id)
+            -> std::optional<std::pair<std::string, std::string>> {
+            seen_id = id;
+            return std::make_pair("LEAF-for-" + id, "CHAIN");
+        });
+
+    // CSR blob "claims" victim-agent; the enrollment is for attacker-agent.
+    auto req = make_gw_register(h.auth_mgr, "attacker-agent",
+                                "CSR-with-subject-CN=victim-agent");
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(seen_id == "attacker-agent");                         // relayed id, NOT the CSR's
+    CHECK(resp.issued_certificate() == "LEAF-for-attacker-agent");
+    CHECK(resp.issued_certificate().find("victim") == std::string::npos);
+}
+
+TEST_CASE("ProxyRegister: a THROWING signer cannot crash the gateway handler (#1273 B-2)",
+          "[agent_service][register][gateway][pki][pr5d][security]") {
+    // The signer runs inside the sync gRPC handler; an exception out of it would
+    // otherwise propagate and `terminate` the now-gateway-reachable service. The
+    // shared signer is wrapped in try/catch — this pins that a throwing signer
+    // degrades to "enrolled, no cert" rather than taking the process down.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    gateway_svc.set_agent_cert_signer(
+        [&](const std::string&, const std::string&)
+            -> std::optional<std::pair<std::string, std::string>> {
+            throw std::runtime_error("signer blew up (key load glitch / OpenSSL error)");
+        });
+
+    auto req = make_gw_register(h.auth_mgr, "agent-gw-throw", "FAKE-CSR");
+    apb::RegisterResponse resp;
+    grpc::Status status;
+    REQUIRE_NOTHROW(status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp));
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());                       // enrollment still succeeds
+    CHECK(resp.issued_certificate().empty());     // no cert, no crash
+}
+
+TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either "
+          "(parity with ProxyRegister, #1273 B-2)",
+          "[agent_service][register][pki][pr5d][security]") {
+    // Parity: the direct Register path shares the same try/catch crash-safety as
+    // ProxyRegister (both signer sites are now exception-contained).
+    GatewayResponseHarness h;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string&, const std::string&)
+            -> std::optional<std::pair<std::string, std::string>> {
+            throw std::runtime_error("signer blew up");
+        });
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-throw");
+    req.mutable_info()->set_hostname("h");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(h.auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    req.set_csr_pem("FAKE-CSR");
+
+    apb::RegisterResponse resp;
+    grpc::Status status;
+    REQUIRE_NOTHROW(status = h.svc.Register(/*context=*/nullptr, &req, &resp));
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+    CHECK(resp.issued_certificate().empty());
+}
+
 // ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
 //
 // Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the

@@ -384,10 +384,16 @@ per-agent identity enforcement** (per-agent mTLS is direct-connect-authoritative
 — a gateway-proxied agent presents the single `default-gateway` leaf upstream, so
 the data-plane `is_revoked` gate cannot see its serial; revoking it does not cut
 it off, and the gateway needs agent-identity *attestation* — not just transport
-mTLS — before it forwards enrollment (the **R-6 confused-deputy** hard gate on
-PR5d: a malicious gateway could swap the agent's CSR for its own keypair and have
-the server issue a CA leaf for the victim's `agent_id`, or strip `csr_pem` to
-downgrade the agent to no-mTLS). Closed durably by the QUIC through-gateway
+mTLS — before it forwards enrollment (the **R-6 confused-deputy** residual: a
+compromised/on-path gateway can swap the agent's CSR for its own keypair and have
+the server issue a CA leaf for the victim's `agent_id` — valid for persistent
+direct gateway-bypassing reconnect — or strip `csr_pem` to downgrade the agent to
+no-mTLS. **PR5d shipped the gateway-path signing without this gate, so the CSR-swap
+forgery is now a LIVE, bounded, accepted M1 residual** — see R-5 in
+`docs/security-reviews/pki-pr5-gateway-tls.md`; compensating controls are that the
+gateway is upstream-mTLS-authenticated and every forged leaf is recorded in
+`ca_issued` + revocable, and a revoked `agent_id` is then re-issue-blocked by the
+#1239 HIGH-2 guard. Closed durably by gateway-mTLS / the QUIC through-gateway
 identity migration, #376); **gateway `_pb.erl` regen CI guard** — gpb generates
 self-contained modules, so a field added to the agent-listener `agent_pb` but not
 the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the

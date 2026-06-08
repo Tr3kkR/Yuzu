@@ -87,16 +87,19 @@ message RegisterRequest {
   // Transport-agnostic (#376): lives in the message, survives the QUIC move.
   // GATEWAY: the gateway's vendored copy of this proto
   // (gateway/priv/proto/.../agent.proto + agent_pb.erl) was regenerated in PKI
-  // PR5 to include this field, so the gateway-proxied Register path now FORWARDS
-  // csr_pem/issued_certificate verbatim — the field SURVIVES TRANSIT through the
-  // gateway. It is NOT yet signed on the gateway path: ProxyRegister has no signer
-  // wired in PR5, so a gateway-connected agent still receives an empty
-  // issued_certificate (fails closed to the bootstrap posture). Gateway-path
-  // issuance (signing the forwarded CSR) lands in PR5d, which must first add
-  // agent-identity attestation on the unauthenticated agent↔gateway hop — see the
-  // R-6 confused-deputy gate in docs/pki-architecture.md. (That hop stays plaintext
-  // in M1 — grpcbox forces mutual TLS on any TLS listener, which breaks unenrolled
-  // bootstrap; one-way TLS is PR5c.)
+  // PR5 to include this field, so the gateway-proxied Register path FORWARDS
+  // csr_pem/issued_certificate verbatim, and PR5d signs the forwarded CSR at the
+  // shared sign_agent_csr chokepoint — so per-agent cert ISSUANCE now works on
+  // both the direct and gateway paths. NOTE: the issued cert is ISSUED-BUT-DORMANT
+  // on the agent↔gateway hop — that hop is one-way (server-authenticated) TLS
+  // (PR5c), so the gateway never REQUESTS the agent's client cert (verify_none) and
+  // mutual auth is not yet performed there; the leaf is used for the direct-connect
+  // mTLS path, inventory, and revocation. Full mutual auth on the gateway hop is a
+  // QUIC-era follow-up (#376). SECURITY: because the gateway relays both agent_id
+  // and csr_pem over an unauthenticated-at-the-app-layer hop, a compromised gateway
+  // can swap the CSR to forge a leaf for any relayed agent_id — a bounded, accepted
+  // M1 residual (R-5 in docs/security-reviews/pki-pr5-gateway-tls.md; the leaf is
+  // recorded + revocable; gateway-attestation / R-6 is the durable fix).
   string csr_pem = 7;
 }
 
