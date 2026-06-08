@@ -262,3 +262,26 @@ buffer_cap_on_failure() ->
     [LastBatch | _] = BatchCalls,
     HBs = maps:get(heartbeats, LastBatch, []),
     ?assert(length(HBs) =< 5).
+
+%%% R-3 (#1243): classify_tls_error/1 picks TLS handshake failures out of the
+%%% upstream transport-error term (so they get a distinct metric) without
+%%% mis-flagging ordinary RPC/network errors and without looping on deep terms.
+classify_tls_error_test() ->
+    %% Bare and nested tls_alert → recognised, alert name surfaced as the kind.
+    ?assertEqual({true, <<"unknown_ca">>},
+                 yuzu_gw_upstream:classify_tls_error({tls_alert, {unknown_ca, "msg"}})),
+    ?assertEqual({true, <<"certificate_expired">>},
+                 yuzu_gw_upstream:classify_tls_error(
+                     {shutdown, {tls_alert, {certificate_expired, "msg"}}})),
+    ?assertEqual({true, <<"handshake_failure">>},
+                 yuzu_gw_upstream:classify_tls_error({tls_alert, handshake_failure})),
+    %% Bad ssl options (unreadable/missing certfile) → recognised.
+    ?assertMatch({true, _},
+                 yuzu_gw_upstream:classify_tls_error({options, {certfile, "/missing.pem"}})),
+    %% Ordinary transport/RPC errors → NOT flagged as TLS.
+    ?assertEqual({false, <<>>}, yuzu_gw_upstream:classify_tls_error(closed)),
+    ?assertEqual({false, <<>>}, yuzu_gw_upstream:classify_tls_error(timeout)),
+    ?assertEqual({false, <<>>}, yuzu_gw_upstream:classify_tls_error({grpc_error, 14})),
+    %% A deeply-nested non-TLS term terminates (depth-bounded) rather than looping.
+    ?assertEqual({false, <<>>},
+                 yuzu_gw_upstream:classify_tls_error({a, {b, {c, {d, {e, deep}}}}})).
