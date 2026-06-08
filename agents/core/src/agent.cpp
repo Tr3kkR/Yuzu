@@ -823,6 +823,16 @@ public:
         // process start / re-provision; a mid-run renewal thread is a follow-up.
         std::string pending_csr_pem;
         std::string pending_key_pem;
+        // cpp-safety (#1239): the agent private key lives in `pending_key_pem`
+        // from generation until it is persisted (then explicitly zeroed below).
+        // A stop/return BETWEEN those points — e.g. shutdown mid-enrollment, or
+        // any early return on the connect path — would otherwise leave the key
+        // resident in process memory. This guard scrubs it on EVERY exit from
+        // run() (the explicit zeroes below clear() too, so the guard then no-ops).
+        struct KeyScrub {
+            std::string& k;
+            ~KeyScrub() { yuzu::secure_zero(k); }
+        } pending_key_scrub{pending_key_pem};
         int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
         const std::filesystem::path cert_dir =
             cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
@@ -1167,6 +1177,13 @@ public:
                         pending_key_pem.clear();
                         pending_csr_pem.clear();
                         if (persisted) {
+                            // Pairs with yuzu_agent_cert_provision_failed_total so an
+                            // operator can distinguish a provisioned (mutual-TLS) agent
+                            // from one that gave up and is running unauthenticated —
+                            // the observability half of the silent-downgrade concern
+                            // (#1239 should-fix; the enforcement half is the planned
+                            // --require-agent-identity flag, see auth-architecture.md).
+                            metrics_.counter("yuzu_agent_cert_provisioned_total").increment();
                             const auto paths = provisioned_cert_paths(cert_dir);
                             cfg_.tls_client_cert = paths.cert_path;
                             cfg_.tls_client_key = paths.key_path;
