@@ -143,3 +143,5 @@ __pycache__/
 /scripts/test/perf-histograms.py
 
 .screenshots/
+content/cve_rules.json
+content/cve_rules.json.sha256
