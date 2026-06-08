@@ -373,8 +373,15 @@ std::vector<IssuedCertRecord> CaStore::list_issued(int limit, int offset) {
     if (offset < 0)
         offset = 0;
     sqlite3_stmt* st = nullptr;
-    const std::string sql = std::string("SELECT ") + kIssuedCols +
-                            " FROM ca_issued ORDER BY issued_at DESC LIMIT ? OFFSET ?;";
+    // serial_hex (unique) is a deterministic secondary sort key: without it,
+    // rows sharing an issued_at second order non-deterministically in SQLite, so
+    // offset pagination could skip/duplicate a row across page boundaries even
+    // with no concurrent insert (Hermes INFO on the /ca/issued has_more change).
+    // (Offset pagination is still subject to shift on concurrent insert — keyset
+    // pagination is the M2 answer; adequate for this slow-changing inventory.)
+    const std::string sql =
+        std::string("SELECT ") + kIssuedCols +
+        " FROM ca_issued ORDER BY issued_at DESC, serial_hex DESC LIMIT ? OFFSET ?;";
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_int(st, 1, limit);
