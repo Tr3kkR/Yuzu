@@ -300,6 +300,15 @@ jobs:
         working-directory: gateway
         run: rebar3 compile
 
+      # F-3 (#1243): fail closed if the committed gpb modules drift from
+      # priv/proto. gpb modules are self-contained — an un-regenerated module
+      # silently drops new proto fields in transit (the PR5 CSR field-drop bug).
+      # Runs after compile so _build/gpb exists; regenerates with rebar.config's
+      # own pinned gpb_opts and byte-diffs against the committed *_pb.erl.
+      - name: Check proto codegen is in sync
+        working-directory: gateway
+        run: bash scripts/check-proto-codegen.sh
+
       - name: Run EUnit tests
         working-directory: gateway
         run: |
