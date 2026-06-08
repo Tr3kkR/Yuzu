@@ -175,3 +175,7 @@ __pycache__/
 # is transient enrollment state. Never track either.
 enrollment-tokens.cfg
 pending-agents.cfg
+
+# Generated CVE rules from scripts/generate-cve-rules.py
+content/cve_rules.json
+content/cve_rules.json.sha256
