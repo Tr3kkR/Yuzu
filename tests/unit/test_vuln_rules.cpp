@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <regex>
 
 using namespace yuzu::vuln;
 
@@ -100,11 +101,11 @@ TEST_CASE("CveRule: all rules have non-empty required fields", "[vuln][rules]") 
     }
 }
 
-TEST_CASE("CveRule: all CVE IDs follow CVE-YYYY-NNNNN format", "[vuln][rules]") {
+TEST_CASE("CveRule: all CVE IDs follow CVE, GHSA, or OSV format", "[vuln][rules]") {
+    std::regex cve_pattern(R"(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9]+-[a-z0-9]+-[a-z0-9]+|OSV-\d{4}-\d+)");
     for (const auto& rule : kCveRules) {
         CAPTURE(rule.cve_id);
-        CHECK(rule.cve_id.starts_with("CVE-"));
-        CHECK(rule.cve_id.size() >= 13); // CVE-YYYY-NNNNN minimum
+        CHECK(std::regex_match(std::string(rule.cve_id), cve_pattern));
     }
 }
 
@@ -297,6 +298,9 @@ TEST_CASE("load_rules_from_json loads valid JSON ruleset", "[vuln][json_rules]")
     CHECK(rules[0].product == "testpkg");
     CHECK(rules[0].affected_below == "2.0.0");
     CHECK(rules[0].severity == "HIGH");
+
+    // Cleanup
+    std::filesystem::remove(tmp);
 }
 
 TEST_CASE("load_rules_from_json rejects wrong schema_version", "[vuln][json_rules]") {
@@ -306,6 +310,9 @@ TEST_CASE("load_rules_from_json rejects wrong schema_version", "[vuln][json_rule
     std::vector<CveRuleDynamic> rules;
     auto err = load_rules_from_json(tmp.string(), rules);
     REQUIRE(!err.empty());
+
+    // Cleanup
+    std::filesystem::remove(tmp);
 }
 
 TEST_CASE("load_rules_from_json returns error for missing file", "[vuln][json_rules]") {

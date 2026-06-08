@@ -54,6 +54,7 @@ message RegisterRequest {
   bytes  machine_certificate    = 3;   // DER-encoded X.509
   bytes  attestation_signature  = 4;   // Signed challenge
   string attestation_provider   = 5;   // "ad-cs", "aws", "azure", etc.
+  reserved 6;  // gateway_observed_peer (removed)
 }
 
 message RegisterResponse {
@@ -76,6 +77,7 @@ message HeartbeatRequest {
   yuzu.common.v1.Timestamp sent_at = 2;
   // Lightweight status fields; full inventory uses ReportInventory
   map<string, string> status_tags = 3;
+  reserved 4;  // fleet_snapshot_json (removed)
 }
 
 message HeartbeatResponse {
@@ -92,6 +94,7 @@ message CommandRequest {
   string action     = 3;  // Action within the plugin
   map<string, string> parameters = 4;
   yuzu.common.v1.Timestamp expires_at = 5;  // Agent should discard after this
+  reserved 6, 7;  // stagger_seconds, delay_seconds (removed)
 }
 
 message CommandResponse {
