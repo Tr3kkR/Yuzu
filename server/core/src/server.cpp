@@ -2646,10 +2646,30 @@ private:
     bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
         if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
             return false;
-        auto details = pki::parse_certificate(peer_cert_pem);
-        if (!details || details->serial_hex.empty())
-            return false; // unparseable → not our cert; the identity gate handles it
-        return ca_store_->is_revoked(details->serial_hex);
+        // gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
+        // PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
+        // revocation gate would otherwise pay an X509 PEM parse on every call,
+        // fleet-wide. CRITICAL: the is_revoked() lookup below stays LIVE — caching
+        // the revocation *result* would let a revoked agent keep talking until the
+        // cache expired (a security bug). Only the parse is memoised.
+        std::string serial;
+        {
+            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+            if (auto it = peer_serial_cache_.find(peer_cert_pem);
+                it != peer_serial_cache_.end())
+                serial = it->second;
+        }
+        if (serial.empty()) {
+            auto details = pki::parse_certificate(peer_cert_pem);
+            if (!details || details->serial_hex.empty())
+                return false; // unparseable → not our cert; the identity gate handles it
+            serial = details->serial_hex;
+            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+            if (peer_serial_cache_.size() > 16384)
+                peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
+            peer_serial_cache_[peer_cert_pem] = serial;
+        }
+        return ca_store_->is_revoked(serial);
     }
 
     /// PKI PR4: build + record a new CRL version over the current revoked set,
@@ -7949,6 +7969,12 @@ private:
     // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
     std::mutex yuzu_issued_cache_mu_;
     std::unordered_map<std::string, bool> yuzu_issued_cache_;
+    // Cache of the immutable PEM→serial parse for the per-heartbeat revocation
+    // gate (is_peer_cert_revoked) — avoids an X509 parse per call fleet-wide. The
+    // revocation status itself is deliberately NOT cached (it is mutable). Keyed
+    // by full leaf PEM; same crude size bound as yuzu_issued_cache_.
+    std::mutex peer_serial_cache_mu_;
+    std::unordered_map<std::string, std::string> peer_serial_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
