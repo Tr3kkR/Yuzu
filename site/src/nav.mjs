@@ -49,6 +49,12 @@ export const NAV = [
     ],
   },
   {
+    heading: 'Vulnerability Management',
+    entries: [
+      { file: 'vulnerability-graph-explained', slug: 'vulnerability-graph', title: 'Vulnerability Graph, Explained' },
+    ],
+  },
+  {
     heading: 'Identity & Access',
     entries: [
       { file: 'user-manual/authentication', slug: 'authentication', title: 'Authentication' },
