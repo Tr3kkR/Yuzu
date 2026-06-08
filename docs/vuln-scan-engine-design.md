@@ -11,6 +11,7 @@
 | **Builds on** | PR #1206 (spike — proved the rule-delivery plumbing) |
 | **Decisions of record** | ADR [0001](adr/0001-observed-grounded-reachability.md) · [0002](adr/0002-reachability-graph-data-model.md) · [0003](adr/0003-telemetry-capture-model.md) · [0004](adr/0004-server-storage-substrate.md) · [0005](adr/0005-attack-path-and-chokepoint-scoring.md) |
 | **Glossary** | `CONTEXT.md` — Reachability, Asset value (Crown jewel), Trust zone, Entry point, Attack path, Chokepoint |
+| **Plain-language version** | [`vulnerability-graph-explained.md`](vulnerability-graph-explained.md) — a non-technical intro to *why a graph*, for curious readers |
 | **Related** | `docs/capability-map.md` §9, `docs/fleet-viz-invariants.md`, `docs/scope-walking-design.md`, `docs/agent-privilege-model.md`, `docs/data-architecture.md` |
 
 ---
