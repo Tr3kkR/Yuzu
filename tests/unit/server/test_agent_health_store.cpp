@@ -48,6 +48,8 @@ public:
         std::unordered_map<std::string, int> os_counts, arch_counts, version_counts;
         double total_commands = 0.0;
         int healthy_count = 0;
+        int crash_observer_disarmed = 0;
+        double total_crashes_observed = 0.0;
 
         for (const auto& [id, snap] : snapshots_) {
             ++healthy_count;
@@ -75,9 +77,22 @@ public:
                     total_commands += std::stod(cmd_val);
                 } catch (...) {}
             }
+
+            if (get("yuzu.crash_observer_armed") == "0")
+                ++crash_observer_disarmed;
+
+            auto crashes_val = get("yuzu.crashes_observed");
+            if (!crashes_val.empty()) {
+                try {
+                    total_crashes_observed += std::stod(crashes_val);
+                } catch (...) {}
+            }
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
+        metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed")
+            .set(static_cast<double>(crash_observer_disarmed));
+        metrics.gauge("yuzu_fleet_crashes_observed_total").set(total_crashes_observed);
 
         for (const auto& [os, count] : os_counts)
             metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));
@@ -187,6 +202,24 @@ TEST_CASE("AgentHealthStore: commands_executed sums across fleet", "[health_stor
     store.recompute_metrics(metrics, std::chrono::seconds(60));
 
     REQUIRE(metrics.gauge("yuzu_fleet_commands_executed_total").value() == 60.0);
+}
+
+TEST_CASE("AgentHealthStore: DEX crash recorder disarmed count + crashes summed",
+          "[health_store]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // Armed Windows agent — must NOT count as disarmed; contributes its crash count.
+    store.upsert("win-armed", {{"yuzu.crash_observer_armed", "1"}, {"yuzu.crashes_observed", "3"}});
+    // Windows agent that FAILED to arm — the fault we want visible; 0 crashes.
+    store.upsert("win-deaf", {{"yuzu.crash_observer_armed", "0"}, {"yuzu.crashes_observed", "0"}});
+    // Non-Windows / --dex-disable agent never emits the tag — must NOT count as disarmed.
+    store.upsert("lin-1", {{"yuzu.os", "linux"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    // Exactly one genuine arm FAILURE — absent tag and armed=1 are not counted.
+    CHECK(metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed").value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_crashes_observed_total").value() == 3.0);
 }
 
 TEST_CASE("AgentHealthStore: version breakdown", "[health_store]") {

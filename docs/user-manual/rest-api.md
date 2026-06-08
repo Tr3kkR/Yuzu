@@ -3201,6 +3201,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
 - **Response:** `data[]` of event objects.
 - **4xx:** `400` on non-integer or negative `limit` / `offset`.
+- **Ruleless DEX crash observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=process.crashed` rows — fleet-wide process crashes recorded independent of any rule (`severity` is a fixed `info`; `expected_value` is empty). See [Crash observations (DEX)](guaranteed-state.md#crash-observations-dex).
 
 #### `GET /api/v1/guaranteed-state/status`
 

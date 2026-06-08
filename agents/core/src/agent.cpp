@@ -534,6 +534,14 @@ public:
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
+        metrics_.describe("yuzu_agent_crash_observer_armed",
+                          "1 if the Guardian DEX crash recorder armed at startup, else 0. "
+                          "Startup-arm success only — NOT a liveness probe (a later runtime "
+                          "subscription error does not reset it), and NOT whether Windows Error "
+                          "Reporting is enabled. Surfaced fleet-wide via the heartbeat rollup "
+                          "yuzu_fleet_agents_crash_observer_disarmed (the agent has no /metrics "
+                          "endpoint).",
+                          "gauge");
     }
 
     void run() override {
@@ -616,23 +624,36 @@ public:
         // No-op off Windows. Armed pre-network; emit_guardian_event() self-guards
         // on the Subscribe stream being up, so crashes before first connect are
         // dropped (like guard events pre-sink; durable buffering is A3).
+        // --dex-disable / YUZU_AGENT_DEX_DISABLE is a deploy-time opt-out: when set,
+        // the recorder never arms and NO process-crash telemetry is collected.
         crash_observer_ = make_crash_observer();
-        if (!crash_observer_->start([this](const CrashObservation& obs) {
-                const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count();
-                const auto seq = crash_seq_.fetch_add(1, std::memory_order_relaxed);
-                // Include agent_id: the at-least-once event_id is a GLOBAL primary key
-                // server-side, so two agents crashing in the same ms (e.g. a bad
-                // fleet-wide deploy) would otherwise mint identical ids and all but one
-                // would be dropped at ingest — losing crashes exactly when they matter.
-                const std::string event_id = std::string(kObservationRuleSentinel) + "-" +
-                                             cfg_.agent_id + "-" + std::to_string(now_ms) + "-" +
-                                             std::to_string(seq);
-                emit_guardian_event(crash_observation_to_event(obs, event_id));
-            })) {
+        bool crash_armed = false;
+        if (cfg_.dex_disable) {
+            spdlog::info(
+                "crash_observer: disabled by --dex-disable — no crash telemetry collected");
+        } else if (crash_observer_->start([this](const CrashObservation& obs) {
+                       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                       const auto seq = crash_seq_.fetch_add(1, std::memory_order_relaxed);
+                       // Include agent_id: the at-least-once event_id is a GLOBAL primary key
+                       // server-side, so two agents crashing in the same ms (e.g. a bad
+                       // fleet-wide deploy) would otherwise mint identical ids and all but one
+                       // would be dropped at ingest — losing crashes exactly when they matter.
+                       const std::string event_id = std::string(kObservationRuleSentinel) + "-" +
+                                                     cfg_.agent_id + "-" + std::to_string(now_ms) +
+                                                     "-" + std::to_string(seq);
+                       // crash_seq_ (incremented above) doubles as the per-agent observed-crash
+                       // total surfaced in the heartbeat → fleet rollup; no separate counter.
+                       emit_guardian_event(crash_observation_to_event(obs, event_id));
+                   })) {
+            crash_armed = true;
+        } else {
             spdlog::debug("crash_observer: not armed on this platform — crash DEX disabled");
         }
+        // Startup-arm gauge (see describe()): reflects whether the subscription armed,
+        // NOT ongoing health — a later EvtSubscribeActionError won't reset it.
+        metrics_.gauge("yuzu_agent_crash_observer_armed").set(crash_armed ? 1.0 : 0.0);
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1291,6 +1312,20 @@ public:
                             if (guardian_)
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+#if defined(_WIN32)
+                            // DEX crash recorder (Windows only — no-op elsewhere). Both tags
+                            // are omitted when --dex-disable opted the agent out, so the server
+                            // rollups reflect genuine state, not opt-outs or non-Windows agents.
+                            // The agent has no /metrics endpoint; these heartbeat tags are the
+                            // ONLY path that makes a silently-deaf recorder and the fleet crash
+                            // count observable (see AgentHealthStore::recompute_metrics).
+                            if (!cfg_.dex_disable) {
+                                tags["yuzu.crash_observer_armed"] = std::to_string(static_cast<int>(
+                                    metrics_.gauge("yuzu_agent_crash_observer_armed").value()));
+                                tags["yuzu.crashes_observed"] =
+                                    std::to_string(crash_seq_.load(std::memory_order_relaxed));
+                            }
+#endif
 
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what

@@ -27,6 +27,10 @@ namespace yuzu::agent {
 /// specific kind. Mirrors the reserved "__guard__" / "__guardian__" convention.
 inline constexpr const char* kObservationRuleSentinel = "__observation__";
 inline constexpr const char* kProcessCrashedEventType = "process.crashed";
+/// guard_type for a crash row. A crash is ruleless, so this is NOT a Guardian rule
+/// type — "process" deliberately groups crash observations with the forthcoming
+/// process-condition guards (slice 2), giving the DEX read-model a stable, non-empty
+/// field to group by rather than leaving it blank.
 inline constexpr const char* kProcessGuardType = "process";
 /// DEX applies its own experience framing and ignores Guardian severity, and a
 /// ruleless row never surfaces in Guardian's rule-centric views — so a fixed,

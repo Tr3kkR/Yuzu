@@ -1152,6 +1152,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, int> version_counts;
     double total_commands = 0.0;
     int healthy_count = 0;
+    int crash_observer_disarmed = 0;
+    double total_crashes_observed = 0.0;
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1179,9 +1181,25 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 total_commands += std::stod(cmd_val);
             } catch (...) {}
         }
+
+        // DEX crash recorder: a Windows agent (DEX enabled) reporting "0" failed to
+        // arm. The tag is only emitted by such agents (see agent heartbeat), so
+        // absent / other values are correctly not counted as a fault.
+        if (get("yuzu.crash_observer_armed") == "0")
+            ++crash_observer_disarmed;
+
+        auto crashes_val = get("yuzu.crashes_observed");
+        if (!crashes_val.empty()) {
+            try {
+                total_crashes_observed += std::stod(crashes_val);
+            } catch (...) {}
+        }
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
+    metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed")
+        .set(static_cast<double>(crash_observer_disarmed));
+    metrics.gauge("yuzu_fleet_crashes_observed_total").set(total_crashes_observed);
 
     for (const auto& [os, count] : os_counts) {
         metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));

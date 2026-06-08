@@ -1,6 +1,6 @@
 #include "crash_event.hpp"
 
-#include <cstdio>
+#include <format>
 
 namespace yuzu::agent {
 
@@ -12,11 +12,9 @@ namespace {
 /// (slice 1 adds no proto fields — richer structure is a later slice). e.g.
 ///   "notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll"
 std::string format_detected(const CrashObservation& o) {
-    char codebuf[16];
-    std::snprintf(codebuf, sizeof(codebuf), "0x%08X", o.termination.code);
-    std::string s = o.process_name.empty() ? "<unknown>" : o.process_name;
-    s += " pid=" + std::to_string(o.pid);
-    s += " code=" + std::string(codebuf);
+    std::string s = std::format("{} pid={} code=0x{:08X}",
+                                o.process_name.empty() ? "<unknown>" : o.process_name, o.pid,
+                                o.termination.code);
     if (!o.termination.symbolic.empty())
         s += " " + o.termination.symbolic;
     if (!o.faulting_module.empty())

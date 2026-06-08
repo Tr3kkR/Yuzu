@@ -12,7 +12,7 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
 | **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry`, `file`, and `service` (run-state) guards are live; service start-type, ETW, and non-Windows guards are on the roadmap. |
-| **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values (all guard types — registry, file, service): `drift.detected` (drift observed in **audit** mode — no remediation), `drift.remediated` (enforce restored the expected state — a registry write-back, or a service start/stop), `remediation.failed` (enforce attempted but the action was denied — e.g. a read-only-fallback registry key or a service-control access denial), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). |
+| **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values (all guard types — registry, file, service): `drift.detected` (drift observed in **audit** mode — no remediation), `drift.remediated` (enforce restored the expected state — a registry write-back, or a service start/stop), `remediation.failed` (enforce attempted but the action was denied — e.g. a read-only-fallback registry key or a service-control access denial), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). A distinct **`process.crashed`** value records a *ruleless* fleet-wide crash observation that belongs to no rule — see [Crash observations (DEX)](#crash-observations-dex). |
 | **Baseline** | The named, **deployable** collection of Guards — the *only* deployable unit. A Guard reaches an agent **exclusively** as a member of a *deployed* Baseline; authoring a Guard alone never enforces it anywhere. Has a draft → deployed lifecycle. See [Baselines](#baselines--how-guards-reach-agents). |
 | **Assignment** | A Baseline's targeting: a set of *included* minus *excluded* management groups (exclude wins). **Deferred** — management-group targeting is not wired yet, so deploy is fleet-wide for now and the dashboard labels the assignment area "coming soon." |
 | **Push** | The distribution of the deployed-Baseline rule union to a scope of agents (driven by a Baseline deploy/re-deploy, or the REST `/push`). Separates deploy authority (`Push`) from authoring authority (`Write`). |
@@ -278,6 +278,32 @@ curl -H "Authorization: Bearer $YUZU_TOKEN" \
 
 > **Breaking: Guards now reach agents only via a deployed Baseline.** If you ran a pre-Baseline Guardian build, a Guard alone no longer enforces anywhere — the push fan-out and heartbeat reconcile source their rules from the union of member Guards of **deployed Baselines**. After upgrading, any Guard not in a deployed Baseline is **silently omitted from every agent push** and stops enforcing. To preserve enforcement: create a Baseline containing your active Guards and **Deploy** it (`/guardian` → Baselines). Until you do, the fleet converges to **zero** enforced Guards.
 
+## Crash observations (DEX)
+
+The agent runs a **fleet-wide crash recorder** for Digital Experience Monitoring (DEX). Unlike a Guard, it is **ruleless**: it records *any* process that crashes on a managed endpoint, with no rule, scope, or Baseline involved. On Windows it is an idle-until-crash subscription to the Application event log (Event ID 1000, "Application Error") — there is no polling and no streaming; the agent does nothing until Windows reports a crash, in keeping with Guardian's resource-light, network-kind posture.
+
+A crash is emitted through the same event pipeline as drift but is distinguished by two markers — **not** a category field:
+
+- `rule_id` = the reserved sentinel **`__observation__`** (a ruleless observation belongs to no rule).
+- `event_type` = **`process.crashed`**.
+
+Query crashes with the existing events endpoint, filtering on the sentinel:
+
+```bash
+curl -H "Authorization: Bearer $YUZU_TOKEN" \
+  "https://yuzu.example.com/api/v1/guaranteed-state/events?rule_id=__observation__"
+```
+
+Each row carries `detected_value` packed as `"<proc> pid=<n> code=0x<NTSTATUS> <SYMBOLIC> module=<dll>"` (e.g. `notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll`); `severity` is a fixed `info` (DEX applies its own experience framing and ignores Guardian severity); `expected_value` is empty (a crash has no desired state). Crashes inherit the same [retention](#retention) window as drift events.
+
+**Scope and limitations (slice 1):**
+
+- **Windows only.** The recorder is a no-op on Linux and macOS until those collectors land (gated behind broader Guardian work on those platforms).
+- **Windows 11 / Server 2022+ field layout.** Parsing targets the *named* `<Data>` layout those builds emit; older builds that emit positional fields may yield blank process / module names.
+- **Event ID 1000 only.** Native crashes — and the common .NET case, which also logs a native 1000 with code `0xE0434352` (surfaced as `CLR_EXCEPTION`) — are caught. The rich managed type / stack in the `.NET Runtime` 1026 event, and crashes that log *only* a 1026, are a deferred follow-up.
+
+**Privacy — what is collected.** For each crash the agent sends the **process name**, **PID**, **faulting module**, and **exception code** (plus its symbolic name). The full executable path is parsed but **deliberately not sent** (data minimisation). No command line, environment, memory, or user identity is collected. To opt a fleet — or an individual endpoint — out entirely, start the agent with **`--dex-disable`** (or set `YUZU_AGENT_DEX_DISABLE=1`): the recorder never arms and no crash telemetry is collected. This is a **deploy-time agent setting**, not a server-side runtime toggle. Whether recorders armed across the fleet is surfaced by `yuzu_fleet_agents_crash_observer_disarmed` (see [Observability](#observability)).
+
 ## Retention
 
 Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/v1/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide.
@@ -289,6 +315,8 @@ Guardian surfaces readiness and event counts via the standard observability endp
 - `/healthz` (authenticated) reports `stores.guaranteed_state` **and `stores.baselines`** alongside the other store-health entries. If either `guaranteed-state.db` or `guardian-baselines.db` fails to open, the server reports `status = "degraded"`.
 - `/readyz` includes both `guaranteed_state_store` and `baseline_store` in the per-store readiness conjunction. A failed store takes the pod out of rotation.
 - `yuzu_server_guardian_baselines_total` reports the number of persisted Baselines.
+- `yuzu_fleet_agents_crash_observer_disarmed` (server) counts Windows agents — DEX enabled — whose crash recorder **failed to arm**. `> 0` means crash telemetry is silently off on that many endpoints; investigate. Agents off Windows, or started with `--dex-disable`, are excluded, so this is a genuine fault count, not an opt-out count. It reflects **startup-arm state**, not ongoing subscription health. (Agents report arm-state in each heartbeat; the server rolls it up — the agent has no `/metrics` endpoint.)
+- `yuzu_fleet_crashes_observed_total` (server) is the fleet-wide sum of process crashes observed by DEX recorders since each agent started. The per-crash records — with process, module, and exception code — live in the [events](#crash-observations-dex) store; a per-exception-type rollup lands with the DEX read-model.
 - Broader Prometheus metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
 ## Related documentation

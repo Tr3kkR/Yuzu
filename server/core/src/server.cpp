@@ -242,6 +242,13 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_agents_crash_observer_disarmed",
+                          "Windows agents (DEX enabled) whose process-crash recorder failed to "
+                          "arm — >0 means crash telemetry is silently off on that many endpoints",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_crashes_observed_total",
+                          "Fleet-wide process crashes observed by DEX recorders (sum of "
+                          "agent-reported counts since each agent started)", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
