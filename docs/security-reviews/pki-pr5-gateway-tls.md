@@ -9,8 +9,12 @@
 
 The Erlang gateway is an **optional** scale-out command fan-out plane between agents
 and the C++ server. This change (a) enables mutual TLS on the gateway→server upstream
-hop as a reference config, (b) fixes a silent field-drop so per-agent mTLS enrollment
-works through the gateway, and (c) makes the gateway's TLS posture honest + fail-closed.
+hop as a reference config, (b) fixes a silent field-drop so the per-agent enrollment
+CSR **survives transit** through the gateway — note this is plumbing only; the gateway
+path does **not** sign the forwarded CSR (ProxyRegister has no signer in PR5, so a
+gateway-connected agent still gets an empty `issued_certificate` and fails closed to
+bootstrap), gateway-path **issuance lands in PR5d** — and (c) makes the gateway's TLS
+posture honest + fail-closed.
 It does **not** change the agent↔gateway transport (still plaintext — see residual risk
 R-1) and does **not** flip the shipped images/composes to TLS-by-default (that is PR5b).
 
@@ -25,10 +29,18 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
   `transport_opts` missing grpcbox's required `ssl => true`) is removed; `log_tls_state/0`
   classifies and warns on `unverified`/`plaintext`; the upstream guard refuses boot on
   `unverified`.
-- **Confused-deputy via forwarded `csr_pem`.** Not exploitable: the gateway forwards the
-  CSR verbatim and never parses/validates/acts on it; the server is the sole POP-verifier
-  and signer and ignores CSR subject/SAN (PR3). `issued_certificate` is a response-only
-  field a request cannot usefully set.
+- **Confused-deputy via forwarded `csr_pem`.** Not exploitable **in PR5** — but ONLY
+  because the gateway path performs no signing yet (B-1). The non-exploitability does
+  **not** survive PR5d on its own: once the gateway path signs, the *unauthenticated*
+  agent↔gateway hop makes the gateway a confused deputy on the enrollment path. A
+  malicious/on-path gateway could (UP-1) swap the agent's CSR for its own keypair — the
+  server keys identity off the relayed enrollment token and ignores CSR subject/SAN, so
+  it would issue a CA-signed cert for the **victim's `agent_id`** (persistent credential
+  forgery); or (UP-2) strip `csr_pem` to silently downgrade the agent to no-mTLS forever.
+  **R-6 (hard gate on PR5d):** the gateway must add agent-identity *attestation* — not
+  just transport mTLS — before it forwards enrollment. Tracked in
+  `docs/pki-architecture.md` deferred follow-ups. In PR5 today the agent↔gateway hop is
+  plaintext (R-1) and signing is absent, so neither UP-1 nor UP-2 is live yet.
 - **Proto field-drop in transit.** Was the live bug (gpb self-contained modules); fixed by
   regenerating all three embedding modules + per-module roundtrip tests. CI codegen-guard
   is follow-up F-3.

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ranges>
@@ -61,6 +62,12 @@ struct AgentSession {
     // Stream pointer -- valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
     grpc::ServerContext* server_context = nullptr; // for timeout cancellation
+    // PR3 H-1: the client leaf PEM presented when this Subscribe stream was
+    // established, captured so a background sweep can re-evaluate revocation on
+    // the long-lived stream (the establishment gate only runs once). Empty when
+    // the agent presented no client cert. Guarded by stream_mu alongside stream/
+    // server_context.
+    std::string peer_cert_pem;
     std::mutex stream_mu;
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
@@ -81,9 +88,26 @@ public:
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
-                    grpc::ServerContext* context = nullptr);
+                    grpc::ServerContext* context = nullptr,
+                    const std::string& peer_cert_pem = {});
 
     void clear_stream(const std::string& agent_id);
+
+    /// PR3 H-1: re-evaluate revocation on every live Subscribe stream and tear
+    /// down (TryCancel) any whose presented client leaf is now revoked. The
+    /// establishment gate (`Subscribe`) only checks once; a long-lived stream
+    /// would otherwise keep dispatching to a revoked/compromised agent until it
+    /// voluntarily reconnects (which a hostile agent never does). Driven
+    /// periodically from the reaper thread and callable immediately after an
+    /// operator revoke (PR4) for prompt teardown. `is_revoked(peer_pem)` returns
+    /// true iff that leaf is on the CRL; sessions with no presented cert are
+    /// skipped. The predicate is evaluated OFF stream_mu (it reads ca.db);
+    /// teardown re-acquires the lock and re-checks the cert is unchanged.
+    /// Returns the `agent_id`s whose streams were cancelled (so the caller can
+    /// emit a per-teardown audit row — the registry holds no AuditStore). Null
+    /// predicate → no-op (empty).
+    std::vector<std::string>
+    sweep_revoked(const std::function<bool(const std::string& peer_cert_pem)>& is_revoked);
 
     /// Update last_activity timestamp for an agent (called on heartbeat + subscribe reads).
     void touch_activity(const std::string& agent_id);

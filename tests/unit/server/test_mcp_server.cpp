@@ -15,6 +15,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "ca_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "response_store.hpp"
@@ -520,6 +521,7 @@ struct McpTestServer {
     std::string mock_tier;              // MCP tier for mock auth
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
+    bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
 
@@ -541,6 +543,14 @@ struct McpTestServer {
     /// Default nullptr preserves backwards-compat with every existing
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
+
+    /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
+    /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
+    /// nullptr keeps every existing test on the no-CA path (tools report
+    /// "CA not available").
+    yuzu::server::CaStore* ca_store_for_test{nullptr};
+    bool crl_publish_succeeds_{true};
+    int crl_publish_calls_{0};
 
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
@@ -602,11 +612,14 @@ private:
             return true;
         };
 
-        // Mock audit: record calls
+        // Mock audit: record calls. Returns audit_succeeds_ so a test can simulate
+        // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/, const std::string& /*detail*/) {
+                               const std::string& /*target_id*/, const std::string& /*detail*/)
+            -> bool {
             audit_log.push_back(action + "|" + result);
+            return audit_succeeds_;
         };
 
         // Mock agents: return two test agents
@@ -635,7 +648,15 @@ private:
             /*policy_store=*/nullptr,
             /*mgmt_store=*/nullptr,
             /*approval_manager=*/nullptr,
-            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn));
+            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn),
+            /*ca_store=*/ca_store_for_test,
+            /*publish_crl_fn=*/
+            [this]() -> std::optional<std::vector<std::uint8_t>> {
+                ++crl_publish_calls_;
+                if (!crl_publish_succeeds_)
+                    return std::nullopt;
+                return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
+            });
     }
 };
 
@@ -1652,4 +1673,140 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
 
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|failure");
+}
+
+// ── PR4 B-2: internal-CA MCP tools (MCP/REST parity for /api/v1/ca/*) ─────────
+
+TEST_CASE("MCP CA: list_issued_certs + revoke_certificate are advertised in tools/list",
+          "[mcp][integration][pki]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> names;
+    for (const auto& t : body["result"]["tools"])
+        names.insert(t["name"].get<std::string>());
+    CHECK(names.count("list_issued_certs") == 1);  // discoverability (A1)
+    CHECK(names.count("revoke_certificate") == 1);
+}
+
+TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
+          "[mcp][integration][pki]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    REQUIRE(store.is_open());
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "AB12";
+    rec.subject = "agent-007";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800; // 2100
+    rec.issued_at = 1700000000;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator"); // operator tier allows Security:Read
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    // content[0].text is the JSON payload (mirrors REST /ca/issued shape).
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+    REQUIRE(payload["items"].size() == 1);
+    CHECK(payload["items"][0]["serial_hex"] == "AB12");
+    CHECK(payload["items"][0]["subject"] == "agent-007");
+    CHECK(payload["items"][0]["status"] == "active");
+    CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
+}
+
+TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
+          "[mcp][integration][pki][security]") {
+    // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
+    // worker can inventory the CA. Pin this so a tier_allows regression can't
+    // silently narrow (or widen) the access boundary.
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "C0DE";
+    rec.subject = "agent-ro";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // allowed, not tier-denied
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+}
+
+TEST_CASE("MCP CA: list_issued_certs without a CA returns an error, not a crash",
+          "[mcp][integration][pki]") {
+    McpTestServer ts; // ca_store_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // CA not available
+}
+
+TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:Delete)",
+          "[mcp][integration][pki][security]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "DEAD";
+    rec.subject = "agent-x";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator"); // operator cannot do Security:Delete
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"DEAD"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // tier denied — the generic gate fired
+    // The cert must NOT have been revoked (gate ran before dispatch).
+    CHECK_FALSE(store.is_revoked("DEAD"));
+    CHECK(ts.crl_publish_calls_ == 0);
+}
+
+TEST_CASE("MCP CA: revoke_certificate on supervised tier is approval-gated (not silently executed)",
+          "[mcp][integration][pki][security]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "BEEF";
+    rec.subject = "agent-y";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("supervised"); // tier allows Security:Delete, but it requires approval
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // approval-required (platform-wide, not CA-specific)
+    // Destructive op must NOT execute without approval: cert stays valid, no CRL.
+    CHECK_FALSE(store.is_revoked("BEEF"));
+    CHECK(ts.crl_publish_calls_ == 0);
 }

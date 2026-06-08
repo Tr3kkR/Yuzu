@@ -980,7 +980,12 @@ grpc::Status AgentServiceImpl::Subscribe(
     }
 
     spdlog::info("Agent subscribe stream opened for {}", agent_id);
-    registry_.set_stream(agent_id, stream, context);
+    // PR3 H-1: stash the presented client leaf so the background revocation sweep
+    // can tear this long-lived stream down if the cert is later revoked (the gate
+    // above only runs once, at establishment). Only captured when a revocation
+    // checker is wired (CA active) so a non-PKI deployment stores nothing.
+    registry_.set_stream(agent_id, stream, context,
+                         revocation_checker_ ? extract_peer_cert_pem(*context) : std::string{});
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
@@ -1695,12 +1700,20 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
 
 // -- OTA Update RPCs ----------------------------------------------------------
 
-grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
+grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
                                               const pb::CheckForUpdateRequest* request,
                                               pb::CheckForUpdateResponse* response) {
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "CheckForUpdate"}, {"status", "received"}})
         .increment();
+
+    // B-1 (#1239): a revoked agent must not learn the latest version / sha256 /
+    // mandatory flag / rollout eligibility for its agent_id. This is the OTA
+    // sibling of DownloadUpdate's gate above — both agent-initiated update RPCs
+    // now reject a revoked peer. (No-op when no cert is presented or no checker
+    // is wired, matching Heartbeat/DownloadUpdate.)
+    if (auto s = reject_revoked_peer(context, "check_for_update"); !s.ok())
+        return s;
 
     if (!update_registry_) {
         response->set_update_available(false);

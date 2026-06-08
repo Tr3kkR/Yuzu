@@ -31,12 +31,14 @@ Validity validity_years_from_now(int years) {
     // of the wall-clock decade; the ±1d test tolerance in test_x509_ca absorbs
     // the leap-day rounding.
     const auto span = std::chrono::seconds(static_cast<int64_t>(years) * 31557600LL);
-    return Validity{now, now + span};
+    // not_before backdated by kClockSkewBackdate (H-2) so a slightly-behind peer
+    // can still validate a just-issued cert.
+    return Validity{now - kClockSkewBackdate, now + span};
 }
 
 Validity validity_days_from_now(int days) {
     const auto now = std::chrono::system_clock::now();
-    return Validity{now, now + std::chrono::hours(24 * days)};
+    return Validity{now - kClockSkewBackdate, now + std::chrono::hours(24 * days)};
 }
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -694,8 +696,16 @@ std::optional<std::vector<uint8_t>> build_crl(std::string_view ca_cert_pem,
 
     // crlNumber extension (monotonic sequence).
     {
-        BIGNUM_ptr bn{BN_new()};
-        if (!bn || BN_set_word(bn.get(), static_cast<BN_ULONG>(crl_number)) != 1) {
+        // BN_set_word takes a BN_ULONG, which is only 32-bit on Windows (LLP64),
+        // so a crl_number above 2^32 would silently truncate. Build the BIGNUM
+        // from the full 8-byte big-endian representation instead — platform-
+        // independent and exact for the whole uint64_t range.
+        std::array<unsigned char, 8> be{};
+        for (int i = 0; i < 8; ++i)
+            be[static_cast<std::size_t>(7 - i)] =
+                static_cast<unsigned char>((crl_number >> (8 * i)) & 0xFFu);
+        BIGNUM_ptr bn{BN_bin2bn(be.data(), static_cast<int>(be.size()), nullptr)};
+        if (!bn) {
             log_ssl_errors("build_crl crlNumber bn");
             return std::nullopt;
         }

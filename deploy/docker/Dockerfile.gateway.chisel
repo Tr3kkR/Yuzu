@@ -35,6 +35,12 @@ RUN --mount=type=cache,target=/root/.cache/rebar3 \
 # ── Stage 2: build — compile app + assemble prod release ──────────────────
 FROM deps AS builder
 COPY gateway/ .
+# PKI PR5c (#1244 B-3): fail the build if the vendored grpcbox is stock upstream
+# (hardcoded fail_if_no_peer_cert=true) rather than the Yuzu-patched copy — stock
+# rejects the one-way-TLS agent listener. Network-free patch-presence assertion
+# (the full clone+byte-diff verify runs in CI/release).
+RUN grep -q 'YUZU PATCH (PKI PR5c)' _checkouts/grpcbox/src/grpcbox_pool.erl \
+    || (echo 'FATAL: vendored grpcbox is not Yuzu-patched — one-way TLS would be rejected'; exit 1)
 RUN rebar3 as prod release \
     && echo "=== release boot script shebang ===" \
     && head -1 _build/prod/rel/yuzu_gw/bin/yuzu_gw \

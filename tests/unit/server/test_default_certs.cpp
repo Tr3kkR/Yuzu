@@ -276,21 +276,49 @@ TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][c
     }
 }
 
-TEST_CASE("default_certs: regeneration purges stale inventory rows", "[default_certs][ca_store]") {
+TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
+          "[default_certs][ca_store][security]") {
+    // B-2 (#1238): a wiped/corrupt on-disk cert dir on a PERSISTENT ca.db must NOT
+    // silently regenerate a fresh CA — that would re-root the fleet and orphan
+    // every agent enrolled under the old root. ensure_default_certs must refuse;
+    // the bootstrap caller turns that into a refuse-to-start with a restore hint.
     TempDir dir;
     yuzu::test::TempDbFile db{std::string_view{"defcerts-ca-"}};
     CaStore store(db.path);
     DefaultCertSet a;
     REQUIRE(ensure_default_certs(dir.path, "host", &store, a));
+    REQUIRE(store.has_root());
     REQUIRE(store.list_issued().size() == 3);
 
-    // Corrupt the set, then regenerate against the SAME store.
+    // Corrupt the on-disk set while ca.db stays populated.
     std::error_code ec;
     std::filesystem::remove(a.server_key, ec);
     DefaultCertSet b;
-    REQUIRE(ensure_default_certs(dir.path, "host", &store, b));
-    REQUIRE(b.freshly_generated);
-    REQUIRE(b.ca_fingerprint_sha256 != a.ca_fingerprint_sha256);
-    // Old rows purged — 3, not 6.
+    REQUIRE_FALSE(ensure_default_certs(dir.path, "host", &store, b)); // refuse, don't re-root
+    REQUIRE_FALSE(b.freshly_generated);
+    // ca.db root + inventory left intact (not REPLACEd, not purged).
+    auto root_after = store.get_root();
+    REQUIRE(root_after);
+    REQUIRE(root_after->fingerprint_sha256 == a.ca_fingerprint_sha256);
     REQUIRE(store.list_issued().size() == 3);
+}
+
+TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be created",
+          "[default_certs][negative]") {
+    // The "ensure_default_certs-fails" refuse-to-start branch (#1238 B-6): a dir
+    // that can't be created (here, a path that is an existing FILE) must make
+    // ensure_default_certs return false — not crash, not half-generate — so the
+    // bootstrap caller turns it into a clean refuse-to-start. (The startup_failed()
+    // wiring itself is exercised by the live boot-test; ServerImpl::run starts a
+    // real server, so it is not unit-constructible.)
+    const auto file_path = yuzu::test::unique_temp_path("defcerts-not-a-dir-");
+    {
+        std::ofstream f(file_path);
+        f << "this is a file, not a directory";
+    }
+    DefaultCertSet set;
+    REQUIRE_FALSE(ensure_default_certs(file_path, "h", nullptr, set));
+    REQUIRE_FALSE(set.freshly_generated);
+    std::error_code ec;
+    std::filesystem::remove(file_path, ec);
 }

@@ -111,13 +111,44 @@ callback so `ca_routes` links no `x509_ca`/`key_provider`.
 | `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by). `limit`/`offset` query params. |
 | `POST /api/v1/ca/revoke` | `Security:Delete` | Revoke a serial (`{"serial_hex","reason"}`), then republish the CRL. |
 
+**MCP parity (A1).** The inventory + revoke operations are also exposed as MCP
+tools — `list_issued_certs` (`Security:Read`) and `revoke_certificate`
+(`Security:Delete`) — so an agentic worker reaches the same surface as the
+dashboard/REST (agentic-first principle A1). They are governed by the standard
+MCP tier ladder: `list_issued_certs` (a `Read`) runs on every tier including
+`readonly`; `revoke_certificate` (a destructive `Delete`) is allowed only on `supervised`,
+where it is approval-gated exactly like every other destructive MCP op (so an
+autonomous worker cannot revoke without the approval workflow — the same
+platform-wide approval-gated-execution boundary, not a CA-specific carve-out).
+
 Audit actions: `ca.cert.issued` (PR3, at enrollment), `ca.cert.revoked`,
-`ca.crl.published`. Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
-`yuzu_grpc_revoked_cert_total{rpc}`. Errors use the A4 envelope
+`ca.crl.published`, plus `ca.cert.reissue_blocked` (PR3 H-2 revoked-identity
+re-provision guard). A revoke of a nonexistent/already-revoked serial audits
+`ca.cert.revoked` `result=denied` (reject-without-state-change, idempotent
+retry-safe — matches the destructive-sibling convention); `result=failure` is
+reserved for an authorized-but-errored op (e.g. a `ca.crl.published` build/record
+failure). Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
+`yuzu_grpc_revoked_cert_total{rpc}`, `yuzu_server_ca_crl_publish_failures_total`,
+`yuzu_server_ca_reissue_blocked_total`. Errors use the A4 envelope
 (`docs/agentic-first-principle.md`). Revocation takes effect server-side
 **immediately** (the mTLS accept gate reads `ca.db`, not the CRL); the CRL
-republish propagates it to external consumers — a republish failure is surfaced
-in the response (`crl_republished:false`) and does not undo the revocation.
+republish propagates it to external consumers. A republish failure is honest:
+`publish_crl()` returns failure (not the previously-built DER) when the CRL
+cannot be persisted, so the response reports `crl_republished:false`, the
+`ca.crl.published` `result=failure` audit fires, and the failure counter
+increments — the revocation itself is NOT undone (already enforced server-side).
+
+**curl examples:**
+
+```bash
+# Issued-cert inventory (admin token):
+curl -s -H "X-Yuzu-Token: $TOKEN" https://localhost:8443/api/v1/ca/issued | jq
+
+# Revoke a compromised agent's cert (republishes the CRL):
+curl -s -X POST -H "X-Yuzu-Token: $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"serial_hex":"AB12CD…","reason":"key compromise"}' \
+     https://localhost:8443/api/v1/ca/revoke | jq
+```
 
 `POST /api/v1/ca/issue` (general operator-chosen-CN signing for service / code-
 signing certs) is **deferred**: an operator-issued client leaf whose CN collides
@@ -219,7 +250,7 @@ while proxying `Register` — per-agent mTLS auto-provisioning only worked
 direct-connect. PR5 regenerates **all three** modules (fields mirrored from the
 canonical proto, same field numbers 7/7/8), so the gateway now forwards the CSR
 and returns the issued cert verbatim. A field added to only one module is
-silently stripped on the hop that marshals via another (`gateway.proto:89`
+silently stripped on the hop that marshals via another (`agent.proto:96`
 documents this trap); per-module roundtrip tests now assert `agent_pb`,
 `gateway_pb`, and `management_pb` — and a CI codegen-consistency guard is a
 tracked follow-up.
@@ -280,18 +311,28 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 - **Inventory:** `GET /api/v1/ca/issued` (or the dashboard CA panel, PR4b).
 - **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}`, or
   use the **Settings → Internal CA** dashboard panel (find the agent's row in the
-  inventory and click **Revoke** — the panel refreshes in place with the new
-  status). Either way it is effective immediately server-side; the agent is
-  refused on its next Subscribe/Heartbeat/OTA call (Register re-auth + the
-  data-plane gates consult `ca.db` directly). NOTE: an agent holding an **already-open** Subscribe stream
-  keeps it until that stream next reconnects — revocation does not actively tear
-  down a live stream today (a follow-up). To force an immediate cutoff, restart
-  the agent or wait for its reconnect; the revoked cert cannot re-establish.
-- **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. A failed
-  republish (after a revoke, or a failed startup pre-publish) increments
-  `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
-  `result=failure` — alert on it: the public CRL is stale while server-side
-  enforcement is already live.
+  inventory, optionally type a reason, and click **Revoke** — the panel refreshes
+  in place with the new status; the dashboard POST is CSRF-gated). Either way it
+  is effective immediately server-side; the agent is refused on its next
+  Subscribe/Heartbeat/CheckForUpdate/OTA call (Register re-auth + the data-plane
+  gates consult `ca.db` directly). An agent holding an **already-open** Subscribe
+  stream is torn down by the server's periodic revocation sweep (~15s; PR3 H-1,
+  `yuzu_grpc_revoked_cert_total{rpc=stream_sweep}`, audited `session.cert_revoked`
+  `source=stream_sweep`) — it does not survive on the data plane until a voluntary
+  reconnect. A revoked agent also cannot re-provision its way back: deleting its
+  key and re-enrolling is refused (`ca.cert.reissue_blocked`) while the
+  revocation stands. **Gateway-proxied agents are the exception** — the server
+  sees the gateway's cert, not the agent's leaf, so revocation is not enforced on
+  the gateway hop (disconnect at the gateway too; see `auth-architecture.md`
+  "Gateway-proxied agents: revocation scope").
+- **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. The
+  server keeps the CRL fresh on its own — a background freshness check
+  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
+  fleet with no revocations never serves an expired CRL and a failed startup
+  pre-publish self-heals on the next tick (no permanent 503). A failed republish
+  increments `yuzu_server_ca_crl_publish_failures_total` and audits
+  `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
+  server-side enforcement is already live.
 - **Back up** `<ca-dir>/default-ca.key` (0600) + `ca.db` to offline storage —
   losing the root key forces a full fleet re-enrollment.
 
@@ -310,36 +351,55 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
-namespace separation; centralized revocation/identity gRPC interceptor +
-`--require-agent-identity`; **active teardown of a live Subscribe stream on
-revocation** (today it ends on the next reconnect); `enrollment_request_id`→
-enrollment-decision correlation; `crlNumber` in the `ca.crl.published` audit
-detail; a `yuzu_server_ca_cert_revoked_total` counter + `/readyz`
-`ca_crl_published` signal + a periodic CRL re-publish before `nextUpdate` (7-day)
-lapses; a dedicated public-CA rate-limit bucket; dropping expired entries from the
-CRL; `ca.db` expired-row pruning; `yuzu_server_ca_*_expiry_seconds` gauges +
-alerting; a `docs/security-reviews/` PKI record + risk-register entries;
-agent↔gateway edge encryption (one-way TLS) — **the grpcbox-patch capability
-SHIPPED in PR5c** (vendored `_checkouts/grpcbox` makes `fail_if_no_peer_cert`/
-`verify` configurable; agent listener enabled in `sys.config.prod`); what remains
-is the **live wiring + CA-to-agent distribution in PR5b** (and the deployment-side
-interim mitigation — TLS termination / trusted network — still applies to any
-not-yet-flipped exposed gateway). Upstreaming the patch to grpcbox (then drop the
-vendor) and the QUIC transport (#376) are the longer-term paths. Also **gateway
-mgmt-listener mTLS for the server command-forwarding client** (one-way TLS would
-leave the privileged mgmt plane unauthenticated — use strict mTLS there);
-an env-substituted `sys.config.src` so
-`YUZU_GW_TLS_*` actually drive the grpcbox cert paths (today they set an advisory
-`yuzu_gw` env that nothing consumes); a **CI guard that regenerates
-ALL gateway `_pb.erl` modules (`agent_pb`, `gateway_pb`, `management_pb`) and diffs
-them against the committed copies, plus asserts every message embedded in more than
-one module has an identical `{name, fnum, type}` field set and matches the canonical
-`proto/yuzu/agent/v1/*.proto`** — gpb generates self-contained modules, so a field
-added to one (e.g. the agent-listener `agent_pb`) but not the `ProxyRegister`
-marshaller `gateway_pb` is silently stripped in transit (the PR5 governance catch;
-`gateway.proto:89` warns of it). A per-module roundtrip test now covers it, but a CI
-guard is the structural fix. ACME (P3). (The admin-configurable **`--cert-san`** flag —
-inject extra DNS/IP SANs into every auto-generated default leaf, for a load-balancer
-name / VIP / cross-host service alias such as `dns:gateway` — **SHIPPED in PR5b**;
-`parse_extra_sans` + `merge_sans` in `default_certs.cpp` (IP validated via
-`pki::is_valid_ip_literal`), threaded from `cfg_.cert_sans` at `server.cpp:1659`.)
+namespace separation; **gateway mgmt-listener mTLS for the server
+command-forwarding client** (one-way TLS would leave the privileged mgmt plane
+unauthenticated — use strict mTLS there, not the agent-listener one-way posture);
+**MCP approval re-dispatch** — the `revoke_certificate`
+tool's success path (revoke → CRL republish → `audit_persisted`) is fully
+implemented but today the generic supervised-tier approval gate returns before
+the dispatch body runs, so it has no end-to-end MCP coverage (the identical
+logic IS covered on the REST path); building the approval re-dispatch unlocks
+both the execution and its test (#1240 M3/M4/L4); centralized revocation/identity
+gRPC interceptor + `--require-agent-identity`; **through-gateway revocation +
+per-agent identity enforcement** (per-agent mTLS is direct-connect-authoritative
+— a gateway-proxied agent presents the single `default-gateway` leaf upstream, so
+the data-plane `is_revoked` gate cannot see its serial; revoking it does not cut
+it off, and the gateway needs agent-identity *attestation* — not just transport
+mTLS — before it forwards enrollment (the **R-6 confused-deputy** hard gate on
+PR5d: a malicious gateway could swap the agent's CSR for its own keypair and have
+the server issue a CA leaf for the victim's `agent_id`, or strip `csr_pem` to
+downgrade the agent to no-mTLS). Closed durably by the QUIC through-gateway
+identity migration, #376); **gateway `_pb.erl` regen CI guard** — gpb generates
+self-contained modules, so a field added to the agent-listener `agent_pb` but not
+the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the
+PR5 `csr_pem` catch; `agent.proto:96`); a per-module roundtrip test covers it but a
+CI regen+diff job (elevated **before PR5d**) is the structural fix; **durable
+cross-instance CRL numbering** (`next_crl_number()` = `MAX(version)+1` is serialised
+within one instance via `crl_publish_mu_`, but an HA/multi-instance/DB-restore
+scenario can still collide — `record_crl` rejects a duplicate rather than
+clobbering, #1240 UP-4); revoke-superseded-cert-on-renewal; the `is_revoked`
+heartbeat hot-path in-memory revoked-set memoization (pairs with the open-stream
+sweep); a distinct gateway **upstream TLS-handshake-failure metric**
+(`yuzu_gw_upstream_tls_handshake_failures_total`, R-3) so cert-expiry / CA-rotation
+/ wrong-SAN failures don't collapse into a generic circuit-open; an env-substituted
+`sys.config.src` so `YUZU_GW_TLS_*` actually drive the grpcbox cert paths (today
+they set an advisory `yuzu_gw` env that nothing consumes, R-2);
+`enrollment_request_id`→enrollment-decision correlation; `crlNumber` in the
+`ca.crl.published` audit detail; a `yuzu_server_ca_cert_revoked_total` counter +
+`/readyz` `ca_crl_published` signal; a dedicated public-CA rate-limit bucket;
+dropping expired entries from the CRL; `ca.db` expired-row pruning;
+`yuzu_server_ca_*_expiry_seconds` gauges + alerting; a `docs/security-reviews/`
+PKI record + risk-register entries; ACME (P3).
+
+**Closed by the #1240 review round:** active teardown of a live Subscribe stream
+on revocation (the periodic sweep, PR3 H-1); periodic CRL re-publish before
+`nextUpdate` + startup-503 self-heal (the freshness check); the revoked-identity
+re-provision guard (PR3 H-2); `idx_ca_issued_issued_at` for the inventory sort.
+**Addressed by the #1243/#1244 round:** the agent↔gateway edge encryption
+(one-way TLS capability, PR5c — vendored+patched grpcbox, agent listener enabled
+in `sys.config.prod`) with live wiring + CA-to-agent distribution in PR5b;
+`--cert-san` for cross-host default leaves; the PR5 over-claim corrected (gateway
+CSR survives transit but is not signed until PR5d). (The plaintext-`:50051`
+agent-listener bind-default was reviewed and kept at `0.0.0.0` — agents must
+reach it; the plaintext exposure is gated behind the deliberate `--no-tls`
+banner.)

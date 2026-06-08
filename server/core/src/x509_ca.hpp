@@ -66,10 +66,23 @@ struct Validity {
     std::chrono::system_clock::time_point not_after;
 };
 
+/// Clock-skew backdating allowance. Every cert minted through the validity
+/// helpers (and the agent leaf in `sign_agent_csr`) has its `notBefore` set this
+/// far in the past. Rationale (PR3 H-2 / inherited PR1 UP-9 / PR2 UP-15): a
+/// freshly-issued leaf presented by an endpoint whose clock lags the issuer by a
+/// few minutes is otherwise "not yet valid" — the TLS handshake rejects it and
+/// the agent's reconnect path does NOT recover from "valid cert, skewed clock",
+/// so the agent would be wedged until its clock caught up. 5 min is the de-facto
+/// PKI default (matches the X.509 nsCertType skew convention) and is negligible
+/// against the 1y leaf / 10y CA lifetimes.
+inline constexpr std::chrono::seconds kClockSkewBackdate{300};
+
 // Validity-window helpers. NOTE (SRE): leaf/CA expiry must be alerted on before
-// it bites the fleet — root warn @365d / crit @90d; server leaf warn @30d /
-// crit @7d. A follow-up PR wires the `yuzu_server_ca_*_expiry_seconds` gauges + alert
-// rules. Assumes a 64-bit time_t (true for every current build target).
+// it bites the fleet. PR2 publishes the default set's notAfter as
+// `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` at bootstrap,
+// and the yuzu-tls alert rules (warn @7d / crit @1d, docs/prometheus/yuzu-alerts.yml)
+// fire on it. Assumes a 64-bit time_t (true for every current build target).
+// Both helpers backdate `not_before` by kClockSkewBackdate (see above).
 [[nodiscard]] Validity validity_years_from_now(int years);
 [[nodiscard]] Validity validity_days_from_now(int days);
 
