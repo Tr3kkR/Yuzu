@@ -206,6 +206,12 @@ void CaStore::run_migrations() {
             ALTER TABLE ca_issued       ADD COLUMN issuer_fingerprint TEXT NOT NULL DEFAULT '';
             ALTER TABLE ca_crl_versions ADD COLUMN issuer_fingerprint TEXT NOT NULL DEFAULT '';
         )"},
+        // v3: index the inventory's default sort key. GET /api/v1/ca/issued and the
+        // list_issued_certs MCP tool ORDER BY issued_at DESC; without this every
+        // call full-scans + sorts ca_issued (#1240 performance). Additive index.
+        {3, R"(
+            CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at ON ca_issued(issued_at);
+        )"},
     };
     if (!MigrationRunner::run(db_, "ca_store", kMigrations)) {
         spdlog::error("CaStore: schema migration failed, closing database");

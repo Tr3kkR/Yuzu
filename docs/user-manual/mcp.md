@@ -268,6 +268,17 @@ for the tool to execute.
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
 | 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
+| 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
+| 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. | `Security:Delete` |
+
+> **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
+> follows the same rules as every other destructive MCP op — `readonly`/`operator`
+> tiers are blocked, and `supervised` routes it through the approval workflow
+> (not yet re-dispatchable from MCP; use the REST API / dashboard CA panel for the
+> actual revoke until the approval re-dispatch path is built). `list_issued_certs`
+> is read-only (`Security:Read`) and works on **every** tier including `readonly`
+> (the `readonly` tier permits all Read operations). Exposing both keeps MCP at
+> parity with the dashboard/REST CA surface (agentic-first principle A1).
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.

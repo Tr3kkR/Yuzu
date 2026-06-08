@@ -102,13 +102,44 @@ callback so `ca_routes` links no `x509_ca`/`key_provider`.
 | `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by). `limit`/`offset` query params. |
 | `POST /api/v1/ca/revoke` | `Security:Delete` | Revoke a serial (`{"serial_hex","reason"}`), then republish the CRL. |
 
+**MCP parity (A1).** The inventory + revoke operations are also exposed as MCP
+tools — `list_issued_certs` (`Security:Read`) and `revoke_certificate`
+(`Security:Delete`) — so an agentic worker reaches the same surface as the
+dashboard/REST (agentic-first principle A1). They are governed by the standard
+MCP tier ladder: `list_issued_certs` (a `Read`) runs on every tier including
+`readonly`; `revoke_certificate` (a destructive `Delete`) is allowed only on `supervised`,
+where it is approval-gated exactly like every other destructive MCP op (so an
+autonomous worker cannot revoke without the approval workflow — the same
+platform-wide approval-gated-execution boundary, not a CA-specific carve-out).
+
 Audit actions: `ca.cert.issued` (PR3, at enrollment), `ca.cert.revoked`,
-`ca.crl.published`. Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
-`yuzu_grpc_revoked_cert_total{rpc}`. Errors use the A4 envelope
+`ca.crl.published`, plus `ca.cert.reissue_blocked` (PR3 H-2 revoked-identity
+re-provision guard). A revoke of a nonexistent/already-revoked serial audits
+`ca.cert.revoked` `result=denied` (reject-without-state-change, idempotent
+retry-safe — matches the destructive-sibling convention); `result=failure` is
+reserved for an authorized-but-errored op (e.g. a `ca.crl.published` build/record
+failure). Metrics: `yuzu_server_ca_cert_issued_total{purpose}`,
+`yuzu_grpc_revoked_cert_total{rpc}`, `yuzu_server_ca_crl_publish_failures_total`,
+`yuzu_server_ca_reissue_blocked_total`. Errors use the A4 envelope
 (`docs/agentic-first-principle.md`). Revocation takes effect server-side
 **immediately** (the mTLS accept gate reads `ca.db`, not the CRL); the CRL
-republish propagates it to external consumers — a republish failure is surfaced
-in the response (`crl_republished:false`) and does not undo the revocation.
+republish propagates it to external consumers. A republish failure is honest:
+`publish_crl()` returns failure (not the previously-built DER) when the CRL
+cannot be persisted, so the response reports `crl_republished:false`, the
+`ca.crl.published` `result=failure` audit fires, and the failure counter
+increments — the revocation itself is NOT undone (already enforced server-side).
+
+**curl examples:**
+
+```bash
+# Issued-cert inventory (admin token):
+curl -s -H "X-Yuzu-Token: $TOKEN" https://localhost:8443/api/v1/ca/issued | jq
+
+# Revoke a compromised agent's cert (republishes the CRL):
+curl -s -X POST -H "X-Yuzu-Token: $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"serial_hex":"AB12CD…","reason":"key compromise"}' \
+     https://localhost:8443/api/v1/ca/revoke | jq
+```
 
 `POST /api/v1/ca/issue` (general operator-chosen-CN signing for service / code-
 signing certs) is **deferred**: an operator-issued client leaf whose CN collides
@@ -140,16 +171,25 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 - **Inventory:** `GET /api/v1/ca/issued` (or the dashboard CA panel, PR4b).
 - **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}` —
   effective immediately server-side; the agent is refused on its next
-  Subscribe/Heartbeat/OTA call (Register re-auth + the data-plane gates consult
-  `ca.db` directly). NOTE: an agent holding an **already-open** Subscribe stream
-  keeps it until that stream next reconnects — revocation does not actively tear
-  down a live stream today (a follow-up). To force an immediate cutoff, restart
-  the agent or wait for its reconnect; the revoked cert cannot re-establish.
-- **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. A failed
-  republish (after a revoke, or a failed startup pre-publish) increments
-  `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
-  `result=failure` — alert on it: the public CRL is stale while server-side
-  enforcement is already live.
+  Subscribe/Heartbeat/CheckForUpdate/OTA call (Register re-auth + the data-plane
+  gates consult `ca.db` directly). An agent holding an **already-open** Subscribe
+  stream is torn down by the server's periodic revocation sweep (~15s; PR3 H-1,
+  `yuzu_grpc_revoked_cert_total{rpc=stream_sweep}`, audited `session.cert_revoked`
+  `source=stream_sweep`) — it does not survive on the data plane until a voluntary
+  reconnect. A revoked agent also cannot re-provision its way back: deleting its
+  key and re-enrolling is refused (`ca.cert.reissue_blocked`) while the
+  revocation stands. **Gateway-proxied agents are the exception** — the server
+  sees the gateway's cert, not the agent's leaf, so revocation is not enforced on
+  the gateway hop (disconnect at the gateway too; see `auth-architecture.md`
+  "Gateway-proxied agents: revocation scope").
+- **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. The
+  server keeps the CRL fresh on its own — a background freshness check
+  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
+  fleet with no revocations never serves an expired CRL and a failed startup
+  pre-publish self-heals on the next tick (no permanent 503). A failed republish
+  increments `yuzu_server_ca_crl_publish_failures_total` and audits
+  `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
+  server-side enforcement is already live.
 - **Back up** `<ca-dir>/default-ca.key` (0600) + `ca.db` to offline storage —
   losing the root key forces a full fleet re-enrollment.
 
@@ -166,12 +206,28 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
-namespace separation; centralized revocation/identity gRPC interceptor +
-`--require-agent-identity`; **active teardown of a live Subscribe stream on
-revocation** (today it ends on the next reconnect); `enrollment_request_id`→
-enrollment-decision correlation; `crlNumber` in the `ca.crl.published` audit
-detail; a `yuzu_server_ca_cert_revoked_total` counter + `/readyz`
-`ca_crl_published` signal + a periodic CRL re-publish before `nextUpdate` (7-day)
-lapses; a dedicated public-CA rate-limit bucket; dropping expired entries from the
-CRL; `ca.db` expired-row pruning; `yuzu_server_ca_*_expiry_seconds` gauges +
-alerting; a `docs/security-reviews/` PKI record + risk-register entries; ACME (P3).
+namespace separation; **MCP approval re-dispatch** — the `revoke_certificate`
+tool's success path (revoke → CRL republish → `audit_persisted`) is fully
+implemented but today the generic supervised-tier approval gate returns before
+the dispatch body runs, so it has no end-to-end MCP coverage (the identical
+logic IS covered on the REST path); building the approval re-dispatch unlocks
+both the execution and its test (#1240 M3/M4/L4); centralized revocation/identity
+gRPC interceptor + `--require-agent-identity`; **through-gateway revocation enforcement** (per-agent
+mTLS is direct-connect-authoritative — a gateway-proxied revoked agent is not cut
+off on the gateway hop until the QUIC migration, #376); **durable cross-instance
+CRL numbering** (`next_crl_number()` = `MAX(version)+1` is serialised within one
+instance via `crl_publish_mu_`, but an HA/multi-instance/DB-restore scenario can
+still collide — `record_crl` rejects a duplicate rather than clobbering, #1240
+UP-4); revoke-superseded-cert-on-renewal; the `is_revoked` heartbeat hot-path
+in-memory revoked-set memoization (pairs with the open-stream sweep);
+`enrollment_request_id`→enrollment-decision correlation; `crlNumber` in the
+`ca.crl.published` audit detail; a `yuzu_server_ca_cert_revoked_total` counter +
+`/readyz` `ca_crl_published` signal; a dedicated public-CA rate-limit bucket;
+dropping expired entries from the CRL; `ca.db` expired-row pruning;
+`yuzu_server_ca_*_expiry_seconds` gauges + alerting; a `docs/security-reviews/`
+PKI record + risk-register entries; ACME (P3).
+
+**Closed by the #1240 review round:** active teardown of a live Subscribe stream
+on revocation (the periodic sweep, PR3 H-1); periodic CRL re-publish before
+`nextUpdate` + startup-503 self-heal (the freshness check); the revoked-identity
+re-provision guard (PR3 H-2); `idx_ca_issued_issued_at` for the inventory sort.

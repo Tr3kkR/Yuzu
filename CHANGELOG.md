@@ -92,13 +92,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **public**), `GET /api/v1/ca/issued` (issued-cert inventory — serial, subject,
   purpose, status, expiry; `Security:Read`), and `POST /api/v1/ca/revoke`
   (`{"serial_hex","reason"}`; `Security:Delete` — revocation takes effect
-  server-side immediately and republishes the CRL). New metric
-  `yuzu_server_ca_cert_issued_total{purpose}`; audit actions `ca.cert.revoked` +
-  `ca.crl.published`. The routed reference doc `docs/pki-architecture.md` lands
-  with this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN
-  signing is intentionally deferred — it needs a non-agent namespace so an
-  operator-issued cert can't impersonate an agent; the dashboard CA panel is a
-  follow-up.) See `docs/pki-architecture.md` "CA REST surface".
+  server-side immediately and republishes the CRL). The same inventory + revoke
+  operations are also exposed as **MCP tools** (`list_issued_certs` /
+  `revoke_certificate`) so an agentic worker reaches the CA surface at parity with
+  the dashboard/REST (governed by the standard MCP tier ladder — `revoke` is
+  destructive and approval-gated like every other destructive MCP op). A revoke
+  of a nonexistent/already-revoked serial is audited `result=denied` (idempotent,
+  retry-safe); a CRL republish that fails to persist now honestly reports
+  `crl_republished:false` (it no longer serves a freshly-built-but-unstored CRL),
+  and a background freshness check re-publishes the CRL before `nextUpdate` lapses
+  (and self-heals a failed startup pre-publish — no permanent `/ca/crl` 503). New
+  metrics `yuzu_server_ca_cert_issued_total{purpose}`,
+  `yuzu_server_ca_crl_publish_failures_total`; audit actions `ca.cert.revoked`
+  (`success`/`denied`) + `ca.crl.published`. Issued-cert inventory is now indexed
+  on `issued_at`. The routed reference doc `docs/pki-architecture.md` lands with
+  this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN signing is
+  intentionally deferred — it needs a non-agent namespace so an operator-issued
+  cert can't impersonate an agent; the dashboard CA panel is a follow-up.) See
+  `docs/pki-architecture.md` "CA REST surface".
 
 - **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
   server runs with its built-in CA (the default-cert bootstrap above) and an

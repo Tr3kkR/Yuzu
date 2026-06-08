@@ -1960,6 +1960,35 @@ public:
                 // ~15s cadence (this thread) is well inside CRL validity windows;
                 // PR4's operator-revoke handler calls the same sweep immediately
                 // for prompt teardown. No-op unless the internal CA is active.
+                // PR4 (architect S1 / UP-3): keep the published CRL fresh. A fleet
+                // with no revocations would otherwise never re-publish, so /ca/crl
+                // eventually serves a CRL past its nextUpdate (external validators
+                // reject an expired CRL), and a failed startup pre-publish would
+                // leave /ca/crl 503 with no self-heal. Re-publish when the latest
+                // CRL is missing or within 24h of nextUpdate. publish_crl()
+                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
+                // 7 days out so this fires at most ~once/6 days in steady state.
+                if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
+                    // Backoff (steady_clock — immune to NTP jumps): after a failed
+                    // freshness publish, don't retry every tick — wait 5 min so a
+                    // persistent failure (bad CA key) doesn't spam logs + the
+                    // failure counter (gov L1/L5).
+                    const auto now_steady = std::chrono::steady_clock::now();
+                    if (now_steady >= crl_freshness_retry_after_) {
+                        // nextUpdate is a wall-clock epoch → compare with wall time.
+                        const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
+                        auto latest = ca_store_->latest_crl();
+                        const bool stale =
+                            !latest || (latest->next_update - now_epoch) < 24 * 3600;
+                        if (stale) {
+                            if (publish_crl())
+                                spdlog::info(
+                                    "PKI: CRL re-published for freshness (nextUpdate window)");
+                            else
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
+                        }
+                    }
+                }
                 if (ca_store_ && ca_store_->is_open()) {
                     const auto swept = registry_.sweep_revoked(
                         [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
@@ -2672,8 +2701,17 @@ private:
         rec.next_update =
             std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
                 .count();
-        if (!ca_store_->record_crl(rec))
-            spdlog::warn("PKI: failed to record CRL v{} (serving it regardless)", number);
+        if (!ca_store_->record_crl(rec)) {
+            // B-1 (#1240): do NOT report success on a persistence failure. Returning
+            // the freshly-built DER here would make the revoke handler audit
+            // ca.crl.published/success and set crl_republished:true while /ca/crl
+            // keeps serving the PREVIOUS CRL (missing the just-revoked serial) — a
+            // false success that also evades the stale-CRL alert. Fail honestly so
+            // the caller reports crl_republished:false and the failure audit fires.
+            spdlog::error("PKI: failed to record CRL v{} — reporting publish failure", number);
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
         return der;
     }
 
@@ -7559,8 +7597,8 @@ private:
                 },
                 [this](const httplib::Request& req, const std::string& action,
                        const std::string& result, const std::string& target_type,
-                       const std::string& target_id, const std::string& detail) {
-                    (void)audit_log(req, action, result, target_type, target_id, detail);
+                       const std::string& target_id, const std::string& detail) -> bool {
+                    return audit_log(req, action, result, target_type, target_id, detail);
                 },
                 [this]() { return registry_.to_json_obj(); }, rbac_store_.get(),
                 instruction_store_.get(), execution_tracker_.get(), response_store_.get(),
@@ -7641,7 +7679,9 @@ private:
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
                                  sent);
                     return {command_id, sent};
-                });
+                },
+                // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
+                ca_store_.get(), [this]() { return publish_crl(); });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -7887,6 +7927,13 @@ private:
     std::unique_ptr<CaStore> ca_store_;
     DefaultCertSet default_cert_set_;
     bool default_certs_failed_{false};
+    // PR4: backoff for the reaper's CRL freshness re-publish — on a persistent
+    // publish failure (e.g. unreadable CA key) skip retries until this point so
+    // the ~15s reaper doesn't spam logs/metrics. steady_clock (NTP-jump-safe,
+    // gov L5). ACCESSED ONLY by the single reaper thread (health_recompute_thread_)
+    // — not atomic by design; do NOT read/write it from another thread without
+    // converting to std::atomic first (gov L1).
+    std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
     bool startup_failed_{false}; // run() refused to start — main() exits non-zero
     // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
     // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.

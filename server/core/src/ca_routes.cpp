@@ -215,18 +215,29 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         for (auto& c : serial)
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         if (!ca_store->revoke(serial, reason)) {
-            // Idempotent: unknown serial or already-revoked. Audit the denied
-            // attempt (SOC 2 CC7.2 — a revoke of a non-existent serial is worth a
-            // forensic row), then 404.
-            audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
-                     "serial not found or already revoked");
+            // Idempotent: unknown serial or already-revoked. result="denied"
+            // (reject-without-state-change) matches every destructive sibling
+            // (api_token.revoke, offload_target.delete, ...) so SIEM `result=denied`
+            // probe queries catch CA-revoke probes; "failure" is reserved for an
+            // authorized-but-errored op (e.g. the ca.crl.published path below). This
+            // also stops a retry of a *successful* revoke logging a false "failure"
+            // (idempotency, #1240 UP-7). SOC 2 CC7.2 forensic row, then 404.
+            // M1 (#1240): surface a dropped denied-row too (a revoke-probe whose
+            // forensic row is lost is the same evidence gap as a lost success row).
+            if (!audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
+                          "serial not found or already revoked"))
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 404;
             res.set_content(
                 error_json_a4(404, "serial not found or already revoked", make_correlation_id()),
                 kJson);
             return;
         }
-        audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial, reason);
+        // A dropped audit row on a privileged revoke is an evidence-chain gap —
+        // surface it to the operator via Sec-Audit-Failed (SOC 2 CC7.2), mirroring
+        // the sibling destructive handlers. The revoke itself already succeeded.
+        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial,
+                                 reason);
         // Republish the CRL so external consumers see the revocation. A failure
         // here does NOT undo the revocation (already enforced server-side) — it is
         // surfaced to the caller so they know the public CRL is momentarily stale.
@@ -234,12 +245,18 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         if (publish_crl_fn)
             crl_ok = publish_crl_fn().has_value();
         // Hermes M2: audit the republish FAILURE too — a stale public CRL after a
-        // revocation is a security-relevant event (SOC 2 CC7.2).
+        // revocation is a security-relevant event (SOC 2 CC7.2). "failure" (not
+        // "denied") is correct here: this is an authorized op that errored.
         if (crl_ok)
-            audit_fn(req, "ca.crl.published", "success", "Security", serial, "");
+            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial, "") &&
+                       audit_ok;
         else
-            audit_fn(req, "ca.crl.published", "failure", "Security", serial,
-                     "CRL build/record failed after revocation; public CRL may be stale");
+            audit_ok = audit_fn(req, "ca.crl.published", "failure", "Security", serial,
+                                "CRL build/record failed after revocation; public CRL may be "
+                                "stale") &&
+                       audit_ok;
+        if (!audit_ok)
+            res.set_header("Sec-Audit-Failed", "true");
         nlohmann::json out = {{"revoked", true},
                               {"serial_hex", serial},
                               {"crl_republished", crl_ok},

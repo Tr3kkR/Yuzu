@@ -127,6 +127,14 @@ public:
     bool delete_issued_by(const std::string& issued_by);
 
     // ── CRL versions ────────────────────────────────────────────────────────────
+    /// Next CRL sequence number = MAX(version)+1. NOT durable across the
+    /// allocate→record gap on its own: callers MUST serialise allocate+record
+    /// externally (the server holds `crl_publish_mu_` for exactly this) so two
+    /// publishers can't compute the same number and have `record_crl` collide.
+    /// In an HA / multi-instance / DB-restore scenario this single-DB counter can
+    /// still collide across instances — durable cross-instance CRL numbering is a
+    /// tracked follow-up (#1240 UP-4). record_crl() rejects a duplicate version
+    /// (no silent clobber), so a collision fails loudly rather than corrupting.
     [[nodiscard]] uint64_t next_crl_number();
     [[nodiscard]] bool record_crl(const CrlVersionRecord& rec);
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();

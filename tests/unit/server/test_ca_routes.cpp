@@ -44,7 +44,8 @@ struct Harness {
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
-    bool crl_succeeds{true}; // when false, publish_crl_fn returns nullopt (GAP-2)
+    bool crl_succeeds{true};   // when false, publish_crl_fn returns nullopt (GAP-2)
+    bool audit_succeeds{true}; // when false, AuditFn returns false (#1240 Sec-Audit-Failed)
     int crl_calls{0};
 
     void wire(bool null_store = false) {
@@ -64,8 +65,9 @@ struct Harness {
         };
         CaRoutes::AuditFn audit = [this](const httplib::Request&, const std::string& a,
                                          const std::string& r, const std::string& tt,
-                                         const std::string& ti, const std::string& d) {
+                                         const std::string& ti, const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
+            return audit_succeeds; // #1240: AuditFn now returns bool (observe persist failure)
         };
         CaRoutes::PublishCrlFn crl = [this]() -> std::optional<std::vector<std::uint8_t>> {
             ++crl_calls;
@@ -186,21 +188,29 @@ TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security]") {
     REQUIRE(saw_revoke);
     REQUIRE(saw_crl);
 
-    // Re-revoke an already-revoked serial → 404 + a failure audit row.
+    // Re-revoke an already-revoked serial → 404 + a "denied" audit row (#1240:
+    // reject-without-state-change uses "denied" like every destructive sibling;
+    // "failure" is reserved for an authorized-but-errored op). This is also the
+    // idempotency case — a retry of a successful revoke must not log a false error.
     auto again = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
     REQUIRE(again);
     REQUIRE(again->status == 404);
-    bool saw_fail = false;
+    bool saw_denied = false;
     for (const auto& a : h.audits)
-        if (a.action == "ca.cert.revoked" && a.result == "failure")
-            saw_fail = true;
-    REQUIRE(saw_fail);
+        if (a.action == "ca.cert.revoked" && a.result == "denied")
+            saw_denied = true;
+    REQUIRE(saw_denied);
 
-    // Perm denied → 403, no revoke attempted.
+    // Perm denied → 403, no revoke attempted, and NO audit row emitted by the
+    // handler (#1240: the perm gate runs before any audit_fn call; the denied
+    // audit is the perm layer's responsibility, not the route's — asserting zero
+    // new rows here proves the route doesn't double-audit or leak a row on 403).
+    const std::size_t audits_before = h.audits.size();
     h.perm_allow = false;
     auto denied = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"BEEF"})");
     REQUIRE(denied);
     REQUIRE(denied->status == 403);
+    REQUIRE(h.audits.size() == audits_before); // handler emitted no audit row on 403
 }
 
 TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the public path",
@@ -304,6 +314,26 @@ TEST_CASE("ca_routes: revoke succeeds but CRL republish fails is audited", "[ca_
     }
     REQUIRE(revoke_ok);
     REQUIRE(crl_fail); // the republish FAILURE is on the evidence chain
+}
+
+TEST_CASE("ca_routes: a dropped audit row on a successful revoke sets Sec-Audit-Failed (#1240 M2)",
+          "[ca_routes][pki][security]") {
+    // The AuditFn is bool-returning; a privileged revoke whose audit row fails to
+    // persist must signal the evidence-chain gap to the operator (Sec-Audit-Failed)
+    // while the revoke itself still stands. Without a test, a regression in the
+    // header wiring would silently break that signal.
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.audit_succeeds = false; // simulate an audit-store write failure
+    h.wire();
+
+    auto ok = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);                       // the revoke still succeeded
+    REQUIRE(json::parse(ok->body)["revoked"] == true);
+    REQUIRE(h.store->is_revoked("DEAD"));             // enforced regardless
+    REQUIRE(ok->get_header_value("Sec-Audit-Failed") == "true"); // gap surfaced
 }
 
 TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca_routes][pki]") {
