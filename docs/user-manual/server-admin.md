@@ -126,7 +126,12 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, and the rest of the `--data-dir` SQLite stores on the same schedule. Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
+
+> **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
+> - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
+> - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
+> - **No silent re-root.** If `ca.db` already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent. Restore `default-*.{pem,key}` from backup (matching the `ca.db` root), or remove `ca.db` too for a deliberate clean re-root.
 
 > **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
 
@@ -335,6 +340,31 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
+| Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
+
+### Revoking an agent certificate from the dashboard
+
+When the server runs its built-in CA, **Settings → Internal CA** lists every
+issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
+
+1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
+   the **Serial**).
+2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
+   stored on the revocation record and audited.
+3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
+   *Revoked* and the public CRL is republished automatically.
+
+Revocation takes effect **immediately server-side**: the agent is refused on its
+next connection, and any already-open command stream is torn down by the
+revocation sweep within ~15s. A revoked agent cannot re-enroll its way back by
+deleting its key (re-issuance is refused while the revocation stands). The same
+operation is available over REST (`POST /api/v1/ca/revoke`) for automation. The
+dashboard action is CSRF-protected and requires `Security:Delete`.
+
+> **Gateway-proxied agents:** revocation is enforced on direct-connect agents
+> only — an agent reaching the server through a gateway presents its cert to the
+> gateway, not the server, so also disconnect it at the gateway. See
+> `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ---
 

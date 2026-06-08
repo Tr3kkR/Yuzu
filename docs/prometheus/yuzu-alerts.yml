@@ -101,10 +101,12 @@ groups:
         annotations:
           summary: "Yuzu server TLS certificate expires in less than 7 days"
           description: >-
-            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
-            Renew the certificate and place the new PEM files at the configured
-            path. If certificate hot-reload is enabled, the server will pick up
-            the new files automatically.
+            The {{ $labels.cert }} certificate expires in
+            {{ $value | humanizeDuration }}. Renew it and place the new PEM files
+            at the configured path (hot-reload picks up HTTPS automatically).
+            Built-in default certs (cert="default-ca") do NOT auto-renew — replace
+            them with operator-provided certs, or clear the cert directory to
+            regenerate.
 
       - alert: YuzuCertificateExpiryCritical
         expr: |
@@ -115,8 +117,9 @@ groups:
         annotations:
           summary: "Yuzu server TLS certificate expires in less than 24 hours"
           description: >-
-            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
-            Immediate action required to prevent service disruption.
+            The {{ $labels.cert }} certificate expires in
+            {{ $value | humanizeDuration }}. Immediate action required to prevent
+            service disruption.
 
       - alert: YuzuCertReloadFailures
         expr: |

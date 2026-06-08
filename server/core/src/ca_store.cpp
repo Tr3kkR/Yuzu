@@ -49,14 +49,50 @@ IssuedCertRecord read_issued_row(sqlite3_stmt* st) {
     r.issued_by = col_text(st, 9);
     r.enrollment_request_id = col_text(st, 10);
     r.cert_pem = col_text(st, 11);
+    r.issuer_fingerprint = col_text(st, 12);
     return r;
 }
 
 constexpr const char* kIssuedCols =
     "serial_hex, subject, san, purpose, not_after, status, revocation_reason, revoked_at, "
-    "issued_at, issued_by, enrollment_request_id, cert_pem";
+    "issued_at, issued_by, enrollment_request_id, cert_pem, issuer_fingerprint";
 
 } // namespace
+
+std::optional<std::string> normalize_serial_hex(std::string_view serial) {
+    // RFC 5280 serials are <= 20 octets (40 hex chars); cap generously so a
+    // pathological multi-megabyte "serial" can't drive an unbounded allocation.
+    if (serial.size() > 256)
+        return std::nullopt;
+    std::string out;
+    out.reserve(serial.size());
+    for (char c : serial) {
+        // Strip the common decorations OpenSSL/operators add (colons, whitespace).
+        if (c == ':' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v')
+            continue;
+        if (c >= '0' && c <= '9')
+            out += c;
+        else if (c >= 'A' && c <= 'F')
+            out += c;
+        else if (c >= 'a' && c <= 'f')
+            out += static_cast<char>(c - 'a' + 'A'); // canonical uppercase
+        else
+            return std::nullopt; // any non-hex byte → fail closed
+    }
+    if (out.empty())
+        return std::nullopt;
+    // Strip leading zeros so the canonical form matches BN_bn2hex's value
+    // semantics (a BIGNUM carries no leading zeros). This makes the form
+    // mathematically unique, so an operator-supplied zero-padded serial still
+    // matches the stored one. Keep a single digit for the (invalid-but-canonical)
+    // zero value rather than collapsing to empty.
+    const auto first = out.find_first_not_of('0');
+    if (first == std::string::npos)
+        out = "0";
+    else if (first > 0)
+        out.erase(0, first);
+    return out;
+}
 
 // ── Enum bridges ──────────────────────────────────────────────────────────────
 
@@ -157,6 +193,25 @@ void CaStore::run_migrations() {
                 published_at INTEGER NOT NULL
             );
         )"},
+        // v2: provenance link to the signing root (its SHA-256 fingerprint) on
+        // both the issued inventory and the CRL history. A subordinate-CA re-key
+        // (PR6) replaces ca_root id=1; without this an issued cert / stored CRL
+        // has no link to the root that signed it (a re-key would orphan the
+        // inventory and could serve an old-root CRL against the new root). Done
+        // as a v2 ALTER — NOT an in-place edit of the v1 CREATE TABLE — so an
+        // already-migrated (v1) ca.db gains the column too, rather than the
+        // IF NOT EXISTS path silently skipping it. NOT NULL DEFAULT '' keeps it
+        // backward-compatible for code that does not set it yet.
+        {2, R"(
+            ALTER TABLE ca_issued       ADD COLUMN issuer_fingerprint TEXT NOT NULL DEFAULT '';
+            ALTER TABLE ca_crl_versions ADD COLUMN issuer_fingerprint TEXT NOT NULL DEFAULT '';
+        )"},
+        // v3: index the inventory's default sort key. GET /api/v1/ca/issued and the
+        // list_issued_certs MCP tool ORDER BY issued_at DESC; without this every
+        // call full-scans + sorts ca_issued (#1240 performance). Additive index.
+        {3, R"(
+            CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at ON ca_issued(issued_at);
+        )"},
     };
     if (!MigrationRunner::run(db_, "ca_store", kMigrations)) {
         spdlog::error("CaStore: schema migration failed, closing database");
@@ -245,21 +300,28 @@ bool CaStore::record_issued(const IssuedCertRecord& rec) {
     std::lock_guard lk(mu_);
     if (!db_)
         return false;
-    if (rec.serial_hex.empty()) {
-        spdlog::error("CaStore: refusing to record issued cert with empty serial");
+    // Canonicalise the serial at the write boundary so a later revoke()/
+    // is_revoked() lookup matches regardless of case/colon decoration. Fail
+    // closed on a non-hex serial — never store a cert we couldn't later revoke.
+    const auto serial = normalize_serial_hex(rec.serial_hex);
+    if (!serial) {
+        // Don't echo the raw serial — it may be untrusted (PR4 operator/REST
+        // input) and could carry CRLF/control bytes to forge log lines.
+        spdlog::error("CaStore: refusing to record issued cert with empty/non-hex serial (len {})",
+                      rec.serial_hex.size());
         return false;
     }
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO ca_issued (serial_hex, subject, san, purpose, not_after, "
                            "status, revocation_reason, revoked_at, issued_at, issued_by, "
-                           "enrollment_request_id, cert_pem) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                           "enrollment_request_id, cert_pem, issuer_fingerprint) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                            -1, &st, nullptr) != SQLITE_OK) {
         spdlog::error("CaStore: prepare record_issued failed: {}", sqlite3_errmsg(db_));
         return false;
     }
-    bind_text(st, 1, rec.serial_hex);
+    bind_text(st, 1, *serial);
     bind_text(st, 2, rec.subject);
     bind_text(st, 3, rec.san);
     bind_text(st, 4, rec.purpose);
@@ -271,6 +333,7 @@ bool CaStore::record_issued(const IssuedCertRecord& rec) {
     bind_text(st, 10, rec.issued_by);
     bind_text(st, 11, rec.enrollment_request_id);
     bind_text(st, 12, rec.cert_pem);
+    bind_text(st, 13, rec.issuer_fingerprint);
     const bool ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (!ok)
@@ -282,12 +345,15 @@ std::optional<IssuedCertRecord> CaStore::get_issued(const std::string& serial_he
     std::lock_guard lk(mu_);
     if (!db_)
         return std::nullopt;
+    const auto serial = normalize_serial_hex(serial_hex);
+    if (!serial)
+        return std::nullopt; // non-hex → no such cert
     sqlite3_stmt* st = nullptr;
     const std::string sql =
         std::string("SELECT ") + kIssuedCols + " FROM ca_issued WHERE serial_hex = ?;";
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK)
         return std::nullopt;
-    bind_text(st, 1, serial_hex);
+    bind_text(st, 1, *serial);
     std::optional<IssuedCertRecord> out;
     if (sqlite3_step(st) == SQLITE_ROW)
         out = read_issued_row(st);
@@ -323,6 +389,11 @@ bool CaStore::revoke(const std::string& serial_hex, const std::string& reason) {
     std::lock_guard lk(mu_);
     if (!db_)
         return false;
+    // Canonicalise so an operator/REST-supplied serial (lowercase / colons)
+    // matches the stored form; fail closed on non-hex (no such cert to revoke).
+    const auto serial = normalize_serial_hex(serial_hex);
+    if (!serial)
+        return false;
     // RETURNING carries the change in the step result — never sqlite3_changes()
     // on a shared connection (#1033). A no-op (already revoked / unknown serial)
     // returns no row.
@@ -337,7 +408,7 @@ bool CaStore::revoke(const std::string& serial_hex, const std::string& reason) {
     }
     bind_text(st, 1, reason);
     sqlite3_bind_int64(st, 2, epoch_seconds());
-    bind_text(st, 3, serial_hex);
+    bind_text(st, 3, *serial);
     const bool changed = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return changed;
@@ -349,12 +420,25 @@ bool CaStore::is_revoked(const std::string& serial_hex) {
     std::lock_guard lk(mu_);
     if (!db_)
         return false;
+    // Canonicalise so the lookup matches the stored form. This is a SECURITY
+    // gate ("reject if revoked"); a serial that won't normalise to hex cannot be
+    // one of our issued certs, so fail closed — treat it as revoked (reject)
+    // rather than silently returning "not revoked". In practice every real caller
+    // passes a BN_bn2hex-form serial from a chain-verified leaf, so this branch
+    // is unreachable on the happy path.
+    const auto serial = normalize_serial_hex(serial_hex);
+    if (!serial) {
+        // Don't echo the raw serial (untrusted → CRLF/log-forging risk).
+        spdlog::warn("CaStore: is_revoked got a non-hex serial (len {}) — failing closed (revoked)",
+                     serial_hex.size());
+        return true;
+    }
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "SELECT 1 FROM ca_issued WHERE serial_hex = ? AND status = 'revoked';",
                            -1, &st, nullptr) != SQLITE_OK)
         return false;
-    bind_text(st, 1, serial_hex);
+    bind_text(st, 1, *serial);
     const bool revoked = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return revoked;
@@ -417,10 +501,20 @@ bool CaStore::record_crl(const CrlVersionRecord& rec) {
         spdlog::error("CaStore: refusing to record empty CRL");
         return false;
     }
+    if (rec.version < 1) {
+        // crlNumber is a positive monotonic sequence (RFC 5280 §5.2.3); version 0
+        // would collide with COALESCE(MAX,0) sentinels and is never legitimate.
+        spdlog::error("CaStore: refusing to record CRL with version {} (< 1)", rec.version);
+        return false;
+    }
+    // Plain INSERT (NOT "OR REPLACE"): a duplicate version is a real conflict
+    // (two publishers raced a number) — fail it so the caller re-allocates,
+    // rather than silently clobbering an existing generation. The race-free path
+    // is publish_next_crl(); this manual path stays safe by refusing collisions.
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
-                           "INSERT OR REPLACE INTO ca_crl_versions (version, der, this_update, "
-                           "next_update, published_at) VALUES (?, ?, ?, ?, ?);",
+                           "INSERT INTO ca_crl_versions (version, der, this_update, "
+                           "next_update, published_at, issuer_fingerprint) VALUES (?, ?, ?, ?, ?, ?);",
                            -1, &st, nullptr) != SQLITE_OK) {
         spdlog::error("CaStore: prepare record_crl failed: {}", sqlite3_errmsg(db_));
         return false;
@@ -430,11 +524,48 @@ bool CaStore::record_crl(const CrlVersionRecord& rec) {
     sqlite3_bind_int64(st, 3, rec.this_update);
     sqlite3_bind_int64(st, 4, rec.next_update);
     sqlite3_bind_int64(st, 5, rec.published_at ? rec.published_at : epoch_seconds());
+    bind_text(st, 6, rec.issuer_fingerprint);
     const bool ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (!ok)
         spdlog::error("CaStore: record_crl step failed: {}", sqlite3_errmsg(db_));
     return ok;
+}
+
+std::optional<CrlVersionRecord>
+CaStore::publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
+                          const std::string& issuer_fingerprint) {
+    if (!build)
+        return std::nullopt;
+    // Serialise publishes against each other so the number allocated by
+    // next_crl_number() is still free when record_crl() inserts it — WITHOUT
+    // holding the connection lock (mu_) across the signing callback. Each DB step
+    // below takes mu_ only briefly via the public methods; `build` (CA-key load +
+    // sign) runs with no DB lock held, so concurrent issuance is not blocked and
+    // `build` cannot deadlock the store.
+    std::lock_guard pub(crl_publish_mu_);
+    if (!is_open())
+        return std::nullopt;
+    const uint64_t version = next_crl_number();                  // MAX(version)+1
+    const std::vector<IssuedCertRecord> revoked = list_revoked(); // current revoked set
+    std::vector<uint8_t> der = build(version, revoked);
+    if (der.empty()) {
+        spdlog::error("CaStore: publish_next_crl build produced no DER (version {})", version);
+        return std::nullopt; // nothing inserted → the number is not consumed
+    }
+    CrlVersionRecord rec;
+    rec.version = static_cast<int64_t>(version);
+    rec.der = std::move(der);
+    rec.this_update = this_update;
+    rec.next_update = next_update;
+    rec.published_at = epoch_seconds();
+    rec.issuer_fingerprint = issuer_fingerprint;
+    // Plain INSERT (in record_crl): a duplicate version — only reachable via a
+    // cross-process publisher, not the single-server M1 model — is refused, never
+    // clobbered. crl_publish_mu_ makes the same-process path collision-free.
+    if (!record_crl(rec))
+        return std::nullopt;
+    return rec;
 }
 
 std::optional<CrlVersionRecord> CaStore::latest_crl() {
@@ -443,8 +574,8 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
         return std::nullopt;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
-                           "SELECT version, der, this_update, next_update, published_at "
-                           "FROM ca_crl_versions ORDER BY version DESC LIMIT 1;",
+                           "SELECT version, der, this_update, next_update, published_at, "
+                           "issuer_fingerprint FROM ca_crl_versions ORDER BY version DESC LIMIT 1;",
                            -1, &st, nullptr) != SQLITE_OK)
         return std::nullopt;
     std::optional<CrlVersionRecord> out;
@@ -460,6 +591,7 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
         r.this_update = sqlite3_column_int64(st, 2);
         r.next_update = sqlite3_column_int64(st, 3);
         r.published_at = sqlite3_column_int64(st, 4);
+        r.issuer_fingerprint = col_text(st, 5);
         out = std::move(r);
     }
     sqlite3_finalize(st);

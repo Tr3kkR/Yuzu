@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <ctime>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -118,13 +119,31 @@ inline std::string html_escape(const std::string& s) {
 
 /// Percent-decode a URL-encoded string (also handles + as space).
 inline std::string url_decode(const std::string& s) {
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ++i) {
+        // #1241 UP-12: a malformed escape (`%zz`, or a truncated `%`/`%a` at the
+        // end) must NOT throw — std::stoul on non-hex raised std::invalid_argument
+        // and 500'd the request. Decode only a well-formed `%HH`; otherwise emit
+        // the bytes literally.
         if (s[i] == '%' && i + 2 < s.size()) {
-            auto hex = s.substr(i + 1, 2);
-            out += static_cast<char>(std::stoul(hex, nullptr, 16));
-            i += 2;
+            const int hi = hexval(s[i + 1]);
+            const int lo = hexval(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+            out += s[i]; // malformed → literal '%'
         } else if (s[i] == '+') {
             out += ' ';
         } else {
@@ -132,6 +151,45 @@ inline std::string url_decode(const std::string& s) {
         }
     }
     return out;
+}
+
+/// CSRF same-site check (shared helper — #1241 H-1). Returns true when the
+/// request is safe to act on: a non-browser client (no Origin AND no Referer —
+/// curl/automation post without them) OR an Origin/Referer whose host matches
+/// Host. Returns false only for a cross-site browser POST. Pure (no I/O) so any
+/// cookie-authenticated POST handler, in any TU, can gate a destructive op the
+/// same way; the caller emits the 403 + `csrf.denied` audit. Default ports
+/// (80/443) are stripped for comparison; userinfo in Origin/Referer (RFC 6454
+/// forbids it) fails the check.
+inline bool origin_is_same_site(std::string_view host, std::string_view origin,
+                                std::string_view referer) {
+    auto strip_default_port = [](std::string h) -> std::string {
+        auto colon = h.rfind(':');
+        if (colon == std::string::npos)
+            return h;
+        auto port = h.substr(colon + 1);
+        if (port == "443" || port == "80")
+            h.erase(colon);
+        return h;
+    };
+    auto extract_host = [&strip_default_port](std::string url) -> std::optional<std::string> {
+        auto p = url.find("://");
+        if (p != std::string::npos)
+            url.erase(0, p + 3);
+        for (char delim : {'/', '?', '#'}) {
+            auto idx = url.find(delim);
+            if (idx != std::string::npos)
+                url.erase(idx);
+        }
+        if (url.find('@') != std::string::npos)
+            return std::nullopt; // userinfo → malformed, fail closed
+        return strip_default_port(std::move(url));
+    };
+    if (origin.empty() && referer.empty())
+        return true; // non-browser client (curl/automation)
+    auto extracted =
+        origin.empty() ? extract_host(std::string(referer)) : extract_host(std::string(origin));
+    return extracted && *extracted == strip_default_port(std::string(host));
 }
 
 /// Extract a value from a URL-encoded form body by key name.

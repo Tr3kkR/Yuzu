@@ -40,7 +40,11 @@ public:
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    // Returns false if the audit row could not be persisted (caller surfaces the
+    // evidence-chain gap via `Sec-Audit-Failed`). Matches the canonical
+    // bool-returning audit contract used across the other route modules so a
+    // privileged revoke can observe an audit-persistence failure (#1240).
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 

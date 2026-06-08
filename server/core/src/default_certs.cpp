@@ -222,6 +222,34 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         }
     }
 
+    // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
+    // We only reach here because the fast path found the on-disk default certs
+    // missing / corrupt / mismatched. If ca.db STILL remembers a CA root,
+    // generating a fresh one would set_root-REPLACE it and purge the issued
+    // inventory — orphaning every agent already enrolled under the old root (their
+    // leaves now chain to a dead CA). That is the dangerous quadrant the
+    // corrupt-only self-heal above does NOT cover: a wiped cert dir on a
+    // persistent ca.db volume, or a botched restore. Refuse with an actionable
+    // message; the operator restores the certs from backup (matching the ca.db
+    // root) or removes ca.db too for a deliberate clean re-root. We refuse on ANY
+    // existing root (not only a fingerprint mismatch): the regen path always mints
+    // a brand-new CA, so proceeding would re-root regardless.
+    if (ca_store && ca_store->is_open() && ca_store->has_root()) {
+        const auto root = ca_store->get_root();
+        const std::string on_disk = file_present(out.ca_cert)
+                                        ? ("on-disk CA " + pki::fingerprint_sha256(
+                                                               read_text_file(out.ca_cert))
+                                                               .value_or(std::string{"unreadable"}))
+                                        : std::string{"no on-disk CA cert"};
+        spdlog::error("default_certs: ca.db already holds a CA root ({}) but the on-disk default "
+                      "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
+                      "would re-root the fleet and orphan every enrolled agent. Restore "
+                      "default-*.{{pem,key}} from backup (matching the ca.db root), or remove ca.db "
+                      "for a deliberate clean re-root.",
+                      root ? root->fingerprint_sha256 : std::string{"?"}, dir.string(), on_disk);
+        return false;
+    }
+
     // ── (Re)generate the whole set ────────────────────────────────────────────
     spdlog::warn("default_certs: generating a fresh per-install CA + default leaves in {}",
                  dir.string());
@@ -239,9 +267,13 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
 
     // On regeneration, purge any prior default-cert inventory rows so ca.db
     // reflects only the live set (no orphan leaves referencing a replaced root;
-    // set_root REPLACEs the single root row separately).
-    if (ca_store)
-        ca_store->delete_issued_by("system:default-certs");
+    // set_root REPLACEs the single root row separately). After B-2 this path is
+    // only reached with an EMPTY ca.db (regen against a populated root is now
+    // refused), so this normally deletes nothing — but a failed purge would leave
+    // stale rows, so surface it (#1238 should-fix: don't silently ignore the rc).
+    if (ca_store && !ca_store->delete_issued_by("system:default-certs"))
+        spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
+                     "(stale rows may remain) — continuing");
 
     auto ca_key_pem = pki::generate_private_key(pki::KeyAlgo::EcP384);
     if (!ca_key_pem)
