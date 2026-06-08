@@ -447,6 +447,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"vuln_scan.cve_scan",    "CVE-only: match installed software against known CVEs"},
         {"vuln_scan.config_scan", "Configuration and compliance checks only"},
         {"vuln_scan.summary",     "Quick severity counts from a full vulnerability scan"},
+        {"vuln_scan.update_rules", "Load dynamic CVE rules from staged file (requires content_dist.stage)"},
         // wifi
         {"wifi.list_networks",    "Scan for visible WiFi networks (SSID, signal, security)"},
         {"wifi.connected",        "Currently connected WiFi network info"},

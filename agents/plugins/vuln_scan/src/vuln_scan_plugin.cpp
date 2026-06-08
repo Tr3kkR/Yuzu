@@ -480,8 +480,10 @@ std::vector<Finding> do_pkg_scan_impl() {
         std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
         return g_dynamic_rules;
     }();
-    if (!dynamic)
+    if (!dynamic) {
+        // Note: this is normal if rules haven't been loaded yet (first install)
         return findings;
+    }
 
     // Match language packages against ecosystem-tagged rules
     for (const auto& pkg : pkgs) {
@@ -609,6 +611,13 @@ public:
             ctx.report_progress(70);
             auto config_findings = do_config_scan_impl();
             ctx.report_progress(90);
+
+            // Emit diagnostic if pkg_scan found zero packages (may indicate clean system or tool detection failure)
+            // This allows operators to distinguish "no packages installed" from "tool missing" by checking logs
+            if (pkg_findings.empty()) {
+                ctx.log(yuzu::CommandContext::LogLevel::Info,
+                        "pkg_scan: no language packages detected (clean system or tool detection gap; check PATH for npm/pip/cargo/gem/dotnet)");
+            }
 
             std::vector<Finding> all;
             all.reserve(cve_findings.size() + pkg_findings.size() + config_findings.size());
