@@ -4109,50 +4109,10 @@ void SettingsRoutes::register_routes(
         auto origin = req.get_header_value("Origin");
         auto referer = req.get_header_value("Referer");
 
-        auto strip_default_port = [](std::string h) -> std::string {
-            // For comparison purposes only — `host:443` and `host` from
-            // the same HTTPS origin are equivalent. Strip well-known
-            // default ports so a TLS-terminating reverse proxy that
-            // rewrites `Host` to the port-less form does not break.
-            auto colon = h.rfind(':');
-            if (colon == std::string::npos)
-                return h;
-            auto port = h.substr(colon + 1);
-            if (port == "443" || port == "80") {
-                h.erase(colon);
-            }
-            return h;
-        };
-        auto extract_host = [&strip_default_port](std::string url) -> std::optional<std::string> {
-            // Strip scheme (`scheme://`).
-            auto p = url.find("://");
-            if (p != std::string::npos)
-                url.erase(0, p + 3);
-            // Strip path / query / fragment.
-            for (char delim : {'/', '?', '#'}) {
-                auto idx = url.find(delim);
-                if (idx != std::string::npos) {
-                    url.erase(idx);
-                }
-            }
-            // Reject userinfo — RFC 6454 forbids it in `Origin`, and a
-            // browser will never emit a Referer with userinfo against a
-            // dashboard. Any `@` is treated as malformed and fails the
-            // CSRF check.
-            if (url.find('@') != std::string::npos) {
-                return std::nullopt;
-            }
-            return strip_default_port(std::move(url));
-        };
-
-        if (origin.empty() && referer.empty()) {
-            // Non-browser client (curl / automation) — pass. Browsers
-            // always emit either Origin or Referer on cross-origin POSTs.
-            return true;
-        }
-        auto extracted = origin.empty() ? extract_host(referer) : extract_host(origin);
-        auto host_norm = strip_default_port(host);
-        if (extracted && *extracted == host_norm) {
+        // Shared same-site comparison (web_utils) — one implementation across
+        // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
+        // audit; ca_routes' dashboard revoke calls the same helper.
+        if (origin_is_same_site(host, origin, referer)) {
             return true;
         }
         res.status = 403;

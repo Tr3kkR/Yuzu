@@ -44,8 +44,11 @@ struct Harness {
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
-    bool crl_succeeds{true}; // when false, publish_crl_fn returns nullopt (GAP-2)
+    bool crl_succeeds{true};   // when false, publish_crl_fn returns nullopt (GAP-2)
+    bool audit_succeeds{true}; // when false, AuditFn returns false (#1240 Sec-Audit-Failed)
     int crl_calls{0};
+    std::string last_perm_type; // captured (securable, op) of the last perm check
+    std::string last_perm_op;
 
     void wire(bool null_store = false) {
         CaRoutes routes;
@@ -54,7 +57,9 @@ struct Harness {
             return std::nullopt;
         };
         CaRoutes::PermFn perm = [this](const httplib::Request&, httplib::Response& res,
-                                       const std::string&, const std::string&) {
+                                       const std::string& type, const std::string& op) {
+            last_perm_type = type;
+            last_perm_op = op;
             if (!perm_allow) {
                 res.status = 403;
                 res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
@@ -64,8 +69,9 @@ struct Harness {
         };
         CaRoutes::AuditFn audit = [this](const httplib::Request&, const std::string& a,
                                          const std::string& r, const std::string& tt,
-                                         const std::string& ti, const std::string& d) {
+                                         const std::string& ti, const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
+            return audit_succeeds; // #1240: AuditFn now returns bool (observe persist failure)
         };
         CaRoutes::PublishCrlFn crl = [this]() -> std::optional<std::vector<std::uint8_t>> {
             ++crl_calls;
@@ -186,21 +192,29 @@ TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security]") {
     REQUIRE(saw_revoke);
     REQUIRE(saw_crl);
 
-    // Re-revoke an already-revoked serial → 404 + a failure audit row.
+    // Re-revoke an already-revoked serial → 404 + a "denied" audit row (#1240:
+    // reject-without-state-change uses "denied" like every destructive sibling;
+    // "failure" is reserved for an authorized-but-errored op). This is also the
+    // idempotency case — a retry of a successful revoke must not log a false error.
     auto again = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
     REQUIRE(again);
     REQUIRE(again->status == 404);
-    bool saw_fail = false;
+    bool saw_denied = false;
     for (const auto& a : h.audits)
-        if (a.action == "ca.cert.revoked" && a.result == "failure")
-            saw_fail = true;
-    REQUIRE(saw_fail);
+        if (a.action == "ca.cert.revoked" && a.result == "denied")
+            saw_denied = true;
+    REQUIRE(saw_denied);
 
-    // Perm denied → 403, no revoke attempted.
+    // Perm denied → 403, no revoke attempted, and NO audit row emitted by the
+    // handler (#1240: the perm gate runs before any audit_fn call; the denied
+    // audit is the perm layer's responsibility, not the route's — asserting zero
+    // new rows here proves the route doesn't double-audit or leak a row on 403).
+    const std::size_t audits_before = h.audits.size();
     h.perm_allow = false;
     auto denied = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"BEEF"})");
     REQUIRE(denied);
     REQUIRE(denied->status == 403);
+    REQUIRE(h.audits.size() == audits_before); // handler emitted no audit row on 403
 }
 
 TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the public path",
@@ -306,6 +320,26 @@ TEST_CASE("ca_routes: revoke succeeds but CRL republish fails is audited", "[ca_
     REQUIRE(crl_fail); // the republish FAILURE is on the evidence chain
 }
 
+TEST_CASE("ca_routes: a dropped audit row on a successful revoke sets Sec-Audit-Failed (#1240 M2)",
+          "[ca_routes][pki][security]") {
+    // The AuditFn is bool-returning; a privileged revoke whose audit row fails to
+    // persist must signal the evidence-chain gap to the operator (Sec-Audit-Failed)
+    // while the revoke itself still stands. Without a test, a regression in the
+    // header wiring would silently break that signal.
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.audit_succeeds = false; // simulate an audit-store write failure
+    h.wire();
+
+    auto ok = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);                       // the revoke still succeeded
+    REQUIRE(json::parse(ok->body)["revoked"] == true);
+    REQUIRE(h.store->is_revoked("DEAD"));             // enforced regardless
+    REQUIRE(ok->get_header_value("Sec-Audit-Failed") == "true"); // gap surfaced
+}
+
 TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca_routes][pki]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
@@ -358,10 +392,14 @@ TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
     REQUIRE(h.store->record_issued(sample_issued("DEAD")));
     h.wire();
 
-    // Revoke via params (HTMX hx-vals → form body in production; the TestRouteSink
-    // only parses the query string into req.params, and the handler reads params
-    // via get_param_value either way, so pass them in the query here) → 200 HTML.
-    auto ok = h.sink.Post("/api/settings/ca/revoke?serial_hex=dead&reason=panel", "");
+    // Same-origin headers so the (now mandatory) CSRF gate passes; the handler
+    // reads serial/reason from params (HTMX hx-vals → form body in production; the
+    // TestRouteSink parses the query string into req.params, and the handler reads
+    // get_param_value either way). → 200 HTML.
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+    auto ok = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=dead&reason=panel", "",
+                              "application/x-www-form-urlencoded", same_origin);
     REQUIRE(ok);
     REQUIRE(ok->status == 200);
     REQUIRE(ok->get_header_value("Content-Type").find("text/html") != std::string::npos);
@@ -369,14 +407,17 @@ TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
     REQUIRE(ok->body.find("Revoked") != std::string::npos); // re-rendered with the new status
     REQUIRE(h.crl_calls == 1);                              // republished via revoke_core
 
-    // Invalid serial → 400 HTML.
-    auto bad = h.sink.Post("/api/settings/ca/revoke?serial_hex=zz", "");
+    // Invalid serial → 400 HTML, full panel re-rendered (not a bare span).
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz", "",
+                               "application/x-www-form-urlencoded", same_origin);
     REQUIRE(bad);
     REQUIRE(bad->status == 400);
+    REQUIRE(bad->body.find("<table") != std::string::npos); // inline error + full fragment
 
-    // Gated on Security:Delete.
+    // Gated on Security:Delete (CSRF passes via same-origin headers, then perm denies).
     h.perm_allow = false;
-    auto denied = h.sink.Post("/api/settings/ca/revoke?serial_hex=DEAD", "");
+    auto denied = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD", "",
+                                  "application/x-www-form-urlencoded", same_origin);
     REQUIRE(denied);
     REQUIRE(denied->status == 403);
 }
@@ -392,4 +433,95 @@ TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
     auto rev = h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"DEAD"})");
     REQUIRE(rev);
     REQUIRE(rev->status == 503);
+}
+
+// ── PR4b dashboard panel (#1241) ────────────────────────────────────────────
+
+TEST_CASE("ca_routes: dashboard revoke refuses a cross-origin POST (H-1 CSRF)",
+          "[ca_routes][pki][security]") {
+    // H-1: the dashboard revoke is cookie-authed; SameSite=Lax does not block a
+    // top-level cross-site form POST, so a forged revoke (= fleet-lockout DoS)
+    // must be refused by the Origin/Referer gate + audited csrf.denied, and the
+    // cert must NOT be revoked.
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+
+    auto res = h.sink.dispatch(
+        "POST", "/api/settings/ca/revoke?serial_hex=DEAD", "", "application/x-www-form-urlencoded",
+        {{"Host", "yuzu.example"}, {"Origin", "https://attacker.example"}});
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(h.store->is_revoked("DEAD")); // not revoked — gate fired first
+    bool saw_csrf = false;
+    for (const auto& a : h.audits)
+        if (a.action == "csrf.denied")
+            saw_csrf = true;
+    REQUIRE(saw_csrf);
+    // The CSRF gate runs BEFORE perm_fn (no perm/role oracle to a cross-site
+    // probe), so perm is never consulted on a refused cross-origin request.
+    REQUIRE(h.last_perm_type.empty());
+}
+
+TEST_CASE("ca_routes: dashboard revoke with NO Origin/Referer is refused (destructive endpoint)",
+          "[ca_routes][pki][security]") {
+    // Hermes PR4b M: a browser HTMX POST always carries Origin (or Referer), so a
+    // request with NEITHER on this DESTRUCTIVE cookie endpoint is treated as
+    // cross-site — closing the both-empty gap a header-stripping proxy could ride.
+    // (Token automation must use the REST endpoint.)
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("BEEF")));
+    h.wire();
+    auto res = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=BEEF", "",
+                               "application/x-www-form-urlencoded", {{"Host", "yuzu.example"}});
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(h.store->is_revoked("BEEF"));
+}
+
+TEST_CASE("ca_routes: dashboard revoke proceeds for a same-origin POST + re-renders the panel",
+          "[ca_routes][pki][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+
+    auto res = h.sink.dispatch(
+        "POST", "/api/settings/ca/revoke?serial_hex=DEAD&reason=decommissioned", "",
+        "application/x-www-form-urlencoded",
+        {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(h.store->is_revoked("DEAD"));                          // revoked
+    REQUIRE(res->body.find("Revoked") != std::string::npos);      // panel re-rendered
+    REQUIRE(res->body.find("<table") != std::string::npos);       // full fragment, not a bare span
+    // The revoke route gates on Security:Delete (not Read) — asserted on the
+    // path that actually reaches perm_fn (same-origin).
+    REQUIRE(h.last_perm_type == "Security");
+    REQUIRE(h.last_perm_op == "Delete");
+    // The reason was recorded (UP-7).
+    auto rec = h.store->get_issued("DEAD");
+    REQUIRE(rec);
+    REQUIRE(rec->revocation_reason == "decommissioned");
+}
+
+TEST_CASE("ca_routes: dashboard fragment renders empty-CA + no-root states without crashing",
+          "[ca_routes][pki]") {
+    {
+        Harness h; // no root set
+        h.wire();
+        auto res = h.sink.Get("/fragments/settings/ca");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(res->body.find("No internal CA") != std::string::npos);
+    }
+    {
+        Harness h;
+        h.wire(/*null_store=*/true); // CA store unavailable
+        auto res = h.sink.Get("/fragments/settings/ca");
+        REQUIRE(res);
+        REQUIRE(res->body.find("unavailable") != std::string::npos);
+    }
 }

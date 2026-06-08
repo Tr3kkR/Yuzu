@@ -67,6 +67,15 @@ std::string normalize_serial(std::string s) {
     return s;
 }
 
+/// Outcome of the shared revoke_core (replaces a tri-state int — cpp-expert
+/// PR4b). `audit_ok` is false when any audit row failed to persist, so both
+/// revoke surfaces can raise Sec-Audit-Failed (#1240 M1/M2).
+enum class RevokeOutcome { NotFound, RevokedCrlStale, RevokedCrlPublished };
+struct RevokeResult {
+    RevokeOutcome outcome;
+    bool audit_ok;
+};
+
 /// Server-rendered HTMX fragment for the Settings → Internal CA panel (PKI PR4b).
 /// Dark-theme product UI (NOT frontend-design). All agent-controlled fields
 /// (subject, SAN) go through html_escape. Revoke buttons post to the settings
@@ -96,7 +105,8 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "href=\"/api/v1/ca/crl\">Download CRL</a>"
             "</div>";
 
-    auto issued = ca_store->list_issued(500, 0);
+    constexpr int kPanelLimit = 500;
+    auto issued = ca_store->list_issued(kPanelLimit, 0);
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Serial</th><th>Subject</th><th>Purpose</th><th>Expires</th>"
             "<th>Status</th><th></th></tr></thead><tbody>";
@@ -125,13 +135,18 @@ std::string render_ca_fragment(CaStore* ca_store) {
                 // form is just the clearer, codebase-standard pattern. The serial
                 // is hex-only in practice; this renders whatever ca.db holds safely.
                 html += "<form hx-post=\"/api/settings/ca/revoke\" hx-target=\"#ca-section\" "
-                        "hx-swap=\"innerHTML\" style=\"display:inline\" "
+                        "hx-swap=\"innerHTML\" style=\"display:inline-flex;gap:0.3rem\" "
                         "hx-confirm=\"Revoke certificate for &quot;" +
                         html_escape(c.subject) +
                         "&quot;? The agent is refused on its next connection.\">"
                         "<input type=\"hidden\" name=\"serial_hex\" value=\"" +
                         html_escape(c.serial_hex) +
                         "\">"
+                        // UP-7: let the operator record WHY (compromise vs
+                        // decommission) — stored as revocation_reason.
+                        "<input type=\"text\" name=\"reason\" maxlength=\"256\" "
+                        "placeholder=\"reason (optional)\" "
+                        "style=\"padding:0.15rem 0.4rem;font-size:0.7rem;width:9rem\">"
                         "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "type=\"submit\">Revoke</button></form>";
@@ -139,8 +154,17 @@ std::string render_ca_fragment(CaStore* ca_store) {
             html += "</td></tr>";
         }
     }
-    html += "</tbody></table>"
-            "<p style=\"font-size:0.72rem;color:var(--mds-color-theme-text-tertiary);"
+    html += "</tbody></table>";
+    // UP-4: the panel caps at kPanelLimit rows. If we hit the cap there may be
+    // more — say so + point at the paginated REST endpoint, so certs beyond the
+    // cap aren't silently invisible/unrevocable from the dashboard.
+    if (static_cast<int>(issued.size()) >= kPanelLimit) {
+        html += "<p style=\"font-size:0.72rem;color:#d29922;margin-top:0.5rem\">Showing the first " +
+                std::to_string(kPanelLimit) +
+                " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
+                "full inventory.</p>";
+    }
+    html += "<p style=\"font-size:0.72rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-top:0.75rem\">To replace the default certificates with operator- or "
             "HSM-issued material, use <strong>TLS / mTLS Configuration</strong> above. "
             "Revocation takes effect immediately server-side; the public CRL is republished "
@@ -168,20 +192,30 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // into the handler lambdas so it outlives this stack frame.
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
-                           const std::string& reason) -> int {
+                           const std::string& reason) -> RevokeResult {
         if (!ca_store->revoke(serial, reason)) {
-            audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
-                     "serial not found or already revoked");
-            return -1;
+            // #1240: unknown/already-revoked is reject-without-state-change →
+            // result="denied" (matches every destructive sibling + idempotent
+            // retry-safe); "failure" is reserved for an authorized-but-errored op.
+            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
+                                     "serial not found or already revoked");
+            return {RevokeOutcome::NotFound, ok};
         }
-        audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial, reason);
+        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial,
+                                 reason);
+        // publish_crl() now fails honestly (#1240 B-1): has_value() is true ONLY
+        // when the new CRL was persisted, so crl_ok never falsely claims success.
         const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
         if (crl_ok)
-            audit_fn(req, "ca.crl.published", "success", "Security", serial, "");
+            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial, "") &&
+                       audit_ok;
         else
-            audit_fn(req, "ca.crl.published", "failure", "Security", serial,
-                     "CRL build/record failed after revocation; public CRL may be stale");
-        return crl_ok ? 1 : 0;
+            audit_ok = audit_fn(req, "ca.crl.published", "failure", "Security", serial,
+                                "CRL build/record failed after revocation; public CRL may be "
+                                "stale") &&
+                       audit_ok;
+        return {crl_ok ? RevokeOutcome::RevokedCrlPublished : RevokeOutcome::RevokedCrlStale,
+                audit_ok};
     };
 
     // ── GET /api/v1/ca/root ── PUBLIC: the CA root certificate (PEM). ─────────
@@ -340,17 +374,25 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                             kJson);
             return;
         }
-        const int rc = revoke_core(req, serial, reason);
-        if (rc < 0) {
+        const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::NotFound) {
+            // M1 (#1240): a dropped denied-row is the same evidence gap as a lost
+            // success row — surface it.
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 404;
             res.set_content(
                 error_json_a4(404, "serial not found or already revoked", make_correlation_id()),
                 kJson);
             return;
         }
+        // The revoke succeeded; a dropped audit row on this privileged op is an
+        // evidence-chain gap surfaced via Sec-Audit-Failed (SOC 2 CC7.2).
+        if (!rv.audit_ok)
+            res.set_header("Sec-Audit-Failed", "true");
         nlohmann::json out = {{"revoked", true},
                               {"serial_hex", serial},
-                              {"crl_republished", rc == 1},
+                              {"crl_republished", rv.outcome == RevokeOutcome::RevokedCrlPublished},
                               {"meta", {{"api_version", "v1"}}}};
         res.set_content(out.dump(), kJson);
     });
@@ -370,28 +412,65 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // Form-encoded (HTMX hx-vals); Security:Delete. Re-renders the panel fragment
     // so the HTMX swap shows the updated inventory. Shares revoke_core with the
     // JSON REST endpoint (same validation, audit, CRL republish).
-    sink.Post("/api/settings/ca/revoke",
-              [perm_fn, ca_store, revoke_core](const httplib::Request& req, httplib::Response& res) {
-                  if (!perm_fn(req, res, "Security", "Delete"))
-                      return;
-                  if (!ca_store || !ca_store->is_open()) {
-                      res.status = 503;
-                      res.set_content("<span style=\"color:#f85149\">CA unavailable.</span>",
-                                      "text/html; charset=utf-8");
-                      return;
-                  }
-                  std::string reason = req.get_param_value("reason").substr(0, 256);
-                  std::erase_if(reason, [](char c) { return c == '\n' || c == '\r'; });
-                  const std::string serial = normalize_serial(req.get_param_value("serial_hex"));
-                  if (serial.empty()) {
-                      res.status = 400;
-                      res.set_content("<span style=\"color:#f85149\">Invalid serial.</span>",
-                                      "text/html; charset=utf-8");
-                      return;
-                  }
-                  (void)revoke_core(req, serial, reason); // -1 (already gone) is fine — re-render
-                  res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
-              });
+    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core](
+                                             const httplib::Request& req, httplib::Response& res) {
+        // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone,
+        // and SameSite=Lax does not block a top-level cross-site form POST — so a
+        // CSRF gate is mandatory (a forged revoke = fleet-wide lockout DoS). Run it
+        // FIRST, before perm_fn, so a cross-site probe cannot read a perm/role
+        // oracle off the response (Hermes PR4b LOW). A browser HTMX POST always
+        // carries Origin (or at least Referer); this DESTRUCTIVE cookie endpoint
+        // therefore treats a request with NEITHER header as cross-site too —
+        // closing the both-empty gap a header-stripping proxy/WebView could ride
+        // (Hermes PR4b MEDIUM). Token/Bearer automation uses the REST sibling.
+        const std::string origin = req.get_header_value("Origin");
+        const std::string referer = req.get_header_value("Referer");
+        const bool same_site = !(origin.empty() && referer.empty()) &&
+                               origin_is_same_site(req.get_header_value("Host"), origin, referer);
+        if (!same_site) {
+            if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.revoke",
+                          "cross-origin or header-less dashboard revoke refused"))
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 403;
+            res.set_content("<span style=\"color:#f85149\">Cross-origin request refused.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (!perm_fn(req, res, "Security", "Delete"))
+            return;
+        // Error branches re-render the FULL fragment with an inline banner rather
+        // than swapping a bare <span> into #ca-section (which blanked the whole
+        // panel until reload — #1241 happy/UP-6).
+        auto error_panel = [&](int status, const std::string& msg) {
+            res.status = status;
+            res.set_content("<div class=\"alert alert-danger\" style=\"margin-bottom:0.75rem\">" +
+                                html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
+                            "text/html; charset=utf-8");
+        };
+        if (!ca_store || !ca_store->is_open()) {
+            error_panel(503, "Certificate authority unavailable.");
+            return;
+        }
+        std::string reason = req.get_param_value("reason").substr(0, 256);
+        std::erase_if(reason, [](char c) { return c == '\n' || c == '\r'; });
+        const std::string serial = normalize_serial(req.get_param_value("serial_hex"));
+        if (serial.empty()) {
+            error_panel(400, "Invalid certificate serial.");
+            return;
+        }
+        const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::NotFound) {
+            // Don't render a success-looking panel for a no-op revoke (Hermes
+            // PR4b INFO) — tell the operator the serial was unknown/already gone.
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            error_panel(404, "Serial not found or already revoked.");
+            return;
+        }
+        if (!rv.audit_ok)
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
+    });
 }
 
 } // namespace yuzu::server

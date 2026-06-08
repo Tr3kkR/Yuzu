@@ -94,10 +94,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway's vendored proto modules — `gateway_pb` (the `ProxyRegister` marshaller),
   `management_pb`, and the agent-listener `agent_pb` — were all regenerated to
   include `csr_pem`/`issued_certificate`/`issued_ca_chain`, so the gateway-proxied
-  `Register` path now **forwards** the agent CSR + issued cert verbatim — per-agent
-  mTLS auto-provisioning works for gateway-connected agents, not just direct-connect
-  (previously gpb's self-contained modules silently dropped the unknown fields in
-  transit; `gateway.proto:89` documents the trap). Startup now
+  `Register` path now **forwards** the agent CSR + issued cert verbatim — the fields
+  **survive transit** through the gateway (previously gpb's self-contained modules
+  silently dropped the unknown fields; `agent.proto:96` documents the trap). **This
+  is plumbing only: the gateway path does not yet *sign* the forwarded CSR** —
+  `ProxyRegister` has no signer wired, so a gateway-connected agent still receives an
+  empty `issued_certificate` and stays on the bootstrap posture (fails closed).
+  Gateway-path issuance lands in **PR5d**, which must first add agent-identity
+  attestation on the unauthenticated agent↔gateway hop (the R-6 confused-deputy gate
+  — a malicious gateway could otherwise swap the CSR and have the server issue a cert
+  for the victim's `agent_id`, or strip `csr_pem` to downgrade the agent). Until then,
+  a gateway-forwarded agent is also **not reachable by per-agent revocation** (it
+  presents the shared `default-gateway` leaf upstream, not its own) — see
+  `docs/pki-architecture.md`. Startup now
   logs the *actual* grpcbox TLS posture (`yuzu_gw_app:log_tls_state/0`), replacing
   a dead/`case_clause`-prone check on the advisory `tls` env, and **fails closed**
   if the upstream is TLS-but-unverified (`https` without `verify_peer` — encrypted
@@ -121,11 +130,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now has a Certificate Authority panel (Settings page, HTMX, dark-theme): the CA
   algorithm/fingerprint/expiry, one-click **Download CA certificate** + **Download
   CRL**, the issued-certificate inventory (serial, subject, purpose, expiry,
-  status), and a per-certificate **Revoke** button that revokes + republishes the
-  CRL and refreshes the table in place. All agent-controlled fields are
-  HTML-escaped; the panel and its revoke action are gated by the `Security`
-  securable (`Read` / `Delete`), matching the REST surface. See
-  `docs/pki-architecture.md`.
+  status), and a per-certificate **Revoke** button (with an optional reason
+  field) that revokes + republishes the CRL and refreshes the table in place. All
+  agent-controlled fields are HTML-escaped; the panel and its revoke action are
+  gated by the `Security` securable (`Read` / `Delete`), matching the REST
+  surface. The cookie-authenticated dashboard revoke is **CSRF-protected**
+  (Origin/Referer same-site check via a shared `origin_is_same_site` helper, also
+  used by the MFA POSTs; a cross-origin attempt is refused + audited
+  `csrf.denied`) — a forged revoke would otherwise be a fleet-wide-lockout DoS.
+  Error responses re-render the full panel with an inline banner (no blank-panel
+  swap), and the inventory shows a truncation notice past 500 certs. See
+  `docs/user-manual/server-admin.md` and `docs/pki-architecture.md`.
 
 - **Internal-CA REST surface — `/api/v1/ca/*` (PKI PR4).** Operators and
   automation can now manage the built-in CA over REST:
@@ -134,13 +149,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **public**), `GET /api/v1/ca/issued` (issued-cert inventory — serial, subject,
   purpose, status, expiry; `Security:Read`), and `POST /api/v1/ca/revoke`
   (`{"serial_hex","reason"}`; `Security:Delete` — revocation takes effect
-  server-side immediately and republishes the CRL). New metric
-  `yuzu_server_ca_cert_issued_total{purpose}`; audit actions `ca.cert.revoked` +
-  `ca.crl.published`. The routed reference doc `docs/pki-architecture.md` lands
-  with this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN
-  signing is intentionally deferred — it needs a non-agent namespace so an
-  operator-issued cert can't impersonate an agent; the dashboard CA panel ships
-  in PR4b above.) See `docs/pki-architecture.md` "CA REST surface".
+  server-side immediately and republishes the CRL). The same inventory + revoke
+  operations are also exposed as **MCP tools** (`list_issued_certs` /
+  `revoke_certificate`) so an agentic worker reaches the CA surface at parity with
+  the dashboard/REST (governed by the standard MCP tier ladder — `revoke` is
+  destructive and approval-gated like every other destructive MCP op). A revoke
+  of a nonexistent/already-revoked serial is audited `result=denied` (idempotent,
+  retry-safe); a CRL republish that fails to persist now honestly reports
+  `crl_republished:false` (it no longer serves a freshly-built-but-unstored CRL),
+  and a background freshness check re-publishes the CRL before `nextUpdate` lapses
+  (and self-heals a failed startup pre-publish — no permanent `/ca/crl` 503). New
+  metrics `yuzu_server_ca_cert_issued_total{purpose}`,
+  `yuzu_server_ca_crl_publish_failures_total`; audit actions `ca.cert.revoked`
+  (`success`/`denied`) + `ca.crl.published`. Issued-cert inventory is now indexed
+  on `issued_at`. The routed reference doc `docs/pki-architecture.md` lands with
+  this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN signing is
+  intentionally deferred — it needs a non-agent namespace so an operator-issued
+  cert can't impersonate an agent; the dashboard CA panel ships in PR4b above.)
+  See `docs/pki-architecture.md` "CA REST surface".
 
 - **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
   server runs with its built-in CA (the default-cert bootstrap above) and an
@@ -160,16 +186,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent must present its leaf on the data plane, while a not-yet-provisioned or
   pre-PR3 agent keeps connecting on the prior session + peer-IP binding rather
   than being rejected. Revoked agent leaves are refused at `Subscribe`,
-  `Heartbeat`, and `DownloadUpdate` (new `yuzu_grpc_revoked_cert_total{rpc}`);
-  issuance is counted (`yuzu_server_ca_cert_issued_total`) and audited
-  (`ca.cert.issued`). New agent flags **`--cert-dir`** and
-  **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`); leaves auto-renew at
-  2/3 of their lifetime (evaluated at agent start). Built entirely on OpenSSL
-  3.x — no new cryptographic primitives. **Upgrade:** no special order is
-  required thanks to gradual enforcement; once a fleet is fully provisioned, a
-  future `--require-agent-identity` flag will be able to harden the data plane to
-  reject any agent without a per-agent cert. See `docs/auth-architecture.md`
-  "Per-agent mTLS".
+  `Heartbeat`, `DownloadUpdate`, **and `CheckForUpdate`** (new
+  `yuzu_grpc_revoked_cert_total{rpc}`), and a periodic server-side **revocation
+  sweep** tears down any *already-open* `Subscribe` stream whose leaf is revoked
+  after it connected (`rpc=stream_sweep`, audited `session.cert_revoked`
+  `source=stream_sweep`) so revocation stops an active agent without waiting for a
+  voluntary reconnect. A revoked agent also cannot silently resurrect its identity:
+  `sign_agent_csr` refuses to re-issue to an `agent_id` that has a revoked,
+  non-expired cert (audit `ca.cert.reissue_blocked`, metric
+  `yuzu_server_ca_reissue_blocked_total`), so deleting the local key and
+  re-enrolling does not bypass revocation. Every issued leaf's `notBefore` is
+  backdated 5 min so a freshly-provisioned agent with a slightly-behind clock can
+  still present its cert on the immediate reconnect. Issuance is counted
+  (`yuzu_server_ca_cert_issued_total`) and audited (`ca.cert.issued`). New agent
+  flags **`--cert-dir`** and **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`);
+  leaves auto-renew at 2/3 of their lifetime (evaluated at agent start). Built
+  entirely on OpenSSL 3.x — no new cryptographic primitives. **Known limitation:**
+  per-agent revocation is enforced on direct-connect agents only; a
+  gateway-proxied agent presents its leaf to the gateway, not the server, so
+  revoking it does not by itself cut it off the data plane until the QUIC
+  through-gateway-identity migration (#376) — disconnect at the gateway too. See
+  `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
+  **Upgrade:** no special order is required thanks to gradual enforcement; once a
+  fleet is fully provisioned, a future `--require-agent-identity` flag will be
+  able to harden the data plane to reject any agent without a per-agent cert. See
+  `docs/auth-architecture.md` "Per-agent mTLS".
+
+- **Internal CA engine + `ca.db` issuance store (PKI PR1).** New pure-OpenSSL
+  PKI engine (`x509_ca`: EC keygen, self-signed root, CSR signing with
+  proof-of-possession, leaf issuance, CRL build, chain verify, SHA-256
+  fingerprint), a `KeyProvider` seam (`FileKeyProvider`: `0600`/`O_EXCL` key
+  custody, HSM/PKCS#11-ready), and the `ca.db` metadata store (`CaStore`: root,
+  issued-cert inventory, CRL versions). The root **private key never enters the
+  database** — only an opaque `key_ref`. Serials are normalised (uppercase,
+  colon-free) at the store boundary so a later operator-supplied serial cannot
+  miss `revoke()`/`is_revoked()`; CRL-number allocation is atomic
+  (`publish_next_crl`, monotonic per RFC 5280 §5.2.3); the inventory carries an
+  `issuer_fingerprint` provenance link to the signing root. Engine only — the
+  first-boot wiring lands in PR2.
 
 - **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
   Settings panel and the login-time enrollment-bootstrap form — now render

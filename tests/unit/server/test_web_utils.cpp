@@ -232,6 +232,52 @@ TEST_CASE("url_decode: mixed encoded and plain", "[web_utils][url]") {
     REQUIRE(url_decode("hello%21+world%3F") == "hello! world?");
 }
 
+TEST_CASE("url_decode: malformed escapes do not throw (#1241 UP-12)", "[web_utils][url]") {
+    // A non-hex or truncated escape previously called std::stoul → threw
+    // std::invalid_argument → 500 on a form-encoded POST. Now decode only a
+    // well-formed %HH and pass malformed bytes through literally.
+    REQUIRE(url_decode("%zz") == "%zz");        // non-hex pair → literal
+    REQUIRE(url_decode("%2") == "%2");          // truncated at end → literal
+    REQUIRE(url_decode("%") == "%");            // bare percent → literal
+    REQUIRE(url_decode("a%g1b") == "a%g1b");    // first nibble non-hex
+    REQUIRE(url_decode("a%1gb") == "a%1gb");    // second nibble non-hex
+    REQUIRE(url_decode("ok%41done") == "okAdone"); // valid escape still decodes
+    REQUIRE(url_decode("%2ztail") == "%2ztail");    // malformed mid-string, then plain
+}
+
+// ── origin_is_same_site (shared CSRF helper, #1241 H-1) ──────────────────────
+
+TEST_CASE("origin_is_same_site: same-origin passes, cross-origin fails", "[web_utils][csrf]") {
+    CHECK(origin_is_same_site("yuzu.example", "https://yuzu.example", ""));
+    CHECK(origin_is_same_site("yuzu.example", "", "https://yuzu.example/settings"));
+    CHECK_FALSE(origin_is_same_site("yuzu.example", "https://attacker.example", ""));
+    CHECK_FALSE(origin_is_same_site("yuzu.example", "", "https://attacker.example/x"));
+}
+
+TEST_CASE("origin_is_same_site: no Origin AND no Referer passes (non-browser client)",
+          "[web_utils][csrf]") {
+    CHECK(origin_is_same_site("yuzu.example", "", ""));
+}
+
+TEST_CASE("origin_is_same_site: default ports are stripped for comparison", "[web_utils][csrf]") {
+    CHECK(origin_is_same_site("yuzu.example", "https://yuzu.example:443", ""));
+    CHECK(origin_is_same_site("yuzu.example:443", "https://yuzu.example", ""));
+    // A non-default port is a real difference → fail.
+    CHECK_FALSE(origin_is_same_site("yuzu.example", "https://yuzu.example:8443", ""));
+}
+
+TEST_CASE("origin_is_same_site: userinfo in Origin is rejected (RFC 6454)", "[web_utils][csrf]") {
+    CHECK_FALSE(origin_is_same_site("yuzu.example", "https://yuzu.example@attacker.example", ""));
+}
+
+TEST_CASE("origin_is_same_site: Origin takes precedence over Referer", "[web_utils][csrf]") {
+    // When both are present, only Origin is consulted (it is the stronger signal).
+    CHECK(origin_is_same_site("yuzu.example", "https://yuzu.example",
+                              "https://attacker.example/ref"));
+    CHECK_FALSE(origin_is_same_site("yuzu.example", "https://attacker.example",
+                                    "https://yuzu.example/ref"));
+}
+
 TEST_CASE("url_decode: percent at end of string (incomplete sequence)", "[web_utils][url]") {
     // '%' at end without two hex digits should be kept as-is
     auto result = url_decode("test%");
