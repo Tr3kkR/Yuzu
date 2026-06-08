@@ -212,6 +212,15 @@ void CaStore::run_migrations() {
         {3, R"(
             CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at ON ca_issued(issued_at);
         )"},
+        // v4: subordinate-CA parent chain (PR6). In Builtin mode the issuing CA is
+        // self-signed and chain_pem is empty. In Subordinate mode cert_pem is our
+        // issuing intermediate (OUR key, signed by the enterprise) and chain_pem
+        // holds the parent chain (enterprise root [+ intermediates]) so issued
+        // leaves can present a full path to the corporate trust anchor. Additive
+        // ALTER (not a v1 edit) so an already-migrated ca.db gains the column.
+        {4, R"(
+            ALTER TABLE ca_root ADD COLUMN chain_pem TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "ca_store", kMigrations)) {
         spdlog::error("CaStore: schema migration failed, closing database");
@@ -242,7 +251,8 @@ std::optional<CaRoot> CaStore::get_root() {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "SELECT cert_pem, key_ref, algo, not_before, not_after, "
-                           "fingerprint_sha256, mode, created_at FROM ca_root WHERE id = 1;",
+                           "fingerprint_sha256, mode, created_at, chain_pem FROM ca_root "
+                           "WHERE id = 1;",
                            -1, &st, nullptr) != SQLITE_OK)
         return std::nullopt;
     std::optional<CaRoot> out;
@@ -256,6 +266,7 @@ std::optional<CaRoot> CaStore::get_root() {
         r.fingerprint_sha256 = col_text(st, 5);
         r.mode = ca_mode_from_string(col_text(st, 6));
         r.created_at = sqlite3_column_int64(st, 7);
+        r.chain_pem = col_text(st, 8);
         out = std::move(r);
     }
     sqlite3_finalize(st);
@@ -273,8 +284,8 @@ bool CaStore::set_root(const CaRoot& root) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT OR REPLACE INTO ca_root (id, cert_pem, key_ref, algo, "
-                           "not_before, not_after, fingerprint_sha256, mode, created_at) "
-                           "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?);",
+                           "not_before, not_after, fingerprint_sha256, mode, created_at, "
+                           "chain_pem) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                            -1, &st, nullptr) != SQLITE_OK) {
         spdlog::error("CaStore: prepare set_root failed: {}", sqlite3_errmsg(db_));
         return false;
@@ -287,6 +298,7 @@ bool CaStore::set_root(const CaRoot& root) {
     bind_text(st, 6, root.fingerprint_sha256);
     bind_text(st, 7, ca_mode_to_string(root.mode));
     sqlite3_bind_int64(st, 8, root.created_at ? root.created_at : epoch_seconds());
+    bind_text(st, 9, root.chain_pem);
     const bool ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (!ok)

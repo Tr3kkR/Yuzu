@@ -79,16 +79,20 @@ TEST_CASE("CaStore: root set/get/replace", "[ca_store][root]") {
     REQUIRE(got->algo == "EcP384");
     REQUIRE(got->fingerprint_sha256 == "AB:CD:EF");
     REQUIRE(got->mode == CaMode::Builtin);
+    REQUIRE(got->chain_pem.empty()); // builtin → no parent chain (PR6)
 
-    // Replace (e.g. subordinate-CA import later): single row, latest wins.
+    // Replace with a subordinate-CA import: single row, latest wins, and the
+    // parent chain (enterprise root above our issuing intermediate) round-trips.
     CaRoot root2 = root;
     root2.fingerprint_sha256 = "99:88:77";
     root2.mode = CaMode::Subordinate;
+    root2.chain_pem = "-----BEGIN CERTIFICATE-----\nENTERPRISE-ROOT\n-----END CERTIFICATE-----\n";
     REQUIRE(store.set_root(root2));
     auto got2 = store.get_root();
     REQUIRE(got2);
     REQUIRE(got2->fingerprint_sha256 == "99:88:77");
     REQUIRE(got2->mode == CaMode::Subordinate);
+    REQUIRE(got2->chain_pem == root2.chain_pem); // PR6 parent chain persisted
 }
 
 TEST_CASE("CaStore: set_root rejects empty cert/key_ref", "[ca_store][root][negative]") {

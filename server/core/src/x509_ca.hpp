@@ -229,4 +229,26 @@ struct CertDetails {
 /// decision.
 [[nodiscard]] bool verify_chain(std::string_view leaf_pem, std::string_view ca_pem);
 
+// ── Subordinate-CA support (PR6) ─────────────────────────────────────────────
+
+/// True iff the public key embedded in `cert_pem` matches the private key in
+/// `key_pem` (a private EVP_PKEY carries its public component, so an equality
+/// check against the cert's public key proves the pair).
+///
+/// This is THE load-bearing check of the subordinate-CA import: when an operator
+/// uploads an enterprise-signed intermediate, we must confirm it carries OUR CA
+/// public key — i.e. the enterprise signed the exact CSR we exported, not some
+/// unrelated CA. Without it, importing a foreign chain would switch our issuing
+/// cert to one whose private key we do NOT hold, silently breaking ALL future
+/// issuance (every subsequent sign_csr would fail) and could point the install
+/// at an attacker-chosen trust hierarchy. Returns false on any parse failure
+/// (fail closed).
+[[nodiscard]] bool cert_matches_key(std::string_view cert_pem, std::string_view key_pem);
+
+/// True iff `cert_pem` is a CA certificate — basicConstraints present with
+/// CA:TRUE. The subordinate-CA import requires the uploaded intermediate to be a
+/// CA (it must be able to sign leaves); a non-CA cert would pass the chain check
+/// yet be unable to issue. Returns false on parse failure.
+[[nodiscard]] bool cert_is_ca(std::string_view cert_pem);
+
 } // namespace yuzu::server::pki

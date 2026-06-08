@@ -388,3 +388,96 @@ TEST_CASE("x509_ca: is_valid_ip_literal matches the SAN-builder parser", "[pki][
     REQUIRE_FALSE(is_valid_ip_literal("gateway"));
     REQUIRE_FALSE(is_valid_ip_literal(""));
 }
+
+// ── Subordinate-CA support (PR6) ─────────────────────────────────────────────
+
+TEST_CASE("x509_ca: cert_matches_key pairs a cert with its private key",
+          "[pki][subordinate][security]") {
+    auto ca = make_test_ca();
+    // The self-signed CA cert is over ca.key → matches.
+    REQUIRE(cert_matches_key(ca.cert, ca.key));
+    // A DIFFERENT key does NOT match the cert — this is the check that stops an
+    // imported intermediate carrying someone else's key from being accepted.
+    auto other = generate_private_key(KeyAlgo::EcP384);
+    REQUIRE(other);
+    REQUIRE_FALSE(cert_matches_key(ca.cert, *other));
+    // Garbage in → false (fail closed), never a throw/crash.
+    REQUIRE_FALSE(cert_matches_key("not a cert", ca.key));
+    REQUIRE_FALSE(cert_matches_key(ca.cert, "not a key"));
+}
+
+TEST_CASE("x509_ca: cert_is_ca distinguishes CA certs from leaves",
+          "[pki][subordinate][security]") {
+    auto ca = make_test_ca();
+    REQUIRE(cert_is_ca(ca.cert));
+
+    // A signed end-entity leaf is NOT a CA.
+    auto leaf_key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key);
+    CsrParams cp;
+    cp.subject = {"leaf.example", "Yuzu"};
+    auto csr = make_csr(*leaf_key, cp);
+    REQUIRE(csr);
+    LeafParams lp;
+    lp.subject = {"leaf.example", "Yuzu"};
+    lp.validity = validity_days_from_now(30);
+    lp.usage = LeafUsage{.server_auth = true};
+    auto leaf = sign_csr(*csr, ca.cert, ca.key, lp);
+    REQUIRE(leaf);
+    REQUIRE_FALSE(cert_is_ca(leaf->cert_pem));
+    REQUIRE_FALSE(cert_is_ca("garbage")); // fail closed
+}
+
+// The subordinate-CA IMPORT must accept an intermediate only when ALL THREE
+// primitives hold: it carries OUR key (cert_matches_key), it is a CA
+// (cert_is_ca), and it chains to the declared parent (verify_chain). This models
+// the import decision against the artifacts the engine can build in-process and
+// asserts each independent rejection reason. (The full positive path — a real
+// enterprise-signed intermediate over our key that a leaf then chains through —
+// needs an externally-minted CA-signed-CA artifact and is exercised in 6b's
+// import-handler test with an openssl fixture; the engine itself never signs CA
+// intermediates, that is the enterprise's offline step.)
+TEST_CASE("x509_ca: subordinate-CA import primitives reject each bad input independently",
+          "[pki][subordinate][security]") {
+    auto install = make_test_ca("Yuzu Install CA"); // our issuing key + self-signed cert
+    auto enterprise = make_test_ca("Acme Corp Root CA");
+
+    // Export a CSR over our EXISTING key (the artifact the enterprise signs).
+    CsrParams ca_csr_params;
+    ca_csr_params.subject = {"Yuzu Install CA", "Yuzu"};
+    auto ca_csr = make_csr(install.key, ca_csr_params);
+    REQUIRE(ca_csr);
+    REQUIRE(ca_csr->find("CERTIFICATE REQUEST") != std::string::npos);
+
+    // Reject reason 1: an uploaded "intermediate" that does NOT carry our key
+    // (here: the enterprise's own self-signed cert). cert_matches_key is false →
+    // import refuses, because we could not sign with a cert whose key we lack.
+    REQUIRE_FALSE(cert_matches_key(enterprise.cert, install.key));
+
+    // Reject reason 2: a non-CA cert (an end-entity leaf over our key) — even if
+    // it carried our key, it cannot issue. cert_is_ca is false.
+    auto leaf_key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key);
+    CsrParams lcsr_p;
+    lcsr_p.subject = {"not-a-ca", "Yuzu"};
+    auto lcsr = make_csr(*leaf_key, lcsr_p);
+    REQUIRE(lcsr);
+    LeafParams lp;
+    lp.subject = {"not-a-ca", "Yuzu"};
+    lp.validity = validity_days_from_now(30);
+    lp.usage = LeafUsage{.client_auth = true};
+    auto leaf = sign_csr(*lcsr, enterprise.cert, enterprise.key, lp);
+    REQUIRE(leaf);
+    REQUIRE_FALSE(cert_is_ca(leaf->cert_pem));
+
+    // Reject reason 3: a cert that does not chain to the declared parent. Our
+    // self-signed install cert does not verify against the enterprise root.
+    REQUIRE_FALSE(verify_chain(install.cert, enterprise.cert));
+
+    // Positive composition on what we CAN build in-process: our self-signed
+    // install cert carries our key AND is a CA AND chains to itself — the three
+    // checks an import runs, each satisfied.
+    REQUIRE(cert_matches_key(install.cert, install.key));
+    REQUIRE(cert_is_ca(install.cert));
+    REQUIRE(verify_chain(install.cert, install.cert));
+}

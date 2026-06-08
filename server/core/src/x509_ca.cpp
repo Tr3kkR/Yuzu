@@ -919,6 +919,41 @@ bool verify_chain(std::string_view leaf_pem, std::string_view ca_pem) {
     return rc == 1;
 }
 
+bool cert_matches_key(std::string_view cert_pem, std::string_view key_pem) {
+    X509_ptr cert = load_cert(cert_pem);
+    EVP_PKEY_ptr key = load_private_key(key_pem);
+    if (!cert || !key) {
+        log_ssl_errors("cert_matches_key load");
+        return false;
+    }
+    // X509_get_pubkey returns a NEW reference — own it so it is freed.
+    EVP_PKEY_ptr cert_pub{X509_get_pubkey(cert.get())};
+    if (!cert_pub) {
+        log_ssl_errors("cert_matches_key pubkey");
+        return false;
+    }
+    // EVP_PKEY_eq compares the PUBLIC components only; a private key carries its
+    // public half, so this is true iff the cert was issued over `key`'s pair.
+    // (1 = match; 0 = mismatch; <0 = not-comparable/error → treat as no match.)
+    const int rc = EVP_PKEY_eq(cert_pub.get(), key.get());
+    if (rc != 1)
+        spdlog::warn("x509_ca: cert_matches_key mismatch (rc={})", rc);
+    return rc == 1;
+}
+
+bool cert_is_ca(std::string_view cert_pem) {
+    X509_ptr cert = load_cert(cert_pem);
+    if (!cert) {
+        log_ssl_errors("cert_is_ca load");
+        return false;
+    }
+    // X509_check_ca returns >0 when the cert is a CA (1 = with basicConstraints
+    // CA:TRUE; other positive values are legacy/v1 heuristics). Require the
+    // explicit basicConstraints CA:TRUE form (==1) — an enterprise subordinate CA
+    // must carry it; we will not accept a v1/heuristic "CA" as an issuing cert.
+    return X509_check_ca(cert.get()) == 1;
+}
+
 #else // !CPPHTTPLIB_OPENSSL_SUPPORT — stubs
 
 static std::optional<std::string> unavailable() {
@@ -951,6 +986,14 @@ std::optional<CertDetails> parse_certificate(std::string_view) {
     return std::nullopt;
 }
 bool verify_chain(std::string_view, std::string_view) {
+    (void)unavailable();
+    return false;
+}
+bool cert_matches_key(std::string_view, std::string_view) {
+    (void)unavailable();
+    return false;
+}
+bool cert_is_ca(std::string_view) {
     (void)unavailable();
     return false;
 }

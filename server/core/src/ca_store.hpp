@@ -39,14 +39,22 @@ std::string ca_mode_to_string(CaMode m);
 CaMode ca_mode_from_string(const std::string& s);
 
 struct CaRoot {
-    std::string cert_pem;
-    std::string key_ref; ///< Opaque KeyProvider reference — never the key itself.
-    std::string algo;    ///< "EcP384" / "EcP256".
+    std::string cert_pem; ///< The ISSUING cert: self-signed root (Builtin) or our
+                          ///< enterprise-signed intermediate (Subordinate).
+    std::string key_ref;  ///< Opaque KeyProvider reference — never the key itself.
+    std::string algo;     ///< "EcP384" / "EcP256".
     int64_t not_before{0};
     int64_t not_after{0};
     std::string fingerprint_sha256;
     CaMode mode{CaMode::Builtin};
     int64_t created_at{0};
+    /// Parent CA chain ABOVE the issuing cert — the enterprise root [+ any
+    /// intermediates], PEM-concatenated. Empty in Builtin mode. Set on
+    /// subordinate-CA import (PR6) so issued leaves can present a full path to the
+    /// corporate trust anchor. The issuing key (`key_ref`) is unchanged across the
+    /// builtin→subordinate transition — the enterprise signs our existing public
+    /// key — so previously-issued leaves keep validating.
+    std::string chain_pem;
 };
 
 enum class CertStatus {
