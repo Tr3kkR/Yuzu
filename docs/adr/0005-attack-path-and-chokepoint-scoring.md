@@ -2,6 +2,7 @@
 status: accepted
 date: 2026-06-08
 owner: "@lesault (Andy Younie)"
+depends-on: 0004 (storage substrate — still proposed; see Consequences)
 ---
 
 # 0005 — Attack-path & chokepoint scoring: bounded max-probability paths, ROI chokepoints
@@ -48,3 +49,10 @@ generic betweenness centrality is O(V·E) and answers the wrong question.
   propagation to the agents (true distributed Pregel). Documented; not v1.
 - Andy owns the model knobs (G4 probability function, depth bound, segmentation cost model,
   acceptance bar); Eng owns the algorithm choices, justified by tractability.
+- **Substrate dependency (status honesty):** the *algorithm* decisions here
+  (Dijkstra / Yen / cost-weighted min-cut / label-propagation) are `accepted` and
+  substrate-independent. But the scoring **join** (`edges ⨝ findings ⨝ value ⨝ guardian_state`)
+  and the in-memory adjacency it loads assume the **ADR-0004 storage substrate, which is still
+  `proposed`**. If 0004 is rejected or reshaped, only the load/join mechanics are revisited —
+  not the math. This ADR should not be read as having pre-approved server-side Postgres; that
+  buy-in lives in 0004.
