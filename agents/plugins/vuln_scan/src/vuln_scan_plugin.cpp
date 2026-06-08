@@ -567,6 +567,10 @@ public:
                 std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
                 g_dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>(std::move(loaded));
                 ctx.storage_set("rules.last_loaded", rules_path);
+            } else {
+                // Log error so operator knows dynamic rules failed; compiled-in rules remain active
+                ctx.log(yuzu::CommandContext::LogLevel::Warn,
+                        "vuln_scan: dynamic rules load failed (" + err + "), using compiled-in rules");
             }
             // Non-fatal: compiled-in rules remain active if file not present
         }
