@@ -19,6 +19,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <format>
 #include <map>
@@ -27,6 +28,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <openssl/sha.h>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
@@ -65,18 +68,34 @@ static bool verify_rules_sha256(const std::string& rules_path) {
     if (!rules_f || !sha_f)
         return false;
 
+    // Read sidecar file: format "<hex_digest>  <filename>"
+    std::string sidecar_line;
+    if (!std::getline(sha_f, sidecar_line))
+        return false;
+    auto space_pos = sidecar_line.find("  ");
+    if (space_pos == std::string::npos || space_pos != 64)  // SHA-256 hex is 64 chars
+        return false;
+    std::string expected_hex = sidecar_line.substr(0, 64);
+
     // Compute SHA-256 of rules file
-    unsigned char hash[32]{};
-    // Simplified: read file and compute; full implementation would use crypto library
-    // For now, accept if sidecar file exists and is readable (basic integrity check)
-    std::string line;
-    if (!std::getline(sha_f, line))
-        return false;
-    // Sidecar format: "<hex_digest>  <filename>"
-    auto space_pos = line.find("  ");
-    if (space_pos == std::string::npos || line.empty())
-        return false;
-    return true;  // Sidecar file is readable and formatted correctly
+    unsigned char hash[SHA256_DIGEST_LENGTH]{};
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    char buf[4096];
+    while (rules_f.read(buf, sizeof(buf)) || rules_f.gcount() > 0) {
+        SHA256_Update(&ctx, buf, rules_f.gcount());
+    }
+    SHA256_Final(hash, &ctx);
+
+    // Convert to hex string
+    char computed_hex[65]{};
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        snprintf(computed_hex + i*2, 3, "%02x", hash[i]);
+    }
+
+    // Compare
+    return std::string(computed_hex) == expected_hex;
 }
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
