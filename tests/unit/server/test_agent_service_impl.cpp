@@ -44,9 +44,13 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 using yuzu::server::AuditStore;
 using yuzu::server::ResponseStore;
@@ -1459,4 +1463,270 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
         CHECK(success_row.source_ip == "203.0.113.9"); // agent origin on the success row too
         CHECK(success_row.detail.find("gateway_ip=") != std::string::npos);
     }
+}
+
+// ── PR3 trust gate: Register CSR-signing callback boundary (#1239 B-2) ──────────
+//
+// These pin the `agent_cert_signer_` callback at the service-layer enforcement
+// boundary — that the Register handler invokes the signer ONLY for an approved
+// enrollment that carries a CSR, forwards the raw CSR plus the SERVER-chosen
+// agent_id (never a CSR-derived identity), and degrades cleanly when signing is
+// unavailable. (The revocation gate and `peer_cert_recognizer_` fire only on a
+// PRESENTED client leaf, which requires a real TLS auth context that a unit test
+// cannot synthesise — those are exercised by the live boot-test and, for the
+// revocation predicate itself, by the sweep tests below + the ca_store
+// revocation round-trip. The recognizer's crypto core is covered by
+// test_x509_ca's verify_chain cases.)
+
+namespace {
+
+apb::RegisterRequest make_register(const std::string& agent_id, const std::string& csr_pem = "") {
+    apb::RegisterRequest req;
+    auto* info = req.mutable_info();
+    info->set_agent_id(agent_id);
+    info->set_hostname("host-" + agent_id);
+    info->mutable_platform()->set_os("linux");
+    info->mutable_platform()->set_arch("x64");
+    info->set_agent_version("0.13.0");
+    if (!csr_pem.empty())
+        req.set_csr_pem(csr_pem);
+    return req;
+}
+
+// Match-all auto-approve so a token-less Register falls through to the accept
+// (and therefore the CSR-signing) path deterministically.
+void install_match_all_auto_approve(GatewayResponseHarness& h) {
+    h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::hostname_glob, "*",
+                             "match-all (test)", /*enabled=*/true});
+}
+
+} // namespace
+
+TEST_CASE("Register: approved CSR reaches the signer with the authenticated agent_id (B-2)",
+          "[agent_service][pki][pr3]") {
+    GatewayResponseHarness h;
+    install_match_all_auto_approve(h);
+
+    std::string seen_csr, seen_agent_id;
+    int signer_calls = 0;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string& csr,
+            const std::string& agent_id) -> std::optional<std::pair<std::string, std::string>> {
+            ++signer_calls;
+            seen_csr = csr;
+            seen_agent_id = agent_id;
+            return std::make_pair(std::string("LEAF-PEM"), std::string("CHAIN-PEM"));
+        });
+
+    grpc::ServerContext ctx;
+    // The CSR blob deliberately "claims" a different identity; the service layer
+    // must hand the signer the AUTHENTICATED agent_id (the signer is what stamps
+    // CN), never anything derived from attacker-controlled CSR bytes.
+    auto req = make_register("agent-real", "CSR-claiming-to-be-agent-evil");
+    apb::RegisterResponse resp;
+    auto st = h.svc.Register(&ctx, &req, &resp);
+
+    REQUIRE(st.ok());
+    REQUIRE(resp.accepted());
+    REQUIRE(signer_calls == 1);
+    REQUIRE(seen_csr == "CSR-claiming-to-be-agent-evil"); // raw CSR forwarded verbatim
+    REQUIRE(seen_agent_id == "agent-real");               // server identity, not the CSR's
+    REQUIRE(resp.issued_certificate() == "LEAF-PEM");
+    REQUIRE(resp.issued_ca_chain() == "CHAIN-PEM");
+}
+
+TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert-less (B-2)",
+          "[agent_service][pki][pr3]") {
+    GatewayResponseHarness h;
+    install_match_all_auto_approve(h);
+    int signer_calls = 0;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string&,
+            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+            ++signer_calls;
+            return std::nullopt; // signing unavailable / failed
+        });
+
+    grpc::ServerContext ctx;
+    auto req = make_register("agent-x", "SOME-CSR");
+    apb::RegisterResponse resp;
+    auto st = h.svc.Register(&ctx, &req, &resp);
+
+    REQUIRE(st.ok());
+    REQUIRE(resp.accepted()); // signing failure is non-fatal: agent stays on bootstrap posture
+    REQUIRE(signer_calls == 1);
+    REQUIRE(resp.issued_certificate().empty());
+    REQUIRE(resp.issued_ca_chain().empty());
+}
+
+TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR signer (B-2)",
+          "[agent_service][pki][pr3][security]") {
+    GatewayResponseHarness h;
+    // No auto-approve rule + no token → the agent lands in the pending queue and
+    // Register returns BEFORE the signing block. A CSR must NOT be signed for an
+    // agent the operator has not approved.
+    bool signer_called = false;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string&,
+            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+            signer_called = true;
+            return std::make_pair(std::string("X"), std::string("Y"));
+        });
+
+    grpc::ServerContext ctx;
+    auto req = make_register("agent-pending", "A-CSR");
+    apb::RegisterResponse resp;
+    auto st = h.svc.Register(&ctx, &req, &resp);
+
+    REQUIRE(st.ok());
+    REQUIRE_FALSE(resp.accepted());
+    REQUIRE(resp.enrollment_status() == "pending");
+    REQUIRE_FALSE(signer_called);
+    REQUIRE(resp.issued_certificate().empty());
+}
+
+TEST_CASE("Register: no CSR → signer is not invoked even when wired (B-2)",
+          "[agent_service][pki][pr3]") {
+    GatewayResponseHarness h;
+    install_match_all_auto_approve(h);
+    bool signer_called = false;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string&,
+            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+            signer_called = true;
+            return std::make_pair(std::string("X"), std::string("Y"));
+        });
+
+    grpc::ServerContext ctx;
+    auto req = make_register("agent-nocsr"); // CSR omitted
+    apb::RegisterResponse resp;
+    auto st = h.svc.Register(&ctx, &req, &resp);
+
+    REQUIRE(st.ok());
+    REQUIRE(resp.accepted());
+    REQUIRE_FALSE(signer_called);
+    REQUIRE(resp.issued_certificate().empty());
+}
+
+// ── PR3 H-1: revocation sweep tears down live Subscribe streams (#1239 H-1) ─────
+//
+// The establishment gate checks revocation once; sweep_revoked() is the
+// mechanism that re-evaluates a long-lived stream so a revoked/compromised agent
+// stops receiving dispatched commands without waiting for a voluntary reconnect.
+// Driving it directly (with a spy predicate standing in for is_peer_cert_revoked)
+// exercises the revocation_checker_ decision boundary that the gRPC entry points
+// cannot in a unit test.
+
+namespace {
+
+apb::AgentInfo make_agent_info(const std::string& agent_id) {
+    apb::AgentInfo info;
+    info.set_agent_id(agent_id);
+    info.set_hostname("host-" + agent_id);
+    info.mutable_platform()->set_os("linux");
+    info.mutable_platform()->set_arch("x64");
+    info.set_agent_version("0.13.0");
+    return info;
+}
+
+} // namespace
+
+TEST_CASE("AgentRegistry::sweep_revoked cancels only the revoked, cert-bearing streams (H-1)",
+          "[agent_service][pki][pr3][revocation]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+
+    registry.register_agent(make_agent_info("agent-good"));
+    registry.register_agent(make_agent_info("agent-bad"));
+    registry.register_agent(make_agent_info("agent-nocert"));
+
+    // Two contexts stand in for live Subscribe streams; TryCancel on a context
+    // with no underlying call is a safe no-op (grpc_call_cancel_with_status
+    // returns GRPC_CALL_ERROR on a null call), so the sweep logic is exercised
+    // without a real RPC.
+    grpc::ServerContext ctx_good, ctx_bad, ctx_nocert;
+    registry.set_stream("agent-good", nullptr, &ctx_good, "PEM-GOOD");
+    registry.set_stream("agent-bad", nullptr, &ctx_bad, "PEM-BAD");
+    // No client cert presented → nothing to evaluate, must be skipped.
+    registry.set_stream("agent-nocert", nullptr, &ctx_nocert, /*peer_cert_pem=*/"");
+
+    std::vector<std::string> seen;
+    auto is_revoked = [&](const std::string& pem) {
+        seen.push_back(pem);
+        return pem == "PEM-BAD";
+    };
+
+    const auto cancelled = registry.sweep_revoked(is_revoked);
+    REQUIRE(cancelled.size() == 1);          // only agent-bad
+    REQUIRE(cancelled.front() == "agent-bad"); // and it is reported for auditing
+
+    // The predicate saw exactly the two cert-bearing PEMs (order-independent);
+    // the no-cert session was never offered to it.
+    REQUIRE(seen.size() == 2);
+    REQUIRE(std::find(seen.begin(), seen.end(), "PEM-GOOD") != seen.end());
+    REQUIRE(std::find(seen.begin(), seen.end(), "PEM-BAD") != seen.end());
+    REQUIRE(std::find(seen.begin(), seen.end(), "") == seen.end());
+}
+
+TEST_CASE("AgentRegistry::sweep_revoked is a no-op for a null predicate or no revocations (H-1)",
+          "[agent_service][pki][pr3][revocation]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_agent_info("agent-1"));
+    grpc::ServerContext ctx;
+    registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
+
+    REQUIRE(registry.sweep_revoked(nullptr).empty()); // null predicate → no work
+    REQUIRE(registry.sweep_revoked([](const std::string&) { return false; }).empty()); // none revoked
+}
+
+TEST_CASE("AgentRegistry::sweep_revoked skips a session whose stream has been cleared (H-1)",
+          "[agent_service][pki][pr3][revocation]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_agent_info("agent-1"));
+    grpc::ServerContext ctx;
+    registry.set_stream("agent-1", nullptr, &ctx, "PEM-1");
+    registry.clear_stream("agent-1"); // disconnect → context + pem cleared
+
+    int calls = 0;
+    const auto cancelled = registry.sweep_revoked([&](const std::string&) {
+        ++calls;
+        return true;
+    });
+    REQUIRE(cancelled.empty()); // no live stream to tear down
+    REQUIRE(calls == 0);        // a cleared session is never offered to the predicate
+}
+
+TEST_CASE("AgentRegistry::sweep_revoked does NOT cancel a stream whose cert changed "
+          "during the off-lock check (H-1 re-check race)",
+          "[agent_service][pki][pr3][revocation]") {
+    // The predicate runs off stream_mu (it reads ca.db); teardown re-acquires the
+    // lock and re-verifies the stored PEM is unchanged. Simulate a reconnection
+    // that swaps in a FRESH (non-revoked) leaf between capture and teardown by
+    // having the predicate itself mutate the session via set_stream. The sweep
+    // must then skip the cancel (the cert it judged revoked is no longer mounted).
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    registry.register_agent(make_agent_info("agent-1"));
+    grpc::ServerContext ctx_old, ctx_new;
+    registry.set_stream("agent-1", nullptr, &ctx_old, "PEM-OLD");
+
+    int calls = 0;
+    auto is_revoked = [&](const std::string& pem) {
+        ++calls;
+        // First (and only) call: the captured PEM is the revoked one. Before we
+        // return true, a "reconnection" swaps in a different, non-revoked leaf.
+        if (pem == "PEM-OLD")
+            registry.set_stream("agent-1", nullptr, &ctx_new, "PEM-NEW");
+        return true; // claim everything revoked — only the re-check should save it
+    };
+
+    const auto cancelled = registry.sweep_revoked(is_revoked);
+    REQUIRE(calls == 1);          // evaluated the originally-captured leaf
+    REQUIRE(cancelled.empty());   // but the re-check saw PEM-NEW != PEM-OLD → no cancel
 }

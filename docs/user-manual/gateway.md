@@ -296,6 +296,35 @@ holds a CA-issued client cert** (not the normal enrollment path), add a
 runs plaintext regardless of the other options. Full detail:
 `docs/pki-architecture.md` "Gateway TLS".
 
+#### Enabling agent-listener TLS — order of operations + caveats (#1244)
+
+One-way TLS on the agent listener only helps if the **agent dials TLS and
+verifies the CA**. A listener doing TLS while agents still dial plaintext (or dial
+TLS without pinning the CA) is either inert or **MITM-able** — if the gateway leaf
+chains to a *public* CA and the agent falls back to the system trust store, any
+publicly-trusted impostor cert for the dial host is accepted. The agent half (CA
+distribution + TLS-dial wiring + a fail-closed guard for `tls_enabled` with an
+empty CA path) lands in **PR5b**; do not flip the listener ahead of it.
+
+**Flag-day upgrade order (enabling the listener disconnects every plaintext agent
+at once — there is no dual-listen transition):**
+
+1. **Distribute the CA** (`default-gateway`'s issuing CA, i.e. the install root)
+   to every agent's `--ca-cert` / cert dir.
+2. **Reconfigure agents** to dial the gateway over TLS and verify that CA.
+3. **Only then flip the listener** to `ssl => true` in `sys.config.prod`.
+
+Reversing the order strands the fleet until every agent is re-pointed.
+
+**Compromised-gateway caveat:** one-way TLS authenticates the **gateway to the
+agent**, not the agent to the gateway. It closes the on-path eavesdrop/inject of
+the plaintext edge, but a *compromised gateway itself* can still inject commands
+to the fleet — the compensating controls are app-layer: the server's
+gateway-authoritative `gateway_observed_peer` attribution and the enrollment
+approval workflow. Full cryptographic agent-to-gateway identity (so the gateway
+can't forge an agent) arrives with the through-gateway attestation work gated on
+PR5d / the QUIC migration (#376).
+
 ### Distribution Cookie (Required in Production)
 
 The gateway enables Erlang distribution (`-name` in `config/vm.args.src`) for

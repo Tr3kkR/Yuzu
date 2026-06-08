@@ -88,11 +88,15 @@ message RegisterRequest {
   // GATEWAY: the gateway's vendored copy of this proto
   // (gateway/priv/proto/.../agent.proto + agent_pb.erl) was regenerated in PKI
   // PR5 to include this field, so the gateway-proxied Register path now FORWARDS
-  // csr_pem/issued_certificate verbatim — per-agent mTLS auto-provisioning works
-  // for gateway-connected agents, not just direct-connect. (The agent↔gateway
-  // transport hop itself stays plaintext in M1 — grpcbox forces mutual TLS on
-  // any TLS listener, which breaks unenrolled bootstrap; see
-  // docs/pki-architecture.md "Gateway TLS".)
+  // csr_pem/issued_certificate verbatim — the field SURVIVES TRANSIT through the
+  // gateway. It is NOT yet signed on the gateway path: ProxyRegister has no signer
+  // wired in PR5, so a gateway-connected agent still receives an empty
+  // issued_certificate (fails closed to the bootstrap posture). Gateway-path
+  // issuance (signing the forwarded CSR) lands in PR5d, which must first add
+  // agent-identity attestation on the unauthenticated agent↔gateway hop — see the
+  // R-6 confused-deputy gate in docs/pki-architecture.md. (That hop stays plaintext
+  // in M1 — grpcbox forces mutual TLS on any TLS listener, which breaks unenrolled
+  // bootstrap; one-way TLS is PR5c.)
   string csr_pem = 7;
 }
 

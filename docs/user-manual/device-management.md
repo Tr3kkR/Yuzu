@@ -278,11 +278,44 @@ start). Pass `--no-auto-provision-cert` to opt out (e.g. when you supply your ow
 client certificate). See `docs/auth-architecture.md` "Per-agent mTLS".
 
 This applies equally to agents enrolling **through the Erlang gateway** — the
-gateway relays the `RegisterResponse` verbatim, so the per-agent leaf reaches the
-agent on both the direct and gateway paths (PKI PR5d). **To stop an agent from
-re-enrolling and re-obtaining a certificate, deny the agent** — certificate
-revocation is serial-scoped (it invalidates the presented leaf) and does not block
-re-issuance at a future `Register`.
+gateway relays the `RegisterResponse` verbatim **and signs the forwarded CSR**
+(`ProxyRegister`, PKI PR5d), so the per-agent leaf reaches the agent on both the
+direct and gateway paths.
+
+**Files written under `--cert-dir`** (default `<data-dir>/certs`):
+
+| File | Contents | Mode |
+|---|---|---|
+| `agent-client.key` | The agent's EC P-256 private key — never leaves the host, never sent to the server | `0600` |
+| `agent-client.pem` | The per-agent client leaf the server issued (`CN=<agent-id>`) | `0644` |
+| `agent-ca.pem` | The issuing CA chain the agent pins the server against | `0644` |
+
+**Key loss → automatic re-provisioning.** If `agent-client.key` is deleted or
+corrupted, the agent transparently re-provisions on its next enrollment: it
+generates a fresh keypair + CSR and the server issues a **new** leaf with a
+**new serial**. The previous serial remains in the server's issued-cert inventory
+(`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
+harmless, but if you reconcile the inventory you should expect one orphan per
+key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
+
+> **Revocation is not bypassable by key deletion.** Auto-re-provisioning applies
+> only when the agent's prior cert was *not* revoked. If you **revoke** an
+> agent's certificate (`POST /api/v1/ca/revoke`) and that agent then deletes its
+> key and reconnects, the server **refuses** to issue a fresh leaf (audit
+> `ca.cert.reissue_blocked`, metric `yuzu_server_ca_reissue_blocked_total`) — the
+> agent cannot silently resurrect a revoked identity. To bring a revoked agent
+> back, an operator must deliberately re-approve it (clearing the revocation),
+> not merely let it re-enroll.
+
+> **Gateway-proxied agents:** per-agent mTLS revocation is enforced on
+> **direct-connect** agents only. An agent that reaches the server *through a
+> gateway* presents its leaf to the gateway, not the server, so revoking that
+> agent's certificate (`POST /api/v1/ca/revoke`) does **not** by itself cut it
+> off the data plane — the server never sees the agent's leaf on the
+> gateway→server hop. To decommission a gateway-proxied agent promptly, also
+> disconnect it at the gateway/management layer. Through-gateway cryptographic
+> revocation is planned with the QUIC transport migration. See
+> `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration
 

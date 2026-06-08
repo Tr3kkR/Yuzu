@@ -233,12 +233,28 @@ per-agent mTLS rolls out without breaking a heterogeneous or mid-upgrade fleet:
   holds); a not-yet-provisioned or legacy (pre-PR3) agent has no bound identity
   and continues on the prior posture (session + `#826` peer-IP binding) rather
   than being hard-rejected.
-- `Heartbeat` and `DownloadUpdate` reject a presented **revoked** leaf
-  (`yuzu_grpc_revoked_cert_total{rpc=heartbeat|download_update}`) so a revoked
-  agent is denied liveness + OTA, not just the command channel. `DownloadUpdate`
-  also emits an audit row (`session.cert_revoked`); `Heartbeat` is metric-only
+- `Heartbeat`, `DownloadUpdate`, and `CheckForUpdate` reject a presented
+  **revoked** leaf (`yuzu_grpc_revoked_cert_total{rpc=heartbeat|download_update|check_for_update}`)
+  so a revoked agent is denied liveness, OTA download, *and* OTA version
+  discovery — not just the command channel. `DownloadUpdate` also emits an audit
+  row (`session.cert_revoked`); `Heartbeat`/`CheckForUpdate` are metric-only
   (high-frequency). `is_yuzu_issued` results are cached (immutable per cert) so
   the per-heartbeat check is not an ECDSA chain verify fleet-wide.
+- **Open-stream revocation sweep (H-1).** The `Subscribe` gate above only runs at
+  stream establishment, so a long-lived command channel would keep dispatching to
+  an agent revoked *after* it connected (a hostile agent never voluntarily
+  reconnects). The server's reaper thread therefore runs a periodic
+  `AgentRegistry::sweep_revoked` (~15 s, well inside any CRL validity window) that
+  re-evaluates every live Subscribe stream's stored leaf against the CRL and
+  `TryCancel`s the stream of any now-revoked agent
+  (`yuzu_grpc_revoked_cert_total{rpc=stream_sweep}`); the cancelled agent must
+  reconnect, where the establishment gate refuses it. The presented leaf is
+  stashed on the session only when a revocation checker is wired (CA active), so a
+  non-PKI deployment stores nothing. PR4's operator-revoke handler calls the same
+  sweep immediately so a dashboard/REST revoke tears the stream down promptly
+  rather than waiting for the next tick. The revocation predicate runs off the
+  per-session lock (it reads `ca.db`), and teardown re-checks the cert is
+  unchanged so a reconnection mid-sweep is not cancelled by mistake.
 - `require_client_identity_` is recomputed *after* the default-cert bootstrap
   (`tls_enabled && !tls_ca_cert.empty()`), since it is baked at construction
   before the CA exists.
@@ -281,11 +297,45 @@ auto-provisioning for that run rather than looping.
 bootstrap). Agent: `--cert-dir` / env `YUZU_CERT_DIR` (where the provisioned
 credential lives) and `--no-auto-provision-cert` (disable the CSR-at-enrollment
 flow — e.g. when supplying an operator-minted client cert via `--client-cert` /
-`--client-key`, or an OS-store cert). Implementation: server signer in
-`server.cpp` (`sign_agent_csr` / `is_peer_cert_revoked`) on the
+`--client-key`, or an OS-store cert). The provisioned credential is written under
+`--cert-dir` as `agent-client.key` (private key, `0600`), `agent-client.pem`
+(the issued leaf), and `agent-ca.pem` (the issuing CA chain the agent pins the
+server against). Deleting these files makes the agent **auto-re-provision** on
+its next enrollment: it generates a fresh keypair + CSR and the server signs a
+NEW leaf with a NEW serial. The previously-issued serial stays in `ca.db`
+inventory as a now-orphaned `agent` row that no live agent holds — harmless, but
+operators reconciling the issued-cert inventory should expect one orphan row per
+key-loss event (revoke the orphan if a strict inventory is required).
+**Revocation-bypass guard (#1239 H-2):** auto-re-provision is refused when the
+agent's prior cert is *revoked* (not merely orphaned). `sign_agent_csr` scans
+`ca.db` for a revoked, non-expired cert with `subject==agent_id` and, if found,
+returns `nullopt` (audit `ca.cert.reissue_blocked`, metric
+`yuzu_server_ca_reissue_blocked_total{reason=revoked_identity}`) — so a
+compromised endpoint cannot drop its key and re-enroll its way back onto the data
+plane. Clearing a revocation is a deliberate operator re-approval, never an
+automatic consequence of key loss.
+Implementation: server signer in `server.cpp`
+(`sign_agent_csr` / `is_peer_cert_revoked`) on the
 `x509_ca`/`key_provider`/`ca_store` engine; agent provisioning in
 `agents/core/src/agent_csr.{hpp,cpp}` (self-contained OpenSSL) wired into the
 `agent.cpp` connect/register loop.
+
+**Gateway-proxied agents: revocation scope (known limitation).** Per-agent mTLS
+identity and revocation enforcement are **authoritative on direct connect only**.
+A gateway-proxied agent terminates its TLS at the *gateway*; on the
+gateway→server hop the server's transport peer is the **gateway's** cert, not the
+agent's leaf — so the server-side revocation gate and the open-stream sweep above
+never see the proxied agent's serial, and a revoked agent behind a gateway stays
+functional on the data plane. PR5d closes the *issuance* half of this gap
+(gateway-proxied agents now obtain a per-agent leaf via `ProxyRegister`
+CSR-signing, so the identity exists and is recorded/revocable in `ca.db`), but
+*enforcing* that revocation at the gateway edge is future work: durable
+cryptographic through-gateway identity (and therefore through-gateway revocation)
+arrives with the QUIC single-connection migration (#376). Until then, to revoke a
+gateway-proxied agent promptly, revoke at the gateway/management layer (disconnect
+the agent) in addition to `POST /api/v1/ca/revoke`. This is the same
+direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
+("Gateway path identity").
 
 ## HTTP security response headers (SOC2-C1)
 

@@ -4695,7 +4695,15 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
-    "policies": "ok"
+    "policies": "ok",
+    "guaranteed_state": "ok",
+    "offload_target": "ok",
+    "ca": "ok"
+  },
+  "tls": {
+    "default_certs_active": false,
+    "ca_fingerprint": "",
+    "ca_expires_at": 0
   },
   "executions": {
     "in_flight": 5,
@@ -4712,7 +4720,10 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`) |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
+| `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
+| `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
 | `executions.in_flight` | integer | Currently running instruction executions |
 | `executions.completed_last_hour` | integer | Executions completed in the past 60 minutes |
 | `executions.failed_last_hour` | integer | Executions that failed in the past 60 minutes |
