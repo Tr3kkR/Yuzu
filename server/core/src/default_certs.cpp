@@ -235,9 +235,18 @@ pki::SubjectAltNames parse_extra_sans(const std::vector<std::string>& extra) {
                          n);
             return;
         }
-        if (n.find('*') != std::string::npos)
-            spdlog::warn("default_certs: --cert-san DNS '{}' has a wildcard — broadens cert validity",
+        if (n.find('*') != std::string::npos) {
+            // #1271 UP-10/11: REJECT wildcards in default-cert SANs (was warn-only).
+            // The install CA is distributed to every agent as a trust anchor, so a
+            // wildcard leaf has real blast radius — a single stolen default-leaf key
+            // would validate for an entire `*.<domain>`. An operator who genuinely
+            // needs a wildcard must bring their own cert (`--https-cert` etc.).
+            spdlog::warn("default_certs: REJECTING --cert-san DNS '{}' — wildcard SANs are not "
+                         "allowed in fleet-trusted default certs; supply your own cert for a "
+                         "wildcard",
                          n);
+            return;
+        }
         if (push_unique(out.dns, std::move(n)))
             ++total;
     };
@@ -273,6 +282,13 @@ pki::SubjectAltNames parse_extra_sans(const std::vector<std::string>& extra) {
             add_dns(piece);
         }
     };
+    // #1271 UP-9: the kMaxExtraSans cap counts only ACCEPTED names, so a flood of
+    // INVALID entries (each warns + validates without ever incrementing `total`)
+    // could CPU/log-flood at boot. Bound the total PIECES parsed (raw entries ×
+    // comma-split) independently — generous headroom above kMaxExtraSans, then a
+    // hard stop. Never boot-fatal (matches the drop-with-warning posture).
+    constexpr std::size_t kMaxSanPieces = 512;
+    std::size_t pieces_seen = 0;
     for (const auto& raw : extra) {
         if (total >= kMaxExtraSans) {
             spdlog::warn("default_certs: --cert-san capped at {} extra names — ignoring the rest",
@@ -286,6 +302,12 @@ pki::SubjectAltNames parse_extra_sans(const std::vector<std::string>& extra) {
         std::string_view rv{raw};
         std::size_t start = 0;
         for (;;) {
+            if (++pieces_seen > kMaxSanPieces) {
+                spdlog::warn("default_certs: --cert-san piece limit ({}) reached — ignoring the "
+                             "rest (invalid-entry flood guard)",
+                             kMaxSanPieces);
+                return out;
+            }
             const std::size_t comma = rv.find(',', start);
             classify(rv.substr(
                 start, comma == std::string_view::npos ? std::string_view::npos : comma - start));
