@@ -78,10 +78,20 @@ struct IssuedCertRecord {
     std::string issued_by;             ///< Yuzu principal that triggered issuance.
     std::string enrollment_request_id; ///< Correlation handle to the enrollment.
     std::string cert_pem;              ///< Full issued leaf PEM (forensic/audit).
-    /// SHA-256 fingerprint of the ROOT that signed this leaf. Links the inventory
-    /// to a specific root so a subordinate-CA re-key (PR6, set_root replaces id=1)
-    /// does not orphan issued certs. Empty until a caller populates it; added in
-    /// PR1 so ca.db's schema is stable before first deploy.
+    /// SHA-256 fingerprint of the issuer CERTIFICATE **at issuance time**. Forensic
+    /// metadata only — it records which issuer cert minted this leaf.
+    ///
+    /// CONTRACT (PR6 Hermes H1): this is NOT a stable CA identity and MUST NEVER be
+    /// used as an admission / revocation / filter key. A subordinate-CA import
+    /// (`CaMode::Subordinate`) keeps the issuing KEY but swaps the issuer cert, so
+    /// the *current* root fingerprint changes while leaves minted before the switch
+    /// retain their original (builtin-root) fingerprint — two distinct fingerprints
+    /// over the SAME signing key. Those leaves stay fully valid: admission verifies
+    /// by the key+DN (`is_yuzu_issued`→`verify_chain`), and revocation matches by
+    /// serial — neither consults this column. A future "issued by THIS CA" query
+    /// must therefore key on the stable identity (the key / SubjectKeyIdentifier),
+    /// never on a single fingerprint value. The stable-key-identity follow-up is
+    /// tracked in #1296. Empty until a caller populates it.
     std::string issuer_fingerprint;
 };
 

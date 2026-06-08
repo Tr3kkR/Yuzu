@@ -305,6 +305,66 @@ Until PR5b, the server is encrypted-and-mutually-authenticated by default when
 run **without** `--no-tls`/`--no-https` (PR2 generates the certs); the shipped
 compose rigs still pass those flags explicitly.
 
+## Subordinate-CA — root Yuzu's CA in an enterprise PKI (PR6, M2)
+
+By default the install CA is a self-signed root (`CaMode::Builtin`). An enterprise
+that already runs PKI can make Yuzu's issuing CA a **subordinate** of its own
+root, so every Yuzu-issued certificate chains to the corporate trust anchor.
+
+**Key invariant — the issuing key never changes.** The enterprise signs Yuzu's
+*existing* public key into an intermediate. Because a leaf's
+`authorityKeyIdentifier` is derived from the issuer **key** (unchanged) and the
+issuer DN is kept identical, every certificate issued *before* the switch keeps
+validating *after* it. Only the issuer's cert (and the chain above it) changes.
+
+**Flow:**
+1. **Export** — `GET /api/v1/ca/root-csr` runs `ServerImpl::export_ca_csr`:
+   `make_csr` over the existing CA key, subject = the CA's current DN. The CA key
+   is loaded transiently and `secure_zero`'d on every exit path (same custody as
+   `sign_agent_csr`). The CSR carries only the public key (already public via
+   `/ca/root`) — no secret.
+2. **Enterprise signs** the CSR as a subordinate CA (must be
+   `basicConstraints: CA:TRUE`, `keyUsage: keyCertSign,cRLSign`) — offline, with
+   the enterprise's own tooling. Yuzu never signs CA intermediates itself.
+3. **Import** — `POST /api/v1/ca/import-chain` runs
+   `ServerImpl::import_subordinate_chain`, which is the security crux and validates
+   **in order**:
+   - `parse_certificate(intermediate)` — parseable;
+   - `pki::cert_is_ca` — `X509_check_ca()==1` (explicit `CA:TRUE`), else it cannot
+     issue;
+   - `pki::cert_matches_key(intermediate, our CA key)` — `EVP_PKEY_eq` of the
+     cert's public key against our private key. **This is the load-bearing check**:
+     it proves the enterprise signed the exact CSR we exported and that we still
+     hold the matching private key. Without it, an operator (or a compromised one)
+     could re-root the install at an attacker-chosen hierarchy or at an issuing
+     cert whose key we don't hold (silently breaking all future issuance);
+   - `pki::verify_chain_to_bundle(intermediate, chain_pem)` — the intermediate
+     verifies up to a trust anchor inside the uploaded parent chain (any depth).
+   Only then `set_root(cert=intermediate, chain=parent_chain, mode=Subordinate)`
+   — `key_ref` and `algo` unchanged; `not_before`/`not_after` + `fingerprint`
+   adopted from the intermediate. The CRL is then re-published so it is served
+   under the new issuer's fingerprint.
+
+**Schema:** `ca_root.chain_pem` (migration v4) holds the parent chain above the
+issuing cert (empty in Builtin). `CaRoot.mode` records `builtin`/`subordinate`.
+Issued-cert `issuer_fingerprint` (v2) links each leaf to the root that signed it,
+so a re-key does not orphan the inventory.
+
+**Issued chain:** `sign_agent_csr` returns `cert_pem + chain_pem` as the
+`issued_ca_chain`, so a gateway/agent leaf receives a full path to the corporate
+root (empty in Builtin → M1 single-cert behaviour unchanged).
+
+**Surfaces:** REST `GET /api/v1/ca/root-csr` (`Security:Read`) + `POST
+/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Internal CA** panel
+shows a Trust-mode badge + the CSR download + an import form (the dashboard
+wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
+`ca.root_csr.exported`, `ca.subordinate.imported`.
+
+**Bring-your-own-leaf** stays orthogonal: any surface with an explicit
+`--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses the
+internal CA entirely for that surface — supported, unchanged, independent of CA
+mode. ACME and a configurable RSA key algorithm remain explicitly out of scope.
+
 ## Key custody + threat model
 
 The CA root key is a 0600 PEM in a 0700 directory via `FileKeyProvider`; it is
@@ -367,7 +427,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes stay plaintext until PR5b wires it.) | shipped |
 | PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test land in PR5b. | shipped |
 | PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing; needs a booted stack — no CI boots the deploy composes). **Partial — shipped:** `--cert-san` + Dockerfile.server cert-dir ownership (boot-test-validated). | in progress |
-| PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
+| PR6 (M2) | Subordinate-CA — export the CA CSR (`GET /ca/root-csr`) + import an enterprise-signed intermediate (`POST /ca/import-chain`, validates carries-our-key + is-CA + chains-to-parent) → `CaMode::Subordinate`; issued leaves chain to the corporate root, issuing key unchanged. Engine `cert_matches_key`/`cert_is_ca`/`verify_chain_to_bundle`; `ca_root.chain_pem` (migration v4); dashboard import panel. See "Subordinate-CA" above. | in review |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
 namespace separation; **gateway mgmt-listener mTLS for the server

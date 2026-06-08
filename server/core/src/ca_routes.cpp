@@ -534,7 +534,26 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     kJson);
                 return;
             }
-            const auto outcome = import_chain_fn(intermediate, chain);
+            // Defensive (Hermes 6c INFO): the validator composes pki::* helpers +
+            // key loading. Those don't throw in practice (OpenSSL C APIs return
+            // codes), but a C++ wrapper throw (e.g. bad_alloc) must not bypass the
+            // audit row on this privileged trust-root switch — catch → failure audit.
+            CaRoutes::ImportOutcome outcome;
+            try {
+                outcome = import_chain_fn(intermediate, chain);
+            } catch (const std::exception& e) {
+                (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                               std::string("reason=exception detail=") + e.what());
+                res.status = 500;
+                res.set_content(error_json_a4(500, "import failed", make_correlation_id()), kJson);
+                return;
+            } catch (...) {
+                (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                               "reason=exception");
+                res.status = 500;
+                res.set_content(error_json_a4(500, "import failed", make_correlation_id()), kJson);
+                return;
+            }
             int status = 200;
             std::string msg;
             std::string detail = "mode=subordinate";
@@ -719,7 +738,21 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                           400, "Both the signed intermediate and the parent chain are required.");
                       return;
                   }
-                  const auto outcome = import_chain_fn(intermediate, chain);
+                  CaRoutes::ImportOutcome outcome;
+                  try {
+                      outcome = import_chain_fn(intermediate, chain);
+                  } catch (const std::exception& e) {
+                      (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                                     std::string("reason=exception via=dashboard detail=") +
+                                         e.what());
+                      error_panel(500, "Import failed (internal error).");
+                      return;
+                  } catch (...) {
+                      (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                                     "reason=exception via=dashboard");
+                      error_panel(500, "Import failed (internal error).");
+                      return;
+                  }
                   std::string result = "denied";
                   std::string emsg;
                   int status = 200;
@@ -765,10 +798,20 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       return;
                   }
                   // Refresh the CRL under the new issuing cert (issuer_fingerprint).
-                  (void)(publish_crl_fn && publish_crl_fn().has_value());
+                  // Hermes 6c LOW: unlike the REST endpoint (which returns
+                  // crl_republished), the dashboard must SURFACE a CRL-refresh
+                  // failure — the import succeeded but external CRL consumers stay
+                  // on the old issuer until the next publish. Prepend a notice.
+                  const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
                   if (!audit_ok)
                       res.set_header("Sec-Audit-Failed", "true");
-                  res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
+                  std::string body;
+                  if (!crl_ok)
+                      body += "<div class=\"alert alert-warning\" style=\"margin-bottom:0.75rem\">"
+                              "Subordinated, but the CRL could not be republished — external CRL "
+                              "consumers will not see the new issuer until the next publish.</div>";
+                  body += render_ca_fragment(ca_store);
+                  res.set_content(body, "text/html; charset=utf-8");
               });
 }
 

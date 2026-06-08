@@ -644,6 +644,17 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
     REQUIRE(h.last_import_intermediate == "INT");
     REQUIRE(h.last_import_chain == "PAR");
 
+    // Hermes 6c LOW: a CRL-republish failure on a successful dashboard import is
+    // SURFACED (the import stands, but the panel warns the CRL is stale).
+    h.crl_succeeds = false;
+    auto crlfail = h.sink.dispatch("POST",
+                                   "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
+                                   "", "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(crlfail);
+    REQUIRE(crlfail->status == 200);                            // import still succeeded
+    REQUIRE(crlfail->body.find("CRL could not be republished") != std::string::npos);
+    h.crl_succeeds = true;
+
     // Cross-origin → 403 + csrf.denied, and import_chain_fn must NOT be called.
     const int calls_before = h.import_calls;
     const std::unordered_map<std::string, std::string> cross = {

@@ -474,6 +474,12 @@ const std::string& openapi_spec() {
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
     },
+    "/ca/root-csr": {
+      "get": {"summary": "Export the install CA's CSR for enterprise (subordinate-CA) signing", "tags": ["Security"], "responses": {"200": {"description": "PKCS#10 CSR (application/pkcs10), over the existing CA key"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "CSR generation failed"}, "503": {"description": "CA unavailable"}}}
+    },
+    "/ca/import-chain": {
+      "post": {"summary": "Import an enterprise-signed intermediate + parent chain (switch to subordinate mode)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["intermediate_pem", "chain_pem"], "properties": {"intermediate_pem": {"type": "string", "description": "This CA's key signed by the enterprise root (must be CA:TRUE)"}, "chain_pem": {"type": "string", "description": "Parent chain: enterprise root [+ intermediates]"}}}}}}, "responses": {"200": {"description": "Validated; issuing identity switched to subordinate, CRL republished"}, "400": {"description": "Bad JSON / missing field / unparseable intermediate"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "No existing CA to subordinate"}, "422": {"description": "Intermediate is not a CA / does not carry this CA's key / does not verify to the chain"}, "413": {"description": "Body too large"}, "503": {"description": "CA unavailable"}}}
+    },
     "/quarantine": {
       "get": {"summary": "List quarantined devices", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices"}}},
       "post": {"summary": "Quarantine a device", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}}}

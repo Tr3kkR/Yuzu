@@ -2768,6 +2768,17 @@ private:
 
         // Switch the issuing identity. Keep key_ref + algo (the key is unchanged);
         // adopt the intermediate's validity window and our new parent chain.
+        //
+        // H1 (PR6 Hermes): the issuing KEY is unchanged, only the issuer cert (and
+        // the current root fingerprint) changes. Leaves issued BEFORE this switch
+        // keep validating — admission verifies by key+DN, not by fingerprint — and
+        // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
+        // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
+        // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint). A
+        // stable key-based CA identity (SubjectKeyIdentifier) is the tracked
+        // follow-up (#1296); nothing in the admission/revocation/CRL paths keys on
+        // the fingerprint, so the two-fingerprints-one-key state is safe today.
         CaRoot updated = *root;
         updated.cert_pem = intermediate_pem;
         updated.chain_pem = parent_chain_pem;

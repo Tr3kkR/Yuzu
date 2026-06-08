@@ -949,6 +949,74 @@ will not see it until the next successful publish. Errors: `400` (missing/invali
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
+#### Subordinate-CA (root your CA in an enterprise PKI)
+
+By default Yuzu's CA is a self-signed install root (`trust mode: built-in`). An
+enterprise can instead make Yuzu's issuing CA a **subordinate** of its own root,
+so every Yuzu-issued certificate chains to the corporate trust anchor. The
+issuing **key never changes** — the enterprise signs Yuzu's *existing* public
+key — so certificates already issued keep validating across the switch.
+
+Workflow:
+
+1. **Export** Yuzu's CA signing request and have your enterprise root sign it as
+   a subordinate CA (the signed cert **must** carry `basicConstraints: CA:TRUE`,
+   `keyUsage: keyCertSign, cRLSign`).
+2. **Import** the signed intermediate plus the parent chain (enterprise root and
+   any intermediates above Yuzu's).
+
+This is also available in **Settings → Internal CA → "Subordinate this CA…"**.
+
+#### `GET /api/v1/ca/root-csr`
+
+Export the install CA's PKCS#10 CSR (PEM), over its existing key, for an
+enterprise root to sign. **Permission:** `Security:Read`. The CSR carries only
+the CA's public key (already public via `GET /api/v1/ca/root`) and subject — no
+secret. Audited (`ca.root_csr.exported`).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://yuzu.example.com/api/v1/ca/root-csr -o yuzu-ca.csr
+# → hand yuzu-ca.csr to your enterprise CA; it returns a signed intermediate.
+```
+
+Errors: `403` (missing `Security:Read`), `500` (CSR generation failed), `503`
+(CA unavailable).
+
+#### `POST /api/v1/ca/import-chain`
+
+Import the enterprise-signed intermediate + parent chain, switching the issuing
+identity to subordinate mode. **Permission:** `Security:Write`. Request body
+(max 256 KB):
+
+```json
+{
+  "intermediate_pem": "-----BEGIN CERTIFICATE-----\n... (Yuzu's key, signed by the enterprise) ...\n-----END CERTIFICATE-----\n",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n... (enterprise root [+ intermediates]) ...\n-----END CERTIFICATE-----\n"
+}
+```
+
+The server validates that the intermediate (a) is a CA certificate, (b) carries
+**this install's** CA public key (proof the enterprise signed the CSR you
+exported), and (c) verifies up to the supplied parent chain — then swaps the
+issuing cert and re-publishes the CRL under the new issuer. Response:
+
+```json
+{ "imported": true, "mode": "subordinate", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+Errors: `400` (bad JSON / missing field / unparseable intermediate), `403`
+(missing `Security:Write`), `409` (no existing CA to subordinate — generate
+default certs first), `422` (intermediate is not a CA / does not carry this CA's
+key / does not verify to the chain), `413` (body too large), `500` (validated but
+persistence failed), `503` (CA unavailable). A rejected import is audited
+`ca.subordinate.imported` with `result=denied`; success with `result=success`.
+
+> **Bring-your-own-leaf** (orthogonal): any surface given an explicit
+> `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
+> the internal CA for that surface entirely — unchanged behaviour, supported and
+> independent of subordinate mode.
+
 ---
 
 ### RBAC
@@ -1464,6 +1532,8 @@ Query audit events.
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
 | `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
+| `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
+| `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
 | `tag.set` | Tag created or updated |
 | `tag.delete` | Tag deleted |
 

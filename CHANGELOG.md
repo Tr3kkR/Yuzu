@@ -85,6 +85,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Subordinate-CA — root Yuzu's internal CA in your enterprise PKI (PKI PR6,
+  M2).** Export the install CA's signing request (`GET /api/v1/ca/root-csr`,
+  `Security:Read`), have your enterprise root sign it as a subordinate CA, then
+  import the signed intermediate + parent chain (`POST /api/v1/ca/import-chain`,
+  `Security:Write`, or **Settings → Internal CA → "Subordinate this CA…"**). Once
+  imported, every Yuzu-issued certificate chains to the corporate trust anchor.
+  The issuing **key is unchanged** (the enterprise signs Yuzu's existing public
+  key), so certificates already issued keep validating across the switch. The
+  import is validated — the intermediate must be a CA, must carry **this
+  install's** CA public key, and must verify to the uploaded parent chain —
+  before the issuing identity is switched; the CRL is then re-published under the
+  new issuer. Audited (`ca.root_csr.exported`, `ca.subordinate.imported`).
+  Bring-your-own-leaf (`--cert`/`--key`/`--ca-cert` per surface) is unchanged and
+  orthogonal. See `docs/pki-architecture.md` "Subordinate-CA".
 - **`--cert-san` — extra Subject Alternative Names for the built-in default
   certs (PKI PR5b).** New repeatable server flag (env `YUZU_CERT_SAN`) that
   injects additional SANs into **every** auto-generated default leaf
