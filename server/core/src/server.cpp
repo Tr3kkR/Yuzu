@@ -214,6 +214,26 @@ struct ScopedKeyZero {
     ~ScopedKeyZero() { yuzu::secure_zero(s); }
 };
 
+// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+// detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
+// Register gate — never charset-checked — and is audited verbatim. Without this,
+// an agent_id like `x via=direct` could forge the very `via=` discriminator
+// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
+// every control byte and structural delimiter (space, '=', ',') with '_'; the
+// identity is preserved verbatim in its own audit columns (principal/target_id)
+// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -2577,7 +2597,8 @@ private:
                                                  .action = "ca.cert.reissue_blocked",
                                                  .target_type = "AgentCertificate",
                                                  .target_id = rev.serial_hex,
-                                                 .detail = "reason=revoked_identity cn=" + agent_id +
+                                                 .detail = "reason=revoked_identity cn=" +
+                                                           detail::audit_token(agent_id) +
                                                            " via=" + via,
                                                  .result = "denied"});
                     }
@@ -2704,7 +2725,9 @@ private:
                                      .action = "ca.cert.issued",
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
-                                     .detail = "purpose=agent cn=" + agent_id + " via=" + via,
+                                     .detail =
+                                         "purpose=agent cn=" + detail::audit_token(agent_id) +
+                                         " via=" + via,
                                      // gov consistency: "success" (not "ok") so a
                                      // SIEM filter on ca.% AND result=success
                                      // catches issuance alongside revoke/publish.
