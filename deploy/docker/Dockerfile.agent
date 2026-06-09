@@ -56,6 +56,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libsqlite3-0 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu-agent \
+    # Shared cert group (PKI #1289): FIXED gid 2000, identical across server/
+    # gateway/agent so the agent reads the shared CA out of /etc/yuzu/certs when the
+    # server runs with --cert-group yuzu-pki.
+    && groupadd -g 2000 yuzu-pki \
+    && usermod -aG yuzu-pki yuzu-agent \
     && mkdir -p /var/lib/yuzu-agent /usr/lib/yuzu/plugins \
     && chown yuzu-agent:yuzu-agent /var/lib/yuzu-agent
 

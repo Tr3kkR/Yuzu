@@ -178,6 +178,14 @@ int main(int argc, char* argv[]) {
         // own comma loop) and mangle entries. Each CLI/env token reaches the parser
         // whole; the parser owns the comma semantics.
         ->envname("YUZU_CERT_SAN");
+    app.add_option("--cert-group", cfg.cert_group,
+                   "Shared POSIX group (name or gid) for the auto-generated cert volume "
+                   "(PKI #1289). When set, the cert dir (0750) + default-gateway.key (0640) "
+                   "are made group-readable so a gateway/agent running as a different uid in a "
+                   "sibling container can read the shared CA + leaf out of /etc/yuzu/certs. "
+                   "All three users must belong to this group. Empty (default) keeps tight "
+                   "single-host perms (0700/0600). POSIX-only.")
+        ->envname("YUZU_CERT_GROUP");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;

@@ -21,7 +21,10 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <unistd.h> // gethostname
+#include <cerrno>
+#include <cstring> // strerror
+#include <grp.h>   // getgrnam (--cert-group resolution)
+#include <unistd.h> // gethostname, chown
 #endif
 
 namespace yuzu::server {
@@ -29,6 +32,63 @@ namespace yuzu::server {
 namespace fs = std::filesystem;
 
 namespace {
+
+// Apply the cross-container cert-sharing perms (PKI #1289). Default (empty group)
+// keeps the tight single-host posture: dir 0700, keys 0600. When `cert_group` is
+// set (a name or numeric gid that the server, gateway, AND agent users all belong
+// to), the shared cert volume is opened up *just enough* for sibling containers:
+//   - cert dir → 0750 + group=cert_group   (so a different-uid container can
+//     TRAVERSE in; the server makes it 0700 by default, which blocks that)
+//   - default-gateway.key → 0640 + group=cert_group  (the ONE shared private key:
+//     the gateway runs as a different uid and must read its own leaf key)
+// The CA cert + leaf certs are public (0644); the server/HTTPS private keys stay
+// 0600 owner-only — never group-shared.
+void apply_cert_group_share(const fs::path& dir, const DefaultCertSet& out,
+                            const std::string& cert_group) {
+    std::error_code ec;
+    if (cert_group.empty()) {
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+        return;
+    }
+#ifndef _WIN32
+    gid_t gid = static_cast<gid_t>(-1);
+    char* end = nullptr;
+    const long n = std::strtol(cert_group.c_str(), &end, 10);
+    if (end && *end == '\0' && n >= 0) {
+        gid = static_cast<gid_t>(n);
+    } else if (const struct group* gr = ::getgrnam(cert_group.c_str())) {
+        gid = gr->gr_gid;
+    }
+    if (gid == static_cast<gid_t>(-1)) {
+        spdlog::warn("default_certs: --cert-group '{}' does not resolve to a group — leaving "
+                     "tight 0700/0600 perms (a gateway/agent in another container will NOT be "
+                     "able to read the shared certs)", cert_group);
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+        return;
+    }
+    fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
+                    fs::perm_options::replace, ec); // 0750
+    if (::chown(dir.c_str(), static_cast<uid_t>(-1), gid) != 0)
+        spdlog::warn("default_certs: chgrp '{}' on {} failed: {} (the server user must be a "
+                     "member of that group to share it)", cert_group, dir.string(),
+                     std::strerror(errno));
+    if (fs::exists(out.gateway_key)) {
+        if (::chown(out.gateway_key.c_str(), static_cast<uid_t>(-1), gid) == 0)
+            fs::permissions(out.gateway_key,
+                            fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
+                            fs::perm_options::replace, ec); // 0640
+        else
+            spdlog::warn("default_certs: chgrp on gateway key failed: {}", std::strerror(errno));
+    }
+    spdlog::info("default_certs: cert dir + gateway key shared with group '{}' (gid {}) for "
+                 "multi-container TLS", cert_group, static_cast<unsigned long>(gid));
+#else
+    (void)out;
+    spdlog::warn("default_certs: --cert-group is POSIX-only; ignored on Windows (use ACLs / a "
+                 "shared service account). Leaving owner-only perms.");
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+#endif
+}
 
 constexpr int kMarkerVersion = 1;
 
@@ -386,7 +446,8 @@ std::string detect_hostname() {
 }
 
 bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
-                          DefaultCertSet& out, const std::vector<std::string>& extra_sans) {
+                          DefaultCertSet& out, const std::vector<std::string>& extra_sans,
+                          const std::string& cert_group) {
     fill_paths(dir, out);
     const fs::path marker = dir / "default-marker.json";
 
@@ -423,6 +484,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                         // Tell the operator if --cert-san now asks for names the
                         // existing certs don't carry (we never auto-rotate).
                         warn_on_san_drift(out.gateway_cert, extra_sans);
+                        // Re-assert the cert-sharing perms on the existing set so a
+                        // restart (or a --cert-group added after first boot) is
+                        // consistent — idempotent.
+                        apply_cert_group_share(dir, out, cert_group);
                         return true;
                     }
                     spdlog::warn("default_certs: existing default certs unusable ({}) — "
@@ -627,6 +692,9 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     out.ca_fingerprint_sha256 = *ca_fp;
     out.ca_expires_at = ca_info->not_after;
     out.freshly_generated = true;
+    // Now that the full set (incl. default-gateway.key) exists, apply the
+    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
+    apply_cert_group_share(dir, out, cert_group);
     spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
                  out.ca_fingerprint_sha256, to_epoch(ca_info->not_after));
     return true;

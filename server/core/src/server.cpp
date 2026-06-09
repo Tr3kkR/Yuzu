@@ -1678,7 +1678,7 @@ public:
             spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
-                                  cfg_.cert_sans)) {
+                                  cfg_.cert_sans, cfg_.cert_group)) {
             spdlog::error("default certificates were required but generation failed");
             default_certs_failed_ = true;
             return;
