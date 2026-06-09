@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
-  "generated_at": "2026-05-31T19:02:43.025818+00:00",
-  "rule_count": 335,
+  "schema_version": 2,
+  "generated_at": "2026-06-09T10:20:37.426405+00:00",
+  "rule_count": 381,
   "rules": [
     {
       "cve_id": "CVE-2002-0083",
@@ -9,7 +9,9 @@
       "affected_below": "3.1",
       "fixed_in": "3.1",
       "severity": "CRITICAL",
-      "description": "Off-by-one error in the channel code of OpenSSH 2.0 through 3.0.2 allows local users or remote malicious servers to gain"
+      "description": "Off-by-one error in the channel code of OpenSSH 2.0 through 3.0.2 allows local users or remote malicious servers to gain",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2002-0639",
@@ -17,7 +19,9 @@
       "affected_below": "3.3",
       "fixed_in": "3.3",
       "severity": "CRITICAL",
-      "description": "Integer overflow in sshd in OpenSSH 2.9.9 through 3.3 allows remote attackers to execute arbitrary code during challenge"
+      "description": "Integer overflow in sshd in OpenSSH 2.9.9 through 3.3 allows remote attackers to execute arbitrary code during challenge",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2009-3555",
@@ -25,15 +29,19 @@
       "affected_below": "0.9.8k",
       "fixed_in": "0.9.8k",
       "severity": "CRITICAL",
-      "description": "The TLS protocol, and the SSL protocol 3.0 and possibly earlier, as used in Microsoft Internet Information Services (IIS"
+      "description": "The TLS protocol, and the SSL protocol 3.0 and possibly earlier, as used in Microsoft Internet Information Services (IIS",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2010-2076",
       "product": "apache",
-      "affected_below": "2.0.13",
-      "fixed_in": "2.0.13",
+      "affected_below": "2.2.9",
+      "fixed_in": "2.2.9",
       "severity": "CRITICAL",
-      "description": "Apache CXF 2.0.x before 2.0.13, 2.1.x before 2.1.10, and 2.2.x before 2.2.9, as used in Apache ServiceMix, Apache Camel,"
+      "description": "Apache CXF 2.0.x before 2.0.13, 2.1.x before 2.1.10, and 2.2.x before 2.2.9, as used in Apache ServiceMix, Apache Camel,",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2010-4478",
@@ -41,7 +49,9 @@
       "affected_below": "5.6",
       "fixed_in": "5.6",
       "severity": "CRITICAL",
-      "description": "OpenSSH 5.6 and earlier, when J-PAKE is enabled, does not properly validate the public parameters in the J-PAKE protocol"
+      "description": "OpenSSH 5.6 and earlier, when J-PAKE is enabled, does not properly validate the public parameters in the J-PAKE protocol",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2011-2767",
@@ -49,15 +59,39 @@
       "affected_below": "2.0.10",
       "fixed_in": "2.0.10",
       "severity": "CRITICAL",
-      "description": "mod_perl 2.0 through 2.0.10 allows attackers to execute arbitrary Perl code by placing it in a user-owned .htaccess file"
+      "description": "mod_perl 2.0 through 2.0.10 allows attackers to execute arbitrary Perl code by placing it in a user-owned .htaccess file",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2015-0244",
+      "product": "postgresql",
+      "affected_below": "9.4.1",
+      "fixed_in": "9.4.1",
+      "severity": "CRITICAL",
+      "description": "PostgreSQL before 9.0.19, 9.1.x before 9.1.15, 9.2.x before 9.2.10, 9.3.x before 9.3.6, and 9.4.x before 9.4.1 does not",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2015-3166",
+      "product": "postgresql",
+      "affected_below": "9.4.2",
+      "fixed_in": "9.4.2",
+      "severity": "CRITICAL",
+      "description": "The snprintf implementation in PostgreSQL before 9.0.20, 9.1.x before 9.1.16, 9.2.x before 9.2.11, 9.3.x before 9.3.7, a",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-0746",
       "product": "nginx",
-      "affected_below": "1.8.0",
-      "fixed_in": "1.8.0",
+      "affected_below": "1.9.10",
+      "fixed_in": "1.9.10",
       "severity": "CRITICAL",
-      "description": "Use-after-free vulnerability in the resolver in nginx 0.6.18 through 1.8.0 and 1.9.x before 1.9.10 allows remote attacke"
+      "description": "Use-after-free vulnerability in the resolver in nginx 0.6.18 through 1.8.0 and 1.9.x before 1.9.10 allows remote attacke",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-1908",
@@ -65,7 +99,9 @@
       "affected_below": "7.2",
       "fixed_in": "7.2",
       "severity": "CRITICAL",
-      "description": "The client in OpenSSH before 7.2 mishandles failed cookie generation for untrusted X11 forwarding and relies on the loca"
+      "description": "The client in OpenSSH before 7.2 mishandles failed cookie generation for untrusted X11 forwarding and relies on the loca",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-2108",
@@ -73,7 +109,9 @@
       "affected_below": "1.0.1n",
       "fixed_in": "1.0.1n",
       "severity": "CRITICAL",
-      "description": "The ASN.1 implementation in OpenSSL before 1.0.1o and 1.0.2 before 1.0.2c allows remote attackers to execute arbitrary c"
+      "description": "The ASN.1 implementation in OpenSSL before 1.0.1o and 1.0.2 before 1.0.2c allows remote attackers to execute arbitrary c",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-4606",
@@ -81,7 +119,9 @@
       "affected_below": "7.49.1",
       "fixed_in": "7.49.1",
       "severity": "CRITICAL",
-      "description": "Curl before 7.49.1 in Apple OS X before macOS Sierra prior to 10.12 allows remote or local attackers to execute arbitrar"
+      "description": "Curl before 7.49.1 in Apple OS X before macOS Sierra prior to 10.12 allows remote or local attackers to execute arbitrar",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-7167",
@@ -89,7 +129,9 @@
       "affected_below": "7.50.2",
       "fixed_in": "7.50.2",
       "severity": "CRITICAL",
-      "description": "Multiple integer overflows in the (1) curl_escape, (2) curl_easy_escape, (3) curl_unescape, and (4) curl_easy_unescape f"
+      "description": "Multiple integer overflows in the (1) curl_escape, (2) curl_easy_escape, (3) curl_unescape, and (4) curl_easy_unescape f",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-20005",
@@ -97,15 +139,9 @@
       "affected_below": "1.13.6",
       "fixed_in": "1.13.6",
       "severity": "CRITICAL",
-      "description": "NGINX before 1.13.6 has a buffer overflow for years that exceed four digits, as demonstrated by a file with a modificati"
-    },
-    {
-      "cve_id": "CVE-2017-5645",
-      "product": "log4j",
-      "affected_below": "2.8.2",
-      "fixed_in": "2.8.2",
-      "severity": "CRITICAL",
-      "description": "In Apache Log4j 2.x before 2.8.2, when using the TCP socket server or UDP socket server to receive serialized log events"
+      "description": "NGINX before 1.13.6 has a buffer overflow for years that exceed four digits, as demonstrated by a file with a modificati",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2017-8816",
@@ -113,7 +149,9 @@
       "affected_below": "7.56.1",
       "fixed_in": "7.56.1",
       "severity": "CRITICAL",
-      "description": "The NTLM authentication feature in curl and libcurl before 7.57.0 on 32-bit platforms allows attackers to cause a denial"
+      "description": "The NTLM authentication feature in curl and libcurl before 7.57.0 on 32-bit platforms allows attackers to cause a denial",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-8817",
@@ -121,7 +159,9 @@
       "affected_below": "7.56.1",
       "fixed_in": "7.56.1",
       "severity": "CRITICAL",
-      "description": "The FTP wildcard function in curl and libcurl before 7.57.0 allows remote attackers to cause a denial of service (out-of"
+      "description": "The FTP wildcard function in curl and libcurl before 7.57.0 allows remote attackers to cause a denial of service (out-of",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-0500",
@@ -129,7 +169,9 @@
       "affected_below": "7.60.0",
       "fixed_in": "7.60.0",
       "severity": "CRITICAL",
-      "description": "Curl_smtp_escape_eob in lib/smtp.c in curl 7.54.1 to and including curl 7.60.0 has a heap-based buffer overflow that mig"
+      "description": "Curl_smtp_escape_eob in lib/smtp.c in curl 7.54.1 to and including curl 7.60.0 has a heap-based buffer overflow that mig",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1000120",
@@ -137,7 +179,9 @@
       "affected_below": "7.58.0",
       "fixed_in": "7.58.0",
       "severity": "CRITICAL",
-      "description": "A buffer overflow exists in curl 7.12.3 to and including curl 7.58.0 in the FTP URL handling that allows an attacker to"
+      "description": "A buffer overflow exists in curl 7.12.3 to and including curl 7.58.0 in the FTP URL handling that allows an attacker to",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1000122",
@@ -145,7 +189,9 @@
       "affected_below": "7.58.0",
       "fixed_in": "7.58.0",
       "severity": "CRITICAL",
-      "description": "A buffer over-read exists in curl 7.20.0 to and including curl 7.58.0 in the RTSP+RTP handling code that allows an attac"
+      "description": "A buffer over-read exists in curl 7.20.0 to and including curl 7.58.0 in the RTSP+RTP handling code that allows an attac",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1000300",
@@ -153,7 +199,9 @@
       "affected_below": "7.59.0",
       "fixed_in": "7.59.0",
       "severity": "CRITICAL",
-      "description": "curl version curl 7.54.1 to and including curl 7.59.0 contains a CWE-122: Heap-based Buffer Overflow vulnerability in de"
+      "description": "curl version curl 7.54.1 to and including curl 7.59.0 contains a CWE-122: Heap-based Buffer Overflow vulnerability in de",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1000301",
@@ -161,7 +209,19 @@
       "affected_below": "7.59.0",
       "fixed_in": "7.59.0",
       "severity": "CRITICAL",
-      "description": "curl version curl 7.20.0 to and including curl 7.59.0 contains a CWE-126: Buffer Over-read vulnerability in denial of se"
+      "description": "curl version curl 7.20.0 to and including curl 7.59.0 contains a CWE-126: Buffer Over-read vulnerability in denial of se",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2018-1115",
+      "product": "postgresql",
+      "affected_below": "10.4",
+      "fixed_in": "10.4",
+      "severity": "CRITICAL",
+      "description": "postgresql before versions 10.4, 9.6.9 is vulnerable in the adminpack extension, the pg_catalog.pg_logfile_rotate() func",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-16395",
@@ -169,7 +229,9 @@
       "affected_below": "2.1.2",
       "fixed_in": "2.1.2",
       "severity": "CRITICAL",
-      "description": "An issue was discovered in the OpenSSL library in Ruby before 2.3.8, 2.4.x before 2.4.5, 2.5.x before 2.5.2, and 2.6.x b"
+      "description": "An issue was discovered in the OpenSSL library in Ruby before 2.3.8, 2.4.x before 2.4.5, 2.5.x before 2.5.2, and 2.6.x b",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-16840",
@@ -177,7 +239,19 @@
       "affected_below": "7.62.0",
       "fixed_in": "7.62.0",
       "severity": "CRITICAL",
-      "description": "A heap use-after-free flaw was found in curl versions from 7.59.0 through 7.61.1 in the code related to closing an easy"
+      "description": "A heap use-after-free flaw was found in curl versions from 7.59.0 through 7.61.1 in the code related to closing an easy",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2018-16850",
+      "product": "postgresql",
+      "affected_below": "11.1",
+      "fixed_in": "11.1",
+      "severity": "CRITICAL",
+      "description": "postgresql before versions 11.1, 10.6 is vulnerable to a to SQL injection in pg_upgrade and pg_dump via CREATE TRIGGER .",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-20997",
@@ -185,15 +259,19 @@
       "affected_below": "0.10.9",
       "fixed_in": "0.10.9",
       "severity": "CRITICAL",
-      "description": "An issue was discovered in the openssl crate before 0.10.9 for Rust. A use-after-free occurs in CMS Signing."
+      "description": "An issue was discovered in the openssl crate before 0.10.9 for Rust. A use-after-free occurs in CMS Signing.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-0192",
       "product": "apache",
-      "affected_below": "5.5.5",
-      "fixed_in": "5.5.5",
+      "affected_below": "6.6.5",
+      "fixed_in": "6.6.5",
       "severity": "CRITICAL",
-      "description": "In Apache Solr versions 5.0.0 to 5.5.5 and 6.0.0 to 6.6.5, the Config API allows to configure the JMX server via an HTTP"
+      "description": "In Apache Solr versions 5.0.0 to 5.5.5 and 6.0.0 to 6.6.5, the Config API allows to configure the JMX server via an HTTP",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-10082",
@@ -201,15 +279,19 @@
       "affected_below": "2.4.39",
       "fixed_in": "2.4.39",
       "severity": "CRITICAL",
-      "description": "In Apache HTTP Server 2.4.18-2.4.39, using fuzzed network input, the http/2 session handling could be made to read memor"
+      "description": "In Apache HTTP Server 2.4.18-2.4.39, using fuzzed network input, the http/2 session handling could be made to read memor",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
-      "cve_id": "CVE-2019-17571",
-      "product": "log4j",
-      "affected_below": "1.2.17",
-      "fixed_in": "1.2.17",
+      "cve_id": "CVE-2019-10211",
+      "product": "postgresql",
+      "affected_below": "11.5",
+      "fixed_in": "11.5",
       "severity": "CRITICAL",
-      "description": "Included in Log4j 1.2 is a SocketServer class that is vulnerable to deserialization of untrusted data which can be explo"
+      "description": "Postgresql Windows installer before versions 11.5, 10.10, 9.6.15, 9.5.19, 9.4.24 is vulnerable via bundled OpenSSL execu",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-5481",
@@ -217,7 +299,9 @@
       "affected_below": "7.65.3",
       "fixed_in": "7.65.3",
       "severity": "CRITICAL",
-      "description": "Double-free vulnerability in the FTP-kerberos code in cURL 7.52.0 to 7.65.3."
+      "description": "Double-free vulnerability in the FTP-kerberos code in cURL 7.52.0 to 7.65.3.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-5482",
@@ -225,7 +309,9 @@
       "affected_below": "7.65.3",
       "fixed_in": "7.65.3",
       "severity": "CRITICAL",
-      "description": "Heap buffer overflow in the TFTP protocol handler in cURL 7.19.4 to 7.65.3."
+      "description": "Heap buffer overflow in the TFTP protocol handler in cURL 7.19.4 to 7.65.3.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-7401",
@@ -233,7 +319,9 @@
       "affected_below": "1.7.1",
       "fixed_in": "1.7.1",
       "severity": "CRITICAL",
-      "description": "NGINX Unit before 1.7.1 might allow an attacker to cause a heap-based buffer overflow in the router process with a speci"
+      "description": "NGINX Unit before 1.7.1 might allow an attacker to cause a heap-based buffer overflow in the router process with a speci",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-11984",
@@ -241,15 +329,19 @@
       "affected_below": "2.4.43",
       "fixed_in": "2.4.43",
       "severity": "CRITICAL",
-      "description": "Apache HTTP server 2.4.32 to 2.4.44 mod_proxy_uwsgi info disclosure and possible RCE"
+      "description": "Apache HTTP server 2.4.32 to 2.4.44 mod_proxy_uwsgi info disclosure and possible RCE",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-27730",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.10.0",
+      "fixed_in": "3.10.0",
       "severity": "CRITICAL",
-      "description": "In versions 3.0.0-3.9.0, 2.0.0-2.9.0, and 1.0.1, the NGINX Controller Agent does not use absolute paths when calling sys"
+      "description": "In versions 3.0.0-3.9.0, 2.0.0-2.9.0, and 1.0.1, the NGINX Controller Agent does not use absolute paths when calling sys",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-5901",
@@ -257,15 +349,9 @@
       "affected_below": "3.4.0",
       "fixed_in": "3.4.0",
       "severity": "CRITICAL",
-      "description": "In NGINX Controller 3.3.0-3.4.0, undisclosed API endpoints may allow for a reflected Cross Site Scripting (XSS) attack."
-    },
-    {
-      "cve_id": "CVE-2020-7043",
-      "product": "openssl",
-      "affected_below": "1.0.2",
-      "fixed_in": "1.0.2",
-      "severity": "CRITICAL",
-      "description": "An issue was discovered in openfortivpn 1.11.0 when used with OpenSSL before 1.0.2. tunnel.c mishandles certificate vali"
+      "description": "In NGINX Controller 3.3.0-3.4.0, undisclosed API endpoints may allow for a reflected Cross Site Scripting (XSS) attack.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-7646",
@@ -273,7 +359,9 @@
       "affected_below": "1.0.1",
       "fixed_in": "1.0.1",
       "severity": "CRITICAL",
-      "description": "curlrequest through 1.0.1 allows reading any file by populating the file parameter with user input."
+      "description": "curlrequest through 1.0.1 allows reading any file by populating the file parameter with user input.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-26691",
@@ -281,7 +369,19 @@
       "affected_below": "2.4.46",
       "fixed_in": "2.4.46",
       "severity": "CRITICAL",
-      "description": "In Apache HTTP Server versions 2.4.0 to 2.4.46 a specially crafted SessionHeader sent by an origin server could cause a"
+      "description": "In Apache HTTP Server versions 2.4.0 to 2.4.46 a specially crafted SessionHeader sent by an origin server could cause a",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2021-33204",
+      "product": "postgresql",
+      "affected_below": "4.5.1",
+      "fixed_in": "4.5.1",
+      "severity": "CRITICAL",
+      "description": "In the pg_partman (aka PG Partition Manager) extension before 4.5.1 for PostgreSQL, arbitrary code execution can be achi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-3711",
@@ -289,7 +389,19 @@
       "affected_below": "1.1.1l",
       "fixed_in": "1.1.1l",
       "severity": "CRITICAL",
-      "description": "In order to decrypt SM2 encrypted data an application is expected to call the API function EVP_PKEY_decrypt(). Typically"
+      "description": "In order to decrypt SM2 encrypted data an application is expected to call the API function EVP_PKEY_decrypt(). Typically",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2021-38140",
+      "product": "postgresql",
+      "affected_below": "2.0.1",
+      "fixed_in": "2.0.1",
+      "severity": "CRITICAL",
+      "description": "The set_user extension module before 2.0.1 for PostgreSQL allows a potential privilege escalation using RESET SESSION AU",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-39275",
@@ -297,7 +409,9 @@
       "affected_below": "2.4.49",
       "fixed_in": "2.4.49",
       "severity": "CRITICAL",
-      "description": "ap_escape_quotes() may write beyond the end of a buffer when given malicious input. No included modules pass untrusted d"
+      "description": "ap_escape_quotes() may write beyond the end of a buffer when given malicious input. No included modules pass untrusted d",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-40438",
@@ -305,15 +419,19 @@
       "affected_below": "2.4.48",
       "fixed_in": "2.4.48",
       "severity": "CRITICAL",
-      "description": "A crafted request uri-path can cause mod_proxy to forward the request to an origin server choosen by the remote user. Th"
+      "description": "A crafted request uri-path can cause mod_proxy to forward the request to an origin server choosen by the remote user. Th",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
-      "cve_id": "CVE-2021-44228",
-      "product": "log4j",
-      "affected_below": "2.3.1",
-      "fixed_in": "2.3.1",
+      "cve_id": "CVE-2021-41558",
+      "product": "postgresql",
+      "affected_below": "3.0.0",
+      "fixed_in": "3.0.0",
       "severity": "CRITICAL",
-      "description": "Apache Log4j2 2.0-beta9 through 2.15.0 (excluding security releases 2.12.2, 2.12.3, and 2.3.1) JNDI features used in con"
+      "description": "The set_user extension module before 3.0.0 for PostgreSQL allows ProcessUtility_hook bypass via set_config.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-44790",
@@ -321,15 +439,9 @@
       "affected_below": "2.4.52",
       "fixed_in": "2.4.52",
       "severity": "CRITICAL",
-      "description": "A carefully crafted request body can cause a buffer overflow in the mod_lua multipart parser (r:parsebody() called from"
-    },
-    {
-      "cve_id": "CVE-2021-45046",
-      "product": "log4j",
-      "affected_below": "2.12.2",
-      "fixed_in": "2.12.2",
-      "severity": "CRITICAL",
-      "description": "It was found that the fix to address CVE-2021-44228 in Apache Log4j 2.15.0 was incomplete in certain non-default configu"
+      "description": "A carefully crafted request body can cause a buffer overflow in the mod_lua multipart parser (r:parsebody() called from",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-46461",
@@ -337,7 +449,9 @@
       "affected_below": "0.7.0",
       "fixed_in": "0.7.0",
       "severity": "CRITICAL",
-      "description": "njs through 0.7.0, used in NGINX, was discovered to contain an out-of-bounds array access via njs_vmcode_typeof in /src/"
+      "description": "njs through 0.7.0, used in NGINX, was discovered to contain an out-of-bounds array access via njs_vmcode_typeof in /src/",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-22720",
@@ -345,7 +459,9 @@
       "affected_below": "2.4.52",
       "fixed_in": "2.4.52",
       "severity": "CRITICAL",
-      "description": "Apache HTTP Server 2.4.52 and earlier fails to close inbound connection when errors are encountered discarding the reque"
+      "description": "Apache HTTP Server 2.4.52 and earlier fails to close inbound connection when errors are encountered discarding the reque",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-22721",
@@ -353,15 +469,9 @@
       "affected_below": "2.4.52",
       "fixed_in": "2.4.52",
       "severity": "CRITICAL",
-      "description": "If LimitXMLRequestBody is set to allow request bodies larger than 350MB (defaults to 1M) on 32 bit systems an integer ov"
-    },
-    {
-      "cve_id": "CVE-2022-23305",
-      "product": "log4j",
-      "affected_below": "1.2.17",
-      "fixed_in": "1.2.17",
-      "severity": "CRITICAL",
-      "description": "By design, the JDBCAppender in Log4j 1.2.x accepts an SQL statement as a configuration parameter where the values to be"
+      "description": "If LimitXMLRequestBody is set to allow request bodies larger than 350MB (defaults to 1M) on 32 bit systems an integer ov",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-23943",
@@ -369,7 +479,9 @@
       "affected_below": "2.4.53",
       "fixed_in": "2.4.53",
       "severity": "CRITICAL",
-      "description": "Out-of-bounds Write vulnerability in mod_sed of Apache HTTP Server allows an attacker to overwrite heap memory with poss"
+      "description": "Out-of-bounds Write vulnerability in mod_sed of Apache HTTP Server allows an attacker to overwrite heap memory with poss",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-28615",
@@ -377,7 +489,9 @@
       "affected_below": "2.4.54",
       "fixed_in": "2.4.54",
       "severity": "CRITICAL",
-      "description": "Apache HTTP Server 2.4.53 and earlier may crash or disclose information due to a read beyond bounds in ap_strcmp_match()"
+      "description": "Apache HTTP Server 2.4.53 and earlier may crash or disclose information due to a read beyond bounds in ap_strcmp_match()",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-29063",
@@ -385,7 +499,9 @@
       "affected_below": "18.12.06",
       "fixed_in": "18.12.06",
       "severity": "CRITICAL",
-      "description": "The Solr plugin of Apache OFBiz is configured by default to automatically make a RMI request on localhost, port 1099. In"
+      "description": "The Solr plugin of Apache OFBiz is configured by default to automatically make a RMI request on localhost, port 1099. In",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-31813",
@@ -393,7 +509,9 @@
       "affected_below": "2.4.54",
       "fixed_in": "2.4.54",
       "severity": "CRITICAL",
-      "description": "Apache HTTP Server 2.4.53 and earlier may not send the X-Forwarded-* headers to the origin server based on client side C"
+      "description": "Apache HTTP Server 2.4.53 and earlier may not send the X-Forwarded-* headers to the origin server based on client side C",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-32207",
@@ -401,7 +519,9 @@
       "affected_below": "7.84.0",
       "fixed_in": "7.84.0",
       "severity": "CRITICAL",
-      "description": "When curl < 7.84.0 saves cookies, alt-svc and hsts data to local files, it makes the operation atomic by finalizing the"
+      "description": "When curl < 7.84.0 saves cookies, alt-svc and hsts data to local files, it makes the operation atomic by finalizing the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-36760",
@@ -409,7 +529,9 @@
       "affected_below": "2.4.55",
       "fixed_in": "2.4.55",
       "severity": "CRITICAL",
-      "description": "Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling') vulnerability in mod_proxy_ajp of Apache HTTP Se"
+      "description": "Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling') vulnerability in mod_proxy_ajp of Apache HTTP Se",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-23914",
@@ -417,7 +539,9 @@
       "affected_below": "7.88.0",
       "fixed_in": "7.88.0",
       "severity": "CRITICAL",
-      "description": "A cleartext transmission of sensitive information vulnerability exists in curl <v7.88.0 that could cause HSTS functional"
+      "description": "A cleartext transmission of sensitive information vulnerability exists in curl <v7.88.0 that could cause HSTS functional",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-25690",
@@ -425,7 +549,9 @@
       "affected_below": "2.4.55",
       "fixed_in": "2.4.55",
       "severity": "CRITICAL",
-      "description": "Some mod_proxy configurations on Apache HTTP Server versions 2.4.0 through 2.4.55 allow a HTTP Request Smuggling attack."
+      "description": "Some mod_proxy configurations on Apache HTTP Server versions 2.4.0 through 2.4.55 allow a HTTP Request Smuggling attack.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-28531",
@@ -433,7 +559,9 @@
       "affected_below": "9.3",
       "fixed_in": "9.3",
       "severity": "CRITICAL",
-      "description": "ssh-add in OpenSSH before 9.3 adds smartcard keys to ssh-agent without the intended per-hop destination constraints. The"
+      "description": "ssh-add in OpenSSH before 9.3 adds smartcard keys to ssh-agent without the intended per-hop destination constraints. The",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-31039",
@@ -441,7 +569,9 @@
       "affected_below": "1.5.0",
       "fixed_in": "1.5.0",
       "severity": "CRITICAL",
-      "description": "Security vulnerability\u00a0in Apache bRPC <1.5.0 on all platforms allows attackers to execute arbitrary code via ServerOptio"
+      "description": "Security vulnerability\u00a0in Apache bRPC <1.5.0 on all platforms allows attackers to execute arbitrary code via ServerOptio",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-38408",
@@ -449,7 +579,9 @@
       "affected_below": "9.3",
       "fixed_in": "9.3",
       "severity": "CRITICAL",
-      "description": "The PKCS#11 feature in ssh-agent in OpenSSH before 9.3p2 has an insufficiently trustworthy search path, leading to remot"
+      "description": "The PKCS#11 feature in ssh-agent in OpenSSH before 9.3p2 has an insufficiently trustworthy search path, leading to remot",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-38545",
@@ -457,7 +589,9 @@
       "affected_below": "8.4.0",
       "fixed_in": "8.4.0",
       "severity": "CRITICAL",
-      "description": "This flaw makes curl overflow a heap based buffer in the SOCKS5 proxy handshake.  When curl is asked to pass along the h"
+      "description": "This flaw makes curl overflow a heap based buffer in the SOCKS5 proxy handshake.  When curl is asked to pass along the h",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-45132",
@@ -465,7 +599,9 @@
       "affected_below": "1.6",
       "fixed_in": "1.6",
       "severity": "CRITICAL",
-      "description": "NAXSI is an open-source maintenance web application firewall (WAF) for NGINX. An issue present starting in version 1.3 a"
+      "description": "NAXSI is an open-source maintenance web application firewall (WAF) for NGINX. An issue present starting in version 1.3 a",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-49210",
@@ -473,7 +609,19 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "CRITICAL",
-      "description": "The openssl (aka node-openssl) NPM package through 2.0.0 was characterized as \"a nonsense wrapper with no real purpose\""
+      "description": "The openssl (aka node-openssl) NPM package through 2.0.0 was characterized as \"a nonsense wrapper with no real purpose\"",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2024-1597",
+      "product": "postgresql",
+      "affected_below": "42.7.2",
+      "fixed_in": "42.7.2",
+      "severity": "CRITICAL",
+      "description": "pgjdbc, the PostgreSQL JDBC Driver, allows attacker to inject SQL if using PreferQueryMode=SIMPLE. Note this is not the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38474",
@@ -481,7 +629,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "CRITICAL",
-      "description": "Substitution encoding issue in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows attacker to execute scripts i"
+      "description": "Substitution encoding issue in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows attacker to execute scripts i",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38475",
@@ -489,7 +639,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "CRITICAL",
-      "description": "Improper escaping of output in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows an attacker to map URLs to fi"
+      "description": "Improper escaping of output in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows an attacker to map URLs to fi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38476",
@@ -497,7 +649,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "CRITICAL",
-      "description": "Vulnerability in core of Apache HTTP Server 2.4.59 and earlier are vulnerably to information disclosure, SSRF or local s"
+      "description": "Vulnerability in core of Apache HTTP Server 2.4.59 and earlier are vulnerably to information disclosure, SSRF or local s",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-49368",
@@ -505,7 +659,9 @@
       "affected_below": "1.9.9-4",
       "fixed_in": "1.9.9-4",
       "severity": "CRITICAL",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.0.0-beta.36, when Nginx UI configures logr"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.0.0-beta.36, when Nginx UI configures logr",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2025-23048",
@@ -513,7 +669,9 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "CRITICAL",
-      "description": "In some mod_ssl configurations on Apache HTTP Server 2.4.35 through to 2.4.63, an access control bypass by trusted clien"
+      "description": "In some mod_ssl configurations on Apache HTTP Server 2.4.35 through to 2.4.63, an access control bypass by trusted clien",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-32463",
@@ -521,7 +679,9 @@
       "affected_below": "1.9.17",
       "fixed_in": "1.9.17",
       "severity": "CRITICAL",
-      "description": "Sudo before 1.9.17p1 allows local users to obtain root access because /etc/nsswitch.conf from a user-controlled director"
+      "description": "Sudo before 1.9.17p1 allows local users to obtain root access because /etc/nsswitch.conf from a user-controlled director",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-27459",
@@ -529,7 +689,9 @@
       "affected_below": "26.0.0",
       "fixed_in": "26.0.0",
       "severity": "CRITICAL",
-      "description": "pyOpenSSL is a Python wrapper around the OpenSSL library. Starting in version 22.0.0 and prior to version 26.0.0, if a u"
+      "description": "pyOpenSSL is a Python wrapper around the OpenSSL library. Starting in version 22.0.0 and prior to version 26.0.0, if a u",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-27944",
@@ -537,7 +699,9 @@
       "affected_below": "2.3.3",
       "fixed_in": "2.3.3",
       "severity": "CRITICAL",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.3, the /api/backup endpoint is accessibl"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.3, the /api/backup endpoint is accessibl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-28780",
@@ -545,15 +709,19 @@
       "affected_below": "2.4.67",
       "fixed_in": "2.4.67",
       "severity": "CRITICAL",
-      "description": "Heap-based Buffer Overflow vulnerability in mod_proxy_ajp of Apache HTTP Server. If mod_proxy_ajp connects to a maliciou"
+      "description": "Heap-based Buffer Overflow vulnerability in mod_proxy_ajp of Apache HTTP Server. If mod_proxy_ajp connects to a maliciou",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-31789",
       "product": "openssl",
-      "affected_below": "3.0.20",
-      "fixed_in": "3.0.20",
+      "affected_below": "3.6.2",
+      "fixed_in": "3.6.2",
       "severity": "CRITICAL",
-      "description": "Issue summary: Converting an excessively large OCTET STRING value to a hexadecimal string leads to a heap buffer overflo"
+      "description": "Issue summary: Converting an excessively large OCTET STRING value to a hexadecimal string leads to a heap buffer overflo",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-33026",
@@ -561,7 +729,9 @@
       "affected_below": "2.3.4",
       "fixed_in": "2.3.4",
       "severity": "CRITICAL",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, the nginx-ui backup restore mechanism"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, the nginx-ui backup restore mechanism",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-33032",
@@ -569,7 +739,9 @@
       "affected_below": "2.3.5",
       "fixed_in": "2.3.5",
       "severity": "CRITICAL",
-      "description": "Nginx UI is a web user interface for the Nginx web server. In versions 2.3.5 and prior, the nginx-ui MCP (Model Context"
+      "description": "Nginx UI is a web user interface for the Nginx web server. In versions 2.3.5 and prior, the nginx-ui MCP (Model Context",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2026-40682",
@@ -577,7 +749,9 @@
       "affected_below": "2.5.9",
       "fixed_in": "2.5.9",
       "severity": "CRITICAL",
-      "description": "XML External Entity (XXE) via Unsanitized Dictionary Parsing in Apache OpenNLP DictionaryEntryPersistor   Versions Affec"
+      "description": "XML External Entity (XXE) via Unsanitized Dictionary Parsing in Apache OpenNLP DictionaryEntryPersistor   Versions Affec",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-41676",
@@ -585,7 +759,9 @@
       "affected_below": "0.10.78",
       "fixed_in": "0.10.78",
       "severity": "CRITICAL",
-      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.27 to before 0.10.78, Deriver::deriv"
+      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.27 to before 0.10.78, Deriver::deriv",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-41677",
@@ -593,7 +769,9 @@
       "affected_below": "0.10.78",
       "fixed_in": "0.10.78",
       "severity": "CRITICAL",
-      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.0 to before 0.10.78, the *_from_pem_"
+      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.0 to before 0.10.78, the *_from_pem_",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-41678",
@@ -601,7 +779,9 @@
       "affected_below": "0.10.78",
       "fixed_in": "0.10.78",
       "severity": "CRITICAL",
-      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From  to before 0.10.78, aes::unwrap_key() co"
+      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From  to before 0.10.78, aes::unwrap_key() co",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-41681",
@@ -609,7 +789,9 @@
       "affected_below": "0.10.78",
       "fixed_in": "0.10.78",
       "severity": "CRITICAL",
-      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.10.39 to before 0.10.78, EVP_DigestFin"
+      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.10.39 to before 0.10.78, EVP_DigestFin",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-41898",
@@ -617,7 +799,9 @@
       "affected_below": "0.10.78",
       "fixed_in": "0.10.78",
       "severity": "CRITICAL",
-      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.24 to before 0.10.78, the FFI trampo"
+      "description": "rust-openssl provides OpenSSL bindings for the Rust programming language.  From 0.9.24 to before 0.10.78, the FFI trampo",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-42238",
@@ -625,7 +809,19 @@
       "affected_below": "2.3.8",
       "fixed_in": "2.3.8",
       "severity": "CRITICAL",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.8, nginx-ui exposes a backup restore end"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.8, nginx-ui exposes a backup restore end",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-5081",
+      "product": "apache",
+      "affected_below": "1.94",
+      "fixed_in": "1.94",
+      "severity": "CRITICAL",
+      "description": "Apache::Session::Generate::ModUniqueId versions from 1.54 through 1.94 for Perl session ids are insecure.  Apache::Sessi",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2000-1254",
@@ -633,7 +829,9 @@
       "affected_below": "0.9.5",
       "fixed_in": "0.9.5",
       "severity": "HIGH",
-      "description": "crypto/rsa/rsa_gen.c in OpenSSL before 0.9.6 mishandles C bitwise-shift operations that exceed the size of an expression"
+      "description": "crypto/rsa/rsa_gen.c in OpenSSL before 0.9.6 mishandles C bitwise-shift operations that exceed the size of an expression",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2002-0184",
@@ -641,7 +839,9 @@
       "affected_below": "1.6.6",
       "fixed_in": "1.6.6",
       "severity": "HIGH",
-      "description": "Sudo before 1.6.6 contains an off-by-one error that can result in a heap-based buffer overflow that may allow local user"
+      "description": "Sudo before 1.6.6 contains an off-by-one error that can result in a heap-based buffer overflow that may allow local user",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2003-1605",
@@ -649,7 +849,9 @@
       "affected_below": "7.10.7",
       "fixed_in": "7.10.7",
       "severity": "HIGH",
-      "description": "curl 7.x before 7.10.7 sends CONNECT proxy credentials to the remote server."
+      "description": "curl 7.x before 7.10.7 sends CONNECT proxy credentials to the remote server.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2005-2946",
@@ -657,7 +859,9 @@
       "affected_below": "0.9.8",
       "fixed_in": "0.9.8",
       "severity": "HIGH",
-      "description": "The default configuration on OpenSSL before 0.9.8 uses MD5 for creating message digests instead of a more cryptographica"
+      "description": "The default configuration on OpenSSL before 0.9.8 uses MD5 for creating message digests instead of a more cryptographica",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2005-4890",
@@ -665,7 +869,9 @@
       "affected_below": "1.7.4",
       "fixed_in": "1.7.4",
       "severity": "HIGH",
-      "description": "There is a possible tty hijacking in shadow 4.x before 4.1.5 and sudo 1.x before 1.7.4 via \"su - user -c program\". The u"
+      "description": "There is a possible tty hijacking in shadow 4.x before 4.1.5 and sudo 1.x before 1.7.4 via \"su - user -c program\". The u",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2006-20001",
@@ -673,7 +879,9 @@
       "affected_below": "2.4.55",
       "fixed_in": "2.4.55",
       "severity": "HIGH",
-      "description": "A carefully crafted If: request header can cause a memory read, or write of a single zero byte, in a pool (heap) memory"
+      "description": "A carefully crafted If: request header can cause a memory read, or write of a single zero byte, in a pool (heap) memory",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2006-5051",
@@ -681,7 +889,9 @@
       "affected_below": "4.4",
       "fixed_in": "4.4",
       "severity": "HIGH",
-      "description": "Signal handler race condition in OpenSSH before 4.4 allows remote attackers to cause a denial of service (crash), and po"
+      "description": "Signal handler race condition in OpenSSH before 4.4 allows remote attackers to cause a denial of service (crash), and po",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2008-0166",
@@ -689,15 +899,19 @@
       "affected_below": "0.9.8g",
       "fixed_in": "0.9.8g",
       "severity": "HIGH",
-      "description": "OpenSSL 0.9.8c-1 up to versions before 0.9.8g-9 on Debian-based operating systems uses a random number generator that ge"
+      "description": "OpenSSL 0.9.8c-1 up to versions before 0.9.8g-9 on Debian-based operating systems uses a random number generator that ge",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2009-1955",
       "product": "apache",
-      "affected_below": "1.3.7",
-      "fixed_in": "1.3.7",
+      "affected_below": "2.2.12",
+      "fixed_in": "2.2.12",
       "severity": "HIGH",
-      "description": "The expat XML parser in the apr_xml_* interface in xml/apr_xml.c in Apache APR-util before 1.3.7, as used in the mod_dav"
+      "description": "The expat XML parser in the apr_xml_* interface in xml/apr_xml.c in Apache APR-util before 1.3.7, as used in the mod_dav",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2009-2699",
@@ -705,7 +919,9 @@
       "affected_below": "2.2.14",
       "fixed_in": "2.2.14",
       "severity": "HIGH",
-      "description": "The Solaris pollset feature in the Event Port backend in poll/unix/port.c in the Apache Portable Runtime (APR) library b"
+      "description": "The Solaris pollset feature in the Event Port backend in poll/unix/port.c in the Apache Portable Runtime (APR) library b",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2010-5107",
@@ -713,7 +929,9 @@
       "affected_below": "6.1",
       "fixed_in": "6.1",
       "severity": "HIGH",
-      "description": "The default configuration of OpenSSH through 6.1 enforces a fixed time limit between establishing a TCP connection and c"
+      "description": "The default configuration of OpenSSH through 6.1 enforces a fixed time limit between establishing a TCP connection and c",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2014-0160",
@@ -721,15 +939,19 @@
       "affected_below": "1.0.1g",
       "fixed_in": "1.0.1g",
       "severity": "HIGH",
-      "description": "The (1) TLS and (2) DTLS implementations in OpenSSL 1.0.1 before 1.0.1g do not properly handle Heartbeat Extension packe"
+      "description": "The (1) TLS and (2) DTLS implementations in OpenSSL 1.0.1 before 1.0.1g do not properly handle Heartbeat Extension packe",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2014-0224",
       "product": "openssl",
-      "affected_below": "0.9.8za",
-      "fixed_in": "0.9.8za",
+      "affected_below": "1.0.1h",
+      "fixed_in": "1.0.1h",
       "severity": "HIGH",
-      "description": "OpenSSL before 0.9.8za, 1.0.0 before 1.0.0m, and 1.0.1 before 1.0.1h does not properly restrict processing of ChangeCiph"
+      "description": "OpenSSL before 0.9.8za, 1.0.0 before 1.0.0m, and 1.0.1 before 1.0.1h does not properly restrict processing of ChangeCiph",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2014-1692",
@@ -737,7 +959,39 @@
       "affected_below": "6.4",
       "fixed_in": "6.4",
       "severity": "HIGH",
-      "description": "The hash_buffer function in schnorr.c in OpenSSH through 6.4, when Makefile.inc is modified to enable the J-PAKE protoco"
+      "description": "The hash_buffer function in schnorr.c in OpenSSH through 6.4, when Makefile.inc is modified to enable the J-PAKE protoco",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2015-0241",
+      "product": "postgresql",
+      "affected_below": "9.4.1",
+      "fixed_in": "9.4.1",
+      "severity": "HIGH",
+      "description": "The to_char function in PostgreSQL before 9.0.19, 9.1.x before 9.1.15, 9.2.x before 9.2.10, 9.3.x before 9.3.6, and 9.4.",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2015-0242",
+      "product": "postgresql",
+      "affected_below": "9.4.1",
+      "fixed_in": "9.4.1",
+      "severity": "HIGH",
+      "description": "Stack-based buffer overflow in the *printf function implementations in PostgreSQL before 9.0.19, 9.1.x before 9.1.15, 9.",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2015-0243",
+      "product": "postgresql",
+      "affected_below": "9.4.1",
+      "fixed_in": "9.4.1",
+      "severity": "HIGH",
+      "description": "Multiple buffer overflows in contrib/pgcrypto in PostgreSQL before 9.0.19, 9.1.x before 9.1.15, 9.2.x before 9.2.10, 9.3",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2015-1789",
@@ -745,7 +999,19 @@
       "affected_below": "0.9.8zf",
       "fixed_in": "0.9.8zf",
       "severity": "HIGH",
-      "description": "The X509_cmp_time function in crypto/x509/x509_vfy.c in OpenSSL before 0.9.8zg, 1.0.0 before 1.0.0s, 1.0.1 before 1.0.1n"
+      "description": "The X509_cmp_time function in crypto/x509/x509_vfy.c in OpenSSL before 0.9.8zg, 1.0.0 before 1.0.0s, 1.0.1 before 1.0.1n",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2015-3167",
+      "product": "postgresql",
+      "affected_below": "9.4.2",
+      "fixed_in": "9.4.2",
+      "severity": "HIGH",
+      "description": "contrib/pgcrypto in PostgreSQL before 9.0.20, 9.1.x before 9.1.16, 9.2.x before 9.2.11, 9.3.x before 9.3.7, and 9.4.x be",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2015-5600",
@@ -753,7 +1019,9 @@
       "affected_below": "6.9",
       "fixed_in": "6.9",
       "severity": "HIGH",
-      "description": "The kbdint_next_device function in auth2-chall.c in sshd in OpenSSH through 6.9 does not properly restrict the processin"
+      "description": "The kbdint_next_device function in auth2-chall.c in sshd in OpenSSH through 6.9 does not properly restrict the processin",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2015-6564",
@@ -761,7 +1029,9 @@
       "affected_below": "6.9",
       "fixed_in": "6.9",
       "severity": "HIGH",
-      "description": "Use-after-free vulnerability in the mm_answer_pam_free_ctx function in monitor.c in sshd in OpenSSH before 7.0 on non-Op"
+      "description": "Use-after-free vulnerability in the mm_answer_pam_free_ctx function in monitor.c in sshd in OpenSSH before 7.0 on non-Op",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2015-8325",
@@ -769,15 +1039,49 @@
       "affected_below": "7.2",
       "fixed_in": "7.2",
       "severity": "HIGH",
-      "description": "The do_setup_env function in session.c in sshd in OpenSSH through 7.2p2, when the UseLogin feature is enabled and PAM is"
+      "description": "The do_setup_env function in session.c in sshd in OpenSSH through 7.2p2, when the UseLogin feature is enabled and PAM is",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-0742",
       "product": "nginx",
-      "affected_below": "1.8.1",
-      "fixed_in": "1.8.1",
+      "affected_below": "1.9.10",
+      "fixed_in": "1.9.10",
       "severity": "HIGH",
-      "description": "The resolver in nginx before 1.8.1 and 1.9.x before 1.9.10 allows remote attackers to cause a denial of service (invalid"
+      "description": "The resolver in nginx before 1.8.1 and 1.9.x before 1.9.10 allows remote attackers to cause a denial of service (invalid",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2016-0766",
+      "product": "postgresql",
+      "affected_below": "9.4.6",
+      "fixed_in": "9.4.6",
+      "severity": "HIGH",
+      "description": "PostgreSQL before 9.1.20, 9.2.x before 9.2.15, 9.3.x before 9.3.11, 9.4.x before 9.4.6, and 9.5.x before 9.5.1 does not",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2016-0768",
+      "product": "postgresql",
+      "affected_below": "9.0",
+      "fixed_in": "9.0",
+      "severity": "HIGH",
+      "description": "PostgreSQL PL/Java after 9.0 does not honor access controls on large objects.",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2016-0773",
+      "product": "postgresql",
+      "affected_below": "9.1.19",
+      "fixed_in": "9.1.19",
+      "severity": "HIGH",
+      "description": "PostgreSQL before 9.1.20, 9.2.x before 9.2.15, 9.3.x before 9.3.11, 9.4.x before 9.4.6, and 9.5.x before 9.5.1 allows re",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-10009",
@@ -785,7 +1089,9 @@
       "affected_below": "7.3",
       "fixed_in": "7.3",
       "severity": "HIGH",
-      "description": "Untrusted search path vulnerability in ssh-agent.c in ssh-agent in OpenSSH before 7.4 allows remote attackers to execute"
+      "description": "Untrusted search path vulnerability in ssh-agent.c in ssh-agent in OpenSSH before 7.4 allows remote attackers to execute",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-10010",
@@ -793,7 +1099,9 @@
       "affected_below": "7.3",
       "fixed_in": "7.3",
       "severity": "HIGH",
-      "description": "sshd in OpenSSH before 7.4, when privilege separation is not used, creates forwarded Unix-domain sockets as root, which"
+      "description": "sshd in OpenSSH before 7.4, when privilege separation is not used, creates forwarded Unix-domain sockets as root, which",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-10012",
@@ -801,7 +1109,9 @@
       "affected_below": "7.3",
       "fixed_in": "7.3",
       "severity": "HIGH",
-      "description": "The shared memory manager (associated with pre-authentication compression) in sshd in OpenSSH before 7.4 does not ensure"
+      "description": "The shared memory manager (associated with pre-authentication compression) in sshd in OpenSSH before 7.4 does not ensure",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-10708",
@@ -809,7 +1119,9 @@
       "affected_below": "7.4",
       "fixed_in": "7.4",
       "severity": "HIGH",
-      "description": "sshd in OpenSSH before 7.4 allows remote attackers to cause a denial of service (NULL pointer dereference and daemon cra"
+      "description": "sshd in OpenSSH before 7.4 allows remote attackers to cause a denial of service (NULL pointer dereference and daemon cra",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-10931",
@@ -817,7 +1129,9 @@
       "affected_below": "0.9.0",
       "fixed_in": "0.9.0",
       "severity": "HIGH",
-      "description": "An issue was discovered in the openssl crate before 0.9.0 for Rust. There is an SSL/TLS man-in-the-middle vulnerability"
+      "description": "An issue was discovered in the openssl crate before 0.9.0 for Rust. There is an SSL/TLS man-in-the-middle vulnerability",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-1247",
@@ -825,7 +1139,9 @@
       "affected_below": "1.10.1",
       "fixed_in": "1.10.1",
       "severity": "HIGH",
-      "description": "The nginx package before 1.6.2-5+deb8u3 on Debian jessie, the nginx packages before 1.4.6-1ubuntu3.6 on Ubuntu 14.04 LTS"
+      "description": "The nginx package before 1.6.2-5+deb8u3 on Debian jessie, the nginx packages before 1.4.6-1ubuntu3.6 on Ubuntu 14.04 LTS",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-2106",
@@ -833,7 +1149,9 @@
       "affected_below": "1.0.1s",
       "fixed_in": "1.0.1s",
       "severity": "HIGH",
-      "description": "Integer overflow in the EVP_EncryptUpdate function in crypto/evp/evp_enc.c in OpenSSL before 1.0.1t and 1.0.2 before 1.0"
+      "description": "Integer overflow in the EVP_EncryptUpdate function in crypto/evp/evp_enc.c in OpenSSL before 1.0.1t and 1.0.2 before 1.0",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-2109",
@@ -841,7 +1159,9 @@
       "affected_below": "1.0.1s",
       "fixed_in": "1.0.1s",
       "severity": "HIGH",
-      "description": "The asn1_d2i_read_bio function in crypto/asn1/a_d2i_fp.c in the ASN.1 BIO implementation in OpenSSL before 1.0.1t and 1."
+      "description": "The asn1_d2i_read_bio function in crypto/asn1/a_d2i_fp.c in the ASN.1 BIO implementation in OpenSSL before 1.0.1t and 1.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-2176",
@@ -849,7 +1169,9 @@
       "affected_below": "1.0.1s",
       "fixed_in": "1.0.1s",
       "severity": "HIGH",
-      "description": "The X509_NAME_oneline function in crypto/x509/x509_obj.c in OpenSSL before 1.0.1t and 1.0.2 before 1.0.2h allows remote"
+      "description": "The X509_NAME_oneline function in crypto/x509/x509_obj.c in OpenSSL before 1.0.1t and 1.0.2 before 1.0.2h allows remote",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-4450",
@@ -857,7 +1179,9 @@
       "affected_below": "1.10.1",
       "fixed_in": "1.10.1",
       "severity": "HIGH",
-      "description": "os/unix/ngx_files.c in nginx before 1.10.1 and 1.11.x before 1.11.1 allows remote attackers to cause a denial of service"
+      "description": "os/unix/ngx_files.c in nginx before 1.10.1 and 1.11.x before 1.11.1 allows remote attackers to cause a denial of service",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-4802",
@@ -865,23 +1189,29 @@
       "affected_below": "7.49.0",
       "fixed_in": "7.49.0",
       "severity": "HIGH",
-      "description": "Multiple untrusted search path vulnerabilities in cURL and libcurl before 7.49.1, when built with SSPI or telnet is enab"
+      "description": "Multiple untrusted search path vulnerabilities in cURL and libcurl before 7.49.1, when built with SSPI or telnet is enab",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-5387",
       "product": "apache",
-      "affected_below": "2.2.31",
-      "fixed_in": "2.2.31",
+      "affected_below": "2.4.23",
+      "fixed_in": "2.4.23",
       "severity": "HIGH",
-      "description": "The Apache HTTP Server through 2.4.23 follows RFC 3875 section 4.1.18 and therefore does not protect applications from t"
+      "description": "The Apache HTTP Server through 2.4.23 follows RFC 3875 section 4.1.18 and therefore does not protect applications from t",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-5388",
       "product": "apache",
-      "affected_below": "6.0.45",
-      "fixed_in": "6.0.45",
+      "affected_below": "8.5.4",
+      "fixed_in": "8.5.4",
       "severity": "HIGH",
-      "description": "Apache Tomcat 7.x through 7.0.70 and 8.x through 8.5.4, when the CGI Servlet is enabled, follows RFC 3875 section 4.1.18"
+      "description": "Apache Tomcat 7.x through 7.0.70 and 8.x through 8.5.4, when the CGI Servlet is enabled, follows RFC 3875 section 4.1.18",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-5419",
@@ -889,7 +1219,9 @@
       "affected_below": "7.50.0",
       "fixed_in": "7.50.0",
       "severity": "HIGH",
-      "description": "curl and libcurl before 7.50.1 do not prevent TLS session resumption when the client certificate has changed, which allo"
+      "description": "curl and libcurl before 7.50.1 do not prevent TLS session resumption when the client certificate has changed, which allo",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-5420",
@@ -897,7 +1229,29 @@
       "affected_below": "7.50.0",
       "fixed_in": "7.50.0",
       "severity": "HIGH",
-      "description": "curl and libcurl before 7.50.1 do not check the client certificate when choosing the TLS connection to reuse, which migh"
+      "description": "curl and libcurl before 7.50.1 do not check the client certificate when choosing the TLS connection to reuse, which migh",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2016-5423",
+      "product": "postgresql",
+      "affected_below": "9.1.22",
+      "fixed_in": "9.1.22",
+      "severity": "HIGH",
+      "description": "PostgreSQL before 9.1.23, 9.2.x before 9.2.18, 9.3.x before 9.3.14, 9.4.x before 9.4.9, and 9.5.x before 9.5.4 allow rem",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2016-5424",
+      "product": "postgresql",
+      "affected_below": "9.1.22",
+      "fixed_in": "9.1.22",
+      "severity": "HIGH",
+      "description": "PostgreSQL before 9.1.23, 9.2.x before 9.2.18, 9.3.x before 9.3.14, 9.4.x before 9.4.9, and 9.5.x before 9.5.4 might all",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-6515",
@@ -905,7 +1259,19 @@
       "affected_below": "7.2",
       "fixed_in": "7.2",
       "severity": "HIGH",
-      "description": "The auth_password function in auth-passwd.c in sshd in OpenSSH before 7.3 does not limit password lengths for password a"
+      "description": "The auth_password function in auth-passwd.c in sshd in OpenSSH before 7.3 does not limit password lengths for password a",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2016-7048",
+      "product": "postgresql",
+      "affected_below": "9.5.5",
+      "fixed_in": "9.5.5",
+      "severity": "HIGH",
+      "description": "The interactive installer in PostgreSQL before 9.3.15, 9.4.x before 9.4.10, and 9.5.x before 9.5.5 might allow remote at",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-7141",
@@ -913,7 +1279,9 @@
       "affected_below": "7.50.1",
       "fixed_in": "7.50.1",
       "severity": "HIGH",
-      "description": "curl and libcurl before 7.50.2, when built with NSS and the libnsspem.so library is available at runtime, allow remote a"
+      "description": "curl and libcurl before 7.50.2, when built with NSS and the libnsspem.so library is available at runtime, allow remote a",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-7798",
@@ -921,7 +1289,9 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "The openssl gem for Ruby uses the same initialization vector (IV) in GCM Mode (aes-*-gcm) when the IV is set before the"
+      "description": "The openssl gem for Ruby uses the same initialization vector (IV) in GCM Mode (aes-*-gcm) when the IV is set before the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2016-8610",
@@ -929,15 +1299,19 @@
       "affected_below": "1.0.2h",
       "fixed_in": "1.0.2h",
       "severity": "HIGH",
-      "description": "A denial of service flaw was found in OpenSSL 0.9.8, 1.0.1, 1.0.2 through 1.0.2h, and 1.1.0 in the way the TLS/SSL proto"
+      "description": "A denial of service flaw was found in OpenSSL 0.9.8, 1.0.1, 1.0.2 through 1.0.2h, and 1.1.0 in the way the TLS/SSL proto",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2016-8743",
       "product": "apache",
-      "affected_below": "2.2.31",
-      "fixed_in": "2.2.31",
+      "affected_below": "2.4.23",
+      "fixed_in": "2.4.23",
       "severity": "HIGH",
-      "description": "Apache HTTP Server, in all releases prior to 2.2.32 and 2.4.25, was liberal in the whitespace accepted from requests and"
+      "description": "Apache HTTP Server, in all releases prior to 2.2.32 and 2.4.25, was liberal in the whitespace accepted from requests and",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-1000368",
@@ -945,7 +1319,9 @@
       "affected_below": "1.8.20",
       "fixed_in": "1.8.20",
       "severity": "HIGH",
-      "description": "Todd Miller's sudo version 1.8.20p1 and earlier is vulnerable to an input validation (embedded newlines) in the get_proc"
+      "description": "Todd Miller's sudo version 1.8.20p1 and earlier is vulnerable to an input validation (embedded newlines) in the get_proc",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-12615",
@@ -953,15 +1329,19 @@
       "affected_below": "7.0.79",
       "fixed_in": "7.0.79",
       "severity": "HIGH",
-      "description": "When running Apache Tomcat 7.0.0 to 7.0.79 on Windows with HTTP PUTs enabled (e.g. via setting the readonly initialisati"
+      "description": "When running Apache Tomcat 7.0.0 to 7.0.79 on Windows with HTTP PUTs enabled (e.g. via setting the readonly initialisati",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-12617",
       "product": "apache",
-      "affected_below": "7.0.82",
-      "fixed_in": "7.0.82",
+      "affected_below": "9.0.1",
+      "fixed_in": "9.0.1",
       "severity": "HIGH",
-      "description": "When running Apache Tomcat versions 9.0.0.M1 to 9.0.0, 8.5.0 to 8.5.22, 8.0.0.RC1 to 8.0.46 and 7.0.0 to 7.0.81 with HTT"
+      "description": "When running Apache Tomcat versions 9.0.0.M1 to 9.0.0, 8.5.0 to 8.5.22, 8.0.0.RC1 to 8.0.46 and 7.0.0 to 7.0.81 with HTT",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2017-12632",
@@ -969,7 +1349,9 @@
       "affected_below": "1.4.0",
       "fixed_in": "1.4.0",
       "severity": "HIGH",
-      "description": "A malicious host header in an incoming HTTP request could cause NiFi to load resources from an external server. The fix"
+      "description": "A malicious host header in an incoming HTTP request could cause NiFi to load resources from an external server. The fix",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-12636",
@@ -977,23 +1359,29 @@
       "affected_below": "1.7.0",
       "fixed_in": "1.7.0",
       "severity": "HIGH",
-      "description": "CouchDB administrative users can configure the database server via HTTP(S). Some of the configuration options include pa"
+      "description": "CouchDB administrative users can configure the database server via HTTP(S). Some of the configuration options include pa",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
-      "cve_id": "CVE-2017-17969",
-      "product": "7-zip",
-      "affected_below": "18.00",
-      "fixed_in": "18.00",
+      "cve_id": "CVE-2017-14798",
+      "product": "postgresql",
+      "affected_below": "9.4-0.5.3.1",
+      "fixed_in": "9.4-0.5.3.1",
       "severity": "HIGH",
-      "description": "Heap-based buffer overflow in the NCompress::NShrink::CDecoder::CodeReal method in 7-Zip before 18.00 and p7zip allows r"
+      "description": "A race condition in the postgresql init script could be used by attackers able to access the postgresql account to escal",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
-      "cve_id": "CVE-2017-2107",
-      "product": "7-zip",
-      "affected_below": "9.22.00.01",
-      "fixed_in": "9.22.00.01",
+      "cve_id": "CVE-2017-18359",
+      "product": "postgresql",
+      "affected_below": "2.3.3",
+      "fixed_in": "2.3.3",
       "severity": "HIGH",
-      "description": "Untrusted search path vulnerability in Self-extracting archive files created by 7-ZIP32.DLL 9.22.00.01 and earlier allow"
+      "description": "PostGIS 2.x before 2.3.3, as used with PostgreSQL, allows remote attackers to cause a denial of service via crafted ST_A",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2017-3163",
@@ -1001,7 +1389,9 @@
       "affected_below": "5.5.3",
       "fixed_in": "5.5.3",
       "severity": "HIGH",
-      "description": "When using the Index Replication feature, Apache Solr nodes can pull index files from a master/leader node using an HTTP"
+      "description": "When using the Index Replication feature, Apache Solr nodes can pull index files from a master/leader node using an HTTP",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-3164",
@@ -1009,15 +1399,39 @@
       "affected_below": "7.6.0",
       "fixed_in": "7.6.0",
       "severity": "HIGH",
-      "description": "Server Side Request Forgery in Apache Solr, versions 1.3 until 7.6 (inclusive). Since the \"shards\" parameter does not ha"
+      "description": "Server Side Request Forgery in Apache Solr, versions 1.3 until 7.6 (inclusive). Since the \"shards\" parameter does not ha",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2017-7484",
+      "product": "postgresql",
+      "affected_below": "9.2.20",
+      "fixed_in": "9.2.20",
+      "severity": "HIGH",
+      "description": "It was found that some selectivity estimation functions in PostgreSQL before 9.2.21, 9.3.x before 9.3.17, 9.4.x before 9",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2017-7529",
       "product": "nginx",
-      "affected_below": "1.12.1",
-      "fixed_in": "1.12.1",
+      "affected_below": "1.13.2",
+      "fixed_in": "1.13.2",
       "severity": "HIGH",
-      "description": "Nginx versions since 0.5.6 up to and including 1.13.2 are vulnerable to integer overflow vulnerability in nginx range fi"
+      "description": "Nginx versions since 0.5.6 up to and including 1.13.2 are vulnerable to integer overflow vulnerability in nginx range fi",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2017-7548",
+      "product": "postgresql",
+      "affected_below": "9.6.4",
+      "fixed_in": "9.6.4",
+      "severity": "HIGH",
+      "description": "PostgreSQL versions before 9.4.13, 9.5.8 and 9.6.4 are vulnerable to authorization flaw allowing remote authenticated at",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2017-9798",
@@ -1025,15 +1439,19 @@
       "affected_below": "2.2.34",
       "fixed_in": "2.2.34",
       "severity": "HIGH",
-      "description": "Apache httpd allows remote attackers to read secret data from process memory if the Limit directive can be set in a user"
+      "description": "Apache httpd allows remote attackers to read secret data from process memory if the Limit directive can be set in a user",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-0732",
       "product": "openssl",
-      "affected_below": "1.0.2o",
-      "fixed_in": "1.0.2o",
+      "affected_below": "1.1.0h",
+      "fixed_in": "1.1.0h",
       "severity": "HIGH",
-      "description": "During key agreement in a TLS handshake using a DH(E) based ciphersuite a malicious server can send a very large prime v"
+      "description": "During key agreement in a TLS handshake using a DH(E) based ciphersuite a malicious server can send a very large prime v",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1000121",
@@ -1041,23 +1459,59 @@
       "affected_below": "7.58.0",
       "fixed_in": "7.58.0",
       "severity": "HIGH",
-      "description": "A NULL pointer dereference exists in curl 7.21.0 to and including curl 7.58.0 in the LDAP code that allows an attacker t"
+      "description": "A NULL pointer dereference exists in curl 7.21.0 to and including curl 7.58.0 in the LDAP code that allows an attacker t",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
-      "cve_id": "CVE-2018-10115",
-      "product": "7-zip",
-      "affected_below": "18.03",
-      "fixed_in": "18.03",
+      "cve_id": "CVE-2018-1053",
+      "product": "postgresql",
+      "affected_below": "9.6.7",
+      "fixed_in": "9.6.7",
       "severity": "HIGH",
-      "description": "Incorrect initialization logic of RAR decoder objects in 7-Zip 18.03 and before can lead to usage of uninitialized memor"
+      "description": "In postgresql 9.3.x before 9.3.21, 9.4.x before 9.4.16, 9.5.x before 9.5.11, 9.6.x before 9.6.7 and 10.x before 10.2, pg",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
-      "cve_id": "CVE-2018-10172",
-      "product": "7-zip",
-      "affected_below": "18.01",
-      "fixed_in": "18.01",
+      "cve_id": "CVE-2018-1058",
+      "product": "postgresql",
+      "affected_below": "10.3",
+      "fixed_in": "10.3",
       "severity": "HIGH",
-      "description": "7-Zip through 18.01 on Windows implements the \"Large memory pages\" option by calling the LsaAddAccountRights function to"
+      "description": "A flaw was found in the way Postgresql allowed a user to modify the behavior of a query for other users. An attacker wit",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2018-10915",
+      "product": "postgresql",
+      "affected_below": "10.5",
+      "fixed_in": "10.5",
+      "severity": "HIGH",
+      "description": "A vulnerability was found in libpq, the default PostgreSQL client library where libpq failed to properly reset its inter",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2018-10925",
+      "product": "postgresql",
+      "affected_below": "10.5",
+      "fixed_in": "10.5",
+      "severity": "HIGH",
+      "description": "It was discovered that PostgreSQL versions before 10.5, 9.6.10, 9.5.14, 9.4.19, and 9.3.24 failed to properly check auth",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2018-10936",
+      "product": "postgresql",
+      "affected_below": "42.2.5",
+      "fixed_in": "42.2.5",
+      "severity": "HIGH",
+      "description": "A weakness was found in postgresql-jdbc before version 42.2.5. It was possible to provide an SSL Factory and not check t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-11759",
@@ -1065,7 +1519,9 @@
       "affected_below": "1.2.44",
       "fixed_in": "1.2.44",
       "severity": "HIGH",
-      "description": "The Apache Web Server (httpd) specific code that normalised the requested path before matching it to the URI-worker map"
+      "description": "The Apache Web Server (httpd) specific code that normalised the requested path before matching it to the URI-worker map",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1303",
@@ -1073,7 +1529,9 @@
       "affected_below": "2.4.29",
       "fixed_in": "2.4.29",
       "severity": "HIGH",
-      "description": "A specially crafted HTTP request header could have crashed the Apache HTTP Server prior to version 2.4.30 due to an out"
+      "description": "A specially crafted HTTP request header could have crashed the Apache HTTP Server prior to version 2.4.30 due to an out",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-1333",
@@ -1081,7 +1539,9 @@
       "affected_below": "2.4.30",
       "fixed_in": "2.4.30",
       "severity": "HIGH",
-      "description": "By specially crafting HTTP/2 requests, workers would be allocated 60 seconds longer than necessary, leading to worker ex"
+      "description": "By specially crafting HTTP/2 requests, workers would be allocated 60 seconds longer than necessary, leading to worker ex",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-14618",
@@ -1089,23 +1549,29 @@
       "affected_below": "7.61.1",
       "fixed_in": "7.61.1",
       "severity": "HIGH",
-      "description": "curl before version 7.61.1 is vulnerable to a buffer overrun in the NTLM authentication code. The internal function Curl"
+      "description": "curl before version 7.61.1 is vulnerable to a buffer overrun in the NTLM authentication code. The internal function Curl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-16843",
       "product": "nginx",
-      "affected_below": "1.14.1",
-      "fixed_in": "1.14.1",
+      "affected_below": "1.15.6",
+      "fixed_in": "1.15.6",
       "severity": "HIGH",
-      "description": "nginx before versions 1.15.6 and 1.14.1 has a vulnerability in the implementation of HTTP/2 that can allow for excessive"
+      "description": "nginx before versions 1.15.6 and 1.14.1 has a vulnerability in the implementation of HTTP/2 that can allow for excessive",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-16844",
       "product": "nginx",
-      "affected_below": "1.14.1",
-      "fixed_in": "1.14.1",
+      "affected_below": "1.15.6",
+      "fixed_in": "1.15.6",
       "severity": "HIGH",
-      "description": "nginx before versions 1.15.6 and 1.14.1 has a vulnerability in the implementation of HTTP/2 that can allow for excessive"
+      "description": "nginx before versions 1.15.6 and 1.14.1 has a vulnerability in the implementation of HTTP/2 that can allow for excessive",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2018-17199",
@@ -1113,23 +1579,19 @@
       "affected_below": "2.4.37",
       "fixed_in": "2.4.37",
       "severity": "HIGH",
-      "description": "In Apache HTTP Server 2.4 release 2.4.37 and prior, mod_session checks the session expiry time before decoding the sessi"
-    },
-    {
-      "cve_id": "CVE-2018-5996",
-      "product": "7-zip",
-      "affected_below": "18.00",
-      "fixed_in": "18.00",
-      "severity": "HIGH",
-      "description": "Insufficient exception handling in the method NCompress::NRar3::CDecoder::Code of 7-Zip before 18.00 and p7zip can lead"
+      "description": "In Apache HTTP Server 2.4 release 2.4.37 and prior, mod_session checks the session expiry time before decoding the sessi",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-8007",
       "product": "apache",
-      "affected_below": "1.7.1",
-      "fixed_in": "1.7.1",
+      "affected_below": "2.1.1",
+      "fixed_in": "2.1.1",
       "severity": "HIGH",
-      "description": "Apache CouchDB administrative users can configure the database server via HTTP(S). Due to insufficient validation of adm"
+      "description": "Apache CouchDB administrative users can configure the database server via HTTP(S). Due to insufficient validation of adm",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2018-8025",
@@ -1137,15 +1599,19 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "CVE-2018-8025 describes an issue in Apache HBase that affects the optional \"Thrift 1\" API server when running over HTTP."
+      "description": "CVE-2018-8025 describes an issue in Apache HBase that affects the optional \"Thrift 1\" API server when running over HTTP.",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-0199",
       "product": "apache",
-      "affected_below": "8.5.37",
-      "fixed_in": "8.5.37",
+      "affected_below": "9.0.14",
+      "fixed_in": "9.0.14",
       "severity": "HIGH",
-      "description": "The HTTP/2 implementation in Apache Tomcat 9.0.0.M1 to 9.0.14 and 8.5.0 to 8.5.37 accepted streams with excessive number"
+      "description": "The HTTP/2 implementation in Apache Tomcat 9.0.0.M1 to 9.0.14 and 8.5.0 to 8.5.37 accepted streams with excessive number",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-0211",
@@ -1153,7 +1619,9 @@
       "affected_below": "2.4.38",
       "fixed_in": "2.4.38",
       "severity": "HIGH",
-      "description": "In Apache HTTP Server 2.4 releases 2.4.17 to 2.4.38, with MPM event, worker or prefork, code executing in less-privilege"
+      "description": "In Apache HTTP Server 2.4 releases 2.4.17 to 2.4.38, with MPM event, worker or prefork, code executing in less-privilege",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-0217",
@@ -1161,23 +1629,79 @@
       "affected_below": "2.4.38",
       "fixed_in": "2.4.38",
       "severity": "HIGH",
-      "description": "In Apache HTTP Server 2.4 release 2.4.38 and prior, a race condition in mod_auth_digest when running in a threaded serve"
+      "description": "In Apache HTTP Server 2.4 release 2.4.38 and prior, a race condition in mod_auth_digest when running in a threaded serve",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-10072",
       "product": "apache",
-      "affected_below": "8.5.40",
-      "fixed_in": "8.5.40",
+      "affected_below": "9.0.19",
+      "fixed_in": "9.0.19",
       "severity": "HIGH",
-      "description": "The fix for CVE-2019-0199 was incomplete and did not address HTTP/2 connection window exhaustion on write in Apache Tomc"
+      "description": "The fix for CVE-2019-0199 was incomplete and did not address HTTP/2 connection window exhaustion on write in Apache Tomc",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-10079",
       "product": "apache",
-      "affected_below": "7.1.7",
-      "fixed_in": "7.1.7",
+      "affected_below": "8.0.4",
+      "fixed_in": "8.0.4",
       "severity": "HIGH",
-      "description": "Apache Traffic Server is vulnerable to HTTP/2 setting flood attacks. Earlier versions of Apache Traffic Server didn't li"
+      "description": "Apache Traffic Server is vulnerable to HTTP/2 setting flood attacks. Earlier versions of Apache Traffic Server didn't li",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2019-10127",
+      "product": "postgresql",
+      "affected_below": "11.3",
+      "fixed_in": "11.3",
+      "severity": "HIGH",
+      "description": "A vulnerability was found in postgresql versions 11.x prior to 11.3. The Windows installer for BigSQL-supplied PostgreSQ",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2019-10128",
+      "product": "postgresql",
+      "affected_below": "11.3",
+      "fixed_in": "11.3",
+      "severity": "HIGH",
+      "description": "A vulnerability was found in postgresql versions 11.x prior to 11.3. The Windows installer for EnterpriseDB-supplied Pos",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2019-10164",
+      "product": "postgresql",
+      "affected_below": "11.4",
+      "fixed_in": "11.4",
+      "severity": "HIGH",
+      "description": "PostgreSQL versions 10.x before 10.9 and versions 11.x before 11.4 are vulnerable to a stack-based buffer overflow. Any",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2019-10208",
+      "product": "postgresql",
+      "affected_below": "11.5",
+      "fixed_in": "11.5",
+      "severity": "HIGH",
+      "description": "A flaw was discovered in postgresql versions 9.4.x before 9.4.24, 9.5.x before 9.5.19, 9.6.x before 9.6.15, 10.x before",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2019-10210",
+      "product": "postgresql",
+      "affected_below": "11.5",
+      "fixed_in": "11.5",
+      "severity": "HIGH",
+      "description": "Postgresql Windows installer before versions 11.5, 10.10, 9.6.15, 9.5.19, 9.4.24 is vulnerable via superuser writing pas",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-14287",
@@ -1185,23 +1709,29 @@
       "affected_below": "1.8.28",
       "fixed_in": "1.8.28",
       "severity": "HIGH",
-      "description": "In Sudo before 1.8.28, an attacker with access to a Runas ALL sudoer account can bypass certain policy blacklists and se"
+      "description": "In Sudo before 1.8.28, an attacker with access to a Runas ALL sudoer account can bypass certain policy blacklists and se",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-1543",
       "product": "openssl",
-      "affected_below": "1.1.0j",
-      "fixed_in": "1.1.0j",
+      "affected_below": "1.1.1b",
+      "fixed_in": "1.1.1b",
       "severity": "HIGH",
-      "description": "ChaCha20-Poly1305 is an AEAD cipher, and requires a unique nonce input for every encryption operation. RFC 7539 specifie"
+      "description": "ChaCha20-Poly1305 is an AEAD cipher, and requires a unique nonce input for every encryption operation. RFC 7539 specifie",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-16905",
       "product": "openssh",
-      "affected_below": "7.9",
-      "fixed_in": "7.9",
+      "affected_below": "8.1",
+      "fixed_in": "8.1",
       "severity": "HIGH",
-      "description": "OpenSSH 7.7 through 7.9 and 8.x before 8.1, when compiled with an experimental key type, has a pre-authentication intege"
+      "description": "OpenSSH 7.7 through 7.9 and 8.x before 8.1, when compiled with an experimental key type, has a pre-authentication intege",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-18634",
@@ -1209,7 +1739,9 @@
       "affected_below": "1.8.26",
       "fixed_in": "1.8.26",
       "severity": "HIGH",
-      "description": "In Sudo before 1.8.26, if pwfeedback is enabled in /etc/sudoers, users can trigger a stack-based buffer overflow in the"
+      "description": "In Sudo before 1.8.26, if pwfeedback is enabled in /etc/sudoers, users can trigger a stack-based buffer overflow in the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-18684",
@@ -1217,7 +1749,9 @@
       "affected_below": "1.8.29",
       "fixed_in": "1.8.29",
       "severity": "HIGH",
-      "description": "Sudo through 1.8.29 allows local users to escalate to root if they have write access to file descriptor 3 of the sudo pr"
+      "description": "Sudo through 1.8.29 allows local users to escalate to root if they have write access to file descriptor 3 of the sudo pr",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-19232",
@@ -1225,7 +1759,9 @@
       "affected_below": "1.8.29",
       "fixed_in": "1.8.29",
       "severity": "HIGH",
-      "description": "In Sudo through 1.8.29, an attacker with access to a Runas ALL sudoer account can impersonate a nonexistent user by invo"
+      "description": "In Sudo through 1.8.29, an attacker with access to a Runas ALL sudoer account can impersonate a nonexistent user by invo",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2019-19234",
@@ -1233,7 +1769,19 @@
       "affected_below": "1.8.29",
       "fixed_in": "1.8.29",
       "severity": "HIGH",
-      "description": "In Sudo through 1.8.29, the fact that a user has been blocked (e.g., by using the ! character in the shadow file instead"
+      "description": "In Sudo through 1.8.29, the fact that a user has been blocked (e.g., by using the ! character in the shadow file instead",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2019-3466",
+      "product": "postgresql",
+      "affected_below": "210",
+      "fixed_in": "210",
+      "severity": "HIGH",
+      "description": "The pg_ctlcluster script in postgresql-common in versions prior to 210 didn't drop privileges when creating socket/stati",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2019-5443",
@@ -1241,7 +1789,29 @@
       "affected_below": "7.65.1",
       "fixed_in": "7.65.1",
       "severity": "HIGH",
-      "description": "A non-privileged user or program can put code and a config file in a known non-privileged path (under C:/usr/local/) tha"
+      "description": "A non-privileged user or program can put code and a config file in a known non-privileged path (under C:/usr/local/) tha",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2019-9193",
+      "product": "postgresql",
+      "affected_below": "11.2",
+      "fixed_in": "11.2",
+      "severity": "HIGH",
+      "description": "In PostgreSQL 9.3 through 11.2, the \"COPY TO/FROM PROGRAM\" function allows superusers and users in the 'pg_execute_serve",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2020-10733",
+      "product": "postgresql",
+      "affected_below": "12.3",
+      "fixed_in": "12.3",
+      "severity": "HIGH",
+      "description": "The Windows installer for PostgreSQL 9.5 - 12 invokes system-provided executables that do not have fully-qualified paths",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-11993",
@@ -1249,15 +1819,29 @@
       "affected_below": "2.4.44",
       "fixed_in": "2.4.44",
       "severity": "HIGH",
-      "description": "Apache HTTP Server versions 2.4.20 to 2.4.43 When trace/debug was enabled for the HTTP/2 module and on certain traffic e"
+      "description": "Apache HTTP Server versions 2.4.20 to 2.4.43 When trace/debug was enabled for the HTTP/2 module and on certain traffic e",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-11996",
       "product": "apache",
-      "affected_below": "8.5.55",
-      "fixed_in": "8.5.55",
+      "affected_below": "9.0.35",
+      "fixed_in": "9.0.35",
       "severity": "HIGH",
-      "description": "A specially crafted sequence of HTTP/2 requests sent to Apache Tomcat 10.0.0-M1 to 10.0.0-M5, 9.0.0.M1 to 9.0.35 and 8.5"
+      "description": "A specially crafted sequence of HTTP/2 requests sent to Apache Tomcat 10.0.0-M1 to 10.0.0-M5, 9.0.0.M1 to 9.0.35 and 8.5",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2020-13692",
+      "product": "postgresql",
+      "affected_below": "42.2.13",
+      "fixed_in": "42.2.13",
+      "severity": "HIGH",
+      "description": "PostgreSQL JDBC Driver (aka PgJDBC) before 42.2.13 allows XXE.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-13950",
@@ -1265,7 +1849,29 @@
       "affected_below": "2.4.46",
       "fixed_in": "2.4.46",
       "severity": "HIGH",
-      "description": "Apache HTTP Server versions 2.4.41 to 2.4.46 mod_proxy_http can be made to crash (NULL pointer dereference) with special"
+      "description": "Apache HTTP Server versions 2.4.41 to 2.4.46 mod_proxy_http can be made to crash (NULL pointer dereference) with special",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2020-14349",
+      "product": "postgresql",
+      "affected_below": "12.4",
+      "fixed_in": "12.4",
+      "severity": "HIGH",
+      "description": "It was found that PostgreSQL versions before 12.4, before 11.9 and before 10.14 did not properly sanitize the search_pat",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2020-14350",
+      "product": "postgresql",
+      "affected_below": "12.4",
+      "fixed_in": "12.4",
+      "severity": "HIGH",
+      "description": "It was found that some PostgreSQL extensions did not use search_path safely in their installation script. An attacker wi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-15778",
@@ -1273,7 +1879,9 @@
       "affected_below": "8.3",
       "fixed_in": "8.3",
       "severity": "HIGH",
-      "description": "scp in OpenSSH through 8.3p1 allows command injection in the scp.c toremote function, as demonstrated by backtick charac"
+      "description": "scp in OpenSSH through 8.3p1 allows command injection in the scp.c toremote function, as demonstrated by backtick charac",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-1967",
@@ -1281,7 +1889,9 @@
       "affected_below": "1.1.1f",
       "fixed_in": "1.1.1f",
       "severity": "HIGH",
-      "description": "Server or client applications that call the SSL_check_chain() function during or after a TLS 1.3 handshake may crash due"
+      "description": "Server or client applications that call the SSL_check_chain() function during or after a TLS 1.3 handshake may crash due",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-25644",
@@ -1289,7 +1899,39 @@
       "affected_below": "1.1.3",
       "fixed_in": "1.1.3",
       "severity": "HIGH",
-      "description": "A memory leak flaw was found in WildFly OpenSSL in versions prior to 1.1.3.Final, where it removes an HTTP session. It m"
+      "description": "A memory leak flaw was found in WildFly OpenSSL in versions prior to 1.1.3.Final, where it removes an HTTP session. It m",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2020-25694",
+      "product": "postgresql",
+      "affected_below": "13.1",
+      "fixed_in": "13.1",
+      "severity": "HIGH",
+      "description": "A flaw was found in PostgreSQL versions before 13.1, before 12.5, before 11.10, before 10.15, before 9.6.20 and before 9",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2020-25695",
+      "product": "postgresql",
+      "affected_below": "13.1",
+      "fixed_in": "13.1",
+      "severity": "HIGH",
+      "description": "A flaw was found in PostgreSQL versions before 13.1, before 12.5, before 11.10, before 10.15, before 9.6.20 and before 9",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2020-25696",
+      "product": "postgresql",
+      "affected_below": "13.1",
+      "fixed_in": "13.1",
+      "severity": "HIGH",
+      "description": "A flaw was found in the psql interactive terminal of PostgreSQL in versions before 13.1, before 12.5, before 11.10, befo",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-35452",
@@ -1297,31 +1939,39 @@
       "affected_below": "2.4.46",
       "fixed_in": "2.4.46",
       "severity": "HIGH",
-      "description": "Apache HTTP Server versions 2.4.0 to 2.4.46 A specially crafted Digest nonce can cause a stack overflow in mod_auth_dige"
+      "description": "Apache HTTP Server versions 2.4.0 to 2.4.46 A specially crafted Digest nonce can cause a stack overflow in mod_auth_dige",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-5863",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.2.0",
+      "fixed_in": "3.2.0",
       "severity": "HIGH",
-      "description": "In NGINX Controller versions prior to 3.2.0, an unauthenticated attacker with network access to the Controller API can c"
+      "description": "In NGINX Controller versions prior to 3.2.0, an unauthenticated attacker with network access to the Controller API can c",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-5864",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.3.0",
+      "fixed_in": "3.3.0",
       "severity": "HIGH",
-      "description": "In versions of NGINX Controller prior to 3.2.0, communication between NGINX Controller and NGINX Plus instances skip TLS"
+      "description": "In versions of NGINX Controller prior to 3.2.0, communication between NGINX Controller and NGINX Plus instances skip TLS",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-5867",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.3.0",
+      "fixed_in": "3.3.0",
       "severity": "HIGH",
-      "description": "In versions prior to 3.3.0, the NGINX Controller Agent installer script 'install.sh' uses HTTP instead of HTTPS to check"
+      "description": "In versions prior to 3.3.0, the NGINX Controller Agent installer script 'install.sh' uses HTTP instead of HTTPS to check",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-5894",
@@ -1329,7 +1979,9 @@
       "affected_below": "3.3.0",
       "fixed_in": "3.3.0",
       "severity": "HIGH",
-      "description": "On versions 3.0.0-3.3.0, the NGINX Controller webserver does not invalidate the server-side session token after users lo"
+      "description": "On versions 3.0.0-3.3.0, the NGINX Controller webserver does not invalidate the server-side session token after users lo",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-5895",
@@ -1337,7 +1989,9 @@
       "affected_below": "3.4.0",
       "fixed_in": "3.4.0",
       "severity": "HIGH",
-      "description": "On NGINX Controller versions 3.1.0-3.3.0, AVRD uses world-readable and world-writable permissions on its socket, which a"
+      "description": "On NGINX Controller versions 3.1.0-3.3.0, AVRD uses world-readable and world-writable permissions on its socket, which a",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-5899",
@@ -1345,31 +1999,39 @@
       "affected_below": "3.4.0",
       "fixed_in": "3.4.0",
       "severity": "HIGH",
-      "description": "In NGINX Controller 3.0.0-3.4.0, recovery code required to change a user's password is transmitted and stored in the dat"
+      "description": "In NGINX Controller 3.0.0-3.4.0, recovery code required to change a user's password is transmitted and stored in the dat",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-5900",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.4.0",
+      "fixed_in": "3.4.0",
       "severity": "HIGH",
-      "description": "In versions 3.0.0-3.4.0, 2.0.0-2.9.0, and 1.0.1, there is insufficient cross-site request forgery (CSRF) protections for"
+      "description": "In versions 3.0.0-3.4.0, 2.0.0-2.9.0, and 1.0.1, there is insufficient cross-site request forgery (CSRF) protections for",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-5910",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.5.0",
+      "fixed_in": "3.5.0",
       "severity": "HIGH",
-      "description": "In versions 3.0.0-3.5.0, 2.0.0-2.9.0, and 1.0.1, the Neural Autonomic Transport System (NATS) messaging services in use"
+      "description": "In versions 3.0.0-3.5.0, 2.0.0-2.9.0, and 1.0.1, the Neural Autonomic Transport System (NATS) messaging services in use",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-5911",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.5.0",
+      "fixed_in": "3.5.0",
       "severity": "HIGH",
-      "description": "In versions 3.0.0-3.5.0, 2.0.0-2.9.0, and 1.0.1, the NGINX Controller installer starts the download of Kubernetes packag"
+      "description": "In versions 3.0.0-3.5.0, 2.0.0-2.9.0, and 1.0.1, the NGINX Controller installer starts the download of Kubernetes packag",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-8169",
@@ -1377,7 +2039,9 @@
       "affected_below": "7.70.0",
       "fixed_in": "7.70.0",
       "severity": "HIGH",
-      "description": "curl 7.62.0 through 7.70.0 is vulnerable to an information disclosure vulnerability that can lead to a partial password"
+      "description": "curl 7.62.0 through 7.70.0 is vulnerable to an information disclosure vulnerability that can lead to a partial password",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-8177",
@@ -1385,7 +2049,9 @@
       "affected_below": "7.70.0",
       "fixed_in": "7.70.0",
       "severity": "HIGH",
-      "description": "curl 7.20.0 through 7.70.0 is vulnerable to improper restriction of names for files and other resources that can lead to"
+      "description": "curl 7.20.0 through 7.70.0 is vulnerable to improper restriction of names for files and other resources that can lead to",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2020-8285",
@@ -1393,7 +2059,9 @@
       "affected_below": "7.74.0",
       "fixed_in": "7.74.0",
       "severity": "HIGH",
-      "description": "curl 7.21.0 to and including 7.73.0 is vulnerable to uncontrolled recursion due to a stack overflow issue in FTP wildcar"
+      "description": "curl 7.21.0 to and including 7.73.0 is vulnerable to uncontrolled recursion due to a stack overflow issue in FTP wildcar",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-8286",
@@ -1401,7 +2069,9 @@
       "affected_below": "7.74.0",
       "fixed_in": "7.74.0",
       "severity": "HIGH",
-      "description": "curl 7.41.0 through 7.73.0 is vulnerable to an improper check for certificate revocation due to insufficient verificatio"
+      "description": "curl 7.41.0 through 7.73.0 is vulnerable to an improper check for certificate revocation due to insufficient verificatio",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-9490",
@@ -1409,15 +2079,19 @@
       "affected_below": "2.4.46",
       "fixed_in": "2.4.46",
       "severity": "HIGH",
-      "description": "Apache HTTP Server versions 2.4.20 to 2.4.43. A specially crafted value for the 'Cache-Digest' header in a HTTP/2 reques"
+      "description": "Apache HTTP Server versions 2.4.20 to 2.4.43. A specially crafted value for the 'Cache-Digest' header in a HTTP/2 reques",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2020-9494",
       "product": "apache",
-      "affected_below": "6.2.3",
-      "fixed_in": "6.2.3",
+      "affected_below": "8.0.7",
+      "fixed_in": "8.0.7",
       "severity": "HIGH",
-      "description": "Apache Traffic Server 6.0.0 to 6.2.3, 7.0.0 to 7.1.10, and 8.0.0 to 8.0.7 is vulnerable to certain types of HTTP/2 HEADE"
+      "description": "Apache Traffic Server 6.0.0 to 6.2.3, 7.0.0 to 7.1.10, and 8.0.0 to 8.0.7 is vulnerable to certain types of HTTP/2 HEADE",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-22901",
@@ -1425,7 +2099,9 @@
       "affected_below": "7.76.1",
       "fixed_in": "7.76.1",
       "severity": "HIGH",
-      "description": "curl 7.75.0 through 7.76.1 suffers from a use-after-free vulnerability resulting in already freed memory being used when"
+      "description": "curl 7.75.0 through 7.76.1 suffers from a use-after-free vulnerability resulting in already freed memory being used when",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-22946",
@@ -1433,7 +2109,9 @@
       "affected_below": "7.79.0",
       "fixed_in": "7.79.0",
       "severity": "HIGH",
-      "description": "A user can tell curl >= 7.20.0 and <= 7.78.0 to require a successful upgrade to TLS when speaking to an IMAP, POP3 or FT"
+      "description": "A user can tell curl >= 7.20.0 and <= 7.78.0 to require a successful upgrade to TLS when speaking to an IMAP, POP3 or FT",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-23017",
@@ -1441,7 +2119,9 @@
       "affected_below": "1.20.1",
       "fixed_in": "1.20.1",
       "severity": "HIGH",
-      "description": "A security issue in nginx resolver was identified, which might allow an attacker who is able to forge UDP packets from t"
+      "description": "A security issue in nginx resolver was identified, which might allow an attacker who is able to forge UDP packets from t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-23018",
@@ -1449,39 +2129,49 @@
       "affected_below": "3.4.0",
       "fixed_in": "3.4.0",
       "severity": "HIGH",
-      "description": "Intra-cluster communication does not use TLS. The services within the NGINX Controller 3.x before 3.4.0 namespace are us"
+      "description": "Intra-cluster communication does not use TLS. The services within the NGINX Controller 3.x before 3.4.0 namespace are us",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-23019",
       "product": "nginx",
-      "affected_below": "2.9.0",
-      "fixed_in": "2.9.0",
+      "affected_below": "3.15.0",
+      "fixed_in": "3.15.0",
       "severity": "HIGH",
-      "description": "The NGINX Controller 2.0.0 thru 2.9.0 and 3.x before 3.15.0 Administrator password may be exposed in the systemd.txt fil"
+      "description": "The NGINX Controller 2.0.0 thru 2.9.0 and 3.x before 3.15.0 Administrator password may be exposed in the systemd.txt fil",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-23050",
       "product": "nginx",
-      "affected_below": "1.3.0",
-      "fixed_in": "1.3.0",
+      "affected_below": "3.5.0",
+      "fixed_in": "3.5.0",
       "severity": "HIGH",
-      "description": "On BIG-IP Advanced WAF and BIG-IP ASM version 16.0.x before 16.0.1.2 and 15.1.x before 15.1.3 and NGINX App Protect on a"
+      "description": "On BIG-IP Advanced WAF and BIG-IP ASM version 16.0.x before 16.0.1.2 and 15.1.x before 15.1.3 and NGINX App Protect on a",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-23240",
       "product": "sudo",
-      "affected_below": "1.8.32",
-      "fixed_in": "1.8.32",
+      "affected_below": "1.9.5",
+      "fixed_in": "1.9.5",
       "severity": "HIGH",
-      "description": "selinux_edit_copy_tfiles in sudoedit in Sudo before 1.9.5 allows a local unprivileged user to gain file ownership and es"
+      "description": "selinux_edit_copy_tfiles in sudoedit in Sudo before 1.9.5 allows a local unprivileged user to gain file ownership and es",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-23840",
       "product": "openssl",
-      "affected_below": "1.0.2y",
-      "fixed_in": "1.0.2y",
+      "affected_below": "1.1.1j",
+      "fixed_in": "1.1.1j",
       "severity": "HIGH",
-      "description": "Calls to EVP_CipherUpdate, EVP_EncryptUpdate and EVP_DecryptUpdate may overflow the output length argument in some cases"
+      "description": "Calls to EVP_CipherUpdate, EVP_EncryptUpdate and EVP_DecryptUpdate may overflow the output length argument in some cases",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-26690",
@@ -1489,7 +2179,9 @@
       "affected_below": "2.4.46",
       "fixed_in": "2.4.46",
       "severity": "HIGH",
-      "description": "Apache HTTP Server versions 2.4.0 to 2.4.46 A specially crafted Cookie header handled by mod_session can cause a NULL po"
+      "description": "Apache HTTP Server versions 2.4.0 to 2.4.46 A specially crafted Cookie header handled by mod_session can cause a NULL po",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-27738",
@@ -1497,7 +2189,9 @@
       "affected_below": "3.1.2",
       "fixed_in": "3.1.2",
       "severity": "HIGH",
-      "description": "All request mappings in `StreamingCoordinatorController.java` handling `/kylin/api/streaming_coordinator/*` REST API end"
+      "description": "All request mappings in `StreamingCoordinatorController.java` handling `/kylin/api/streaming_coordinator/*` REST API end",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-28041",
@@ -1505,39 +2199,49 @@
       "affected_below": "8.5",
       "fixed_in": "8.5",
       "severity": "HIGH",
-      "description": "ssh-agent in OpenSSH before 8.5 has a double free that may be relevant in a few less-common scenarios, such as unconstra"
-    },
-    {
-      "cve_id": "CVE-2021-3100",
-      "product": "log4j",
-      "affected_below": "1.1-13",
-      "fixed_in": "1.1-13",
-      "severity": "HIGH",
-      "description": "The Apache Log4j hotpatch package before log4j-cve-2021-44228-hotpatch-1.1-13 didn\u2019t mimic the permissions of the JVM be"
+      "description": "ssh-agent in OpenSSH before 8.5 has a double free that may be relevant in a few less-common scenarios, such as unconstra",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-3156",
       "product": "sudo",
-      "affected_below": "1.8.32",
-      "fixed_in": "1.8.32",
+      "affected_below": "1.9.5",
+      "fixed_in": "1.9.5",
       "severity": "HIGH",
-      "description": "Sudo before 1.9.5p2 contains an off-by-one error that can result in a heap-based buffer overflow, which allows privilege"
+      "description": "Sudo before 1.9.5p2 contains an off-by-one error that can result in a heap-based buffer overflow, which allows privilege",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2021-32027",
+      "product": "postgresql",
+      "affected_below": "13.3",
+      "fixed_in": "13.3",
+      "severity": "HIGH",
+      "description": "A flaw was found in postgresql in versions before 13.3, before 12.7, before 11.12, before 10.17 and before 9.6.22. While",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-32566",
       "product": "apache",
-      "affected_below": "7.1.12",
-      "fixed_in": "7.1.12",
+      "affected_below": "9.0.1",
+      "fixed_in": "9.0.1",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/2 of Apache Traffic Server allows an attacker to DOS the server. This is"
+      "description": "Improper Input Validation vulnerability in HTTP/2 of Apache Traffic Server allows an attacker to DOS the server. This is",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-32567",
       "product": "apache",
-      "affected_below": "7.1.12",
-      "fixed_in": "7.1.12",
+      "affected_below": "9.0.1",
+      "fixed_in": "9.0.1",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/2 of Apache Traffic Server allows an attacker to DOS the server. This is"
+      "description": "Improper Input Validation vulnerability in HTTP/2 of Apache Traffic Server allows an attacker to DOS the server. This is",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-33193",
@@ -1545,7 +2249,9 @@
       "affected_below": "2.4.49",
       "fixed_in": "2.4.49",
       "severity": "HIGH",
-      "description": "A crafted method sent through HTTP/2 will bypass validation and be forwarded by mod_proxy, which can lead to request spl"
+      "description": "A crafted method sent through HTTP/2 will bypass validation and be forwarded by mod_proxy, which can lead to request spl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-3450",
@@ -1553,7 +2259,9 @@
       "affected_below": "1.1.1k",
       "fixed_in": "1.1.1k",
       "severity": "HIGH",
-      "description": "The X509_V_FLAG_X509_STRICT flag enables additional security checks of the certificates present in a certificate chain."
+      "description": "The X509_V_FLAG_X509_STRICT flag enables additional security checks of the certificates present in a certificate chain.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-34798",
@@ -1561,7 +2269,9 @@
       "affected_below": "2.4.48",
       "fixed_in": "2.4.48",
       "severity": "HIGH",
-      "description": "Malformed requests may cause the server to dereference a NULL pointer. This issue affects Apache HTTP Server 2.4.48 and"
+      "description": "Malformed requests may cause the server to dereference a NULL pointer. This issue affects Apache HTTP Server 2.4.48 and",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2021-3560",
@@ -1569,7 +2279,9 @@
       "affected_below": "0.119",
       "fixed_in": "0.119",
       "severity": "HIGH",
-      "description": "It was found that polkit could be tricked into bypassing the credential checks for D-Bus requests, elevating the privile"
+      "description": "It was found that polkit could be tricked into bypassing the credential checks for D-Bus requests, elevating the privile",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-36160",
@@ -1577,15 +2289,19 @@
       "affected_below": "2.4.49",
       "fixed_in": "2.4.49",
       "severity": "HIGH",
-      "description": "A carefully crafted request uri-path can cause mod_proxy_uwsgi to read above the allocated memory and crash (DoS). This"
+      "description": "A carefully crafted request uri-path can cause mod_proxy_uwsgi to read above the allocated memory and crash (DoS). This",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-3712",
       "product": "openssl",
-      "affected_below": "1.0.2za",
-      "fixed_in": "1.0.2za",
+      "affected_below": "1.1.1l",
+      "fixed_in": "1.1.1l",
       "severity": "HIGH",
-      "description": "ASN.1 strings are represented internally within OpenSSL as an ASN1_STRING structure which contains a buffer holding the"
+      "description": "ASN.1 strings are represented internally within OpenSSL as an ASN1_STRING structure which contains a buffer holding the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-4034",
@@ -1593,7 +2309,9 @@
       "affected_below": "121",
       "fixed_in": "121",
       "severity": "HIGH",
-      "description": "A local privilege escalation vulnerability was found on polkit's pkexec utility. The pkexec application is a setuid tool"
+      "description": "A local privilege escalation vulnerability was found on polkit's pkexec utility. The pkexec application is a setuid tool",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-4044",
@@ -1601,7 +2319,9 @@
       "affected_below": "1.0.2",
       "fixed_in": "1.0.2",
       "severity": "HIGH",
-      "description": "Internally libssl in OpenSSL calls X509_verify_cert() on the client side to verify a certificate supplied by a server. T"
+      "description": "Internally libssl in OpenSSL calls X509_verify_cert() on the client side to verify a certificate supplied by a server. T",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-41617",
@@ -1609,7 +2329,9 @@
       "affected_below": "8.8",
       "fixed_in": "8.8",
       "severity": "HIGH",
-      "description": "sshd in OpenSSH 6.2 through 8.x before 8.8, when certain non-default configurations are used, allows privilege escalatio"
+      "description": "sshd in OpenSSH 6.2 through 8.x before 8.8, when certain non-default configurations are used, allows privilege escalatio",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2021-44224",
@@ -1617,31 +2339,29 @@
       "affected_below": "2.4.52",
       "fixed_in": "2.4.52",
       "severity": "HIGH",
-      "description": "A crafted URI sent to httpd configured as a forward proxy (ProxyRequests on) can cause a crash (NULL pointer dereference"
-    },
-    {
-      "cve_id": "CVE-2022-0070",
-      "product": "log4j",
-      "affected_below": "1.1-16",
-      "fixed_in": "1.1-16",
-      "severity": "HIGH",
-      "description": "Incomplete fix for CVE-2021-3100. The Apache Log4j hotpatch package starting with log4j-cve-2021-44228-hotpatch-1.1-16 w"
+      "description": "A crafted URI sent to httpd configured as a forward proxy (ProxyRequests on) can cause a crash (NULL pointer dereference",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-0778",
       "product": "openssl",
-      "affected_below": "1.0.2zd",
-      "fixed_in": "1.0.2zd",
+      "affected_below": "3.0.2",
+      "fixed_in": "3.0.2",
       "severity": "HIGH",
-      "description": "The BN_mod_sqrt() function, which computes a modular square root, contains a bug that can cause it to loop forever for n"
+      "description": "The BN_mod_sqrt() function, which computes a modular square root, contains a bug that can cause it to loop forever for n",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-1292",
       "product": "openssl",
-      "affected_below": "1.0.2ze",
-      "fixed_in": "1.0.2ze",
+      "affected_below": "3.0.3",
+      "fixed_in": "3.0.3",
       "severity": "HIGH",
-      "description": "The c_rehash script does not properly sanitise shell metacharacters to prevent command injection. This script is distrib"
+      "description": "The c_rehash script does not properly sanitise shell metacharacters to prevent command injection. This script is distrib",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-1473",
@@ -1649,15 +2369,39 @@
       "affected_below": "3.0.3",
       "fixed_in": "3.0.3",
       "severity": "HIGH",
-      "description": "The OPENSSL_LH_flush() function, which empties a hash table, contains a bug that breaks reuse of the memory occuppied by"
+      "description": "The OPENSSL_LH_flush() function, which empties a hash table, contains a bug that breaks reuse of the memory occuppied by",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2022-1552",
+      "product": "postgresql",
+      "affected_below": "14.3",
+      "fixed_in": "14.3",
+      "severity": "HIGH",
+      "description": "A flaw was found in PostgreSQL. There is an issue with incomplete efforts to operate safely when a privileged user is ma",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-2068",
       "product": "openssl",
-      "affected_below": "1.0.2zf",
-      "fixed_in": "1.0.2zf",
+      "affected_below": "3.0.4",
+      "fixed_in": "3.0.4",
       "severity": "HIGH",
-      "description": "In addition to the c_rehash shell command injection identified in CVE-2022-1292, further circumstances where the c_rehas"
+      "description": "In addition to the c_rehash shell command injection identified in CVE-2022-1292, further circumstances where the c_rehas",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2022-21724",
+      "product": "postgresql",
+      "affected_below": "42.3.2",
+      "fixed_in": "42.3.2",
+      "severity": "HIGH",
+      "description": "pgjdbc is the offical PostgreSQL JDBC Driver. A security hole was found in the jdbc driver for postgresql database while",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-22576",
@@ -1665,7 +2409,9 @@
       "affected_below": "7.83.0",
       "fixed_in": "7.83.0",
       "severity": "HIGH",
-      "description": "An improper authentication vulnerability exists in curl 7.33.0 to and including 7.82.0 which might allow reuse OAUTH2-au"
+      "description": "An improper authentication vulnerability exists in curl 7.33.0 to and including 7.82.0 which might allow reuse OAUTH2-au",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-22719",
@@ -1673,39 +2419,39 @@
       "affected_below": "2.4.52",
       "fixed_in": "2.4.52",
       "severity": "HIGH",
-      "description": "A carefully crafted request body can cause a read to a random memory area which could cause the process to crash. This i"
+      "description": "A carefully crafted request body can cause a read to a random memory area which could cause the process to crash. This i",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-23206",
       "product": "apache",
-      "affected_below": "5.1.6",
-      "fixed_in": "5.1.6",
+      "affected_below": "6.1.0",
+      "fixed_in": "6.1.0",
       "severity": "HIGH",
-      "description": "In Apache Traffic Control Traffic Ops prior to 6.1.0 or 5.1.6, an unprivileged user who can reach Traffic Ops over HTTPS"
-    },
-    {
-      "cve_id": "CVE-2022-23302",
-      "product": "log4j",
-      "affected_below": "1.2.17",
-      "fixed_in": "1.2.17",
-      "severity": "HIGH",
-      "description": "JMSSink in all versions of Log4j 1.x is vulnerable to deserialization of untrusted data when the attacker has write acce"
-    },
-    {
-      "cve_id": "CVE-2022-23307",
-      "product": "log4j",
-      "affected_below": "2.0",
-      "fixed_in": "2.0",
-      "severity": "HIGH",
-      "description": "CVE-2020-9493 identified a deserialization issue that was present in Apache Chainsaw. Prior to Chainsaw V2.0 Chainsaw wa"
+      "description": "In Apache Traffic Control Traffic Ops prior to 6.1.0 or 5.1.6, an unprivileged user who can reach Traffic Ops over HTTPS",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-25763",
       "product": "apache",
-      "affected_below": "8.1.5",
-      "fixed_in": "8.1.5",
+      "affected_below": "9.1.3",
+      "fixed_in": "9.1.3",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/2 request validation of Apache Traffic Server allows an attacker to crea"
+      "description": "Improper Input Validation vulnerability in HTTP/2 request validation of Apache Traffic Server allows an attacker to crea",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2022-2625",
+      "product": "postgresql",
+      "affected_below": "14.5",
+      "fixed_in": "14.5",
+      "severity": "HIGH",
+      "description": "A vulnerability was found in PostgreSQL. This attack requires permission to create non-temporary objects in at least one",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-26377",
@@ -1713,7 +2459,9 @@
       "affected_below": "2.4.54",
       "fixed_in": "2.4.54",
       "severity": "HIGH",
-      "description": "Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling') vulnerability in mod_proxy_ajp of Apache HTTP Se"
+      "description": "Inconsistent Interpretation of HTTP Requests ('HTTP Request Smuggling') vulnerability in mod_proxy_ajp of Apache HTTP Se",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-27775",
@@ -1721,7 +2469,9 @@
       "affected_below": "7.82.0",
       "fixed_in": "7.82.0",
       "severity": "HIGH",
-      "description": "An information disclosure vulnerability exists in curl 7.65.0 to 7.82.0 are vulnerable that by using an IPv6 address tha"
+      "description": "An information disclosure vulnerability exists in curl 7.65.0 to 7.82.0 are vulnerable that by using an IPv6 address tha",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-27780",
@@ -1729,23 +2479,19 @@
       "affected_below": "7.83.1",
       "fixed_in": "7.83.1",
       "severity": "HIGH",
-      "description": "The curl URL parser wrongly accepts percent-encoded URL separators like '/'when decoding the host name part of a URL, ma"
+      "description": "The curl URL parser wrongly accepts percent-encoded URL separators like '/'when decoding the host name part of a URL, ma",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-28129",
       "product": "apache",
-      "affected_below": "8.1.4",
-      "fixed_in": "8.1.4",
+      "affected_below": "9.1.2",
+      "fixed_in": "9.1.2",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/1.1 header parsing of Apache Traffic Server allows an attacker to send i"
-    },
-    {
-      "cve_id": "CVE-2022-29072",
-      "product": "7-zip",
-      "affected_below": "21.07",
-      "fixed_in": "21.07",
-      "severity": "HIGH",
-      "description": "7-Zip through 21.07 on Windows allows privilege escalation and command execution when a file with the .7z extension is d"
+      "description": "Improper Input Validation vulnerability in HTTP/1.1 header parsing of Apache Traffic Server allows an attacker to send i",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-29404",
@@ -1753,7 +2499,9 @@
       "affected_below": "2.4.53",
       "fixed_in": "2.4.53",
       "severity": "HIGH",
-      "description": "In Apache HTTP Server 2.4.53 and earlier, a malicious request to a lua script that calls r:parsebody(0) may cause a deni"
+      "description": "In Apache HTTP Server 2.4.53 and earlier, a malicious request to a lua script that calls r:parsebody(0) may cause a deni",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-30556",
@@ -1761,7 +2509,9 @@
       "affected_below": "2.4.54",
       "fixed_in": "2.4.54",
       "severity": "HIGH",
-      "description": "Apache HTTP Server 2.4.53 and earlier may return lengths to applications calling r:wsread() that point past the end of t"
+      "description": "Apache HTTP Server 2.4.53 and earlier may return lengths to applications calling r:wsread() that point past the end of t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-31124",
@@ -1769,23 +2519,39 @@
       "affected_below": "0.0.6",
       "fixed_in": "0.0.6",
       "severity": "HIGH",
-      "description": "openssh_key_parser is an open source Python package providing utilities to parse and pack OpenSSH private and public key"
+      "description": "openssh_key_parser is an open source Python package providing utilities to parse and pack OpenSSH private and public key",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2022-31197",
+      "product": "postgresql",
+      "affected_below": "42.3.7",
+      "fixed_in": "42.3.7",
+      "severity": "HIGH",
+      "description": "PostgreSQL JDBC Driver (PgJDBC for short) allows Java programs to connect to a PostgreSQL database using standard, datab",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-31779",
       "product": "apache",
-      "affected_below": "8.1.4",
-      "fixed_in": "8.1.4",
+      "affected_below": "9.1.2",
+      "fixed_in": "9.1.2",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/2 header parsing of Apache Traffic Server allows an attacker to smuggle"
+      "description": "Improper Input Validation vulnerability in HTTP/2 header parsing of Apache Traffic Server allows an attacker to smuggle",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-31780",
       "product": "apache",
-      "affected_below": "8.1.4",
-      "fixed_in": "8.1.4",
+      "affected_below": "9.1.2",
+      "fixed_in": "9.1.2",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in HTTP/2 frame handling of Apache Traffic Server allows an attacker to smuggle"
+      "description": "Improper Input Validation vulnerability in HTTP/2 frame handling of Apache Traffic Server allows an attacker to smuggle",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-3358",
@@ -1793,31 +2559,19 @@
       "affected_below": "3.0.6",
       "fixed_in": "3.0.6",
       "severity": "HIGH",
-      "description": "OpenSSL supports creating a custom cipher via the legacy EVP_CIPHER_meth_new() function and associated function calls. T"
+      "description": "OpenSSL supports creating a custom cipher via the legacy EVP_CIPHER_meth_new() function and associated function calls. T",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-33684",
       "product": "apache",
-      "affected_below": "2.6.4",
-      "fixed_in": "2.6.4",
+      "affected_below": "2.10.2",
+      "fixed_in": "2.10.2",
       "severity": "HIGH",
-      "description": "The Apache Pulsar C++ Client does not verify peer TLS certificates when making HTTPS calls for the OAuth2.0 Client Crede"
-    },
-    {
-      "cve_id": "CVE-2022-33915",
-      "product": "log4j",
-      "affected_below": "1.3.5",
-      "fixed_in": "1.3.5",
-      "severity": "HIGH",
-      "description": "Versions of the Amazon AWS Apache Log4j hotpatch package before log4j-cve-2021-44228-hotpatch-1.3.5 are affected by a ra"
-    },
-    {
-      "cve_id": "CVE-2022-34169",
-      "product": "openjdk",
-      "affected_below": "11.0.15",
-      "fixed_in": "11.0.15",
-      "severity": "HIGH",
-      "description": "The Apache Xalan Java XSLT library is vulnerable to an integer truncation issue when processing malicious XSLT styleshee"
+      "description": "The Apache Pulsar C++ Client does not verify peer TLS certificates when making HTTPS calls for the OAuth2.0 Client Crede",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-3602",
@@ -1825,31 +2579,49 @@
       "affected_below": "3.0.7",
       "fixed_in": "3.0.7",
       "severity": "HIGH",
-      "description": "A buffer overrun can be triggered in X.509 certificate verification, specifically in name constraint checking. Note that"
+      "description": "A buffer overrun can be triggered in X.509 certificate verification, specifically in name constraint checking. Note that",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-41741",
       "product": "nginx",
-      "affected_below": "1.22.0",
-      "fixed_in": "1.22.0",
+      "affected_below": "r27",
+      "fixed_in": "r27",
       "severity": "HIGH",
-      "description": "NGINX Open Source before versions 1.23.2 and 1.22.1, NGINX Open Source Subscription before versions R2 P1 and R1 P1, and"
+      "description": "NGINX Open Source before versions 1.23.2 and 1.22.1, NGINX Open Source Subscription before versions R2 P1 and R1 P1, and",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-41742",
       "product": "nginx",
-      "affected_below": "1.22.0",
-      "fixed_in": "1.22.0",
+      "affected_below": "r27",
+      "fixed_in": "r27",
       "severity": "HIGH",
-      "description": "NGINX Open Source before versions 1.23.2 and 1.22.1, NGINX Open Source Subscription before versions R2 P1 and R1 P1, and"
+      "description": "NGINX Open Source before versions 1.23.2 and 1.22.1, NGINX Open Source Subscription before versions R2 P1 and R1 P1, and",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2022-41743",
       "product": "nginx",
-      "affected_below": "1.12.4",
-      "fixed_in": "1.12.4",
+      "affected_below": "r27",
+      "fixed_in": "r27",
       "severity": "HIGH",
-      "description": "NGINX Plus before versions R27 P1 and R26 P1 have a vulnerability in the module ngx_http_hls_module that might allow a l"
+      "description": "NGINX Plus before versions R27 P1 and R26 P1 have a vulnerability in the module ngx_http_hls_module that might allow a l",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2022-4223",
+      "product": "postgresql",
+      "affected_below": "6.17",
+      "fixed_in": "6.17",
+      "severity": "HIGH",
+      "description": "The pgAdmin server includes an HTTP API that is intended to be used to validate the path a user selects to external Post",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-42915",
@@ -1857,7 +2629,9 @@
       "affected_below": "7.86.0",
       "fixed_in": "7.86.0",
       "severity": "HIGH",
-      "description": "curl before 7.86.0 has a double free. If curl is told to use an HTTP proxy for a transfer with a non-HTTP(S) URL, it set"
+      "description": "curl before 7.86.0 has a double free. If curl is told to use an HTTP proxy for a transfer with a non-HTTP(S) URL, it set",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-42916",
@@ -1865,7 +2639,9 @@
       "affected_below": "7.86.0",
       "fixed_in": "7.86.0",
       "severity": "HIGH",
-      "description": "In curl before 7.86.0, the HSTS check could be bypassed to trick it into staying with HTTP. Using its HSTS support, curl"
+      "description": "In curl before 7.86.0, the HSTS check could be bypassed to trick it into staying with HTTP. Using its HSTS support, curl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-43551",
@@ -1873,7 +2649,9 @@
       "affected_below": "7.87.0",
       "fixed_in": "7.87.0",
       "severity": "HIGH",
-      "description": "A vulnerability exists in curl <7.87.0 HSTS check that could be bypassed to trick it to keep using HTTP. Using its HSTS"
+      "description": "A vulnerability exists in curl <7.87.0 HSTS check that could be bypassed to trick it to keep using HTTP. Using its HSTS",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-43995",
@@ -1881,23 +2659,39 @@
       "affected_below": "1.9.12",
       "fixed_in": "1.9.12",
       "severity": "HIGH",
-      "description": "Sudo 1.8.0 through 1.9.12, with the crypt() password backend, contains a plugins/sudoers/auth/passwd.c array-out-of-boun"
+      "description": "Sudo 1.8.0 through 1.9.12, with the crypt() password backend, contains a plugins/sudoers/auth/passwd.c array-out-of-boun",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2022-4450",
       "product": "openssl",
-      "affected_below": "1.1.1t",
-      "fixed_in": "1.1.1t",
+      "affected_below": "3.0.8",
+      "fixed_in": "3.0.8",
       "severity": "HIGH",
-      "description": "The function PEM_read_bio_ex() reads a PEM file from a BIO and parses and decodes the \"name\" (e.g. \"CERTIFICATE\"), any h"
+      "description": "The function PEM_read_bio_ex() reads a PEM file from a BIO and parses and decodes the \"name\" (e.g. \"CERTIFICATE\"), any h",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2022-45786",
+      "product": "postgresql",
+      "affected_below": "1.1.0",
+      "fixed_in": "1.1.0",
+      "severity": "HIGH",
+      "description": "There are issues with the AGE drivers for Golang and Python that enable SQL injections to occur. This impacts AGE for Po",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-0215",
       "product": "openssl",
-      "affected_below": "1.0.2zg",
-      "fixed_in": "1.0.2zg",
+      "affected_below": "3.0.8",
+      "fixed_in": "3.0.8",
       "severity": "HIGH",
-      "description": "The public API function BIO_new_NDEF is a helper function used for streaming ASN.1 data via a BIO. It is primarily used"
+      "description": "The public API function BIO_new_NDEF is a helper function used for streaming ASN.1 data via a BIO. It is primarily used",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-0216",
@@ -1905,7 +2699,9 @@
       "affected_below": "3.0.7",
       "fixed_in": "3.0.7",
       "severity": "HIGH",
-      "description": "An invalid pointer dereference on read can be triggered when an application tries to load malformed PKCS7 data with the"
+      "description": "An invalid pointer dereference on read can be triggered when an application tries to load malformed PKCS7 data with the",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-0217",
@@ -1913,15 +2709,19 @@
       "affected_below": "3.0.7",
       "fixed_in": "3.0.7",
       "severity": "HIGH",
-      "description": "An invalid pointer dereference on read can be triggered when an application tries to check a malformed DSA public key by"
+      "description": "An invalid pointer dereference on read can be triggered when an application tries to check a malformed DSA public key by",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-0286",
       "product": "openssl",
-      "affected_below": "1.0.2zg",
-      "fixed_in": "1.0.2zg",
+      "affected_below": "3.0.8",
+      "fixed_in": "3.0.8",
       "severity": "HIGH",
-      "description": "There is a type confusion vulnerability relating to X.400 address processing inside an X.509 GeneralName. X.400 addresse"
+      "description": "There is a type confusion vulnerability relating to X.400 address processing inside an X.509 GeneralName. X.400 addresse",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-0401",
@@ -1929,15 +2729,19 @@
       "affected_below": "3.0.7",
       "fixed_in": "3.0.7",
       "severity": "HIGH",
-      "description": "A NULL pointer can be dereferenced when signatures are being verified on PKCS7 signed or signedAndEnveloped data. In cas"
+      "description": "A NULL pointer can be dereferenced when signatures are being verified on PKCS7 signed or signedAndEnveloped data. In cas",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-0464",
       "product": "openssl",
-      "affected_below": "1.0.2zh",
-      "fixed_in": "1.0.2zh",
+      "affected_below": "3.1.1",
+      "fixed_in": "3.1.1",
       "severity": "HIGH",
-      "description": "A security vulnerability has been identified in all supported versions  of OpenSSL related to the verification of X.509"
+      "description": "A security vulnerability has been identified in all supported versions  of OpenSSL related to the verification of X.509",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-22809",
@@ -1945,7 +2749,9 @@
       "affected_below": "1.9.12",
       "fixed_in": "1.9.12",
       "severity": "HIGH",
-      "description": "In Sudo before 1.9.12p2, the sudoedit (aka -e) feature mishandles extra arguments passed in the user-provided environmen"
+      "description": "In Sudo before 1.9.12p2, the sudoedit (aka -e) feature mishandles extra arguments passed in the user-provided environmen",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-23596",
@@ -1953,15 +2759,19 @@
       "affected_below": "2.9.19",
       "fixed_in": "2.9.19",
       "severity": "HIGH",
-      "description": "jc21 NGINX Proxy Manager through 2.9.19 allows OS command injection. When creating an access list, the backend builds an"
+      "description": "jc21 NGINX Proxy Manager through 2.9.19 allows OS command injection. When creating an access list, the backend builds an",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
-      "cve_id": "CVE-2023-26464",
-      "product": "log4j",
-      "affected_below": "2.0",
-      "fixed_in": "2.0",
+      "cve_id": "CVE-2023-2454",
+      "product": "postgresql",
+      "affected_below": "15.3",
+      "fixed_in": "15.3",
       "severity": "HIGH",
-      "description": "** UNSUPPORTED WHEN ASSIGNED **  When using the Chainsaw or SocketAppender components with Log4j 1.x on JRE less than 1."
+      "description": "schema_element defeats protective search_path changes; It was found that certain database calls in PostgreSQL could perm",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-27320",
@@ -1969,7 +2779,9 @@
       "affected_below": "1.9.13",
       "fixed_in": "1.9.13",
       "severity": "HIGH",
-      "description": "Sudo before 1.9.13p2 has a double free in the per-command chroot feature."
+      "description": "Sudo before 1.9.13p2 has a double free in the per-command chroot feature.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-27522",
@@ -1977,7 +2789,9 @@
       "affected_below": "2.4.56",
       "fixed_in": "2.4.56",
       "severity": "HIGH",
-      "description": "HTTP Response Smuggling vulnerability in Apache HTTP Server via mod_proxy_uwsgi. This issue affects Apache HTTP Server:"
+      "description": "HTTP Response Smuggling vulnerability in Apache HTTP Server via mod_proxy_uwsgi. This issue affects Apache HTTP Server:",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-27533",
@@ -1985,7 +2799,9 @@
       "affected_below": "7.881",
       "fixed_in": "7.881",
       "severity": "HIGH",
-      "description": "A vulnerability in input validation exists in curl <8.0 during communication using the TELNET protocol may allow an atta"
+      "description": "A vulnerability in input validation exists in curl <8.0 during communication using the TELNET protocol may allow an atta",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-27534",
@@ -1993,7 +2809,9 @@
       "affected_below": "7.88.1",
       "fixed_in": "7.88.1",
       "severity": "HIGH",
-      "description": "A path traversal vulnerability exists in curl <8.0.0 SFTP implementation causes the tilde (~) character to be wrongly re"
+      "description": "A path traversal vulnerability exists in curl <8.0.0 SFTP implementation causes the tilde (~) character to be wrongly re",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2023-28319",
@@ -2001,23 +2819,29 @@
       "affected_below": "8.1.0",
       "fixed_in": "8.1.0",
       "severity": "HIGH",
-      "description": "A use after free vulnerability exists in curl <v8.1.0 in the way libcurl offers a feature to verify an SSH server's publ"
+      "description": "A use after free vulnerability exists in curl <v8.1.0 in the way libcurl offers a feature to verify an SSH server's publ",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-28656",
       "product": "nginx",
-      "affected_below": "1.5.0",
-      "fixed_in": "1.5.0",
+      "affected_below": "2.9.0",
+      "fixed_in": "2.9.0",
       "severity": "HIGH",
-      "description": "NGINX Management Suite may allow an authenticated attacker to gain access to configuration objects outside of their assi"
+      "description": "NGINX Management Suite may allow an authenticated attacker to gain access to configuration objects outside of their assi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-28724",
       "product": "nginx",
-      "affected_below": "1.5.0",
-      "fixed_in": "1.5.0",
+      "affected_below": "2.9.0",
+      "fixed_in": "2.9.0",
       "severity": "HIGH",
-      "description": "NGINX Management Suite default file permissions are set such that an authenticated attacker may be able to modify sensit"
+      "description": "NGINX Management Suite default file permissions are set such that an authenticated attacker may be able to modify sensit",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-29055",
@@ -2025,15 +2849,9 @@
       "affected_below": "4.0.4",
       "fixed_in": "4.0.4",
       "severity": "HIGH",
-      "description": "In Apache Kylin version 2.0.0 to 4.0.3, there is a Server Config web interface that displays the content of file 'kylin."
-    },
-    {
-      "cve_id": "CVE-2023-31102",
-      "product": "7-zip",
-      "affected_below": "22.01",
-      "fixed_in": "22.01",
-      "severity": "HIGH",
-      "description": "Ppmd7.c in 7-Zip before 23.00 allows an integer underflow and invalid read operation via a crafted 7Z archive."
+      "description": "In Apache Kylin version 2.0.0 to 4.0.3, there is a Server Config web interface that displays the content of file 'kylin.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-31122",
@@ -2041,7 +2859,19 @@
       "affected_below": "2.4.58",
       "fixed_in": "2.4.58",
       "severity": "HIGH",
-      "description": "Out-of-bounds Read vulnerability in mod_macro of Apache HTTP Server.This issue affects Apache HTTP Server: through 2.4.5"
+      "description": "Out-of-bounds Read vulnerability in mod_macro of Apache HTTP Server.This issue affects Apache HTTP Server: through 2.4.5",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2023-32305",
+      "product": "postgresql",
+      "affected_below": "1.1.9",
+      "fixed_in": "1.1.9",
+      "severity": "HIGH",
+      "description": "aiven-extras is a PostgreSQL extension. Versions prior to 1.1.9 contain a privilege escalation vulnerability, allowing e",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-38039",
@@ -2049,15 +2879,19 @@
       "affected_below": "8.3.0",
       "fixed_in": "8.3.0",
       "severity": "HIGH",
-      "description": "When curl retrieves an HTTP response, it stores the incoming headers so that they can be accessed later via the libcurl"
+      "description": "When curl retrieves an HTTP response, it stores the incoming headers so that they can be accessed later via the libcurl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-38522",
       "product": "apache",
-      "affected_below": "8.1.11",
-      "fixed_in": "8.1.11",
+      "affected_below": "9.2.5",
+      "fixed_in": "9.2.5",
       "severity": "HIGH",
-      "description": "Apache Traffic Server accepts characters that are not allowed for HTTP field names and forwards malformed requests to or"
+      "description": "Apache Traffic Server accepts characters that are not allowed for HTTP field names and forwards malformed requests to or",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-38709",
@@ -2065,7 +2899,19 @@
       "affected_below": "2.4.59",
       "fixed_in": "2.4.59",
       "severity": "HIGH",
-      "description": "Faulty input validation in the core of Apache allows malicious or exploitable backend/content generators to split HTTP r"
+      "description": "Faulty input validation in the core of Apache allows malicious or exploitable backend/content generators to split HTTP r",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2023-39417",
+      "product": "postgresql",
+      "affected_below": "15.4",
+      "fixed_in": "15.4",
+      "severity": "HIGH",
+      "description": "IN THE EXTENSION SCRIPT, a SQL Injection vulnerability was found in PostgreSQL if it uses @extowner@, @extschema@, or @e",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-39456",
@@ -2073,7 +2919,9 @@
       "affected_below": "9.2.3",
       "fixed_in": "9.2.3",
       "severity": "HIGH",
-      "description": "Improper Input Validation vulnerability in Apache Traffic Server with malformed HTTP/2 frames.This issue affects Apache"
+      "description": "Improper Input Validation vulnerability in Apache Traffic Server with malformed HTTP/2 frames.This issue affects Apache",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-40195",
@@ -2081,7 +2929,9 @@
       "affected_below": "4.1.3",
       "fixed_in": "4.1.3",
       "severity": "HIGH",
-      "description": "Deserialization of Untrusted Data, Inclusion of Functionality from Untrusted Control Sphere vulnerability in Apache Soft"
+      "description": "Deserialization of Untrusted Data, Inclusion of Functionality from Untrusted Control Sphere vulnerability in Apache Soft",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-42465",
@@ -2089,7 +2939,9 @@
       "affected_below": "1.9.15",
       "fixed_in": "1.9.15",
       "severity": "HIGH",
-      "description": "Sudo before 1.9.15 might allow row hammer attacks (for authentication bypass or privilege escalation) because applicatio"
+      "description": "Sudo before 1.9.15 might allow row hammer attacks (for authentication bypass or privilege escalation) because applicatio",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-43622",
@@ -2097,15 +2949,19 @@
       "affected_below": "2.4.58",
       "fixed_in": "2.4.58",
       "severity": "HIGH",
-      "description": "An attacker, opening a HTTP/2 connection with an initial window size of 0, was able to block handling of that connection"
+      "description": "An attacker, opening a HTTP/2 connection with an initial window size of 0, was able to block handling of that connection",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-4807",
       "product": "openssl",
-      "affected_below": "1.1.1w",
-      "fixed_in": "1.1.1w",
+      "affected_below": "3.1.3",
+      "fixed_in": "3.1.3",
       "severity": "HIGH",
-      "description": "Issue summary: The POLY1305 MAC (message authentication code) implementation contains a bug that might corrupt the inter"
+      "description": "Issue summary: The POLY1305 MAC (message authentication code) implementation contains a bug that might corrupt the inter",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-49250",
@@ -2113,7 +2969,9 @@
       "affected_below": "3.2.1",
       "fixed_in": "3.2.1",
       "severity": "HIGH",
-      "description": "Because the HttpUtils class did not verify certificates, an attacker that could perform a Man-in-the-Middle (MITM) attac"
+      "description": "Because the HttpUtils class did not verify certificates, an attacker that could perform a Man-in-the-Middle (MITM) attac",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-5043",
@@ -2121,7 +2979,9 @@
       "affected_below": "1.9.0",
       "fixed_in": "1.9.0",
       "severity": "HIGH",
-      "description": "Ingress nginx annotation injection causes arbitrary command execution."
+      "description": "Ingress nginx annotation injection causes arbitrary command execution.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-5044",
@@ -2129,23 +2989,49 @@
       "affected_below": "1.9.0",
       "fixed_in": "1.9.0",
       "severity": "HIGH",
-      "description": "Code injection via nginx.ingress.kubernetes.io/permanent-redirect annotation."
+      "description": "Code injection via nginx.ingress.kubernetes.io/permanent-redirect annotation.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2023-5363",
       "product": "openssl",
-      "affected_below": "3.0.12",
-      "fixed_in": "3.0.12",
+      "affected_below": "3.1.4",
+      "fixed_in": "3.1.4",
       "severity": "HIGH",
-      "description": "Issue summary: A bug has been identified in the processing of key and initialisation vector (IV) lengths.  This can lead"
+      "description": "Issue summary: A bug has been identified in the processing of key and initialisation vector (IV) lengths.  This can lead",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
-      "cve_id": "CVE-2024-11477",
-      "product": "7-zip",
-      "affected_below": "24.07",
-      "fixed_in": "24.07",
+      "cve_id": "CVE-2023-5869",
+      "product": "postgresql",
+      "affected_below": "15.5",
+      "fixed_in": "15.5",
       "severity": "HIGH",
-      "description": "7-Zip Zstandard Decompression Integer Underflow Remote Code Execution Vulnerability. This vulnerability allows remote at"
+      "description": "A flaw was found in PostgreSQL that allows authenticated database users to execute arbitrary code through missing overfl",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2024-0985",
+      "product": "postgresql",
+      "affected_below": "15.6",
+      "fixed_in": "15.6",
+      "severity": "HIGH",
+      "description": "Late privilege drop in REFRESH MATERIALIZED VIEW CONCURRENTLY in PostgreSQL allows an object creator to execute arbitrar",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2024-10979",
+      "product": "postgresql",
+      "affected_below": "17.1",
+      "fixed_in": "17.1",
+      "severity": "HIGH",
+      "description": "Incorrect control of environment variables in PostgreSQL PL/Perl allows an unprivileged database user to change sensitiv",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-22196",
@@ -2153,7 +3039,9 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "Nginx-UI is an online statistics for Server Indicators\u200b\u200b Monitor CPU usage, memory usage, load average, and disk usage i"
+      "description": "Nginx-UI is an online statistics for Server Indicators\u200b\u200b Monitor CPU usage, memory usage, load average, and disk usage i",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-22197",
@@ -2161,7 +3049,9 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "Nginx-ui is online statistics for Server Indicators\u200b\u200b Monitor CPU usage, memory usage, load average, and disk usage in r"
+      "description": "Nginx-ui is online statistics for Server Indicators\u200b\u200b Monitor CPU usage, memory usage, load average, and disk usage in r",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-22198",
@@ -2169,7 +3059,9 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "Nginx-UI is a web interface to manage Nginx configurations. It is vulnerable to arbitrary command execution by abusing t"
+      "description": "Nginx-UI is a web interface to manage Nginx configurations. It is vulnerable to arbitrary command execution by abusing t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-23452",
@@ -2177,7 +3069,9 @@
       "affected_below": "1.8.0",
       "fixed_in": "1.8.0",
       "severity": "HIGH",
-      "description": "Request smuggling vulnerability in HTTP server in Apache bRPC 0.9.5~1.7.0 on all platforms allows attacker to smuggle re"
+      "description": "Request smuggling vulnerability in HTTP server in Apache bRPC 0.9.5~1.7.0 on all platforms allows attacker to smuggle re",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-23828",
@@ -2185,7 +3079,9 @@
       "affected_below": "2.0.0",
       "fixed_in": "2.0.0",
       "severity": "HIGH",
-      "description": "Nginx-UI is a web interface to manage Nginx configurations. It is vulnerable to an authenticated arbitrary command execu"
+      "description": "Nginx-UI is a web interface to manage Nginx configurations. It is vulnerable to an authenticated arbitrary command execu",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-24990",
@@ -2193,23 +3089,29 @@
       "affected_below": "1.25.4",
       "fixed_in": "1.25.4",
       "severity": "HIGH",
-      "description": "When NGINX Plus or NGINX OSS are configured to use the HTTP/3 QUIC module, undisclosed requests can cause NGINX worker p"
+      "description": "When NGINX Plus or NGINX OSS are configured to use the HTTP/3 QUIC module, undisclosed requests can cause NGINX worker p",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-31309",
       "product": "apache",
-      "affected_below": "8.1.10",
-      "fixed_in": "8.1.10",
+      "affected_below": "9.2.4",
+      "fixed_in": "9.2.4",
       "severity": "HIGH",
-      "description": "HTTP/2 CONTINUATION\u00a0DoS attack can cause Apache Traffic Server to consume more resources on the server.\u00a0 Version from 8."
+      "description": "HTTP/2 CONTINUATION\u00a0DoS attack can cause Apache Traffic Server to consume more resources on the server.\u00a0 Version from 8.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-35161",
       "product": "apache",
-      "affected_below": "8.1.11",
-      "fixed_in": "8.1.11",
+      "affected_below": "9.2.5",
+      "fixed_in": "9.2.5",
       "severity": "HIGH",
-      "description": "Apache Traffic Server forwards malformed HTTP chunked trailer section to origin servers. This can be utilized for reques"
+      "description": "Apache Traffic Server forwards malformed HTTP chunked trailer section to origin servers. This can be utilized for reques",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-3738",
@@ -2217,7 +3119,9 @@
       "affected_below": "4.2.4",
       "fixed_in": "4.2.4",
       "severity": "HIGH",
-      "description": "A vulnerability classified as critical has been found in cym1102 nginxWebUI up to 3.9.9. This affects the function handl"
+      "description": "A vulnerability classified as critical has been found in cym1102 nginxWebUI up to 3.9.9. This affects the function handl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38472",
@@ -2225,7 +3129,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "HIGH",
-      "description": "SSRF in Apache HTTP Server on Windows allows to potentially leak NTLM hashes to a malicious server via SSRF and\u00a0maliciou"
+      "description": "SSRF in Apache HTTP Server on Windows allows to potentially leak NTLM hashes to a malicious server via SSRF and\u00a0maliciou",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38473",
@@ -2233,7 +3139,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "HIGH",
-      "description": "Encoding problem in mod_proxy in Apache HTTP Server 2.4.59 and earlier allows request URLs with incorrect encoding to be"
+      "description": "Encoding problem in mod_proxy in Apache HTTP Server 2.4.59 and earlier allows request URLs with incorrect encoding to be",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-38477",
@@ -2241,7 +3149,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "HIGH",
-      "description": "null pointer dereference in mod_proxy in Apache HTTP Server 2.4.59 and earlier allows an attacker to crash the server vi"
+      "description": "null pointer dereference in mod_proxy in Apache HTTP Server 2.4.59 and earlier allows an attacker to crash the server vi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-39573",
@@ -2249,7 +3159,9 @@
       "affected_below": "2.4.60",
       "fixed_in": "2.4.60",
       "severity": "HIGH",
-      "description": "Potential SSRF in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows an attacker to cause unsafe RewriteRules t"
+      "description": "Potential SSRF in mod_rewrite in Apache HTTP Server 2.4.59 and earlier allows an attacker to cause unsafe RewriteRules t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-39935",
@@ -2257,7 +3169,9 @@
       "affected_below": "2.11.3",
       "fixed_in": "2.11.3",
       "severity": "HIGH",
-      "description": "jc21 NGINX Proxy Manager before 2.11.3 allows backend/internal/certificate.js OS command injection by an authenticated u"
+      "description": "jc21 NGINX Proxy Manager before 2.11.3 allows backend/internal/certificate.js OS command injection by an authenticated u",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-40898",
@@ -2265,7 +3179,9 @@
       "affected_below": "2.4.62",
       "fixed_in": "2.4.62",
       "severity": "HIGH",
-      "description": "SSRF in Apache HTTP Server on Windows with mod_rewrite in server/vhost context, allows to potentially leak NTML hashes t"
+      "description": "SSRF in Apache HTTP Server on Windows with mod_rewrite in server/vhost context, allows to potentially leak NTML hashes t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-42516",
@@ -2273,7 +3189,9 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "HTTP response splitting in the core of Apache HTTP Server allows an attacker who can manipulate the Content-Type respons"
+      "description": "HTTP response splitting in the core of Apache HTTP Server allows an attacker who can manipulate the Content-Type respons",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-43204",
@@ -2281,7 +3199,9 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "SSRF in Apache HTTP Server with mod_proxy loaded allows an attacker to send outbound proxy requests to a URL controlled"
+      "description": "SSRF in Apache HTTP Server with mod_proxy loaded allows an attacker to send outbound proxy requests to a URL controlled",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-43394",
@@ -2289,7 +3209,19 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "Server-Side Request Forgery (SSRF)\u00a0in Apache HTTP Server on Windows allows to potentially leak NTLM hashes to a maliciou"
+      "description": "Server-Side Request Forgery (SSRF)\u00a0in Apache HTTP Server on Windows allows to potentially leak NTLM hashes to a maliciou",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2024-43613",
+      "product": "postgresql",
+      "affected_below": "16.4",
+      "fixed_in": "16.4",
+      "severity": "HIGH",
+      "description": "Azure Database for PostgreSQL Flexible Server Extension Elevation of Privilege Vulnerability",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-45307",
@@ -2297,7 +3229,9 @@
       "affected_below": "9.26.7",
       "fixed_in": "9.26.7",
       "severity": "HIGH",
-      "description": "SudoBot, a Discord moderation bot, is vulnerable to privilege escalation and exploit of the `-config` command in version"
+      "description": "SudoBot, a Discord moderation bot, is vulnerable to privilege escalation and exploit of the `-config` command in version",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-47252",
@@ -2305,7 +3239,19 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "Insufficient escaping of user-supplied data in mod_ssl in Apache HTTP Server 2.4.63 and earlier allows an untrusted SSL/"
+      "description": "Insufficient escaping of user-supplied data in mod_ssl in Apache HTTP Server 2.4.63 and earlier allows an untrusted SSL/",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2024-49042",
+      "product": "postgresql",
+      "affected_below": "16.4",
+      "fixed_in": "16.4",
+      "severity": "HIGH",
+      "description": "Azure Database for PostgreSQL Flexible Server Extension Elevation of Privilege Vulnerability",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2024-49366",
@@ -2313,7 +3259,9 @@
       "affected_below": "1.9.9-4",
       "fixed_in": "1.9.9-4",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Nginx UI v2.0.0-beta.35 and earlier gets the value from the j"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Nginx UI v2.0.0-beta.35 and earlier gets the value from the j",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2024-49367",
@@ -2321,31 +3269,49 @@
       "affected_below": "1.9.9-4",
       "fixed_in": "1.9.9-4",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.0.0-beta.36, the log path of nginxui is co"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.0.0-beta.36, the log path of nginxui is co",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2024-6387",
       "product": "openssh",
-      "affected_below": "4.4",
-      "fixed_in": "4.4",
+      "affected_below": "9.8",
+      "fixed_in": "9.8",
       "severity": "HIGH",
-      "description": "A security regression (CVE-2006-5051) was discovered in OpenSSH's server (sshd). There is a race condition which can lea"
+      "description": "A security regression (CVE-2006-5051) was discovered in OpenSSH's server (sshd). There is a race condition which can lea",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
-      "cve_id": "CVE-2025-0411",
-      "product": "7-zip",
-      "affected_below": "24.09",
-      "fixed_in": "24.09",
+      "cve_id": "CVE-2024-7348",
+      "product": "postgresql",
+      "affected_below": "16.4",
+      "fixed_in": "16.4",
       "severity": "HIGH",
-      "description": "7-Zip Mark-of-the-Web Bypass Vulnerability. This vulnerability allows remote attackers to bypass the Mark-of-the-Web pro"
+      "description": "Time-of-check Time-of-use (TOCTOU) race condition in pg_dump in PostgreSQL allows an object creator to execute arbitrary",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-15467",
       "product": "openssl",
-      "affected_below": "3.0.19",
-      "fixed_in": "3.0.19",
+      "affected_below": "3.6.1",
+      "fixed_in": "3.6.1",
       "severity": "HIGH",
-      "description": "Issue summary: Parsing CMS AuthEnvelopedData or EnvelopedData message with maliciously crafted AEAD parameters can trigg"
+      "description": "Issue summary: Parsing CMS AuthEnvelopedData or EnvelopedData message with maliciously crafted AEAD parameters can trigg",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2025-22248",
+      "product": "postgresql",
+      "affected_below": "16.0.0",
+      "fixed_in": "16.0.0",
+      "severity": "HIGH",
+      "description": "The bitnami/pgpool\u00a0Docker image, and the bitnami/postgres-ha\u00a0k8s chart, under default configurations, comes with an 'rep",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-35471",
@@ -2353,7 +3319,19 @@
       "affected_below": "2024-05-20",
       "fixed_in": "2024-05-20",
       "severity": "HIGH",
-      "description": "conda-forge openssl-feedstock before 066e83c (2024-05-20), on Microsoft Windows, configures OpenSSL to use an OPENSSLDIR"
+      "description": "conda-forge openssl-feedstock before 066e83c (2024-05-20), on Microsoft Windows, configures OpenSSL to use an OPENSSLDIR",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2025-49146",
+      "product": "postgresql",
+      "affected_below": "42.7.7",
+      "fixed_in": "42.7.7",
+      "severity": "HIGH",
+      "description": "pgjdbc is an open source postgresql JDBC Driver. From 42.7.4 and until 42.7.7, when the PostgreSQL JDBC driver is config",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-49812",
@@ -2361,7 +3339,9 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "In some mod_ssl configurations on Apache HTTP Server versions through to 2.4.63, an HTTP desynchronisation attack allows"
+      "description": "In some mod_ssl configurations on Apache HTTP Server versions through to 2.4.63, an HTTP desynchronisation attack allows",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-53020",
@@ -2369,23 +3349,9 @@
       "affected_below": "2.4.64",
       "fixed_in": "2.4.64",
       "severity": "HIGH",
-      "description": "Late Release of Memory after Effective Lifetime vulnerability in Apache HTTP Server.  This issue affects Apache HTTP Ser"
-    },
-    {
-      "cve_id": "CVE-2025-53816",
-      "product": "7-zip",
-      "affected_below": "25.00",
-      "fixed_in": "25.00",
-      "severity": "HIGH",
-      "description": "7-Zip is a file archiver with a high compression ratio. Zeroes written outside heap buffer in RAR5 handler may lead to m"
-    },
-    {
-      "cve_id": "CVE-2025-53817",
-      "product": "7-zip",
-      "affected_below": "25.00",
-      "fixed_in": "25.00",
-      "severity": "HIGH",
-      "description": "7-Zip is a file archiver with a high compression ratio. 7-Zip supports extracting from Compound Documents. Prior to vers"
+      "description": "Late Release of Memory after Effective Lifetime vulnerability in Apache HTTP Server.  This issue affects Apache HTTP Ser",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-54472",
@@ -2393,7 +3359,9 @@
       "affected_below": "1.14.1",
       "fixed_in": "1.14.1",
       "severity": "HIGH",
-      "description": "Unlimited memory allocation in redis protocol parser in Apache bRPC (all versions < 1.14.1) on all platforms allows atta"
+      "description": "Unlimited memory allocation in redis protocol parser in Apache bRPC (all versions < 1.14.1) on all platforms allows atta",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-55753",
@@ -2401,7 +3369,9 @@
       "affected_below": "2.4.66",
       "fixed_in": "2.4.66",
       "severity": "HIGH",
-      "description": "An integer overflow in the case of failed ACME certificate renewal leads, after a number of failures (~30 days in defaul"
+      "description": "An integer overflow in the case of failed ACME certificate renewal leads, after a number of failures (~30 days in defaul",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-58098",
@@ -2409,7 +3379,9 @@
       "affected_below": "2.4.66",
       "fixed_in": "2.4.66",
       "severity": "HIGH",
-      "description": "Apache HTTP Server 2.4.65 and earlier with Server Side Includes (SSI) enabled and mod_cgid (but not mod_cgi) passes the"
+      "description": "Apache HTTP Server 2.4.65 and earlier with Server Side Includes (SSI) enabled and mod_cgid (but not mod_cgi) passes the",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-59775",
@@ -2417,7 +3389,9 @@
       "affected_below": "2.4.66",
       "fixed_in": "2.4.66",
       "severity": "HIGH",
-      "description": "Server-Side Request Forgery (SSRF) vulnerability   \u00a0in Apache HTTP Server on Windows   with AllowEncodedSlashes On\u00a0and M"
+      "description": "Server-Side Request Forgery (SSRF) vulnerability   \u00a0in Apache HTTP Server on Windows   with AllowEncodedSlashes On\u00a0and M",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-59789",
@@ -2425,7 +3399,9 @@
       "affected_below": "1.15.0",
       "fixed_in": "1.15.0",
       "severity": "HIGH",
-      "description": "Uncontrolled recursion in the json2pb component in Apache bRPC (version < 1.15.0) on all platforms allows remote attacke"
+      "description": "Uncontrolled recursion in the json2pb component in Apache bRPC (version < 1.15.0) on all platforms allows remote attacke",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-67936",
@@ -2433,31 +3409,39 @@
       "affected_below": "3.3",
       "fixed_in": "3.3",
       "severity": "HIGH",
-      "description": "Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion') vulnerability in"
+      "description": "Improper Control of Filename for Include/Require Statement in PHP Program ('PHP Remote File Inclusion') vulnerability in",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-69419",
       "product": "openssl",
-      "affected_below": "1.1.1ze",
-      "fixed_in": "1.1.1ze",
+      "affected_below": "3.6.1",
+      "fixed_in": "3.6.1",
       "severity": "HIGH",
-      "description": "Issue summary: Calling PKCS12_get_friendlyname() function on a maliciously crafted PKCS#12 file with a BMPString (UTF-16"
+      "description": "Issue summary: Calling PKCS12_get_friendlyname() function on a maliciously crafted PKCS#12 file with a BMPString (UTF-16",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-69420",
       "product": "openssl",
-      "affected_below": "1.1.1ze",
-      "fixed_in": "1.1.1ze",
+      "affected_below": "3.6.1",
+      "fixed_in": "3.6.1",
       "severity": "HIGH",
-      "description": "Issue summary: A type confusion vulnerability exists in the TimeStamp Response verification code where an ASN1_TYPE unio"
+      "description": "Issue summary: A type confusion vulnerability exists in the TimeStamp Response verification code where an ASN1_TYPE unio",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-69421",
       "product": "openssl",
-      "affected_below": "1.0.2zn",
-      "fixed_in": "1.0.2zn",
+      "affected_below": "3.6.1",
+      "fixed_in": "3.6.1",
       "severity": "HIGH",
-      "description": "Issue summary: Processing a malformed PKCS#12 file can trigger a NULL pointer dereference in the PKCS12_item_decrypt_d2i"
+      "description": "Issue summary: Processing a malformed PKCS#12 file can trigger a NULL pointer dereference in the PKCS12_item_decrypt_d2i",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2025-9086",
@@ -2465,31 +3449,79 @@
       "affected_below": "8.16.0",
       "fixed_in": "8.16.0",
       "severity": "HIGH",
-      "description": "1. A cookie is set using the `secure` keyword for `https://target`   2. curl is redirected to or otherwise made to speak"
+      "description": "1. A cookie is set using the `secure` keyword for `https://target`   2. curl is redirected to or otherwise made to speak",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-2004",
+      "product": "postgresql",
+      "affected_below": "18.2",
+      "fixed_in": "18.2",
+      "severity": "HIGH",
+      "description": "Missing validation of type of input in PostgreSQL intarray extension selectivity estimator function allows an object cre",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-2005",
+      "product": "postgresql",
+      "affected_below": "18.2",
+      "fixed_in": "18.2",
+      "severity": "HIGH",
+      "description": "Heap buffer overflow in PostgreSQL pgcrypto allows a ciphertext provider to execute arbitrary code as the operating syst",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-2006",
+      "product": "postgresql",
+      "affected_below": "18.2",
+      "fixed_in": "18.2",
+      "severity": "HIGH",
+      "description": "Missing validation of multibyte character length in PostgreSQL text manipulation allows a database user to issue crafted",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-2007",
+      "product": "postgresql",
+      "affected_below": "18.2",
+      "fixed_in": "18.2",
+      "severity": "HIGH",
+      "description": "Heap buffer overflow in PostgreSQL pg_trgm allows a database user to achieve unknown impacts via a crafted input string.",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-27651",
       "product": "nginx",
-      "affected_below": "0.9.7",
-      "fixed_in": "0.9.7",
+      "affected_below": "r35",
+      "fixed_in": "r35",
       "severity": "HIGH",
-      "description": "When the ngx_mail_auth_http_module\u00a0module is enabled on NGINX Plus or NGINX Open Source, undisclosed requests can cause"
+      "description": "When the ngx_mail_auth_http_module\u00a0module is enabled on NGINX Plus or NGINX Open Source, undisclosed requests can cause",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-27654",
       "product": "nginx",
-      "affected_below": "0.9.7",
-      "fixed_in": "0.9.7",
+      "affected_below": "1.29.7",
+      "fixed_in": "1.29.7",
       "severity": "HIGH",
-      "description": "NGINX Open Source and NGINX Plus have a vulnerability in the ngx_http_dav_module module that might allow an attacker to"
+      "description": "NGINX Open Source and NGINX Plus have a vulnerability in the ngx_http_dav_module module that might allow an attacker to",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-27784",
       "product": "nginx",
-      "affected_below": "1.28.3",
-      "fixed_in": "1.28.3",
+      "affected_below": "1.29.7",
+      "fixed_in": "1.29.7",
       "severity": "HIGH",
-      "description": "The 32-bit implementation of NGINX Open Source has a vulnerability in the ngx_http_mp4_module module, which might allow"
+      "description": "The 32-bit implementation of NGINX Open Source has a vulnerability in the ngx_http_mp4_module module, which might allow",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-28386",
@@ -2497,31 +3529,39 @@
       "affected_below": "3.6.2",
       "fixed_in": "3.6.2",
       "severity": "HIGH",
-      "description": "Issue summary: Applications using AES-CFB128 encryption or decryption on systems with AVX-512 and VAES support can trigg"
+      "description": "Issue summary: Applications using AES-CFB128 encryption or decryption on systems with AVX-512 and VAES support can trigg",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-28388",
       "product": "openssl",
-      "affected_below": "1.0.2zp",
-      "fixed_in": "1.0.2zp",
+      "affected_below": "3.6.2",
+      "fixed_in": "3.6.2",
       "severity": "HIGH",
-      "description": "Issue summary: When a delta CRL that contains a Delta CRL Indicator extension is processed a NULL pointer dereference mi"
+      "description": "Issue summary: When a delta CRL that contains a Delta CRL Indicator extension is processed a NULL pointer dereference mi",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-28389",
       "product": "openssl",
-      "affected_below": "1.0.2zp",
-      "fixed_in": "1.0.2zp",
+      "affected_below": "3.6.2",
+      "fixed_in": "3.6.2",
       "severity": "HIGH",
-      "description": "Issue summary: During processing of a crafted CMS EnvelopedData message with KeyAgreeRecipientInfo a NULL pointer derefe"
+      "description": "Issue summary: During processing of a crafted CMS EnvelopedData message with KeyAgreeRecipientInfo a NULL pointer derefe",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-28390",
       "product": "openssl",
-      "affected_below": "1.0.2zp",
-      "fixed_in": "1.0.2zp",
+      "affected_below": "3.6.2",
+      "fixed_in": "3.6.2",
       "severity": "HIGH",
-      "description": "Issue summary: During processing of a crafted CMS EnvelopedData message with KeyTransportRecipientInfo a NULL pointer de"
+      "description": "Issue summary: During processing of a crafted CMS EnvelopedData message with KeyTransportRecipientInfo a NULL pointer de",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-29168",
@@ -2529,7 +3569,9 @@
       "affected_below": "2.4.67",
       "fixed_in": "2.4.67",
       "severity": "HIGH",
-      "description": "Allocation of Resources Without Limits or Throttling vulnerability in Apache HTTP Server's\u00a0 mod_md via OCSP response dat"
+      "description": "Allocation of Resources Without Limits or Throttling vulnerability in Apache HTTP Server's\u00a0 mod_md via OCSP response dat",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-29169",
@@ -2537,23 +3579,29 @@
       "affected_below": "2.4.67",
       "fixed_in": "2.4.67",
       "severity": "HIGH",
-      "description": "A NULL pointer dereference in mod_dav_lock in Apache HTTP Server 2.4.66 and earlier may allow an attacker to crash the s"
+      "description": "A NULL pointer dereference in mod_dav_lock in Apache HTTP Server 2.4.66 and earlier may allow an attacker to crash the s",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-32647",
       "product": "nginx",
-      "affected_below": "1.28.3",
-      "fixed_in": "1.28.3",
+      "affected_below": "1.29.7",
+      "fixed_in": "1.29.7",
       "severity": "HIGH",
-      "description": "NGINX Open Source and NGINX Plus have a vulnerability in the ngx_http_mp4_module module, which might allow an attacker t"
+      "description": "NGINX Open Source and NGINX Plus have a vulnerability in the ngx_http_mp4_module module, which might allow an attacker t",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-3288",
       "product": "nginx",
-      "affected_below": "1.13.8",
-      "fixed_in": "1.13.8",
+      "affected_below": "1.14.4",
+      "fixed_in": "1.14.4",
       "severity": "HIGH",
-      "description": "A security issue was discovered in ingress-nginx where the `nginx.ingress.kubernetes.io/rewrite-target` Ingress annotati"
+      "description": "A security issue was discovered in ingress-nginx where the `nginx.ingress.kubernetes.io/rewrite-target` Ingress annotati",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-33028",
@@ -2561,7 +3609,9 @@
       "affected_below": "2.3.4",
       "fixed_in": "2.3.4",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, the nginx-ui application is vulnerabl"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, the nginx-ui application is vulnerabl",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-33030",
@@ -2569,7 +3619,9 @@
       "affected_below": "2.3.3",
       "fixed_in": "2.3.3",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. In versions 2.3.3 and prior, Nginx-UI contains an Insecure Di"
+      "description": "Nginx UI is a web user interface for the Nginx web server. In versions 2.3.3 and prior, Nginx-UI contains an Insecure Di",
+      "ecosystem": "",
+      "affected_inclusive": true
     },
     {
       "cve_id": "CVE-2026-33031",
@@ -2577,7 +3629,9 @@
       "affected_below": "2.3.4",
       "fixed_in": "2.3.4",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, a user who was disabled by an adminis"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.4, a user who was disabled by an adminis",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-33752",
@@ -2585,7 +3639,9 @@
       "affected_below": "0.15.0",
       "fixed_in": "0.15.0",
       "severity": "HIGH",
-      "description": "curl_cffi is the a Python binding for curl. Prior to 0.15.0, curl_cffi does not restrict requests to internal IP ranges,"
+      "description": "curl_cffi is the a Python binding for curl. Prior to 0.15.0, curl_cffi does not restrict requests to internal IP ranges,",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-34059",
@@ -2593,7 +3649,9 @@
       "affected_below": "2.4.67",
       "fixed_in": "2.4.67",
       "severity": "HIGH",
-      "description": "Buffer Over-read vulnerability in Apache HTTP Server.  This issue affects Apache HTTP Server: through 2.4.66.  Users are"
+      "description": "Buffer Over-read vulnerability in Apache HTTP Server.  This issue affects Apache HTTP Server: through 2.4.66.  Users are",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-34403",
@@ -2601,39 +3659,9 @@
       "affected_below": "2.3.5",
       "fixed_in": "2.3.5",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.5, all WebSocket endpoints in nginx-ui u"
-    },
-    {
-      "cve_id": "CVE-2026-34478",
-      "product": "log4j",
-      "affected_below": "2.25.4",
-      "fixed_in": "2.25.4",
-      "severity": "HIGH",
-      "description": "Apache Log4j Core's  Rfc5424Layout https://logging.apache.org/log4j/2.x/manual/layouts.html#RFC5424Layout , in versions"
-    },
-    {
-      "cve_id": "CVE-2026-34479",
-      "product": "log4j",
-      "affected_below": "2.25.4",
-      "fixed_in": "2.25.4",
-      "severity": "HIGH",
-      "description": "The Log4j1XmlLayout from the Apache Log4j 1-to-Log4j 2 bridge fails to escape characters forbidden by the XML 1.0 standa"
-    },
-    {
-      "cve_id": "CVE-2026-34480",
-      "product": "log4j",
-      "affected_below": "2.25.4",
-      "fixed_in": "2.25.4",
-      "severity": "HIGH",
-      "description": "Apache Log4j Core's  XmlLayout https://logging.apache.org/log4j/2.x/manual/layouts.html#XmlLayout , in versions up to an"
-    },
-    {
-      "cve_id": "CVE-2026-34481",
-      "product": "log4j",
-      "affected_below": "2.25.4",
-      "fixed_in": "2.25.4",
-      "severity": "HIGH",
-      "description": "Apache Log4j's  JsonTemplateLayout https://logging.apache.org/log4j/2.x/manual/json-template-layout.html , in versions u"
+      "description": "Nginx UI is a web user interface for the Nginx web server. Prior to version 2.3.5, all WebSocket endpoints in nginx-ui u",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-35385",
@@ -2641,7 +3669,19 @@
       "affected_below": "10.3",
       "fixed_in": "10.3",
       "severity": "HIGH",
-      "description": "In OpenSSH before 10.3, a file downloaded by scp may be installed setuid or setgid, an outcome contrary to some users' e"
+      "description": "In OpenSSH before 10.3, a file downloaded by scp may be installed setuid or setgid, an outcome contrary to some users' e",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-35535",
+      "product": "sudo",
+      "affected_below": "1.9.17",
+      "fixed_in": "1.9.17",
+      "severity": "HIGH",
+      "description": "In Sudo through 1.9.17p2 before 3e474c2, a failure of a setuid, setgid, or setgroups call, during a privilege drop befor",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-3805",
@@ -2649,15 +3689,29 @@
       "affected_below": "8.19.0",
       "fixed_in": "8.19.0",
       "severity": "HIGH",
-      "description": "When doing a second SMB request to the same host again, curl would wrongly use a data pointer pointing into already free"
+      "description": "When doing a second SMB request to the same host again, curl would wrongly use a data pointer pointing into already free",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-40022",
       "product": "apache",
-      "affected_below": "4.14.6",
-      "fixed_in": "4.14.6",
+      "affected_below": "4.18.2",
+      "fixed_in": "4.18.2",
       "severity": "HIGH",
-      "description": "When authentication is enabled on the Apache Camel embedded HTTP server or embedded management server (camel-platform-ht"
+      "description": "When authentication is enabled on the Apache Camel embedded HTTP server or embedded management server (camel-platform-ht",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-42198",
+      "product": "postgresql",
+      "affected_below": "42.7.11",
+      "fixed_in": "42.7.11",
+      "severity": "HIGH",
+      "description": "pgjdbc is an open source postgresql JDBC Driver. From version 42.2.0 to before version 42.7.11, pgjdbc is vulnerable to",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-42221",
@@ -2665,15 +3719,19 @@
       "affected_below": "2.3.8",
       "fixed_in": "2.3.8",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. From version 2.0.0 to before version 2.3.8, an unauthenticate"
+      "description": "Nginx UI is a web user interface for the Nginx web server. From version 2.0.0 to before version 2.3.8, an unauthenticate",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-4342",
       "product": "nginx",
-      "affected_below": "1.13.9",
-      "fixed_in": "1.13.9",
+      "affected_below": "1.14.5",
+      "fixed_in": "1.14.5",
       "severity": "HIGH",
-      "description": "A security issue was discovered in ingress-nginx where a combination of Ingress annotations can be used to inject config"
+      "description": "A security issue was discovered in ingress-nginx where a combination of Ingress annotations can be used to inject config",
+      "ecosystem": "",
+      "affected_inclusive": false
     },
     {
       "cve_id": "CVE-2026-44015",
@@ -2681,7 +3739,79 @@
       "affected_below": "2.3.4",
       "fixed_in": "2.3.4",
       "severity": "HIGH",
-      "description": "Nginx UI is a web user interface for the Nginx web server. In 2.3.4 and earlier, an authenticated user can perform Serve"
+      "description": "Nginx UI is a web user interface for the Nginx web server. In 2.3.4 and earlier, an authenticated user can perform Serve",
+      "ecosystem": "",
+      "affected_inclusive": true
+    },
+    {
+      "cve_id": "CVE-2026-6473",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "Integer wraparound in multiple PostgreSQL server features allows an unprivileged database user to cause the server to un",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-6475",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "Symlink following in PostgreSQL pg_basebackup plain format and in pg_rewind allows an origin superuser to overwrite loca",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-6476",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "SQL injection in PostgreSQL pg_createsubscriber allows an attacker with pg_create_subscription rights to execute arbitra",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-6477",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "Use of inherently dangerous function PQfn(..., result_is_int=0, ...) in PostgreSQL libpq lo_export(), lo_read(), lo_lsee",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-6479",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "Uncontrolled recursion in PostgreSQL SSL and GSS negotiation allows an attacker able to connect to a PostgreSQL AF_UNIX",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-6637",
+      "product": "postgresql",
+      "affected_below": "18.4",
+      "fixed_in": "18.4",
+      "severity": "HIGH",
+      "description": "Stack buffer overflow in PostgreSQL module \"refint\" allows an unprivileged database user to execute arbitrary code as th",
+      "ecosystem": "",
+      "affected_inclusive": false
+    },
+    {
+      "cve_id": "CVE-2026-7815",
+      "product": "postgresql",
+      "affected_below": "9.15",
+      "fixed_in": "9.15",
+      "severity": "HIGH",
+      "description": "SQL injection vulnerability in pgAdmin 4 Maintenance Tool.  Four user-supplied JSON fields (buffer_usage_limit, vacuum_p",
+      "ecosystem": "",
+      "affected_inclusive": false
     }
   ]
 }

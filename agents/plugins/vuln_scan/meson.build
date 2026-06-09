@@ -1,4 +1,4 @@
-vuln_scan_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep]
+vuln_scan_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep, openssl_dep]
 
 if host_machine.system() == 'windows'
   vuln_scan_deps += meson.get_compiler('cpp').find_library('version')

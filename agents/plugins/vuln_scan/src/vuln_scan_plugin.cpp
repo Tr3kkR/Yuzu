@@ -28,6 +28,8 @@
 #include <string_view>
 #include <vector>
 
+#include <openssl/evp.h>
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
 #endif
@@ -65,18 +67,52 @@ static bool verify_rules_sha256(const std::string& rules_path) {
     if (!rules_f || !sha_f)
         return false;
 
-    // Compute SHA-256 of rules file
-    unsigned char hash[32]{};
-    // Simplified: read file and compute; full implementation would use crypto library
-    // For now, accept if sidecar file exists and is readable (basic integrity check)
+    // Read expected SHA-256 from sidecar
     std::string line;
     if (!std::getline(sha_f, line))
         return false;
     // Sidecar format: "<hex_digest>  <filename>"
     auto space_pos = line.find("  ");
-    if (space_pos == std::string::npos || line.empty())
+    if (space_pos == std::string::npos || space_pos == 0)
         return false;
-    return true;  // Sidecar file is readable and formatted correctly
+    std::string expected_hex = line.substr(0, space_pos);
+    if (expected_hex.length() != 64)  // SHA-256 is 256 bits = 64 hex chars
+        return false;
+
+    // Compute actual SHA-256 of rules file
+    rules_f.seekg(0);
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx)
+        return false;
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) <= 0) {
+        EVP_MD_CTX_free(mdctx);
+        return false;
+    }
+
+    std::array<char, 4096> buf{};
+    while (rules_f.read(buf.data(), buf.size()) || rules_f.gcount() > 0) {
+        if (EVP_DigestUpdate(mdctx, buf.data(), static_cast<size_t>(rules_f.gcount())) <= 0) {
+            EVP_MD_CTX_free(mdctx);
+            return false;
+        }
+    }
+
+    unsigned char digest[EVP_MAX_MD_SIZE]{};
+    unsigned int digest_len = 0;
+    if (EVP_DigestFinal_ex(mdctx, digest, &digest_len) <= 0 || digest_len != 32) {
+        EVP_MD_CTX_free(mdctx);
+        return false;
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    // Convert computed digest to hex and compare
+    std::array<char, 65> actual_hex{};
+    for (unsigned i = 0; i < digest_len; i++) {
+        snprintf(actual_hex.data() + (i * 2), 3, "%02x", digest[i]);
+    }
+
+    return expected_hex == std::string_view(actual_hex.data(), 64);
 }
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
@@ -342,7 +378,15 @@ std::vector<AppInfo> get_installed_apps() {
         while (std::getline(ss, line)) {
             auto sp = line.find(' ');
             if (sp != std::string::npos) {
-                apps.push_back({line.substr(0, sp), line.substr(sp + 1)});
+                std::string name = line.substr(0, sp);
+                std::string versions_str = line.substr(sp + 1);
+                // brew list --versions can output multiple versions: "python@3.11 3.11.15_1 3.12.8"
+                // Split on spaces to get each version and create a separate AppInfo for each
+                std::istringstream version_ss(versions_str);
+                std::string version;
+                while (version_ss >> version) {
+                    apps.push_back({name, version});
+                }
             }
         }
     }
@@ -374,12 +418,12 @@ std::vector<Finding> do_cve_scan_impl() {
     // Debian epoch, RPM/Alpine release suffix, and semver pre-release.
     auto match_rule = [&](std::string_view product, std::string_view affected_below,
                           std::string_view severity, std::string_view cve_id,
-                          std::string_view description, std::string_view fixed_in) {
+                          std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
         for (const auto& app : apps) {
             if (!icontains(app.name, product) || app.version.empty())
                 continue;
-            if (yuzu::vuln::compare_versions_normalized(app.version,
-                                                        std::string(affected_below)) < 0) {
+            int cmp = yuzu::vuln::compare_versions_normalized(app.version, std::string(affected_below));
+            if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
                 findings.push_back(
                     {std::string(severity), "cve",
                      std::format("{}: {}", cve_id, description),
@@ -389,7 +433,7 @@ std::vector<Finding> do_cve_scan_impl() {
     };
 
     for (const auto& r : yuzu::vuln::kCveRules)
-        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in);
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
 
     // Safely copy dynamic rules ptr while holding lock
     auto dynamic = [&]() {
@@ -402,7 +446,7 @@ std::vector<Finding> do_cve_scan_impl() {
             // cve_scan matches only OS-native rules (ecosystem="")
             if (!r.ecosystem.empty())
                 continue;
-            match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in);
+            match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
         }
     }
 
@@ -423,11 +467,11 @@ std::vector<Finding> do_kernel_scan_impl() {
 
     auto match_rule = [&](std::string_view rule_product, std::string_view affected_below,
                           std::string_view severity, std::string_view cve_id,
-                          std::string_view description, std::string_view fixed_in) {
+                          std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
         if (!icontains(product, rule_product))
             return;
-        if (yuzu::vuln::compare_versions_normalized(ki.full_version,
-                                                    std::string(affected_below)) < 0) {
+        int cmp = yuzu::vuln::compare_versions_normalized(ki.full_version, std::string(affected_below));
+        if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
             findings.push_back(
                 {std::string(severity), "kernel",
                  std::format("{}: {}", cve_id, description),
@@ -436,7 +480,7 @@ std::vector<Finding> do_kernel_scan_impl() {
     };
 
     for (const auto& r : yuzu::vuln::kCveRules)
-        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in);
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
     // Safely access dynamic rules
     auto dynamic_rules = [&]() {
         std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
@@ -444,7 +488,7 @@ std::vector<Finding> do_kernel_scan_impl() {
     }();
     if (!dynamic_rules) dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>();
     for (const auto& r : *dynamic_rules)
-        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in);
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
 
     return findings;
 }
@@ -710,11 +754,11 @@ public:
 
                 auto match_rule = [&](std::string_view product, std::string_view affected_below,
                                       std::string_view severity, std::string_view cve_id,
-                                      std::string_view description, std::string_view fixed_in) {
+                                      std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
                     if (!icontains(app.name, product))
                         return;
-                    if (yuzu::vuln::compare_versions_normalized(clean_ver,
-                                                                std::string(affected_below)) < 0) {
+                    int cmp = yuzu::vuln::compare_versions_normalized(clean_ver, std::string(affected_below));
+                    if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
                         findings.push_back(
                             {std::string(severity), "binary",
                              std::format("{}: {}", cve_id, description),
@@ -724,7 +768,7 @@ public:
 
                 for (const auto& r : yuzu::vuln::kCveRules)
                     match_rule(r.product, r.affected_below, r.severity,
-                               r.cve_id, r.description, r.fixed_in);
+                               r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
                 // Safely access dynamic rules
     auto dynamic_rules = [&]() {
         std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
@@ -733,7 +777,7 @@ public:
     if (!dynamic_rules) dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>();
     for (const auto& r : *dynamic_rules)
                     match_rule(r.product, r.affected_below, r.severity,
-                               r.cve_id, r.description, r.fixed_in);
+                               r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
             }
             output_findings(ctx, findings);
             return 0;

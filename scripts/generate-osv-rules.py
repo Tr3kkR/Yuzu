@@ -174,10 +174,11 @@ def extract_severity(vuln: dict) -> str:
     return "MEDIUM"
 
 
-def extract_version_bounds(affected: list[dict]) -> list[tuple[str, str]]:
+def extract_version_bounds(affected: list[dict]) -> list[tuple[str, str, bool]]:
     """
-    Extract (affected_below, fixed_in) version pairs from OSV affected ranges.
+    Extract (affected_below, fixed_in, affected_inclusive) version triples from OSV affected ranges.
     Returns list of tuples; empty list if no concrete bounds found.
+    affected_inclusive is True when the boundary came from last_affected (boundary itself is vulnerable).
     """
     bounds = []
     for entry in affected:
@@ -201,18 +202,20 @@ def extract_version_bounds(affected: list[dict]) -> list[tuple[str, str]]:
                     while j < len(events):
                         next_ev = events[j]
                         if "fixed" in next_ev:
-                            bounds.append((next_ev["fixed"], next_ev["fixed"]))
+                            # fixed = boundary not inclusive (versions < fixed are vulnerable)
+                            bounds.append((next_ev["fixed"], next_ev["fixed"], False))
                             i = j
                             break
                         elif "last_affected" in next_ev:
-                            bounds.append((next_ev["last_affected"], next_ev["last_affected"]))
+                            # last_affected = boundary inclusive (versions <= last_affected are vulnerable)
+                            bounds.append((next_ev["last_affected"], next_ev["last_affected"], True))
                             i = j
                             break
                         j += 1
                     else:
                         # No fixed/last_affected found after this introduced
                         # Still add it (vulnerability unfixed)
-                        bounds.append((introduced_ver, "unfixed"))
+                        bounds.append((introduced_ver, "unfixed", False))
                         i = j - 1
 
                 i += 1
@@ -298,7 +301,7 @@ def build_rules(min_severity: str = "HIGH") -> list[dict]:
             if bounds:
                 # Use bounds from vuln record, but pair with batch-discovered packages
                 for ecosystem, package_name in vuln_to_packages.get(vuln_id, []):
-                    for affected_below, fixed_in in bounds:
+                    for affected_below, fixed_in, affected_inclusive in bounds:
                         rule = {
                             "cve_id": cve_id,
                             "product": package_name,
@@ -307,6 +310,7 @@ def build_rules(min_severity: str = "HIGH") -> list[dict]:
                             "severity": severity,
                             "description": description,
                             "ecosystem": ecosystem,
+                            "affected_inclusive": affected_inclusive,
                         }
                         rules.append(rule)
                         seen_cves.add(cve_id)
@@ -321,6 +325,7 @@ def build_rules(min_severity: str = "HIGH") -> list[dict]:
                         "severity": severity,
                         "description": description,
                         "ecosystem": ecosystem,
+                        "affected_inclusive": False,
                     }
                     rules.append(rule)
                     seen_cves.add(cve_id)

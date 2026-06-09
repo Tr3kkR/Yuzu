@@ -1,0 +1,58 @@
+# UAT Stack with locally-built images (with OSV integration)
+services:
+  server:
+    image: yuzu-server:dev
+    container_name: yuzu-server
+    restart: unless-stopped
+    ports:
+      - "8092:8080"
+      - "50051:50051"
+      - "50052:50052"
+      - "50055:50055"
+    environment:
+      - YUZU_LOG_LEVEL=info
+      - YUZU_LOG_FORMAT=json
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--data-dir"
+      - "/var/lib/yuzu"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--metrics-no-auth"
+    volumes:
+      - server-data:/var/lib/yuzu
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    image: yuzu-gateway:dev
+    container_name: yuzu-gateway
+    restart: unless-stopped
+    ports:
+      - "50061:50051"
+      - "50063:50063"
+      - "8081:8081"
+      - "9568:9568"
+    environment:
+      - YUZU_GW_TLS_ENABLED=false
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  server-data:

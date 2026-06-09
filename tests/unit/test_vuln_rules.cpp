@@ -235,3 +235,72 @@ TEST_CASE("CVE matching: unrelated product does not match", "[vuln][match]") {
     }
     CHECK(match_count == 0);
 }
+
+// === NEW: Robust version comparison tests ===
+
+TEST_CASE("compare_versions_normalized: Homebrew _1 suffix stripped", "[vuln][version][norm]") {
+    // macOS Homebrew uses _N release suffix (e.g., 3.11.15_1)
+    // This should be stripped before comparison: 3.11.15_1 → 3.11.15
+    CHECK(compare_versions_normalized("3.11.15_1", "3.11.4") > 0);   // 3.11.15 > 3.11.4
+    CHECK(compare_versions_normalized("3.11.3_1", "3.11.4") < 0);    // 3.11.3 < 3.11.4
+    CHECK(compare_versions_normalized("3.11.4_1", "3.11.4") == 0);   // 3.11.4 == 3.11.4 (suffix stripped)
+}
+
+TEST_CASE("compare_versions_normalized: Alpine rN suffix stripped", "[vuln][version][norm]") {
+    // Alpine uses -rN release suffix (e.g., 9.7p1-r3, 9.7p1-r10)
+    // These should be stripped to just the upstream version
+    CHECK(compare_versions_normalized("9.7p1-r3", "9.8") < 0);       // 9.7p1 < 9.8
+    CHECK(compare_versions_normalized("9.8p1-r10", "9.8") > 0);      // 9.8p1 > 9.8
+    CHECK(compare_versions_normalized("9.8-r3", "9.8") == 0);        // 9.8 == 9.8 (suffix stripped)
+}
+
+TEST_CASE("compare_versions_normalized: Debian epoch handling", "[vuln][version][norm]") {
+    // Debian uses epoch:version-release format
+    // Epoch 2 versions are always > epoch 0 versions (epoch first in comparison)
+    CHECK(compare_versions_normalized("2:1.0.1f", "1.0.1g") > 0);    // epoch 2 > epoch 0
+    CHECK(compare_versions_normalized("10:1.0", "9:2.0") > 0);       // epoch 10 > epoch 9
+    CHECK(compare_versions_normalized("1:9.8p1", "9.9") > 0);        // 1:9.8p1 > 0:9.9 (epoch wins)
+}
+
+TEST_CASE("compare_versions_normalized: RPM release suffix stripped", "[vuln][version][norm]") {
+    // RPM uses version-release format (e.g., 9.8p1-1.el9)
+    // Release suffix should be stripped: 9.8p1-1.el9 → 9.8p1
+    CHECK(compare_versions_normalized("9.8p1-1.el9", "9.9") < 0);    // 9.8p1 < 9.9
+    CHECK(compare_versions_normalized("9.9p1-1.el9", "9.9") > 0);    // 9.9p1 > 9.9
+    CHECK(compare_versions_normalized("9.8-1", "9.8") == 0);         // 9.8 == 9.8 (suffix stripped)
+}
+
+TEST_CASE("compare_versions: alphanumeric segments (p-suffix numeric ordering)", "[vuln][version]") {
+    // Mixed alphanumeric segments like "p10", "p2", "1g" should be compared numerically
+    // Previously: lexicographic "p9" > "p10" (char '9' > '1')
+    // Fixed: numeric comparison 9 < 10
+    CHECK(compare_versions("9.8p2", "9.8p10") < 0);                  // p2 < p10 (numeric)
+    CHECK(compare_versions("9.8p10", "9.8p9") > 0);                  // p10 > p9 (numeric)
+    CHECK(compare_versions("1.0.1g", "1.0.1f") > 0);                 // 1g > 1f
+}
+
+TEST_CASE("compare_versions_normalized: pre-release ordering", "[vuln][version][norm]") {
+    // Pre-release versions (-rc1, -alpha, -beta) sort before final releases
+    CHECK(compare_versions_normalized("3.0.6-rc1", "3.0.6") < 0);    // rc < final
+    CHECK(compare_versions_normalized("3.0.6", "3.0.6-rc1") > 0);    // final > rc
+    CHECK(compare_versions_normalized("3.0.6-alpha", "3.0.6-beta") < 0);  // alpha < beta
+}
+
+TEST_CASE("compare_versions: OpenSSH portable version ordering", "[vuln][version]") {
+    // OpenSSH uses pN suffix for portable releases (e.g., 9.8p1 is the portable of 9.8)
+    // p1 is an increment to 9.8, so 9.8p1 > 9.8
+    CHECK(compare_versions("9.8p1", "9.8") > 0);                     // 9.8p1 > 9.8
+    CHECK(compare_versions("9.8p2", "9.8p1") > 0);                   // p2 > p1
+}
+
+TEST_CASE("split_epoch: Debian epoch >= 10 handling", "[vuln][version][epoch]") {
+    // Bug fix: previously epochs >= 10 were treated as epoch 0
+    // Now they are properly handled up to epoch 99
+    auto [e10, v10] = split_epoch("10:1.2.3");
+    CHECK(e10 == 10);
+    CHECK(v10 == "1.2.3");
+
+    auto [e25, v25] = split_epoch("25:2.0.0");
+    CHECK(e25 == 25);
+    CHECK(v25 == "2.0.0");
+}

@@ -1,17 +1,20 @@
 #pragma once
 
 #include <array>
+#include <fstream>
 #include <string_view>
+#include <nlohmann/json.hpp>
 
 namespace yuzu::vuln {
 
 struct CveRule {
     std::string_view cve_id;
     std::string_view product;        // case-insensitive substring match on app name
-    std::string_view affected_below; // versions below this are vulnerable
+    std::string_view affected_below; // versions below this are vulnerable (or at this boundary if affected_inclusive)
     std::string_view fixed_in;       // informational: version that fixed it
     std::string_view severity;       // CRITICAL, HIGH, MEDIUM, LOW
     std::string_view description;
+    bool affected_inclusive = false; // if true, boundary version itself is vulnerable (<=); if false, only below (<)
 };
 
 // ── Version comparison ─────────────────────────────────────────────────────
@@ -57,7 +60,34 @@ inline int compare_versions(std::string_view a, std::string_view b) {
         if (a_num && b_num) {
             if (a_val != b_val)
                 return (a_val < b_val) ? -1 : 1;
+        } else if (!a_num && !b_num) {
+            // Both are mixed alphanumeric. Split each into (prefix, digits, suffix)
+            // and compare by (prefix, digits_as_int, suffix)
+            auto split_mixed = [](std::string_view seg)
+                -> std::tuple<std::string_view, long long, std::string_view> {
+                size_t i = 0;
+                while (i < seg.size() && !std::isdigit(seg[i])) ++i;
+                std::string_view pre = seg.substr(0, i);
+                size_t j = i;
+                while (j < seg.size() && std::isdigit(seg[j])) ++j;
+                long long num = 0;
+                for (size_t k = i; k < j; ++k) num = num * 10 + (seg[k] - '0');
+                return {pre, num, seg.substr(j)};
+            };
+
+            auto [pa, na, ta] = split_mixed(sa);
+            auto [pb, nb, tb] = split_mixed(sb);
+
+            int pcmp = pa.compare(pb);
+            if (pcmp != 0)
+                return pcmp;
+            if (na != nb)
+                return na < nb ? -1 : 1;
+            int tcmp = ta.compare(tb);
+            if (tcmp != 0)
+                return tcmp;
         } else {
+            // One is numeric, one is mixed — numeric is less than mixed
             int cmp = sa.compare(sb);
             if (cmp != 0)
                 return cmp;
@@ -81,28 +111,45 @@ inline std::pair<long long, std::string_view> split_epoch(std::string_view v) {
     for (char c : epoch_str) {
         if (c < '0' || c > '9')
             return {0, v};
-        // Bounds check: prevent integer overflow on unreasonable epoch values (>99)
-        if (epoch > 9)
-            return {0, v};
         epoch = epoch * 10 + (c - '0');
+        // Bounds check: prevent integer overflow on unreasonable epoch values (>99)
+        if (epoch > 99)  // Allow up to 99 (Debian uses epochs like 10:, 11:, etc.)
+            return {0, v};
     }
     return {epoch, v.substr(colon + 1)};
 }
 
-// Strip distro release suffix (e.g. -1.el8, -r3) but NOT pre-release markers
+// Strip distro release suffix (e.g. -1.el8, -r3, _1 on macOS) but NOT pre-release markers
 // (-rc1, -alpha, -beta) which must be preserved for ordering.
 inline std::string_view strip_distro_release(std::string_view v) {
-    auto last_dash = v.rfind('-');
-    if (last_dash == std::string_view::npos)
+    // Check for both dash and underscore separators (pick the last one)
+    auto dash_pos = v.rfind('-');
+    auto under_pos = v.rfind('_');
+    size_t last_sep = std::string_view::npos;
+    if (dash_pos != std::string_view::npos && under_pos != std::string_view::npos)
+        last_sep = std::max(dash_pos, under_pos);
+    else if (dash_pos != std::string_view::npos)
+        last_sep = dash_pos;
+    else if (under_pos != std::string_view::npos)
+        last_sep = under_pos;
+
+    if (last_sep == std::string_view::npos)
         return v;
-    auto suffix = v.substr(last_dash + 1);
+    auto suffix = v.substr(last_sep + 1);
     bool has_leading_digit = !suffix.empty() && suffix[0] >= '0' && suffix[0] <= '9';
     bool has_letter = suffix.find_first_of("abcdefghijklmnopqrstuvwxyz") != std::string_view::npos;
     bool is_prerelease = (suffix.find("rc")    != std::string_view::npos ||
                           suffix.find("alpha") != std::string_view::npos ||
                           suffix.find("beta")  != std::string_view::npos);
-    if (has_leading_digit && has_letter && !is_prerelease)
-        return v.substr(0, last_dash);
+    // Alpine uses rN release suffix (e.g. -r3, -r10): starts with 'r' followed by digits only
+    bool is_alpine_release = !suffix.empty() && suffix[0] == 'r' &&
+        suffix.size() > 1 &&
+        suffix.find_first_not_of("0123456789", 1) == std::string_view::npos;
+    // Strip if: Alpine -rN OR (digit+letter without prerelease) OR (digit-only without prerelease)
+    if (is_alpine_release ||
+        (has_leading_digit && has_letter && !is_prerelease) ||
+        (has_leading_digit && !has_letter && !is_prerelease))
+        return v.substr(0, last_sep);
     return v;
 }
 
@@ -276,9 +323,10 @@ struct CveRuleDynamic {
     std::string severity;
     std::string description;
     std::string ecosystem;  // "npm", "PyPI", "crates.io", etc. Empty = OS-native (v1 compat)
+    bool affected_inclusive = false;  // if true, boundary version itself is vulnerable (<=); if false, only below (<)
 };
 
-static constexpr int kRuleSchemaVersion = 2;
+static constexpr int kRuleSchemaVersion = 3;
 
 /// Load rules from a JSON file. Returns empty string on success, error on failure.
 /// Does NOT throw — all exceptions are caught and converted to error strings.
@@ -314,6 +362,7 @@ inline std::string load_rules_from_json(const std::string& path,
             rule.severity       = r.value("severity",        "MEDIUM");
             rule.description    = r.value("description",     "");
             rule.ecosystem      = r.value("ecosystem",       "");
+            rule.affected_inclusive = r.value("affected_inclusive", false);
             if (!rule.cve_id.empty() && !rule.product.empty() && !rule.affected_below.empty())
                 out.push_back(std::move(rule));
         }
