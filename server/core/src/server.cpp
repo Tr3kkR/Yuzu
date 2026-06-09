@@ -2671,6 +2671,14 @@ private:
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;
+        // #1296: stamp the STABLE key-based CA identity (and the issuance-time cert
+        // fingerprint, which agent rows previously left blank) so an "issued by this
+        // CA" inventory query survives a subordinate re-key. issuer_key_id hashes the
+        // root's public key (invariant across the re-key); both are best-effort
+        // forensic metadata — a derivation miss does not block issuance.
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
         if (!ca_store_->record_issued(rec)) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
@@ -2804,10 +2812,14 @@ private:
         // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
         // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
         // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
-        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint). A
-        // stable key-based CA identity (SubjectKeyIdentifier) is the tracked
-        // follow-up (#1296); nothing in the admission/revocation/CRL paths keys on
-        // the fingerprint, so the two-fingerprints-one-key state is safe today.
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint).
+        //
+        // #1296 resolves the "issued by this CA" query landmine: ca_issued.issuer_key_id
+        // is the STABLE key-based identity (pki::issuer_key_id — a hash of the public
+        // key). Because THIS import keeps the key, that id is unchanged across the
+        // switch, so leaves issued before AND after share one issuer_key_id and
+        // CaStore::list_issued_by_key_id returns the whole population with NO rewrite
+        // here. (issuer_fingerprint stays split two-for-one-key, by design.)
         CaRoot updated = *root;
         updated.cert_pem = intermediate_pem;
         updated.chain_pem = parent_chain_pem;
@@ -2913,6 +2925,12 @@ private:
         rec.next_update =
             std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
                 .count();
+        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+        // cert fingerprint plus the STABLE key id (invariant across a subordinate
+        // re-key) so the CRL history is attributable to the key, not just a cert.
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
         if (!ca_store_->record_crl(rec)) {
             // B-1 (#1240): do NOT report success on a persistence failure. Returning
             // the freshly-built DER here would make the revoke handler audit

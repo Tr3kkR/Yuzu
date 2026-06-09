@@ -1870,7 +1870,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                      {"issued_at", r.issued_at},
                                      {"revoked_at", r.revoked_at},
                                      {"revocation_reason", r.revocation_reason},
-                                     {"issued_by", r.issued_by}});
+                                     {"issued_by", r.issued_by},
+                                     // #1296: stable key-based CA identity (see
+                                     // ca_routes /ca/issued). Empty on pre-v5 rows.
+                                     {"issuer_key_id", r.issuer_key_id}});
                 }
                 nlohmann::json payload = {{"items", std::move(items)},
                                           {"count", records.size()},
