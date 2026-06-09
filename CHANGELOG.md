@@ -66,21 +66,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Guardian DEX — fleet-wide process-crash recorder (slice 1).** The agent now
-  records *any* process crash on a managed endpoint as a **ruleless** Digital
-  Experience (DEX) observation, independent of any Guardian rule. On Windows it is
-  an idle-until-crash subscription to the Application event log (Event ID 1000,
-  "Application Error") — no polling, no streaming. A crash is emitted through the
-  existing Guardian event pipeline and distinguished by `rule_id=__observation__`
-  (a reserved sentinel) plus `event_type=process.crashed` — not a category field;
-  query it via `GET /api/v1/guaranteed-state/events?rule_id=__observation__`. The
-  recorder is a no-op off Windows. Agents report crash-recorder arm-state and
-  observed-crash count in their heartbeat; the server rolls these up into
-  `yuzu_fleet_agents_crash_observer_disarmed` (Windows agents whose recorder
-  failed to arm — `> 0` means crash telemetry is silently off there) and
-  `yuzu_fleet_crashes_observed_total`. A deploy-time opt-out, `--dex-disable` /
-  `YUZU_AGENT_DEX_DISABLE`, collects no
-  crash telemetry. The full executable path is parsed but deliberately not sent
-  (data minimisation). See `docs/user-manual/guaranteed-state.md#crash-observations-dex`.
+  records Windows process crashes (Application event log, Event ID 1000,
+  "Application Error") on managed endpoints as **ruleless** Digital Experience (DEX)
+  observations, independent of any Guardian rule. It is an idle-until-crash
+  `EvtSubscribe` to the Application channel — no polling, no streaming. Scope is
+  Windows-only and Event-1000-only this slice (pure-.NET crashes that emit only a
+  `.NET Runtime` 1026, and hosts with Windows Error Reporting disabled, are not yet
+  captured). A crash is emitted through the existing Guardian event pipeline and
+  distinguished by `rule_id=__observation__` (a reserved sentinel) plus
+  `event_type=process.crashed` — not a category field; query it via
+  `GET /api/v1/guaranteed-state/events?rule_id=__observation__`. The recorder is a
+  no-op off Windows. Agents report crash-recorder arm-state and observed-crash count
+  in their heartbeat; the server rolls these up into
+  `yuzu_fleet_agents_crash_observer_disarmed` (Windows agents whose recorder is not
+  armed — failed to arm at startup or lost its subscription at runtime; `> 0` means
+  crash telemetry is silently off there) and `yuzu_fleet_crashes_observed_total` (a
+  resetting gauge, not a monotonic counter). A deploy-time opt-out, `--dex-disable` /
+  `YUZU_AGENT_DEX_DISABLE`, collects no crash telemetry. The full executable path is
+  parsed but deliberately not sent (data minimisation). See
+  `docs/user-manual/guaranteed-state.md#crash-observations-dex`.
 - **Guardian service guards — real-time Windows service run-state enforcement
   (PR5).** A new `service-status-change` spark with `service-running` /
   `service-stopped` assertions watches one Windows service via

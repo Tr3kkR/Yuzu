@@ -318,6 +318,47 @@ TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance
     CHECK(store.agent_rule_statuses("__observation__").empty());
 }
 
+TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the census",
+          "[guaranteed_state_store][events][crash][security]") {
+    // Security hardening (Gate-2 LOW → enforced): the "__observation__" sentinel is
+    // reserved for ruleless observations and has no live rule. A (mis)behaving agent
+    // could pair it with a COMPLIANCE event_type (drift.detected) to mint a phantom
+    // per-(agent,rule) census row keyed to the reserved id. The store must skip the
+    // census for ANY reserved __…__ rule_id regardless of event_type — not just for
+    // process.crashed.
+    GuaranteedStateStore store(":memory:");
+
+    GuaranteedStateEventRow abuse;
+    abuse.event_id = "__observation__-abuse-1";
+    abuse.rule_id = "__observation__";
+    abuse.agent_id = "agent-A";
+    abuse.event_type = "drift.detected"; // a compliance verdict paired with the sentinel
+    abuse.severity = "info";
+    abuse.timestamp = "2026-06-09T12:00:00Z";
+    REQUIRE(store.insert_event(abuse));
+
+    // The event is still stored (rule_id is NOT NULL — the sentinel satisfies it)…
+    GuaranteedStateEventQuery q;
+    q.rule_id = "__observation__";
+    REQUIRE(store.query_events(q).size() == 1);
+    // …but it creates NO census row for the reserved id.
+    CHECK(store.agent_rule_statuses().empty());
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+
+    // Regression guard: the skip is EXACT-match, NOT a "__"-prefix. A legitimately
+    // authored guard whose name slugifies to a "__"-prefixed rule_id (e.g. "__foo-<hex>")
+    // is a REAL rule-bound id and MUST keep its compliance census.
+    GuaranteedStateEventRow real;
+    real.event_id = "evt-real-1";
+    real.rule_id = "__foo-abc123"; // not the exact sentinel
+    real.agent_id = "agent-A";
+    real.event_type = "drift.detected";
+    real.severity = "high";
+    real.timestamp = "2026-06-09T12:01:00Z";
+    REQUIRE(store.insert_event(real));
+    CHECK(store.agent_rule_statuses("__foo-abc123").size() == 1);
+}
+
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");

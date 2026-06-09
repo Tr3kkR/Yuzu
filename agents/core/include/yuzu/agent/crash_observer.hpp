@@ -67,7 +67,15 @@ using CrashSink = std::function<void(const CrashObservation&)>;
 class ICrashObserver {
 public:
     virtual ~ICrashObserver() = default;
-    virtual bool start(CrashSink sink) = 0;
+    /// Arm the OS subscription. `sink` is called on each observed crash (OS callback
+    /// thread). `on_subscription_error` (optional) is called if the subscription fails
+    /// at RUNTIME after a successful start (e.g. the EventLog channel becomes
+    /// unreadable / the EventLog service restarts) — the owner uses it to mark the
+    /// recorder no longer healthy, since start() returning true proves only that it
+    /// armed, not that it stays live. It may fire on an OS thread and LATE (even during
+    /// teardown), so it must be self-contained — capture owner-independent state (e.g.
+    /// a shared atomic), never the owner by raw pointer.
+    virtual bool start(CrashSink sink, std::function<void()> on_subscription_error = {}) = 0;
     virtual void stop() = 0;
 };
 

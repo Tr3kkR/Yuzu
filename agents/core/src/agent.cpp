@@ -535,10 +535,12 @@ public:
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
         metrics_.describe("yuzu_agent_crash_observer_armed",
-                          "1 if the Guardian DEX crash recorder armed at startup, else 0. "
-                          "Startup-arm success only — NOT a liveness probe (a later runtime "
-                          "subscription error does not reset it), and NOT whether Windows Error "
-                          "Reporting is enabled. Surfaced fleet-wide via the heartbeat rollup "
+                          "1 if the Guardian DEX crash recorder is armed AND its subscription is "
+                          "live, else 0. Tracks runtime health: a runtime EvtSubscribe error "
+                          "(EventLog restart / channel ACL change) flips it to 0 via the observer "
+                          "error callback. NOT whether Windows Error Reporting is enabled (a "
+                          "WER-disabled host stays armed=1 yet emits no Event 1000). Surfaced "
+                          "fleet-wide via the heartbeat rollup "
                           "yuzu_fleet_agents_crash_observer_disarmed (the agent has no /metrics "
                           "endpoint).",
                           "gauge");
@@ -627,8 +629,20 @@ public:
         // --dex-disable / YUZU_AGENT_DEX_DISABLE is a deploy-time opt-out: when set,
         // the recorder never arms and NO process-crash telemetry is collected.
         crash_observer_ = make_crash_observer();
-        bool crash_armed = false;
+        // Runtime health flag — the single source of truth for the heartbeat arm tag.
+        // A shared_ptr<atomic> (NOT `this`) so the observer's error callback, which fires
+        // on an OS threadpool thread and may outlive this agent, can flip it to false
+        // without a use-after-free. A runtime EvtSubscribeActionError (EventLog restart /
+        // channel ACL change → recorder goes deaf after a successful start) flips it, so
+        // the next heartbeat reports armed=0 and the fleet `disarmed` gauge rises — the
+        // arm signal now tracks runtime health, not just the initial arm (UP-1).
+        // Seeded OPTIMISTICALLY true: the error callback may fire DURING start() (once
+        // EvtSubscribe arms, before start() returns), so we must NOT blind-store the
+        // start() result afterwards — that would clobber a false the callback wrote in
+        // that window. The disable / not-armed branches clear it explicitly instead.
+        crash_health_ = std::make_shared<std::atomic<bool>>(true);
         if (cfg_.dex_disable) {
+            crash_health_->store(false, std::memory_order_relaxed);
             spdlog::info(
                 "crash_observer: disabled by --dex-disable — no crash telemetry collected");
         } else if (crash_observer_->start([this](const CrashObservation& obs) {
@@ -646,14 +660,19 @@ public:
                        // crash_seq_ (incremented above) doubles as the per-agent observed-crash
                        // total surfaced in the heartbeat → fleet rollup; no separate counter.
                        emit_guardian_event(crash_observation_to_event(obs, event_id));
-                   })) {
-            crash_armed = true;
+                   },
+                   [h = crash_health_] { h->store(false, std::memory_order_relaxed); })) {
+            // Armed — leave crash_health_ as-is: true, or false if the error callback
+            // already fired during start(). Do NOT blind-store — see the seed comment.
         } else {
+            crash_health_->store(false, std::memory_order_relaxed);
             spdlog::debug("crash_observer: not armed on this platform — crash DEX disabled");
         }
-        // Startup-arm gauge (see describe()): reflects whether the subscription armed,
-        // NOT ongoing health — a later EvtSubscribeActionError won't reset it.
-        metrics_.gauge("yuzu_agent_crash_observer_armed").set(crash_armed ? 1.0 : 0.0);
+        // Arm gauge: seeded from crash_health_ (so a during-start error is reflected) and
+        // re-synced from it at each heartbeat, so it tracks runtime subscription health,
+        // not just the initial arm (UP-1).
+        metrics_.gauge("yuzu_agent_crash_observer_armed")
+            .set(crash_health_->load(std::memory_order_relaxed) ? 1.0 : 0.0);
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1320,10 +1339,14 @@ public:
                             // ONLY path that makes a silently-deaf recorder and the fleet crash
                             // count observable (see AgentHealthStore::recompute_metrics).
                             if (!cfg_.dex_disable) {
-                                tags["yuzu.crash_observer_armed"] = std::to_string(static_cast<int>(
-                                    metrics_.gauge("yuzu_agent_crash_observer_armed").value()));
+                                const bool healthy =
+                                    crash_health_ &&
+                                    crash_health_->load(std::memory_order_relaxed);
+                                tags["yuzu.crash_observer_armed"] = healthy ? "1" : "0";
                                 tags["yuzu.crashes_observed"] =
                                     std::to_string(crash_seq_.load(std::memory_order_relaxed));
+                                metrics_.gauge("yuzu_agent_crash_observer_armed")
+                                    .set(healthy ? 1.0 : 0.0);
                             }
 #endif
 
@@ -1711,19 +1734,25 @@ public:
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
+        // Cancel the Subscribe stream FIRST. The Guardian drift workers and the crash
+        // observer both emit through emit_guardian_event(), whose synchronous gRPC
+        // Write() BLOCKS on a stalled-but-not-dead stream (gateway up, not draining).
+        // guardian_->stop() / crash_observer_->stop() below DRAIN those emitters with an
+        // unbounded wait, so cancelling only after the drain lets an in-flight crash
+        // Write during shutdown wedge stop() forever (cpp-safety BLOCKING). TryCancel
+        // aborts the blocked Write; it does NOT tear the stream down — the stream holder
+        // and stream_write_mu_ are members destroyed AFTER guardian_/crash_observer_, so
+        // they stay live through both drains and emit_guardian_event's null-check under
+        // the lock remains UAF-safe.
+        if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
+            ctx->TryCancel();
+        }
         if (guardian_)
             guardian_->stop();
-        // Stop (join) the crash observer BEFORE cancelling the Subscribe stream
-        // below: its worker emits through emit_guardian_event, so the stream +
-        // mutex must still be live while we join it.
         if (crash_observer_)
             crash_observer_->stop();
         if (updater_)
             updater_->stop();
-        // Cancel the Subscribe stream to unblock the Read() call
-        if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
-            ctx->TryCancel();
-        }
         // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
         if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
             hctx->TryCancel();
@@ -1795,6 +1824,11 @@ private:
     // bursts within one millisecond; agent_id (folded into the id) disambiguates
     // ACROSS agents so a fleet-wide crash wave doesn't collide on the global PK.
     std::atomic<std::uint64_t> crash_seq_{0};
+    // Runtime arm/health of the crash observer — flipped to false by the observer's
+    // error callback on a runtime subscription failure (UP-1). A shared_ptr<atomic>
+    // (not `this`) so a late OS-threadpool error callback stays UAF-safe. Read by the
+    // heartbeat thread to drive the `yuzu.crash_observer_armed` tag.
+    std::shared_ptr<std::atomic<bool>> crash_health_;
     std::unique_ptr<ICrashObserver> crash_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;

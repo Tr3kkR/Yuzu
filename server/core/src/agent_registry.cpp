@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1175,12 +1177,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!ver_val.empty())
             version_counts[ver_val]++;
 
-        auto cmd_val = get("yuzu.commands_executed");
-        if (!cmd_val.empty()) {
+        // std::stod does NOT throw on "inf"/"nan" — it returns the non-finite value,
+        // which a single (rogue/buggy) agent could use to poison a fleet-wide gauge for
+        // every operator until it ages out. Accept only finite, non-negative counts.
+        auto add_finite_count = [](double& acc, const std::string& s) {
             try {
-                total_commands += std::stod(cmd_val);
+                double v = std::stod(s);
+                if (std::isfinite(v) && v >= 0.0)
+                    acc += v;
             } catch (...) {}
-        }
+        };
+
+        auto cmd_val = get("yuzu.commands_executed");
+        if (!cmd_val.empty())
+            add_finite_count(total_commands, cmd_val);
 
         // DEX crash recorder: a Windows agent (DEX enabled) reporting "0" failed to
         // arm. The tag is only emitted by such agents (see agent heartbeat), so
@@ -1189,11 +1199,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             ++crash_observer_disarmed;
 
         auto crashes_val = get("yuzu.crashes_observed");
-        if (!crashes_val.empty()) {
-            try {
-                total_crashes_observed += std::stod(crashes_val);
-            } catch (...) {}
-        }
+        if (!crashes_val.empty())
+            add_finite_count(total_crashes_observed, crashes_val);
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));

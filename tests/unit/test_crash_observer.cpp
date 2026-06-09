@@ -106,6 +106,38 @@ TEST_CASE("extract_named_data handles double-quoted attrs and self-closing Data"
     CHECK(f[1].second.empty());
 }
 
+TEST_CASE("extract_named_data tolerates malformed XML without crashing", "[crash][parse]") {
+    // The Application channel is world-writable: any local process can emit a crafted
+    // Event 1000. The parser must never crash on malformed input — it returns what it
+    // could parse (or nothing) and the caller defaults the rest.
+    CHECK(extract_named_data("").empty());                         // empty input
+    CHECK(extract_named_data("<EventData></EventData>").empty());  // no Data elements
+    // Unterminated tag (no closing '>') — stop, don't read out of bounds.
+    CHECK_NOTHROW(extract_named_data("<EventData><Data Name='X'"));
+    // Missing </Data> — return what was parsed so far without overrunning.
+    CHECK_NOTHROW(extract_named_data("<EventData><Data Name='X'>val"));
+    // A Data element with no Name= attribute -> empty name, value preserved.
+    const auto noname = extract_named_data("<EventData><Data>v</Data></EventData>");
+    REQUIRE(noname.size() == 1);
+    CHECK(noname[0].first.empty());
+    CHECK(noname[0].second == "v");
+}
+
+TEST_CASE("parse_application_error defaults garbage hex fields to 0", "[crash][parse]") {
+    // ProcessId / ExceptionCode are hex; a non-hex value (forged or locale-variant
+    // event) must default to 0, not throw out of the OS callback.
+    const std::vector<std::pair<std::string, std::string>> garbage = {
+        {"AppName", "x.exe"}, {"ProcessId", "not-a-pid"}, {"ExceptionCode", "0xZZZZ"}};
+    const auto o = parse_application_error(garbage);
+    CHECK(o.process_name == "x.exe");
+    CHECK(o.pid == 0u);
+    CHECK(o.termination.code == 0u);
+    // Empty hex strings likewise default rather than throw.
+    const auto e = parse_application_error({{"ProcessId", ""}, {"ExceptionCode", ""}});
+    CHECK(e.pid == 0u);
+    CHECK(e.termination.code == 0u);
+}
+
 TEST_CASE("crash_observation_to_event maps to a ruleless DEX event", "[crash][event]") {
     CrashObservation o;
     o.process_name = "notepad.exe";

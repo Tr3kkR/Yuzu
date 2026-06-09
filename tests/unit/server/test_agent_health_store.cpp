@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -71,22 +72,27 @@ public:
             if (!ver_val.empty())
                 version_counts[ver_val]++;
 
-            auto cmd_val = get("yuzu.commands_executed");
-            if (!cmd_val.empty()) {
+            // Mirrors AgentRegistry::recompute_metrics: std::stod does NOT throw on
+            // "inf"/"nan", so guard finite + non-negative or one rogue agent poisons the
+            // fleet gauge.
+            auto add_finite_count = [](double& acc, const std::string& s) {
                 try {
-                    total_commands += std::stod(cmd_val);
+                    double v = std::stod(s);
+                    if (std::isfinite(v) && v >= 0.0)
+                        acc += v;
                 } catch (...) {}
-            }
+            };
+
+            auto cmd_val = get("yuzu.commands_executed");
+            if (!cmd_val.empty())
+                add_finite_count(total_commands, cmd_val);
 
             if (get("yuzu.crash_observer_armed") == "0")
                 ++crash_observer_disarmed;
 
             auto crashes_val = get("yuzu.crashes_observed");
-            if (!crashes_val.empty()) {
-                try {
-                    total_crashes_observed += std::stod(crashes_val);
-                } catch (...) {}
-            }
+            if (!crashes_val.empty())
+                add_finite_count(total_crashes_observed, crashes_val);
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -220,6 +226,30 @@ TEST_CASE("AgentHealthStore: DEX crash recorder disarmed count + crashes summed"
     // Exactly one genuine arm FAILURE — absent tag and armed=1 are not counted.
     CHECK(metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed").value() == 1.0);
     CHECK(metrics.gauge("yuzu_fleet_crashes_observed_total").value() == 3.0);
+}
+
+TEST_CASE("AgentHealthStore: non-finite/garbage crash count does not poison the fleet gauge",
+          "[health_store]") {
+    // std::stod("inf"/"nan") returns a non-finite value WITHOUT throwing, so a single
+    // rogue/buggy agent could push the fleet-wide gauge to +/-Inf or NaN for every
+    // operator. The finite+non-negative guard rejects those; well-formed counts still sum.
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    store.upsert("good", {{"yuzu.crashes_observed", "5"}, {"yuzu.commands_executed", "10"}});
+    store.upsert("inf", {{"yuzu.crashes_observed", "inf"}, {"yuzu.commands_executed", "inf"}});
+    store.upsert("nan", {{"yuzu.crashes_observed", "nan"}});
+    store.upsert("neg", {{"yuzu.crashes_observed", "-4"}}); // negative count is nonsense
+    store.upsert("junk", {{"yuzu.crashes_observed", "garbage"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    // Only the well-formed counts survive; the gauges stay finite.
+    const double crashes = metrics.gauge("yuzu_fleet_crashes_observed_total").value();
+    const double cmds = metrics.gauge("yuzu_fleet_commands_executed_total").value();
+    CHECK(crashes == 5.0);
+    CHECK(cmds == 10.0);
+    CHECK(std::isfinite(crashes));
+    CHECK(std::isfinite(cmds));
 }
 
 TEST_CASE("AgentHealthStore: version breakdown", "[health_store]") {

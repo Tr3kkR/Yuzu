@@ -188,11 +188,12 @@ class WindowsCrashObserver final : public ICrashObserver {
 public:
     ~WindowsCrashObserver() override { stop(); }
 
-    bool start(CrashSink sink) override {
+    bool start(CrashSink sink, std::function<void()> on_error) override {
         std::lock_guard lk(state_->mu);
         if (sub_) return true; // already armed (idempotent)
         state_->stopping = false;
         state_->sink = std::move(sink);
+        state_->on_error = std::move(on_error);
         const wchar_t* query =
             L"*[System[Provider[@Name='Application Error'] and (EventID=1000)]]";
         // Heap strong-ref handed to EvtSubscribe as the callback context; keeps State
@@ -206,6 +207,7 @@ public:
                          ::GetLastError());
             delete ctx;
             state_->sink = nullptr;
+            state_->on_error = nullptr;
             return false;
         }
         sub_.reset(h);
@@ -225,6 +227,7 @@ public:
         std::unique_lock lk(state_->mu);
         state_->cv.wait(lk, [this] { return state_->in_flight == 0; });
         state_->sink = nullptr;
+        state_->on_error = nullptr;
     }
 
 private:
@@ -233,7 +236,8 @@ private:
         std::condition_variable cv;
         int in_flight = 0;
         bool stopping = false;
-        CrashSink sink; // guarded by mu
+        CrashSink sink;              // guarded by mu
+        std::function<void()> on_error; // runtime-error handler (UP-1), guarded by mu
     };
 
     static DWORD WINAPI callback(EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID ctx, EVT_HANDLE event) {
@@ -241,8 +245,25 @@ private:
         const std::shared_ptr<State> state = *static_cast<std::shared_ptr<State>*>(ctx);
         if (action == EvtSubscribeActionError) {
             // For the error action `event` carries the status code, not a handle.
-            spdlog::warn("crash_observer: subscription error (status={})",
+            spdlog::warn("crash_observer: subscription error (status={}) — recorder going deaf",
                          static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(event)));
+            // Signal the owner the subscription died at runtime so it marks the recorder
+            // unhealthy (UP-1) — start() succeeded but we stop receiving crashes. Copy the
+            // handler under mu, call it OUTSIDE mu. The handler is owner-independent (a
+            // shared atomic), so a late call during teardown is safe; the `stopping` check
+            // just avoids redundant work once stop() has begun.
+            std::function<void()> on_err;
+            {
+                std::lock_guard lk(state->mu);
+                if (!state->stopping)
+                    on_err = state->on_error;
+            }
+            if (on_err) {
+                try {
+                    on_err();
+                } catch (...) {
+                }
+            }
             return ERROR_SUCCESS;
         }
         try {
@@ -294,7 +315,7 @@ namespace yuzu::agent {
 namespace {
 class NoopCrashObserver final : public ICrashObserver {
 public:
-    bool start(CrashSink) override { return false; } // never armed off-Windows
+    bool start(CrashSink, std::function<void()>) override { return false; } // never armed off-Windows
     void stop() override {}
 };
 } // namespace

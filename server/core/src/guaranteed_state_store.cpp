@@ -61,6 +61,21 @@ const char* event_state_from_type(const std::string& t) {
     return nullptr; // guard.armed, resilience.escalated, … — no census change
 }
 
+// The reserved ruleless-observation sentinel (DEX crash recorder) is NEVER a rule-bound
+// compliance verdict — it has no live rule. Enforce that server-side so a (mis)behaving
+// agent that pairs the sentinel with a compliance event_type (e.g. drift.detected)
+// cannot mint a phantom per-(agent,rule) census row keyed to the reserved id (security
+// Gate-2: the sentinel is otherwise only a convention).
+//
+// EXACT match, NOT a "__"-prefix: a legitimately authored guard whose name slugifies to
+// a "__"-prefixed rule_id (e.g. "__foo-<hex>") is a REAL rule-bound id and MUST keep its
+// compliance census — a prefix check would silently suppress it (a real regression).
+// Must stay in sync with the agent's kObservationRuleSentinel (shared-constant +
+// cross-check is a tracked follow-up).
+bool is_reserved_rule_id(const std::string& rule_id) {
+    return rule_id == "__observation__";
+}
+
 } // namespace
 
 GuaranteedStateStore::GuaranteedStateStore(const std::filesystem::path& db_path,
@@ -575,9 +590,13 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     stmt.reset(); // finalize before the separate (auto-commit) census upsert below
     events_written_.fetch_add(1, std::memory_order_relaxed);
     // Maintain the per-(agent, rule) compliance census in lock-step with the event
-    // (Slice B). Same lock; idempotent for non-compliance event_types (skipped).
-    if (const char* state = event_state_from_type(row.event_type))
-        upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
+    // (Slice B). Same lock; idempotent for non-compliance event_types (skipped). A
+    // reserved sentinel rule_id (ruleless DEX observation) never updates the census
+    // regardless of event_type — it has no live rule (security: enforce the sentinel
+    // convention here, not just trust the agent to pair it with process.crashed).
+    if (!is_reserved_rule_id(row.rule_id))
+        if (const char* state = event_state_from_type(row.event_type))
+            upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
     return {};
 }
 

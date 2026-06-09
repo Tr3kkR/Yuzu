@@ -298,6 +298,8 @@ SSE.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_guardian_baselines_total` | gauge | Number of persisted Guardian Baselines. Refreshed on every `/metrics` scrape. |
+| `yuzu_fleet_agents_crash_observer_disarmed` | gauge | Windows agents (DEX enabled) whose process-crash recorder is not currently armed — it failed to arm at startup, or its subscription died at runtime (EventLog restart / channel ACL change). `> 0` means crash telemetry is silently off on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats; see the `YuzuCrashObserverDisarmed` alert. Note: it does **not** detect a host where Windows Error Reporting is disabled (the recorder stays armed but no Event 1000 is ever written). |
+| `yuzu_fleet_crashes_observed_total` | gauge | Fleet-wide sum of process crashes observed by DEX recorders since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-crash detail (process, module, exception code) lives in the Guardian events store, query via `GET /api/v1/guaranteed-state/events?rule_id=__observation__`. |
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
