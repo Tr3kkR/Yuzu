@@ -133,8 +133,15 @@ std::string rand_suffix() {
 }
 
 // Atomic write of a PUBLIC file (certs, marker) — stage to a sibling temp then
-// rename. Public artifacts keep default perms; private keys go through
-// FileKeyProvider (0600) instead.
+// rename. The artifact is set to a DETERMINISTIC 0644 (world-readable), NOT the
+// umask default: the CA cert + leaf certs are public trust material (the CA cert
+// is also served at GET /api/v1/ca/root), and under the secure-by-default
+// multi-container deploy a different-uid agent/gateway container must be able to
+// read the shared default-ca.pem. A strict server umask (e.g. 0077) would
+// otherwise leave it 0600 and break CA auto-discovery even with --cert-group
+// sharing the dir. The 0700/0750 dir still gates who can traverse to it, so 0644
+// on the file never widens access beyond what the dir already allows. Private
+// keys never come through here — they go through FileKeyProvider (0600).
 bool write_public_file(const fs::path& dest, const std::string& contents) {
     std::error_code ec;
     const fs::path tmp = dest.parent_path() / (dest.filename().string() + ".tmp." + rand_suffix());
@@ -153,6 +160,14 @@ bool write_public_file(const fs::path& dest, const std::string& contents) {
             return false;
         }
     }
+    // Set perms on the temp BEFORE the rename so the destination is never briefly
+    // visible at the umask default (and so the public bit is atomic with publish).
+    fs::permissions(tmp,
+                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                        fs::perms::others_read,
+                    fs::perm_options::replace, ec); // 0644
+    if (ec)
+        spdlog::warn("default_certs: chmod 0644 on {} failed: {}", tmp.string(), ec.message());
     fs::rename(tmp, dest, ec);
     if (ec) {
         spdlog::error("default_certs: rename {} -> {} failed: {}", tmp.string(), dest.string(),
