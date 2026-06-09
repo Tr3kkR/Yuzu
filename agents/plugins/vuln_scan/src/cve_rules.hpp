@@ -61,12 +61,20 @@ inline int compare_versions(std::string_view a, std::string_view b) {
             if (a_val != b_val)
                 return (a_val < b_val) ? -1 : 1;
         } else if (!a_num && !b_num) {
-            // Both are mixed alphanumeric. Split each into (prefix, digits, suffix)
-            // and compare by (prefix, digits_as_int, suffix)
+            // Both are mixed alphanumeric. Split each into (prefix_letters, numeric_value, suffix)
+            // and compare by (prefix_letters, numeric_value, suffix_recursively)
             auto split_mixed = [](std::string_view seg)
                 -> std::tuple<std::string_view, long long, std::string_view> {
+                // Find first digit position
                 size_t i = 0;
                 while (i < seg.size() && !std::isdigit(seg[i])) ++i;
+
+                // If no digits found, return whole segment as prefix with num=0, suffix=""
+                // This handles cases like "p2" correctly as ("p", 2, "") not ("", 0, "p2")
+                if (i == seg.size())
+                    return {seg, 0, {}};
+
+                // Extract (prefix_before_digit, digit_block, suffix_after_digit)
                 std::string_view pre = seg.substr(0, i);
                 size_t j = i;
                 while (j < seg.size() && std::isdigit(seg[j])) ++j;
@@ -83,7 +91,8 @@ inline int compare_versions(std::string_view a, std::string_view b) {
                 return pcmp;
             if (na != nb)
                 return na < nb ? -1 : 1;
-            int tcmp = ta.compare(tb);
+            // Recursively compare suffixes to handle nested alphanumeric patterns like "p2" vs "p10"
+            int tcmp = compare_versions(ta, tb);
             if (tcmp != 0)
                 return tcmp;
         } else {
