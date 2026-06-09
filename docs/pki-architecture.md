@@ -365,6 +365,52 @@ wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
 internal CA entirely for that surface — supported, unchanged, independent of CA
 mode. ACME and a configurable RSA key algorithm remain explicitly out of scope.
 
+## Secure-by-default deployment (PKI #1289)
+
+The PR2 engine generates the CA + leaves on first boot, but the **shipped Docker
+images** historically baked `--no-tls`/`--no-https` into their default CMD, so a
+container off the published image was plaintext. #1289 flips that: the
+`yuzu-server(-chisel)` and `yuzu-agent(-chisel)` images drop those flags, so a
+container is encrypted + mutually authenticated with zero configuration —
+dashboard over **HTTPS:8443** (8080 → HTTP→HTTPS redirect), agent/management/
+gateway listeners over (m)TLS. Demo/UAT/test composes keep `--no-tls`
+deliberately; native installs (deb/systemd, the Windows installer's opt-in
+disable checkbox) were already secure-by-default.
+
+**Agent CA auto-discovery.** The agent connects over TLS by default. With no
+`--ca-cert` it checks the standard install-CA path
+(`/etc/yuzu/certs/default-ca.pem`, or the Windows ProgramData path) **before**
+grpc falls back to the system trust store — a Yuzu self-signed CA is not in the
+system roots, so without this an agent pointed at a default-cert server silently
+fails the handshake. If neither an explicit `--ca-cert` nor a discovered CA is
+present it logs a clear warning rather than failing opaquely.
+
+**Cross-container cert sharing — `--cert-group`.** A multi-container deploy
+(server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids but
+shares ONE `/etc/yuzu/certs` volume. The server creates that dir `0700` and each
+leaf key `0600` owned by itself, so a different-uid sibling can neither traverse
+the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
+**`--cert-group <name|gid>`** flag (`YUZU_CERT_GROUP`) fixes this at cert-gen
+time: it chgrp's the cert dir (`0750`) and **only** `default-gateway.key`
+(`0640`) to a shared group — the FIXED gid 2000 `yuzu-pki` group baked into all
+three images, of which each image's user is a member. The CA key, server key,
+and HTTPS key stay `0600` owner-only — never group-shared; the CA + leaf certs
+are public `0644`. Empty (the default, single-host) keeps the tight 0700/0600
+posture. POSIX-only (Windows uses ACLs). This is `apply_cert_group_share()` in
+`default_certs.cpp`, applied on both the generate and idempotent-restart paths.
+
+**Gateway TLS config** still comes from the grpcbox block (`{grpcbox,
+client|servers}`), which grpcbox reads itself — the `YUZU_GW_*` env vars do NOT
+drive it (#1291). The secure reference mounts a TLS `sys.config`
+(`reference-gateway-sys.config`: upstream mutual TLS to the `server` service,
+one-way TLS agent listener). `--cert-san dns:gateway dns:server` puts the service
+names on the default leaves so SNI verification succeeds across the hops.
+
+**Reference composes:** `deploy/docker/docker-compose.reference.yml` (single
+server, HTTPS + persistent CA volume) and
+`deploy/docker/docker-compose.reference-gateway.yml` (server + gateway + agent,
+the full mTLS topology with `--cert-group` + the mounted gateway sys.config).
+
 ## Key custody + threat model
 
 The CA root key is a 0600 PEM in a 0700 directory via `FileKeyProvider`; it is

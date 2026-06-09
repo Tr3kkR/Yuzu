@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
+  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
+  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
+  container started from the published image is **encrypted + mutually
+  authenticated out of the box**: the server auto-generates a per-install CA and
+  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
+  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
+  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. Two operational notes: (1)
+  the dashboard cert is signed by the per-install CA, so a browser shows an
+  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
+  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
+  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
+  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
+  with the `yuzu-pki` group baked into all three images, so the
+  different-uid containers can read the shared certs (the CA/server/HTTPS private
+  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
+  Native installs (deb/systemd, Windows installer) were already secure-by-default.
+  New secure reference composes: `docker-compose.reference.yml` (single server) and
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). To run the old
+  insecure posture, pass `--no-tls --no-https` explicitly. See
+  `docs/pki-architecture.md` "Secure-by-default deployment".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
