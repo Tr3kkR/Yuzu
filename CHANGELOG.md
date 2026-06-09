@@ -103,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Epochs are authoritative (`2:1.0.0 > 1.99.99`); release suffixes and pre-release
   qualifiers do not affect ordering.
 
+- **Version comparison correctness for nested alphanumeric suffixes (OpenSSH p-releases)** —
+  Fixed `compare_versions()` to correctly handle version strings where the alphabetic
+  suffix itself contains digits, such as `9.8p2 < 9.8p10`. The previous implementation
+  compared suffix tails using lexicographic ordering, causing "p2" to rank higher than "p10"
+  (ASCII '2' > '1'). Suffixes are now compared recursively using the same numeric-aware
+  algorithm, correctly handling multi-level alphanumeric nesting. Affects CVE matching
+  accuracy for packages using this versioning convention (notably OpenSSH). Operators should
+  re-run `vuln_scan` after upgrade to correct any false-positive matches from prior scans.
+
 ### Tests
 
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
