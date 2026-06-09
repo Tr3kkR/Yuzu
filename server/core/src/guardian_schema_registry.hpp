@@ -45,4 +45,15 @@ const SchemaCatalog& guardian_schema_catalog();
 const std::vector<std::string_view>& supported_registry_hives();
 const std::vector<std::string_view>& supported_registry_value_types();
 
+/// Service run-state tokens the agent's ServiceGuard can actually arm and enforce
+/// (agent source: `service_support::kStates` in
+/// `agents/core/include/yuzu/agent/guard_service.hpp`). Each token `S` corresponds
+/// to a published `service-<S>` assertion and an agent handler in
+/// `guardian_engine.cpp`'s service spark branch. Same H2/G9 contract as the
+/// registry accessors: a cross-check unit test binds this to the agent constant so
+/// the server can never publish a `service-*` assertion the agent never arms.
+/// `service-disabled` is deliberately absent (start-type config; registry-
+/// expressible today, no agent handler yet).
+const std::vector<std::string_view>& supported_service_states();
+
 } // namespace yuzu::server::guardian

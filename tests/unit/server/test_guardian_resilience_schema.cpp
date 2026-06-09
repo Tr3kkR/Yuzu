@@ -16,6 +16,7 @@
 #include "guardian_schema_registry.hpp"
 
 #include <yuzu/agent/guard_registry.hpp>      // registry_support::kHives / kValueTypes (cross-check)
+#include <yuzu/agent/guard_service.hpp>       // service_support::kStates (cross-check)
 #include <yuzu/agent/resilience_strategy.hpp> // resilience_keys (cross-check)
 
 #include <catch2/catch_test_macros.hpp>
@@ -168,6 +169,13 @@ TEST_CASE("schema catalog: parses, lists Slice-A types, stable content ETag",
     CHECK(has("file-change"));
     CHECK(has("file-exists"));
     CHECK(has("file-hash-equals"));
+    // PR5 service types.
+    CHECK(has("service-status-change"));
+    CHECK(has("service-running"));
+    CHECK(has("service-stopped"));
+    // service-disabled (start-type config) is deliberately NOT published until the
+    // agent arms it — it is registry-expressible today.
+    CHECK_FALSE(has("service-disabled"));
 
     // The assertion type publishes the registry value-equals params + the
     // discriminated `expected` encoding (decision 3).
@@ -191,6 +199,12 @@ TEST_CASE("schema catalog: parses, lists Slice-A types, stable content ETag",
             const auto& props = e["json_schema"]["properties"]["params"]["properties"];
             CHECK(props.contains("path"));
             CHECK(props["expected"]["enum"] == json::array({"present", "absent"}));
+        }
+        if (e["type"] == "service-running" || e["type"] == "service-stopped") {
+            const auto& props = e["json_schema"]["properties"]["params"]["properties"];
+            CHECK(props.contains("service_name"));
+            // charset pattern (the service analogue of the registry discriminators).
+            CHECK(props["service_name"].contains("pattern"));
         }
     }
 }
@@ -280,6 +294,34 @@ TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent s
     }
 }
 
+TEST_CASE("CROSS-CHECK: service-state schema == server set == agent set (H2 drift guard)",
+          "[guardian][service][crosscheck]") {
+    using namespace yuzu::agent;
+
+    // The agent arms exactly the run-state assertions in service_support::kStates;
+    // the server publishes a service-<state> assertion + a supported_service_states()
+    // accessor that derive_rule_spec gates on. If these drift, an author following
+    // GET /schemas could create a service guard the agent never arms (silent G11
+    // errored) — the confidently-wrong-guard failure the registry cross-check closes.
+    // Re-sync service_support::kStates (agent) and kServiceStates (server) on merge.
+    auto server = sorted_strings(supported_service_states());
+    auto agent = sorted_strings(service_support::kStates);
+    CHECK(server == agent);
+
+    // Every supported state has a published service-<state> assertion, and the
+    // published service-* assertion set is EXACTLY that set — no service-disabled.
+    auto j = json::parse(guardian_schema_catalog().json);
+    std::vector<std::string> published;
+    for (const auto& e : j["schemas"]) {
+        const std::string t = e["type"].get<std::string>();
+        if (e["kind"] == "assertion" && t.rfind("service-", 0) == 0)
+            published.push_back(t.substr(std::string_view("service-").size()));
+    }
+    std::sort(published.begin(), published.end());
+    CHECK(published == server);
+    CHECK(std::find(published.begin(), published.end(), "disabled") == published.end());
+}
+
 namespace {
 // Build a registry-value-equals rule body for derive_rule_spec.
 json reg_rule_body(const std::string& key, const std::string& remediation_type) {
@@ -293,7 +335,53 @@ json reg_rule_body(const std::string& key, const std::string& remediation_type) 
         {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
     };
 }
+
+// Build a service run-state rule body for derive_rule_spec.
+json service_rule_body(const std::string& assertion_type, const std::string& service_name,
+                       const std::string& remediation_type) {
+    return json{
+        {"spark", {{"type", "service-status-change"}, {"params", json::object()}}},
+        {"assertion", {{"type", assertion_type}, {"params", {{"service_name", service_name}}}}},
+        {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
+    };
+}
 } // namespace
+
+TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",
+          "[guardian][service][derive]") {
+    for (const char* atype : {"service-running", "service-stopped"}) {
+        auto r = derive_rule_spec(service_rule_body(atype, "Spooler", "alert-only"), "svc", 1, true,
+                                  "audit");
+        CHECK_FALSE(r.error.has_value());
+        CHECK(r.structured);
+        auto spec = json::parse(r.spec_json);
+        CHECK(spec["assertion"]["type"] == atype);
+        CHECK(spec["assertion"]["params"]["service_name"] == "Spooler");
+    }
+}
+
+TEST_CASE("PR5: service-disabled is rejected until the agent arms it",
+          "[guardian][service][derive]") {
+    auto r = derive_rule_spec(service_rule_body("service-disabled", "Spooler", "alert-only"), "svc",
+                              1, true, "audit");
+    REQUIRE(r.error.has_value());
+    CHECK_FALSE(r.structured);
+}
+
+TEST_CASE("PR5: service assertion requires a valid service_name", "[guardian][service][derive]") {
+    // empty service_name
+    CHECK(derive_rule_spec(service_rule_body("service-running", "", "alert-only"), "svc", 1, true,
+                           "audit")
+              .error.has_value());
+    // shell metacharacters / out-of-charset name
+    CHECK(derive_rule_spec(service_rule_body("service-running", "Spooler; rm -rf /", "alert-only"),
+                           "svc", 1, true, "audit")
+              .error.has_value());
+    // a name using the full allowed charset passes
+    CHECK_FALSE(derive_rule_spec(service_rule_body("service-running", "My_Svc.1-2@x", "alert-only"),
+                                 "svc", 1, true, "audit")
+                    .error.has_value());
+}
 
 TEST_CASE("H1: enforce-mode write to a denylisted key is rejected (contract §6)",
           "[guardian][denylist][h1]") {
@@ -340,23 +428,63 @@ TEST_CASE("H1: denylist normalisation resists separator/case evasion",
     CHECK(dangerous_enforce_registry_key("software\\yuzutest\\flag").empty());
 }
 
-TEST_CASE("H1: dangerous_enforce_key_in_spec inspects the stored spec_json",
+TEST_CASE("H1: dangerous_enforce_in_spec inspects the stored spec_json",
           "[guardian][denylist][h1]") {
     // The audit→enforce bypass guard relies on detecting a denylisted key in a
     // stored (already-created, audit-mode) spec.
     auto clean = derive_rule_spec(reg_rule_body("SOFTWARE\\YuzuTest\\Flag", "alert-only"), "g", 1,
                                   true, "audit");
     REQUIRE(clean.structured);
-    CHECK(dangerous_enforce_key_in_spec(clean.spec_json).empty());
+    CHECK(dangerous_enforce_in_spec(clean.spec_json).empty());
 
     auto stored = derive_rule_spec(
         reg_rule_body("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "alert-only"), "g", 1,
         true, "audit");
     REQUIRE(stored.structured);
-    CHECK_FALSE(dangerous_enforce_key_in_spec(stored.spec_json).empty());
+    CHECK_FALSE(dangerous_enforce_in_spec(stored.spec_json).empty());
 
     // Robust to junk.
-    CHECK(dangerous_enforce_key_in_spec("").empty());
-    CHECK(dangerous_enforce_key_in_spec("not json").empty());
-    CHECK(dangerous_enforce_key_in_spec("{}").empty());
+    CHECK(dangerous_enforce_in_spec("").empty());
+    CHECK(dangerous_enforce_in_spec("not json").empty());
+    CHECK(dangerous_enforce_in_spec("{}").empty());
+}
+
+TEST_CASE("PR5: enforce service-stopped on a security service is denied at every promote path",
+          "[guardian][service][denylist]") {
+    // Enforce-STOPPING Defender / the agent's own service would disable a security
+    // control / self-destruct — the service-control mirror of the H1 registry gate.
+    // enforce service-RUNNING is protective and must stay allowed.
+    SECTION("raw denylist: security services + self, case-insensitive; others allowed") {
+        CHECK_FALSE(dangerous_enforce_service_stop("WinDefend").empty());
+        CHECK_FALSE(dangerous_enforce_service_stop("windefend").empty()); // case-insensitive
+        CHECK_FALSE(dangerous_enforce_service_stop("Sense").empty());
+        CHECK_FALSE(dangerous_enforce_service_stop("wscsvc").empty());
+        CHECK_FALSE(dangerous_enforce_service_stop("RpcSs").empty());      // critical infra
+        CHECK_FALSE(dangerous_enforce_service_stop("dcomlaunch").empty()); // critical infra
+        CHECK_FALSE(dangerous_enforce_service_stop("YuzuAgent").empty()); // self-destruct
+        CHECK(dangerous_enforce_service_stop("Spooler").empty());         // ordinary service
+        CHECK(dangerous_enforce_service_stop("").empty());
+    }
+    SECTION("create path: enforce service-stopped on WinDefend rejected") {
+        auto r = derive_rule_spec(service_rule_body("service-stopped", "WinDefend", "enforce"),
+                                  "svc", 1, true, "enforce");
+        CHECK(r.error.has_value());
+    }
+    SECTION("create path: enforce service-RUNNING on WinDefend allowed (protective)") {
+        auto r = derive_rule_spec(service_rule_body("service-running", "WinDefend", "enforce"),
+                                  "svc", 1, true, "enforce");
+        CHECK_FALSE(r.error.has_value());
+    }
+    SECTION("audit path: service-stopped on WinDefend allowed (observation only)") {
+        auto r = derive_rule_spec(service_rule_body("service-stopped", "WinDefend", "alert-only"),
+                                  "svc", 1, true, "audit");
+        CHECK_FALSE(r.error.has_value());
+    }
+    SECTION("toggle/push/update backstop: stored spec detected via dangerous_enforce_in_spec") {
+        auto stored = derive_rule_spec(
+            service_rule_body("service-stopped", "WinDefend", "alert-only"), "svc", 1, true,
+            "audit");
+        REQUIRE(stored.structured);
+        CHECK_FALSE(dangerous_enforce_in_spec(stored.spec_json).empty());
+    }
 }

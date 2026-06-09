@@ -1,0 +1,27 @@
+---
+import Base from '../layouts/Base.astro';
+import HeroStrata from '../components/hero/HeroStrata.astro';
+const base = import.meta.env.BASE_URL;
+---
+<Base>
+  <header class="hero">
+    <div class="wrap">
+      <span class="eyebrow">agentic colleagues for the fleet <span class="caret"></span></span>
+      <h1>The fleet now has<br /><span class="iris">a colleague.</span></h1>
+      <p class="lede">
+        Yuzu places <strong>agentic colleagues</strong> inside your endpoint estate —
+        reasoning over Windows, Linux, and macOS in real time. Not a console.
+        Not a script runner. <strong>Something that was not here before.</strong>
+      </p>
+      <div class="hero-diagram"><HeroStrata /></div>
+      <div class="cta-row">
+        <a class="btn btn-primary" href={`${base}architecture/`}>Enter the architecture</a>
+        <a class="btn btn-ghost" href={`${base}manual/getting-started/`}>Read the manual</a>
+      </div>
+    </div>
+  </header>
+
+  <style>
+    .hero-diagram{ max-width:620px; margin:26px 0 40px; }
+  </style>
+</Base>

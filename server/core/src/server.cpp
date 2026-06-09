@@ -45,6 +45,7 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
 #include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
@@ -448,6 +449,8 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_baselines_total",
+                          "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -1143,7 +1146,11 @@ public:
                     // Per-agent filtering as the fan-out (M4): only rules that target
                     // this agent's OS and name it in scope. Cache scope membership
                     // across rules sharing a scope_expr within this one reconcile.
-                    const auto rules = guaranteed_state_store_->list_rules();
+                    // Baseline gate (docs/guardian-baseline-model.md): the rule source
+                    // is the union of member Guards of *deployed* Baselines, so an
+                    // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    const auto rules = guardian::filter_deployed_members(
+                        guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -1500,6 +1507,16 @@ public:
                 if (gateway_service_)
                     gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
             }
+        }
+
+        // Guardian Baselines — the deployable collection of Guards (M:N members +
+        // included/excluded management-group assignment). Control-plane only; the
+        // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
+        {
+            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
+            if (baseline_store_ && baseline_store_->is_open())
+                spdlog::info("BaselineStore initialized at {}", bl_db.string());
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -2123,6 +2140,10 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                }
+                if (baseline_store_) {
+                    metrics_.gauge("yuzu_server_guardian_baselines_total")
+                        .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
                 // Process health sampling (22.1)
                 {
@@ -3643,6 +3664,9 @@ private:
             // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+            // Guardian Baselines store — load-bearing for the Baseline dashboard +
+            // deploy surface; same rationale as the Guard store row above.
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
             // Phase 8.3 #255 — same pattern as Guardian above. Without
             // this row /healthz would report "healthy" while every
             // /api/v1/offload-targets endpoint and every fire_event call
@@ -3657,7 +3681,7 @@ private:
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && offload_target_ok && ca_ok;
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -3670,6 +3694,7 @@ private:
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
+                  {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
@@ -3779,6 +3804,7 @@ private:
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
                  guaranteed_state_store_ && guaranteed_state_store_->is_open()},
+                {"baseline_store", baseline_store_ && baseline_store_->is_open()},
                 // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
                 // legacy config-file-only deployments (auth_db_ == nullptr
                 // in AuthManager) and false only when an opted-in AuthDB
@@ -3871,8 +3897,9 @@ private:
             bool policy_ok = policy_store_ && policy_store_->is_open();
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
-            bool all_ok =
-                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
+            bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+                          guaranteed_state_ok && baseline_ok;
 
             // Execution stats
             int in_flight = 0;
@@ -7354,6 +7381,7 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             guaranteed_state_store_.get(),
+            baseline_store_.get(),
             [this]() -> std::string { return registry_.to_json(); },
             // Dashboard enforcement toggle deploys via the same push fan-out the
             // REST endpoint uses. guardian_push_fn_ is assigned just below during
@@ -7682,7 +7710,11 @@ private:
                 // and wedge the heartbeat reconcile. (M6 / #1209.)
                 const std::uint64_t generation =
                     guaranteed_state_store_->current_policy_generation();
-                const auto rules = guaranteed_state_store_->list_rules();
+                // Baseline gate: push only Guards that are members of a *deployed*
+                // Baseline (docs/guardian-baseline-model.md). With nothing deployed
+                // the set is empty and a full_sync converges agents to zero guards.
+                const auto rules = guardian::filter_deployed_members(
+                    guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -8114,6 +8146,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
     DefaultCertSet default_cert_set_;
     bool default_certs_failed_{false};
@@ -8167,6 +8200,22 @@ private:
     std::mutex guardian_reconcile_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point>
         guardian_last_reconcile_;
+
+    // The Baseline gate's input: the union of member-Guard rule_ids across all
+    // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
+    // was deployed) — NOT its live member set. A Guard reaches an agent only as a
+    // member of a deployed Baseline (docs/guardian-baseline-model.md), so the push
+    // fan-out and the heartbeat reconcile filter their rule source through this via
+    // guardian::filter_deployed_members. Empty when nothing is deployed — a
+    // full_sync push then converges agents to zero guards (correct by model).
+    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // format) so an edit to a deployed Baseline's members does not change what the
+    // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
+    std::unordered_set<std::string> deployed_member_rule_ids() const {
+        if (!baseline_store_)
+            return {};
+        return baseline_store_->deployed_member_rule_ids();
+    }
 
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;

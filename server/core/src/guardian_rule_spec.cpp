@@ -129,6 +129,43 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
         return std::nullopt;
     }
 
+    // Service run-state assertions (service-running / service-stopped). The desired
+    // state is the type suffix; bind it to the published kServiceStates set (H2) so a
+    // state the agent does not arm — notably service-disabled — is rejected at
+    // authoring rather than arming a confidently-wrong guard. The only param is the
+    // SCM service name, validated against the agent's valid_service_name() charset so
+    // a name the agent would reject cannot be authored.
+    if (assertion_type.rfind("service-", 0) == 0) {
+        const std::string state = assertion_type.substr(std::string_view("service-").size());
+        if (!in_set(supported_service_states(), state))
+            return ResilienceParamError{
+                "unsupported service assertion '" + assertion_type + "'",
+                "use an assertion published by GET /api/v1/guaranteed-state/schemas "
+                "(service-running, service-stopped)"};
+        const std::string svc = str_param(params, "service_name");
+        if (svc.empty())
+            return ResilienceParamError{
+                "service assertion requires a non-empty 'service_name'",
+                "set assertion.params.service_name to the SCM service (key) name, e.g. Spooler"};
+        if (svc.size() > 256 || !std::all_of(svc.begin(), svc.end(), [](unsigned char c) {
+                return std::isalnum(c) || c == '.' || c == '_' || c == '-' || c == '@';
+            }))
+            return ResilienceParamError{
+                "invalid service_name '" + svc + "'",
+                "service names are alphanumeric plus . _ - @ (max 256 chars)"};
+        // Enforce-STOPPING a security service (Defender etc.) or the agent's own
+        // service would turn Guardian into a security-control disabler / self-destruct
+        // — gate it the same way enforce-writes to denylisted registry keys are gated
+        // (H1). enforce service-running is protective and stays ungated.
+        if (enforcement_mode == "enforce" && assertion_type == "service-stopped")
+            if (std::string why = dangerous_enforce_service_stop(svc); !why.empty())
+                return ResilienceParamError{
+                    "enforce-mode stop of " + why + " is not permitted",
+                    "author this Guard in audit mode (enforcement_mode=\"audit\") to observe its "
+                    "state, or target a service outside the protected set"};
+        return std::nullopt;
+    }
+
     // Unknown assertion type is not this validator's job to gate — the agent marks
     // an unknown assertion errored (G11). derive_rule_spec validates only the
     // types we publish in the schema catalog.
@@ -181,21 +218,63 @@ std::string dangerous_enforce_registry_key(std::string_view key) {
     return {};
 }
 
-std::string dangerous_enforce_key_in_spec(const std::string& spec_json) {
+std::string dangerous_enforce_service_stop(std::string_view service_name) {
+    // Enforce-STOPPING these would turn Guardian (a security-enforcement tool) into a
+    // security-control disabler, or have the agent stop its own service (self-destruct
+    // / flap). Detection (audit) on them is fine; enforce-stop is not. EXACT
+    // case-insensitive match on the SCM key name — service names are case-insensitive
+    // but not path-structured, so substring matching would over-block (e.g. a service
+    // legitimately named "...EventLog..."). The service-control mirror of
+    // dangerous_enforce_registry_key.
+    const std::string lc = ascii_lower(service_name);
+    struct Denied {
+        std::string_view name;
+        std::string_view why;
+    };
+    static constexpr Denied kDenied[] = {
+        // Security controls — enforce-stopping these disables endpoint protection.
+        {"windefend", "the Microsoft Defender Antivirus service"},
+        {"wdnissvc", "the Microsoft Defender Network Inspection service"},
+        {"sense", "the Microsoft Defender for Endpoint sensor"},
+        {"wscsvc", "the Windows Security Center service"},
+        {"mpssvc", "the Windows Defender Firewall service"},
+        {"eventlog", "the Windows Event Log service"},
+        // Critical infrastructure — enforce-stopping these strands the agent itself
+        // and breaks the host's ability to launch/recover services (self-inflicted
+        // outage, not a security-control bypass, but equally catastrophic).
+        {"rpcss", "the RPC subsystem (stopping it strands the agent and most Windows services)"},
+        {"dcomlaunch", "the DCOM Server Process Launcher (stopping it breaks service launch/recovery)"},
+        // The agent's own service — enforce-stop would be self-destruct / flap.
+        {"yuzuagent", "the Yuzu agent's own service"},
+    };
+    for (const auto& d : kDenied)
+        if (lc == d.name)
+            return std::string(d.why);
+    return {};
+}
+
+std::string dangerous_enforce_in_spec(const std::string& spec_json) {
     if (spec_json.empty())
         return {};
     auto spec = nlohmann::json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
     if (!spec.is_object() || !spec.contains("assertion") || !spec["assertion"].is_object())
         return {};
     const auto& assertion = spec["assertion"];
-    if (assertion.value("type", std::string{}) != "registry-value-equals")
-        return {};
+    const std::string atype = assertion.value("type", std::string{});
     if (!assertion.contains("params") || !assertion["params"].is_object())
         return {};
     const auto& params = assertion["params"];
-    if (!params.contains("key") || !params["key"].is_string())
-        return {};
-    return dangerous_enforce_registry_key(params["key"].get<std::string>());
+    if (atype == "registry-value-equals") {
+        if (!params.contains("key") || !params["key"].is_string())
+            return {};
+        return dangerous_enforce_registry_key(params["key"].get<std::string>());
+    }
+    if (atype == "service-stopped") {
+        if (!params.contains("service_name") || !params["service_name"].is_string())
+            return {};
+        return dangerous_enforce_service_stop(params["service_name"].get<std::string>());
+    }
+    return {};
 }
 
 RuleSpecResult derive_rule_spec(const nlohmann::json& body, const std::string& name,

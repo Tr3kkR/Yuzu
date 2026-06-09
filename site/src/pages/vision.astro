@@ -1,0 +1,119 @@
+---
+import Base from '../layouts/Base.astro';
+const base = import.meta.env.BASE_URL;
+---
+<Base title="Vision — Yuzu" description="Yuzu is built so an agentic colleague can do everything a human operator can — through a documented, discoverable, machine-readable surface.">
+  <header class="hero vision-hero">
+    <div class="wrap">
+      <span class="eyebrow">the thesis <span class="caret"></span></span>
+      <h1>Built for a colleague<br /><span class="iris">that isn't human.</span></h1>
+      <p class="lede">
+        Yuzu is an enterprise endpoint platform — real-time query, command, and compliance
+        across Windows, Linux, and macOS. What makes it strange is the contract underneath:
+        <strong>everything a human operator can do, an agentic colleague can do too</strong> —
+        through a documented, discoverable, machine-readable surface.
+      </p>
+    </div>
+  </header>
+
+  <section>
+    <div class="wrap vision-section">
+      <span class="eyebrow">a colleague, not a console</span>
+      <h2 class="kicker">Most fleet tools wait to be clicked.</h2>
+      <p>
+        A console assumes a human at the controls: someone points, the machine obeys. Yuzu
+        inverts the assumption. Its founding architectural rule — the <em>agentic-first
+        principle</em> — holds that every operation an authorised human can perform via the
+        dashboard must be performable by an authenticated agentic worker; that every signal a
+        human can see must be available to that worker; and that every error must be
+        machine-actionable.
+      </p>
+      <p>
+        The consequence is subtle and total. Yuzu is not a dashboard with an API bolted on. It
+        is a control plane designed, from its first commit, to be operated by something that
+        reasons — and only incidentally by someone with a browser.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <span class="eyebrow">four laws</span>
+      <h2 class="kicker">What it takes to trust a machine with the fleet.</h2>
+      <p class="section-sub">
+        Four invariants govern every new surface Yuzu grows. They are the difference between a
+        tool a colleague can <em>use</em> and one it can only guess at.
+      </p>
+      <div class="laws">
+        <div class="law">
+          <span class="tag">A1 · parity</span>
+          <h3>Every surface, both ways</h3>
+          <p>Anything the dashboard renders is also available as structured JSON — the human view and the machine view never diverge.</p>
+        </div>
+        <div class="law">
+          <span class="tag">A2 · discovery</span>
+          <h3>Learn from the server alone</h3>
+          <p>Tools, routes, scope kinds, permissions, instruction definitions — all enumerable from the live server, with no side-channel documentation fetch.</p>
+        </div>
+        <div class="law">
+          <span class="tag">A3 · observability</span>
+          <h3>Watch the work happen</h3>
+          <p>Every long-running operation streams structured events, each carrying an execution id and a step name drawn from a published taxonomy.</p>
+        </div>
+        <div class="law">
+          <span class="tag">A4 · legible failure</span>
+          <h3>Errors that can be acted on</h3>
+          <p>Every failure carries a code, a correlation id, whether to retry, and how to remediate. A denied permission names the permission — and how to request it.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap vision-section">
+      <span class="eyebrow">alien to the landscape</span>
+      <h2 class="kicker">Not a re-skin of the thing you already have.</h2>
+      <p>
+        Yuzu is built from the ground up in modern C++23: a plugin ABI that stays stable across
+        compiler versions, gRPC / Protobuf / mTLS transport, SQLite for embedded storage,
+        Prometheus-native metrics, and an embedded MCP server that hands its tools to AI
+        directly rather than through a human intermediary.
+      </p>
+      <p>
+        The effect is a system that behaves less like a tool you operate and more like a
+        colleague you brief — one that reasons over the whole estate, in real time, and does
+        not sleep. That is the part that should feel slightly unfamiliar. It is supposed to.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href={`${base}architecture/`}>See the architecture</a>
+        <a class="btn btn-ghost" href={`${base}manual/getting-started/`}>Read the manual</a>
+      </div>
+    </div>
+  </section>
+
+  <style>
+    .vision-hero{ padding-bottom:64px; }
+    .vision-hero h1{ font-size:clamp(44px, 7.5vw, 96px); }
+    .vision-section{ max-width:760px; }
+    .vision-section p{ color:var(--ink-2); font-size:17px; margin:0 0 18px; }
+    .vision-section .cta-row{ margin-top:30px; }
+
+    .laws{ display:grid; grid-template-columns:repeat(2, 1fr); gap:18px; margin-top:4px; }
+    .law{
+      border:1px solid var(--line-1); border-left:3px solid var(--cyan);
+      border-radius:var(--rad); padding:20px 22px;
+      background:linear-gradient(180deg, rgba(26,41,64,.5), rgba(14,26,45,.35));
+    }
+    .law:nth-child(2n){ border-left-color:var(--violet); }
+    .law .tag{
+      font-family:var(--font-mono); font-size:11px; letter-spacing:.18em;
+      text-transform:uppercase; color:var(--ink-4);
+    }
+    .law h3{
+      font-family:var(--font-display); font-weight:600; font-size:20px;
+      color:var(--ink); letter-spacing:-.01em; margin:7px 0 8px;
+    }
+    .law p{ margin:0; color:var(--ink-2); font-size:15px; }
+    @media (max-width:760px){ .laws{ grid-template-columns:1fr; } }
+  </style>
+</Base>

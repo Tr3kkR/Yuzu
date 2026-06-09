@@ -395,7 +395,7 @@ the address and port for the GatewayUpstream service. This port must match
 `upstream_port` in `sys.config`:
 
 ```bash
-yuzu-server --gateway-upstream "0.0.0.0:50051"
+yuzu-server --gateway-upstream "0.0.0.0:50055"
 ```
 
 > **Known limitation — gateway origin-IP attribution (#1064).** On the gateway
@@ -476,7 +476,7 @@ This starts the gateway with all applications loaded, useful for debugging.
 | Dependency | Version | Purpose |
 |---|---|---|
 | grpcbox | 0.17.1 | gRPC server and client (HTTP/2, protobuf) |
-| gpb | 4.21.2 | Protobuf compiler and runtime |
+| gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
 | prometheus | 4.11.0 | Prometheus exposition |
 | prometheus_httpd | 2.1.2 | HTTP endpoint for Prometheus scraping |
@@ -536,16 +536,31 @@ The gateway exposes Prometheus metrics on a configurable HTTP port (default:
 
 ### Available Metrics
 
+Names, types, and labels below are taken from the emitting source
+(`gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`) and match the canonical
+gateway list in [`docs/grafana/README.md`](../grafana/README.md). Only metrics
+that are actually emitted are listed.
+
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_gw_agents_connected` | gauge | Number of currently connected agents |
-| `yuzu_gw_commands_dispatched_total` | counter | Total commands dispatched to agents |
-| `yuzu_gw_commands_completed_total` | counter | Total commands completed (by status) |
-| `yuzu_gw_heartbeats_batched_total` | counter | Total heartbeats sent in batch RPCs |
-| `yuzu_gw_upstream_rpc_duration_seconds` | histogram | Upstream RPC latency by method |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC failures by method |
+| `yuzu_gw_agents_current` | gauge | Agents currently connected to this gateway node (label `node`) |
+| `yuzu_gw_agents_connected_total` | counter | Total agent connections since startup (label `node`) |
+| `yuzu_gw_agents_disconnected_total` | counter | Total agent disconnections (label `node`) |
+| `yuzu_gw_commands_dispatched_total` | counter | Commands dispatched to agents (label `plugin`) |
+| `yuzu_gw_commands_timed_out_total` | counter | Commands that timed out before a response |
+| `yuzu_gw_commands_dropped_backpressure_total` | counter | Commands dropped because an agent's send buffer was full |
+| `yuzu_gw_stream_write_errors_total` | counter | Agent stream write errors |
+| `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms (labels `plugin`, `status`) |
+| `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms (label `node`) |
+| `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
 | `yuzu_gw_registration_replay_total` | counter | Agents re-proxied upstream by the registration-replay drip after an upstream reconnect |
-| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle). A persistently non-zero value indicates a replay that never drains — alert on it. |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains — alert on it. |
+
+The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
+queue-length histograms, circuit-breaker and cluster counters) is registered in
+`yuzu_gw_telemetry.erl`; see [`docs/grafana/README.md`](../grafana/README.md)
+for the canonical catalogue.
 
 ### Planned Metrics (Not Yet Implemented)
 

@@ -272,6 +272,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`publish_next_crl`, monotonic per RFC 5280 §5.2.3); the inventory carries an
   `issuer_fingerprint` provenance link to the signing root. Engine only — the
   first-boot wiring lands in PR2.
+- **Guardian service guards — real-time Windows service run-state enforcement
+  (PR5).** A new `service-status-change` spark with `service-running` /
+  `service-stopped` assertions watches one Windows service via
+  `NotifyServiceStatusChange` (kernel-notified by the SCM, ~0 ms, no polling)
+  and, in `enforce` mode, drives it back to the desired state via the
+  service-control API (`StartService` / `ControlService` — never `sc.exe`),
+  gated by the same per-rule resilience policy as registry guards. Pending
+  service states are held as transitional (no spurious drift / control loop
+  during start-up); the watch is resilient to the service being deleted and
+  recreated. Off-Windows the guard is a no-op (never reads as armed). The
+  schema catalog (`GET /api/v1/guaranteed-state/schemas`) and the
+  `derive_rule_spec` authoring validator publish the new types, bound to the
+  agent's `service_support::kStates` by a schema↔handler cross-check (H2/G9).
+  Enforce-*stop* is denied (and downgraded at push) for security services
+  (Defender/Firewall/Security Center/Event Log), critical infrastructure
+  (`RpcSs`/`DcomLaunch`), and the agent's own service, so Guardian cannot be
+  turned into a security-control disabler or strand itself; enforce-*run* is
+  always allowed.
+  `service-disabled` (start-type config, which fires no SCM notification) is
+  deliberately **not** published yet — express it as a registry guard on
+  `…\Services\<name>\Start` = `4` meanwhile. Service guards are authored via
+  REST / the seed rig today (like file guards); a dashboard form follows.
+- **Break-glass MFA reset CLI (#1226).** `yuzu-server --mfa-reset <username>`
+  clears a user's MFA enrollment and exits without starting the server —
+  the documented recovery from MFA-enforcement lockout (lost device, IdP
+  not asserting `amr`, sole admin who could not enroll). Unlike the manual
+  SQL break-glass it replaces, it **writes an audit row**
+  (`mfa.reset.breakglass`), closing the SOC 2 CC6.6 evidence gap. Requires
+  no TLS/HTTPS flags. Security hardening (adversarial + cybersecurity
+  review): the audit row is **mandatory and fail-closed** — `audit.db` is
+  opened and verified writable *before* any MFA is cleared, and the command
+  exits non-zero rather than silently clearing a second factor with no
+  evidence; the audit principal is the **real OS identity**
+  (`getpwuid`/`GetUserNameA`), not the forgeable `$USER`/`$USERNAME` env
+  var; and the JSON status line is output-escaped. See
+  `docs/ops-runbooks/auth-db-recovery.md` for the threat model and the
+  `mfa.reset.breakglass` alerting hook.
 
 - **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
   Settings panel and the login-time enrollment-bootstrap form — now render
@@ -327,6 +364,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `docs/user-manual/{authentication,rest-api,server-admin,upgrading}.md`,
     `docs/ops-runbooks/auth-db-recovery.md`.
 
+- **Guardian Baselines — the deployable unit, with baseline-gated deploy.**
+  A **Baseline** is a named collection of Guards and is now the *only* deployable
+  unit: a Guard reaches an agent exclusively as a member of a **deployed**
+  Baseline. New `BaselineStore` (`guardian-baselines.db`): M:N member Guards, an
+  included/excluded management-group assignment (reserved — targeting is deferred,
+  so deploy is fleet-wide for now), and a draft → deployed lifecycle. Dashboard
+  surface only (no REST API yet): create / edit / deploy / re-deploy / delete. The
+  push fan-out and heartbeat reconcile source their rule set from the union of
+  member Guards of deployed Baselines, taken from each Baseline's **deployed
+  snapshot** (what was deployed) — so editing a deployed Baseline's members is a
+  staged change that reaches agents only on a Push-gated re-deploy. New `baselines`
+  row in `/healthz` + `/readyz` and a `yuzu_server_guardian_baselines_total`
+  metric. Audited under `guaranteed_state.baseline.{create,update,deploy,delete}`.
+- **Guardian compliance overview + per-(agent, rule) census.** A new
+  `guard.compliant` event (emitted once on the transition into compliant, then
+  silent) drives a pruning-immune per-(agent, rule) status table
+  (`guardian_agent_rule_status`). The dashboard overview reports live fleet
+  compliance — Fleet / By Guard / By Baseline coverage, a compliant/drifted/error/
+  unknown proportion, a 7-day enforcement-effectiveness trend, and per-device
+  drill-down — from one liveness-folded rollup (offline agents fold to unknown).
+  **Platform honesty:** Guardian arms guards on Windows only today (the registry /
+  file guards are agent-side no-ops on macOS and Linux), but deploy is fleet-wide,
+  so connected macOS/Linux agents are reported as a distinct **"not implemented"**
+  class — a fleet banner with per-platform counts, a separate census segment (in the
+  compliant-share denominator, so the headline % drops when targeted Macs can't be
+  enforced), and explicit per-device rows — never folded into compliant or into the
+  offline "unknown" bucket. An operator can never mistake a no-op platform for an
+  armed one. The REST `/status` endpoint still returns placeholder zeros; the census
+  is dashboard-only for now.
+- Per-Guard `prerequisites` column reserved on the Guard store (stored, not yet
+  evaluated — engine-side evaluation is deferred).
 - **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
   A new agent guard watches a target file via `ReadDirectoryChangesW` on its
   parent directory — kernel-notified, no polling, so detection is realtime — and
@@ -603,6 +671,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
     AuthDB enroll → verify → login → recovery → disable).
 
+### Changed
+
+- **Guardian dashboard redesign — full-page detail, card views, and a Guard
+  filter (UI only; no REST `/api/v1` change).** The Guard and Baseline detail
+  views are now **full pages** (`/guardian/guard/<id>`, `/guardian/baseline/<id>`)
+  replacing the detail modal. The By-Guard and By-Baseline compliance views are
+  stats-forward **card lists** (not tables); By-Guard gained a **filter bar**
+  (free-text search + state / severity / mode). The Fleet stat cards are now
+  **clickable** (jump to the matching sub-view, pre-filtered). The Guard detail
+  page's per-device rows link to the host page; the Baseline page shows its member
+  Guards and recent events; the Recent Events panel has a free-text search box.
+  Baseline **Edit** moved to the Baselines-section card. A CSP fix removed htmx
+  `hx-on` handlers from the product UI (operators see no functional change).
+- **Breaking — Guardian `enforcement_mode` is immutable after creation.**
+  `PUT /api/v1/guaranteed-state/rules/{id}` with an `enforcement_mode` that
+  differs from the stored value now returns `400` (`enforcement_mode is immutable
+  — create a new Guard for a different mode`); a different posture (enforce vs
+  audit) is a different Guard. The dashboard's per-Guard **Switch to Audit /
+  Switch to Enforce** toggle is **removed**; the remaining enable/disable toggle
+  is state-only (`Write`, no auto-push) and propagates on the next
+  deploy/reconcile.
+- **Breaking — Guards reach agents only via a deployed Baseline.** After
+  upgrading from a pre-Baseline Guardian build, a Guard not in a deployed Baseline
+  is silently omitted from every agent push and stops enforcing. Create a Baseline
+  containing your active Guards and deploy it — see the upgrade note in
+  `docs/user-manual/guaranteed-state.md`.
+
 ### Fixed
 
 - **Agents enrolling *through the gateway* now receive a per-agent client
@@ -622,6 +717,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/etc/yuzu` was root-owned, so the secure-by-default first-boot CA + default
   cert generation (which runs as `yuzu`) failed with a permission error in the
   container. Surfaced by the live two-host gateway boot-test.
+- **MFA enrollment no longer rotates the provisional secret on re-init
+  (#1227).** `mfa_init_enrollment` on a not-yet-confirmed (provisional)
+  row now **reuses** the existing secret instead of minting a fresh one,
+  so a second browser tab, a retried `/login` enrollment bootstrap, or a
+  re-opened Settings panel no longer invalidates the QR the operator
+  already scanned. The provisional secret is still reaped if abandoned;
+  once enrollment is confirmed, the secret is never re-revealed. The reuse
+  path carries a TOCTOU guard (adversarial + cybersecurity review): it
+  re-checks the freshly-loaded row's `enrolled` flag — read in the same
+  SELECT as the secret, so it is a consistent snapshot — and refuses to
+  re-reveal (`MfaAlreadyEnrolled`) if a concurrent `mfa_verify_enrollment`
+  confirmed the secret between the status-check and the reuse-load on the
+  shared FULLMUTEX connection.
 
 - **Login inputs no longer auto-capitalise on iOS (#1233).** The username,
   MFA-code, and enrollment-code fields on the login page — and the MFA

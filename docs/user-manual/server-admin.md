@@ -73,6 +73,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
 | `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 11 high-risk REST + Settings endpoints (PR2 of the MFA ladder) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
@@ -170,7 +171,7 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
 
-Three MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), and `--mfa-login-pending-secs` (default `120`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
+MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
 ### v0.10.0 — API token revocation is owner-scoped
 
@@ -331,7 +332,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts. |
-| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; the admin force-disable for other users is a planned follow-up — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable for the break-glass procedure. |
+| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
@@ -987,8 +988,8 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 
 ```bash
 # Copy binaries
-sudo cp builddir/yuzu-server /usr/local/bin/
-sudo cp builddir/yuzu-agent /usr/local/bin/
+sudo cp build-linux/server/core/yuzu-server /usr/local/bin/
+sudo cp build-linux/agents/core/yuzu-agent /usr/local/bin/
 
 # Create service user
 sudo useradd --system --no-create-home yuzu

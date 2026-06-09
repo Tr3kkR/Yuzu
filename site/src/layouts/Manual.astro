@@ -1,0 +1,14 @@
+---
+import Base from './Base.astro';
+import Sidebar from '../components/Sidebar.astro';
+const { title, slug } = Astro.props;
+---
+<Base title={`${title} — Yuzu`}>
+  <main class="manual-shell wrap">
+    <Sidebar active={slug} />
+    <article class="prose" data-pagefind-body>
+      <h1>{title}</h1>
+      <slot />
+    </article>
+  </main>
+</Base>

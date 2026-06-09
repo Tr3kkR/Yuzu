@@ -75,6 +75,9 @@ extern const char* const kGuardianHtml =
     .stat-num.bad  { color: var(--red); }
     .stat-num.info { color: var(--accent); }
     .stat-num.mute { color: var(--muted); }
+    /* Clickable Fleet stat cards (navigate into the matching status sub-view). */
+    .stat-card-nav { transition: border-color 0.12s; }
+    .stat-card-nav:hover { border-color: var(--accent); }
 
     /* Fleet worst-of badge — the single most-severe state present. */
     .worst-badge {
@@ -138,6 +141,31 @@ extern const char* const kGuardianHtml =
     .guard-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.3rem;
                   display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 
+    /* ── Guard item: left content column + right control column ─ */
+    .gi-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+    .gi-left { min-width: 0; }
+    .gi-row1 { display: flex; align-items: center; gap: 0.6rem; }
+    .gi-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.45rem;
+               display: flex; gap: 0.85rem; align-items: center; flex-wrap: wrap; }
+    .gi-mode { font-weight: 700; font-size: 0.86rem; }
+    .gi-mode.observe { color: #a5d6ff; }       /* very light blue */
+    .gi-mode.enforce { color: var(--yellow); } /* dashboard gold */
+    .gi-right { display: flex; flex-direction: column; align-items: flex-end;
+                gap: 0.4rem; flex: none; }
+    .gi-state { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.03em; }
+    .gi-state.on  { color: var(--green); }
+    .gi-state.off { color: var(--muted); }
+    .gi-act { width: 74px; text-align: center; padding: 0.12rem 0; font-size: 0.72rem; }
+    .gi-deploy { margin-top: 0.65rem; font-size: 0.74rem; }
+    .gi-dep-on  { color: #7be3a3; font-weight: 600; } /* lighter green */
+    .gi-dep-off { color: var(--muted); }
+    .gi-bl { color: #ffffff; text-decoration: underline; cursor: pointer; }
+    .gi-bl:hover { color: var(--accent); }
+)HTM"
+    // Split point 0 (MSVC C2026 — string too big): the <style> block crossed 16 KB
+    // after the guard-item CSS grew. Adjacent string literals concatenate at compile
+    // time, so this is purely a source-level cut (no stray whitespace enters the HTML).
+    R"HTM(
     /* ── Event timeline ────────────────────────────────────── */
     .event-list { display: flex; flex-direction: column; }
     .event-item {
@@ -172,6 +200,59 @@ extern const char* const kGuardianHtml =
     .lifecycle-draft    { color: var(--muted); }
     .lifecycle-deployed { color: var(--green); }
 
+    /* ── By-Guard / By-Baseline LIST cards + filter (view-switch) ───────── */
+    .gs-filterbar {
+      display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
+      padding: 0.5rem 0.65rem; margin-bottom: 0.8rem;
+    }
+    .gs-filterbar input[type="search"] {
+      flex: 1; min-width: 200px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.4rem; color: var(--fg); padding: 0.32rem 0.55rem; font-size: 0.76rem;
+    }
+    .gs-filterbar select {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 0.4rem;
+      color: var(--fg); padding: 0.32rem 0.45rem; font-size: 0.74rem;
+    }
+    .gs-chips { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+    .gs-chip {
+      font-size: 0.7rem; padding: 0.22rem 0.55rem; border-radius: 0.35rem;
+      border: 1px solid var(--border); color: var(--muted); background: var(--surface);
+      cursor: pointer; white-space: nowrap;
+    }
+    .gs-chip.on { color: var(--fg); border-color: var(--accent); }
+    .gs-rescount { font-size: 0.7rem; color: var(--muted); margin-left: auto; }
+
+    .gs-list { display: flex; flex-direction: column; gap: 0.55rem; }
+    .gs-card {
+      display: grid; grid-template-columns: 1.6fr 1.9fr 1fr; gap: 1rem;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
+      padding: 0.75rem 0.85rem; cursor: pointer; text-decoration: none; color: inherit;
+    }
+    .gs-card:hover { border-color: var(--accent); }
+    .gs-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .gs-card-name { font-weight: 700; font-size: 0.9rem; color: var(--fg); }
+    .gs-card-sub { font-size: 0.7rem; color: var(--muted); margin-top: 0.25rem; }
+    .gs-cpills { display: flex; gap: 0.35rem; align-items: center; margin-top: 0.45rem; flex-wrap: wrap; }
+    .gs-cpill {
+      font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+      border-radius: 0.25rem; padding: 0.05rem 0.35rem; border: 1px solid var(--border);
+    }
+    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--red); border-color: rgba(255,87,101,0.5); }
+    .gs-cpill.sev-medium { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
+    .gs-cpill.sev-low { color: #a5d6ff; }
+    .gs-cpill.observe { color: #a5d6ff; }
+    .gs-cpill.enforce { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
+    .gs-cpill.on { color: var(--green); }
+    .gs-cpill.off { color: var(--muted); }
+    .gs-pbar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+    .gs-pbar > span { display: flex; align-items: center; justify-content: center; font-size: 0.56rem; color: #04101f; font-weight: 700; }
+    .gs-legend { font-size: 0.68rem; color: var(--muted); margin-top: 0.35rem; }
+    .gs-cr { text-align: right; font-size: 0.7rem; color: var(--muted); }
+    .gs-cr .big { font-size: 1.15rem; font-weight: 700; color: var(--fg); line-height: 1.1; }
+    .gs-view { color: var(--accent); font-size: 0.72rem; font-weight: 600; margin-top: 0.35rem; }
+    @media (max-width: 760px) { .gs-card { grid-template-columns: 1fr; } }
+
     /* ── Detail panel ──────────────────────────────────────── */
     .detail-panel {
       margin-top: 0.5rem; padding: 1rem;
@@ -183,6 +264,8 @@ extern const char* const kGuardianHtml =
     .kv { display: grid; grid-template-columns: 130px 1fr; gap: 0.3rem 1rem;
           font-size: 0.78rem; margin-bottom: 0.75rem; }
     .kv .k { color: var(--muted); }
+    /* let long unbreakable values (registry key paths) wrap instead of clipping */
+    .kv > div { min-width: 0; overflow-wrap: anywhere; }
     .detail-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
     .detail-table th {
       text-align: left; padding: 0.35rem 0.5rem;
@@ -228,6 +311,77 @@ extern const char* const kGuardianHtml =
 
     .htmx-indicator { display: none; color: var(--muted); font-size: 0.75rem; }
     .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }
+
+    /* ── New Guard modal ───────────────────────────────────── */
+    .gs-modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.62);
+      display: none; align-items: flex-start; justify-content: center;
+      z-index: 1000; padding: 3rem 1rem; overflow-y: auto;
+    }
+    .gs-modal-overlay.open { display: flex; }
+    .gs-modal-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.6rem; width: 100%; max-width: 560px;
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+      /* No height cap: the card grows to its content and the overlay
+         (overflow-y:auto, top-aligned) scrolls the whole modal when tall — so
+         the surface always covers every field and nothing is clipped. */
+    }
+    .gs-modal-header, .gs-modal-footer {
+      display: flex; align-items: center; padding: 0.8rem 1.1rem; flex: none;
+    }
+    .gs-modal-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+    .gs-modal-header h3 { font-size: 0.95rem; font-weight: 700; }
+    .gs-modal-footer { justify-content: flex-end; gap: 0.5rem; border-top: 1px solid var(--border); }
+    .gs-modal-body { padding: 1.1rem; }
+    .gs-modal-close {
+      background: none; border: none; color: var(--muted);
+      font-size: 1.4rem; line-height: 1; cursor: pointer; padding: 0 0.2rem;
+    }
+    .gs-modal-close:hover { color: var(--fg); }
+
+    /* Schema-driven form helpers */
+    .gs-field { margin-bottom: 0.6rem; }
+    .gs-hint { color: var(--subtle); font-size: 0.68rem; margin-top: 0.2rem; line-height: 1.35; }
+    .gs-trigger-fields {
+      border: 1px solid var(--border); border-radius: 0.4rem;
+      padding: 0.7rem 0.8rem; margin: 0.5rem 0;
+    }
+    .gs-trigger-fields[hidden], .gs-res-field[hidden] { display: none; }
+    .gs-advanced { margin: 0.6rem 0; }
+    .gs-advanced > summary {
+      cursor: pointer; font-size: 0.74rem; color: var(--muted);
+      padding: 0.3rem 0; user-select: none; list-style: none;
+    }
+    .gs-advanced > summary::-webkit-details-marker { display: none; }
+    .gs-advanced > summary::before { content: "\25B8\00a0"; }
+    .gs-advanced[open] > summary::before { content: "\25BE\00a0"; }
+    .gs-advanced[open] > summary { color: var(--fg); }
+    .gs-radio-row { display: flex; gap: 1.2rem; margin: 0.3rem 0 0.2rem; }
+    .gs-radio {
+      display: flex; align-items: center; gap: 0.35rem; margin: 0;
+      font-size: 0.82rem; cursor: pointer; text-transform: none; letter-spacing: normal;
+      color: var(--fg);
+    }
+    .gs-radio input { width: auto; }
+
+    /* New Baseline — member-guards typeahead + chips */
+    .bl-guard-picker { display: flex; gap: 0.5rem; align-items: center; }
+    .bl-guard-picker input { flex: 1 1 auto; width: auto; min-width: 0; }
+    .bl-guard-picker .btn { flex: none; }
+    .bl-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+    .bl-chip {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      background: var(--mds-color-state-selected); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 1rem;
+      padding: 0.15rem 0.3rem 0.15rem 0.6rem; font-size: 0.75rem;
+    }
+    .bl-chip-x {
+      background: none; border: none; color: var(--muted);
+      cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0 0.2rem;
+    }
+    .bl-chip-x:hover { color: var(--red); }
   </style>
 )HTM"
     // Split point 1 (MSVC C2026 — see file header). Adjacent literals concat.
@@ -267,13 +421,15 @@ extern const char* const kGuardianHtml =
       </div>
       <div class="header-actions">
         <button class="btn btn-secondary"
+                onclick="guardianOpenModal()"
                 hx-get="/fragments/guardian/guard-form"
-                hx-target="#guardian-detail" hx-swap="innerHTML">
+                hx-target="#guardian-modal-content" hx-swap="innerHTML">
           + New Guard
         </button>
         <button class="btn btn-secondary"
+                onclick="guardianOpenModal()"
                 hx-get="/fragments/guardian/baseline-form"
-                hx-target="#guardian-detail" hx-swap="innerHTML">
+                hx-target="#guardian-modal-content" hx-swap="innerHTML">
           + New Baseline
         </button>
         <button class="btn btn-secondary"
@@ -300,12 +456,6 @@ extern const char* const kGuardianHtml =
           <button class="view-btn" hx-get="/fragments/guardian/status?view=guard"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Guard</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=agent"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Agent</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=mgroup"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Management Group</button>
           <button class="view-btn" hx-get="/fragments/guardian/status?view=baseline"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Baseline</button>
@@ -338,7 +488,10 @@ extern const char* const kGuardianHtml =
         <div class="section-header">
           <svg class="icon"><use href="/static/icons.svg#activity"></use></svg>
           Recent Events
-          <span class="htmx-indicator" style="margin-left:auto">&middot;&middot;&middot;</span>
+          <input type="search" id="gs-event-q" placeholder="Filter events&hellip;"
+                 oninput="gsEventFilter()" aria-label="Filter recent events"
+                 style="margin-left:auto;background:var(--surface);border:1px solid var(--border);border-radius:0.4rem;color:var(--fg);padding:0.2rem 0.45rem;font-size:0.72rem;max-width:170px">
+          <span class="htmx-indicator">&middot;&middot;&middot;</span>
         </div>
         <div class="section-body">
           <div id="guardian-events"
@@ -369,21 +522,16 @@ extern const char* const kGuardianHtml =
     </div>
 
     <!-- ── Detail drill-in (guard / baseline / forms) ───────── -->
-    <div class="section">
-      <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#info"></use></svg>
-        Detail
-      </div>
-      <div class="section-body">
-        <div id="guardian-detail">
-          <div class="empty-state">
-            Select a Guard or Baseline above, or use <strong>+ New Guard</strong> /
-            <strong>+ New Baseline</strong> to compose one.
-          </div>
-        </div>
-      </div>
-    </div>
+    <!-- Guard / Baseline detail opens in the modal (#guardian-modal-content),
+         like New Guard — no inline detail panel at the bottom of the page. -->
 
+  </div>
+
+  <!-- New Guard authoring modal — the form fragment swaps into #guardian-modal-content.
+       Clicking the dimmed backdrop (but not the card) closes it. -->
+  <div class="gs-modal-overlay" id="guardian-modal"
+       onclick="if(event.target===this)guardianCloseModal()">
+    <div id="guardian-modal-content"></div>
   </div>
 
   <div id="toast-container" class="toast-container"></div>
@@ -396,6 +544,149 @@ extern const char* const kGuardianHtml =
       var btns = btn.parentNode.querySelectorAll('.view-btn');
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
       btn.classList.add('active');
+    }
+
+    /* Fleet stat cards → status sub-view navigation. Clicks the matching view
+       button (which runs the hx-get + sets the active tab), and stashes a filter
+       to apply once the new fragment settles (htmx:afterSettle below). */
+    function gsGoView(view, filterState) {
+      window.__gsPendingFilter = (view === 'guard') ? (filterState || null) : null;
+      var btn = document.querySelector('.view-switch .view-btn[hx-get*="view=' + view + '"]');
+      if (btn) btn.click();
+    }
+    document.body.addEventListener('htmx:afterSettle', function (e) {
+      if (e.target && e.target.id === 'guardian-status' && window.__gsPendingFilter) {
+        var fs = window.__gsPendingFilter;
+        window.__gsPendingFilter = null;
+        var chip = document.querySelector('#guardian-status .gs-chip[data-gstate="' + fs + '"]');
+        if (chip) gsGuardState(chip);
+      }
+    });
+
+    /* ── By-Guard list filter: search + state chip + severity + mode ──────
+       The fragment carries the markup (chips/inputs call these); the functions
+       live here on the page so they survive HTMX fragment swaps. State is read
+       from the active chip, so a freshly-swapped fragment (All active, empty
+       search, "Any" selects) needs no explicit reset. */
+    function gsGuardFilter() {
+      var qi = document.getElementById('gs-guard-q');
+      var q = (qi ? qi.value : '').toLowerCase().trim();
+      var sevEl = document.getElementById('gs-guard-sev');
+      var modeEl = document.getElementById('gs-guard-mode');
+      var sev = sevEl ? sevEl.value : 'all';
+      var mode = modeEl ? modeEl.value : 'all';
+      var activeChip = document.querySelector('#guardian-status .gs-chip.on[data-gstate]');
+      var st = activeChip ? activeChip.getAttribute('data-gstate') : 'all';
+      var cards = document.querySelectorAll('#guardian-status .gs-card[data-gstate]');
+      var shown = 0;
+      for (var i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        var ok = (st === 'all' || c.getAttribute('data-gstate') === st)
+          && (sev === 'all' || c.getAttribute('data-gsev') === sev)
+          && (mode === 'all' || c.getAttribute('data-gmode') === mode)
+          && (!q || (c.getAttribute('data-gname') || '').indexOf(q) !== -1);
+        c.style.display = ok ? '' : 'none';
+        if (ok) shown++;
+      }
+      var rc = document.getElementById('gs-guard-rc');
+      if (rc) rc.textContent = shown + ' of ' + cards.length + ' guards';
+    }
+    function gsGuardState(btn) {
+      var chips = btn.parentNode.querySelectorAll('.gs-chip');
+      for (var i = 0; i < chips.length; i++) chips[i].classList.remove('on');
+      btn.classList.add('on');
+      gsGuardFilter();
+    }
+
+    /* ── Recent Events free-text filter ───────────────────────────────────
+       The search box lives in the section header (outside #guardian-events),
+       so it survives the panel's 5s auto-refresh; the body htmx:afterSettle
+       listener below re-runs this after each swap so the active query keeps
+       applying. Matches the whole event row text (time, type, Guard name, agent). */
+    function gsEventFilter() {
+      var qi = document.getElementById('gs-event-q');
+      var q = (qi ? qi.value : '').toLowerCase().trim();
+      var items = document.querySelectorAll('#guardian-events .event-item');
+      for (var i = 0; i < items.length; i++) {
+        var t = (items[i].textContent || '').toLowerCase();
+        items[i].style.display = (!q || t.indexOf(q) !== -1) ? '' : 'none';
+      }
+    }
+    // Re-apply the events filter after each 5s panel refresh. A body listener,
+    // NOT hx-on — the page CSP forbids 'unsafe-eval' and htmx compiles hx-on
+    // handlers with new Function (which CSP blocks).
+    document.body.addEventListener('htmx:afterSettle', function (e) {
+      if (e.target && e.target.id === 'guardian-events') gsEventFilter();
+    });
+
+    /* ── New Guard modal ───────────────────────────────────── */
+    function guardianOpenModal() {
+      var m = document.getElementById('guardian-modal');
+      if (m) m.classList.add('open');
+    }
+    function guardianCloseModal() {
+      var m = document.getElementById('guardian-modal');
+      if (m) m.classList.remove('open');
+      var c = document.getElementById('guardian-modal-content');
+      if (c) c.innerHTML = '';
+    }
+    /* Trigger-type picker: reveal + enable only the chosen trigger's fieldset.
+       Disabled fieldsets are skipped by HTML5 validation and (belt-and-braces with
+       the namespaced field names) cannot shadow the active type's params on submit. */
+    function guardianPickTrigger(sel) {
+      var form = sel.closest('form');
+      if (!form) return;
+      var sets = form.querySelectorAll('fieldset[data-trigger]');
+      for (var i = 0; i < sets.length; i++) {
+        var on = sets[i].getAttribute('data-trigger') === sel.value;
+        sets[i].hidden = !on;
+        sets[i].disabled = !on;
+      }
+    }
+    /* New Baseline — add the typed/picked guard as a removable chip with a hidden
+       "guards" input so it submits. De-dupes; Enter or the Add button calls this. */
+    function guardianAddGuardChip() {
+      var input = document.getElementById('bl-guard-input');
+      var box = document.getElementById('bl-selected-guards');
+      if (!input || !box) return;
+      var val = (input.value || '').trim();
+      if (!val) return;
+      var existing = box.querySelectorAll('input[name="guards"]');
+      for (var i = 0; i < existing.length; i++) {
+        if (existing[i].value === val) { input.value = ''; return; }
+      }
+      var chip = document.createElement('span');
+      chip.className = 'bl-chip';
+      var hid = document.createElement('input');
+      hid.type = 'hidden'; hid.name = 'guards'; hid.value = val;
+      chip.appendChild(hid);
+      chip.appendChild(document.createTextNode(val + ' '));
+      var x = document.createElement('button');
+      x.type = 'button'; x.className = 'bl-chip-x'; x.textContent = '×';
+      x.onclick = function() { chip.remove(); };
+      chip.appendChild(x);
+      box.appendChild(chip);
+      input.value = '';
+      input.focus();
+    }
+
+    /* Mode picker: remediation/resilience options apply only in Enforce mode. */
+    function guardianPickMode(sel) {
+      var form = sel.closest('form');
+      if (!form) return;
+      var blocks = form.querySelectorAll('.gs-enforce-only');
+      var on = sel.value === 'enforce';
+      for (var i = 0; i < blocks.length; i++) blocks[i].hidden = !on;
+    }
+    /* Resilience: show only the numeric knobs load-bearing for the chosen mode. */
+    function guardianPickResilienceMode(sel) {
+      var box = sel.closest('.gs-resilience');
+      if (!box) return;
+      var fields = box.querySelectorAll('[data-modes]');
+      for (var i = 0; i < fields.length; i++) {
+        var modes = (fields[i].getAttribute('data-modes') || '').split(' ');
+        fields[i].hidden = modes.indexOf(sel.value) === -1;
+      }
     }
 
     /* ── Toast notification system ─────────────────────────── */
@@ -421,6 +712,11 @@ extern const char* const kGuardianHtml =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
+    /* Close the detail modal in response to an HX-Trigger (used after a Baseline
+       delete, where the modal's subject no longer exists). */
+    document.body.addEventListener('guardianModalClose', function() {
+      guardianCloseModal();
+    });
 
     /* ── Populate nav bar + context bar ─────────────────────── */
     fetch('/api/me').then(function(r){return r.json()}).then(function(d){
@@ -439,6 +735,10 @@ extern const char* const kGuardianHtml =
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
         window.location.href = '/?palette=1';
+      }
+      if (e.key === 'Escape') {
+        var m = document.getElementById('guardian-modal');
+        if (m && m.classList.contains('open')) guardianCloseModal();
       }
     });
   </script>

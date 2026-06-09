@@ -149,6 +149,11 @@ void FileGuard::run() try {
     std::optional<std::chrono::steady_clock::time_point> last_emit;
     std::uint64_t suppressed = 0;
 
+    // Compliance-edge state (Slice B, shared convention with RegistryGuard). nullopt
+    // until the first eval, then a guard.compliant event fires ONCE on the edge into
+    // compliant; steady compliant state stays silent (NFR). Only this thread touches it.
+    std::optional<bool> last_compliant;
+
     // file-hash-equals state.
     std::string baseline;      // captured-on-arm hash when expected_hash is empty
     bool baseline_set = false;
@@ -174,6 +179,7 @@ void FileGuard::run() try {
     };
 
     auto report = [&](const std::string& detected, const std::string& expected) {
+        last_compliant = false; // drifted / can't-verify (reported, possibly collapsed)
         const auto now = std::chrono::steady_clock::now();
         if (last_emit && (now - *last_emit) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
             ++suppressed; // fold into the next post-window emission
@@ -192,6 +198,24 @@ void FileGuard::run() try {
             sink_(d);
     };
 
+    // Compliant edge (Slice B): emit guard.compliant ONCE on the transition into
+    // compliant (incl. the first eval / baseline-on-arm, last_compliant == nullopt).
+    // Steady compliant state is silent; bypasses the drift-debounce collapse.
+    auto report_compliant = [&]() {
+        if (last_compliant == true)
+            return;
+        last_compliant = true;
+        GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = cfg_.rule_id;
+        d.rule_name = cfg_.rule_name;
+        d.detected_value = "<compliant>";
+        d.expected_value = "<compliant>";
+        d.compliant = true;
+        if (sink_)
+            sink_(d);
+    };
+
     // file-exists: drift when presence != expected.
     auto eval_exists = [&] {
         std::error_code ec;
@@ -202,6 +226,8 @@ void FileGuard::run() try {
                          cfg_.path);
             report(present ? "<present>" : "<absent>",
                    cfg_.expect_present ? "<present>" : "<absent>");
+        } else {
+            report_compliant();
         }
     };
 
@@ -245,13 +271,16 @@ void FileGuard::run() try {
             baseline = cur; // baseline-on-arm: first present read establishes the good state
             baseline_set = true;
             spdlog::info("Guardian FileGuard[{}]: baselined {} = {}", cfg_.rule_id, cfg_.path, cur);
-            return; // no drift — we just captured the baseline
+            report_compliant(); // armed at the known-good baseline → compliant edge
+            return;             // no drift — we just captured the baseline
         }
         const std::string& effective = cfg_.expected_hash.empty() ? baseline : cfg_.expected_hash;
         if (cur != effective) {
             spdlog::info("Guardian FileGuard[{}]: content drift on {} ({} != {})", cfg_.rule_id,
                          cfg_.path, cur, effective);
             report(cur, effective);
+        } else {
+            report_compliant();
         }
     };
 

@@ -87,7 +87,7 @@ Settings → Multi-Factor Authentication → **Disable MFA**. Clears the secret 
 
 #### Recovery when locked out
 
-If a user loses both their authenticator and all 10 recovery codes, MFA must be cleared via direct database surgery on the server host. See `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable" for the procedure (admin force-disable via REST is planned for a future release).
+If a user loses both their authenticator and all 10 recovery codes (or is locked out by MFA enforcement), an operator clears their MFA on the server host with the audited break-glass command `yuzu-server --mfa-reset <username>`. See `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable" for the full procedure (it writes an `mfa.reset.breakglass` audit row; a direct-SQL fallback is documented for hosts without the binary).
 
 #### Configuration flags
 
@@ -116,6 +116,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 - `mfa.step_up.required` — high-risk endpoint returned a 401 because the session's MFA proof was stale (PR 2)
 - `mfa.step_up.passed` — `POST /login/mfa/stepup` accepted, session's MFA proof refreshed (PR 2)
 - `mfa.step_up.failed` — `POST /login/mfa/stepup` rejected the code (PR 2)
+- `mfa.reset.breakglass` — MFA enrollment cleared via `yuzu-server --mfa-reset <username>`; principal is the OS account that ran the CLI (not an authenticated session). Written to `audit.db` even when the server is not running in serving mode (#1226)
 
 `auth.login` is also emitted on every successful MFA login alongside `mfa.login.verified` / `mfa.recovery_code.used`, so SIEM rules keying on `auth.login` for session-creation parity stay correct across password, OIDC, and MFA flows.
 
