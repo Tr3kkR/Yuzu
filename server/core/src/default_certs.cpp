@@ -48,6 +48,12 @@ void apply_cert_group_share(const fs::path& dir, const DefaultCertSet& out,
     std::error_code ec;
     if (cert_group.empty()) {
         fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+        // True idempotency: if a prior boot ran with --cert-group, the gateway key
+        // may still carry 0640. Re-tighten it to 0600 so dropping --cert-group fully
+        // reverts the posture (the 0700 dir already blocks traversal, but be explicit).
+        if (fs::exists(out.gateway_key))
+            fs::permissions(out.gateway_key, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec); // 0600
         return;
     }
 #ifndef _WIN32
@@ -66,12 +72,18 @@ void apply_cert_group_share(const fs::path& dir, const DefaultCertSet& out,
         fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
         return;
     }
-    fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
-                    fs::perm_options::replace, ec); // 0750
-    if (::chown(dir.c_str(), static_cast<uid_t>(-1), gid) != 0)
-        spdlog::warn("default_certs: chgrp '{}' on {} failed: {} (the server user must be a "
-                     "member of that group to share it)", cert_group, dir.string(),
+    // Chgrp BEFORE widening: never expose the dir to a group we have not
+    // confirmed ownership of. On chgrp failure the dir stays 0700.
+    if (::chown(dir.c_str(), static_cast<uid_t>(-1), gid) == 0) {
+        fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
+                        fs::perm_options::replace, ec); // 0750
+    } else {
+        spdlog::warn("default_certs: chgrp '{}' on {} failed: {} — leaving 0700 (the server user "
+                     "must be a member of that group to share it)", cert_group, dir.string(),
                      std::strerror(errno));
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+        return; // do not group-share the gateway key either if the dir chgrp failed
+    }
     if (fs::exists(out.gateway_key)) {
         if (::chown(out.gateway_key.c_str(), static_cast<uid_t>(-1), gid) == 0)
             fs::permissions(out.gateway_key,
