@@ -218,7 +218,7 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_tls_handshake_failures_total},
         {labels, [rpc_name, kind]},
         {help, "Upstream TLS handshake failures (cert expiry / CA rotation / "
-               "wrong-SAN / unreadable cert) — distinct from a generic RPC error "
+               "wrong-SAN / unreadable cert) - distinct from a generic RPC error "
                "so a broken gateway cert is not mistaken for 'server down'"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_circuit_transitions_total},
