@@ -250,6 +250,24 @@ static const ToolDef kTools[] = {
      R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
      R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
+
+    // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
+    {"list_issued_certs",
+     "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
+     "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
+     R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
+     R"j(}})j"},
+
+    {"revoke_certificate",
+     "Revoke an issued certificate by serial and republish the CRL. Mirrors "
+     "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
+     "approval-gated like every other destructive MCP op).",
+     R"j({"type":"object","properties":{)j"
+     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
+     R"j(},"required":["serial_hex"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -264,6 +282,7 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
+    "revoke_certificate",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -307,6 +326,9 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
     {"quarantine_device", {"Security", "Write"}},
+    // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
+    {"list_issued_certs", {"Security", "Read"}},
+    {"revoke_certificate", {"Security", "Delete"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -366,7 +388,8 @@ McpServer::HandlerFn McpServer::build_handler(
     ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
-    const bool& mcp_disabled, DispatchFn dispatch_fn) {
+    const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+    PublishCrlFn publish_crl_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1808,6 +1831,147 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── list_issued_certs ─────────────────────────────────────────
+            // MCP/REST parity for GET /api/v1/ca/issued (PR4 B-2). Same field
+            // set the REST handler returns (cert_pem deliberately omitted —
+            // forensic-only, large). Security:Read.
+            if (tool_name == "list_issued_certs") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!ca_store || !ca_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                int limit = args.value("limit", 200);
+                int offset = args.value("offset", 0);
+                limit = std::clamp(limit, 1, 1000);
+                offset = std::clamp(offset, 0, 1000000);
+                // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
+                // precise has_more so an agentic client can paginate deterministically.
+                auto records = ca_store->list_issued(limit + 1, offset);
+                const bool has_more = static_cast<int>(records.size()) > limit;
+                if (has_more)
+                    records.resize(static_cast<std::size_t>(limit));
+                nlohmann::json items = nlohmann::json::array();
+                for (const auto& r : records) {
+                    items.push_back({{"serial_hex", r.serial_hex},
+                                     {"subject", r.subject},
+                                     {"san", r.san},
+                                     {"purpose", r.purpose},
+                                     {"status", cert_status_to_string(r.status)},
+                                     {"not_after", r.not_after},
+                                     {"issued_at", r.issued_at},
+                                     {"revoked_at", r.revoked_at},
+                                     {"revocation_reason", r.revocation_reason},
+                                     {"issued_by", r.issued_by}});
+                }
+                nlohmann::json payload = {{"items", std::move(items)},
+                                          {"count", records.size()},
+                                          {"limit", limit},
+                                          {"offset", offset},
+                                          {"has_more", has_more}};
+                if (has_more)
+                    payload["next_offset"] = offset + limit;
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── revoke_certificate ────────────────────────────────────────
+            // MCP/REST parity for POST /api/v1/ca/revoke (PR4 B-2). Destructive:
+            // Security:Delete, which the generic gate above already tier-checks +
+            // approval-gates (supervised tier → approval, which is the same
+            // platform-wide not-yet-implemented path as every other destructive
+            // MCP op; lower tiers are tier-denied). When reached, it mirrors the
+            // REST handler exactly: validate+canonicalize serial, revoke, republish
+            // the CRL, and emit the SAME ca.* audit actions so the audit trail is
+            // surface-agnostic.
+            if (tool_name == "revoke_certificate") {
+                if (!tier_allows(tier, "Security", "Delete")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Delete"))
+                    return;
+                if (!ca_store || !ca_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                auto serial = param_str(args, "serial_hex");
+                const std::string reason = param_str(args, "reason");
+                const bool serial_ok =
+                    !serial.empty() && serial.size() <= 64 &&
+                    serial.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+                if (!serial_ok) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "serial_hex must be 1-64 hex digits"),
+                        "application/json");
+                    return;
+                }
+                for (auto& c : serial)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (!ca_store->revoke(serial, reason)) {
+                    // Idempotent reject-without-state-change → "denied" (matches REST).
+                    // M1 (#1240): surface a dropped denied-row via the error data.
+                    const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",
+                                                          "AgentCertificate", serial,
+                                                          "serial not found or already revoked");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "serial not found or already revoked",
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                // Observe the audit return (AuditFn is bool): a dropped row on a
+                // privileged revoke is an evidence-chain gap, surfaced to the agentic
+                // caller via audit_persisted:false (the REST sibling uses the
+                // Sec-Audit-Failed header; JSON-RPC has no header channel).
+                bool audit_ok =
+                    audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial, reason);
+                bool crl_ok = false;
+                if (publish_crl_fn)
+                    crl_ok = publish_crl_fn().has_value();
+                audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                    "Security", serial,
+                                    crl_ok ? ""
+                                           : "CRL build/record failed after revocation; CRL may "
+                                             "be stale") &&
+                           audit_ok;
+                nlohmann::json payload = {{"revoked", true},
+                                          {"serial_hex", serial},
+                                          {"crl_republished", crl_ok}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
+                // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
+                // MCP usage correlates with the ca.* domain events in the audit store.
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── Unknown tool ──────────────────────────────────────────────
             mcp_audit("failure", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
@@ -1831,13 +1995,15 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 InventoryStore* inventory_store, PolicyStore* policy_store,
                                 ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine, const bool& read_only_mode,
-                                const bool& mcp_disabled, DispatchFn dispatch_fn) {
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
                            response_store, audit_store, tag_store, inventory_store, policy_store,
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
-                           mcp_disabled, std::move(dispatch_fn)));
+                           mcp_disabled, std::move(dispatch_fn), ca_store,
+                           std::move(publish_crl_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

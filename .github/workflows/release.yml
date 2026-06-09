@@ -287,9 +287,27 @@ jobs:
       # persistence is functionally equivalent without GHA round-trip.
       # Issue #569.
 
+      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
+      # _checkouts/grpcbox (one-way TLS on the agent listener). This gate fails
+      # the build if that copy is ever anything other than upstream grpcbox at the
+      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch — catching
+      # tamper, drift, or version skew. See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
+      - name: Verify vendored grpcbox integrity
+        working-directory: gateway
+        run: bash scripts/verify-vendored-grpcbox.sh
+
       - name: Compile gateway
         working-directory: gateway
         run: rebar3 compile
+
+      # F-3 (#1243): fail closed if the committed gpb modules drift from
+      # priv/proto. gpb modules are self-contained — an un-regenerated module
+      # silently drops new proto fields in transit (the PR5 CSR field-drop bug).
+      # Runs after compile so _build/gpb exists; regenerates with rebar.config's
+      # own pinned gpb_opts and byte-diffs against the committed *_pb.erl.
+      - name: Check proto codegen is in sync
+        working-directory: gateway
+        run: bash scripts/check-proto-codegen.sh
 
       - name: Run EUnit tests
         working-directory: gateway

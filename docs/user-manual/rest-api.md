@@ -49,6 +49,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [API Tokens](#api-tokens)
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
+  - [Internal CA](#internal-ca)
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
@@ -857,6 +858,167 @@ Release a device from quarantine.
 
 ---
 
+### Internal CA
+
+The server's built-in certificate authority (see `docs/pki-architecture.md`) can
+be managed via the **Settings → Internal CA** dashboard panel or the REST
+endpoints below. `root` and `crl` are **public** (clients and browsers need
+them to establish trust / check revocation before they have a session); the
+inventory and revoke endpoints are gated by the `Security` securable.
+
+> Note on `Security` operations: certificate **revocation** uses `Security:Delete`
+> (a destructive operation on an issued cert), while device **quarantine** uses
+> `Security:Execute`. A custom role scoped to security operations needs both.
+
+#### `GET /api/v1/ca/root`
+
+Download the CA root certificate (PEM) and add it to an OS/browser trust store.
+**Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
+`Content-Disposition: attachment; filename="yuzu-ca.pem"`,
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
+openssl x509 -in yuzu-ca.pem -noout -fingerprint -sha256
+```
+
+#### `GET /api/v1/ca/crl`
+
+Download the current certificate revocation list (DER). **Public** — no
+authentication. Returns `Content-Type: application/pkix-crl`,
+`Cache-Control: no-cache, must-revalidate`. `503` if no CRL has been published
+yet (transient — the server pre-publishes at startup and republishes on each
+revocation).
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/crl -o yuzu.crl
+openssl crl -inform DER -in yuzu.crl -noout -text
+```
+
+#### `GET /api/v1/ca/issued`
+
+List certificates issued by the internal CA. **Permission:** `Security:Read`.
+Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
+certificate PEM and enrollment reference are intentionally omitted.
+
+`meta.has_more` is `true` when more rows exist beyond the current page; when it is,
+`meta.next_offset` carries the `offset` to pass for the next page. Iterate until
+`has_more` is `false` (do **not** infer end-of-list from `count < limit`).
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "active",
+      "not_after": 1780000000,
+      "issued_at": 1710849600,
+      "issued_by": "agent:agent-prod-01"
+    }
+  ],
+  "count": 1,
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
+}
+```
+
+The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
+
+#### `POST /api/v1/ca/revoke`
+
+Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
+takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
+the CRL); the CRL is then republished. Request body (max 64 KB):
+
+```json
+{ "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
+```
+
+`serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
+are rejected. Response:
+
+```json
+{ "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+`crl_republished: false` means the revocation stands (the agent is refused on its
+next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
+will not see it until the next successful publish. Errors: `400` (missing/invalid
+serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
+not found or already revoked), `413` (body too large), `503` (CA unavailable).
+
+#### Subordinate-CA (root your CA in an enterprise PKI)
+
+By default Yuzu's CA is a self-signed install root (`trust mode: built-in`). An
+enterprise can instead make Yuzu's issuing CA a **subordinate** of its own root,
+so every Yuzu-issued certificate chains to the corporate trust anchor. The
+issuing **key never changes** — the enterprise signs Yuzu's *existing* public
+key — so certificates already issued keep validating across the switch.
+
+Workflow:
+
+1. **Export** Yuzu's CA signing request and have your enterprise root sign it as
+   a subordinate CA (the signed cert **must** carry `basicConstraints: CA:TRUE`,
+   `keyUsage: keyCertSign, cRLSign`).
+2. **Import** the signed intermediate plus the parent chain (enterprise root and
+   any intermediates above Yuzu's).
+
+This is also available in **Settings → Internal CA → "Subordinate this CA…"**.
+
+#### `GET /api/v1/ca/root-csr`
+
+Export the install CA's PKCS#10 CSR (PEM), over its existing key, for an
+enterprise root to sign. **Permission:** `Security:Read`. The CSR carries only
+the CA's public key (already public via `GET /api/v1/ca/root`) and subject — no
+secret. Audited (`ca.root_csr.exported`).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://yuzu.example.com/api/v1/ca/root-csr -o yuzu-ca.csr
+# → hand yuzu-ca.csr to your enterprise CA; it returns a signed intermediate.
+```
+
+Errors: `403` (missing `Security:Read`), `500` (CSR generation failed), `503`
+(CA unavailable).
+
+#### `POST /api/v1/ca/import-chain`
+
+Import the enterprise-signed intermediate + parent chain, switching the issuing
+identity to subordinate mode. **Permission:** `Security:Write`. Request body
+(max 256 KB):
+
+```json
+{
+  "intermediate_pem": "-----BEGIN CERTIFICATE-----\n... (Yuzu's key, signed by the enterprise) ...\n-----END CERTIFICATE-----\n",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n... (enterprise root [+ intermediates]) ...\n-----END CERTIFICATE-----\n"
+}
+```
+
+The server validates that the intermediate (a) is a CA certificate, (b) carries
+**this install's** CA public key (proof the enterprise signed the CSR you
+exported), and (c) verifies up to the supplied parent chain — then swaps the
+issuing cert and re-publishes the CRL under the new issuer. Response:
+
+```json
+{ "imported": true, "mode": "subordinate", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+Errors: `400` (bad JSON / missing field / unparseable intermediate), `403`
+(missing `Security:Write`), `409` (no existing CA to subordinate — generate
+default certs first), `422` (intermediate is not a CA / does not carry this CA's
+key / does not verify to the chain), `413` (body too large), `500` (validated but
+persistence failed), `503` (CA unavailable). A rejected import is audited
+`ca.subordinate.imported` with `result=denied`; success with `result=success`.
+
+> **Bring-your-own-leaf** (orthogonal): any surface given an explicit
+> `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
+> the internal CA for that surface entirely — unchanged behaviour, supported and
+> independent of subordinate mode.
+
+---
+
 ### RBAC
 
 Role-Based Access Control endpoints for inspecting roles, permissions, and authorization decisions.
@@ -1367,6 +1529,11 @@ Query audit events.
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
+| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
+| `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
+| `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
 | `tag.set` | Tag created or updated |
 | `tag.delete` | Tag deleted |
 
@@ -4605,7 +4772,15 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
-    "policies": "ok"
+    "policies": "ok",
+    "guaranteed_state": "ok",
+    "offload_target": "ok",
+    "ca": "ok"
+  },
+  "tls": {
+    "default_certs_active": false,
+    "ca_fingerprint": "",
+    "ca_expires_at": 0
   },
   "executions": {
     "in_flight": 5,
@@ -4622,7 +4797,10 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`) |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
+| `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
+| `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
 | `executions.in_flight` | integer | Currently running instruction executions |
 | `executions.completed_last_hour` | integer | Executions completed in the past 60 minutes |
 | `executions.failed_last_hour` | integer | Executions that failed in the past 60 minutes |

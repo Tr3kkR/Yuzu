@@ -10,6 +10,7 @@ __declspec(allocate(".CRT$XCB"))
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
@@ -532,6 +533,11 @@ public:
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
+        // PKI PR3 (gov UP-9 / enterprise): make a stuck/failed per-agent mTLS
+        // provisioning observable to fleet alerting, not just the agent log.
+        metrics_.describe("yuzu_agent_cert_provision_failed_total",
+                          "Per-agent mTLS provisioning failures, labeled by reason "
+                          "(persist_failed|no_cert_issued)", "counter");
     }
 
     void run() override {
@@ -805,63 +811,124 @@ public:
             }
         }
 
-        CloudIdentity cloud_id; // Populated before registration (step 2b)
-        std::shared_ptr<grpc::ChannelCredentials> creds;
-        std::shared_ptr<grpc::Channel> channel;
-        std::unique_ptr<pb::AgentService::Stub> stub;
-        if (cfg_.tls_enabled) {
-            grpc::SslCredentialsOptions ssl_opts;
-            if (!cfg_.tls_ca_cert.empty()) {
-                ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
-                if (ssl_opts.pem_root_certs.empty()) {
-                    spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
-                    return;
+        // PKI PR3: per-agent mTLS provisioning. When TLS is on with a CA but the
+        // operator supplied no explicit client cert / OS-store cert, the agent
+        // obtains its OWN client leaf from the server — it generates a keypair +
+        // CSR, sends the CSR in Register, persists the issued leaf (key 0600), and
+        // reconnects presenting it. `pending_csr_pem` rides the next Register; a
+        // non-empty `pending_key_pem` is the key awaiting its issued leaf.
+        //
+        // Renewal is evaluated here at startup (NeedsRenew at 2/3 life). A
+        // continuously-running agent that never restarts renews on its next
+        // process start / re-provision; a mid-run renewal thread is a follow-up.
+        std::string pending_csr_pem;
+        std::string pending_key_pem;
+        // cpp-safety (#1239): the agent private key lives in `pending_key_pem`
+        // from generation until it is persisted (then explicitly zeroed below).
+        // A stop/return BETWEEN those points — e.g. shutdown mid-enrollment, or
+        // any early return on the connect path — would otherwise leave the key
+        // resident in process memory. This guard scrubs it on EVERY exit from
+        // run() (the explicit zeroes below clear() too, so the guard then no-ops).
+        struct KeyScrub {
+            std::string& k;
+            ~KeyScrub() { yuzu::secure_zero(k); }
+        } pending_key_scrub{pending_key_pem};
+        int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
+        const std::filesystem::path cert_dir =
+            cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
+        const bool provisioning_eligible =
+            cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
+            cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();
+        if (provisioning_eligible) {
+            const auto state = inspect_provisioned_cert(cert_dir);
+            const auto paths = provisioned_cert_paths(cert_dir);
+            if (state == CertState::Valid || state == CertState::NeedsRenew) {
+                // A usable leaf exists — present it (mTLS from the first connect).
+                cfg_.tls_client_cert = paths.cert_path;
+                cfg_.tls_client_key = paths.key_path;
+                spdlog::info("PKI: using provisioned client cert {} ({})", paths.cert_path.string(),
+                             state == CertState::NeedsRenew ? "past 2/3 life — will renew"
+                                                            : "valid");
+            }
+            if (state != CertState::Valid) {
+                // Missing / Expired → enroll; NeedsRenew → renew. Either way mint a
+                // fresh keypair + CSR to present in Register.
+                if (auto kc = generate_key_and_csr(cfg_.agent_id)) {
+                    pending_key_pem = std::move(kc->private_key_pem);
+                    pending_csr_pem = std::move(kc->csr_pem);
+                    spdlog::info("PKI: generated EC P-256 keypair + CSR ({})",
+                                 state == CertState::NeedsRenew ? "renewal" : "first enrollment");
+                } else {
+                    spdlog::error("PKI: failed to generate agent keypair/CSR — continuing without "
+                                  "per-agent mTLS");
                 }
             }
-
-            // Client certificate: prefer cert store, fall back to PEM files
-            if (!cfg_.cert_store.empty()) {
-                // Read client cert + key from OS certificate store
-                spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
-                auto store_result =
-                    read_cert_from_store(cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
-
-                if (!store_result.ok()) {
-                    spdlog::error("Certificate store error: {}", store_result.error);
-                    return;
-                }
-
-                ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
-                ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
-                spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
-            } else {
-                const bool has_client_cert = !cfg_.tls_client_cert.empty();
-                const bool has_client_key = !cfg_.tls_client_key.empty();
-                if (has_client_cert != has_client_key) {
-                    spdlog::error("mTLS requires both --client-cert and --client-key");
-                    return;
-                }
-
-                if (has_client_cert && has_client_key) {
-                    ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
-                    ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
-                    if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
-                        spdlog::error("Failed to read client cert/key for mTLS");
-                        return;
-                    } else {
-                        spdlog::info("mTLS enabled: using client certificate files");
-                    }
-                }
-            }
-            creds = grpc::SslCredentials(ssl_opts);
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-        } else {
-            creds = grpc::InsecureChannelCredentials();
         }
 
-        channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
+        CloudIdentity cloud_id; // Populated before registration (step 2b)
+        std::shared_ptr<grpc::Channel> channel;
+        std::unique_ptr<pb::AgentService::Stub> stub;
+        // Build (or rebuild, post-issuance) the credentials + channel + stub from
+        // the current cfg_ cert paths. Returns false on an unreadable cert/key.
+        auto build_channel = [&]() -> bool {
+            std::shared_ptr<grpc::ChannelCredentials> creds;
+            if (cfg_.tls_enabled) {
+                grpc::SslCredentialsOptions ssl_opts;
+                if (!cfg_.tls_ca_cert.empty()) {
+                    ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
+                    if (ssl_opts.pem_root_certs.empty()) {
+                        spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
+                        return false;
+                    }
+                }
 
-        stub = pb::AgentService::NewStub(channel);
+                // Client certificate: prefer cert store, fall back to PEM files
+                if (!cfg_.cert_store.empty()) {
+                    // Read client cert + key from OS certificate store
+                    spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
+                    auto store_result = read_cert_from_store(cfg_.cert_store, cfg_.cert_subject,
+                                                             cfg_.cert_thumbprint);
+
+                    if (!store_result.ok()) {
+                        spdlog::error("Certificate store error: {}", store_result.error);
+                        return false;
+                    }
+
+                    ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
+                    ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
+                    spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
+                } else {
+                    const bool has_client_cert = !cfg_.tls_client_cert.empty();
+                    const bool has_client_key = !cfg_.tls_client_key.empty();
+                    if (has_client_cert != has_client_key) {
+                        spdlog::error("mTLS requires both --client-cert and --client-key");
+                        return false;
+                    }
+
+                    if (has_client_cert && has_client_key) {
+                        ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
+                        ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
+                        if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                            spdlog::error("Failed to read client cert/key for mTLS");
+                            return false;
+                        } else {
+                            spdlog::info("mTLS enabled: using client certificate files");
+                        }
+                    }
+                }
+                creds = grpc::SslCredentials(ssl_opts);
+                yuzu::secure_zero(ssl_opts.pem_private_key);
+            } else {
+                creds = grpc::InsecureChannelCredentials();
+            }
+
+            channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
+            stub = pb::AgentService::NewStub(channel);
+            return true;
+        };
+
+        if (!build_channel())
+            return;
 
         // 2b. Detect cloud instance identity (for auto-approve)
         {
@@ -938,6 +1005,7 @@ public:
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
@@ -1053,6 +1121,15 @@ public:
                                  cloud_id.provider);
                 }
 
+                // PKI PR3: present the CSR so the server signs a per-agent client
+                // leaf (CN=<agent_id>). Only set when enrolling/renewing — once a
+                // leaf is issued and the channel rebuilt, pending_csr_pem is cleared
+                // so a steady-state re-Register never triggers a re-issue.
+                if (!pending_csr_pem.empty()) {
+                    req.set_csr_pem(pending_csr_pem);
+                    spdlog::info("Including CSR for per-agent mTLS enrollment");
+                }
+
                 pb::RegisterResponse resp;
                 auto register_start = std::chrono::steady_clock::now();
                 auto status = stub->Register(&ctx, req, &resp);
@@ -1080,6 +1157,86 @@ public:
                 }
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
+
+                // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
+                // + issuing chain, point the config at it, and rebuild the channel
+                // so the next connection is mutual TLS. We then `continue` to
+                // re-Register over mTLS — the FIRST (server-auth) session bound an
+                // empty client identity, so the data plane (Subscribe) would reject
+                // it; re-registering binds the leaf's CN=<agent_id> to a fresh
+                // session. The CSR is cleared first so the re-Register doesn't
+                // request a second cert.
+                if (!pending_csr_pem.empty()) {
+                    if (!resp.issued_certificate().empty()) {
+                        const bool persisted = persist_provisioned_cert(
+                            cert_dir, pending_key_pem, resp.issued_certificate(),
+                            resp.issued_ca_chain());
+                        // Zero the in-memory key on every path; clear the CSR once we
+                        // no longer need to act on it.
+                        yuzu::secure_zero(pending_key_pem);
+                        pending_key_pem.clear();
+                        pending_csr_pem.clear();
+                        if (persisted) {
+                            // Pairs with yuzu_agent_cert_provision_failed_total so an
+                            // operator can distinguish a provisioned (mutual-TLS) agent
+                            // from one that gave up and is running unauthenticated —
+                            // the observability half of the silent-downgrade concern
+                            // (#1239 should-fix; the enforcement half is the planned
+                            // --require-agent-identity flag, see auth-architecture.md).
+                            metrics_.counter("yuzu_agent_cert_provisioned_total").increment();
+                            const auto paths = provisioned_cert_paths(cert_dir);
+                            cfg_.tls_client_cert = paths.cert_path;
+                            cfg_.tls_client_key = paths.key_path;
+                            spdlog::info("PKI: received per-agent client cert — reconnecting with "
+                                         "mutual TLS");
+                            if (!build_channel()) {
+                                spdlog::error("PKI: failed to rebuild channel with issued cert");
+                                return;
+                            }
+                            continue; // re-Register over mTLS (binds the cert identity)
+                        }
+                        // Persist failed (disk full / perms). The server recorded the
+                        // leaf but we can't use it; falling through would Subscribe
+                        // with no client identity and be rejected, then reconnect with
+                        // an empty CSR and never recover. Exit so the service manager
+                        // restarts us — on restart the pre-step mints a fresh CSR.
+                        metrics_.counter("yuzu_agent_cert_provision_failed_total",
+                                         {{"reason", "persist_failed"}})
+                            .increment();
+                        spdlog::error("PKI: failed to persist the issued client cert under {} — "
+                                      "exiting for a clean restart-driven retry",
+                                      cert_dir.string());
+                        return;
+                    }
+                    // Hermes HIGH-2: enrolled but NO cert returned (server signer
+                    // unavailable/rate-limited, or an active MITM stripped the field).
+                    // reconnect_count was reset to 0 above, so without a bound the
+                    // agent would tight-loop re-minting/dropping certs. Back off and
+                    // retry the SAME CSR a bounded number of times; then give up
+                    // provisioning (clear the pending CSR) and proceed — if the server
+                    // requires client identity Subscribe will be rejected and the
+                    // normal reconnect backoff applies (no more cert churn), and if it
+                    // does not (one-way TLS) the agent runs without a client cert.
+                    if (++csr_attempts >= kMaxCsrAttempts) {
+                        metrics_.counter("yuzu_agent_cert_provision_failed_total",
+                                         {{"reason", "no_cert_issued"}})
+                            .increment();
+                        spdlog::error("PKI: enrolled but the server issued no client certificate "
+                                      "after {} attempts — giving up auto-provisioning for this "
+                                      "run (check the server CA / signer)",
+                                      csr_attempts);
+                        yuzu::secure_zero(pending_key_pem);
+                        pending_key_pem.clear();
+                        pending_csr_pem.clear();
+                        // fall through unauthenticated
+                    } else {
+                        spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
+                                     "backing off and retrying",
+                                     csr_attempts, kMaxCsrAttempts);
+                        reconnect_count = csr_attempts; // drive exponential backoff
+                        continue;                       // retry Register with the same CSR
+                    }
+                }
 
                 session_id_ = resp.session_id();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

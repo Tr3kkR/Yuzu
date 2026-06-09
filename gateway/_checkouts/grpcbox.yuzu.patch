@@ -1,0 +1,23 @@
+--- a/src/grpcbox_pool.erl	2026-06-04 22:17:05.972841831 +0100
++++ b/src/grpcbox_pool.erl	2026-06-04 21:56:12.137683967 +0100
+@@ -19,12 +19,18 @@
+                                  keyfile := KeyFile,
+                                  certfile := CertFile,
+                                  cacertfile := CACertFile} ->
++                                   %% YUZU PATCH (PKI PR5c): read fail_if_no_peer_cert
++                                   %% + verify from transport_opts (defaults preserve
++                                   %% stock strict mTLS) so a listener can opt into
++                                   %% one-way / server-authenticated TLS. Upstream
++                                   %% grpcbox v0.17.1 hardcodes these to true/verify_peer.
++                                   %% See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
+                                    {ssl, [{keyfile, KeyFile},
+                                           {certfile, CertFile},
+                                           {honor_cipher_order, false},
+                                           {cacertfile, CACertFile},
+-                                          {fail_if_no_peer_cert, true},
+-                                          {verify, verify_peer},
++                                          {fail_if_no_peer_cert, maps:get(fail_if_no_peer_cert, TransportOpts, true)},
++                                          {verify, maps:get(verify, TransportOpts, verify_peer)},
+                                           {versions, ['tlsv1.2']},
+                                           {next_protocols_advertised, [<<"h2">>]}]};
+                                _ ->

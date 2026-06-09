@@ -238,6 +238,14 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24'
 
+      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
+      # gateway/_checkouts/grpcbox. This supply-chain gate fails the PR build if
+      # that copy is ever anything other than upstream grpcbox at the
+      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch (tamper /
+      # drift / version skew). Runs on the merge-guarding path, not only release.
+      - name: Verify vendored grpcbox integrity
+        run: bash gateway/scripts/verify-vendored-grpcbox.sh
+
       # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
       # runner, which persists in the github-runner user's home between
       # jobs by definition. No actions/cache round-trip needed — paying

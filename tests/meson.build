@@ -116,6 +116,7 @@ agent_test_exe = executable(
     'unit/test_guard_file.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
+    'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -226,6 +227,11 @@ if build_server
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
+      'unit/server/test_x509_ca.cpp',
+      'unit/server/test_ca_store.cpp',
+      'unit/server/test_ca_routes.cpp',
+      'unit/server/test_key_provider.cpp',
+      'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',

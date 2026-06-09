@@ -6,11 +6,14 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -131,6 +134,32 @@ public:
     void set_execution_tracker(ExecutionTracker* tracker) {
         execution_tracker_.store(tracker, std::memory_order_release);
     }
+
+    /// PR3: per-agent mTLS issuance + enforcement. The signer (wired by ServerImpl
+    /// after the default-cert bootstrap, when a CA issuing key is available) signs a
+    /// client leaf bound to agent_id from the agent's CSR, returning
+    /// {leaf_pem, ca_chain_pem}; nullopt = signing unavailable/failed. The revocation
+    /// checker returns true iff a presented peer leaf PEM is revoked (checked against
+    /// ca.db). set_require_client_identity recomputes the mTLS-identity-required
+    /// posture AFTER bootstrap — require_client_identity_ is otherwise baked at ctor,
+    /// before the default CA exists. All set once during bring-up, before the gRPC
+    /// dispatcher accepts traffic.
+    using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
+        const std::string& csr_pem, const std::string& agent_id)>;
+    void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
+    void set_revocation_checker(std::function<bool(const std::string& peer_cert_pem)> checker) {
+        revocation_checker_ = std::move(checker);
+    }
+    /// Recognizer returning true iff a presented client leaf was issued by our
+    /// internal CA (signature-verified). When set, the Register re-auth gate
+    /// enforces identity/revocation ONLY for Yuzu-issued certs — a foreign cert in
+    /// a multi-CA trust bundle falls through to bootstrap rather than being trusted
+    /// as an agent identity (Hermes CRITICAL-1). Null = single-trust-root
+    /// deployment: every authenticated cert is treated as an agent (legacy).
+    void set_peer_cert_recognizer(std::function<bool(const std::string& peer_cert_pem)> r) {
+        peer_cert_recognizer_ = std::move(r);
+    }
+    void set_require_client_identity(bool v) { require_client_identity_ = v; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
@@ -288,7 +317,15 @@ private:
     /// pair instead of a plain raw pointer.
     std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
 
+    // PR3 per-agent mTLS (set post-bootstrap; empty = disabled / legacy path).
+    AgentCertSigner agent_cert_signer_;
+    std::function<bool(const std::string&)> revocation_checker_;
+    std::function<bool(const std::string&)> peer_cert_recognizer_;
+
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
+    /// PR3: the presented client leaf PEM from the gRPC auth context (the
+    /// x509_pem_cert property), or empty if no client cert was presented.
+    static std::string extract_peer_cert_pem(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
                                                const std::string& agent_id);
     static std::string client_metadata_value(const grpc::ServerContext& context,
@@ -298,6 +335,14 @@ private:
 
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
+
+    /// PR3: if a Yuzu-issued client leaf is presented and revoked, return a
+    /// non-OK status to send back; otherwise grpc::Status::OK. Lets the
+    /// agent-initiated RPCs (Heartbeat, DownloadUpdate) lock out a revoked agent
+    /// from liveness + OTA, not just the command channel — `Subscribe` keeps its
+    /// own richer audited gate. No-op when no checker is wired or no/foreign cert
+    /// is presented (the checker is issuer-scoped). `rpc` labels the metric/log.
+    grpc::Status reject_revoked_peer(grpc::ServerContext* context, std::string_view rpc);
 
     /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
     /// state change for the given command_id. Resolves command_id →

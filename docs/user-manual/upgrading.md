@@ -70,6 +70,37 @@ admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
 re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
 
+## ⚠️ Breaking: server generates default TLS certificates on first boot (v0.13.0)
+
+Before v0.13.0 the server **refused to start** without operator-provided certs
+(or `--no-tls`/`--no-https`). From v0.13.0, when a TLS surface has no certs the
+server **auto-generates a per-install ECDSA CA + leaf certs** on first boot and
+serves encrypted with no operator action.
+
+Impact by prior configuration:
+
+| Prior startup flags | After upgrade |
+|---|---|
+| `--cert`/`--key` (+ `--https-cert`/`--https-key`) supplied | No change — operator certs always win; defaults are never generated for a supplied surface. |
+| `--no-tls --no-https` (plaintext dev) | No change — both surfaces disabled; no certs generated. |
+| `--no-tls` only (HTTPS previously errored without certs) | **HTTPS now serves an auto-generated default cert** instead of failing. The agent surface stays plaintext. |
+| No cert flags (previously refused to start) | **Now starts, encrypted, on default certs**, with a loud banner. |
+
+What to expect / do:
+
+- **Browsers show an untrusted-issuer warning** for the dashboard until you trust
+  the per-install CA (`<ca-dir>/default-ca.pem`, default `/etc/yuzu/certs`) or
+  replace the cert with `--https-cert`/`--https-key`. The connection is encrypted;
+  only issuer verification is missing.
+- **Agents:** while on default certs the agent listener is encrypted but does
+  **not require** client certs (per-agent mTLS arrives in a later release).
+  Agents that previously connected over plaintext must switch to TLS — point them
+  at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
+- **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
+  — losing the CA key forces a full fleet re-enrollment.
+- Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
 ## Upgrade Order
 
 Always upgrade in this order:
