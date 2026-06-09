@@ -25,6 +25,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 
 // Forward declarations to avoid pulling in full store headers
@@ -144,8 +145,10 @@ public:
     /// posture AFTER bootstrap — require_client_identity_ is otherwise baked at ctor,
     /// before the default CA exists. All set once during bring-up, before the gRPC
     /// dispatcher accepts traffic.
+    /// `src` records whether issuance entered via the direct Register path or the
+    /// gateway proxy, threaded into the ca.cert.issued audit (#1290).
     using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
-        const std::string& csr_pem, const std::string& agent_id)>;
+        const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
     void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
     void set_revocation_checker(std::function<bool(const std::string& peer_cert_pem)> checker) {
         revocation_checker_ = std::move(checker);

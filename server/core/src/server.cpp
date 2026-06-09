@@ -1817,12 +1817,12 @@ public:
             // exception out of a sync gRPC handler on the exposed one-way-TLS agent
             // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
             std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&)>
-                cert_signer = [this](const std::string& csr_pem,
-                                     const std::string& agent_id)
+                const std::string&, const std::string&, CertIssuanceSource)>
+                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                     CertIssuanceSource src)
                 -> std::optional<std::pair<std::string, std::string>> {
                 try {
-                    return sign_agent_csr(csr_pem, agent_id);
+                    return sign_agent_csr(csr_pem, agent_id, src);
                 } catch (const std::exception& e) {
                     spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
                                   agent_id);
@@ -2511,7 +2511,13 @@ private:
     /// key is loaded transiently and zeroed before return (incl. exception
     /// unwind) so the crown jewel is not resident for the process lifetime.
     std::optional<std::pair<std::string, std::string>>
-    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id) {
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id,
+                   CertIssuanceSource src) {
+        // #1290: forensic discriminator on the issuance audit — was this minted on a
+        // direct agent connection or relayed by a (potentially compromised) gateway?
+        // The exact population an incident responder scopes when bulk-revoking after
+        // a gateway compromise (the PR5 R-5 confused-deputy compensating control).
+        const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
         auto root = ca_store_->get_root();
@@ -2571,7 +2577,8 @@ private:
                                                  .action = "ca.cert.reissue_blocked",
                                                  .target_type = "AgentCertificate",
                                                  .target_id = rev.serial_hex,
-                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .detail = "reason=revoked_identity cn=" + agent_id +
+                                                           " via=" + via,
                                                  .result = "denied"});
                     }
                     return std::nullopt;
@@ -2679,7 +2686,8 @@ private:
         }
         // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
         // storms / CSR floods (the audit row below is the forensic record).
-        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}}).increment();
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}, {"via", via}})
+            .increment();
 
         if (audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
@@ -2688,7 +2696,7 @@ private:
                                      .action = "ca.cert.issued",
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
-                                     .detail = "purpose=agent cn=" + agent_id,
+                                     .detail = "purpose=agent cn=" + agent_id + " via=" + via,
                                      // gov consistency: "success" (not "ok") so a
                                      // SIEM filter on ca.% AND result=success
                                      // catches issuance alongside revoke/publish.
