@@ -880,6 +880,37 @@ public:
                         spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
                         return false;
                     }
+                } else {
+                    // Secure-by-default (PKI #1289): no --ca-cert given. Auto-discover
+                    // the install CA at the standard shared-cert-volume path BEFORE
+                    // grpc falls back to the system trust store — a Yuzu self-signed
+                    // install CA is not in the system roots, so without this an agent
+                    // pointed at a default-cert server/gateway silently fails the TLS
+                    // handshake. The deployment may still pass --ca-cert explicitly.
+                    static constexpr const char* kInstallCaPaths[] = {
+#ifdef _WIN32
+                        "C:/ProgramData/Yuzu/certs/default-ca.pem",
+#else
+                        "/etc/yuzu/certs/default-ca.pem",
+#endif
+                    };
+                    for (const char* p : kInstallCaPaths) {
+                        std::error_code ec;
+                        if (!std::filesystem::exists(p, ec))
+                            continue;
+                        ssl_opts.pem_root_certs = read_file_contents(p);
+                        if (!ssl_opts.pem_root_certs.empty()) {
+                            spdlog::info("Auto-discovered install CA at {}", p);
+                            break;
+                        }
+                    }
+                    if (ssl_opts.pem_root_certs.empty())
+                        spdlog::warn("TLS is enabled but no --ca-cert was given and no install CA "
+                                     "was found at the standard path — verification will use the "
+                                     "SYSTEM trust store, which does NOT trust a Yuzu self-signed "
+                                     "install CA. Provide --ca-cert (e.g. "
+                                     "/etc/yuzu/certs/default-ca.pem) or use --no-tls for a "
+                                     "dev/demo stack.");
                 }
 
                 // Client certificate: prefer cert store, fall back to PEM files

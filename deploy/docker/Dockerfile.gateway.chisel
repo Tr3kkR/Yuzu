@@ -99,6 +99,11 @@ COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /rootfs/opt/yuzu_gw/
 RUN set -eux; \
     echo 'yuzu-gw:x:1000:1000:Yuzu Gateway:/opt/yuzu_gw:/bin/sh' >> /rootfs/etc/passwd; \
     echo 'yuzu-gw:x:1000:' >> /rootfs/etc/group; \
+    # Shared cert group (PKI #1289): FIXED gid 2000 yuzu-pki (member: yuzu-gw),
+    # matching the server/agent images, so the gateway can read the shared
+    # default-gateway.key out of /etc/yuzu/certs when the server runs with
+    # --cert-group yuzu-pki.
+    echo 'yuzu-pki:x:2000:yuzu-gw' >> /rootfs/etc/group; \
     printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
     chmod 1777 /rootfs/tmp; \
     chown -R 1000:1000 /rootfs/opt/yuzu_gw; \

@@ -116,6 +116,10 @@ COPY --from=builder /src/builddir/server/core/yuzu-server /rootfs/usr/local/bin/
 RUN set -eux; \
     echo 'yuzu:x:1000:1000:Yuzu Server:/var/lib/yuzu:/usr/sbin/nologin' >> /rootfs/etc/passwd; \
     echo 'yuzu:x:1000:' >> /rootfs/etc/group; \
+    # Shared cert group (PKI #1289): FIXED gid 2000 yuzu-pki (member: yuzu),
+    # matching the gateway/agent images, so `--cert-group yuzu-pki` lets a
+    # sibling container read the shared certs out of /etc/yuzu/certs.
+    echo 'yuzu-pki:x:2000:yuzu' >> /rootfs/etc/group; \
     printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu; \
@@ -132,7 +136,11 @@ COPY --from=chisel /rootfs /
 USER 1000:1000
 WORKDIR /var/lib/yuzu
 
-EXPOSE 8080 50051 50052 50055
+# 8443 = HTTPS dashboard (secure-by-default); 8080 = HTTP→HTTPS redirect.
+EXPOSE 8443 8080 50051 50052 50055
 
 ENTRYPOINT ["/usr/local/bin/yuzu-server"]
-CMD ["--listen", "0.0.0.0:50051", "--no-tls", "--no-https", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]
+# Secure by default (PKI #1289): no --no-tls/--no-https — auto-generates a
+# per-install CA + leaves and serves HTTPS (8443) + (m)TLS gRPC. For a
+# multi-container deploy sharing /etc/yuzu/certs add `--cert-group yuzu-pki`.
+CMD ["--listen", "0.0.0.0:50051", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]
