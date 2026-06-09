@@ -4,6 +4,17 @@ This guide covers hardening Yuzu for production enterprise deployments.
 
 ## mTLS Setup
 
+> **Default certificates are convenience, not production.** A fresh install
+> generates a per-install CA + server leaves on first boot so it is encrypted
+> with zero configuration — but those leaves are 10-year, do not auto-renew, and
+> carry SANs for `localhost`/loopback/hostname only. **Replace them before a
+> production rollout** with operator-provided or organisation-CA certs (below),
+> or root the built-in CA in your enterprise CA (subordinate mode, roadmap). The
+> server warns loudly while on default certs (startup banner, audit
+> `server.default_certs_in_use`, the `yuzu_server_default_certs_active` gauge).
+> Back up `--ca-dir` (esp. `default-ca.key`) and `ca.db` — losing the CA key
+> forces a full fleet re-enrollment.
+
 All agent-to-server communication should use mutual TLS. Create a private CA, server certificate, and per-agent certificates.
 
 ### 1. Create Certificate Authority
@@ -92,6 +103,29 @@ Run each component under its own system user:
 - `yuzu` — server process
 - `yuzu-agent` — agent process
 - `yuzu-gw` — gateway process
+
+## Gateway TLS (if you deploy the Erlang gateway)
+
+> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
+> The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
+> agent listener lets an on-path attacker inject commands (fleet RCE).
+> **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
+> the agent listener (`transport_opts` with `verify => verify_none`,
+> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> CA to your agents. It is not on by default in the deployed composes until PR5b.
+
+If you deploy the gateway, you **must** protect the agent edge — either enable the
+PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
+- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
+  `:50051`, forwarding only over loopback or a trusted segment), **or**
+- keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
+  directly internet-exposed.
+
+The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
+`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
+without `verify_peer`. Direct agent→server connections (no gateway) are already full
+mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+"TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 ## Secret Management
 

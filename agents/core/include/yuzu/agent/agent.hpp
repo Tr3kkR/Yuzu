@@ -24,6 +24,13 @@ struct Config {
     std::string cert_subject;              // Subject CN match for cert store lookup
     std::string cert_thumbprint;           // SHA-1 thumbprint for cert store lookup
     bool cert_auto_discovery{true};        // Auto-discover certs from well-known paths
+    // PKI PR3: directory for the auto-provisioned per-agent mTLS credential
+    // (agent-client.{key,pem} + agent-ca.pem). When tls is enabled with a CA but
+    // no explicit client cert/store, the agent generates a CSR at enrollment,
+    // persists the server-issued leaf here (key 0600), and reconnects with mTLS.
+    // Empty → defaults to data_dir/"certs". --no-auto-provision-cert disables it.
+    std::filesystem::path cert_dir;
+    bool auto_provision_cert{true};        // PKI PR3: enable CSR-at-enrollment flow
     std::string enrollment_token;          // Pre-shared enrollment token (Tier 2)
     std::string log_level{"info"};         // Current log level
     bool debug_mode{false};                // Debug mode flag (diagnostic features)

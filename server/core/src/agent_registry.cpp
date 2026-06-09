@@ -84,13 +84,14 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
 void AgentRegistry::set_stream(
     const std::string& agent_id,
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
-    grpc::ServerContext* context) {
+    grpc::ServerContext* context, const std::string& peer_cert_pem) {
     std::lock_guard lock(mu_);
     auto it = agents_.find(agent_id);
     if (it != agents_.end()) {
         std::lock_guard slock(it->second->stream_mu);
         it->second->stream = stream;
         it->second->server_context = context;
+        it->second->peer_cert_pem = peer_cert_pem; // PR3 H-1: for the revocation sweep
         it->second->last_activity_epoch_ms.store(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
@@ -112,6 +113,7 @@ void AgentRegistry::clear_stream(const std::string& agent_id) {
         std::lock_guard slock(session->stream_mu);
         session->stream = nullptr;
         session->server_context = nullptr;
+        session->peer_cert_pem.clear(); // PR3 H-1: stream gone → nothing to sweep
     }
 }
 
@@ -158,6 +160,64 @@ void AgentRegistry::reap_stale_sessions(std::chrono::seconds timeout) {
             session->server_context->TryCancel();
         }
     }
+}
+
+std::vector<std::string>
+AgentRegistry::sweep_revoked(const std::function<bool(const std::string&)>& is_revoked) {
+    std::vector<std::string> cancelled;
+    if (!is_revoked)
+        return cancelled;
+
+    // Snapshot every session (shared_ptrs keep them alive across the off-lock
+    // revocation check + TryCancel, mirroring reap_stale_sessions).
+    std::vector<std::shared_ptr<AgentSession>> sessions;
+    {
+        std::lock_guard lock(mu_);
+        sessions.reserve(agents_.size());
+        for (auto& [id, s] : agents_)
+            sessions.push_back(s);
+    }
+
+    for (auto& session : sessions) {
+        // Capture the presented leaf under the stream lock; skip sessions with no
+        // live stream or no client cert (nothing to revoke).
+        std::string pem;
+        {
+            std::lock_guard slock(session->stream_mu);
+            if (!session->server_context || session->peer_cert_pem.empty())
+                continue;
+            pem = session->peer_cert_pem;
+        }
+        // Evaluate revocation OFF stream_mu — is_revoked() reads ca.db under its
+        // own mutex, and holding a per-session lock across a cross-store query is
+        // the lock-discipline footgun gov #1117 forbids.
+        if (!is_revoked(pem))
+            continue;
+        // Re-acquire and re-verify the cert is unchanged before teardown, so a
+        // reconnection that swapped in a fresh (non-revoked) leaf between capture
+        // and now is not cancelled by mistake.
+        std::lock_guard slock(session->stream_mu);
+        if (session->server_context && session->peer_cert_pem == pem) {
+            spdlog::warn("Revocation sweep: cancelling Subscribe stream for agent {} "
+                         "(client cert revoked)",
+                         session->agent_id);
+            session->server_context->TryCancel();
+            // Clear the stashed leaf so a subsequent tick does not re-detect and
+            // re-cancel the SAME stream (and re-increment the counter / re-log)
+            // during the window between TryCancel and the Subscribe handler
+            // returning to call clear_stream_if_session. One cancel + one metric
+            // per revocation event. The handler-exit cleanup (or the stale-session
+            // reaper, if the cancel is somehow not observed) still tears the
+            // session down fully.
+            session->peer_cert_pem.clear();
+            metrics_
+                .counter("yuzu_grpc_revoked_cert_total",
+                         {{"event", "security"}, {"rpc", "stream_sweep"}})
+                .increment();
+            cancelled.push_back(session->agent_id);
+        }
+    }
+    return cancelled;
 }
 
 void AgentRegistry::remove_agent(const std::string& agent_id) {
@@ -211,6 +271,7 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
         std::lock_guard slock(session->stream_mu);
         session->stream = nullptr;
         session->server_context = nullptr;
+        session->peer_cert_pem.clear(); // PR3 H-1: stream gone → nothing to sweep
     }
 }
 

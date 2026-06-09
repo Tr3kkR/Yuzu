@@ -98,11 +98,14 @@ Agent (verify server cert, present its own client cert):
     --client-cert  Agent's PEM certificate (presented to server)
     --client-key   Agent's private key
 
-By default, server startup now requires --ca-cert when TLS is enabled.
-If you intentionally want one-way TLS, pass --insecure-skip-client-verify
-AND set YUZU_ALLOW_INSECURE_TLS=1.
+As of v0.13.0, if you provide NO cert flags (and do not pass --no-tls /
+--no-https), the server AUTO-GENERATES a per-install CA + leaf certs on first
+boot and serves HTTPS + gRPC encrypted with zero configuration. The steps below
+are for operator-managed certs; pass --no-default-certs to require them (the
+legacy refuse-to-start). See docs/auth-architecture.md "Default certificates"
+and the --no-default-certs / --ca-dir flags in docs/user-manual/server-admin.md.
 
-When TLS is enabled:
+When TLS is enabled AND --no-default-certs is set (or you supply certs):
   - Server startup fails if --cert/--key are missing or unreadable.
   - Server startup fails if --ca-cert is provided but unreadable.
   - Server startup fails if --ca-cert is missing (unless

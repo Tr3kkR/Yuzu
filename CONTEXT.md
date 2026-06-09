@@ -61,3 +61,34 @@ Timeline Activity Record. TAR captures ordered endpoint activity and response hi
 ## Gateway
 
 The Erlang service under `gateway/` that scales agent connectivity and command fanout. It proxies registration and heartbeat traffic upstream to the server, exposes agent-facing gRPC, and provides management forwarding for server-dispatched commands.
+
+## Reachability
+
+Whether one node in the fleet can initiate a network connection to another. Yuzu distinguishes two kinds and commits to one:
+
+- **Observed reachability** — an edge backed by a network flow the fleet's own agents *actually saw* (a `fleet_snapshot.v1` connection whose destination resolves to another fleet member via the server's IP→agent map). This is the spine of Yuzu's reachability graph. It deliberately **undercounts** what is possible — a path that policy permits but no host ever exercised is invisible — and that recall trade-off is accepted because trustworthy, low-false-positive results are the product's cornerstone.
+- **Potential reachability** — what the network/firewall *policy would allow*, independent of whether a flow was ever observed. Yuzu can only ever approximate the **host-firewall** slice of this (the set of `(port, protocol, allowed-source)` a host would accept), and only after structured firewall parsing that does not exist yet — it is a later, clearly-labeled enrichment, never conflated with observed edges.
+
+**Fabric-level reachability** — what switch/router ACLs, cloud security groups, and VLAN segmentation permit — is **out of scope**: an on-box agent cannot see it and Yuzu never fabricates it. A seam is left to *consume* it from an upstream source or *publish* Yuzu's observed graph upstream in a future iteration.
+
+Distinct from **Scope**, which is a device-*set* target expression, not a graph; reachability is about edges between nodes, not membership.
+
+## Asset value (Crown jewel)
+
+A risk-weighting of how much a node matters to defend — a *value* axis, **orthogonal** to tags, management groups, and scope (which are *targeting* axes). **Operator-declared**: the defender knows what matters and Yuzu does not guess it, though optional inference *hints* may suggest a value (never auto-apply it). Value is carried by the **service** — the process/listening unit where a vulnerability and an exposed port actually live — and may also be declared on an addressable instance (container, VM, bare-metal host). A host's **effective value is the maximum** of the values of the services/instances it carries: a box is as valuable a target as its most valuable tenant. A **crown jewel** is the high end of that axis — the service whose compromise is the attacker's objective and the defender's nightmare. New term; does not collide with any existing Yuzu concept.
+
+## Trust zone
+
+An operator-declared, ordered trust tier over network positions — a labeled set of CIDRs and/or sites (e.g. `internet` < `partner-extranet` (MPLS / third-party via an extranet block) < `branch-campus` (staff sites with fewer physical controls) < `datacenter` (where crown jewels live)). Trust zones are **declared, not inferred**: Yuzu cannot tell that `10.50.0.0/16` is the branch LAN or that an off-fleet peer arrived over an MPLS extranet — the operator labels the ranges, which Yuzu matches against the host `local_ips` and connection addresses it already collects. This is what disambiguates the blunt `External` edge into `internet` / `partner-extranet` / `branch`. A flow crossing from a lower-trust zone into a higher-trust one is a **cross-trust-boundary** edge — the source side of attack-path enumeration and the cut side of segmentation analysis. **Orthogonal** to **Management Group** (device-grouping for authz/targeting) and to **Scope** (a device-set expression): a host sits in exactly one trust zone *and* any number of management groups. With **Asset value**, trust zones bracket the attack graph — value declares *what attackers are after*, trust zones declare *where they start*.
+
+## Entry point
+
+A service an attacker is assumed able to reach from outside a defended zone — the *source set* for attack-path enumeration. In v1, an entry point is any service **exposed across a trust-zone boundary** (reachable from a zone of lower trust than the service's own), the lowest tier being the public Internet; laptops in low-trust staff zones are entry points as phishing / initial-access landing nodes. **Assume-breach** entry — treating *any* node as a possible foothold to model post-initial-access lateral movement — is a later, explicitly separate view, not the v1 default.
+
+## Attack path
+
+A directed chain through the reachability graph from an **entry point** to a **crown jewel**, where each hop is an observed reachability edge whose destination service carries an exploitable vulnerability. Each hop is weighted by the probability an attacker can exploit the destination service on arrival; the path's score is the product of its hop probabilities — found as a shortest *weighted* path so the **most probable** route surfaces, depth-bounded to the few hops that constitute a real threat. A finding's rank is driven by whether it sits on a short, probable attack path to value — **not** by raw CVSS. Distinct from **TAR** (observed temporal activity): an attack path is a structural statement about *possible* compromise routes, grounded in observed reachability but oriented toward what *could* happen.
+
+## Chokepoint
+
+A node or edge lying on many high-value attack paths, such that removing it — patching/isolating the host, or closing the port/flow — severs the most at-risk value for the least defender effort. Ranked by **defender ROI**: the sum of `crown-jewel value × path probability` over the attack paths the removal would break, **not** by generic graph centrality. The minimum-effort set of removals that fully severs a trust zone from crown jewels it should not reach is a **segmentation recommendation** (a cost-weighted min-cut). Because the graph is observed-grounded, a chokepoint severs *observed* paths; policy-permitted-but-unobserved paths are out of scope until host-firewall potential-reachability enrichment lands.

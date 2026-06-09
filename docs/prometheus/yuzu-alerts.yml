@@ -97,30 +97,34 @@ groups:
 
   - name: yuzu-tls
     rules:
-      # DISABLED: certificate-expiry alerting requires a
-      # `yuzu_server_cert_expiry_timestamp_seconds` gauge that the server does
-      # not currently export. Re-enable the two rules below once that metric is
-      # emitted (it should be set to the leaf certificate's notAfter, in epoch
-      # seconds).
-      #
-      # - alert: YuzuCertificateExpiringSoon
-      #   expr: |
-      #     yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
-      #   for: 1h
-      #   labels:
-      #     severity: warning
-      #   annotations:
-      #     summary: "Yuzu server TLS certificate expires in less than 7 days"
-      #     description: "The HTTPS certificate expires soon; renew the PEM files."
-      #
-      # - alert: YuzuCertificateExpiryCritical
-      #   expr: |
-      #     yuzu_server_cert_expiry_timestamp_seconds - time() < 86400
-      #   for: 10m
-      #   labels:
-      #     severity: critical
-      #   annotations:
-      #     summary: "Yuzu server TLS certificate expires in less than 24 hours"
+      - alert: YuzuCertificateExpiringSoon
+        expr: |
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server TLS certificate expires in less than 7 days"
+          description: >-
+            The {{ $labels.cert }} certificate expires in
+            {{ $value | humanizeDuration }}. Renew it and place the new PEM files
+            at the configured path (hot-reload picks up HTTPS automatically).
+            Built-in default certs (cert="default-ca") do NOT auto-renew — replace
+            them with operator-provided certs, or clear the cert directory to
+            regenerate.
+
+      - alert: YuzuCertificateExpiryCritical
+        expr: |
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server TLS certificate expires in less than 24 hours"
+          description: >-
+            The {{ $labels.cert }} certificate expires in
+            {{ $value | humanizeDuration }}. Immediate action required to prevent
+            service disruption.
 
       # yuzu_server_cert_reload_failures_total is a gauge holding the running
       # count of failed hot-reloads, so use delta() (not rate()) to detect a
