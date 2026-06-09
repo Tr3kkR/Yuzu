@@ -303,7 +303,22 @@ Operator                     Server                                  Agent
 | Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
 | VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
-**Why SQLite everywhere?** Zero configuration, single-file deployment, fast reads, supports concurrent readers with WAL mode. For the agent (which must be lightweight), SQLite adds ~600KB to the binary and requires no external database. For the server, SQLite scales to millions of rows per shard. If the server outgrows SQLite, the storage layer can be swapped to PostgreSQL with minimal code change — the query patterns are simple (insert, filter, paginate).
+**Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** The
+table above reflects the SQLite-everywhere origin; that principle has been **retired for the
+server**. PostgreSQL is now the standard server-side storage substrate, driven by cross-store
+joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
+scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
+is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the federated edge
+warehouse (ADR-0003) and `agent.db` KV/identity — because endpoint locality is exactly what
+makes SQLite right there.
+
+New server stores default to Postgres; the existing server SQLite stores migrate
+incrementally, each behind its own per-store ADR + migration plan (`SqliteTxn`/`SqliteStmt`
+→ a pg transaction owner; `MigrationRunner` → a pg schema-migration mechanism). This is a
+**breaking deployment change** — the server gains an external database dependency (compose,
+Dockerfile, systemd, UAT/demo rigs, install docs, a CI Postgres service). Secrets are **not**
+a plain Postgres column (envelope encryption / KMS / `pgcrypto`, separate review). Substrate
+decision of record: `docs/adr/0006-server-postgresql-substrate.md` (generalising ADR-0004).
 
 ## Plugin Architecture
 
