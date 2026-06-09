@@ -25,6 +25,12 @@
 #include <system_error>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/stat.h> // stat (--cert-group perm assertions)
+#include <unistd.h>   // getgid
+#include <utility>    // pair
+#endif
+
 using namespace yuzu::server;
 
 namespace {
@@ -341,3 +347,64 @@ TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be cre
     std::error_code ec;
     std::filesystem::remove(file_path, ec);
 }
+
+// ── --cert-group (multi-container shared-cert TLS, PKI #1289) ─────────────────
+#ifndef _WIN32
+
+namespace {
+// {permission bits, owning gid} of a path; {0, -1} on stat failure.
+std::pair<unsigned, gid_t> mode_and_gid(const std::filesystem::path& p) {
+    struct stat st{};
+    if (::stat(p.c_str(), &st) != 0)
+        return {0u, static_cast<gid_t>(-1)};
+    return {static_cast<unsigned>(st.st_mode) & 07777u, st.st_gid};
+}
+} // namespace
+
+TEST_CASE("default_certs: --cert-group shares the dir + gateway key, keeps the rest tight",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    // Use the test process's OWN gid: chgrp to a group you belong to always
+    // succeeds, so this drives the real apply_cert_group_share path deterministically.
+    const std::string own_gid = std::to_string(static_cast<unsigned long>(::getgid()));
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, {}, own_gid));
+
+    // Cert dir: 0750 + chgrp'd to the shared group (so a different-uid sibling
+    // container can traverse it).
+    auto [dmode, dgid] = mode_and_gid(dir.path);
+    REQUIRE(dmode == 0750u);
+    REQUIRE(dgid == ::getgid());
+
+    // Gateway leaf key: group-readable (0640) for the gateway uid.
+    auto [gkmode, gkgid] = mode_and_gid(set.gateway_key);
+    REQUIRE(gkmode == 0640u);
+    REQUIRE(gkgid == ::getgid());
+
+    // The server + HTTPS private keys are NEVER group-shared — owner-only 0600.
+    REQUIRE(mode_and_gid(set.server_key).first == 0600u);
+    REQUIRE(mode_and_gid(set.https_key).first == 0600u);
+
+    // Public certs stay world-readable (group + other read bits set).
+    REQUIRE((mode_and_gid(set.ca_cert).first & 044u) == 044u);
+}
+
+TEST_CASE("default_certs: no --cert-group keeps the tight single-host posture (0700/0600)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set)); // empty cert_group
+    REQUIRE(mode_and_gid(dir.path).first == 0700u);             // owner-only dir
+    REQUIRE(mode_and_gid(set.gateway_key).first == 0600u);      // key owner-only
+}
+
+TEST_CASE("default_certs: a bogus --cert-group falls back to tight perms (no boot-fail)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, {},
+                                 "no-such-group-xyzzy-1289"));
+    REQUIRE(mode_and_gid(dir.path).first == 0700u); // resolves nothing → tight
+}
+
+#endif // !_WIN32

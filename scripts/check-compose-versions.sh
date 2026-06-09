@@ -44,6 +44,7 @@ else
     docker-compose.uat.yml
     deploy/docker/docker-compose.yml
     deploy/docker/docker-compose.reference.yml
+    deploy/docker/docker-compose.reference-gateway.yml
     deploy/docker/docker-compose.uat.yml
     deploy/docker/docker-compose.full-uat.yml
     deploy/docker/docker-compose.sanitizer-uat.yml

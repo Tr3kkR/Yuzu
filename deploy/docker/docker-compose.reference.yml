@@ -1,127 +1,92 @@
-## Yuzu — Reference Docker Compose template
+## Yuzu — Reference Docker Compose template (single-server)
 ##
-## ⚠  THIS IS A COPYABLE REFERENCE, NOT A PRODUCTION-READY DEPLOYMENT AS-IS.
+## SECURE BY DEFAULT (PKI #1289). The image auto-generates a per-install
+## Certificate Authority + leaf certs on first boot and serves:
+##   - the dashboard + REST API over HTTPS on 8443
+##   - the agent / management gRPC listeners over (mutual) TLS
+## No --no-tls/--no-https, no operator-supplied certs, and no manual steps are
+## required to be encrypted + mutually authenticated out of the box.
 ##
-## The image's default CMD runs `--no-tls --no-https --web-address 0.0.0.0`
-## for first-run convenience, which is NOT secure. Before you expose this
-## stack to any untrusted network you must:
-##   1. Generate TLS certificates (server.pem, server.key, ca.pem)
-##   2. Uncomment the `command:` block below and mount the `./certs` directory
-##   3. Verify with `curl -k https://localhost:8080/readyz`
+## Two consequences to know:
+##   1. The dashboard cert is signed by the per-install CA, so a browser shows
+##      an "untrusted issuer" warning until you trust the CA. Download it from
+##      the `certs` volume (default-ca.pem) or GET https://<host>:8443/api/v1/ca/root,
+##      and import it into your trust store. The CA fingerprint is logged at
+##      startup and surfaced at /health.
+##   2. The certs live in the `certs` named volume below so the CA + leaves
+##      (and therefore the trust your agents have) SURVIVE container
+##      replacement / upgrades. Do not delete that volume.
 ##
-## CLAUDE.md invariants: mTLS for agent ↔ server gRPC is mandatory, HTTPS is
-## the default transport for the dashboard, and the web UI should bind to
-## 127.0.0.1 unless you know what you're doing. The default image command
-## violates all three for convenience — fix that before you trust this stack.
+## Bring-your-own-cert (optional): to use your own PKI instead of the built-in
+## CA, mount your material into /etc/yuzu/certs and add
+##   --https-cert /path --https-key /path --ca-cert /path (and --cert/--key for
+## the gRPC listeners) to `command:` below. Or root the built-in CA in your
+## enterprise PKI via Settings → Internal CA → "Subordinate this CA" (PR6).
 ##
-## Purpose:
-##   A minimal, upgrade-safe deployment that pulls pre-built images from
-##   ghcr.io. Copy this file into your deployment directory, harden per the
-##   checklist above, and adjust paths, passwords, and TLS material to match
-##   your environment.
+## Gateway scale-out plane: this single-server reference does NOT include the
+## Erlang gateway. For the multi-container (server + gateway + agents) TLS
+## topology — which uses a shared /etc/yuzu/certs volume + `--cert-group` so the
+## different-uid containers can read the shared certs — see
+## docker-compose.reference-gateway.yml.
+##
+## ⚠  Still NOT a turnkey production deployment: set a strong admin password in
+## yuzu-server.cfg, decide whether to bind the dashboard to 127.0.0.1 + front it
+## with a reverse proxy, and review docs/user-manual/ before exposing it.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.10.0
+##   export YUZU_VERSION=0.13.0
 ##   docker compose -f docker-compose.reference.yml up -d
 ##   docker compose -f docker-compose.reference.yml logs -f server
+##   # trust the CA, then browse https://localhost:8443/
 ##
-## Upgrade (data-preserving):
-##   export YUZU_VERSION=0.11.0     # pick the new release tag
+## Upgrade (data + CA preserving):
+##   export YUZU_VERSION=0.14.0     # pick the new release tag
 ##   docker compose -f docker-compose.reference.yml pull
 ##   docker compose -f docker-compose.reference.yml up -d
 ##
-## The `server-data` volume survives container replacement, and the server
-## runs schema migrations automatically at startup via the MigrationRunner
-## (each SQLite store tracks its version in the `schema_meta` table and
-## applies pending migrations in a transaction). No manual steps are
-## required. See docs/user-manual/upgrading.md for full upgrade + rollback
-## procedures.
+## The `server-data` and `certs` volumes survive container replacement; the
+## server runs schema migrations automatically at startup. See
+## docs/user-manual/upgrading.md.
 ##
-## CAUTION: `docker compose down -v` deletes the `server-data` volume and
-## ALL server state (credentials, agents, audit log, instruction history).
-## Always back up `server-data` before any destructive operation.
-##
-## Backup (run from a dedicated backup directory so $PWD is predictable):
-##   mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
-##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
-##
-## Restore (with server stopped):
-##   docker compose -f docker-compose.reference.yml down server
-##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
-##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data
-##   docker compose -f docker-compose.reference.yml up -d server
+## CAUTION: `docker compose down -v` deletes BOTH volumes (server state AND the
+## CA) — agents would have to re-trust a freshly generated CA. Don't, unless you
+## intend to re-root the install.
 
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0}
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-server
     restart: unless-stopped
+    # The image's default CMD is already secure (no --no-tls/--no-https): it
+    # auto-generates the CA + leaves and serves HTTPS on 8443. Override `command:`
+    # only to bring your own certs or change ports — see the header.
     ports:
-      - "8080:8080"     # Web dashboard + REST API
-      - "50051:50051"   # Agent gRPC (direct-connect agents)
-      - "50052:50052"   # Management gRPC
-    # File-descriptor headroom mirrors the systemd unit at
-    # deploy/systemd/yuzu-server.service. The Docker default soft limit
-    # is 1024 — comfortably exhausted on a busy fleet by SSE EventSource
-    # connections + agent gRPC streams + SQLite WAL + log handles.
-    # Bump to 65536 so a single container can carry up to ~50k agents.
+      - "8443:8443"     # Dashboard + REST API (HTTPS)
+      - "8080:8080"     # HTTP → HTTPS redirect
+      - "50051:50051"   # Agent gRPC (mTLS; direct-connect agents)
+      - "50052:50052"   # Management gRPC (mTLS)
+    # File-descriptor headroom mirrors deploy/systemd/yuzu-server.service. The
+    # Docker default soft limit (1024) is exhausted on a busy fleet by SSE +
+    # agent gRPC streams + SQLite WAL + log handles. 65536 ≈ ~50k agents.
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     volumes:
-      # Single writable volume for all server state:
-      #   - SQLite databases (response, audit, policy, RBAC, etc.)
-      #   - yuzu-server.cfg (admin credentials, hashed)
-      #   - enrollment-tokens.cfg, pending-agents.cfg, auto-approve.cfg
-      #   - agent-updates/ OTA binaries
-      # The server's default CMD points --config and --data-dir here,
-      # so everything in this volume is preserved across upgrades.
+      # All server state (SQLite DBs, yuzu-server.cfg, enrollment tokens, OTA
+      # binaries). The default CMD points --config + --data-dir here, so it is
+      # preserved across upgrades.
       - server-data:/var/lib/yuzu
-      # Read-only TLS material — keep certs in source control or a secrets
-      # manager, not in the data volume. Uncomment after generating certs:
-      # - ./certs:/etc/yuzu/certs:ro
-    # Production TLS — UNCOMMENT this block and remove the default CMD's
-    # --no-tls/--no-https flags before running in any environment where
-    # untrusted clients can reach the ports above.
-    # command:
-    #   - "--listen"
-    #   - "0.0.0.0:50051"
-    #   - "--web-address"
-    #   - "127.0.0.1"      # or 0.0.0.0 + front with a reverse proxy
-    #   - "--web-port"
-    #   - "8080"
-    #   - "--config"
-    #   - "/var/lib/yuzu/yuzu-server.cfg"
-    #   - "--data-dir"
-    #   - "/var/lib/yuzu"
-    #   - "--https-cert"
-    #   - "/etc/yuzu/certs/server.pem"
-    #   - "--https-key"
-    #   - "/etc/yuzu/certs/server.key"
-    #   - "--tls-ca-cert"
-    #   - "/etc/yuzu/certs/ca.pem"
-    #
-    # Healthcheck uses bash's /dev/tcp pseudo-device to verify /readyz
-    # returns 200 OK without requiring curl in the runtime image.
-    #
-    # CRITICAL: must invoke `bash` explicitly — `CMD-SHELL` uses /bin/sh
-    # which on ubuntu:24.04 is `dash`, and dash does NOT implement
-    # /dev/tcp. Using `["CMD", "bash", "-c", ...]` forces bash, which
-    # IS present in the runtime image.
-    #
-    # /readyz (not /livez) is intentional — it reflects migration
-    # success, not just HTTP listener readiness. The agent sidecar's
-    # `depends_on: service_healthy` will not fire until every store in
-    # the readiness conjunction has completed its schema migration.
+      # The auto-generated CA + leaf certs. MUST persist so the CA (and the
+      # trust your agents have in it) survives container replacement.
+      - certs:/etc/yuzu/certs
+    # Healthcheck: a bash /dev/tcp probe that the HTTPS listener (8443) is up.
+    # MUST invoke `bash` explicitly — CMD-SHELL uses /bin/sh (dash), which does
+    # NOT implement /dev/tcp. A bare TCP open is used (not an HTTP GET) because
+    # the listener is TLS and the runtime image has no curl/openssl.
     healthcheck:
-      test:
-        - "CMD"
-        - "bash"
-        - "-c"
-        - "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8443"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -129,26 +94,18 @@ services:
 
   # ── Yuzu Agent — install natively, not in Docker ─────────────────────
   #
-  # Agents always run natively on each managed endpoint. We do NOT
-  # publish a `yuzu-agent` GHCR image and do NOT recommend running
-  # the agent in a container.
-  #
-  # Production install paths:
-  #   Linux  — yuzu-agent_X.Y.Z_amd64.deb / yuzu-agent-X.Y.Z-1.x86_64.rpm
-  #   Windows — YuzuAgentSetup-X.Y.Z.exe (Authenticode-signed, InnoSetup)
-  #   macOS   — YuzuAgent-X.Y.Z-macos-arm64.pkg (notarized + stapled)
-  # All four are published as release assets — see
-  # docs/user-manual/agent-install.md for per-platform install steps.
-  #
-  # Dev smoke test (server↔agent roundtrip without touching real fleet):
-  #   bash scripts/linux-start-UAT.sh         # native agent against this stack
-  #
-  # Power users who insist on a containerised agent can build from
-  # deploy/docker/Dockerfile.agent themselves; we don't support or
-  # encourage that path.
+  # Agents run natively on each managed endpoint (we do not publish a
+  # production agent container). They connect over TLS by default and
+  # auto-discover the install CA at /etc/yuzu/certs/default-ca.pem, or take
+  # --ca-cert <path> / --server <host:port>. Install paths:
+  #   Linux  — yuzu-agent_X.Y.Z_amd64.deb / .x86_64.rpm
+  #   Windows — YuzuAgentSetup-X.Y.Z.exe (Authenticode-signed)
+  #   macOS   — YuzuAgent-X.Y.Z-macos-arm64.pkg (notarized)
+  # See docs/user-manual/agent-install.md.
 
 volumes:
-  # Named volume for server state — must persist across
-  # `docker compose down`. Do NOT use `docker compose down -v` unless
-  # you intend to destroy state.
+  # Server state — must persist across `docker compose down`.
   server-data:
+  # The per-install CA + default leaves — must persist or agents lose trust on
+  # every restart. See the header CAUTION about `down -v`.
+  certs:
