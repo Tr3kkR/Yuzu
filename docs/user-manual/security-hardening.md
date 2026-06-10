@@ -302,7 +302,7 @@ Five secret classes are currently stored **plaintext inside 0600-mode server-sid
 database files** (not encrypted at the column level): MFA TOTP secrets and session
 tokens (`auth.db`), webhook signing secrets (`webhooks.db`), offload-target
 credentials (`offload_targets.db`), and the OIDC client secret
-(`runtime_config.db`). Protection today is file permissions + the host-level
+(`runtime-config.db`). Protection today is file permissions + the host-level
 encryption above. ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`)
 is the adopted roadmap: app-side AES-256-GCM envelope encryption lands with each
 store's PostgreSQL migration, and session tokens convert to hashed (verify-only)
