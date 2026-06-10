@@ -4,7 +4,7 @@ date: 2026-06-10
 owner: Nathan Dornbrook (platform)
 deciders: Nathan Dornbrook; HITL session 2026-06-10 (#1319)
 scope: platform — secret material at rest in the server's Postgres substrate
-builds-on: ADR-0006 (PostgreSQL substrate); ADR-0008 (substrate architecture); ADR-0009 (backfill cutover)
+builds-on: ADR-0006 (PostgreSQL substrate), ADR-0008 (substrate architecture), ADR-0009 (backfill cutover)
 ---
 
 # 0010 — Secrets at rest: app-side envelope encryption behind the KeyProvider seam
@@ -74,28 +74,115 @@ existing `KeyProvider` seam and never enters Postgres.**
    - **Nonces and DEK single-use:** 96-bit nonces, fresh per encryption; a DEK encrypts
      exactly one value exactly once — updating a secret mints a fresh DEK (never DEK reuse
      under a new nonce). KEK rotation re-wraps only; it never touches `data_nonce`/payload.
-   - **Decrypt-failure semantics:** a GCM tag failure is the tamper signal — fail closed
-     (refuse the operation), emit an audit event + metric, and **never** degrade to an
-     empty secret. This is load-bearing: `webhooks.secret` and
-     `offload_targets.auth_credential` both have existing "empty means no auth" code paths
-     (`webhook_store.cpp`, `offload_target_store.cpp`), so an empty-on-failure idiom would
-     silently disable signing/auth.
+   - **Canonical AAD serialization:** naive concatenation of the AAD tuple is ambiguous
+     (`"a"+"bc"` ≡ `"ab"+"c"` — exactly the swap class AAD exists to defeat). Each field
+     is length-prefixed (u32-BE length before each field); row PKs use one canonical
+     encoding (BIGINT → fixed 8-byte BE); the `kek_version` bytes in the AAD are
+     byte-identical to the blob's field. Covered by a round-trip + boundary-shift test.
+   - **Blob v1 pins widths:** `ver` u8; `kek_version` u32-BE; nonces 12 bytes; tags 16
+     bytes; `wrapped_dek` fixed 32 bytes (raw GCM output, tag separate) — every field but
+     `ciphertext` is fixed-width, so `ciphertext` is the remainder and needs no framing.
+     Decode rejects blobs below the fixed minimum length before slicing.
+   - **Decrypt-failure semantics — fail closed at EVERY store that calls
+     `SecretCodec::decrypt`:** a GCM tag failure is the tamper signal — refuse the
+     operation, emit an audit event + metric, and **never** degrade to an empty secret.
+     Concrete examples of why empty-on-failure is dangerous: `webhooks.secret` and
+     `offload_targets.auth_credential` both have existing "empty means no auth" code
+     paths (`webhook_store.cpp`, `offload_target_store.cpp`), so it would silently
+     disable signing/auth. The audit event carries **identifiers only** (the AAD tuple:
+     store, table, column, row PK, kek_version) — never ciphertext, plaintext, DEK, or
+     key bytes.
+   - **NULL/absent semantics (anti-downgrade):** AAD stops blob *swap*, not blob
+     *deletion*. A NULL or absent value in a secret column whose row is configured to
+     carry a secret is a **hard error** (same handling as a tag failure), never "no
+     auth". "No secret configured" must be represented by an independent non-secret
+     flag/column, never by column emptiness — otherwise an SQL-write insider NULLs the
+     column and rides the empty-means-no-auth path to disable signing without ever
+     touching the crypto.
    - **Zeroization:** `SecretCodec` `secure_zero`s DEKs and decrypted plaintext buffers
-     once consumed (mirrors the `KeyProvider::load_key` caller contract).
+     once consumed (mirrors the `KeyProvider::load_key` caller contract). Codec
+     interfaces use a non-copyable, move-only zeroizing buffer type (`OPENSSL_cleanse`
+     in the destructor — resists dead-store elimination); `std::string` at the boundary
+     bounds, not guarantees, zeroization, so it is not used for key/secret bytes. (The
+     existing `yuzu::secure_zero` in `sdk/include/yuzu/secure_zero.hpp` is string-only;
+     the implementation adds a span overload or uses `OPENSSL_cleanse` directly — no
+     third idiom.) EVP contexts are RAII-owned (`EVP_CIPHER_CTX_free` on all paths, the
+     `x509_ca.cpp` idiom). Codec errors return `std::expected<T, std::string>`
+     (`runtime_config_store` precedent) and never embed secret material in error strings.
 
    Decryption happens in the store class, never in SQL.
+
+   **Stable-identity constraint:** because AAD binds to `(store, table, column, row PK)`,
+   secret-bearing tables must use stable primary keys, and any migration or feature that
+   changes row identity — surrogate-PK churn from delete-and-reinsert upserts, table
+   rebuilds that renumber serials, table/column renames, or a Postgres schema (store
+   namespace) rename — must decrypt-and-re-encrypt through `SecretCodec` as part of that
+   migration, never copy blobs.
 2. **Key custody.** The KEK is 32 bytes from `RAND_bytes`, generated on first boot (same
    bootstrap pattern as the default certs), stored base64-encoded through
    `KeyProvider::store_key` (`key_id = "secrets-kek-v<N>"`) — exactly like the CA root key:
-   `FileKeyProvider` 0600/0700 today; PKCS#11/KMS/HSM later by swapping the provider, with
-   `key_ref` opaque to all callers. The KEK is never written to Postgres, never logged,
-   never exported by any API. If encrypted values exist but the KEK ref does not resolve,
-   the server **fails closed** at boot (`startup_failed()`), matching ADR-0007's posture —
-   a loudly-down server over one silently serving with unreadable secrets.
+   `FileKeyProvider` 0600/0700 today (on Windows the equivalent is a restrictive DACL
+   granting only the service account — POSIX mode bits are an approximation there, and the
+   implementation must state the NTFS posture explicitly); PKCS#11/KMS/HSM later by
+   swapping the provider, with `key_ref` opaque to all callers. The KEK is never written
+   to Postgres, never logged, never exported by any API. Custody mechanics:
+   - **Atomic write:** `store_key` for the file provider writes temp-file → fsync → rename,
+     so power loss during first-boot generation can never leave a torn KEK file that
+     "resolves" but fails every decrypt as pseudo-tamper.
+   - **Fingerprint registration:** at KEK generation/rotation the substrate records
+     `(kek_version, SHA-256 fingerprint of the key material, created_at)` in a substrate
+     meta table. Fingerprints are non-secret (standard key-check-value practice) and are
+     the one KEK-related artifact allowed in the database. At boot, `SecretCodec` init —
+     substrate-level, before stores open — verifies that **every kek_version registered in
+     the meta table resolves through `KeyProvider` to material matching its fingerprint**.
+     This catches: backup skew (keys dir older than the DB), a torn/corrupt KEK file
+     (fingerprint mismatch ≠ tamper), and the dual-server case below — each with a
+     distinct, actionable error instead of a flood of per-row decrypt failures.
+   - **Fail-closed boot:** any unresolvable or fingerprint-mismatched registered KEK →
+     `startup_failed()` with a distinct `kek_unresolvable` / `kek_corrupt` log token
+     (operators must be able to triage this separately from "DB down"), matching
+     ADR-0007's posture — a loudly-down server over one silently serving with unreadable
+     secrets.
+   - **KEK residency:** `SecretCodec` loads the KEK once at construction into the
+     zeroizing buffer (one resident copy beats N transient `load_key` copies) and reloads
+     only on a rotation event.
+   - **Topology rule (one KEK per database):** in the FileKeyProvider era the supported
+     topology is **one server instance per database**. Two servers first-booting against
+     one Postgres with separate keys directories would each mint an independent
+     `secrets-kek-v1` and read each other's writes as tamper. The fingerprint registration
+     makes this fail loudly: the second server's boot check finds a registered fingerprint
+     it cannot match and refuses. Multi-server (HA/blue-green) requires shared custody —
+     a shared keys directory or the KMS/PKCS#11 provider — and is out of scope until then.
 3. **Key hierarchy & rotation.** KEK rotation mints `secrets-kek-v<N+1>` and re-wraps DEKs
    (cheap: re-encrypt the small wrapped-DEK blob, not the payload). The blob's
    `kek_version` field makes rotation incremental and interruptible. DEK-per-secret means
-   a single leaked DEK exposes one value, not a class.
+   a single leaked DEK exposes one value, not a class. Rotation lifecycle rules:
+   - **Discovery by scan is acceptable at our volumes** (the secret-bearing tables are
+     tens-to-low-thousands of rows: operators × TOTP, webhooks, offload targets, one OIDC
+     row; sessions are hashes and excluded), and the `kek_version` field sits at a fixed
+     offset in the blob header, so "find rows wrapped under v<N>" is a cheap header scan.
+     If a secret table ever outgrows scan-trivial, the escape hatch is a denormalized
+     `kek_version` column kept consistent with the blob field — not mandated now.
+   - **Completion signal:** rotation is complete when a verified scan shows zero rows
+     referencing v<N>; the substrate exposes `oldest_kek_version_in_use()` so the
+     operator (and the runbook) can confirm before retiring anything.
+   - **Safe retirement:** an old KEK version may be deleted from `KeyProvider` storage
+     only when (a) zero stored blobs reference it AND (b) the oldest database backup the
+     operator intends to honour no longer contains blobs wrapped under it (a restored
+     backup needs the KEK versions its rows reference). The server refuses
+     `delete_key` on a KEK version that condition (a) fails — premature retirement is
+     permanent, unrecoverable loss of every un-rewrapped row. Retirement is recorded
+     (audit event) as destruction evidence.
+   - **Concurrent-update safety:** re-wrap is read-rewrap-write and must be
+     compare-and-swap (`WHERE secret_blob = <value read>`); a plain write would silently
+     revert an operator's mid-rotation secret update to the old value under the new KEK.
+   - **KEK lifecycle audit events:** `kek.generated`, `kek.rotated`, `kek.retired`, and
+     `secret.decrypt_failure` are audit-taxonomy entries from the first implementation
+     PR, with failure classes distinguished: `tag_mismatch` (tamper) vs
+     `kek_unresolvable` (config/key loss) vs `malformed_blob` (parse). Metric:
+     `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (counter), per
+     `docs/observability-conventions.md`. A systemic class (`kek_unresolvable`) must not
+     bury a genuine single-row `tag_mismatch` — distinct classes make that triageable.
 4. **The substrate rule** (replaces the store-name carve-out): **no plaintext
    recover-plaintext secret may land in a Postgres column.** Secret columns are either
    (a) verify-only hashes, or (b) envelope-encrypted blobs as above. Every store migration
@@ -145,16 +232,39 @@ existing `KeyProvider` seam and never enters Postgres.**
 
 ## Consequences
 
-- **Backups.** `pg_dump` and volume snapshots contain ciphertext and wrapped DEKs only — a
-  database backup alone recovers no secrets. The KEK file (or future KMS handle) must be
-  backed up **separately and offline**, exactly like the CA root key (same SRE note as
-  `key_provider.hpp`): losing the KEK orphans TOTP enrollments, webhook secrets,
-  offload-target credentials, and the OIDC client secret. All are re-enrollable/re-issuable,
-  but at operator pain; the restore-verification drill must cover the KEK alongside the CA
-  root.
+- **Backups — the restore-pairing invariant.** `pg_dump` and volume snapshots contain
+  ciphertext and wrapped DEKs only — a database backup alone recovers no secrets, **and
+  therefore a database restore is unusable without the matching keys directory**. DB
+  backups and keys-dir backups are a *pair*: restoring a dump to a fresh install (new
+  `KeyProvider` dir) orphans every encrypted secret by design. The KEK file (or future KMS
+  handle) must be backed up **separately and offline**, exactly like the CA root key (same
+  SRE note as `key_provider.hpp`), and the restore-verification drill must restore *both
+  halves together* and confirm a clean fingerprint check at boot. Losing the KEK orphans
+  TOTP enrollments, webhook secrets, offload-target credentials, and the OIDC client
+  secret — all re-enrollable/re-issuable, but at operator pain (every TOTP-enrolled
+  operator re-enrolls; every webhook secret is re-issued and its downstream consumer
+  reconfigured; every offload credential re-issued).
+- **Break-glass (KEK permanently lost).** Two parts, both deliberate:
+  - **Admin login survives KEK loss by design:** MFA recovery codes are verify-only PBKDF2
+    hashes — they need no KEK. An admin whose TOTP secret is undecryptable signs in via a
+    recovery code and re-enrolls TOTP. KEK loss is painful, never a total lockout.
+  - **Voided-secrets boot:** an explicit operator flag (named at implementation, e.g.
+    `--accept-voided-secrets`) boots the server treating all undecryptable values as
+    *absent-and-must-be-re-set* — loudly logged and audited, never silent. Without the
+    flag, the fail-closed boot stands. This converts a DR-without-keys event from a hard
+    outage into a documented re-enrollment procedure.
+- **Operator documentation home:** the KEK backup/rotation/restore-drill and break-glass
+  procedures land in `docs/user-manual/server-admin.md` under a "Key management"
+  subsection (alongside the CA root key guidance) with the first implementation PR.
+  Key-escrow / split-custody is acknowledged as a known enterprise questionnaire item:
+  unsupported in the FileKeyProvider era, addressed by the KMS/PKCS#11 provider swap.
 - **The pg substrate (#1320) grows a `SecretCodec` helper** (`server/core/src/pg/`):
-  encrypt/wrap/unwrap/decrypt + KEK-version bookkeeping, used by every store that owns a
-  secret column. It takes a `KeyProvider&`; tests use a temp-dir `FileKeyProvider`.
+  encrypt/wrap/unwrap/decrypt + KEK-version bookkeeping (the fingerprint meta table and
+  `oldest_kek_version_in_use()`), used by every store that owns a secret column. It takes
+  a `KeyProvider&`; tests use a temp-dir `FileKeyProvider`. Build-graph note:
+  `key_provider.{hpp,cpp}` is currently compiled into the main server target — when `pg/`
+  becomes a library depending on it, extract KeyProvider into a leaf target first or the
+  meson graph cycles.
 - **Migration backfills that touch secret columns transform, not copy** (ADR-0009 note):
   plaintext SQLite values are encrypted (or hashed, for sessions) on the way in. The legacy
   read-only `.db` retained for one release still contains plaintext — do **not** scrub it
@@ -164,10 +274,18 @@ existing `KeyProvider` seam and never enters Postgres.**
   per-store ADR instructs operators to treat window-era data-dir backups as secret-bearing
   and to rotate webhook/offload/OIDC secrets after the window if backup posture is unknown
   (all are re-issuable); (d) the next-release deletion is implemented and upgrade-tested,
-  not left aspirational.
+  not left aspirational. Verification note: fresh-DEK-per-encrypt makes ciphertext
+  nondeterministic, so backfill verification is **decrypt-and-compare** (never byte
+  comparison), and interrupted-backfill re-runs detect already-transformed rows via the
+  blob version header / a completion marker, not by value.
 - **Operational cost.** One more trust-anchor file in the certs/keys directory; KEK rotation
   is an operator procedure (incremental re-wrap) to document in the user manual; per-value
-  AES-GCM cost is negligible at our volumes.
+  AES-GCM cost is negligible at our volumes for four of the five classes (TOTP per MFA
+  login, OIDC at startup/refresh, offload per flush). The webhook signing secret is the
+  potential hot path (per outbound delivery): implementations **may** cache the decrypted
+  signing secret in memory for the lifetime of a delivery batch, provided the buffer is
+  zeroized after — consistent with the zeroization contract, no premature optimisation
+  forced or foreclosed.
 - **`security-guardian` review is structural:** any PR adding or migrating a secret column
   cites this ADR and carries that review (the routed-concern row in CLAUDE.md).
 
@@ -176,10 +294,25 @@ existing `KeyProvider` seam and never enters Postgres.**
 `security-guardian` design review, 2026-06-10 (#1319): **APPROVE-WITH-CHANGES**, all changes
 folded into this text. Verified against code: the session-token access patterns (§Decision 5),
 the api_token/ca clean-store claims (§Decision 7), and inventory completeness (independent
-sweep of all 38 schema-bearing server stores found exactly the five columns above, no others —
-Entra directory-sync client secrets are request-scoped and never persisted). Findings folded:
+sweep of all 38 schema-bearing server stores — a larger denominator than ADR-0007's "~29
+concrete stores" / CLAUDE.md's "~27 migrating stores" because it counts every file with a
+CREATE TABLE, including reference/read-only ones — found exactly the five columns above, no
+others; Entra directory-sync client secrets are request-scoped and never persisted). Findings
+folded:
 AAD anti-swap binding, wrap-algorithm/nonce/DEK-single-use rules, versioned blob format,
 decrypt-failure semantics, zeroization, KEK provisioning + fail-closed boot (S-1…S-7);
 residual-risk statement (T-1); session preconditions + sequencing (T-2/T-3); hardened
 one-release retention window (R-1). Code note fixed alongside: `runtime_config_store` falsely
 commented `oidc_client_secret` as "encrypted at rest" (I-1).
+
+Full `/governance` run on PR #1333, 2026-06-10 (Gates 1–8, 12 agent reviews): the run
+verified fold fidelity, re-verified every code-grounded claim independently (no ADR-0008-class
+false premise), and surfaced four design gaps amended into this text in the same PR: KEK
+retention/retirement lifecycle + completion signal (§Decision 3), the restore-pairing
+invariant + break-glass position (§Consequences — including the observation that MFA recovery
+codes are verify-only hashes and survive KEK loss by design), the one-KEK-per-database
+topology rule + fingerprint registration (§Decision 2), and NULL/absent anti-downgrade
+semantics (§Decision 1). Implementation-phase chaos scenarios (CH-1…CH-8: DR restore without
+keys, backup skew + audit-flood masking, mid-rotation crash + premature retirement, dual
+server, torn KEK, rewrap CAS race, NULL-out downgrade, rename re-bind) are attached to #1320
+and the per-store migration issues.

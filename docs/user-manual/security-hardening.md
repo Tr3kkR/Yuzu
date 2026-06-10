@@ -296,6 +296,18 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
   - Windows: BitLocker on the data volume
   - Docker: encrypted volumes
 
+### Current encryption posture (interim, disclosed)
+
+Five secret classes are currently stored **plaintext inside 0600-mode server-side
+database files** (not encrypted at the column level): MFA TOTP secrets and session
+tokens (`auth.db`), webhook signing secrets (`webhooks.db`), offload-target
+credentials (`offload_targets.db`), and the OIDC client secret
+(`runtime_config.db`). Protection today is file permissions + the host-level
+encryption above. ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`)
+is the adopted roadmap: app-side AES-256-GCM envelope encryption lands with each
+store's PostgreSQL migration, and session tokens convert to hashed (verify-only)
+storage. Until then, treat server data-directory backups as secret-bearing.
+
 ## Plugin Allowlist
 
 In production, verify plugin binaries against a SHA-256 allowlist to prevent loading of tampered or unauthorized code:
