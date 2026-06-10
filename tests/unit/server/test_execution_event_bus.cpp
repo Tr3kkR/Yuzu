@@ -153,6 +153,44 @@ TEST_CASE("execution_event_bus — terminal flag and gc",
     }
 }
 
+TEST_CASE("execution_event_bus — GC collects an expired terminal channel "
+          "without destroying a locked mutex (#1198)",
+          "[execution_event_bus][pr3][gc]") {
+    // Regression for #1198: gc_terminal_channels() erased the channel —
+    // destroying the std::mutex inside it — while a lock_guard still owned
+    // that mutex (the map held the only shared_ptr). The unlock of the
+    // freed mutex aborted the whole server on MSVC and is UB everywhere.
+    // Under ASan this test flags the use-after-free directly; without
+    // sanitizers it pins the collection path the older gc tests never
+    // reached (they only exercised the not-collected branches).
+    ExecutionEventBus bus;
+    std::int64_t fake_now = 1'000'000; // past the throttle vs last_gc=0
+    bus.set_clock_fn([&] { return fake_now; });
+
+    // Terminal event, no subscribers — exactly the channel shape GC targets.
+    bus.publish("exec-1", "execution-completed", "{}", /*is_terminal=*/true);
+    REQUIRE(bus.channel_count() == 1);
+
+    // Advance past retention + GC throttle so the sweep both runs and
+    // finds exec-1 expired.
+    fake_now += ExecutionEventBus::kRetentionAfterTerminalSec * 1000 +
+                ExecutionEventBus::kMinGcIntervalMs + 1;
+
+    SECTION("direct gc_terminal_channels() call") {
+        CHECK(bus.gc_terminal_channels() == 1);
+        CHECK(bus.channel_count() == 0);
+        CHECK(bus.gc_channels_total() == 1);
+    }
+    SECTION("publish-driven opportunistic sweep (production trigger)") {
+        // In production the sweep fires from publish() on an unrelated
+        // execution — the crash signature from the UAT rig.
+        bus.publish("exec-2", "agent-transition", "{}");
+        CHECK(bus.channel_count() == 1); // exec-1 collected, exec-2 live
+        CHECK(bus.gc_channels_total() == 1);
+        CHECK(bus.snapshot("exec-1").empty());
+    }
+}
+
 TEST_CASE("execution_event_bus — listener invocation is synchronous within publish",
           "[execution_event_bus][pr3]") {
     ExecutionEventBus bus;
