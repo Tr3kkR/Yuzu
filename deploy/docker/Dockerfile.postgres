@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu Postgres — the server's storage substrate (ADR-0006/0007/0008).
+#
+# PostgreSQL 16 + pgvector, plus an init script that creates the Yuzu app
+# role and database on first boot (docker-entrypoint-initdb.d). Per-store
+# SCHEMAs and all tables are created at runtime by the server's migration
+# runner (ADR-0008 "PgMigrationRunner") — deliberately NOT here, so the
+# database image never has to move in lockstep with server-side schema
+# changes.
+#
+# Published as ghcr.io/<owner>/yuzu-postgres:<version> by the
+# `docker-publish-postgres` job in .github/workflows/release.yml (cosign
+# keyless + SLSA provenance + SBOM, same as the other three images) and
+# release-pinned in the composes via ${YUZU_VERSION:-X.Y.Z}
+# (scripts/check-compose-versions.sh enforces the pin).
+#
+# Version pinning:
+#   - Base image is pinned tag + manifest-list digest (multi-arch:
+#     linux/amd64 + linux/arm64 — the demo/viz rigs are arm64).
+#   - pgvector is built from source at a pinned release tag. The PGDG apt
+#     package (postgresql-16-pgvector) was considered but rejected: PGDG
+#     only carries the latest package revision, so an apt version pin rots
+#     as soon as PGDG supersedes it. A git release tag is reproducible for
+#     as long as the upstream repo exists.
+#
+# Local build:
+#   docker build -t yuzu-postgres:local -f deploy/docker/Dockerfile.postgres .
+#
+# Runtime contract (consumed by the composes):
+#   POSTGRES_PASSWORD   required by the upstream entrypoint (superuser).
+#   YUZU_DB_USER        app role name        (default: yuzu)
+#   YUZU_DB_NAME        app database name    (default: yuzu)
+#   YUZU_DB_PASSWORD    app role password    (default: POSTGRES_PASSWORD)
+#   Data dir: /var/lib/postgresql/data (mount a named volume).
+#   Healthcheck lives in the composes: pg_isready -h 127.0.0.1 -U yuzu -d yuzu
+#   (-h 127.0.0.1 is load-bearing — during docker-entrypoint-initdb.d the
+#   temporary server listens on the unix socket only, so a TCP probe cannot
+#   false-positive mid-init).
+
+# Global ARG so both stages use the same pinned base.
+# postgres:16.14-bookworm, multi-arch manifest list (amd64 + arm64),
+# resolved 2026-06-10.
+ARG PG_BASE=postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb0942a77e012fe74f016c114c3e25b8
+
+# ── Stage 1: build pgvector against the exact server version ────────────
+FROM ${PG_BASE} AS pgvector-build
+
+# pgvector release tag — bump deliberately, never float.
+ARG PGVECTOR_VERSION=v0.8.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git ca-certificates postgresql-server-dev-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+# OPTFLAGS="" strips pgvector's default -march=native — this image must be
+# portable across CPUs (and across the amd64/arm64 publish matrix), not
+# tuned to the build host. Same convention as the upstream pgvector image.
+RUN git clone --branch "${PGVECTOR_VERSION}" --depth 1 \
+        https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && make -C /tmp/pgvector OPTFLAGS="" -j"$(nproc)" \
+    && make -C /tmp/pgvector install DESTDIR=/out
+
+# ── Stage 2: runtime — stock postgres + the extension + init SQL ────────
+FROM ${PG_BASE}
+
+# vector.so + extension control/SQL files + LLVM bitcode (JIT inlining),
+# captured wholesale via DESTDIR so a pgvector layout change can't silently
+# drop a file.
+COPY --from=pgvector-build /out/ /
+
+# First-boot init: creates the app role + database and installs the vector
+# extension into the app database. Runs only when the data volume is empty
+# (upstream entrypoint semantics) — existing deployments are never touched.
+COPY deploy/docker/postgres-init/ /docker-entrypoint-initdb.d/
