@@ -50,6 +50,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         ev_row.guard_category = ev.guard_category();
         ev_row.detected_value = ev.detected_value();
         ev_row.expected_value = ev.expected_value();
+        ev_row.detail_json = ev.detail_json(); // structured companion (route a'); "" for plain drift
+
         ev_row.remediation_action = ev.remediation_action();
         ev_row.remediation_success = ev.remediation_success();
         ev_row.detection_latency_us = static_cast<int64_t>(ev.detection_latency_us());

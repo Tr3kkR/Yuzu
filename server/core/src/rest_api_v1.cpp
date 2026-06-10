@@ -356,6 +356,7 @@ const std::string& openapi_spec() {
           "guard_category": {"type": "string", "enum": ["event", "condition"]},
           "detected_value": {"type": "string"},
           "expected_value": {"type": "string"},
+          "detail_json": {"type": "string", "description": "Structured machine-readable detail, JSON keyed by event_type (route a'); empty for plain drift. For process.crashed: process/pid/kind/exception_code/symbolic/faulting_module/platform."},
           "remediation_action": {"type": "string"},
           "remediation_success": {"type": "boolean"},
           "detection_latency_us": {"type": "integer"},
@@ -4728,6 +4729,7 @@ void RestApiV1::register_routes(
                     .add("guard_category", e.guard_category)
                     .add("detected_value", e.detected_value)
                     .add("expected_value", e.expected_value)
+                    .add("detail_json", e.detail_json)
                     .add("remediation_action", e.remediation_action)
                     .add("remediation_success", e.remediation_success)
                     .add("detection_latency_us", static_cast<int64_t>(e.detection_latency_us))

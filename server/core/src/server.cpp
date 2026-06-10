@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -265,13 +266,15 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
-        metrics_.describe("yuzu_fleet_agents_crash_observer_disarmed",
-                          "Windows agents (DEX enabled) whose process-crash recorder failed to "
-                          "arm — >0 means crash telemetry is silently off on that many endpoints",
+        metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
+                          "Windows agents (DEX enabled) whose DEX signal observer failed to arm "
+                          "or lost a channel subscription — >0 means reliability telemetry is "
+                          "silently off (or partial) on that many endpoints",
                           "gauge");
-        metrics_.describe("yuzu_fleet_crashes_observed_total",
-                          "Fleet-wide process crashes observed by DEX recorders (sum of "
-                          "agent-reported counts since each agent started)", "gauge");
+        metrics_.describe("yuzu_fleet_dex_observed_total",
+                          "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
+                          "boot reports, …; sum of agent-reported counts since each agent "
+                          "started)", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -7398,6 +7401,33 @@ private:
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             });
 
+        // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
+        // over the crash-observation projection). Read-only; NO mock data — real
+        // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
+        dex_routes_ = std::make_unique<DexRoutes>();
+        dex_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(),
+            // Cross-store fleet denominator for the DEX rates: count online agents,
+            // and of those the Windows ones (the only OS with a crash collector
+            // today — the coverage-honest crash-free denominator). Real data; an
+            // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            [this]() -> DexFleet {
+                DexFleet f;
+                const auto ids = registry_.all_ids();
+                f.total_online = static_cast<int64_t>(ids.size());
+                for (const auto& id : ids) {
+                    if (auto s = registry_.get_session(id)) {
+                        std::string os = s->os;
+                        for (auto& c : os)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        if (os.find("win") != std::string::npos)
+                            ++f.windows_online;
+                    }
+                }
+                return f;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -8191,6 +8221,7 @@ private:
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
+    std::unique_ptr<DexRoutes> dex_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

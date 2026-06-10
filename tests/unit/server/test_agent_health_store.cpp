@@ -49,8 +49,8 @@ public:
         std::unordered_map<std::string, int> os_counts, arch_counts, version_counts;
         double total_commands = 0.0;
         int healthy_count = 0;
-        int crash_observer_disarmed = 0;
-        double total_crashes_observed = 0.0;
+        int dex_observer_disarmed = 0;
+        double total_dex_observed = 0.0;
 
         for (const auto& [id, snap] : snapshots_) {
             ++healthy_count;
@@ -87,18 +87,18 @@ public:
             if (!cmd_val.empty())
                 add_finite_count(total_commands, cmd_val);
 
-            if (get("yuzu.crash_observer_armed") == "0")
-                ++crash_observer_disarmed;
+            if (get("yuzu.dex_observer_armed") == "0")
+                ++dex_observer_disarmed;
 
-            auto crashes_val = get("yuzu.crashes_observed");
-            if (!crashes_val.empty())
-                add_finite_count(total_crashes_observed, crashes_val);
+            auto dex_val = get("yuzu.dex_observed");
+            if (!dex_val.empty())
+                add_finite_count(total_dex_observed, dex_val);
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
-        metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed")
-            .set(static_cast<double>(crash_observer_disarmed));
-        metrics.gauge("yuzu_fleet_crashes_observed_total").set(total_crashes_observed);
+        metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
+            .set(static_cast<double>(dex_observer_disarmed));
+        metrics.gauge("yuzu_fleet_dex_observed_total").set(total_dex_observed);
 
         for (const auto& [os, count] : os_counts)
             metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));
@@ -210,25 +210,25 @@ TEST_CASE("AgentHealthStore: commands_executed sums across fleet", "[health_stor
     REQUIRE(metrics.gauge("yuzu_fleet_commands_executed_total").value() == 60.0);
 }
 
-TEST_CASE("AgentHealthStore: DEX crash recorder disarmed count + crashes summed",
+TEST_CASE("AgentHealthStore: DEX signal observer disarmed count + signals summed",
           "[health_store]") {
     TestAgentHealthStore store;
     yuzu::MetricsRegistry metrics;
 
-    // Armed Windows agent — must NOT count as disarmed; contributes its crash count.
-    store.upsert("win-armed", {{"yuzu.crash_observer_armed", "1"}, {"yuzu.crashes_observed", "3"}});
-    // Windows agent that FAILED to arm — the fault we want visible; 0 crashes.
-    store.upsert("win-deaf", {{"yuzu.crash_observer_armed", "0"}, {"yuzu.crashes_observed", "0"}});
+    // Armed Windows agent — must NOT count as disarmed; contributes its signal count.
+    store.upsert("win-armed", {{"yuzu.dex_observer_armed", "1"}, {"yuzu.dex_observed", "3"}});
+    // Windows agent that FAILED to arm — the fault we want visible; 0 signals.
+    store.upsert("win-deaf", {{"yuzu.dex_observer_armed", "0"}, {"yuzu.dex_observed", "0"}});
     // Non-Windows / --dex-disable agent never emits the tag — must NOT count as disarmed.
     store.upsert("lin-1", {{"yuzu.os", "linux"}});
     store.recompute_metrics(metrics, std::chrono::seconds(60));
 
     // Exactly one genuine arm FAILURE — absent tag and armed=1 are not counted.
-    CHECK(metrics.gauge("yuzu_fleet_agents_crash_observer_disarmed").value() == 1.0);
-    CHECK(metrics.gauge("yuzu_fleet_crashes_observed_total").value() == 3.0);
+    CHECK(metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed").value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_dex_observed_total").value() == 3.0);
 }
 
-TEST_CASE("AgentHealthStore: non-finite/garbage crash count does not poison the fleet gauge",
+TEST_CASE("AgentHealthStore: non-finite/garbage signal count does not poison the fleet gauge",
           "[health_store]") {
     // std::stod("inf"/"nan") returns a non-finite value WITHOUT throwing, so a single
     // rogue/buggy agent could push the fleet-wide gauge to +/-Inf or NaN for every
@@ -236,19 +236,19 @@ TEST_CASE("AgentHealthStore: non-finite/garbage crash count does not poison the 
     TestAgentHealthStore store;
     yuzu::MetricsRegistry metrics;
 
-    store.upsert("good", {{"yuzu.crashes_observed", "5"}, {"yuzu.commands_executed", "10"}});
-    store.upsert("inf", {{"yuzu.crashes_observed", "inf"}, {"yuzu.commands_executed", "inf"}});
-    store.upsert("nan", {{"yuzu.crashes_observed", "nan"}});
-    store.upsert("neg", {{"yuzu.crashes_observed", "-4"}}); // negative count is nonsense
-    store.upsert("junk", {{"yuzu.crashes_observed", "garbage"}});
+    store.upsert("good", {{"yuzu.dex_observed", "5"}, {"yuzu.commands_executed", "10"}});
+    store.upsert("inf", {{"yuzu.dex_observed", "inf"}, {"yuzu.commands_executed", "inf"}});
+    store.upsert("nan", {{"yuzu.dex_observed", "nan"}});
+    store.upsert("neg", {{"yuzu.dex_observed", "-4"}}); // negative count is nonsense
+    store.upsert("junk", {{"yuzu.dex_observed", "garbage"}});
     store.recompute_metrics(metrics, std::chrono::seconds(60));
 
     // Only the well-formed counts survive; the gauges stay finite.
-    const double crashes = metrics.gauge("yuzu_fleet_crashes_observed_total").value();
+    const double signals = metrics.gauge("yuzu_fleet_dex_observed_total").value();
     const double cmds = metrics.gauge("yuzu_fleet_commands_executed_total").value();
-    CHECK(crashes == 5.0);
+    CHECK(signals == 5.0);
     CHECK(cmds == 10.0);
-    CHECK(std::isfinite(crashes));
+    CHECK(std::isfinite(signals));
     CHECK(std::isfinite(cmds));
 }
 
