@@ -379,9 +379,12 @@ executable(
   install: true,
 )
 
-# Postgres F0 static-link canary (#1317, ADR-0008): proves libpq links on the
-# MSVC static triplet before any substrate code is committed (the #375 lesson).
-# Throwaway — folded into the pg/ substrate when F1 (#1320) lands.
+# Postgres F0 link canary (#1317, ADR-0008): proves libpq builds at the pinned
+# vcpkg baseline and links on MSVC with no LNK-class errors, before any
+# substrate code is committed (the #375 lesson). Linkage is static on
+# Linux/macOS, dynamic DLL on Windows (see the libpq_dep comment in the root
+# meson.build and the ADR-0008 Correction). Throwaway — folded into the pg/
+# substrate when F1 (#1320) lands.
 executable(
   'yuzu_pg_canary',
   files('src/pg/canary_main.cpp'),

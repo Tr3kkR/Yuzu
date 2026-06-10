@@ -72,12 +72,15 @@ jobs:
       - name: Verify build dependencies
         run: |
           MISSING=""
-          for cmd in gcc-13 g++-13 cmake ninja meson ccache pkg-config rpmbuild; do
+          # bison/flex: vcpkg's libpq port builds postgresql from source and
+          # cannot auto-acquire them on Linux (gov #1331 — do not rely on the
+          # machine-wide side effect of ci.yml's apt step).
+          for cmd in gcc-13 g++-13 cmake ninja meson ccache pkg-config rpmbuild bison flex; do
             command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
           done
           if [ -n "$MISSING" ]; then
             echo "::error::Missing tools on self-hosted runner:$MISSING"
-            echo "Install with: sudo apt-get install -y ccache rpm"
+            echo "Install with: sudo apt-get install -y ccache rpm bison flex"
             exit 1
           fi
 

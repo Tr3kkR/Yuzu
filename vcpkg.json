@@ -21,7 +21,11 @@
     "cli11",
     "cpp-httplib",
     "sqlite3",
-    "libpq",
+    {
+      "name": "libpq",
+      "default-features": false,
+      "features": ["openssl"]
+    },
     "openssl",
     {
       "name": "catch2",

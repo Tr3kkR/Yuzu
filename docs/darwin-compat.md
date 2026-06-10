@@ -39,6 +39,7 @@ Before invoking `/test` (the pre-commit/pre-push gate skill) on a fresh macOS de
 
 | Tool | Install | Why |
 |---|---|---|
+| autoconf/automake/libtool | `brew install autoconf automake libtool` | vcpkg's libpq port (Postgres substrate, ADR-0006) runs autoreconf during `vcpkg install`; a fresh mac fails the configure phase without them |
 | GNU bash 5+ | `brew install bash` | `mapfile` and `declare -A` are bash-4-only; stock `/bin/bash` 3.2 trips the version guards in `preflight.sh`, `perf-gate.sh`, `teardown.sh`, `test-fixtures-verify.sh` |
 | Erlang/OTP 28 | via kerl (see `scripts/ensure-erlang.sh` or `scripts/darwin-activate-erlang.sh` if you've created a local shim) | Gateway build + EUnit + dialyzer |
 | OrbStack or Docker Desktop | GUI / `brew install --cask orbstack` | Phase 1 image build + Phase 2 upgrade-test. Without a running Docker daemon both phases SKIP gracefully (the rest of `/test` continues), but you cannot exercise the upgrade-test surface |

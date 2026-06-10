@@ -792,7 +792,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 

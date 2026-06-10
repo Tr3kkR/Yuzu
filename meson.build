@@ -274,20 +274,36 @@ sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLi
   required: true, include_type: 'system')
 
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
-# ADR-0008). vcpkg builds it static on every triplet we use, and static libpq
-# needs the companion libpgcommon/libpgport archives (scram/auth helpers live
-# there) that neither cmake's FindPostgreSQL nor any imported target carries —
-# only libpq.pc's Libs.private lists them, and pkg-config isn't wired to the
-# vcpkg prefix in this build. So: resolve libpq via cmake (unix) or hand-wired
-# find_library (windows, same reasoning as the #375 protobuf/grpc block above),
-# then add pgcommon/pgport from the vcpkg lib dir explicitly.
-if host_os == 'windows'
+# ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
+# (-Dbuild_server=false) and cross builds must not require libpq at configure.
+#
+# Linkage per platform: static .a on Linux/macOS (vcpkg static triplets);
+# **dynamic DLL on Windows** — triplets/x64-windows.cmake's base linkage is
+# dynamic and its static override is scoped to the grpc stack only, so vcpkg
+# produces libpq.dll + import lib, same as sqlite3/openssl. The release zip's
+# vcpkg-DLL sweep (release.yml `Get-ChildItem $vcpkgBin *.dll`) bundles it.
+# Static libpq (unix) needs the companion libpgcommon/libpgport archives
+# (scram/auth helpers) that neither cmake's FindPostgreSQL nor any imported
+# target carries — only libpq.pc's Libs.private lists them, and pkg-config
+# isn't wired to the vcpkg prefix in this build. So: resolve libpq via cmake
+# (unix) or hand-wired find_library (windows, same reasoning as the #375
+# protobuf/grpc block above), then add pgcommon/pgport explicitly. Pure-C
+# libpq carries no MSVC detect_mismatch records, so the buildtype-conditional
+# _vcpkg_lib_win selection is load-bearing — a wrong-CRT pick links silently
+# rather than failing with LNK2038. Baseline-bump watch: a vcpkg libpq port
+# moving to PostgreSQL 17/18's meson build may rename or drop the
+# pgcommon/pgport archives — revisit this block on any baseline change.
+if not build_server
+  libpq_dep = disabler()
+elif host_os == 'windows'
   _libpq_libs = []
   foreach _pq_name : ['libpq', 'libpgcommon', 'libpgport']
     _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win], required: true)
   endforeach
-  # Static libpq's Windows auth paths (SSPI) and socket layer need these
-  # system libs; libssl/libcrypto are reused from the grpc block above.
+  # With dynamic libpq (the current triplet posture) the DLL self-contains
+  # these; they are listed so a future flip of libpq to the static override
+  # (SSPI auth paths + socket layer + OpenSSL) links without edits here.
+  # Harmless overlinking today. libssl/libcrypto reused from the grpc block.
   foreach _pq_sys : ['ws2_32', 'secur32', 'advapi32', 'shell32', 'crypt32']
     _libpq_libs += _cxx.find_library(_pq_sys, required: true)
   endforeach

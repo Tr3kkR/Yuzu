@@ -1,16 +1,21 @@
-// Postgres F0 static-link canary (#1317, ADR-0008).
+// Postgres F0 link canary (#1317, ADR-0008).
 //
 // Connects to the DSN given as argv[1] (or YUZU_POSTGRES_DSN), runs SELECT 1,
 // and prints the result plus libpq/server versions. Its only job is to prove
-// that libpq links — in particular statically on the Windows MSVC triplet —
-// before the pg/ substrate (F1, #1320) is built on top of it.
+// that libpq builds at the pinned vcpkg baseline and links on every platform
+// — static .a on Linux/macOS, DLL + import lib on Windows (see the ADR-0008
+// Correction) — before the pg/ substrate (F1, #1320) is built on top of it.
 //
 // Exit codes: 0 = SELECT 1 succeeded, 1 = connect/query failure, 2 = no DSN.
-
-#include <libpq-fe.h>
+// The exit codes are the only stable contract; stdout format is not. Note for
+// CI wiring (#1318): PQconnectdb/PQexec have no client-side timeout — include
+// connect_timeout=<s> in the DSN or wrap in timeout(1) before using as a
+// smoke step, or a black-holed host wedges the job.
 
 #include <cstdio>
 #include <cstdlib>
+
+#include <libpq-fe.h>
 
 int main(int argc, char** argv) {
     const char* dsn = argc > 1 ? argv[1] : std::getenv("YUZU_POSTGRES_DSN");

@@ -52,6 +52,7 @@ section is maintained manually; see `vcpkg.json` and
   CLI11 ................................. BSD-3-Clause
   cpp-httplib ........................... MIT
   SQLite ................................ Public Domain
+  libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)
   OpenSSL ............................... Apache-2.0 / OpenSSL
   Catch2 (test only) .................... BSL-1.0
   grpcbox / gpb ......................... Apache-2.0
