@@ -31,8 +31,9 @@
 #     yuzu-macos-arm64.cdx.json       + .spdx.json
 #
 #   Image SBOMs:
-#     yuzu-server-image.cdx.json  + .spdx.json
-#     yuzu-gateway-image.cdx.json + .spdx.json
+#     yuzu-server-image.cdx.json   + .spdx.json
+#     yuzu-gateway-image.cdx.json  + .spdx.json
+#     yuzu-postgres-image.cdx.json + .spdx.json   (#1318)
 #
 # Emits GitHub Actions `::error file=...` annotations so failures show
 # up inline on the release run summary.
@@ -96,6 +97,9 @@ SBOM_BASES=(
   "yuzu-macos-arm64"
   "yuzu-server-image"
   "yuzu-gateway-image"
+  # yuzu-postgres joined the release images in #1318; docker-publish-postgres
+  # is in the release job's needs, so its SBOM artifact must be present.
+  "yuzu-postgres-image"
 )
 
 for base in "${SBOM_BASES[@]}"; do
