@@ -554,8 +554,14 @@ jobs:
       # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
       # 127.0.0.1:5432 and exports the DSN; warns (non-fatal until #1320)
       # when nothing is listening.
+      #
+      # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
+      # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
+      # `bash` resolves to the WSL stub, which refuses to run as the
+      # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
+      # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
       - name: Ensure Postgres 16 (server tests)
-        run: bash scripts/ci/ensure-postgres.sh
+        run: source scripts/ci/ensure-postgres.sh
 
       - name: Test
         run: |
