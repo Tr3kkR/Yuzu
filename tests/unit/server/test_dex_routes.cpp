@@ -67,22 +67,53 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: empty store still lists ALL 20 monitored signal types",
+TEST_CASE("DEX overview: empty store still lists ALL 70 monitored signal types, grouped",
           "[dex][routes]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
-    // is MONITORING, not just what fired — every catalogued type renders, quiet
-    // ones as muted real-zero rows. Zeros are facts, not mock data.
+    // is MONITORING, not just what fired — every catalogued type renders inside
+    // its group, quiet ones as muted real-zero rows. Zeros are facts, not mock
+    // data. This label list mirrors kAllObsTypes in test_dex_signals.cpp — the
+    // two-sided drift net for catalogue additions.
     GuaranteedStateStore store(":memory:");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{});
+
+    // The 11 group headings.
+    for (const char* group :
+         {"App reliability", "Boot, start-up &amp; shutdown", "Service health",
+          "System stability", "Hardware &amp; storage", "File system", "Network",
+          "Identity &amp; logon", "Security &amp; protection", "Updates &amp; installs",
+          "Printing"})
+        CHECK(html.find(group) != std::string::npos);
+
+    // All 70 labels.
     for (const char* label :
-         {"App crash", "App hang", "Service crash", "Service start failure",
+         {// wave 1
+          "App crash", "App hang", "Service crash", "Service start failure",
           "Blue screen (bugcheck)", "Unexpected reboot", "Display driver reset",
           "Hardware error", "Disk error", "Filesystem corruption", "Memory exhaustion",
-          "Boot", "Update failure", "App install failure", "Profile failure",
+          ">Boot<", "Update failure", "App install failure", "Profile failure",
           "Group Policy failure", "Wi-Fi disconnect", "DNS timeout", "IP address conflict",
-          "Print failure"})
+          "Print failure",
+          // wave 2
+          "Slow boot: application", "Slow boot: driver", "Slow boot: service",
+          "Slow boot: device", ">Shutdown<", "Slow shutdown: application", "Standby/resume",
+          "Slow resume", "Slow logon (subscriber)", "Uptime report", "Dirty shutdown",
+          "Clock unsynchronized", "Windows activation failure", "Shadow copy error",
+          "Registry hive recovered", "Disk check at boot", "App crash (.NET)",
+          "App dependency error", "App activation failure", "COM server failure",
+          "Error dialog shown", "App blocked shutdown", "Service hung",
+          "Service start timeout", "Service logon failure", "Service recovery failure",
+          "Disk SMART warning", "Storage port reset", "Lost delayed write",
+          "Database corruption", "Device start failure", "CPU throttled",
+          "Wi-Fi connect failure", "DHCP failure", "VPN failure", "File share failure",
+          "Name conflict", "No domain controller", "Kerberos error",
+          "Profile unload blocked", "Folder redirection failure", "Real-time protection off",
+          "Malware detected", "AV update failure", "Tamper attempt blocked",
+          "App uninstall failure", "Store app install failure", "Download failure (BITS)",
+          "Printer driver failure", "Print spooler plug-in failure"})
         CHECK(html.find(label) != std::string::npos);
-    CHECK(html.find("monitored signal types") != std::string::npos);
+
+    CHECK(html.find("All 70 monitored signal types") != std::string::npos);
     // No fabricated numbers: quiet rows carry a literal zero count.
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
@@ -119,14 +150,16 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]
     CHECK(html.find("gp-table") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: unknown obs_type falls back to the raw (escaped) label",
+TEST_CASE("DEX overview: unknown obs_type falls back to the raw label under 'Other'",
           "[dex][routes]") {
-    // Forward-compat: a signal added agent-side renders with NO server change.
+    // Forward-compat: a signal added agent-side renders with NO server change,
+    // grouped under "Other".
     GuaranteedStateStore store(":memory:");
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", "2026-06-09T10:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
     CHECK(html.find("future.signal_type") != std::string::npos);
+    CHECK(html.find(">Other") != std::string::npos);
 }
 
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",

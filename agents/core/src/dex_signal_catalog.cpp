@@ -348,6 +348,523 @@ SignalObservation x_print_failed(const EventFields& f, int) {
     return o;
 }
 
+// ── Wave-2 helpers ───────────────────────────────────────────────────────────
+
+// First field value that parses as a positive number (classic events like
+// EventLog 6013 carry the payload at a positional offset that varies by build —
+// the numeric field IS the discriminator).
+double first_numeric(const EventFields& f) {
+    for (const auto& [k, v] : f) {
+        const double d = parse_metric_ms(v);
+        if (d > 0.0)
+            return d;
+    }
+    return 0.0;
+}
+
+// Strip a Windows path down to its basename. PRIVACY guard: full paths can leak
+// usernames (C:\Users\<name>\…) or document locations; the basename keeps the
+// diagnostic value (which binary/hive/dll) without the location.
+std::string strip_path(const std::string& s) {
+    const auto pos = s.find_last_of("\\/");
+    return pos == std::string::npos ? s : s.substr(pos + 1);
+}
+
+// Render a numeric error field as hex when it looks like an HRESULT/NTSTATUS
+// (BITS reports `hr` in DECIMAL — "2147954407" is unreadable; 0x80072EE7 is not).
+std::string hex_reason(const std::string& s) {
+    if (s.empty()) return s;
+    try {
+        const unsigned long long v = std::stoull(s);
+        if (v > 0xFFFF && v <= 0xFFFFFFFFull)
+            return std::format("0x{:08X}", static_cast<std::uint32_t>(v));
+    } catch (...) {
+    }
+    return s;
+}
+
+// Value of a "Key: value" line inside a multi-line blob (.NET Runtime 1026 packs
+// everything into ONE positional Data element).
+std::string line_value(const std::string& blob, std::string_view key) {
+    const auto kpos = blob.find(key);
+    if (kpos == std::string::npos) return {};
+    const auto start = kpos + key.size();
+    auto end = blob.find('\n', start);
+    if (end == std::string::npos) end = blob.size();
+    std::string v = blob.substr(start, end - start);
+    while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+    while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+    return v;
+}
+
+// ── Wave-2 extractors ────────────────────────────────────────────────────────
+// Real layouts: Diagnostics-Performance 101/103/200/203, EventLog 6008/6013,
+// Time-Service 36, .NET 1026, DCOM 10010, Application Popup 26, SCM 7009,
+// Kernel-PnP 411, WLAN 8002, Defender 2001, AppX 404, BITS 61 are all pinned
+// against records captured from a live Win11 26100 box (2026-06-10); the rest
+// are manifest-best-effort with graceful degradation.
+
+// Shared by every Diagnostics-Performance degradation event (101/102/103/109 =
+// boot, 203 = shutdown, 301/302 = standby/resume). Real layout: named Name /
+// FriendlyName / TotalTime / DegradationTime / Path (Path DROPPED — privacy).
+SignalObservation x_dp_degraded(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = named(f, "Name");
+    if (o.subject.empty())
+        o.subject = named(f, "FriendlyName");
+    o.metric = parse_metric_ms(named(f, "DegradationTime"));
+    if (o.metric <= 0.0)
+        o.metric = parse_metric_ms(named(f, "TotalTime"));
+    const char* phase = (id == 203) ? "shutdown" : (id == 301 || id == 302) ? "resume" : "boot";
+    o.symbolic = "DEGRADATION";
+    o.sentence = "'" + (o.subject.empty() ? "<unknown>" : o.subject) + "' slowed " + phase +
+                 (o.metric > 0 ? std::format(" by {:.0f} ms", o.metric) : "");
+    return o;
+}
+
+SignalObservation x_shutdown_report(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "shutdown";
+    o.metric = parse_metric_ms(named(f, "ShutdownTime")); // real: 17733 (ms)
+    o.sentence = o.metric > 0 ? std::format("shutdown completed in {:.0f} ms", o.metric)
+                              : "shutdown completed (duration not reported)";
+    return o;
+}
+
+SignalObservation x_standby_report(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "standby";
+    o.metric = parse_metric_ms(named(f, "StandbyTime")); // best-effort; 0 = occurrence only
+    o.sentence = "standby/resume cycle reported";
+    return o;
+}
+
+SignalObservation x_winlogon_slow(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "SubscriberName", 0); // e.g. "GPClient" — the classic
+    o.symbolic = "SLOW_LOGON_SUBSCRIBER";
+    o.sentence = "winlogon notification subscriber '" +
+                 (o.subject.empty() ? "<unknown>" : o.subject) + "' is taking a long time";
+    return o;
+}
+
+SignalObservation x_uptime_report(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "uptime";
+    o.metric = first_numeric(f); // real 6013: positional, leading fields empty
+    o.sentence = o.metric > 0 ? std::format("system uptime {:.0f} s", o.metric)
+                              : "daily uptime report";
+    return o;
+}
+
+SignalObservation x_dirty_shutdown(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "system";
+    o.symbolic = "DIRTY_SHUTDOWN";
+    // Real 6008: pos0 = time, pos1 = date (with embedded LTR marks — clip only).
+    const std::string t = clip(pos(f, 0), 16), d = clip(pos(f, 1), 16);
+    o.sentence = "previous shutdown" + (d.empty() ? std::string{} : " at " + d + " " + t) +
+                 " was unexpected";
+    return o;
+}
+
+SignalObservation x_time_unsynced(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = "time sync";
+    o.metric = parse_metric_ms(named(f, "UnsynchronizedTimeSeconds")); // real: 51254
+    o.symbolic = "TIME_UNSYNCED";
+    o.reason = std::to_string(id);
+    o.sentence = o.metric > 0
+                     ? std::format("clock unsynchronized for {:.0f} s", o.metric)
+                     : "time service cannot reach a time source";
+    return o;
+}
+
+SignalObservation x_activation_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "windows activation";
+    o.reason = hex_reason(named_or_pos(f, "ErrorCode", 0));
+    o.symbolic = "ACTIVATION_FAILED";
+    o.sentence = "license activation failed" + (o.reason.empty() ? "" : " (" + o.reason + ")");
+    return o;
+}
+
+SignalObservation x_vss_error(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "volume shadow copy";
+    o.reason = clip(pos(f, 0), 80);
+    o.symbolic = "VSS_ERROR";
+    o.sentence = "volume shadow copy service error";
+    return o;
+}
+
+SignalObservation x_hive_recovered(const EventFields&, int) {
+    SignalObservation o;
+    // PRIVACY: the hive path can be C:\Users\<name>\ntuser.dat — not extracted.
+    o.subject = "registry hive";
+    o.symbolic = "HIVE_RECOVERED";
+    o.sentence = "a corrupted registry hive was recovered from its log";
+    return o;
+}
+
+SignalObservation x_autochk_ran(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "autochk";
+    o.symbolic = "FS_CHECK_AT_BOOT";
+    o.sentence = "file system check ran at boot (volume was marked dirty)";
+    return o;
+}
+
+SignalObservation x_dotnet_crash(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 1026: ONE positional blob — extract ONLY the app + exception type
+    // (the stack frames can carry paths; they are never shipped).
+    const std::string blob = pos(f, 0);
+    o.subject = strip_path(line_value(blob, "Application: "));
+    std::string exc = line_value(blob, "Exception Info: ");
+    if (auto colon = exc.find(':'); colon != std::string::npos)
+        exc = exc.substr(0, colon);
+    o.reason = clip(std::move(exc), 120); // e.g. "System.ArgumentNullException"
+    o.kind = "exception";
+    o.symbolic = "CLR_UNHANDLED_EXCEPTION";
+    o.sentence = (o.subject.empty() ? "<unknown>" : o.subject) + " .NET unhandled exception" +
+                 (o.reason.empty() ? "" : " " + o.reason);
+    return o;
+}
+
+SignalObservation x_sxs_error(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = strip_path(clip(pos(f, 0), 120)); // assembly/app — basename if a path
+    o.symbolic = "SXS_ACTIVATION_FAILED";
+    o.sentence = "side-by-side activation context generation failed" +
+                 (o.subject.empty() ? std::string{} : " for " + o.subject);
+    return o;
+}
+
+SignalObservation x_app_activation_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "AppId", 0), 120);
+    o.reason = hex_reason(named(f, "ErrorCode"));
+    o.symbolic = "APP_ACTIVATION_FAILED";
+    o.sentence = "app activation failed" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_dcom_failed(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "param1", 0), 80); // CLSID / server (real 10010)
+    o.reason = std::to_string(id);
+    o.symbolic = "COM_SERVER_FAILED";
+    o.sentence = id == 10010 ? "a COM server did not register within the required timeout"
+                             : "DCOM could not start a server";
+    return o;
+}
+
+SignalObservation x_error_popup(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 26: named Caption + Message — a hard error dialog the USER SAW.
+    o.subject = clip(named(f, "Caption"), 80);
+    o.symbolic = "ERROR_DIALOG";
+    o.sentence = clip(named(f, "Message"), 160);
+    if (o.sentence.empty())
+        o.sentence = "an error dialog was shown";
+    return o;
+}
+
+SignalObservation x_shutdown_blocked(const EventFields& f, int) {
+    SignalObservation o;
+    // PRIVACY: RestartManager carries FullPath — only the display name is taken.
+    o.subject = clip(named_or_pos(f, "DisplayName", 0), 80);
+    o.symbolic = "SHUTDOWN_BLOCKED";
+    o.sentence = "an application could not be shut down" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_service_hung(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "param1", 0);
+    o.symbolic = "SERVICE_HUNG";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' hung on starting";
+    return o;
+}
+
+SignalObservation x_service_start_timeout(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 7009: param1 = timeout ms, param2 = service (REVERSED vs 7000).
+    o.subject = named_or_pos(f, "param2", 1);
+    const std::string ms = named_or_pos(f, "param1", 0);
+    o.reason = ms.empty() ? "timeout" : "timeout " + ms + " ms";
+    o.symbolic = "START_TIMEOUT";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' did not connect to the service controller in time";
+    return o;
+}
+
+SignalObservation x_service_logon_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // PRIVACY: param2 is the logon ACCOUNT (can be a person) — not extracted.
+    o.subject = named_or_pos(f, "param1", 0);
+    o.symbolic = "SERVICE_LOGON_FAILED";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' failed to log on (account/password problem)";
+    return o;
+}
+
+SignalObservation x_service_recovery_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "param2", 1);
+    o.component = clip(named_or_pos(f, "param1", 0), 60); // the corrective action
+    o.symbolic = "RECOVERY_FAILED";
+    o.kind = "service";
+    o.sentence = "recovery action failed for service '" +
+                 (o.subject.empty() ? "<unknown>" : o.subject) + "'";
+    return o;
+}
+
+SignalObservation x_disk_smart(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "param1", 0);
+    o.symbolic = "SMART_PREDICTIVE_FAILURE";
+    o.sentence = "disk " + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 " is predicting its own failure (SMART) — back up and replace";
+    return o;
+}
+
+SignalObservation x_port_reset(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "param1", 0); // \Device\RaidPort0
+    o.symbolic = "PORT_RESET";
+    o.sentence = "a reset was issued to storage port " +
+                 (o.subject.empty() ? "<unknown>" : o.subject) +
+                 " (I/O stalled — reset storms indicate a dying disk/cable)";
+    return o;
+}
+
+SignalObservation x_write_lost(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(strip_path(pos(f, 0)), 80);
+    o.symbolic = "DELAYED_WRITE_LOST";
+    o.sentence = "Windows lost delayed-write data (possible data loss)";
+    return o;
+}
+
+SignalObservation x_esent_corrupt(const EventFields& f, int id) {
+    SignalObservation o;
+    // PRIVACY: ESENT params include the database PATH (often under a user
+    // profile) — only the owning process name is taken.
+    o.subject = clip(strip_path(pos(f, 0)), 80);
+    o.reason = std::to_string(id);
+    o.symbolic = "DATABASE_CORRUPT";
+    o.sentence = "an ESE database is corrupted" +
+                 (o.subject.empty() ? std::string{} : " (owner: " + o.subject + ")");
+    return o;
+}
+
+SignalObservation x_device_start_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 411: named DeviceInstanceId / DriverName / Status.
+    o.subject = clip(named(f, "DeviceInstanceId"), 100);
+    o.component = named(f, "DriverName");
+    o.reason = named(f, "Status");
+    o.symbolic = "DEVICE_START_FAILED";
+    o.sentence = "a device failed to start" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_cpu_throttled(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "cpu";
+    o.symbolic = "FIRMWARE_THROTTLED";
+    o.sentence = "processor speed is being limited by system firmware (thermal/power cap)";
+    return o;
+}
+
+SignalObservation x_wifi_connect_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 8002: named SSID / FailureReason / ReasonCode / InterfaceDescription.
+    o.subject = named(f, "SSID");
+    o.reason = clip(named(f, "FailureReason"), 120);
+    o.component = named(f, "InterfaceDescription");
+    o.symbolic = "WIFI_CONNECT_FAILED";
+    o.sentence = "Wi-Fi connection failed" +
+                 (o.subject.empty() ? std::string{} : " to '" + o.subject + "'") +
+                 (o.reason.empty() ? "" : ": " + o.reason);
+    return o;
+}
+
+SignalObservation x_dhcp_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "dhcp";
+    o.reason = hex_reason(clip(named_or_pos(f, "ErrorCode", 0), 40));
+    o.symbolic = "DHCP_FAILED";
+    o.sentence = "DHCP address acquisition/renewal failed";
+    return o;
+}
+
+SignalObservation x_vpn_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // PRIVACY: insert %1 is the dialing USER — deliberately never read; %2 is the
+    // connection name, %3 the error code. A drifted layout degrades to empty
+    // fields rather than risking the username.
+    o.subject = clip(pos(f, 1), 80);
+    o.reason = clip(pos(f, 2), 40);
+    o.symbolic = "VPN_FAILED";
+    o.sentence = "VPN connection failed" +
+                 (o.subject.empty() ? std::string{} : " ('" + o.subject + "')") +
+                 (o.reason.empty() ? "" : " error " + o.reason);
+    return o;
+}
+
+SignalObservation x_smb_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named(f, "ServerName"), 80); // corp file server — kept
+    o.reason = hex_reason(named(f, "Status"));
+    o.symbolic = "SMB_CONNECT_FAILED";
+    o.sentence = "network share connection failed" +
+                 (o.subject.empty() ? std::string{} : " to " + o.subject);
+    return o;
+}
+
+SignalObservation x_name_conflict(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "netbios name";
+    o.symbolic = "NAME_CONFLICT";
+    o.sentence = "a duplicate computer name was detected on the network";
+    return o;
+}
+
+SignalObservation x_no_dc(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(pos(f, 0), 60); // the domain — corp infrastructure
+    o.reason = clip(pos(f, 1), 120);
+    o.symbolic = "NO_DOMAIN_CONTROLLER";
+    o.sentence = "no domain controller reachable" +
+                 (o.subject.empty() ? std::string{} : " for domain " + o.subject);
+    return o;
+}
+
+SignalObservation x_kerberos_error(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "Server", 0), 80);
+    o.symbolic = "KERBEROS_ERROR";
+    o.sentence = "Kerberos authentication error (KRB_AP_ERR_MODIFIED — check SPN/clock)";
+    return o;
+}
+
+SignalObservation x_rtp_disabled(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "real-time protection";
+    o.symbolic = "RTP_DISABLED";
+    o.sentence = "antivirus real-time protection was disabled";
+    return o;
+}
+
+SignalObservation x_threat_detected(const EventFields& f, int) {
+    SignalObservation o;
+    // PRIVACY: the detection carries the file PATH and USER — only the threat
+    // family name (malware taxonomy, not user content) is taken.
+    o.subject = clip(named(f, "Threat Name"), 80);
+    o.symbolic = "THREAT_DETECTED";
+    o.sentence = "malware detected" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_av_update_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "security intelligence update";
+    o.reason = named(f, "Error Code"); // real: Defender names carry SPACES
+    o.symbolic = "AV_UPDATE_FAILED";
+    o.sentence = "antivirus definition update failed" +
+                 (o.reason.empty() ? "" : " (" + o.reason + ")");
+    return o;
+}
+
+SignalObservation x_tamper_blocked(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "tamper protection";
+    o.reason = clip(named_or_pos(f, "Value", 0), 80);
+    o.symbolic = "TAMPER_BLOCKED";
+    o.sentence = "tamper protection blocked a change to security settings";
+    return o;
+}
+
+SignalObservation x_appx_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 404: named PackageFullName / ErrorCode / SummaryError.
+    o.subject = clip(named(f, "PackageFullName"), 100);
+    o.reason = named(f, "ErrorCode");
+    o.symbolic = "APPX_DEPLOY_FAILED";
+    o.sentence = "store app deployment failed" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_bits_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 61: named name / url / hr. PRIVACY: the URL is dropped (can encode
+    // user-specific endpoints); the job name + hex error carry the diagnosis.
+    o.subject = clip(named(f, "name"), 80);
+    o.reason = hex_reason(named(f, "hr"));
+    o.symbolic = "TRANSFER_FAILED";
+    o.sentence = "background transfer failed" +
+                 (o.subject.empty() ? std::string{} : " ('" + o.subject + "')") +
+                 (o.reason.empty() ? "" : " " + o.reason);
+    return o;
+}
+
+SignalObservation x_profile_locked(const EventFields&, int) {
+    SignalObservation o;
+    // PRIVACY: the event names the profile (≈ the person) — not extracted.
+    o.subject = "user profile";
+    o.symbolic = "PROFILE_LOCKED";
+    o.sentence = "a user profile registry hive did not unload (held by another process)";
+    return o;
+}
+
+SignalObservation x_folder_redirect_failed(const EventFields&, int) {
+    SignalObservation o;
+    // PRIVACY: params carry redirected folder paths (user content) — dropped.
+    o.subject = "folder redirection";
+    o.symbolic = "REDIRECT_FAILED";
+    o.sentence = "folder redirection failed";
+    return o;
+}
+
+SignalObservation x_print_driver_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "Param1", 0), 80);
+    o.symbolic = "DRIVER_INSTALL_FAILED";
+    o.sentence = "printer driver installation failed" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_print_plugin_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(strip_path(named_or_pos(f, "Param1", 0)), 80);
+    o.symbolic = "SPOOLER_PLUGIN_FAILED";
+    o.sentence = "the print spooler failed to load a plug-in module";
+    return o;
+}
+
+// MSI events share the "Product: X -- <verb> failed." string shape; the verb in
+// the sentence comes from the event id (11708 install, 11725 uninstall).
+SignalObservation x_msi_uninstall_failed(const EventFields& f, int id) {
+    SignalObservation o = x_msi_failed(f, id);
+    o.symbolic = "UNINSTALL_FAILED";
+    o.sentence = "application uninstall failed: " +
+                 (o.subject.empty() ? "<unknown>" : o.subject);
+    return o;
+}
+
 // ── The catalogue ─────────────────────────────────────────────────────────────
 // 20 obs_types. Two are backed by dual provider spellings (BugCheck / Ntfs ship
 // under both classic and manifest names depending on build), so the spec count
@@ -400,6 +917,112 @@ const std::vector<SignalSpec>& catalog_impl() {
         // Print experience
         {"print.failed", "Microsoft-Windows-PrintService/Admin", "Microsoft-Windows-PrintService",
          {372}, 0, 60, &x_print_failed},
+
+        // ── Wave 2 (2026-06-10): +50 signals ─────────────────────────────────
+        // Boot, start-up & shutdown
+        {"boot.degraded_app", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {101}, 0, 30, &x_dp_degraded},
+        {"boot.degraded_driver", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {102}, 0, 30, &x_dp_degraded},
+        {"boot.degraded_service", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {103}, 0, 30, &x_dp_degraded},
+        {"boot.degraded_device", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {109}, 0, 30, &x_dp_degraded},
+        {"os.shutdown", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {200}, 0, 30, &x_shutdown_report},
+        {"shutdown.degraded", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {203}, 0, 30, &x_dp_degraded},
+        {"os.standby", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {300}, 0, 30, &x_standby_report},
+        {"os.standby_degraded", "Microsoft-Windows-Diagnostics-Performance/Operational",
+         "Microsoft-Windows-Diagnostics-Performance", {301, 302}, 0, 30, &x_dp_degraded},
+        {"logon.slow_subscriber", "Application", "Microsoft-Windows-Winlogon", {6005, 6006}, 0, 12,
+         &x_winlogon_slow},
+        {"os.uptime_report", "System", "EventLog", {6013}, 0, 4, &x_uptime_report},
+        // System stability
+        // NOTE: 6008 usually co-fires with Kernel-Power 41 after the same dirty
+        // reboot — composite stability scores must not sum the two types.
+        {"os.dirty_shutdown", "System", "EventLog", {6008}, 0, 12, &x_dirty_shutdown},
+        {"os.time_unsynced", "System", "Microsoft-Windows-Time-Service", {36, 47}, 0, 12,
+         &x_time_unsynced},
+        {"os.activation_failed", "Application", "Microsoft-Windows-Security-SPP", {8198}, 0, 12,
+         &x_activation_failed},
+        {"os.vss_error", "Application", "VSS", {8193}, 0, 12, &x_vss_error},
+        {"fs.hive_recovered", "System", "Microsoft-Windows-Kernel-General", {5}, 0, 12,
+         &x_hive_recovered},
+        {"fs.autochk_ran", "Application", "Microsoft-Windows-Wininit", {1001}, 0, 12,
+         &x_autochk_ran},
+        // App reliability
+        // NOTE: a managed crash usually PAIRS with a process.crashed 1000 — this
+        // type adds the exception TYPE the native event lacks; app crash counts
+        // use process.crashed alone.
+        {"process.crashed_managed", "Application", ".NET Runtime", {1026}, 0, 120,
+         &x_dotnet_crash},
+        {"app.sxs_error", "Application", "SideBySide", {33, 35, 59}, 0, 30, &x_sxs_error},
+        {"app.activation_failed", "Microsoft-Windows-TWinUI/Operational",
+         "Microsoft-Windows-Immersive-Shell", {5973}, 0, 30, &x_app_activation_failed},
+        // 10016 (activation permission noise) is deliberately EXCLUDED.
+        {"app.com_failed", "System", "Microsoft-Windows-DistributedCOM", {10005, 10010}, 0, 12,
+         &x_dcom_failed},
+        {"app.error_popup", "System", "Application Popup", {26}, 0, 30, &x_error_popup},
+        {"app.shutdown_blocked", "Application", "Microsoft-Windows-RestartManager", {10006}, 0, 12,
+         &x_shutdown_blocked},
+        // Service health
+        {"service.hung", "System", "Service Control Manager", {7022}, 0, 30, &x_service_hung},
+        {"service.start_timeout", "System", "Service Control Manager", {7009}, 0, 30,
+         &x_service_start_timeout},
+        {"service.logon_failed", "System", "Service Control Manager", {7038}, 0, 12,
+         &x_service_logon_failed},
+        {"service.recovery_failed", "System", "Service Control Manager", {7032}, 0, 12,
+         &x_service_recovery_failed},
+        // Hardware & storage
+        {"disk.smart_failure", "System", "disk", {52}, 0, 12, &x_disk_smart},
+        {"disk.port_reset", "System", "storahci", {129}, 0, 30, &x_port_reset},
+        {"disk.port_reset", "System", "stornvme", {129}, 0, 30, &x_port_reset},
+        {"fs.write_lost", "System", "Ntfs", {50}, 0, 12, &x_write_lost},
+        {"fs.database_corrupt", "Application", "ESENT", {447, 454, 467}, 0, 12, &x_esent_corrupt},
+        {"hw.device_start_failed", "Microsoft-Windows-Kernel-PnP/Configuration",
+         "Microsoft-Windows-Kernel-PnP", {411}, 0, 12, &x_device_start_failed},
+        {"hw.cpu_throttled", "System", "Microsoft-Windows-Kernel-Processor-Power", {37}, 0, 12,
+         &x_cpu_throttled},
+        // Network
+        {"network.wifi_connect_failed", "Microsoft-Windows-WLAN-AutoConfig/Operational",
+         "Microsoft-Windows-WLAN-AutoConfig", {8002}, 0, 60, &x_wifi_connect_failed},
+        {"network.dhcp_failed", "Microsoft-Windows-Dhcp-Client/Admin",
+         "Microsoft-Windows-Dhcp-Client", {1001, 1002}, 0, 12, &x_dhcp_failed},
+        {"network.vpn_failed", "Application", "RasClient", {20227}, 0, 12, &x_vpn_failed},
+        {"network.smb_failed", "Microsoft-Windows-SmbClient/Connectivity",
+         "Microsoft-Windows-SmbClient", {30803}, 0, 30, &x_smb_failed},
+        {"network.name_conflict", "System", "NetBT", {4319}, 0, 12, &x_name_conflict},
+        // Identity & logon
+        {"logon.no_dc", "System", "NETLOGON", {5719}, 0, 12, &x_no_dc},
+        {"security.kerberos_error", "System", "Microsoft-Windows-Security-Kerberos", {4}, 0, 12,
+         &x_kerberos_error},
+        {"logon.profile_locked", "Application", "Microsoft-Windows-User Profiles Service", {1530},
+         0, 12, &x_profile_locked},
+        {"logon.folder_redirect_failed", "Application", "Microsoft-Windows-Folder Redirection",
+         {502}, 0, 12, &x_folder_redirect_failed},
+        // Security & protection
+        {"security.rtp_disabled", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {5001}, 0, 12, &x_rtp_disabled},
+        {"security.threat_detected", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {1116}, 0, 30, &x_threat_detected},
+        {"security.av_update_failed", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {2001}, 0, 12, &x_av_update_failed},
+        {"security.tamper_blocked", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {5013}, 0, 12, &x_tamper_blocked},
+        // Updates & installs
+        {"app_uninstall.failed", "Application", "MsiInstaller", {11725}, 0, 30,
+         &x_msi_uninstall_failed},
+        {"app_install.appx_failed", "Microsoft-Windows-AppXDeploymentServer/Operational",
+         "Microsoft-Windows-AppXDeployment-Server", {404}, 0, 30, &x_appx_failed},
+        {"update.transfer_failed", "Microsoft-Windows-Bits-Client/Operational",
+         "Microsoft-Windows-Bits-Client", {61}, 0, 30, &x_bits_failed},
+        // Printing
+        {"print.driver_install_failed", "Microsoft-Windows-PrintService/Admin",
+         "Microsoft-Windows-PrintService", {215}, 0, 12, &x_print_driver_failed},
+        {"print.plugin_failed", "Microsoft-Windows-PrintService/Admin",
+         "Microsoft-Windows-PrintService", {808}, 0, 12, &x_print_plugin_failed},
     };
     return kCatalog;
 }

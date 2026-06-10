@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <iterator> // std::size
 #include <set>
 #include <string>
 #include <vector>
@@ -32,7 +33,34 @@ using namespace yuzu::agent;
 
 // ── Catalogue integrity ──────────────────────────────────────────────────────
 
-TEST_CASE("catalogue: 20 distinct obs_types, every spec complete", "[dex][catalog]") {
+// THE 70-type taxonomy — the drift net. This list is mirrored (as labels +
+// groups) in tests/unit/server/test_dex_routes.cpp; adding a catalogue signal
+// fails this count until both sides are updated together.
+static const char* kAllObsTypes[] = {
+    // wave 1
+    "process.crashed", "process.hung", "service.crashed", "service.start_failed", "os.bugcheck",
+    "os.power_loss", "display.driver_reset", "hw.error", "disk.error", "fs.corruption",
+    "memory.exhausted", "os.boot", "update.failed", "app_install.failed", "logon.temp_profile",
+    "gpo.failed", "network.wifi_drop", "network.dns_timeout", "network.ip_conflict",
+    "print.failed",
+    // wave 2
+    "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service", "boot.degraded_device",
+    "os.shutdown", "shutdown.degraded", "os.standby", "os.standby_degraded",
+    "logon.slow_subscriber", "os.uptime_report", "os.dirty_shutdown", "os.time_unsynced",
+    "os.activation_failed", "os.vss_error", "fs.hive_recovered", "fs.autochk_ran",
+    "process.crashed_managed", "app.sxs_error", "app.activation_failed", "app.com_failed",
+    "app.error_popup", "app.shutdown_blocked", "service.hung", "service.start_timeout",
+    "service.logon_failed", "service.recovery_failed", "disk.smart_failure", "disk.port_reset",
+    "fs.write_lost", "fs.database_corrupt", "hw.device_start_failed", "hw.cpu_throttled",
+    "network.wifi_connect_failed", "network.dhcp_failed", "network.vpn_failed",
+    "network.smb_failed", "network.name_conflict", "logon.no_dc", "security.kerberos_error",
+    "logon.profile_locked", "logon.folder_redirect_failed", "security.rtp_disabled",
+    "security.threat_detected", "security.av_update_failed", "security.tamper_blocked",
+    "app_uninstall.failed", "app_install.appx_failed", "update.transfer_failed",
+    "print.driver_install_failed", "print.plugin_failed",
+};
+
+TEST_CASE("catalogue: 70 distinct obs_types, every spec complete", "[dex][catalog]") {
     const auto& cat = dex_signal_catalog();
     std::set<std::string> types;
     for (const auto& s : cat) {
@@ -47,20 +75,30 @@ TEST_CASE("catalogue: 20 distinct obs_types, every spec complete", "[dex][catalo
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    CHECK(types.size() == 20); // the catalogue contract: 20 signals
-    // Spot-check the taxonomy keys the server label map + tests rely on.
-    for (const char* t :
-         {"process.crashed", "process.hung", "service.crashed", "service.start_failed",
-          "os.bugcheck", "os.power_loss", "display.driver_reset", "hw.error", "disk.error",
-          "fs.corruption", "memory.exhausted", "os.boot", "update.failed", "app_install.failed",
-          "logon.temp_profile", "gpo.failed", "network.wifi_drop", "network.dns_timeout",
-          "network.ip_conflict", "print.failed"})
+    CHECK(types.size() == std::size(kAllObsTypes)); // the catalogue contract: 70 signals
+    for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
+}
+
+TEST_CASE("catalogue: every extractor degrades gracefully on empty fields",
+          "[dex][catalog]") {
+    // A drifted/forged event yields empty or reordered fields — every extractor
+    // must produce a well-formed observation (never throw; obs_type stamped by
+    // extract_signal) so the occurrence still counts.
+    for (const auto& s : dex_signal_catalog()) {
+        const int id = s.event_ids.empty() ? 1 : s.event_ids.front();
+        const int level = s.max_level > 0 ? s.max_level : 2;
+        std::optional<SignalObservation> o;
+        REQUIRE_NOTHROW(o = extract_signal(s.channel, s.provider, id, level, {}));
+        REQUIRE(o);
+        CHECK(o->obs_type == s.obs_type);
+        CHECK_FALSE(o->sentence.empty()); // detected_value never blank
+    }
 }
 
 TEST_CASE("catalogue: channels + per-channel QueryList structure", "[dex][catalog]") {
     const auto channels = dex_channels();
-    CHECK(channels.size() == 5);
+    CHECK(channels.size() == 12);
     CHECK(std::find(channels.begin(), channels.end(), "Application") != channels.end());
     CHECK(std::find(channels.begin(), channels.end(), "System") != channels.end());
 
@@ -575,6 +613,218 @@ TEST_CASE("REAL records: disk controller error 11 (full chain)", "[dex][parse][r
     CHECK(o->obs_type == "disk.error");
     CHECK(o->subject == "\\Device\\Harddisk1\\DR1");
     CHECK(o->symbolic == "CONTROLLER_ERROR");
+}
+
+// ── Wave-2 real-record + privacy pins (Win11 26100, harvested 2026-06-10) ────
+
+TEST_CASE("REAL records: boot degradation 101 (Name + DegradationTime; Path dropped)",
+          "[dex][parse][real][privacy]") {
+    // Real layout: named Name/FriendlyName/TotalTime/DegradationTime/Path.
+    const EventFields f = {{"StartTime", "2026-06-09T14:00:12Z"},
+                           {"Name", "TiWorker.exe"},
+                           {"FriendlyName", "Windows Modules Installer Worker"},
+                           {"TotalTime", "2682"},
+                           {"DegradationTime", "182"},
+                           {"Path", "C:\\Users\\dave\\secret\\TiWorker.exe"}};
+    const auto o = extract_signal("Microsoft-Windows-Diagnostics-Performance/Operational",
+                                  "Microsoft-Windows-Diagnostics-Performance", 101, 2, f);
+    REQUIRE(o);
+    CHECK(o->obs_type == "boot.degraded_app");
+    CHECK(o->subject == "TiWorker.exe");
+    CHECK(o->metric == 182.0); // DegradationTime preferred over TotalTime
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("secret") == std::string::npos); // PRIVACY: Path never extracted
+}
+
+TEST_CASE("REAL records: shutdown 200 carries ShutdownTime", "[dex][parse][real]") {
+    const auto o = extract_signal("Microsoft-Windows-Diagnostics-Performance/Operational",
+                                  "Microsoft-Windows-Diagnostics-Performance", 200, 2,
+                                  {{"ShutdownTsVersion", "1"}, {"ShutdownTime", "17733"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.shutdown");
+    CHECK(o->metric == 17733.0);
+}
+
+TEST_CASE("REAL records: SCM 7009 start timeout (params REVERSED vs 7000)",
+          "[dex][parse][real]") {
+    const auto o = extract_signal("System", "Service Control Manager", 7009, 2,
+                                  {{"param1", "30000"}, {"param2", "YuzuDexCanarySvc"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "service.start_timeout");
+    CHECK(o->subject == "YuzuDexCanarySvc"); // param2, not param1
+    CHECK(o->reason == "timeout 30000 ms");
+}
+
+TEST_CASE("REAL records: time-service 36 unsynchronized seconds", "[dex][parse][real]") {
+    const auto o = extract_signal("System", "Microsoft-Windows-Time-Service", 36, 3,
+                                  {{"UnsynchronizedTimeSeconds", "51254"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.time_unsynced");
+    CHECK(o->metric == 51254.0);
+}
+
+TEST_CASE("REAL records: .NET 1026 blob — app + exception type only, no stack/paths",
+          "[dex][parse][real][privacy]") {
+    // Real 1026: ONE positional blob with app, exception, and stack frames.
+    const EventFields f = {
+        {"", "Application: AOTListenerService.exe\nCoreCLR Version: 8.0.1625.21506\n"
+             "Description: The process was terminated due to an unhandled exception.\n"
+             "Exception Info: System.ArgumentNullException: Value cannot be null.\n"
+             "   at CtxLogFileService.Cli.MachineIdentityCli.ToNative(MachineIdentity*)\n"}};
+    const auto o = extract_signal("Application", ".NET Runtime", 1026, 2, f);
+    REQUIRE(o);
+    CHECK(o->obs_type == "process.crashed_managed");
+    CHECK(o->subject == "AOTListenerService.exe");
+    CHECK(o->reason == "System.ArgumentNullException");
+    // PRIVACY/size: the stack frames are never shipped.
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("MachineIdentityCli") == std::string::npos);
+}
+
+TEST_CASE("REAL records: Application Popup 26 caption + message", "[dex][parse][real]") {
+    const auto o = extract_signal("System", "Application Popup", 26, 4,
+                                  {{"Caption", "Windows - Virtual Memory Minimum Too Low"},
+                                   {"Message", "Your system is low on virtual memory."}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "app.error_popup");
+    CHECK(o->subject.find("Virtual Memory") != std::string::npos);
+    CHECK(o->sentence.find("low on virtual memory") != std::string::npos);
+}
+
+TEST_CASE("REAL records: Kernel-PnP 411 device start failure", "[dex][parse][real]") {
+    const auto o = extract_signal("Microsoft-Windows-Kernel-PnP/Configuration",
+                                  "Microsoft-Windows-Kernel-PnP", 411, 2,
+                                  {{"DeviceInstanceId", "ROOT\\VMS_VSMP\\0001"},
+                                   {"DriverName", "wvms_mp_windows.inf"},
+                                   {"Status", "0xc0000001"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "hw.device_start_failed");
+    CHECK(o->subject == "ROOT\\VMS_VSMP\\0001");
+    CHECK(o->component == "wvms_mp_windows.inf");
+    CHECK(o->reason == "0xc0000001");
+}
+
+TEST_CASE("REAL records: WLAN 8002 connect failure (Level 4 — no level filter)",
+          "[dex][parse][real]") {
+    const auto o = extract_signal(
+        "Microsoft-Windows-WLAN-AutoConfig/Operational", "Microsoft-Windows-WLAN-AutoConfig",
+        8002, 4,
+        {{"SSID", "Samsung Smart Fridge"},
+         {"FailureReason", "Failed to connect because no connectable Access Point was visible"},
+         {"InterfaceDescription", "Intel(R) Wi-Fi 6 AX201 160MHz"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "network.wifi_connect_failed");
+    CHECK(o->subject == "Samsung Smart Fridge");
+    CHECK(o->reason.find("no connectable Access Point") != std::string::npos);
+}
+
+TEST_CASE("REAL records: Defender 2001 — spaced field names; user fields dropped",
+          "[dex][parse][real][privacy]") {
+    // Real layout: Data names contain SPACES ('Error Code'); Domain/User present.
+    const EventFields f = {{"Product Name", "Microsoft Defender Antivirus"},
+                           {"Update Source", "Microsoft Update Server"},
+                           {"Domain", "CONTOSO"},
+                           {"User", "jane.doe"},
+                           {"Error Code", "0x8024402c"}};
+    const auto o = extract_signal("Microsoft-Windows-Windows Defender/Operational",
+                                  "Microsoft-Windows-Windows Defender", 2001, 2, f);
+    REQUIRE(o);
+    CHECK(o->obs_type == "security.av_update_failed");
+    CHECK(o->reason == "0x8024402c");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("jane.doe") == std::string::npos); // PRIVACY
+}
+
+TEST_CASE("REAL records: AppX 404 + BITS 61 (url dropped, hr hexified)",
+          "[dex][parse][real][privacy]") {
+    const auto a = extract_signal("Microsoft-Windows-AppXDeploymentServer/Operational",
+                                  "Microsoft-Windows-AppXDeployment-Server", 404, 2,
+                                  {{"PackageFullName", "MdOdrMcpFilterPackage_1.0.0.0_neutral"},
+                                   {"ErrorCode", "0x80073cf9"}});
+    REQUIRE(a);
+    CHECK(a->obs_type == "app_install.appx_failed");
+    CHECK(a->subject.find("MdOdrMcpFilterPackage") != std::string::npos);
+    CHECK(a->reason == "0x80073cf9");
+
+    const auto b = extract_signal("Microsoft-Windows-Bits-Client/Operational",
+                                  "Microsoft-Windows-Bits-Client", 61, 2,
+                                  {{"name", "PreSignInSettingsConfigJSON"},
+                                   {"url", "https://g.live.com/odclientsettings/ProdV2"},
+                                   {"hr", "2147954407"}});
+    REQUIRE(b);
+    CHECK(b->obs_type == "update.transfer_failed");
+    CHECK(b->subject == "PreSignInSettingsConfigJSON");
+    CHECK(b->reason == "0x80072EE7"); // decimal hr rendered as the HRESULT it is
+    for (const std::string& field : {b->subject, b->reason, b->component, b->sentence})
+        CHECK(field.find("g.live.com") == std::string::npos); // PRIVACY: url dropped
+}
+
+TEST_CASE("REAL records: EventLog 6013 uptime + 6008 dirty shutdown (positional)",
+          "[dex][parse][real]") {
+    // Real 6013: leading empty positional fields, uptime seconds at index 4.
+    const EventFields up = {{"", ""}, {"", ""}, {"", ""}, {"", ""},
+                            {"", "75587"}, {"", "60"}, {"", "0 GMT Standard Time"}};
+    const auto u = extract_signal("System", "EventLog", 6013, 4, up);
+    REQUIRE(u);
+    CHECK(u->obs_type == "os.uptime_report");
+    CHECK(u->metric == 75587.0); // first numeric field
+
+    const auto d = extract_signal("System", "EventLog", 6008, 2,
+                                  {{"", "14:45:39"}, {"", "09/06/2026"}});
+    REQUIRE(d);
+    CHECK(d->obs_type == "os.dirty_shutdown");
+    CHECK(d->sentence.find("unexpected") != std::string::npos);
+}
+
+TEST_CASE("PRIVACY: VPN 20227 never reads the dialing user (insert %1)",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal("Application", "RasClient", 20227, 2,
+                                  {{"", "CONTOSO\\dave.rae"}, {"", "Corp VPN"}, {"", "691"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "network.vpn_failed");
+    CHECK(o->subject == "Corp VPN");
+    CHECK(o->reason == "691");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("dave.rae") == std::string::npos);
+}
+
+TEST_CASE("PRIVACY: Defender 1116 keeps the threat name, drops path + user",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal("Microsoft-Windows-Windows Defender/Operational",
+                                  "Microsoft-Windows-Windows Defender", 1116, 3,
+                                  {{"Threat Name", "Trojan:Win32/Wacatac.B!ml"},
+                                   {"Path", "file:_C:\\Users\\dave\\Downloads\\keygen.exe"},
+                                   {"Detection User", "CONTOSO\\dave.rae"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "security.threat_detected");
+    CHECK(o->subject == "Trojan:Win32/Wacatac.B!ml");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence}) {
+        CHECK(field.find("Downloads") == std::string::npos);
+        CHECK(field.find("dave.rae") == std::string::npos);
+    }
+}
+
+TEST_CASE("PRIVACY: service logon failure 7038 drops the account name",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal("System", "Service Control Manager", 7038, 2,
+                                  {{"param1", "MyAgentSvc"}, {"param2", "CONTOSO\\dave.rae"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "service.logon_failed");
+    CHECK(o->subject == "MyAgentSvc");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("dave.rae") == std::string::npos);
+}
+
+TEST_CASE("PRIVACY: ESENT corruption keeps the process, drops the db path",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal("Application", "ESENT", 447, 2,
+                                  {{"", "svchost"}, {"", "Instance:"},
+                                   {"", "C:\\Users\\dave\\AppData\\Local\\db.jet"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "fs.database_corrupt");
+    CHECK(o->subject == "svchost");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("AppData") == std::string::npos);
 }
 
 // ── Wire mapping (dex_event) ─────────────────────────────────────────────────

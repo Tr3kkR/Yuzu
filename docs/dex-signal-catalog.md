@@ -1,16 +1,18 @@
 # DEX Signal Catalogue
 
-The Guardian DEX observer collects **20 reliability / employee-experience
-signals** from Windows endpoints as ruleless observations (`rule_id =
-"__observation__"`, `event_type` = the obs_type below). One catalogue-driven
-engine (`agents/core/src/dex_observer.cpp`) arms one kernel-filtered
-`EvtSubscribe` per channel; the signal set, field extraction, privacy
-minimisations, and per-type rate caps all live in
-`agents/core/src/dex_signal_catalog.cpp`. **Adding signal #21 is one catalogue
+The Guardian DEX observer collects **70 reliability / employee-experience
+signals** (wave 1: 20, wave 2: +50) from Windows endpoints as ruleless
+observations (`rule_id = "__observation__"`, `event_type` = the obs_type
+below). One catalogue-driven engine (`agents/core/src/dex_observer.cpp`) arms
+one kernel-filtered `EvtSubscribe` per channel (12 channels); the signal set,
+field extraction, privacy minimisations, and per-type rate caps all live in
+`agents/core/src/dex_signal_catalog.cpp`. **Adding a signal is one catalogue
 entry + one extractor + fixtures — zero server change** (the projection reads
-the uniform `detail_json` keys generically, the `/dex` signal-summary panel
-GROUP-BYs whatever types exist, and unknown types render with a raw-label
-fallback).
+the uniform `detail_json` keys generically, the `/dex` signal panel GROUP-BYs
+whatever types exist, and unknown types render with a raw-label fallback under
+"Other"). The dashboard groups the catalogue into 11 display groups; the
+server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
+sync (the paired drift-net tests fail loudly if not).
 
 ## Uniform observation shape
 
@@ -29,7 +31,7 @@ projection (`guardian_observations`), and in the dashboard:
 (`process`/`exception_code`/`faulting_module`) for the PR #1311 transition;
 remove once that window closes.
 
-## The 20 signals
+## Wave 1 — the first 20 signals
 
 | # | obs_type | Channel / Provider / Event IDs | DEX meaning | Cap (events/h) | Privacy minimisation | Verified |
 |---|---|---|---|---|---|---|
@@ -76,6 +78,66 @@ catalogued type, fired or not (quiet types as muted real-zero rows), so
 operators see what the fleet monitors — `kDexCatalogueOrder` in
 `dex_routes.cpp` is the server-side mirror of this table; keep both in sync
 when adding a signal.
+
+## Wave 2 — +50 signals (2026-06-10), by display group
+
+Sources marked **real** are pinned by full-chain fixtures captured from a live
+Win11 26100 box; the rest are manifest-best-effort and covered by the
+whole-catalogue graceful-degradation test (empty/reordered fields → counted
+occurrence, never a crash).
+
+| Group | obs_type | Source | Notes / privacy |
+|---|---|---|---|
+| Boot, start-up & shutdown | `boot.degraded_app` | Diag-Perf/Op 101 **real** | subject=Name, metric=DegradationTime ms; **Path dropped** |
+| | `boot.degraded_driver` | Diag-Perf 102 | same shape |
+| | `boot.degraded_service` | Diag-Perf 103 **real** | same shape |
+| | `boot.degraded_device` | Diag-Perf 109 | same shape |
+| | `os.shutdown` | Diag-Perf 200 **real** | metric=ShutdownTime ms |
+| | `shutdown.degraded` | Diag-Perf 203 **real** | app delaying shutdown |
+| | `os.standby` | Diag-Perf 300 | occurrence + best-effort metric |
+| | `os.standby_degraded` | Diag-Perf 301, 302 | resume slowed |
+| | `logon.slow_subscriber` | Winlogon 6005, 6006 (Application) | e.g. GPClient — classic slow logon |
+| | `os.uptime_report` | EventLog 6013 **real** | metric=uptime s (first numeric positional) |
+| System stability | `os.dirty_shutdown` | EventLog 6008 **real** | co-fires with Kernel-Power 41 — never sum both |
+| | `os.time_unsynced` | Time-Service 36, 47 **real** | metric=UnsynchronizedTimeSeconds |
+| | `os.activation_failed` | Security-SPP 8198 (Application) | license activation |
+| | `os.vss_error` | VSS 8193 (Application) | shadow-copy errors |
+| | `fs.hive_recovered` | Kernel-General 5 | **hive path dropped** (ntuser.dat ⇒ username) |
+| | `fs.autochk_ran` | Wininit 1001 (Application) | chkdsk output blob dropped |
+| App reliability | `process.crashed_managed` | .NET Runtime 1026 **real** | app + exception TYPE only; **stack frames never shipped**; pairs with 1000 — crash counts use `process.crashed` alone |
+| | `app.sxs_error` | SideBySide 33, 35, 59 | missing VC-runtime class; paths → basename |
+| | `app.activation_failed` | Immersive-Shell / TWinUI 5973 | store-app activation |
+| | `app.com_failed` | DistributedCOM 10005, 10010 | **10016 noise excluded** |
+| | `app.error_popup` | Application Popup 26 **real** | the dialog the user actually saw (Caption+Message clipped) |
+| | `app.shutdown_blocked` | RestartManager 10006 | **FullPath dropped** |
+| Service health | `service.hung` | SCM 7022 | |
+| | `service.start_timeout` | SCM 7009 **real** | params REVERSED vs 7000 (param2=service) |
+| | `service.logon_failed` | SCM 7038 | **logon account dropped** |
+| | `service.recovery_failed` | SCM 7032 | |
+| Hardware & storage | `disk.smart_failure` | disk 52 | SMART predictive failure |
+| | `disk.port_reset` | storahci + stornvme 129 | reset storms = dying disk/cable |
+| | `fs.write_lost` | Ntfs 50 | delayed-write data loss |
+| | `fs.database_corrupt` | ESENT 447, 454, 467 | **db paths dropped**, owner process kept |
+| | `hw.device_start_failed` | Kernel-PnP/Configuration 411 **real** | DeviceInstanceId/DriverName/Status |
+| | `hw.cpu_throttled` | Kernel-Processor-Power 37 | firmware thermal/power cap |
+| Network | `network.wifi_connect_failed` | WLAN-AutoConfig 8002 **real** | SSID + FailureReason |
+| | `network.dhcp_failed` | Dhcp-Client/Admin 1001, 1002 | |
+| | `network.vpn_failed` | RasClient 20227 (Application) | **dialing user (insert %1) never read** |
+| | `network.smb_failed` | SmbClient/Connectivity 30803 | server name kept (corp infra) |
+| | `network.name_conflict` | NetBT 4319 | |
+| Identity & logon | `logon.no_dc` | NETLOGON 5719 | domain kept |
+| | `security.kerberos_error` | Security-Kerberos 4 | SPN/clock problems |
+| | `logon.profile_locked` | User Profiles Service 1530 | **profile (≈person) not extracted** |
+| | `logon.folder_redirect_failed` | Folder Redirection 502 | **folder paths dropped** |
+| Security & protection | `security.rtp_disabled` | Defender 5001 | |
+| | `security.threat_detected` | Defender 1116 | threat name kept; **file path + user dropped** |
+| | `security.av_update_failed` | Defender 2001 **real** | Data names contain SPACES ('Error Code') |
+| | `security.tamper_blocked` | Defender 5013 | |
+| Updates & installs | `app_uninstall.failed` | MsiInstaller 11725 | same "Product: X --" parse as 11708 |
+| | `app_install.appx_failed` | AppXDeployment-Server 404 **real** | PackageFullName + ErrorCode |
+| | `update.transfer_failed` | Bits-Client 61 **real** | job name kept; **url dropped**; decimal `hr` → HRESULT hex |
+| Printing | `print.driver_install_failed` | PrintService/Admin 215 | |
+| | `print.plugin_failed` | PrintService/Admin 808 | dll → basename |
 
 ## Privacy / works-council contract
 

@@ -7,8 +7,8 @@
 #include <chrono>
 #include <ctime>
 #include <format>
-#include <iterator> // std::size (catalogue array)
 #include <string>
+#include <vector>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp);
 // {{TITLE}}/{{FRAGMENT}} are substituted per request. Reused verbatim so the DEX
@@ -43,19 +43,65 @@ std::string esc(const std::string& s) {
 
 std::string num(int64_t n) { return std::to_string(n); }
 
-// The 20 catalogued signal types in display order — the server-side mirror of
-// the agent catalogue (dex_signal_catalog.cpp). The All-signals panel renders
-// EVERY entry, fired or not, so operators see what the fleet is monitoring —
-// not just what happened to fire in the window. Types present in the DB but
-// absent here (a newer agent's signal) are appended with the raw-label
-// fallback, so the panel never hides data.
-constexpr const char* kDexCatalogueOrder[] = {
-    "process.crashed",  "process.hung",        "service.crashed", "service.start_failed",
-    "os.bugcheck",      "os.power_loss",       "display.driver_reset", "hw.error",
-    "disk.error",       "fs.corruption",       "memory.exhausted", "os.boot",
-    "update.failed",    "app_install.failed",  "logon.temp_profile", "gpo.failed",
-    "network.wifi_drop", "network.dns_timeout", "network.ip_conflict", "print.failed",
+// The 70 catalogued signal types, GROUPED for display — the server-side mirror
+// of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
+// signal). The All-signals panel renders EVERY entry, fired or not, so
+// operators see what the fleet is monitoring — not just what happened to fire
+// in the window. Types present in the DB but absent here (a newer agent's
+// signal) are appended under "Other" with the raw-label fallback, so the panel
+// never hides data.
+struct DexSignalGroup {
+    const char* name;
+    std::vector<const char*> types;
 };
+
+const std::vector<DexSignalGroup>& dex_signal_groups() {
+    static const std::vector<DexSignalGroup> kGroups = {
+        {"App reliability",
+         {"process.crashed", "process.hung", "process.crashed_managed", "app.sxs_error",
+          "app.activation_failed", "app.com_failed", "app.error_popup", "app.shutdown_blocked"}},
+        {"Boot, start-up & shutdown",
+         {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
+          "boot.degraded_device", "os.shutdown", "shutdown.degraded", "os.standby",
+          "os.standby_degraded", "os.uptime_report"}},
+        {"Service health",
+         {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
+          "service.logon_failed", "service.recovery_failed"}},
+        {"System stability",
+         {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
+          "os.activation_failed", "os.vss_error", "display.driver_reset", "memory.exhausted"}},
+        {"Hardware & storage",
+         {"hw.error", "hw.device_start_failed", "hw.cpu_throttled", "disk.error",
+          "disk.smart_failure", "disk.port_reset"}},
+        {"File system",
+         {"fs.corruption", "fs.write_lost", "fs.database_corrupt", "fs.hive_recovered",
+          "fs.autochk_ran"}},
+        {"Network",
+         {"network.wifi_drop", "network.wifi_connect_failed", "network.dns_timeout",
+          "network.dhcp_failed", "network.vpn_failed", "network.smb_failed",
+          "network.ip_conflict", "network.name_conflict"}},
+        {"Identity & logon",
+         {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
+          "logon.folder_redirect_failed", "logon.no_dc", "security.kerberos_error",
+          "gpo.failed"}},
+        {"Security & protection",
+         {"security.rtp_disabled", "security.threat_detected", "security.av_update_failed",
+          "security.tamper_blocked"}},
+        {"Updates & installs",
+         {"update.failed", "update.transfer_failed", "app_install.failed",
+          "app_uninstall.failed", "app_install.appx_failed"}},
+        {"Printing",
+         {"print.failed", "print.driver_install_failed", "print.plugin_failed"}},
+    };
+    return kGroups;
+}
+
+std::size_t dex_catalogued_type_count() {
+    std::size_t n = 0;
+    for (const auto& g : dex_signal_groups())
+        n += g.types.size();
+    return n;
+}
 
 // Friendly display label for an obs_type — the ONE place the catalogue taxonomy
 // meets the UI. Unknown types fall back to the escaped raw obs_type, so a signal
@@ -81,6 +127,57 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "network.dns_timeout") return "DNS timeout";
     if (obs_type == "network.ip_conflict") return "IP address conflict";
     if (obs_type == "print.failed") return "Print failure";
+    // Wave 2 (2026-06-10)
+    if (obs_type == "boot.degraded_app") return "Slow boot: application";
+    if (obs_type == "boot.degraded_driver") return "Slow boot: driver";
+    if (obs_type == "boot.degraded_service") return "Slow boot: service";
+    if (obs_type == "boot.degraded_device") return "Slow boot: device";
+    if (obs_type == "os.shutdown") return "Shutdown";
+    if (obs_type == "shutdown.degraded") return "Slow shutdown: application";
+    if (obs_type == "os.standby") return "Standby/resume";
+    if (obs_type == "os.standby_degraded") return "Slow resume";
+    if (obs_type == "logon.slow_subscriber") return "Slow logon (subscriber)";
+    if (obs_type == "os.uptime_report") return "Uptime report";
+    if (obs_type == "os.dirty_shutdown") return "Dirty shutdown";
+    if (obs_type == "os.time_unsynced") return "Clock unsynchronized";
+    if (obs_type == "os.activation_failed") return "Windows activation failure";
+    if (obs_type == "os.vss_error") return "Shadow copy error";
+    if (obs_type == "fs.hive_recovered") return "Registry hive recovered";
+    if (obs_type == "fs.autochk_ran") return "Disk check at boot";
+    if (obs_type == "process.crashed_managed") return "App crash (.NET)";
+    if (obs_type == "app.sxs_error") return "App dependency error";
+    if (obs_type == "app.activation_failed") return "App activation failure";
+    if (obs_type == "app.com_failed") return "COM server failure";
+    if (obs_type == "app.error_popup") return "Error dialog shown";
+    if (obs_type == "app.shutdown_blocked") return "App blocked shutdown";
+    if (obs_type == "service.hung") return "Service hung";
+    if (obs_type == "service.start_timeout") return "Service start timeout";
+    if (obs_type == "service.logon_failed") return "Service logon failure";
+    if (obs_type == "service.recovery_failed") return "Service recovery failure";
+    if (obs_type == "disk.smart_failure") return "Disk SMART warning";
+    if (obs_type == "disk.port_reset") return "Storage port reset";
+    if (obs_type == "fs.write_lost") return "Lost delayed write";
+    if (obs_type == "fs.database_corrupt") return "Database corruption";
+    if (obs_type == "hw.device_start_failed") return "Device start failure";
+    if (obs_type == "hw.cpu_throttled") return "CPU throttled";
+    if (obs_type == "network.wifi_connect_failed") return "Wi-Fi connect failure";
+    if (obs_type == "network.dhcp_failed") return "DHCP failure";
+    if (obs_type == "network.vpn_failed") return "VPN failure";
+    if (obs_type == "network.smb_failed") return "File share failure";
+    if (obs_type == "network.name_conflict") return "Name conflict";
+    if (obs_type == "logon.no_dc") return "No domain controller";
+    if (obs_type == "security.kerberos_error") return "Kerberos error";
+    if (obs_type == "logon.profile_locked") return "Profile unload blocked";
+    if (obs_type == "logon.folder_redirect_failed") return "Folder redirection failure";
+    if (obs_type == "security.rtp_disabled") return "Real-time protection off";
+    if (obs_type == "security.threat_detected") return "Malware detected";
+    if (obs_type == "security.av_update_failed") return "AV update failure";
+    if (obs_type == "security.tamper_blocked") return "Tamper attempt blocked";
+    if (obs_type == "app_uninstall.failed") return "App uninstall failure";
+    if (obs_type == "app_install.appx_failed") return "Store app install failure";
+    if (obs_type == "update.transfer_failed") return "Download failure (BITS)";
+    if (obs_type == "print.driver_install_failed") return "Printer driver failure";
+    if (obs_type == "print.plugin_failed") return "Print spooler plug-in failure";
     return esc(obs_type); // forward-compatible fallback
 }
 
@@ -270,14 +367,23 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
          "OS with a signal collector today); offline agents are excluded, not counted as crash-free. "
          "macOS/Linux: collector pending.</div>";
 
-    // All signals — every catalogued type, fired or not (stable catalogue order),
-    // then any uncatalogued types the DB carries (newer-agent forward-compat).
-    // Quiet rows render muted with a real zero — monitored, nothing happened.
+    // All signals — every catalogued type, fired or not, GROUPED (App
+    // reliability / Boot / Network / …), then any uncatalogued types the DB
+    // carries under "Other" (newer-agent forward-compat). Quiet rows render
+    // muted with a real zero — monitored, nothing happened. Group header rows
+    // also show the group's event total so a hot family stands out collapsed.
     h += "<div class=\"gp-sech\">All signals</div>";
-    h += "<div class=\"gp-note\">All " + std::to_string(std::size(kDexCatalogueOrder)) +
-         " monitored signal types are listed; a dash means no events in this window.</div>";
+    h += "<div class=\"gp-note\">All " + std::to_string(dex_catalogued_type_count()) +
+         " monitored signal types are listed by group; a dash means no events in this "
+         "window.</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th class=\"gp-num\">Events</th>"
          "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
+    auto find_sig = [&](const std::string& t) -> const DexSignalCount* {
+        for (const auto& sig : signals)
+            if (sig.obs_type == t)
+                return &sig;
+        return nullptr;
+    };
     auto sig_row = [&](const std::string& obs_type, const DexSignalCount* c) {
         if (c) {
             h += "<tr><td>" + dex_signal_label(obs_type) + "</td><td class=\"gp-num\">" +
@@ -289,24 +395,47 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                  "<td class=\"gp-mute\">&mdash;</td></tr>";
         }
     };
-    for (const char* t : kDexCatalogueOrder) {
-        const DexSignalCount* hit = nullptr;
-        for (const auto& sig : signals)
-            if (sig.obs_type == t) {
-                hit = &sig;
-                break;
-            }
-        sig_row(t, hit);
+    auto group_header = [&](const std::string& name, int64_t total) {
+        h += "<tr><td colspan=\"4\" style=\"font-weight:600;padding-top:.7rem;"
+             "border-bottom:1px solid var(--border);\">" + esc(name) +
+             (total > 0 ? " <span class=\"gp-mute\">&middot; " + num(total) + " events</span>"
+                        : "") +
+             "</td></tr>";
+    };
+    for (const auto& group : dex_signal_groups()) {
+        int64_t total = 0;
+        for (const char* t : group.types)
+            if (const auto* c = find_sig(t))
+                total += c->count;
+        group_header(group.name, total);
+        for (const char* t : group.types)
+            sig_row(t, find_sig(t));
     }
-    for (const auto& sig : signals) { // uncatalogued extras (forward-compat)
-        bool known = false;
-        for (const char* t : kDexCatalogueOrder)
-            if (sig.obs_type == t) {
-                known = true;
-                break;
+    // Uncatalogued extras (forward-compat) under "Other".
+    {
+        std::vector<const DexSignalCount*> extras;
+        for (const auto& sig : signals) {
+            bool known = false;
+            for (const auto& group : dex_signal_groups()) {
+                for (const char* t : group.types)
+                    if (sig.obs_type == t) {
+                        known = true;
+                        break;
+                    }
+                if (known)
+                    break;
             }
-        if (!known)
-            sig_row(sig.obs_type, &sig);
+            if (!known)
+                extras.push_back(&sig);
+        }
+        if (!extras.empty()) {
+            int64_t total = 0;
+            for (const auto* e : extras)
+                total += e->count;
+            group_header("Other", total);
+            for (const auto* e : extras)
+                sig_row(e->obs_type, e);
+        }
     }
     h += "</tbody></table>";
 
