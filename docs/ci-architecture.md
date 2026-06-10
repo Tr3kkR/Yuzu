@@ -65,6 +65,40 @@ stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret
 (fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
 returns false and self-hosted jobs are skipped with a clear reason.
 
+## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
+
+ADR-0006 decision 8: every tier that runs server tests gets a real
+PostgreSQL 16 and exports `YUZU_TEST_POSTGRES_DSN`. One script implements
+it everywhere — `scripts/ci/ensure-postgres.sh`, inserted as an
+`Ensure Postgres 16 (server tests)` step between Build and Test in
+ci.yml (linux / windows / macos) and nightly.yml (asan / tsan / coverage).
+Resolution order inside the script:
+
+1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — trusted
+   as-is. The escape hatch for any bespoke runner setup.
+2. **Docker** (self-hosted Linux: `yuzu-wsl2-linux` / `yuzu-shulgi`) —
+   idempotent persistent container `yuzu-ci-postgres` on
+   `127.0.0.1:15432` (`docker start` || `docker run --restart
+   unless-stopped`, image pinned to the same digest as
+   `deploy/docker/Dockerfile.postgres`'s base). One-time cost per runner;
+   port 15432 avoids colliding with native clusters or UAT rigs on 5432.
+3. **brew** (GHA-hosted macOS, no docker) — `postgresql@16` bottle +
+   throwaway trust-auth cluster under `$RUNNER_TEMP` on
+   `127.0.0.1:15432`.
+4. **Native cluster on `127.0.0.1:5432`** — the `yuzu-local-windows`
+   precondition: a PostgreSQL 16 Windows service with role `yuzu` /
+   password `yuzu` / database `yuzu_test`, bootstrapped **once** per
+   runner (installer or `choco install postgresql16`, then
+   `createuser`/`createdb` as above). Prefer the runner-level env
+   override (path 1) if the box already runs Postgres with different
+   credentials.
+5. Nothing found → `::warning`, exit 0.
+
+**Non-fatal by design (for now):** no test consumes the DSN until #1320
+lands the server-side Postgres substrate. When the first Postgres-backed
+store test ships, flip `SOFT_EXIT=1` in the script so a missing database
+fails the job instead of silently skipping coverage.
+
 ## Universal vcpkg cache-key contract
 
 `scripts/ci/vcpkg-triplet-sentinel.sh` is the single source of truth for

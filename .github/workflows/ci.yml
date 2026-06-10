@@ -321,6 +321,14 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
 
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). On this
+      # self-hosted runner the script idempotently (re)uses a persistent
+      # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
+      # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
+      # no per-run install. Non-fatal until #1320 ships the first consumer.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
+
       - name: Test
         run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
 
@@ -539,6 +547,16 @@ jobs:
       - name: Build
         run: meson compile -C build-windows-${{ matrix.build_type }}
 
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
+      # Precondition on yuzu-local-windows: a native PostgreSQL 16 service
+      # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
+      # see docs/ci-architecture.md "Postgres for server tests"), or a
+      # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
+      # 127.0.0.1:5432 and exports the DSN; warns (non-fatal until #1320)
+      # when nothing is listening.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
+
       - name: Test
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
@@ -674,6 +692,15 @@ jobs:
 
       - name: Build
         run: meson compile -C build-macos
+
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). GHA
+      # macOS runners have no docker; the script brew-installs
+      # postgresql@16 (bottle, ~1 min), boots a throwaway trust-auth
+      # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports
+      # YUZU_TEST_POSTGRES_DSN. Non-fatal until #1320 ships the first
+      # consumer.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
         run: meson test -C build-macos --print-errorlogs
