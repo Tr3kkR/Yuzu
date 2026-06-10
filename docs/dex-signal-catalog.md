@@ -1,18 +1,23 @@
 # DEX Signal Catalogue
 
-The Guardian DEX observer collects **70 reliability / employee-experience
-signals** (wave 1: 20, wave 2: +50) from Windows endpoints as ruleless
-observations (`rule_id = "__observation__"`, `event_type` = the obs_type
-below). One catalogue-driven engine (`agents/core/src/dex_observer.cpp`) arms
-one kernel-filtered `EvtSubscribe` per channel (12 channels); the signal set,
-field extraction, privacy minimisations, and per-type rate caps all live in
-`agents/core/src/dex_signal_catalog.cpp`. **Adding a signal is one catalogue
+The Guardian DEX observer collects **103 reliability / employee-experience
+signals** (wave 1: 20, wave 2: +50, wave 3: +33) from Windows endpoints as
+ruleless observations (`rule_id = "__observation__"`, `event_type` = the
+obs_type below). One catalogue-driven engine (`agents/core/src/dex_observer.cpp`)
+arms one kernel-filtered `EvtSubscribe` per channel (22 channels); the signal
+set, field extraction, privacy minimisations, and per-type rate caps all live
+in `agents/core/src/dex_signal_catalog.cpp`. **Adding a signal is one catalogue
 entry + one extractor + fixtures — zero server change** (the projection reads
 the uniform `detail_json` keys generically, the `/dex` signal panel GROUP-BYs
 whatever types exist, and unknown types render with a raw-label fallback under
-"Other"). The dashboard groups the catalogue into 11 display groups; the
+"Other"). The dashboard groups the catalogue into 12 display groups; the
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not).
+
+Channels that do not exist on a given SKU fail to arm individually and are
+logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
+absent on some builds) — the catalogue row then honestly reads zero for that
+device while other devices still report.
 
 ## Uniform observation shape
 
@@ -138,6 +143,34 @@ occurrence, never a crash).
 | | `update.transfer_failed` | Bits-Client 61 **real** | job name kept; **url dropped**; decimal `hr` → HRESULT hex |
 | Printing | `print.driver_install_failed` | PrintService/Admin 215 | |
 | | `print.plugin_failed` | PrintService/Admin 808 | dll → basename |
+
+## Wave 3 — +33 signals (2026-06-10), the identity / remote-work / management lens
+
+Real-record pins from the live box: Power-Troubleshooter 1 (**WakeDuration ms
+metric** → resume-speed trend), User32 1074 (**param7 = initiating user,
+dropped**; process basename + reason kept), TPM-WMI 1801 / Biometrics 1014 /
+MDM 844 (validating the any-id + level≤2 pattern for providers whose error ids
+vary), AAD 1097 (decimal `Error` → HRESULT hex; **ErrorMessage never shipped —
+can embed UPNs**).
+
+| Group | New types |
+|---|---|
+| Boot, start-up & shutdown | `boot.fast_startup_failed` (Kernel-Boot 29), `os.resume_report` (Power-Troubleshooter 1, metric), `os.restart_initiated` (User32 1074, user dropped) |
+| System stability | `os.shadow_copies_lost` (volsnap 25), `os.crashdump_disabled` (volmgr 46), `display.dwm_exited` (DWM 9009) |
+| App reliability | `process.file_access_failure` (1005, file path dropped), `app.push_notification_error` (WPN any-err), `app.file_association_reset` (Shell-Core 62), `app.staterepo_error` (StateRepository any-err) |
+| Service health | `service.dependency_failed` (SCM 7001) |
+| File system | `fs.flush_failed` (Ntfs 57) |
+| Hardware & storage | `hw.user_driver_error` (UMDF 10110/10111), `hw.tpm_error` (TPM-WMI any-err) |
+| Network | `network.port_exhaustion` (Tcpip 4227/4231), `network.smb_write_lost` (mrxsmb 50), `network.dns_register_failed` (DNS-Client 8015/8016), `session.rdp_disconnected` (TS-LSM 24/39/40 — **user + client address dropped**) |
+| Identity & logon | `logon.winlogon_terminated` (4005), `logon.machine_trust_failed` (NETLOGON 3210), `logon.biometric_error` (any-err), `logon.hello_error` (any-err), `logon.aad_token_error` (AAD 1097/1098), `security.auth_error` (LsaSrv 40960/40961) |
+| Security & protection | `security.tls_alert` (Schannel 36874/36887), `security.threat_action_failed` (Defender 1119), `security.rtp_error` (3002), `security.bitlocker_error` (any-err), `security.cert_enroll_failed` (AutoEnrollment 6/13) |
+| Updates & installs | `update.check_failed` (WUC 16/25), `update.download_failed` (WUC 31) |
+| Policy & management | `gpo.cse_failed` (GroupPolicy 1085), `mgmt.mdm_error` (DeviceManagement any-err) — `gpo.failed` moved into this group |
+
+Deliberately still excluded: Security-channel logon events (privilege-gated),
+Task Scheduler (channel disabled by default), DCOM 10016 + WMI-Activity 5858
+(noise), app start-times / audio glitches / NCSI (need ETW collectors, not
+event IDs — collector-gated future work).
 
 ## Privacy / works-council contract
 

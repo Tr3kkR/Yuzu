@@ -58,9 +58,21 @@ static const char* kAllObsTypes[] = {
     "security.threat_detected", "security.av_update_failed", "security.tamper_blocked",
     "app_uninstall.failed", "app_install.appx_failed", "update.transfer_failed",
     "print.driver_install_failed", "print.plugin_failed",
+    // wave 3
+    "boot.fast_startup_failed", "os.resume_report", "os.restart_initiated",
+    "os.shadow_copies_lost", "os.crashdump_disabled", "display.dwm_exited",
+    "process.file_access_failure", "app.push_notification_error", "app.file_association_reset",
+    "app.staterepo_error", "service.dependency_failed", "fs.flush_failed",
+    "hw.user_driver_error", "hw.tpm_error", "network.port_exhaustion", "network.smb_write_lost",
+    "network.dns_register_failed", "session.rdp_disconnected", "logon.winlogon_terminated",
+    "logon.machine_trust_failed", "logon.biometric_error", "logon.hello_error",
+    "logon.aad_token_error", "security.auth_error", "security.tls_alert",
+    "security.threat_action_failed", "security.rtp_error", "security.bitlocker_error",
+    "security.cert_enroll_failed", "update.check_failed", "update.download_failed",
+    "gpo.cse_failed", "mgmt.mdm_error",
 };
 
-TEST_CASE("catalogue: 70 distinct obs_types, every spec complete", "[dex][catalog]") {
+TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catalog]") {
     const auto& cat = dex_signal_catalog();
     std::set<std::string> types;
     for (const auto& s : cat) {
@@ -75,7 +87,7 @@ TEST_CASE("catalogue: 70 distinct obs_types, every spec complete", "[dex][catalo
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    CHECK(types.size() == std::size(kAllObsTypes)); // the catalogue contract: 70 signals
+    CHECK(types.size() == std::size(kAllObsTypes)); // the catalogue contract: 103 signals
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
 }
@@ -98,7 +110,7 @@ TEST_CASE("catalogue: every extractor degrades gracefully on empty fields",
 
 TEST_CASE("catalogue: channels + per-channel QueryList structure", "[dex][catalog]") {
     const auto channels = dex_channels();
-    CHECK(channels.size() == 12);
+    CHECK(channels.size() == 22);
     CHECK(std::find(channels.begin(), channels.end(), "Application") != channels.end());
     CHECK(std::find(channels.begin(), channels.end(), "System") != channels.end());
 
@@ -825,6 +837,133 @@ TEST_CASE("PRIVACY: ESENT corruption keeps the process, drops the db path",
     CHECK(o->subject == "svchost");
     for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
         CHECK(field.find("AppData") == std::string::npos);
+}
+
+// ── Wave-3 real-record + privacy pins (Win11 26100, harvested 2026-06-10) ────
+
+TEST_CASE("REAL records: Power-Troubleshooter 1 resume metric", "[dex][parse][real]") {
+    // Real layout: WakeDuration (ms) named alongside SleepTime/WakeTime stamps.
+    const auto o = extract_signal("System", "Microsoft-Windows-Power-Troubleshooter", 1, 4,
+                                  {{"SleepTime", "2026-06-09T19:55:32Z"},
+                                   {"WakeTime", "2026-06-10T09:22:29Z"},
+                                   {"WakeDuration", "2719"},
+                                   {"BiosInitDuration", "7588"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.resume_report");
+    CHECK(o->metric == 2719.0);
+    CHECK(o->sentence.find("2719 ms") != std::string::npos);
+}
+
+TEST_CASE("PRIVACY + REAL: User32 1074 restart — process + reason kept, user dropped",
+          "[dex][parse][real][privacy]") {
+    // Real layout: param1 = "path\app.exe (HOST)", param3 = reason, param5 =
+    // action, param7 = the initiating USER ("DGRHP\daver") — never read.
+    const EventFields f = {
+        {"param1", "C:\\Windows\\SystemApps\\Host\\StartMenuExperienceHost.exe (DGRHP)"},
+        {"param2", "DGRHP"},
+        {"param3", "Other (Unplanned)"},
+        {"param4", "0x0"},
+        {"param5", "restart"},
+        {"param6", ""},
+        {"param7", "DGRHP\\daver"}};
+    const auto o = extract_signal("System", "User32", 1074, 4, f);
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.restart_initiated");
+    CHECK(o->subject == "StartMenuExperienceHost.exe"); // basename, host suffix cut
+    CHECK(o->sentence.find("restart") != std::string::npos);
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("daver") == std::string::npos);
+}
+
+TEST_CASE("REAL records: any-error specs catch live ids (TPM 1801, Biometrics 1014, MDM 844)",
+          "[dex][parse][real]") {
+    // The any-id + level-filter pattern, validated against three real errors.
+    const auto tpm = extract_signal("System", "Microsoft-Windows-TPM-WMI", 1801, 2, {});
+    REQUIRE(tpm);
+    CHECK(tpm->obs_type == "hw.tpm_error");
+    CHECK(tpm->reason == "tpm-1801");
+
+    const auto bio = extract_signal(
+        "Microsoft-Windows-Biometrics/Operational", "Microsoft-Windows-Biometrics", 1014, 2,
+        {{"BiometricSensor", "Synaptics FS7605 Touch Fingerprint Sensor"}});
+    REQUIRE(bio);
+    CHECK(bio->obs_type == "logon.biometric_error");
+    CHECK(bio->subject.find("Synaptics") != std::string::npos);
+
+    const auto mdm = extract_signal(
+        "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin",
+        "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider", 844, 2,
+        {{"Message1", "Inbox"}, {"HRESULT", "0x3f"}});
+    REQUIRE(mdm);
+    CHECK(mdm->obs_type == "mgmt.mdm_error");
+    CHECK(mdm->reason == "0x3f");
+
+    // …and the level filter still drops informational records from those channels.
+    CHECK_FALSE(extract_signal("System", "Microsoft-Windows-TPM-WMI", 1801, 4, {}));
+}
+
+TEST_CASE("REAL records: AAD 1097 decimal error rendered as hex; no message text shipped",
+          "[dex][parse][real][privacy]") {
+    // Real layout: Error decimal + ErrorMessage free text (can embed UPNs in
+    // some failure shapes — never shipped).
+    const auto o = extract_signal("Microsoft-Windows-AAD/Operational", "Microsoft-Windows-AAD",
+                                  1097, 3,
+                                  {{"Error", "2325807322"},
+                                   {"ErrorMessage", "Token failure for dave.rae@contoso.com"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "logon.aad_token_error");
+    CHECK(o->reason == "0x8AA100DA"); // 2325807322 in hex
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("dave.rae") == std::string::npos);
+}
+
+TEST_CASE("PRIVACY: RDP disconnect never reads user or client address",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal(
+        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+        "Microsoft-Windows-TerminalServices-LocalSessionManager", 40, 4,
+        {{"Session", "3"}, {"User", "CONTOSO\\dave.rae"}, {"Address", "82.13.5.77"},
+         {"Reason", "5"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "session.rdp_disconnected");
+    CHECK(o->reason == "5");
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence}) {
+        CHECK(field.find("dave.rae") == std::string::npos);
+        CHECK(field.find("82.13") == std::string::npos);
+    }
+}
+
+TEST_CASE("PRIVACY: app file-access failure 1005 drops the file path",
+          "[dex][parse][privacy]") {
+    const auto o = extract_signal("Application", "Application Error", 1005, 2,
+                                  {{"", "C:\\Program Files\\Acme\\acme.exe"},
+                                   {"", "\\\\share\\users\\dave\\salary_review.xlsx"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "process.file_access_failure");
+    CHECK(o->subject == "acme.exe"); // basename of the app only
+    for (const std::string& field : {o->subject, o->reason, o->component, o->sentence})
+        CHECK(field.find("salary_review") == std::string::npos);
+}
+
+TEST_CASE("wave 3: dependency failure + port exhaustion + update download", "[dex][parse]") {
+    const auto dep = extract_signal("System", "Service Control Manager", 7001, 2,
+                                    {{"param1", "Print Spooler"}, {"param2", "HTTP Service"}});
+    REQUIRE(dep);
+    CHECK(dep->obs_type == "service.dependency_failed");
+    CHECK(dep->subject == "Print Spooler");
+    CHECK(dep->component == "HTTP Service");
+
+    const auto port = extract_signal("System", "Tcpip", 4231, 3, {});
+    REQUIRE(port);
+    CHECK(port->obs_type == "network.port_exhaustion");
+
+    const auto dl = extract_signal("System", "Microsoft-Windows-WindowsUpdateClient", 31, 2,
+                                   {{"errorCode", "0x80244018"},
+                                    {"updateTitle", "2026-06 Cumulative Update"}});
+    REQUIRE(dl);
+    CHECK(dl->obs_type == "update.download_failed");
+    CHECK(dl->subject == "2026-06 Cumulative Update");
+    CHECK(dl->reason == "0x80244018");
 }
 
 // ── Wire mapping (dex_event) ─────────────────────────────────────────────────

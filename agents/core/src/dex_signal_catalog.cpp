@@ -865,6 +865,331 @@ SignalObservation x_msi_uninstall_failed(const EventFields& f, int id) {
     return o;
 }
 
+// ── Wave-3 extractors (2026-06-10) ───────────────────────────────────────────
+// Real layouts pinned from a live box: Power-Troubleshooter 1 (WakeDuration ms),
+// User32 1074 (param7 = USER, dropped), TPM-WMI (real error id 1801 — validates
+// the any-id pattern), Biometrics 1014 (BiometricSensor named), AAD 1097
+// (decimal Error), MDM 844 (named HRESULT). The rest are manifest-best-effort
+// behind the whole-catalogue graceful-degradation test.
+
+SignalObservation x_fast_startup_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "fast startup";
+    o.reason = hex_reason(named_or_pos(f, "Status", 0));
+    o.symbolic = "FAST_STARTUP_FAILED";
+    o.sentence = "fast startup failed — the system fell back to a full boot";
+    return o;
+}
+
+SignalObservation x_resume_report(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "resume";
+    o.metric = parse_metric_ms(named(f, "WakeDuration")); // real: ms
+    o.sentence = o.metric > 0 ? std::format("resumed from sleep in {:.0f} ms", o.metric)
+                              : "resumed from sleep";
+    return o;
+}
+
+SignalObservation x_restart_initiated(const EventFields& f, int) {
+    SignalObservation o;
+    // Real 1074: param1 = "C:\...\app.exe (HOST)", param3 = reason text,
+    // param5 = action. PRIVACY: param7 is the initiating USER — never read.
+    std::string proc = strip_path(named_or_pos(f, "param1", 0));
+    if (auto sp = proc.find(" ("); sp != std::string::npos)
+        proc.resize(sp);
+    o.subject = clip(std::move(proc), 80);
+    const std::string action = named_or_pos(f, "param5", 4);
+    const std::string why = named_or_pos(f, "param3", 2);
+    o.reason = clip(why, 60);
+    o.symbolic = "RESTART_INITIATED";
+    o.sentence = (action.empty() ? std::string("restart/shutdown") : action) + " initiated" +
+                 (o.subject.empty() ? std::string{} : " by " + o.subject) +
+                 (why.empty() ? "" : " (" + clip(why, 60) + ")");
+    return o;
+}
+
+SignalObservation x_shadow_copies_lost(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "shadow copies";
+    o.symbolic = "SHADOW_COPIES_LOST";
+    o.sentence = "shadow copies were deleted under I/O pressure (restore points lost)";
+    return o;
+}
+
+SignalObservation x_crashdump_disabled(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "crash dump";
+    o.symbolic = "CRASHDUMP_DISABLED";
+    o.sentence = "crash dump initialization failed — a future BSOD would leave no dump";
+    return o;
+}
+
+SignalObservation x_dwm_exited(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "desktop window manager";
+    o.reason = clip(pos(f, 0), 40);
+    o.symbolic = "DWM_EXITED";
+    o.sentence = "the Desktop Window Manager exited (visible flicker/black screen)";
+    return o;
+}
+
+SignalObservation x_file_access_failure(const EventFields& f, int) {
+    SignalObservation o;
+    // PRIVACY: the inaccessible FILE PATH (often a user document) is dropped;
+    // the app name carries the diagnosis.
+    o.subject = strip_path(clip(pos(f, 0), 80));
+    o.symbolic = "FILE_ACCESS_FAILED";
+    o.sentence = "an application could not access a required file (disk or network problem)";
+    return o;
+}
+
+SignalObservation x_push_notification_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "push notifications";
+    o.reason = "wpn-" + std::to_string(id);
+    o.symbolic = "NOTIFICATION_ERROR";
+    o.sentence = "the push-notification platform reported an error";
+    return o;
+}
+
+SignalObservation x_file_association_reset(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "Extension", 0), 20);
+    o.symbolic = "ASSOCIATION_RESET";
+    o.sentence = "a file-type association was reset to the Windows default" +
+                 (o.subject.empty() ? std::string{} : " (" + o.subject + ")");
+    return o;
+}
+
+SignalObservation x_staterepo_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "app state repository";
+    o.reason = "sr-" + std::to_string(id);
+    o.symbolic = "STATEREPO_ERROR";
+    o.sentence = "the app state repository reported an error (Start/Search health)";
+    return o;
+}
+
+SignalObservation x_dependency_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = named_or_pos(f, "param1", 0);
+    o.component = named_or_pos(f, "param2", 1); // the dependency that failed
+    o.symbolic = "DEPENDENCY_FAILED";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' did not start because its dependency failed" +
+                 (o.component.empty() ? "" : " (" + o.component + ")");
+    return o;
+}
+
+SignalObservation x_flush_failed(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "ntfs";
+    o.symbolic = "FLUSH_FAILED";
+    o.sentence = "the system failed to flush data to the transaction log — corruption possible";
+    return o;
+}
+
+SignalObservation x_user_driver_error(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(strip_path(pos(f, 0)), 80);
+    o.symbolic = "USER_DRIVER_ERROR";
+    o.sentence = "a user-mode device driver (webcam/USB class) reported a problem";
+    return o;
+}
+
+SignalObservation x_tpm_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "tpm";
+    o.reason = "tpm-" + std::to_string(id); // real: 1801
+    o.symbolic = "TPM_ERROR";
+    o.sentence = "the TPM reported an error (Hello/BitLocker dependency)";
+    return o;
+}
+
+SignalObservation x_port_exhaustion(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "tcp ports";
+    o.reason = std::to_string(id);
+    o.symbolic = "PORT_EXHAUSTION";
+    o.sentence = "ephemeral TCP port allocation failed (port exhaustion — connections will "
+                 "fail until freed)";
+    return o;
+}
+
+SignalObservation x_smb_write_lost(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(pos(f, 0), 80); // \\server\share — corp infrastructure
+    o.symbolic = "DELAYED_WRITE_LOST";
+    o.sentence = "Windows lost delayed-write data on a network share";
+    return o;
+}
+
+SignalObservation x_dns_register_failed(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "dns registration";
+    o.reason = std::to_string(id);
+    o.symbolic = "DNS_REGISTER_FAILED";
+    o.sentence = "this host could not register its own DNS records";
+    return o;
+}
+
+SignalObservation x_rdp_disconnected(const EventFields& f, int id) {
+    SignalObservation o;
+    // PRIVACY: LSM events name the USER and the client ADDRESS — neither read.
+    o.subject = "rdp session";
+    const std::string why = named(f, "Reason");
+    o.reason = why.empty() ? std::to_string(id) : clip(why, 60);
+    o.symbolic = "RDP_DISCONNECTED";
+    o.sentence = "a remote desktop session was disconnected";
+    return o;
+}
+
+SignalObservation x_winlogon_terminated(const EventFields&, int) {
+    SignalObservation o;
+    o.subject = "winlogon";
+    o.symbolic = "WINLOGON_TERMINATED";
+    o.sentence = "the Windows logon process terminated unexpectedly";
+    return o;
+}
+
+SignalObservation x_machine_trust_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(pos(f, 0), 60); // the domain — corp infrastructure
+    o.reason = clip(pos(f, 1), 60);
+    o.symbolic = "MACHINE_TRUST_FAILED";
+    o.sentence = "this computer could not authenticate with its domain (broken trust)";
+    return o;
+}
+
+SignalObservation x_biometric_error(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = clip(named(f, "BiometricSensor"), 80); // real: sensor model
+    if (o.subject.empty())
+        o.subject = "biometric sensor";
+    o.reason = "bio-" + std::to_string(id);
+    o.symbolic = "BIOMETRIC_ERROR";
+    o.sentence = "a biometric (fingerprint/face) sensor reported an error";
+    return o;
+}
+
+SignalObservation x_hello_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "windows hello";
+    o.reason = "hello-" + std::to_string(id);
+    o.symbolic = "HELLO_ERROR";
+    o.sentence = "Windows Hello for Business reported an error";
+    return o;
+}
+
+SignalObservation x_aad_token_error(const EventFields& f, int id) {
+    SignalObservation o;
+    // PRIVACY: AAD ErrorMessage texts can embed UPNs — only the numeric error is
+    // taken (real layout: decimal 'Error' → render as hex).
+    o.subject = "entra sso";
+    o.reason = hex_reason(named(f, "Error"));
+    if (o.reason.empty())
+        o.reason = std::to_string(id);
+    o.symbolic = "AAD_TOKEN_ERROR";
+    o.sentence = "Entra ID (AAD) token acquisition error — SSO/sign-in may be failing";
+    return o;
+}
+
+SignalObservation x_auth_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "authentication";
+    o.reason = std::to_string(id);
+    o.symbolic = "AUTH_ERROR";
+    o.sentence = "the security system reported an authentication error";
+    return o;
+}
+
+SignalObservation x_tls_alert(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = "tls";
+    const std::string alert = named_or_pos(f, "AlertDesc", 0);
+    o.reason = alert.empty() ? std::to_string(id) : "alert " + clip(alert, 20);
+    o.symbolic = "TLS_ALERT";
+    o.sentence = "a fatal TLS alert was generated (secure connections failing)";
+    return o;
+}
+
+SignalObservation x_threat_action_failed(const EventFields& f, int) {
+    SignalObservation o;
+    // Same privacy posture as 1116: threat name kept, path + user dropped.
+    o.subject = clip(named(f, "Threat Name"), 80);
+    o.symbolic = "THREAT_ACTION_FAILED";
+    o.sentence = "antivirus could not complete its action against a detected threat";
+    return o;
+}
+
+SignalObservation x_rtp_error(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "real-time protection";
+    o.reason = named(f, "Error Code"); // Defender names carry spaces
+    o.symbolic = "RTP_ERROR";
+    o.sentence = "real-time protection encountered an error";
+    return o;
+}
+
+SignalObservation x_bitlocker_error(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "bitlocker";
+    o.reason = "bl-" + std::to_string(id);
+    o.symbolic = "BITLOCKER_ERROR";
+    o.sentence = "BitLocker reported an error";
+    return o;
+}
+
+SignalObservation x_cert_enroll_failed(const EventFields&, int id) {
+    SignalObservation o;
+    o.subject = "certificate enrollment";
+    o.reason = std::to_string(id);
+    o.symbolic = "CERT_ENROLL_FAILED";
+    o.sentence = "automatic certificate enrollment failed (expiring VPN/Wi-Fi certs ahead)";
+    return o;
+}
+
+SignalObservation x_update_check_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "update check";
+    o.reason = hex_reason(named_or_pos(f, "errorCode", 0));
+    o.symbolic = "UPDATE_CHECK_FAILED";
+    o.sentence = "checking for updates failed" + (o.reason.empty() ? "" : " (" + o.reason + ")");
+    return o;
+}
+
+SignalObservation x_update_download_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "updateTitle", 1), 120);
+    o.reason = hex_reason(named_or_pos(f, "errorCode", 0));
+    o.symbolic = "UPDATE_DOWNLOAD_FAILED";
+    o.sentence = "an update failed to download" +
+                 (o.subject.empty() ? std::string{} : ": " + o.subject);
+    return o;
+}
+
+SignalObservation x_gpo_cse_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "ExtensionName", 0), 60);
+    o.reason = hex_reason(named(f, "ErrorCode"));
+    o.symbolic = "GPO_CSE_FAILED";
+    o.sentence = "Windows failed to apply a Group Policy extension" +
+                 (o.subject.empty() ? std::string{} : " (" + o.subject + ")");
+    return o;
+}
+
+SignalObservation x_mdm_error(const EventFields& f, int id) {
+    SignalObservation o;
+    o.subject = "mdm agent";
+    o.reason = named(f, "HRESULT"); // real layout
+    if (o.reason.empty())
+        o.reason = "mdm-" + std::to_string(id);
+    o.symbolic = "MDM_ERROR";
+    o.sentence = "the device-management (MDM/Intune) agent reported an error";
+    return o;
+}
+
 // ── The catalogue ─────────────────────────────────────────────────────────────
 // 20 obs_types. Two are backed by dual provider spellings (BugCheck / Ntfs ship
 // under both classic and manifest names depending on build), so the spec count
@@ -1023,6 +1348,82 @@ const std::vector<SignalSpec>& catalog_impl() {
          "Microsoft-Windows-PrintService", {215}, 0, 12, &x_print_driver_failed},
         {"print.plugin_failed", "Microsoft-Windows-PrintService/Admin",
          "Microsoft-Windows-PrintService", {808}, 0, 12, &x_print_plugin_failed},
+
+        // ── Wave 3 (2026-06-10): +33 signals ─────────────────────────────────
+        // Boot, start-up & shutdown
+        {"boot.fast_startup_failed", "System", "Microsoft-Windows-Kernel-Boot", {29}, 0, 12,
+         &x_fast_startup_failed},
+        {"os.resume_report", "System", "Microsoft-Windows-Power-Troubleshooter", {1}, 0, 30,
+         &x_resume_report},
+        {"os.restart_initiated", "System", "User32", {1074}, 0, 12, &x_restart_initiated},
+        // System stability
+        {"os.shadow_copies_lost", "System", "volsnap", {25}, 0, 12, &x_shadow_copies_lost},
+        {"os.crashdump_disabled", "System", "volmgr", {46}, 0, 12, &x_crashdump_disabled},
+        {"display.dwm_exited", "Application", "Desktop Window Manager", {9009}, 0, 12,
+         &x_dwm_exited},
+        // App reliability
+        {"process.file_access_failure", "Application", "Application Error", {1005}, 0, 30,
+         &x_file_access_failure},
+        {"app.push_notification_error", "Microsoft-Windows-PushNotifications-Platform/Operational",
+         "Microsoft-Windows-PushNotifications-Platform", {}, 2, 12, &x_push_notification_error},
+        {"app.file_association_reset", "Microsoft-Windows-Shell-Core/AppDefaults",
+         "Microsoft-Windows-Shell-Core", {62}, 0, 12, &x_file_association_reset},
+        {"app.staterepo_error", "Microsoft-Windows-StateRepository/Operational",
+         "Microsoft-Windows-StateRepository", {}, 2, 12, &x_staterepo_error},
+        // Service health
+        {"service.dependency_failed", "System", "Service Control Manager", {7001}, 0, 30,
+         &x_dependency_failed},
+        // File system
+        {"fs.flush_failed", "System", "Ntfs", {57}, 0, 12, &x_flush_failed},
+        // Hardware & storage
+        {"hw.user_driver_error", "Microsoft-Windows-DriverFrameworks-UserMode/Operational",
+         "Microsoft-Windows-DriverFrameworks-UserMode", {10110, 10111}, 0, 12,
+         &x_user_driver_error},
+        {"hw.tpm_error", "System", "Microsoft-Windows-TPM-WMI", {}, 2, 12, &x_tpm_error},
+        // Network
+        {"network.port_exhaustion", "System", "Tcpip", {4227, 4231}, 0, 12, &x_port_exhaustion},
+        {"network.smb_write_lost", "System", "mrxsmb", {50}, 0, 12, &x_smb_write_lost},
+        {"network.dns_register_failed", "System", "Microsoft-Windows-DNS-Client", {8015, 8016}, 0,
+         12, &x_dns_register_failed},
+        {"session.rdp_disconnected",
+         "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+         "Microsoft-Windows-TerminalServices-LocalSessionManager", {24, 39, 40}, 0, 30,
+         &x_rdp_disconnected},
+        // Identity & logon
+        {"logon.winlogon_terminated", "Application", "Microsoft-Windows-Winlogon", {4005}, 0, 12,
+         &x_winlogon_terminated},
+        {"logon.machine_trust_failed", "System", "NETLOGON", {3210}, 0, 12,
+         &x_machine_trust_failed},
+        {"logon.biometric_error", "Microsoft-Windows-Biometrics/Operational",
+         "Microsoft-Windows-Biometrics", {}, 2, 12, &x_biometric_error},
+        {"logon.hello_error", "Microsoft-Windows-HelloForBusiness/Operational",
+         "Microsoft-Windows-HelloForBusiness", {}, 2, 12, &x_hello_error},
+        {"logon.aad_token_error", "Microsoft-Windows-AAD/Operational", "Microsoft-Windows-AAD",
+         {1097, 1098}, 0, 12, &x_aad_token_error},
+        {"security.auth_error", "System", "LsaSrv", {40960, 40961}, 0, 12, &x_auth_error},
+        // Security & protection
+        {"security.tls_alert", "System", "Schannel", {36874, 36887}, 0, 12, &x_tls_alert},
+        {"security.threat_action_failed", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {1119}, 0, 12, &x_threat_action_failed},
+        {"security.rtp_error", "Microsoft-Windows-Windows Defender/Operational",
+         "Microsoft-Windows-Windows Defender", {3002}, 0, 12, &x_rtp_error},
+        {"security.bitlocker_error", "Microsoft-Windows-BitLocker/BitLocker Management",
+         "Microsoft-Windows-BitLocker-API", {}, 2, 12, &x_bitlocker_error},
+        {"security.cert_enroll_failed", "Application",
+         "Microsoft-Windows-CertificateServicesClient-AutoEnrollment", {6, 13}, 0, 12,
+         &x_cert_enroll_failed},
+        // Updates & installs
+        {"update.check_failed", "System", "Microsoft-Windows-WindowsUpdateClient", {16, 25}, 0,
+         12, &x_update_check_failed},
+        {"update.download_failed", "System", "Microsoft-Windows-WindowsUpdateClient", {31}, 0, 12,
+         &x_update_download_failed},
+        // Policy & management
+        {"gpo.cse_failed", "System", "Microsoft-Windows-GroupPolicy", {1085}, 0, 12,
+         &x_gpo_cse_failed},
+        {"mgmt.mdm_error",
+         "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin",
+         "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider", {}, 2, 12,
+         &x_mdm_error},
     };
     return kCatalog;
 }

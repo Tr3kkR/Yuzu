@@ -58,38 +58,50 @@ struct DexSignalGroup {
 const std::vector<DexSignalGroup>& dex_signal_groups() {
     static const std::vector<DexSignalGroup> kGroups = {
         {"App reliability",
-         {"process.crashed", "process.hung", "process.crashed_managed", "app.sxs_error",
-          "app.activation_failed", "app.com_failed", "app.error_popup", "app.shutdown_blocked"}},
+         {"process.crashed", "process.hung", "process.crashed_managed",
+          "process.file_access_failure", "app.sxs_error", "app.activation_failed",
+          "app.com_failed", "app.error_popup", "app.shutdown_blocked",
+          "app.push_notification_error", "app.file_association_reset", "app.staterepo_error"}},
         {"Boot, start-up & shutdown",
          {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
-          "boot.degraded_device", "os.shutdown", "shutdown.degraded", "os.standby",
-          "os.standby_degraded", "os.uptime_report"}},
+          "boot.degraded_device", "boot.fast_startup_failed", "os.shutdown",
+          "shutdown.degraded", "os.restart_initiated", "os.standby", "os.standby_degraded",
+          "os.resume_report", "os.uptime_report"}},
         {"Service health",
          {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
-          "service.logon_failed", "service.recovery_failed"}},
+          "service.logon_failed", "service.recovery_failed", "service.dependency_failed"}},
         {"System stability",
          {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
-          "os.activation_failed", "os.vss_error", "display.driver_reset", "memory.exhausted"}},
+          "os.activation_failed", "os.vss_error", "os.shadow_copies_lost",
+          "os.crashdump_disabled", "display.driver_reset", "display.dwm_exited",
+          "memory.exhausted"}},
         {"Hardware & storage",
-         {"hw.error", "hw.device_start_failed", "hw.cpu_throttled", "disk.error",
-          "disk.smart_failure", "disk.port_reset"}},
+         {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
+          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset"}},
         {"File system",
-         {"fs.corruption", "fs.write_lost", "fs.database_corrupt", "fs.hive_recovered",
-          "fs.autochk_ran"}},
+         {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
+          "fs.hive_recovered", "fs.autochk_ran"}},
         {"Network",
          {"network.wifi_drop", "network.wifi_connect_failed", "network.dns_timeout",
-          "network.dhcp_failed", "network.vpn_failed", "network.smb_failed",
-          "network.ip_conflict", "network.name_conflict"}},
+          "network.dns_register_failed", "network.dhcp_failed", "network.vpn_failed",
+          "network.smb_failed", "network.smb_write_lost", "network.ip_conflict",
+          "network.name_conflict", "network.port_exhaustion", "session.rdp_disconnected"}},
         {"Identity & logon",
          {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
-          "logon.folder_redirect_failed", "logon.no_dc", "security.kerberos_error",
-          "gpo.failed"}},
+          "logon.folder_redirect_failed", "logon.no_dc", "logon.winlogon_terminated",
+          "logon.machine_trust_failed", "logon.biometric_error", "logon.hello_error",
+          "logon.aad_token_error", "security.kerberos_error", "security.auth_error"}},
         {"Security & protection",
-         {"security.rtp_disabled", "security.threat_detected", "security.av_update_failed",
-          "security.tamper_blocked"}},
+         {"security.rtp_disabled", "security.rtp_error", "security.threat_detected",
+          "security.threat_action_failed", "security.av_update_failed",
+          "security.tamper_blocked", "security.tls_alert", "security.bitlocker_error",
+          "security.cert_enroll_failed"}},
         {"Updates & installs",
-         {"update.failed", "update.transfer_failed", "app_install.failed",
-          "app_uninstall.failed", "app_install.appx_failed"}},
+         {"update.failed", "update.check_failed", "update.download_failed",
+          "update.transfer_failed", "app_install.failed", "app_uninstall.failed",
+          "app_install.appx_failed"}},
+        {"Policy & management",
+         {"gpo.failed", "gpo.cse_failed", "mgmt.mdm_error"}},
         {"Printing",
          {"print.failed", "print.driver_install_failed", "print.plugin_failed"}},
     };
@@ -178,6 +190,40 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "update.transfer_failed") return "Download failure (BITS)";
     if (obs_type == "print.driver_install_failed") return "Printer driver failure";
     if (obs_type == "print.plugin_failed") return "Print spooler plug-in failure";
+    // Wave 3 (2026-06-10)
+    if (obs_type == "boot.fast_startup_failed") return "Fast startup failure";
+    if (obs_type == "os.resume_report") return "Resume from sleep";
+    if (obs_type == "os.restart_initiated") return "Restart initiated";
+    if (obs_type == "os.shadow_copies_lost") return "Restore points lost";
+    if (obs_type == "os.crashdump_disabled") return "Crash dump disabled";
+    if (obs_type == "display.dwm_exited") return "Window manager exited";
+    if (obs_type == "process.file_access_failure") return "App file-access failure";
+    if (obs_type == "app.push_notification_error") return "Notification platform error";
+    if (obs_type == "app.file_association_reset") return "File association reset";
+    if (obs_type == "app.staterepo_error") return "App repository error";
+    if (obs_type == "service.dependency_failed") return "Service dependency failure";
+    if (obs_type == "fs.flush_failed") return "Disk flush failure";
+    if (obs_type == "hw.user_driver_error") return "Peripheral driver error";
+    if (obs_type == "hw.tpm_error") return "TPM error";
+    if (obs_type == "network.port_exhaustion") return "TCP port exhaustion";
+    if (obs_type == "network.smb_write_lost") return "Share write lost";
+    if (obs_type == "network.dns_register_failed") return "DNS registration failure";
+    if (obs_type == "session.rdp_disconnected") return "Remote session disconnect";
+    if (obs_type == "logon.winlogon_terminated") return "Logon process terminated";
+    if (obs_type == "logon.machine_trust_failed") return "Machine trust failure";
+    if (obs_type == "logon.biometric_error") return "Biometric sensor error";
+    if (obs_type == "logon.hello_error") return "Windows Hello error";
+    if (obs_type == "logon.aad_token_error") return "Entra ID token error";
+    if (obs_type == "security.auth_error") return "Authentication error";
+    if (obs_type == "security.tls_alert") return "TLS failure";
+    if (obs_type == "security.threat_action_failed") return "Threat removal failure";
+    if (obs_type == "security.rtp_error") return "Protection engine error";
+    if (obs_type == "security.bitlocker_error") return "BitLocker error";
+    if (obs_type == "security.cert_enroll_failed") return "Certificate enrollment failure";
+    if (obs_type == "update.check_failed") return "Update check failure";
+    if (obs_type == "update.download_failed") return "Update download failure";
+    if (obs_type == "gpo.cse_failed") return "Policy extension failure";
+    if (obs_type == "mgmt.mdm_error") return "MDM/Intune error";
     return esc(obs_type); // forward-compatible fallback
 }
 

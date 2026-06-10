@@ -67,7 +67,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: empty store still lists ALL 70 monitored signal types, grouped",
+TEST_CASE("DEX overview: empty store still lists ALL 103 monitored signal types, grouped",
           "[dex][routes]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -77,12 +77,12 @@ TEST_CASE("DEX overview: empty store still lists ALL 70 monitored signal types, 
     GuaranteedStateStore store(":memory:");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{});
 
-    // The 11 group headings.
+    // The 12 group headings.
     for (const char* group :
          {"App reliability", "Boot, start-up &amp; shutdown", "Service health",
           "System stability", "Hardware &amp; storage", "File system", "Network",
           "Identity &amp; logon", "Security &amp; protection", "Updates &amp; installs",
-          "Printing"})
+          "Policy &amp; management", "Printing"})
         CHECK(html.find(group) != std::string::npos);
 
     // All 70 labels.
@@ -110,10 +110,22 @@ TEST_CASE("DEX overview: empty store still lists ALL 70 monitored signal types, 
           "Profile unload blocked", "Folder redirection failure", "Real-time protection off",
           "Malware detected", "AV update failure", "Tamper attempt blocked",
           "App uninstall failure", "Store app install failure", "Download failure (BITS)",
-          "Printer driver failure", "Print spooler plug-in failure"})
+          "Printer driver failure", "Print spooler plug-in failure",
+          // wave 3
+          "Fast startup failure", "Resume from sleep", "Restart initiated",
+          "Restore points lost", "Crash dump disabled", "Window manager exited",
+          "App file-access failure", "Notification platform error", "File association reset",
+          "App repository error", "Service dependency failure", "Disk flush failure",
+          "Peripheral driver error", "TPM error", "TCP port exhaustion", "Share write lost",
+          "DNS registration failure", "Remote session disconnect", "Logon process terminated",
+          "Machine trust failure", "Biometric sensor error", "Windows Hello error",
+          "Entra ID token error", "Authentication error", "TLS failure",
+          "Threat removal failure", "Protection engine error", "BitLocker error",
+          "Certificate enrollment failure", "Update check failure", "Update download failure",
+          "Policy extension failure", "MDM/Intune error"})
         CHECK(html.find(label) != std::string::npos);
 
-    CHECK(html.find("All 70 monitored signal types") != std::string::npos);
+    CHECK(html.find("All 103 monitored signal types") != std::string::npos);
     // No fabricated numbers: quiet rows carry a literal zero count.
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
