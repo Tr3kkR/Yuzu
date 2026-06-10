@@ -21,6 +21,7 @@
     "cli11",
     "cpp-httplib",
     "sqlite3",
+    "libpq",
     "openssl",
     {
       "name": "catch2",

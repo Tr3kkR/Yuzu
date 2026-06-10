@@ -378,3 +378,13 @@ executable(
   dependencies: [yuzu_server_core_dep, cli11_dep] + auth_crypto_deps,
   install: true,
 )
+
+# Postgres F0 static-link canary (#1317, ADR-0008): proves libpq links on the
+# MSVC static triplet before any substrate code is committed (the #375 lesson).
+# Throwaway — folded into the pg/ substrate when F1 (#1320) lands.
+executable(
+  'yuzu_pg_canary',
+  files('src/pg/canary_main.cpp'),
+  dependencies: [libpq_dep],
+  install: false,
+)

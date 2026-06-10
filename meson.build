@@ -273,6 +273,44 @@ endif
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'],
   required: true, include_type: 'system')
 
+# libpq — Postgres client library for the server storage substrate (ADR-0006/
+# ADR-0008). vcpkg builds it static on every triplet we use, and static libpq
+# needs the companion libpgcommon/libpgport archives (scram/auth helpers live
+# there) that neither cmake's FindPostgreSQL nor any imported target carries —
+# only libpq.pc's Libs.private lists them, and pkg-config isn't wired to the
+# vcpkg prefix in this build. So: resolve libpq via cmake (unix) or hand-wired
+# find_library (windows, same reasoning as the #375 protobuf/grpc block above),
+# then add pgcommon/pgport from the vcpkg lib dir explicitly.
+if host_os == 'windows'
+  _libpq_libs = []
+  foreach _pq_name : ['libpq', 'libpgcommon', 'libpgport']
+    _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win], required: true)
+  endforeach
+  # Static libpq's Windows auth paths (SSPI) and socket layer need these
+  # system libs; libssl/libcrypto are reused from the grpc block above.
+  foreach _pq_sys : ['ws2_32', 'secur32', 'advapi32', 'shell32', 'crypt32']
+    _libpq_libs += _cxx.find_library(_pq_sys, required: true)
+  endforeach
+  libpq_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: _libpq_libs + [_libssl, _libcrypto],
+  )
+else
+  libpq_dep = dependency('PostgreSQL', method: 'cmake', modules: ['PostgreSQL::PostgreSQL'],
+    required: true, include_type: 'system')
+  _pq_prefixes = get_option('cmake_prefix_path')
+  _pq_extras = []
+  foreach _pq_name : ['pgcommon', 'pgport']
+    _pq_extras += cxx.find_library(_pq_name,
+      dirs: _pq_prefixes.length() > 0 ? [_pq_prefixes[0] / 'lib'] : [],
+      required: true)
+  endforeach
+  # vcpkg's libpq is built with the openssl feature, so libpq.a's TLS layer
+  # (fe-secure-openssl.o) needs libssl/libcrypto at final link.
+  _pq_openssl = dependency('openssl', required: true, include_type: 'system')
+  libpq_dep = declare_dependency(dependencies: [libpq_dep] + _pq_extras + [_pq_openssl])
+endif
+
 # macOS frameworks needed by gRPC, abseil, and cpp-httplib
 if host_os == 'darwin'
   corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
