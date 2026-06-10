@@ -67,12 +67,24 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: empty store renders 'no signals' placeholder, no fabricated rows",
+TEST_CASE("DEX overview: empty store still lists ALL 20 monitored signal types",
           "[dex][routes]") {
+    // Visibility contract (Dave 2026-06-10): operators must see what the fleet
+    // is MONITORING, not just what fired — every catalogued type renders, quiet
+    // ones as muted real-zero rows. Zeros are facts, not mock data.
     GuaranteedStateStore store(":memory:");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{});
-    CHECK(html.find("No signals observed") != std::string::npos);
-    CHECK(html.find("gp-table") == std::string::npos); // no mock tables
+    for (const char* label :
+         {"App crash", "App hang", "Service crash", "Service start failure",
+          "Blue screen (bugcheck)", "Unexpected reboot", "Display driver reset",
+          "Hardware error", "Disk error", "Filesystem corruption", "Memory exhaustion",
+          "Boot", "Update failure", "App install failure", "Profile failure",
+          "Group Policy failure", "Wi-Fi disconnect", "DNS timeout", "IP address conflict",
+          "Print failure"})
+        CHECK(html.find(label) != std::string::npos);
+    CHECK(html.find("monitored signal types") != std::string::npos);
+    // No fabricated numbers: quiet rows carry a literal zero count.
+    CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
 
 TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]") {

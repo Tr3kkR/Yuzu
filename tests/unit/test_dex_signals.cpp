@@ -428,6 +428,155 @@ TEST_CASE("extract_signal: uncatalogued events return nullopt", "[dex][parse]") 
     CHECK_FALSE(extract_signal("", "", 0, 0, {}));
 }
 
+// ── REAL captured records (Win11 26100, harvested 2026-06-10) ────────────────
+// Full-chain pins (XML -> system fields + named data -> extract_signal) against
+// REAL event-log records from a live box — the same discipline as the crash
+// fixture. These are the records that promoted their extractors from
+// "manifest-best-effort" to "verified against a real capture".
+
+namespace {
+// SCM 7031 — a real service crash ("HP Insights Analytics"): named param1..param5.
+constexpr const char* kReal7031 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Service Control Manager' Guid='{555908d1-a6d7-4695-8e1e-26931d2012f4}' "
+    "EventSourceName='Service Control Manager'/><EventID Qualifiers='49152'>7031</EventID>"
+    "<Version>0</Version><Level>2</Level><Channel>System</Channel></System><EventData>"
+    "<Data Name='param1'>HP Insights Analytics</Data><Data Name='param2'>1</Data>"
+    "<Data Name='param3'>30000</Data><Data Name='param4'>1</Data>"
+    "<Data Name='param5'>Restart the service</Data>"
+    "<Binary>480070005400</Binary></EventData></Event>";
+
+// Kernel-Power 41 — a real unexpected reboot with BugcheckCode 0 (pure power loss).
+constexpr const char* kReal41 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/>"
+    "<EventID>41</EventID><Version>10</Version><Level>1</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='BugcheckCode'>0</Data><Data Name='BugcheckParameter1'>0x0</Data>"
+    "<Data Name='SleepInProgress'>0</Data><Data Name='PowerButtonTimestamp'>0</Data>"
+    "<Data Name='LidState'>1</Data><Data Name='WHEABootErrorCount'>0</Data></EventData></Event>";
+
+// Diagnostics-Performance 100 — a real 64.9 s boot (BootTime in ms, named).
+constexpr const char* kReal100 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Diagnostics-Performance' "
+    "Guid='{cfc18ec0-96b1-4eba-961b-622caee05b0a}'/><EventID>100</EventID><Version>2</Version>"
+    "<Level>2</Level><Channel>Microsoft-Windows-Diagnostics-Performance/Operational</Channel>"
+    "</System><EventData><Data Name='BootTsVersion'>2</Data>"
+    "<Data Name='BootStartTime'>2026-06-09T14:00:12.7424637Z</Data>"
+    "<Data Name='SystemBootInstance'>11</Data><Data Name='BootTime'>64934</Data>"
+    "<Data Name='MainPathBootTime'>29434</Data><Data Name='BootKernelInitTime'>33</Data>"
+    "<Data Name='BootIsDegradation'>false</Data><Data Name='UserLogonWaitDuration'>5375</Data>"
+    "</EventData></Event>";
+
+// WindowsUpdateClient 20 — a real store-app update failure (named errorCode/title).
+constexpr const char* kReal20 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-WindowsUpdateClient' "
+    "Guid='{945a8954-c147-4acd-923f-40c45405a658}'/><EventID>20</EventID><Version>1</Version>"
+    "<Level>2</Level><Channel>System</Channel></System><EventData>"
+    "<Data Name='errorCode'>0x80073d02</Data>"
+    "<Data Name='updateTitle'>9MSSGKG348SP-MicrosoftWindows.Client.WebExperience</Data>"
+    "<Data Name='updateGuid'>{6cfae217-28ff-4d71-9d9b-ebbc16a3041c}</Data>"
+    "<Data Name='updateRevisionNumber'>1</Data></EventData></Event>";
+
+// MsiInstaller 11708 — a real MSI install failure: classic UNNAMED positional Data
+// (plus (NULL) filler + a Binary element the parser must skip).
+constexpr const char* kReal11708 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='MsiInstaller'/><EventID Qualifiers='0'>11708</EventID><Version>0</Version>"
+    "<Level>4</Level><Channel>Application</Channel></System><EventData>"
+    "<Data>Product: Zoom VDI Plugin Management(64bit) -- Installation failed.</Data>"
+    "<Data>(NULL)</Data><Data>(NULL)</Data><Data>(NULL)</Data>"
+    "<Binary>7B4432383537</Binary></EventData></Event>";
+
+// WLAN-AutoConfig 8003 — a real Wi-Fi disconnect. NOTE: Level 4 (informational) —
+// pins that the wifi spec carries NO level filter (a max_level would silence it).
+constexpr const char* kReal8003 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-WLAN-AutoConfig' "
+    "Guid='{9580d7dd-0379-4658-9870-d5be7d52d6de}'/><EventID>8003</EventID><Version>0</Version>"
+    "<Level>4</Level><Channel>Microsoft-Windows-WLAN-AutoConfig/Operational</Channel></System>"
+    "<EventData><Data Name='InterfaceGuid'>{61bf35ae-4999-4499-a618-0d74fab75d8d}</Data>"
+    "<Data Name='InterfaceDescription'>Intel(R) Wi-Fi 6 AX201 160MHz</Data>"
+    "<Data Name='ConnectionMode'>Automatic connection with a profile</Data>"
+    "<Data Name='ProfileName'>Samsung Smart Fridge</Data>"
+    "<Data Name='SSID'>Samsung Smart Fridge</Data><Data Name='BSSType'>Infrastructure</Data>"
+    "<Data Name='Reason'>The network is disconnected by the driver.</Data>"
+    "<Data Name='ReasonCode'>0</Data></EventData></Event>";
+
+// disk 11 — a real controller error: classic UNNAMED positional device path. This
+// record is WHY event 11 joined the disk.error id list (real Win11 disk failures
+// landed there, not in the manifest-guessed 7/51/153).
+constexpr const char* kRealDisk11 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='disk'/><EventID Qualifiers='49156'>11</EventID><Version>0</Version>"
+    "<Level>2</Level><Channel>System</Channel></System><EventData>"
+    "<Data>\\Device\\Harddisk1\\DR1</Data><Binary>0F008000</Binary></EventData></Event>";
+
+// Run one real record through the FULL chain, exactly as the engine does.
+std::optional<SignalObservation> run_chain(const char* xml) {
+    const auto sys = extract_system_fields(xml);
+    return extract_signal(sys.channel, sys.provider, sys.event_id, sys.level,
+                          extract_named_data(xml));
+}
+} // namespace
+
+TEST_CASE("REAL records: service crash 7031 (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kReal7031);
+    REQUIRE(o);
+    CHECK(o->obs_type == "service.crashed");
+    CHECK(o->subject == "HP Insights Analytics");
+    CHECK(o->sentence.find("terminated unexpectedly") != std::string::npos);
+}
+
+TEST_CASE("REAL records: kernel-power 41 power loss (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kReal41);
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.power_loss");
+    CHECK(o->reason == "power loss"); // BugcheckCode 0 -> the pure power-loss path
+    CHECK(o->symbolic == "UNEXPECTED_REBOOT");
+}
+
+TEST_CASE("REAL records: boot 100 duration metric (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kReal100);
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.boot");
+    CHECK(o->metric == 64934.0); // a real 64.9 s boot
+}
+
+TEST_CASE("REAL records: update failure 20 (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kReal20);
+    REQUIRE(o);
+    CHECK(o->obs_type == "update.failed");
+    CHECK(o->subject == "9MSSGKG348SP-MicrosoftWindows.Client.WebExperience");
+    CHECK(o->reason == "0x80073d02");
+}
+
+TEST_CASE("REAL records: MSI 11708 positional parse (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kReal11708);
+    REQUIRE(o);
+    CHECK(o->obs_type == "app_install.failed");
+    CHECK(o->subject == "Zoom VDI Plugin Management(64bit)");
+}
+
+TEST_CASE("REAL records: wifi 8003 at informational level (full chain)",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kReal8003);
+    REQUIRE(o);
+    CHECK(o->obs_type == "network.wifi_drop");
+    CHECK(o->subject == "Samsung Smart Fridge");
+    CHECK(o->reason.find("disconnected by the driver") != std::string::npos);
+    CHECK(o->component.find("AX201") != std::string::npos);
+}
+
+TEST_CASE("REAL records: disk controller error 11 (full chain)", "[dex][parse][real]") {
+    const auto o = run_chain(kRealDisk11);
+    REQUIRE(o);
+    CHECK(o->obs_type == "disk.error");
+    CHECK(o->subject == "\\Device\\Harddisk1\\DR1");
+    CHECK(o->symbolic == "CONTROLLER_ERROR");
+}
+
 // ── Wire mapping (dex_event) ─────────────────────────────────────────────────
 
 namespace {

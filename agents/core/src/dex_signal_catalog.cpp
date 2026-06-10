@@ -209,6 +209,7 @@ SignalObservation x_disk_error(const EventFields& f, int id) {
     o.reason = std::to_string(id);
     switch (id) {
     case 7:   o.symbolic = "BAD_BLOCK"; break;
+    case 11:  o.symbolic = "CONTROLLER_ERROR"; break; // live-observed (Win11 26100)
     case 51:  o.symbolic = "PAGING_ERROR"; break;
     case 153: o.symbolic = "IO_RETRIED"; break;
     default:  o.symbolic = "DISK_ERROR"; break;
@@ -371,7 +372,9 @@ const std::vector<SignalSpec>& catalog_impl() {
         {"os.power_loss", "System", "Microsoft-Windows-Kernel-Power", {41}, 0, 30, &x_power_loss},
         {"display.driver_reset", "System", "Display", {4101}, 0, 60, &x_display_reset},
         {"hw.error", "System", "Microsoft-Windows-WHEA-Logger", {}, 3, 30, &x_whea},
-        {"disk.error", "System", "disk", {7, 51, 153}, 0, 30, &x_disk_error},
+        // Event 11 (controller error) added after a real Win11 box showed its disk
+        // failures land there, not only 7/51/153.
+        {"disk.error", "System", "disk", {7, 11, 51, 153}, 0, 30, &x_disk_error},
         {"fs.corruption", "System", "Ntfs", {55}, 0, 30, &x_fs_corruption},
         {"fs.corruption", "System", "Microsoft-Windows-Ntfs", {55}, 0, 30, &x_fs_corruption},
         {"memory.exhausted", "System", "Microsoft-Windows-Resource-Exhaustion-Detector", {2004}, 0,

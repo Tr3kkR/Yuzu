@@ -7,6 +7,7 @@
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <iterator> // std::size (catalogue array)
 #include <string>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp);
@@ -41,6 +42,20 @@ std::string esc(const std::string& s) {
 }
 
 std::string num(int64_t n) { return std::to_string(n); }
+
+// The 20 catalogued signal types in display order — the server-side mirror of
+// the agent catalogue (dex_signal_catalog.cpp). The All-signals panel renders
+// EVERY entry, fired or not, so operators see what the fleet is monitoring —
+// not just what happened to fire in the window. Types present in the DB but
+// absent here (a newer agent's signal) are appended with the raw-label
+// fallback, so the panel never hides data.
+constexpr const char* kDexCatalogueOrder[] = {
+    "process.crashed",  "process.hung",        "service.crashed", "service.start_failed",
+    "os.bugcheck",      "os.power_loss",       "display.driver_reset", "hw.error",
+    "disk.error",       "fs.corruption",       "memory.exhausted", "os.boot",
+    "update.failed",    "app_install.failed",  "logon.temp_profile", "gpo.failed",
+    "network.wifi_drop", "network.dns_timeout", "network.ip_conflict", "print.failed",
+};
 
 // Friendly display label for an obs_type — the ONE place the catalogue taxonomy
 // meets the UI. Unknown types fall back to the escaped raw obs_type, so a signal
@@ -192,13 +207,10 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     head += "<div class=\"gp-filters\">" + chip("24h", "24h") + chip("7d", "7d") +
             chip("30d", "30d") + chip("all", "All") + "</div>";
 
-    // The whole-catalogue rollup decides the empty state: no signals at all →
-    // one honest placeholder, no fabricated panels.
+    // The whole-catalogue rollup. NOTE: no whole-page empty state any more —
+    // the All-signals panel below always lists every catalogued type, fired or
+    // not (zero counts are real data: "monitored, nothing happened").
     const auto signals = store->dex_signal_summary(since);
-    if (signals.empty())
-        return head + placeholder("No signals observed",
-                                  "No reliability signals recorded across the fleet in this "
-                                  "window.");
 
     const auto summary = store->dex_crash_summary(since);
     const auto apps = store->dex_top_apps(since, 20);
@@ -258,16 +270,43 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
          "OS with a signal collector today); offline agents are excluded, not counted as crash-free. "
          "macOS/Linux: collector pending.</div>";
 
-    // All signals — the whole-catalogue rollup. A signal type appears here the
-    // moment one device reports it; the deeper panels below cover the headline
-    // families (apps / boot / crash detail).
+    // All signals — every catalogued type, fired or not (stable catalogue order),
+    // then any uncatalogued types the DB carries (newer-agent forward-compat).
+    // Quiet rows render muted with a real zero — monitored, nothing happened.
     h += "<div class=\"gp-sech\">All signals</div>";
+    h += "<div class=\"gp-note\">All " + std::to_string(std::size(kDexCatalogueOrder)) +
+         " monitored signal types are listed; a dash means no events in this window.</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th class=\"gp-num\">Events</th>"
          "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
-    for (const auto& sig : signals) {
-        h += "<tr><td>" + dex_signal_label(sig.obs_type) + "</td><td class=\"gp-num\">" +
-             num(sig.count) + "</td><td class=\"gp-num\">" + num(sig.distinct_devices) +
-             "</td><td class=\"gp-mute\">" + esc(sig.last_seen) + "</td></tr>";
+    auto sig_row = [&](const std::string& obs_type, const DexSignalCount* c) {
+        if (c) {
+            h += "<tr><td>" + dex_signal_label(obs_type) + "</td><td class=\"gp-num\">" +
+                 num(c->count) + "</td><td class=\"gp-num\">" + num(c->distinct_devices) +
+                 "</td><td class=\"gp-mute\">" + esc(c->last_seen) + "</td></tr>";
+        } else {
+            h += "<tr class=\"gp-mute\"><td>" + dex_signal_label(obs_type) +
+                 "</td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
+                 "<td class=\"gp-mute\">&mdash;</td></tr>";
+        }
+    };
+    for (const char* t : kDexCatalogueOrder) {
+        const DexSignalCount* hit = nullptr;
+        for (const auto& sig : signals)
+            if (sig.obs_type == t) {
+                hit = &sig;
+                break;
+            }
+        sig_row(t, hit);
+    }
+    for (const auto& sig : signals) { // uncatalogued extras (forward-compat)
+        bool known = false;
+        for (const char* t : kDexCatalogueOrder)
+            if (sig.obs_type == t) {
+                known = true;
+                break;
+            }
+        if (!known)
+            sig_row(sig.obs_type, &sig);
     }
     h += "</tbody></table>";
 

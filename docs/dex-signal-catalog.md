@@ -41,7 +41,7 @@ remove once that window closes.
 | 6 | `os.power_loss` | System / Kernel-Power / 41 | Unexpected reboot (6008 deliberately excluded — co-fires with 41, would double-count) | 30 | — | fixture |
 | 7 | `display.driver_reset` | System / Display / 4101 | GPU TDR (screen freeze/flash) | 60 | — | fixture |
 | 8 | `hw.error` | System / WHEA-Logger / any id, Level ≤ 3 | Hardware (CPU/PCIe/memory) error | 30 | — | fixture |
-| 9 | `disk.error` | System / disk / 7, 51, 153 | Failing disk I/O (bad block / paging / retried) | 30 | — | fixture |
+| 9 | `disk.error` | System / disk / 7, 11, 51, 153 | Failing disk I/O (bad block / controller / paging / retried) | 30 | — | **real record** (event 11 added after a live box showed its disk failures land there) |
 | 10 | `fs.corruption` | System / Ntfs **and** Microsoft-Windows-Ntfs / 55 | Filesystem corruption | 30 | — | fixture |
 | 11 | `memory.exhausted` | System / Resource-Exhaustion-Detector / 2004 | Commit-charge exhaustion | 12 | — | fixture |
 | 12 | `os.boot` | Diagnostics-Performance/Operational / 100 | Boot duration (ms, every boot — trendable) | 30 | — | fixture |
@@ -56,8 +56,26 @@ remove once that window closes.
 
 "fixture" = the extractor is pinned by a unit fixture encoding the provider's
 manifest field layout; field-name drift on a real box degrades gracefully
-(empty `subject`, occurrence still counted). Promote to **live** as each signal
-is observed on a real rig — the crash + service canaries run in UAT today.
+(empty `subject`, occurrence still counted).
+
+**Real-record verification (2026-06-10):** full-chain fixtures captured from a
+live Win11 26100 box now pin `process.crashed` (slice 1), `service.crashed`
+(7031), `service.start_failed` (7000 incl. the `%%1053` message-resource form),
+`os.power_loss` (41), `os.boot` (100, 64.9 s boot), `update.failed` (20),
+`app_install.failed` (11708), `network.wifi_drop` (8003 — **Level 4**, which is
+why that spec carries no level filter), and `disk.error` (11). `process.hung`
+is canary-verified through the live pipeline (synthetic 1002). Still
+manifest-pinned (no local specimen exists — they require a BSOD, hardware
+fault, FS corruption, DNS outage, etc.): `os.bugcheck`, `display.driver_reset`,
+`hw.error`, `fs.corruption`, `memory.exhausted`, `logon.temp_profile`,
+`gpo.failed`, `network.dns_timeout`, `network.ip_conflict`, `print.failed` —
+each degrades to a counted occurrence if its field layout drifts.
+
+**Dashboard visibility contract:** the `/dex` All-signals panel lists every
+catalogued type, fired or not (quiet types as muted real-zero rows), so
+operators see what the fleet monitors — `kDexCatalogueOrder` in
+`dex_routes.cpp` is the server-side mirror of this table; keep both in sync
+when adding a signal.
 
 ## Privacy / works-council contract
 
