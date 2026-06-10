@@ -103,6 +103,11 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.postgres
     image: yuzu-postgres:local
+    # pull_policy: build — without it, the harness's `docker compose pull`
+    # step exits 1 trying to pull the local-only yuzu-postgres:local tag
+    # from a registry (verified). With it, pull skips this service and
+    # `up -d` builds it when missing.
+    pull_policy: build
     restart: "no"
     environment:
       POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
