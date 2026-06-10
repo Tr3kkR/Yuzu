@@ -29,6 +29,13 @@ services:
       - "8080:8080"     # Web dashboard + REST API
       - "50051:50051"   # gRPC (agent connections)
       - "50052:50052"   # gRPC (management)
+    environment:
+      # Postgres substrate DSN (ADR-0006/0007, #1318). The server does not
+      # consume this yet — #1320 wires the --postgres-dsn / env plumbing —
+      # so today it is inert and the server still boots without Postgres.
+      # Env var (not a CLI flag) on purpose: the current binary would
+      # reject an unknown --postgres-dsn flag.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
     volumes:
       - server-data:/var/lib/yuzu
     # File-descriptor headroom mirrors the systemd unit
@@ -39,6 +46,31 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP probe — during first-boot init the
+      # temporary server listens on the unix socket only, so a socket
+      # probe would report ready before the init scripts have run.
+      # -U yuzu -d yuzu also proves the app role/db exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Prometheus ──────────────────────────────────────────────────────
@@ -66,5 +98,6 @@ services:
 
 volumes:
   server-data:
+  postgres-data:
   prometheus-data:
   grafana-data:

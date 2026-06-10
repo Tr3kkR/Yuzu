@@ -191,6 +191,10 @@ services:
     environment:
       - YUZU_LOG_LEVEL=info
       - YUZU_LOG_FORMAT=json
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags.
+      - YUZU_POSTGRES_DSN=postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
     command:
       - "--listen"
       - "0.0.0.0:50051"
@@ -244,6 +248,26 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
+  postgres:
+    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_PASSWORD=${YUZU_POSTGRES_PASSWORD:-yuzu}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
   gateway:
@@ -347,6 +371,7 @@ services:
 
 volumes:
   server-data:
+  postgres-data:
   prometheus-data:
   grafana-data:
   clickhouse-data:

@@ -62,6 +62,11 @@ services:
       # gRPC honours them and breaks cross-container bidi RPC. Force-bypass.
       NO_PROXY: "*"
       no_proxy: "*"
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags. Demo-only baked default —
+      # same convenience class as the baked admin password above.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu-demo}@postgres:5432/yuzu
     ports:
       - "8080:8080"     # Dashboard + REST API (operator-facing)
     volumes:
@@ -74,6 +79,33 @@ services:
       timeout: 3s
       retries: 40
       start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Tier 1b: PostgreSQL (server storage substrate, ADR-0006) ───────────
+  # Release-pinned like every other image here (no -chisel variant — this is
+  # the same yuzu-postgres image production composes use). Published + signed
+  # by docker-publish-postgres in release.yml; start-demo.sh --build builds
+  # it locally during pre-release bootstrap.
+  postgres:
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-postgres:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-demo-postgres
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu-demo}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
@@ -142,3 +174,4 @@ services:
 
 volumes:
   server-data:
+  postgres-data:

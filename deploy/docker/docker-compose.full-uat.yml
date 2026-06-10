@@ -49,6 +49,11 @@ services:
       - "5"
       - "--analytics-batch-size"
       - "50"
+    environment:
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags.
+      - YUZU_POSTGRES_DSN=postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
     ports:
       - "8080:8080"     # Web dashboard + REST API
       - "50052:50052"   # gRPC (management)
@@ -61,6 +66,29 @@ services:
     depends_on:
       clickhouse:
         condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ────────────────────
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    container_name: yuzu-uat-postgres
+    environment:
+      - POSTGRES_PASSWORD=${YUZU_POSTGRES_PASSWORD:-yuzu}
+    volumes:
+      - postgres-uat-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Erlang Gateway ─────────────────────────────────────────────────────
@@ -134,6 +162,7 @@ services:
 
 volumes:
   server-data:
+  postgres-uat-data:
   prometheus-uat-data:
   grafana-uat-data:
   clickhouse-uat-data:

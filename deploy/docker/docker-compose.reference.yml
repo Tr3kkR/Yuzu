@@ -22,6 +22,7 @@
 ##
 ## Usage:
 ##   export YUZU_VERSION=0.10.0
+##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"   # store it in your secrets manager
 ##   docker compose -f docker-compose.reference.yml up -d
 ##   docker compose -f docker-compose.reference.yml logs -f server
 ##
@@ -71,6 +72,18 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    environment:
+      # Postgres substrate DSN (ADR-0006/0007, #1318). The server does not
+      # consume this yet — #1320 wires the server-side plumbing — so it is
+      # inert today and the server still boots without Postgres. Env var
+      # (not a CLI flag) on purpose: the current binary rejects unknown
+      # flags. Pointing this at an external/managed Postgres instead of
+      # the bundled service below is fully supported — replace the whole
+      # DSN and drop the postgres service + depends_on if you do.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (no insecure default in the reference template)}@postgres:5432/yuzu
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       # Single writable volume for all server state:
       #   - SQLite databases (response, audit, policy, RBAC, etc.)
@@ -127,6 +140,33 @@ services:
       retries: 3
       start_period: 30s
 
+  # ── PostgreSQL (server storage substrate, ADR-0006) ──────────────────
+  # Release-pinned, signed yuzu-postgres image: PostgreSQL 16 + pgvector +
+  # first-boot app role/db init. Per-store schemas are created at runtime
+  # by the server's migration runner. Using an external/managed Postgres
+  # instead is first-class — point YUZU_POSTGRES_DSN at it and remove this
+  # service.
+  postgres:
+    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (no insecure default in the reference template)}
+    volumes:
+      # Database state — same persistence rules as server-data: back it up,
+      # never `down -v` unless you intend to destroy it.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP probe — during first-boot init the
+      # temporary server listens on the unix socket only, so a socket
+      # probe would report ready before the init scripts have run.
+      # -U yuzu -d yuzu also proves the app role/db exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   # ── Yuzu Agent — install natively, not in Docker ─────────────────────
   #
   # Agents always run natively on each managed endpoint. We do NOT
@@ -148,7 +188,8 @@ services:
   # encourage that path.
 
 volumes:
-  # Named volume for server state — must persist across
+  # Named volumes for server + database state — must persist across
   # `docker compose down`. Do NOT use `docker compose down -v` unless
   # you intend to destroy state.
   server-data:
+  postgres-data:

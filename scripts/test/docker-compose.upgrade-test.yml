@@ -46,6 +46,10 @@ services:
   server:
     image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
     restart: "no"
+    environment:
+      # Postgres substrate DSN (ADR-0006, #1318). Inert on the old-release
+      # leg (and on the new leg until #1320 ships the consumer).
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
     ports:
       - "8080"     # web dashboard + REST API (random host port via compose)
       - "50051"   # agent gRPC
@@ -82,6 +86,39 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── PostgreSQL (server storage substrate, ADR-0006, #1318) ───────────
+  # Built locally from Dockerfile.postgres (a ghcr yuzu-postgres pin can't
+  # work here: YUZU_VERSION is the OLD release on the first leg and a
+  # never-published -test tag on the second). The postgres service stays
+  # identical across both legs while the server image swaps around it —
+  # exactly the topology the ADR-0009 first-boot backfill upgrade
+  # assertions will exercise. The OLD release's server ignores
+  # YUZU_POSTGRES_DSN entirely; the env var below is inert until #1320.
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    restart: "no"
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+    volumes:
+      # Project-scoped like server-data, so the database also survives the
+      # old→new image swap but stays isolated between parallel runs.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   server-data:
+  postgres-data:
