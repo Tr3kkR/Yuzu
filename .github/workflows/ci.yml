@@ -216,6 +216,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -593,7 +594,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja ccache pipx
+          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
+          # ADR-0006) runs autoreconf during its build and the hosted macOS
+          # image doesn't ship autotools.
+          brew install cmake ninja ccache pipx autoconf automake libtool
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"

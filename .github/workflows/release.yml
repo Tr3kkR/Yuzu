@@ -744,7 +744,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja ccache pipx
+          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
+          # ADR-0006) runs autoreconf during its build and the hosted macOS
+          # image doesn't ship autotools.
+          brew install cmake ninja ccache pipx autoconf automake libtool
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
