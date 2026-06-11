@@ -214,6 +214,22 @@ struct DexSignalCount {            // the whole-catalogue rollup (overview panel
     int64_t distinct_devices{0};
     std::string last_seen;
 };
+struct DexSubjectCount {           // top subjects for ONE obs_type (signal drill-down)
+    std::string subject;
+    int64_t count{0};
+    int64_t distinct_devices{0};
+    std::string last_seen;
+};
+struct DexOsScope {                // per-OS coverage: how many types each OS collects
+    std::string platform;
+    int64_t distinct_types{0};
+    int64_t total_events{0};
+};
+struct DexDaySignal {              // one (day, obs_type) cell of the trends matrix
+    std::string day;               // YYYY-MM-DD
+    std::string obs_type;
+    int64_t count{0};
+};
 struct DexBootStats {              // boot-performance rollup (os.boot metric, ms)
     int64_t boots{0};
     double avg_ms{0.0};
@@ -299,6 +315,27 @@ public:
     DexBootStats dex_boot_stats(const std::string& since = "") const;
     std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",
                                                  int limit = 10) const;
+
+    // Generic per-obs_type drill-down (catalogue signal-detail, View 3) — these
+    // are the dex_top_apps/_devices/_by_os/_by_day family GENERALISED over any
+    // obs_type, not crash-scoped. The "crashes" field on the reused structs holds
+    // the generic event count. `dex_os_signal_scope` is the per-OS coverage (how
+    // many distinct types each OS collects) — drives the live cross-OS captions
+    // that replace the mockups' stale "macOS 6 of 103".
+    std::vector<DexSubjectCount> dex_signal_subjects(const std::string& obs_type,
+                                                     const std::string& since = "",
+                                                     int limit = 20) const;
+    std::vector<DexOsCrashCount> dex_signal_by_os(const std::string& obs_type,
+                                                  const std::string& since = "") const;
+    std::vector<DexDeviceCrashCount> dex_signal_devices(const std::string& obs_type,
+                                                        const std::string& since = "",
+                                                        int limit = 20) const;
+    std::vector<DexDayCrashCount> dex_signal_by_day(const std::string& obs_type,
+                                                    const std::string& since = "") const;
+    std::vector<DexOsScope> dex_os_signal_scope(const std::string& since = "") const;
+    // The (day, obs_type, count) matrix — aggregated to family×day in the route
+    // for the Trends small-multiples + heatmap. One GROUP BY pass.
+    std::vector<DexDaySignal> dex_signal_day_matrix(const std::string& since = "") const;
 
     // DEX drill-downs — single-entity scope. App summaries span crash+hang;
     // device summary + history span ALL signal types.

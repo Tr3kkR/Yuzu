@@ -67,25 +67,26 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: empty store still lists ALL 104 monitored signal types, grouped",
-          "[dex][routes]") {
+TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quiet ones too",
+          "[dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
-    // its group, quiet ones as muted real-zero rows. Zeros are facts, not mock
-    // data. This label list mirrors kAllObsTypes in test_dex_signals.cpp — the
-    // two-sided drift net for catalogue additions.
+    // its family, quiet ones as muted real-zero rows. Zeros are facts, not mock
+    // data. The hub slimmed to summarise-and-link (the old All-signals panel was
+    // retired), so the contract now lives on the Catalogue: rendering all 12
+    // family fragments must surface every label. This list mirrors kAllObsTypes
+    // in test_dex_signals.cpp — the two-sided drift net for catalogue additions.
     GuaranteedStateStore store(":memory:");
-    auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{});
+    // Raw family names (literal '&') match dex_signal_groups(); a wrong name
+    // would render "Unknown family" and its labels would go missing below.
+    std::string html;
+    for (const char* family :
+         {"App reliability", "Boot, start-up & shutdown", "Service health", "System stability",
+          "Hardware & storage", "File system", "Network", "Identity & logon",
+          "Security & protection", "Updates & installs", "Policy & management", "Printing"})
+        html += render_dex_catalogue_group_fragment(&store, "", 7, family);
 
-    // The 12 group headings.
-    for (const char* group :
-         {"App reliability", "Boot, start-up &amp; shutdown", "Service health",
-          "System stability", "Hardware &amp; storage", "File system", "Network",
-          "Identity &amp; logon", "Security &amp; protection", "Updates &amp; installs",
-          "Policy &amp; management", "Printing"})
-        CHECK(html.find(group) != std::string::npos);
-
-    // All 70 labels.
+    // All 104 labels.
     for (const char* label :
          {// wave 1
           "App crash", "App hang", "Service crash", "Service start failure",
@@ -125,10 +126,164 @@ TEST_CASE("DEX overview: empty store still lists ALL 104 monitored signal types,
           "Policy extension failure", "MDM/Intune error"})
         CHECK(html.find(label) != std::string::npos);
 
-    // 103 Windows catalogue types + the macOS-collector `storage.low` (Hardware).
-    CHECK(html.find("All 104 monitored signal types") != std::string::npos);
-    // No fabricated numbers: quiet rows carry a literal zero count.
+    // No fabricated numbers: quiet rows carry a literal zero count. (The "All
+    // 104 monitored signal types" headline is asserted on Catalogue View 1 by
+    // the "lists every family + the sub-nav" test below.)
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
+}
+
+TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
+    GuaranteedStateStore store(":memory:");
+    const auto html = render_dex_catalogue_fragment(&store, "", 7);
+    // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
+    CHECK(html.find("/fragments/dex/overview") != std::string::npos);
+    CHECK(html.find("gp-subnav") != std::string::npos);
+    CHECK(html.find("All 104 monitored signal types") != std::string::npos);
+    // every family heading renders as a card (escaped where needed)
+    for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
+                            "Service health", "Identity &amp; logon"})
+        CHECK(html.find(fam) != std::string::npos);
+    // a card drills into the family-detail fragment
+    CHECK(html.find("/fragments/dex/catalogue/group?name=") != std::string::npos);
+}
+
+TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
+          "[dex][routes][catalogue]") {
+    GuaranteedStateStore store(":memory:");
+    const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network");
+    CHECK(net.find("Wi-Fi disconnect") != std::string::npos);  // friendly label
+    CHECK(net.find("network.wifi_drop") != std::string::npos); // obs_type
+    CHECK(net.find("&larr; All families") != std::string::npos);
+    // unknown family → placeholder; the reflected name is HTML-escaped (no XSS)
+    const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>");
+    CHECK(bad.find("Unknown family") != std::string::npos);
+    CHECK(bad.find("<script>") == std::string::npos);
+}
+
+TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",
+          "[dex][routes][catalogue]") {
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
+                   const std::string& plat) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = "network.wifi_drop";
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = "2026-06-09T10:00:00Z";
+        REQUIRE(store.insert_event(r));
+    };
+    obs("a", "agent-A", "CorpNet", "windows");
+    obs("b", "agent-B", "CorpNet", "windows");
+    obs("c", "mac-1", "Wi-Fi", "macos");
+
+    const auto html = render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop");
+    CHECK(html.find("Wi-Fi disconnect") != std::string::npos); // friendly label (title)
+    CHECK(html.find("Top subjects") != std::string::npos);
+    CHECK(html.find("CorpNet") != std::string::npos);          // top subject
+    CHECK(html.find("Windows + macOS") != std::string::npos);  // DERIVED-LIVE collected-on
+    CHECK(html.find("Behavioral data") != std::string::npos);  // per-device PII banner
+    CHECK(html.find("/fragments/dex/catalogue/group?name=") != std::string::npos); // back link
+
+    // empty selection + a nasty obs_type (reflected) are handled safely
+    CHECK(render_dex_catalogue_signal_fragment(&store, "", 7, "").find("No signal selected") !=
+          std::string::npos);
+    const auto bad = render_dex_catalogue_signal_fragment(&store, "", 7, "<img src=x onerror=y>");
+    CHECK(bad.find("<img src=x") == std::string::npos); // escaped, no XSS
+}
+
+TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
+          "[dex][routes][health]") {
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& plat) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = type;
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"x\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = "2026-06-09T10:00:00Z";
+        REQUIRE(store.insert_event(r));
+    };
+    obs("a", "agent-A", "process.crashed", "windows");
+    obs("b", "agent-B", "network.wifi_drop", "windows");
+
+    DexFleet fleet;
+    fleet.windows_online = 10;
+    const auto html = render_dex_health_fragment(&store, "", 7, fleet, "default");
+    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("100 &minus; weighted deductions") != std::string::npos); // the formula is shown
+    CHECK(html.find("derived &middot; secondary") != std::string::npos);
+    CHECK(html.find("Why this score") != std::string::npos);
+    CHECK(html.find("weighting:") != std::string::npos); // server-round-tripped presets
+
+    // No reporting agents → suppressed (NEVER a fabricated 100).
+    const auto suppressed = render_dex_health_fragment(&store, "", 7, DexFleet{}, "default");
+    CHECK(suppressed.find("Index suppressed") != std::string::npos);
+
+    // A bogus weighting falls back to "default" — the raw param is never echoed.
+    const auto bad = render_dex_health_fragment(&store, "", 7, fleet, "<script>x</script>");
+    CHECK(bad.find("<script>") == std::string::npos);
+}
+
+TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
+          "[dex][routes][trends]") {
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& plat, const std::string& day) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = type;
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"x\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = day + "T10:00:00Z";
+        REQUIRE(store.insert_event(r));
+    };
+    obs("1", "w", "process.crashed", "windows", "2026-06-08");
+    obs("2", "w", "network.wifi_drop", "windows", "2026-06-09");
+    obs("3", "m", "process.crashed", "macos", "2026-06-09");
+
+    DexFleet fleet;
+    fleet.windows_online = 5;
+    const auto html = render_dex_trends_fragment(&store, "", 30, fleet);
+    CHECK(html.find("Cross-OS") != std::string::npos);
+    CHECK(html.find("By operating system") != std::string::npos);
+    CHECK(html.find("Windows") != std::string::npos);
+    CHECK(html.find("macOS") != std::string::npos);
+    CHECK(html.find("gp-oscard pending") != std::string::npos);          // Linux pending (no data)
+    CHECK(html.find("Signal families over time") != std::string::npos);  // small-multiples
+    CHECK(html.find("Activity heatmap") != std::string::npos);           // heatmap
+    CHECK(html.find("App reliability") != std::string::npos);            // a family row
+    // DERIVED-LIVE scope caption — "of 104 signal types", not the mockup's stale 6
+    CHECK(html.find("of 104 signal types") != std::string::npos);
+}
+
+TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
+          "[dex][routes][hub]") {
+    GuaranteedStateStore store(":memory:");
+    DexFleet fleet;
+    fleet.windows_online = 5;
+    const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
+    CHECK(html.find("Explore") != std::string::npos);
+    CHECK(html.find("Signal catalogue") != std::string::npos);
+    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("Cross-OS &amp; trends") != std::string::npos);
+    // each card drills into its deep page
+    CHECK(html.find("/fragments/dex/catalogue?window=") != std::string::npos);
+    CHECK(html.find("/fragments/dex/health?window=") != std::string::npos);
+    CHECK(html.find("/fragments/dex/trends?window=") != std::string::npos);
+    // with reporting agents the health teaser computes (not suppressed)
+    CHECK(html.find("suppressed") == std::string::npos);
+
+    // with no reporting agents the health teaser is suppressed (no fabricated score)
+    const auto sup = render_dex_overview_fragment(&store, "", 7, DexFleet{});
+    CHECK(sup.find("suppressed") != std::string::npos);
 }
 
 TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]") {
@@ -144,33 +299,33 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]
 
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
     CHECK(html.find("Digital Employee Experience") != std::string::npos);
-    // All-signals rollup with FRIENDLY labels.
-    CHECK(html.find("All signals") != std::string::npos);
-    CHECK(html.find("App crash") != std::string::npos);
-    CHECK(html.find("App hang") != std::string::npos);
-    CHECK(html.find("Service crash") != std::string::npos);
-    // App reliability table spans crashes + hangs.
-    CHECK(html.find("App reliability") != std::string::npos);
+    // Hub slim: the All-signals / boot / faulting-modules panels moved to the
+    // deep pages (Catalogue + App reliability) — the hub summarises and links.
+    CHECK(html.find("All signals") == std::string::npos);
+    CHECK(html.find("Boot performance") == std::string::npos);
+    CHECK(html.find("Top faulting modules") == std::string::npos);
+    // Top crashing apps table spans crashes + hangs, with a deep-page CTA.
+    CHECK(html.find("Top crashing apps") != std::string::npos);
+    CHECK(html.find("App reliability") != std::string::npos); // section CTA → catalogue family
     CHECK(html.find("chrome.exe") != std::string::npos);
     CHECK(html.find("Hangs") != std::string::npos);
-    // Boot panel from the metric column.
-    CHECK(html.find("Boot performance") != std::string::npos);
-    CHECK(html.find("Average boot") != std::string::npos);
-    CHECK(html.find("91.0 s") != std::string::npos); // slowest boot, humanised
-    // Crash detail panels still present.
-    CHECK(html.find("ntdll.dll") != std::string::npos);
+    // Most-affected devices (crash-scoped) + the By-OS coverage teaser.
+    CHECK(html.find("Most-affected devices") != std::string::npos);
     CHECK(html.find("WS-1") != std::string::npos);
+    CHECK(html.find("By operating system") != std::string::npos);
+    CHECK(html.find("Windows") != std::string::npos); // the one OS that reported
     CHECK(html.find("gp-table") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: unknown obs_type falls back to the raw label under 'Other'",
-          "[dex][routes]") {
-    // Forward-compat: a signal added agent-side renders with NO server change,
-    // grouped under "Other".
+TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Other'",
+          "[dex][routes][catalogue]") {
+    // Forward-compat: a signal added agent-side renders with NO server change.
+    // The slimmed hub no longer carries the per-type rollup, so the "Other"
+    // (uncatalogued) fallback now surfaces on the Catalogue.
     GuaranteedStateStore store(":memory:");
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", "2026-06-09T10:00:00Z");
-    auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
+    auto html = render_dex_catalogue_fragment(&store, "", 7);
     CHECK(html.find("future.signal_type") != std::string::npos);
     CHECK(html.find(">Other") != std::string::npos);
 }
@@ -198,8 +353,8 @@ TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",
     GuaranteedStateStore store(":memory:");
     seed_hang(store, "e1", "WS-1", "Teams.exe", "2026-06-09T09:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
-    CHECK(html.find("100.0%") != std::string::npos); // 0 crash-impacted of 4
-    CHECK(html.find("App hang") != std::string::npos); // but the hang IS surfaced
+    CHECK(html.find("100.0%") != std::string::npos);    // 0 crash-impacted of 4
+    CHECK(html.find("Teams.exe") != std::string::npos); // the hung app still surfaces (Hangs col)
 }
 
 TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][security]") {
