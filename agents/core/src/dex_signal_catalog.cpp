@@ -1200,9 +1200,10 @@ SignalObservation x_mdm_error(const EventFields& f, int id) {
 }
 
 // ── The catalogue ─────────────────────────────────────────────────────────────
-// 20 obs_types. Two are backed by dual provider spellings (BugCheck / Ntfs ship
-// under both classic and manifest names depending on build), so the spec count
-// is 22. Caps are per-type events/hour — generous for real incident rates,
+// 103 obs_types (waves 1–3). Some are backed by dual provider spellings (e.g.
+// BugCheck / Ntfs ship under both classic and manifest names depending on build),
+// so the spec count is higher than the obs_type count. Caps are per-type
+// events/hour — generous for real incident rates,
 // tight enough that a storming provider (WHEA corrected-error loops, failing
 // disks, Wi-Fi flaps) cannot flood the wire.
 

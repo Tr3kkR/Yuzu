@@ -76,6 +76,23 @@ are named roadmap items (see the enterprise-readiness plan).
 Every panel renders real aggregations or an explicit "no data" placeholder —
 never sample or fabricated values. A zero is a measured zero.
 
+## Recovery — empty or stale DEX projection
+
+`guardian_observations` (the table behind `/dex`) is a **derived, forward-only
+read model** projected from the Guardian event store; it holds no source data of
+its own. If the server logs a stale-schema warning (a dev/UAT database that ran
+a pre-release build) or the projection is otherwise corrupt, the projection
+degrades safely — the underlying events are preserved and
+`yuzu_server_guardian_proj_failures_total` rises — and recovery is:
+
+1. Stop the server.
+2. `sqlite3 <data-dir>/guaranteed-state.db "DROP TABLE guardian_observations;"`
+3. Restart — the table is recreated empty and projection resumes **forward only**.
+
+There is no automatic back-fill today: projected history before the drop is not
+reconstructed (a back-fill script from the retained source events is a tracked
+follow-up). The Guardian event store and rules are unaffected by this operation.
+
 ## Related documentation
 
 - [Guaranteed State (Guardian)](guaranteed-state.md) — the underlying event

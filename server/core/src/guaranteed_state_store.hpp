@@ -138,7 +138,7 @@ struct GuardianAgentRuleStatus {
 // guardian_observations read model). DERIVED from guaranteed_state_events: written
 // atomically with the event so it inherits the event_id dedup, reaped in lockstep.
 // Promotes the detail_json UNIFORM facts into queryable columns the DEX
-// aggregations GROUP BY. Column semantics are generic across the 20-signal
+// aggregations GROUP BY. Column semantics are generic across the 103-signal
 // catalogue (docs/dex-signal-catalog.md): subject = the failing entity (app,
 // service, printer, update title, SSID…), reason = failure code, component =
 // secondary entity (faulting module, NIC…), metric = numeric payload (boot ms).

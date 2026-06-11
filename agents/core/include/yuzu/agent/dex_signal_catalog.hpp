@@ -79,7 +79,7 @@ struct SignalSpec {
     SignalObservation (*extract)(const EventFields& fields, int event_id);
 };
 
-/// The catalogue — 20 obs_types (some backed by two provider spellings, so the
+/// The catalogue — 103 obs_types (some backed by two provider spellings, so the
 /// spec count is slightly higher). Static, immutable, no registration API:
 /// signals are code, reviewed like code.
 YUZU_EXPORT const std::vector<SignalSpec>& dex_signal_catalog();
