@@ -342,4 +342,32 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(dev->status == 403);
         CHECK(audited.empty()); // perm gate runs BEFORE the audit + render
     }
+
+    SECTION("hostile ?window= is canonicalised, never reflected into markup (Gate-8 XSS)") {
+        // The raw window param flows into hx-get="…" attributes in drill-down
+        // links; the route MUST canonicalise it to one of the four fixed tokens
+        // before render. Must be exercised through the ROUTE (the raw param
+        // entry point) — calling the render fns directly with a clean token
+        // masks the bug. CSP is script-src 'self' 'unsafe-inline', so a
+        // reflected attribute-break would execute.
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        const char* payload = R"(window="><script>alert(1)</script>)";
+
+        auto ov = sink.Get(std::string("/fragments/dex/overview?window=") + payload);
+        REQUIRE(ov);
+        CHECK(ov->body.find("<script>") == std::string::npos);
+        CHECK(ov->body.find("alert(1)") == std::string::npos); // payload not reflected anywhere
+
+        auto app = sink.Get(std::string("/fragments/dex/app?name=chrome.exe&window=") + payload);
+        REQUIRE(app);
+        CHECK(app->body.find("<script>") == std::string::npos);
+        CHECK(app->body.find("alert(1)") == std::string::npos);
+
+        auto dev = sink.Get(std::string("/fragments/dex/device?id=WS-1&window=") + payload);
+        REQUIRE(dev);
+        CHECK(dev->body.find("<script>") == std::string::npos);
+        CHECK(dev->body.find("alert(1)") == std::string::npos);
+    }
 }

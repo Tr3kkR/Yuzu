@@ -299,6 +299,16 @@ int window_to_days(const std::string& w) {
     return 7; // "7d" / default
 }
 
+// CANONICAL window token for a day count — the inverse of window_to_days. This
+// is the XSS chokepoint (governance Gate-8 HIGH): the window value is
+// concatenated into hx-get="…" attributes in the drill-down links, so the RAW
+// `?window=` query param must NEVER reach markup. Routes canonicalise an
+// incoming param through window_to_days→window_token so only one of these four
+// fixed literals can ever be rendered, regardless of attacker input.
+std::string window_token(int days) {
+    return days == 1 ? "24h" : days == 30 ? "30d" : days == 0 ? "all" : "7d";
+}
+
 // A dashed "no data" panel — the no-mock-data contract's empty state.
 std::string placeholder(const std::string& title, const std::string& sub) {
     return "<div class=\"gp-placeholder\"><b>" + esc(title) + "</b>" + esc(sub) + "</div>";
@@ -786,7 +796,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
-        const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
+        // Canonicalise the window to a fixed token BEFORE it can reach markup —
+        // the raw param is reflected into hx-get attributes downstream (Gate-8 XSS).
+        const std::string w =
+            window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
+                                                                : "7d"));
         res.set_content(render_dex_app_fragment(store_, name, w), "text/html; charset=utf-8");
     });
 
@@ -795,7 +809,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
+        // Canonicalise the window before it can reach markup (Gate-8 XSS chokepoint).
+        const std::string w =
+            window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
+                                                                : "7d"));
         if (audit_fn_)
             audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
