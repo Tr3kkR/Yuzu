@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y \
     # Build essentials
     cmake ninja-build make pkg-config ccache \
     gcc-13 g++-13 \
-    # Autotools (required by vcpkg ports: c-ares, grpc)
-    autoconf automake libtool \
+    # Autotools (required by vcpkg ports: c-ares, grpc) + bison/flex (libpq)
+    autoconf automake libtool bison flex \
     # OpenSSL build deps
     perl linux-libc-dev \
     # Utilities
