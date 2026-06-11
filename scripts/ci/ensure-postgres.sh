@@ -60,6 +60,15 @@ fi
 
 # ── 2. Docker (self-hosted Linux) ────────────────────────────────────────
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  # Digest-drift guard: the container is persistent (--restart
+  # unless-stopped), so a PG_IMAGE pin bump would otherwise never reach
+  # runners that already have one — tests would silently keep running the
+  # old Postgres. Recreate when the recorded image differs.
+  EXISTING_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$EXISTING_IMAGE" && "$EXISTING_IMAGE" != "$PG_IMAGE" ]]; then
+    echo "ensure-postgres: ${CONTAINER} image ${EXISTING_IMAGE} != pinned ${PG_IMAGE} — recreating" >&2
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
     docker start "$CONTAINER" >/dev/null 2>&1 || docker run -d \
       --name "$CONTAINER" \

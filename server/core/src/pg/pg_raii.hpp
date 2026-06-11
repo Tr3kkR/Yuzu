@@ -118,7 +118,10 @@ private:
 /// connection rolled back, never wedged in an open transaction.
 ///
 /// Move-only (unlike `SqliteTxn`, which predates the need): moving transfers
-/// the rollback obligation; the moved-from guard is disarmed.
+/// the rollback obligation; the moved-from guard is disarmed. Two further
+/// deliberate divergences from `SqliteTxn`: `commit()` returns `bool`, not
+/// the C-API return code, and a second `commit()` after success is a no-op
+/// returning true (SqliteTxn would re-issue COMMIT and surface the error).
 ///
 /// The guard borrows the connection — it must not outlive the `PgConn` /
 /// pool lease that owns it. Operational note: the destructor's ROLLBACK is

@@ -223,6 +223,16 @@ bool PgPool::with_txn(const std::function<bool(PGconn*)>& fn) {
     PgTxn txn{lease.get()};
     if (!fn(lease.get()))
         return false; // txn dtor rolls back
+    // Refuse to "commit" an aborted transaction: COMMIT in PQTRANS_INERROR
+    // completes as ROLLBACK yet reports PGRES_COMMAND_OK, so a callback
+    // that swallowed a statement failure and returned true would otherwise
+    // get `true` back with nothing persisted (UP-3). Enforce here instead
+    // of trusting every store author to check.
+    if (PQtransactionStatus(lease.get()) != PQTRANS_INTRANS) {
+        spdlog::error("PgPool: with_txn callback returned true on an aborted/idle "
+                      "transaction — rolling back");
+        return false; // txn dtor rolls back
+    }
     return txn.commit();
 }
 

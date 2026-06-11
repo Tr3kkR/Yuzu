@@ -27,6 +27,13 @@ namespace {
 constexpr const char* kAdvisoryLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext($1::text))";
 
+// Global (constant-key) variant for the meta-table/schema bootstrap txn:
+// two processes migrating DIFFERENT stores hold different per-store locks
+// yet race the same `CREATE TABLE IF NOT EXISTS public.schema_meta`, which
+// can fail one of them spuriously on the catalog unique index (UP-1).
+// Startup-only, so the brief global serialization is free.
+constexpr const char* kGlobalLockSql = "SELECT pg_advisory_xact_lock(2037545589, 0)";
+
 /// One-row, one-param text query helper.
 PgResult exec_param(PGconn* conn, const char* sql, const std::string& param) {
     const char* values[] = {param.c_str()};
@@ -95,13 +102,15 @@ bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view st
         return false;
     PgTxn txn{conn};
 
-    // Serialize concurrent runners before the IF NOT EXISTS DDL — two
-    // simultaneous CREATE TABLE IF NOT EXISTS can still collide on the
-    // catalog unique index and fail one of them spuriously.
+    // Serialize ALL runners (global key — see kGlobalLockSql) before the
+    // IF NOT EXISTS DDL: two simultaneous CREATE TABLE IF NOT EXISTS can
+    // collide on the catalog unique index and fail one of them spuriously,
+    // and a per-store key would not cover two processes bootstrapping
+    // different stores.
     {
-        PgResult lock = exec_param(conn, kAdvisoryLockSql, store);
+        PgResult lock{PQexec(conn, kGlobalLockSql)};
         if (lock.status() != PGRES_TUPLES_OK) {
-            spdlog::error("PgMigrationRunner: advisory lock failed for {}: {}", store,
+            spdlog::error("PgMigrationRunner: global advisory lock failed for {}: {}", store,
                           PQerrorMessage(conn));
             return false;
         }

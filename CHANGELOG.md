@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **CI server-test legs now require a reachable PostgreSQL 16**
   (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
-  provision or verify one) — the new `[pg]`-tagged server tests for the
+  provision or authenticate one — except the documented psql-less TCP-probe
+  fallback on a native cluster) — the new `[pg]`-tagged server tests for the
   Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
   development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
   tests skip cleanly; when it is set but unreachable they fail. See

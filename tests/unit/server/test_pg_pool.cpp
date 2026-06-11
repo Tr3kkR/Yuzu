@@ -272,6 +272,19 @@ TEST_CASE("PgPool with_txn", "[pg][pool]") {
         CHECK(count_rows() == 0);
     }
 
+    SECTION("fn swallowing a failed statement cannot fake a commit") {
+        // COMMIT on an aborted txn completes as ROLLBACK but reports
+        // PGRES_COMMAND_OK — with_txn must detect PQTRANS_INERROR and
+        // return false rather than trusting the callback (UP-3).
+        const bool ok = pool.with_txn([](PGconn* c) {
+            PgResult bad{PQexec(c, "INSERT INTO t (id) VALUES ('not an int')")};
+            (void)bad; // callback "forgets" to check
+            return true;
+        });
+        CHECK_FALSE(ok);
+        CHECK(count_rows() == 0);
+    }
+
     SECTION("fn throws -> rolled back, exception propagates, conn healthy") {
         CHECK_THROWS_AS(pool.with_txn([](PGconn* c) -> bool {
             PgResult res{PQexec(c, "INSERT INTO t (id) VALUES (3)")};
