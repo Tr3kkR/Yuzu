@@ -64,11 +64,18 @@ existing `KeyProvider` seam and never enters Postgres.**
 
    Normative rules (the implementation PR's security review checks conformance to these,
    it does not re-derive them):
-   - **AAD binding (anti-swap):** both the payload encryption and the DEK wrap use AES-GCM
-     AAD = `(ver, store namespace, table, column, row primary key, kek_version)`. Encrypted
-     values are therefore **non-relocatable** — an insider with SQL *write* access cannot
-     swap blobs between rows/columns and have the server decrypt one secret in another's
-     context (e.g. recovering an offload credential through the webhook-HMAC path).
+   - **AAD binding (anti-swap):** the payload encryption uses AES-GCM
+     AAD = `(ver, store namespace, table, column, row primary key)`; the DEK wrap uses the
+     same tuple **plus `kek_version`**. Encrypted values are therefore **non-relocatable**
+     — an insider with SQL *write* access cannot swap blobs between rows/columns and have
+     the server decrypt one secret in another's context (e.g. recovering an offload
+     credential through the webhook-HMAC path). `kek_version` lives in the **wrap-layer
+     AAD only, deliberately**: rotation re-wraps the DEK (recomputing the wrap tag under
+     the new version) without touching the payload, so the payload tag must not depend on
+     `kek_version` — including it there would invalidate every payload tag at first
+     rotation and brick all secrets behind the fail-closed rule (empirically reproduced
+     with live AES-GCM in the #1333 adversarial review). Version integrity is preserved:
+     a tampered blob `kek_version` fails the wrap-layer tag check.
    - **Wrap algorithm:** AES-256-GCM with its own independent random nonce (`wrap_nonce`);
      one primitive throughout rather than a separate AES-KW dependency.
    - **Nonces and DEK single-use:** 96-bit nonces, fresh per encryption; a DEK encrypts
@@ -77,7 +84,7 @@ existing `KeyProvider` seam and never enters Postgres.**
    - **Canonical AAD serialization:** naive concatenation of the AAD tuple is ambiguous
      (`"a"+"bc"` ≡ `"ab"+"c"` — exactly the swap class AAD exists to defeat). Each field
      is length-prefixed (u32-BE length before each field); row PKs use one canonical
-     encoding (BIGINT → fixed 8-byte BE); the `kek_version` bytes in the AAD are
+     encoding (BIGINT → fixed 8-byte BE); the `kek_version` bytes in the **wrap** AAD are
      byte-identical to the blob's field. Covered by a round-trip + boundary-shift test.
    - **Blob v1 pins widths:** `ver` u8; `kek_version` u32-BE; nonces 12 bytes; tags 16
      bytes; `wrapped_dek` fixed 32 bytes (raw GCM output, tag separate) — every field but
@@ -99,6 +106,15 @@ existing `KeyProvider` seam and never enters Postgres.**
      flag/column, never by column emptiness — otherwise an SQL-write insider NULLs the
      column and rides the empty-means-no-auth path to disable signing without ever
      touching the crypto.
+   - **Encrypt-failure semantics:** if `SecretCodec::encrypt` fails (CSPRNG failure
+     minting a DEK/nonce, provider error), the surrounding store write/transaction
+     **aborts** — a failed encrypt never results in writing plaintext (or anything else)
+     to the column. Every `RAND_bytes` return is checked.
+   - **No decryption oracle to callers:** external surfaces (REST/MCP/dashboard) receive
+     one generic "unavailable" error for every decrypt-failure class — an external caller
+     must not be able to distinguish decrypt-failure from not-found (existence/tamper
+     oracle). The failure-class taxonomy (`tag_mismatch`/`kek_unresolvable`/
+     `malformed_blob`) appears only in the server-side audit event and metric.
    - **Zeroization:** `SecretCodec` `secure_zero`s DEKs and decrypted plaintext buffers
      once consumed (mirrors the `KeyProvider::load_key` caller contract). Codec
      interfaces use a non-copyable, move-only zeroizing buffer type (`OPENSSL_cleanse`
@@ -106,9 +122,11 @@ existing `KeyProvider` seam and never enters Postgres.**
      bounds, not guarantees, zeroization, so it is not used for key/secret bytes. (The
      existing `yuzu::secure_zero` in `sdk/include/yuzu/secure_zero.hpp` is string-only;
      the implementation adds a span overload or uses `OPENSSL_cleanse` directly — no
-     third idiom.) EVP contexts are RAII-owned (`EVP_CIPHER_CTX_free` on all paths, the
-     `x509_ca.cpp` idiom). Codec errors return `std::expected<T, std::string>`
-     (`runtime_config_store` precedent) and never embed secret material in error strings.
+     third idiom.) Store methods that return recovered secrets to in-process callers
+     return the zeroizing buffer type as well, not `std::string`. EVP contexts are
+     RAII-owned (`EVP_CIPHER_CTX_free` on all paths, the `x509_ca.cpp` idiom). Codec
+     errors return `std::expected<T, std::string>` (`runtime_config_store` precedent) and
+     never embed secret material in error strings.
 
    Decryption happens in the store class, never in SQL.
 
@@ -118,21 +136,32 @@ existing `KeyProvider` seam and never enters Postgres.**
    rebuilds that renumber serials, table/column renames, or a Postgres schema (store
    namespace) rename — must decrypt-and-re-encrypt through `SecretCodec` as part of that
    migration, never copy blobs.
-2. **Key custody.** The KEK is 32 bytes from `RAND_bytes`, generated on first boot (same
-   bootstrap pattern as the default certs), stored base64-encoded through
-   `KeyProvider::store_key` (`key_id = "secrets-kek-v<N>"`) — exactly like the CA root key:
-   `FileKeyProvider` 0600/0700 today (on Windows the equivalent is a restrictive DACL
-   granting only the service account — POSIX mode bits are an approximation there, and the
-   implementation must state the NTFS posture explicitly); PKCS#11/KMS/HSM later by
-   swapping the provider, with `key_ref` opaque to all callers. The KEK is never written
-   to Postgres, never logged, never exported by any API. Custody mechanics:
+2. **Key custody.** The KEK is 32 bytes of CSPRNG output (`RAND_bytes`, return value
+   checked — CSPRNG failure at generation is `startup_failed()`), generated on first boot
+   (same bootstrap pattern as the default certs), custodied behind the `KeyProvider` seam
+   (`key_id = "secrets-kek-v<N>"`): `FileKeyProvider` 0600/0700 today (on Windows the
+   equivalent is a restrictive DACL granting only the service account — POSIX mode bits
+   are an approximation there, and the implementation must state the NTFS posture
+   explicitly); PKCS#11/KMS/HSM later by swapping the provider, with `key_ref` opaque to
+   all callers. The KEK is never written to Postgres, never logged, never exported by any
+   API. **The codec↔provider contract is wrap/unwrap, not key export** (#1333 review
+   HIGH-2): `SecretCodec` never handles raw KEK bytes — the provider interface for this
+   use is `generate_kek() → key_ref`, `wrap_dek(key_ref, dek, wrap_aad) → wrapped+tag`,
+   `unwrap_dek(key_ref, wrapped, tag, wrap_aad) → dek`, and a deterministic
+   `kek_check_value(key_ref)`. `FileKeyProvider` implements these locally over its 0600
+   file (raw key loaded, used, and zeroized *inside the provider*); a PKCS#11/KMS provider
+   delegates to the token, so a **non-exportable** KEK is fully supported — the
+   `load_key`/raw-export path is NOT part of the SecretCodec contract. Custody mechanics:
    - **Atomic write:** `store_key` for the file provider writes temp-file → fsync → rename,
      so power loss during first-boot generation can never leave a torn KEK file that
      "resolves" but fails every decrypt as pseudo-tamper.
    - **Fingerprint registration:** at KEK generation/rotation the substrate records
-     `(kek_version, SHA-256 fingerprint of the key material, created_at)` in a substrate
-     meta table. Fingerprints are non-secret (standard key-check-value practice) and are
-     the one KEK-related artifact allowed in the database. At boot, `SecretCodec` init —
+     `(kek_version, key-check value, created_at)` in a substrate meta table. The KCV comes
+     from `kek_check_value(key_ref)`: for `FileKeyProvider` the SHA-256 of the key
+     material (safe — full-entropy 256-bit key, no dictionary angle); a non-exportable
+     provider derives it deterministically on-token (e.g. ciphertext of a fixed test
+     vector). KCVs are non-secret (standard practice) and are the one KEK-related artifact
+     allowed in the database. At boot, `SecretCodec` init —
      substrate-level, before stores open — verifies that **every kek_version registered in
      the meta table resolves through `KeyProvider` to material matching its fingerprint**.
      This catches: backup skew (keys dir older than the DB), a torn/corrupt KEK file
@@ -143,9 +172,11 @@ existing `KeyProvider` seam and never enters Postgres.**
      (operators must be able to triage this separately from "DB down"), matching
      ADR-0007's posture — a loudly-down server over one silently serving with unreadable
      secrets.
-   - **KEK residency:** `SecretCodec` loads the KEK once at construction into the
-     zeroizing buffer (one resident copy beats N transient `load_key` copies) and reloads
-     only on a rotation event.
+   - **KEK residency:** lives *inside the provider*. `FileKeyProvider` loads its raw KEK
+     once into a non-copyable zeroizing buffer at first use (one resident copy beats N
+     transient ones, `OPENSSL_cleanse` on every exit path — the zeroization rule covers
+     every KEK representation, not just DEKs/plaintext) and re-reads only on rotation;
+     `SecretCodec` holds `key_ref`s, never key bytes.
    - **Topology rule (one KEK per database):** in the FileKeyProvider era the supported
      topology is **one server instance per database**. Two servers first-booting against
      one Postgres with separate keys directories would each mint an independent
@@ -270,7 +301,9 @@ existing `KeyProvider` seam and never enters Postgres.**
   read-only `.db` retained for one release still contains plaintext — do **not** scrub it
   (that breaks ADR-0009's rollback net), but the window is hardened, not merely documented:
   (a) the cutover verifies/forces 0600 on retained secret-bearing legacy files; (b) an
-  operator purge flag allows early deletion once rollback confidence exists; (c) the
+  operator purge flag allows early deletion once rollback confidence exists — purge does a
+  best-effort overwrite before unlink, but on journaled/SSD storage overwrite guarantees
+  are weak, which is why the rotation guidance in (c) is the primary mitigation; (c) the
   per-store ADR instructs operators to treat window-era data-dir backups as secret-bearing
   and to rotate webhook/offload/OIDC secrets after the window if backup posture is unknown
   (all are re-issuable); (d) the next-release deletion is implemented and upgrade-tested,
@@ -316,3 +349,18 @@ semantics (§Decision 1). Implementation-phase chaos scenarios (CH-1…CH-8: DR 
 keys, backup skew + audit-flood masking, mid-rotation crash + premature retirement, dual
 server, torn KEK, rewrap CAS race, NULL-out downgrade, rename re-bind) are attached to #1320
 and the per-store migration issues.
+
+Adversarial review by @fjarvis (PR #1333, 2026-06-10, Claude+Codex cross-examination + Hermes
+×2): **REQUEST CHANGES**, both HIGHs valid and folded 2026-06-11. HIGH-1 found a genuine
+self-contradiction the 12-agent governance run missed and reproduced it with live AES-GCM:
+`kek_version` in the *payload* AAD + re-wrap-only rotation ⇒ first rotation invalidates every
+payload tag and bricks all secrets behind the fail-closed rule. Fixed: `kek_version` moved to
+the wrap-layer AAD only (where rotation recomputes it); payload AAD is the identity tuple.
+HIGH-2: the seam promised "HSM swap with zero caller change" while requiring raw-key export —
+fixed by making the codec↔provider contract wrap/unwrap (`generate_kek`/`wrap_dek`/
+`unwrap_dek`/`kek_check_value` over opaque `key_ref`), so non-exportable keys are genuinely
+supported. MEDIUMs folded: encrypt-failure aborts the transaction (never writes plaintext),
+no decryption oracle to external callers, KEK zeroization inside the provider, zeroizing
+return types for secret-returning store methods, checked `RAND_bytes`. LOW: purge-overwrite
+honesty note. (His other MEDIUMs — canonical AAD encoding, universal fail-closed — were
+already fixed in the governance amendment round, which his review predates.)
