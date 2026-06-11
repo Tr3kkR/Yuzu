@@ -1,0 +1,76 @@
+#pragma once
+
+/// @file pg_migration_runner.hpp
+/// Postgres port of `MigrationRunner` (ADR-0008 "Migrations" +
+/// "Namespacing"): numbered `{version, sql}` migrations registered in C++
+/// next to each store, applied against a shared
+/// `public.schema_meta(store, version, upgraded_at)` table, with one
+/// Postgres SCHEMA per store namespace.
+///
+/// Differences from the SQLite runner that callers must know:
+///  - The runner creates `CREATE SCHEMA IF NOT EXISTS <store>` and runs each
+///    migration with `SET LOCAL search_path TO <store>, public` — so a
+///    migration's unqualified `CREATE TABLE items (...)` lands in the
+///    store's own schema. The setting is transaction-local (`SET LOCAL`);
+///    nothing leaks onto the pooled connection.
+///  - At runtime (outside migrations) stores must schema-qualify their table
+///    names (`SELECT ... FROM response.items`) — pooled connections carry no
+///    per-store search_path.
+///  - Concurrent runners (two server processes against one database) are
+///    serialized per store via a transaction-scoped advisory lock, and the
+///    applied version is re-read under that lock — the loser of the race
+///    sees the winner's version and skips.
+///  - Store names are SQL identifiers here, so they are restricted to
+///    `[a-z_][a-z0-9_]*`, max 63 bytes. Anything else is rejected.
+
+#include <string>
+#include <string_view>
+#include <vector>
+
+struct pg_conn; // PGconn — avoid pulling libpq-fe.h into every includer
+using PGconn = pg_conn;
+
+namespace yuzu::server::pg {
+
+/// A single schema migration step. `sql` is owning (`std::string`) for the
+/// same reason as the SQLite `Migration`: libpq's `PQexec` requires a
+/// null-terminated C string, and a future caller constructing from a
+/// non-null-terminated view must not be able to slip one in.
+struct PgMigration {
+    int version;     ///< Target version after this migration runs.
+    std::string sql; ///< SQL statement(s) to execute.
+};
+
+/**
+ * Runs sequential schema migrations for one store against a PostgreSQL
+ * connection (typically a pinned `PgPool` lease at store construction).
+ *
+ * Usage:
+ *   PgMigrationRunner::run(conn, "response", {
+ *       {1, "CREATE TABLE responses (...)"},
+ *       {2, "ALTER TABLE responses ADD COLUMN ..."},
+ *   });
+ */
+class PgMigrationRunner {
+public:
+    /// Run all pending migrations for the named store. Each migration runs in
+    /// its own transaction (Postgres DDL is transactional), so a failure at
+    /// step N leaves 1..N-1 applied and recorded — same contract as the
+    /// SQLite runner. Returns true if all migrations succeeded (or none were
+    /// needed).
+    [[nodiscard]] static bool run(PGconn* conn, std::string_view store_name,
+                                  const std::vector<PgMigration>& migrations);
+
+    /// Current schema version for a store. Returns 0 if the store (or the
+    /// schema_meta table itself) is untracked, -1 on query error.
+    [[nodiscard]] static int current_version(PGconn* conn, std::string_view store_name);
+
+    /// True when `name` is usable as a store name / Postgres schema
+    /// identifier: `[a-z_][a-z0-9_]*`, at most 63 bytes.
+    [[nodiscard]] static bool valid_store_name(std::string_view name);
+
+private:
+    static bool ensure_meta_and_schema(PGconn* conn, std::string_view store_name);
+};
+
+} // namespace yuzu::server::pg
