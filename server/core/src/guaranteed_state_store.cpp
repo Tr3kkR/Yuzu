@@ -801,9 +801,16 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             return std::unexpected("insert failed: " + err);
         }
         // Census upsert inside the same transaction (Slice B) — rolled back with the
-        // batch on any later failure, so events and status never diverge.
-        if (const char* state = event_state_from_type(row.event_type))
-            upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
+        // batch on any later failure, so events and status never diverge. The
+        // reserved sentinel (ruleless DEX observation) must NEVER touch the
+        // compliance census — it has no live rule (§24). This guard MUST match the
+        // single-row insert_event path: enforce the convention server-side, not by
+        // trusting the agent to pair the sentinel with a non-census event_type
+        // (governance/adversarial-review F1 — the batch path is the preferred gRPC
+        // GuaranteedStatePush ingest, so the gap was the more dangerous half).
+        if (!is_reserved_rule_id(row.rule_id))
+            if (const char* state = event_state_from_type(row.event_type))
+                upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
         // DEX projection for ruleless observations — same degrade-don't-destroy
         // contract as insert_event (UP-1/UP-15): a projection failure must never
         // roll back the batch (which would take unrelated DRIFT events with it).

@@ -51,6 +51,19 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         ev_row.detected_value = ev.detected_value();
         ev_row.expected_value = ev.expected_value();
         ev_row.detail_json = ev.detail_json(); // structured companion (route a'); "" for plain drift
+        // Ingest-boundary size cap (governance/adversarial-review F6): a legit
+        // detail_json is well under 1 KiB; a compromised enrolled agent could ship
+        // a multi-MB blob to bloat the events column and burn JSON-parse cost on the
+        // ingest thread in-txn. Drop an over-cap blob (the event is still recorded;
+        // the DEX projection degrades to empty fields — degrade-don't-destroy). 16
+        // KiB is generous headroom over any real signal payload.
+        constexpr std::size_t kMaxDetailJson = 16 * 1024;
+        if (ev_row.detail_json.size() > kMaxDetailJson) {
+            spdlog::warn("Guardian: dropping oversized detail_json ({} bytes) from agent {} "
+                         "event {} (cap {})",
+                         ev_row.detail_json.size(), agent_id, ev_row.event_id, kMaxDetailJson);
+            ev_row.detail_json.clear();
+        }
 
         ev_row.remediation_action = ev.remediation_action();
         ev_row.remediation_success = ev.remediation_success();

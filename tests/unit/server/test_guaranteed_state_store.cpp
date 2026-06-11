@@ -976,6 +976,36 @@ TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations"
         CHECK((r.subject == "chrome.exe" || r.subject == "Teams.exe"));
 }
 
+TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the sentinel",
+          "[guaranteed_state_store][events][dex][security]") {
+    // Adversarial-review F1: the batch insert_events path (the preferred gRPC
+    // GuaranteedStatePush ingest) must apply the SAME sentinel guard as the
+    // single-row path — a batch carrying rule_id="__observation__" with a
+    // census-mapping event_type (drift.detected) must NOT mint a phantom
+    // (agent, __observation__) census row (§24). Enforce server-side, never trust
+    // the agent to pair the sentinel with a non-census event_type.
+    GuaranteedStateStore store(":memory:");
+    std::vector<GuaranteedStateEventRow> batch;
+    // A real rule's drift (SHOULD create a census row) + a hostile sentinel row
+    // with a census-mapping event_type (must NOT) in the same batch.
+    batch.push_back(make_event("real-1", "rule-real", "agent-A")); // event_type drift.detected
+    GuaranteedStateEventRow abuse;
+    abuse.event_id = "abuse-1";
+    abuse.rule_id = "__observation__";
+    abuse.agent_id = "agent-A";
+    abuse.event_type = "drift.detected"; // maps to a census state — the attack
+    abuse.severity = "high";
+    abuse.timestamp = "2026-06-09T10:00:00Z";
+    batch.push_back(abuse);
+    auto n = store.insert_events(batch);
+    REQUIRE(n.has_value());
+    CHECK(*n == 2); // both events recorded (the sentinel event itself is valid)
+    // The real rule got its census row…
+    CHECK(store.agent_rule_statuses("rule-real").size() == 1);
+    // …but the sentinel minted NONE (this is the F1 regression assertion).
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+}
+
 TEST_CASE("GuaranteedStateStore: projected fields are length-clamped (server-side)",
           "[guaranteed_state_store][dex][security]") {
     // Governance sec-M1: the server must not trust an enrolled agent to clip —
