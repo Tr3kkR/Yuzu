@@ -23,6 +23,11 @@
 /// include credentials — F1 conditions ledger #3 on #1320). Connect errors
 /// from a well-formed conninfo pass through `PQerrorMessage`, which names
 /// host/port but never the password.
+///
+/// TLS note for DSN wiring (F1 ledger #4): on Windows libpq verifies
+/// `sslmode=verify-ca/verify-full` against `%APPDATA%\postgresql\root.crt`
+/// (or the DSN's `sslrootcert=`), NOT the Windows certificate store that
+/// `cert_store.cpp` handles — provision the root there when a TLS DSN ships.
 
 #include <chrono>
 #include <condition_variable>

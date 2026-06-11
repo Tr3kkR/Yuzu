@@ -124,6 +124,42 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
     }
 }
 
+TEST_CASE("PgPool discards a connection lost mid-use", "[pg][pool]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+
+    // Sever the leased connection server-side (the F1 ledger's
+    // "connection loss mid-txn" error path), then verify the pool discards
+    // it on release instead of recycling a dead handle.
+    auto victim = pool.acquire();
+    REQUIRE(static_cast<bool>(victim));
+    const int victim_pid = PQbackendPID(victim.get());
+    REQUIRE(victim_pid > 0);
+
+    {
+        auto axe = pool.acquire();
+        REQUIRE(static_cast<bool>(axe));
+        const std::string kill = "SELECT pg_terminate_backend(" + std::to_string(victim_pid) + ")";
+        PgResult res{PQexec(axe.get(), kill.c_str())};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+    }
+
+    // Mid-"transaction" use of the severed connection fails...
+    {
+        PgResult begin{PQexec(victim.get(), "BEGIN")};
+        CHECK(begin.status() != PGRES_COMMAND_OK);
+        CHECK(PQstatus(victim.get()) != CONNECTION_OK);
+    }
+    const std::size_t open_before = pool.open();
+    victim.reset(); // ...and release must close it, not pool it
+    CHECK(pool.open() == open_before - 1);
+
+    // The freed capacity yields a fresh, working connection.
+    auto replacement = pool.acquire();
+    REQUIRE(static_cast<bool>(replacement));
+    CHECK(select_1_works(replacement.get()));
+}
+
 TEST_CASE("PgPool concurrent acquire and teardown", "[pg][pool]") {
     YUZU_REQUIRE_PG_DB(db);
 
