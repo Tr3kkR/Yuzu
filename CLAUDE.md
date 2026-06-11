@@ -4,7 +4,7 @@
 
 Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues can query, command, scan, patch, and enforce policy compliance on Windows, Linux, and macOS fleets in real time. Think of it as an open-source alternative to commercial endpoint management platforms, built from scratch in C++23.
 
-The project's goal is to match the full capability set of mature enterprise platforms (see `docs/capability-map.md`) while using modern architecture: gRPC/Protobuf transport, Prometheus-native metrics, SQLite for embedded storage, and a plugin ABI that is stable across compiler versions.
+The project's goal is to match the full capability set of mature enterprise platforms (see `docs/capability-map.md`) while using modern architecture: gRPC/Protobuf transport, Prometheus-native metrics, **PostgreSQL as the server-side storage substrate with SQLite embedded on the agent** (ADR-0006 — see "Server storage substrate" in Routed concerns), and a plugin ABI that is stable across compiler versions.
 
 ## Target Architecture
 
@@ -93,6 +93,12 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
+- **Linux:** `bison`, `flex` — vcpkg's libpq port (Postgres substrate, ADR-0006) builds
+  postgresql from source and cannot auto-acquire them on Linux (`sudo apt-get install -y
+  bison flex`)
+- **macOS:** `autoconf`, `automake`, `libtool` — same libpq port runs autoreconf
+  (`brew install autoconf automake libtool`)
+- **Windows:** no new packages — vcpkg auto-acquires winflexbison
 
 ### Quick start (setup script)
 ```bash
@@ -205,6 +211,7 @@ docs/             Architecture docs, conventions, roadmap, capability map
 - `builtin-baseline` is required because of the `version>=` constraint on abseil. Without it vcpkg resolves against HEAD.
 - OpenSSL is a **required dependency on every platform including Windows**. vcpkg's gRPC port compiles its TLS / JWT / PEM code paths against OpenSSL headers regardless of linkage mode, so `grpc.lib` has unresolved references to `BIO_*`, `EVP_*`, `PEM_*`, `X509_*`, `OPENSSL_sk_*` that must be satisfied by `libssl.lib` + `libcrypto.lib` at final link time. A previous iteration of `vcpkg.json` marked openssl `"platform": "!windows"` with a comment that gRPC would use schannel — that was aspirational, never actually wired up, and confirmed wrong by the #375 option D canary's LNK2019 errors. The comment and platform filter have been removed; openssl is an unconditional top-level dep.
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
+- **libpq (Postgres substrate, ADR-0006/0008): no cmake target carries static libpq's full closure.** `libpgcommon`/`libpgport` (scram/auth helpers) and OpenSSL appear only in `libpq.pc`'s `Libs.private`, so the meson `libpq_dep` block wires them explicitly (unix: cmake `FindPostgreSQL` + `find_library`; Windows: hand-wired per the #375 pattern below). On Windows libpq is a **DLL** (the triplet's static override covers the grpc stack only) and ships via the release zip's vcpkg-DLL sweep — see the ADR-0008 Correction (2026-06-10). `libpq_dep` is gated on `build_server` (the agent stays SQLite). Manifest pins `default-features: false, features: [openssl]`. Pure-C libpq carries no MSVC `detect_mismatch` records, so a wrong-CRT lib pick links silently — the buildtype-conditional `_vcpkg_lib_win` selection is load-bearing. Cold vcpkg builds need bison/flex (Linux) and autotools (macOS) — see Prerequisites.
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND `meson.build`'s Windows-specific `cxx.find_library()` hand-wired `protobuf_dep`/`grpcpp_dep` construction are the **only configuration we've found** that simultaneously avoids LNK2038 (meson cmake-dep bug) and LNK2005 (abseil DLL symbol conflicts). Do not simplify either half without reading `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375" — full timeline, every failed approach, and the #376 strategic escape (migrate off gRPC to QUIC) are there. Linux/macOS are unaffected.
 
 ## CI architecture
@@ -251,6 +258,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Agent privilege model — dedicated `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent` account, narrow `sudo NOPASSWD` entries (Linux/macOS) and LSA privileges (Windows), per-plugin privilege matrix, **production virtual-service-account vs dev local-user paths**, install scripts at `scripts/install-agent-user.{sh,ps1}` | `docs/agent-privilege-model.md` | `security-guardian` on any plugin shell-out / sudoers / setcap change; `cross-platform` on any change that gates a plugin behind a privileged command; `plugin-developer` when adding a new privileged plugin (the doc has the procedure) |
 | Fleet visualization (3D) — REST surface, page-shell, renderer, and process-layer invariants for the 11-PR `feat/viz-engine` ladder | `docs/fleet-viz-invariants.md` | `security-guardian` + `docs-writer` on any change to `viz_routes.{hpp,cpp}` / `fleet_topology_store.{hpp,cpp}` / `viz_page_ui.cpp` / `static/yuzu-viz.js` / `--viz-disable` / `Config::viz_disable` |
 | SQLite `sqlite3_changes()` after `sqlite3_step()` on a FULLMUTEX connection is a data race + correctness bug — `sqlite3_changes()` reads `db->nChange` without the per-connection mutex, so it races any concurrent `step()` on the same handle. FULLMUTEX serialises individual API calls but not the `step → changes` pair. **Use `RETURNING` on the statement itself** so the result is carried in the step return code; or for cases that genuinely need a count, wrap the pair under `sqlite3_db_mutex`. Issue #1033 tracks 24 live store sites still carrying this anti-pattern; until it is closed, every new or modified store must use one of the two correct idioms. | issue #1033 | `cpp-expert` and `architect` on any new `sqlite3_changes()` call site on a shared store connection |
+| **Server storage substrate — PostgreSQL.** As of 2026-06-09 the server's storage substrate is **PostgreSQL**, not SQLite; the "SQLite for embedded storage" principle is **retired for the server, retained for the agent** (`agent.db` + the federated edge warehouse stay SQLite). **New server stores default to Postgres** (no new server SQLite store without an exception ADR); the ~27 existing server SQLite stores migrate incrementally, each behind its own per-store ADR + migration plan (schema port, `SqliteTxn`/`SqliteStmt` → pg transaction owner, `MigrationRunner` → pg schema-migration). `RETURNING` stays the mutate-and-return idiom. **Secrets are NOT a plain Postgres column** — envelope encryption / KMS / `pgcrypto`, separate `security-guardian` review. This is a BREAKING deploy change (compose/Dockerfile/systemd/UAT + CI Postgres service). | `docs/adr/0006-server-postgresql-substrate.md` (+ ADR-0004, its first instance) | `architect` + `sre` on any server store/schema change; `build-ci` on CI Postgres service; `release-deploy` on deploy/compose; `security-guardian` on any secret-at-rest |
 
 ## Guardian engine — stores
 

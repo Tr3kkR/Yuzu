@@ -76,9 +76,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -191,9 +194,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -416,9 +422,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           # requirements-ci.txt is hash-pinned (includes gcovr for the
           # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt

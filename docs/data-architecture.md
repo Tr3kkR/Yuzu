@@ -31,8 +31,17 @@ When building new features, design data schemas with downstream analytics in min
 - Queryable via REST API with filter expressions.
 - **Schema is self-describing** — the plugin reports its own schema at registration. Downstream tooling consumes the schema to materialize tables, not by hard-coding column lists.
 
+## Storage substrate
+
+Server-side stores live on **PostgreSQL** as of 2026-06-09 (ADR-0006); the agent stays on
+SQLite. New server stores default to Postgres, existing ones migrate incrementally behind
+per-store ADRs. ClickHouse (below) remains the **analytics** sink, fed separately — it is not
+the OLTP substrate. Schema designers: read `docs/adr/0006-server-postgresql-substrate.md`
+(and ADR-0004, its first instance) before adding a server store.
+
 ## Cross-references
 
+- `docs/adr/0006-server-postgresql-substrate.md` — server storage substrate (PostgreSQL)
 - `docs/observability-conventions.md` — metric/label/audit envelope rules
 - `docs/clickhouse-setup.md` — ClickHouse ingest pipeline
 - `docs/analytics-events.md` — event taxonomy and downstream contracts
