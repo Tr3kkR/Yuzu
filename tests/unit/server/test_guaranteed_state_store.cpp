@@ -277,6 +277,444 @@ TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store
     CHECK(by_sev[0].event_id == "evt-2");
 }
 
+TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
+          "[guaranteed_state_store][events][crash]") {
+    // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel
+    // rule_id "__observation__" + event_type "process.crashed". It must insert
+    // (rule_id is NOT NULL — the sentinel satisfies it), keep its agent-set
+    // severity verbatim, and NOT create a per-(agent,rule) compliance census row
+    // (process.crashed is not a compliance state). A normal drift event in the
+    // same store still updates the census — proving the skip is crash-specific.
+    // Pins the ruleless path the agent crash recorder relies on.
+    GuaranteedStateStore store(":memory:");
+
+    // A normal rule-bound drift (drift.remediated) -> updates the census.
+    REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
+
+    // A ruleless crash observation.
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-1718000000000-0";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-A";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.guard_type = "process";
+    crash.guard_category = ""; // ruleless-ness + event_type IS the discriminator
+    crash.detected_value = "notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+    REQUIRE(store.insert_event(crash));
+
+    // The crash is stored and keeps its severity verbatim (no rule to enrich from).
+    GuaranteedStateEventQuery q;
+    q.rule_id = "__observation__";
+    auto crashes = store.query_events(q);
+    REQUIRE(crashes.size() == 1);
+    CHECK(crashes[0].event_type == "process.crashed");
+    CHECK(crashes[0].severity == "info");
+    CHECK(crashes[0].guard_category.empty());
+
+    // The census has the drift's (agent,rule) row but NONE for the sentinel.
+    CHECK(store.agent_rule_statuses().size() == 1);
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+}
+
+TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the census",
+          "[guaranteed_state_store][events][crash][security]") {
+    // Security hardening (Gate-2 LOW → enforced): the "__observation__" sentinel is
+    // reserved for ruleless observations and has no live rule. A (mis)behaving agent
+    // could pair it with a COMPLIANCE event_type (drift.detected) to mint a phantom
+    // per-(agent,rule) census row keyed to the reserved id. The store must skip the
+    // census for ANY reserved __…__ rule_id regardless of event_type — not just for
+    // process.crashed.
+    GuaranteedStateStore store(":memory:");
+
+    GuaranteedStateEventRow abuse;
+    abuse.event_id = "__observation__-abuse-1";
+    abuse.rule_id = "__observation__";
+    abuse.agent_id = "agent-A";
+    abuse.event_type = "drift.detected"; // a compliance verdict paired with the sentinel
+    abuse.severity = "info";
+    abuse.timestamp = "2026-06-09T12:00:00Z";
+    REQUIRE(store.insert_event(abuse));
+
+    // The event is still stored (rule_id is NOT NULL — the sentinel satisfies it)…
+    GuaranteedStateEventQuery q;
+    q.rule_id = "__observation__";
+    REQUIRE(store.query_events(q).size() == 1);
+    // …but it creates NO census row for the reserved id.
+    CHECK(store.agent_rule_statuses().empty());
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+
+    // Regression guard: the skip is EXACT-match, NOT a "__"-prefix. A legitimately
+    // authored guard whose name slugifies to a "__"-prefixed rule_id (e.g. "__foo-<hex>")
+    // is a REAL rule-bound id and MUST keep its compliance census.
+    GuaranteedStateEventRow real;
+    real.event_id = "evt-real-1";
+    real.rule_id = "__foo-abc123"; // not the exact sentinel
+    real.agent_id = "agent-A";
+    real.event_type = "drift.detected";
+    real.severity = "high";
+    real.timestamp = "2026-06-09T12:01:00Z";
+    REQUIRE(store.insert_event(real));
+    CHECK(store.agent_rule_statuses("__foo-abc123").size() == 1);
+}
+
+TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // A ruleless observation projects its UNIFORM detail_json facts
+    // (subject/reason/symbolic/component/metric) into the guardian_observations
+    // read model — generically, for every signal type. A plain drift event must
+    // NOT project — the projection is observations-only.
+    GuaranteedStateStore store(":memory:");
+
+    REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
+    CHECK(store.query_observations().empty()); // drift does not project
+
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-proj-1";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-A";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detected_value = "notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll";
+    crash.detail_json =
+        R"({"subject":"notepad.exe","pid":1234,"kind":"exception",)"
+        R"("reason":"0xC0000005","symbolic":"ACCESS_VIOLATION",)"
+        R"("component":"ntdll.dll","platform":"windows"})";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+    REQUIRE(store.insert_event(crash));
+
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 1); // the crash projected; the drift did not
+    CHECK(obs[0].event_id == "__observation__-proj-1");
+    CHECK(obs[0].agent_id == "agent-A");
+    CHECK(obs[0].observed_at == "2026-06-08T12:00:00Z");
+    CHECK(obs[0].obs_type == "process.crashed");
+    CHECK(obs[0].subject == "notepad.exe");
+    CHECK(obs[0].reason == "0xC0000005");
+    CHECK(obs[0].symbolic == "ACCESS_VIOLATION");
+    CHECK(obs[0].component == "ntdll.dll");
+    CHECK(obs[0].platform == "windows");
+}
+
+TEST_CASE("GuaranteedStateStore: legacy slice-1 crash keys still project (fallback)",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // PR #1311 transition compat: an agent still emitting the slice-1 crash keys
+    // (process/exception_code/faulting_module) must keep projecting — the
+    // projection falls back to them when the uniform keys are absent.
+    GuaranteedStateStore store(":memory:");
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-legacy-1";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-L";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detail_json =
+        R"({"process":"old-agent.exe","exception_code":"0xC0000374",)"
+        R"("symbolic":"HEAP_CORRUPTION","faulting_module":"heap.dll","platform":"windows"})";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+    REQUIRE(store.insert_event(crash));
+
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 1);
+    CHECK(obs[0].subject == "old-agent.exe");   // process → subject
+    CHECK(obs[0].reason == "0xC0000374");       // exception_code → reason
+    CHECK(obs[0].component == "heap.dll");      // faulting_module → component
+}
+
+TEST_CASE("GuaranteedStateStore: metric projects for numeric payloads, rejects garbage",
+          "[guaranteed_state_store][events][dex]") {
+    GuaranteedStateStore store(":memory:");
+    auto boot = [&](const std::string& id, const std::string& json) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "os.boot";
+        e.severity = "info";
+        e.detail_json = json;
+        e.timestamp = "2026-06-09T08:00:00Z";
+        REQUIRE(store.insert_event(e));
+    };
+    boot("b1", R"({"subject":"boot","metric":43210.0,"platform":"windows"})");
+    boot("b2", R"({"subject":"boot","metric":-99,"platform":"windows"})");   // negative → 0
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 2);
+    // newest-first ties broken by event_id DESC → b2 first
+    CHECK(obs[0].metric == 0.0);
+    CHECK(obs[1].metric == 43210.0);
+}
+
+TEST_CASE("GuaranteedStateStore: redelivered crash event_id does not double-count the projection",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // The event journal is at-least-once. The projection INSERT lives inside the
+    // event INSERT's transaction, so a duplicate event_id fails the event PK and
+    // rolls back BOTH — the projection inherits the dedup and never double-counts.
+    // A plain round-trip test would miss this (the catch the advisor flagged).
+    GuaranteedStateStore store(":memory:");
+
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-dup-1";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-A";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detail_json = R"({"process":"svc.exe","exception_code":"0xC0000409","platform":"windows"})";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+
+    REQUIRE(store.insert_event(crash));
+    auto dup = store.insert_event(crash); // same event_id redelivered
+    REQUIRE_FALSE(dup.has_value());
+    CHECK(is_conflict_error(dup.error())); // event PK conflict
+
+    // Exactly one event row AND one projection row — no double-count.
+    GuaranteedStateEventQuery q;
+    q.rule_id = "__observation__";
+    CHECK(store.query_events(q).size() == 1);
+    CHECK(store.query_observations().size() == 1);
+}
+
+TEST_CASE("GuaranteedStateStore: malformed crash detail_json still records the observation",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // detail_json is parsed defensively: a malformed blob must NOT drop the crash
+    // (the event itself is still valuable). The observation lands with empty crash
+    // fields rather than failing the insert.
+    GuaranteedStateStore store(":memory:");
+
+    GuaranteedStateEventRow crash;
+    crash.event_id = "__observation__-bad-json-1";
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-A";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detail_json = "{not valid json";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+    REQUIRE(store.insert_event(crash)); // does not fail
+
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 1);
+    CHECK(obs[0].obs_type == "process.crashed");
+    CHECK(obs[0].subject.empty()); // degraded, not dropped
+}
+
+TEST_CASE("GuaranteedStateStore: DEX crash aggregations", "[guaranteed_state_store][crash][dex]") {
+    // Slice 2: crash-scoped GROUP BY over the projection. Known dataset with
+    // verifiable counts, blast radius (distinct devices), tie-break, by-OS, by-day,
+    // and the since-cutoff.
+    GuaranteedStateStore store(":memory:");
+    auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
+                     const std::string& mod, const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow c;
+        c.event_id = id;
+        c.rule_id = "__observation__";
+        c.agent_id = agent;
+        c.event_type = "process.crashed";
+        c.severity = "info";
+        c.detail_json = "{\"subject\":\"" + proc + "\",\"reason\":\"0xC0000005\","
+                        "\"symbolic\":\"ACCESS_VIOLATION\",\"component\":\"" + mod +
+                        "\",\"platform\":\"" + plat + "\"}";
+        c.timestamp = ts;
+        REQUIRE(store.insert_event(c));
+    };
+    crash("e1", "agent-A", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
+    crash("e2", "agent-A", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T11:00:00Z");
+    crash("e3", "agent-B", "chrome.exe", "chrome.dll", "windows", "2026-06-09T10:00:00Z");
+    crash("e4", "agent-B", "Teams.exe", "ntdll.dll", "windows", "2026-06-09T11:00:00Z");
+    crash("e5", "agent-C", "AcmeCRM.exe", "AcmeCRM.dll", "linux", "2026-06-09T12:00:00Z");
+
+    auto sum = store.dex_crash_summary();
+    CHECK(sum.total_crashes == 5);
+    CHECK(sum.distinct_devices == 3);
+    CHECK(sum.distinct_apps == 3);
+
+    auto apps = store.dex_top_apps();
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].subject == "chrome.exe");
+    CHECK(apps[0].crashes == 3);
+    CHECK(apps[0].hangs == 0); // crash-only dataset
+    CHECK(apps[0].distinct_devices == 2); // blast radius: agent-A + agent-B
+    CHECK(apps[0].last_seen == "2026-06-09T10:00:00Z");
+
+    auto mods = store.dex_top_modules();
+    REQUIRE(mods.size() == 3);
+    CHECK(mods[0].component == "ntdll.dll");
+    CHECK(mods[0].crashes == 3);
+    CHECK(mods[0].distinct_apps == 2); // chrome.exe + Teams.exe
+
+    auto devs = store.dex_top_devices();
+    REQUIRE(devs.size() == 3);
+    CHECK(devs[0].agent_id == "agent-A"); // ties at 2 broken by agent_id ASC
+    CHECK(devs[0].crashes == 2);
+    CHECK(devs[1].agent_id == "agent-B");
+    CHECK(devs[2].agent_id == "agent-C");
+    CHECK(devs[2].crashes == 1);
+
+    auto os = store.dex_crashes_by_os();
+    REQUIRE(os.size() == 2);
+    CHECK(os[0].platform == "windows");
+    CHECK(os[0].crashes == 4);
+    CHECK(os[0].distinct_devices == 2);
+    CHECK(os[1].platform == "linux");
+    CHECK(os[1].crashes == 1);
+
+    auto days = store.dex_crashes_by_day();
+    REQUIRE(days.size() == 2);
+    CHECK(days[0].day == "2026-06-08");
+    CHECK(days[0].crashes == 2);
+    CHECK(days[1].day == "2026-06-09");
+    CHECK(days[1].crashes == 3);
+
+    // since-cutoff: only 06-09 onward → e3,e4,e5
+    auto recent = store.dex_crash_summary("2026-06-09T00:00:00Z");
+    CHECK(recent.total_crashes == 3);
+    CHECK(recent.distinct_devices == 2); // agent-B + agent-C
+}
+
+TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_state_store][crash][dex]") {
+    GuaranteedStateStore store(":memory:");
+    auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
+                     const std::string& mod, const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow c;
+        c.event_id = id;
+        c.rule_id = "__observation__";
+        c.agent_id = agent;
+        c.event_type = "process.crashed";
+        c.severity = "info";
+        c.detail_json = "{\"subject\":\"" + proc + "\",\"reason\":\"0xC0000005\","
+                        "\"symbolic\":\"ACCESS_VIOLATION\",\"component\":\"" + mod +
+                        "\",\"platform\":\"" + plat + "\"}";
+        c.timestamp = ts;
+        REQUIRE(store.insert_event(c));
+    };
+    crash("e1", "agent-A", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
+    crash("e2", "agent-A", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T11:00:00Z");
+    crash("e3", "agent-B", "chrome.exe", "chrome.dll", "windows", "2026-06-09T10:00:00Z");
+    crash("e4", "agent-B", "Teams.exe", "ntdll.dll", "windows", "2026-06-09T11:00:00Z");
+
+    // Per-app (chrome.exe): 3 crashes across 2 devices.
+    auto as = store.dex_app_summary("chrome.exe");
+    CHECK(as.crashes == 3);
+    CHECK(as.hangs == 0);
+    CHECK(as.distinct_devices == 2);
+    CHECK(as.first_seen == "2026-06-08T10:00:00Z");
+    CHECK(as.last_seen == "2026-06-09T10:00:00Z");
+
+    auto am = store.dex_app_modules("chrome.exe");
+    REQUIRE(am.size() == 2);
+    CHECK(am[0].component == "ntdll.dll"); // 2 beats chrome.dll's 1
+    CHECK(am[0].crashes == 2);
+
+    auto ae = store.dex_app_exceptions("chrome.exe");
+    REQUIRE(ae.size() == 1);
+    CHECK(ae[0].reason == "0xC0000005");
+    CHECK(ae[0].symbolic == "ACCESS_VIOLATION");
+    CHECK(ae[0].crashes == 3);
+
+    auto ad = store.dex_app_devices("chrome.exe");
+    REQUIRE(ad.size() == 2);
+    CHECK(ad[0].agent_id == "agent-A"); // 2 beats agent-B's 1
+    CHECK(ad[0].crashes == 2);
+
+    // Per-device (agent-A): 2 crashes, 1 distinct app; history newest-first.
+    auto ds = store.dex_device_summary("agent-A");
+    CHECK(ds.crashes == 2);
+    CHECK(ds.signals == 2);
+    CHECK(ds.distinct_apps == 1);
+
+    auto dh = store.dex_device_history("agent-A");
+    REQUIRE(dh.size() == 2);
+    CHECK(dh[0].event_id == "e2"); // newest first (11:00 before 10:00)
+    CHECK(dh[0].subject == "chrome.exe");
+    CHECK(dh[1].event_id == "e1");
+}
+
+TEST_CASE("GuaranteedStateStore: multi-signal summary, hang-aware apps, boot stats",
+          "[guaranteed_state_store][dex][signals]") {
+    // The multi-signal read model: mixed signal types land in ONE projection;
+    // dex_signal_summary rolls up per type; dex_top_apps pivots crash+hang; the
+    // boot aggregations read the metric column; the device history is unified.
+    GuaranteedStateStore store(":memory:");
+    auto sig = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& json, const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = type;
+        e.severity = "info";
+        e.detail_json = json;
+        e.timestamp = ts;
+        REQUIRE(store.insert_event(e));
+    };
+    sig("s1", "agent-A", "process.crashed",
+        R"({"subject":"chrome.exe","reason":"0xC0000005","symbolic":"ACCESS_VIOLATION","component":"ntdll.dll","platform":"windows"})",
+        "2026-06-09T10:00:00Z");
+    sig("s2", "agent-A", "process.hung",
+        R"({"subject":"chrome.exe","symbolic":"NOT_RESPONDING","platform":"windows"})",
+        "2026-06-09T10:05:00Z");
+    sig("s3", "agent-B", "process.hung",
+        R"({"subject":"chrome.exe","symbolic":"NOT_RESPONDING","platform":"windows"})",
+        "2026-06-09T10:06:00Z");
+    sig("s4", "agent-A", "service.crashed",
+        R"({"subject":"Spooler","reason":"7031","symbolic":"SERVICE_CRASHED","platform":"windows"})",
+        "2026-06-09T11:00:00Z");
+    sig("s5", "agent-A", "os.boot",
+        R"({"subject":"boot","metric":43210.0,"platform":"windows"})", "2026-06-09T08:00:00Z");
+    sig("s6", "agent-B", "os.boot",
+        R"({"subject":"boot","metric":91000.0,"platform":"windows"})", "2026-06-09T08:05:00Z");
+
+    // Whole-catalogue rollup: 4 types, ordered by count.
+    auto summary = store.dex_signal_summary();
+    REQUIRE(summary.size() == 4);
+    CHECK(summary[0].count == 2); // hung / boot tie at 2, obs_type ASC → os.boot first
+    CHECK(summary[0].obs_type == "os.boot");
+    CHECK(summary[1].obs_type == "process.hung");
+    CHECK(summary[1].distinct_devices == 2);
+
+    // Hang-aware app table: chrome has 1 crash + 2 hangs across 2 devices.
+    auto apps = store.dex_top_apps();
+    REQUIRE(apps.size() == 1); // only crash/hang subjects (Spooler/boot are other types)
+    CHECK(apps[0].subject == "chrome.exe");
+    CHECK(apps[0].crashes == 1);
+    CHECK(apps[0].hangs == 2);
+    CHECK(apps[0].distinct_devices == 2);
+
+    // Crash summary stays crash-scoped: 1 crash, 1 device.
+    auto cs = store.dex_crash_summary();
+    CHECK(cs.total_crashes == 1);
+    CHECK(cs.distinct_devices == 1);
+
+    // Boot stats from the metric column.
+    auto boot = store.dex_boot_stats();
+    CHECK(boot.boots == 2);
+    CHECK(boot.avg_ms == 67105.0); // (43210 + 91000) / 2
+    CHECK(boot.max_ms == 91000.0);
+    CHECK(boot.distinct_devices == 2);
+    auto slow = store.dex_slowest_boots();
+    REQUIRE(slow.size() == 2);
+    CHECK(slow[0].agent_id == "agent-B"); // slowest average first
+    CHECK(slow[0].max_ms == 91000.0);
+
+    // Per-app summary spans crash + hang, fleet-wide.
+    auto as = store.dex_app_summary("chrome.exe");
+    CHECK(as.crashes == 1);  // s1
+    CHECK(as.hangs == 2);    // s2 + s3
+    CHECK(as.distinct_devices == 2);
+
+    // Per-device summary + unified history for agent-A: crash + hang + service + boot.
+    auto ds = store.dex_device_summary("agent-A");
+    CHECK(ds.crashes == 1);
+    CHECK(ds.hangs == 1);
+    CHECK(ds.signals == 4);
+    CHECK(ds.distinct_apps == 1); // only crash/hang subjects count as apps
+
+    auto dh = store.dex_device_history("agent-A");
+    REQUIRE(dh.size() == 4);
+    CHECK(dh[0].obs_type == "service.crashed"); // newest first
+    CHECK(dh[3].obs_type == "os.boot");
+    CHECK(dh[3].metric == 43210.0);
+}
+
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");
@@ -299,10 +737,12 @@ TEST_CASE("GuaranteedStateStore: event round-trip preserves all fields",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");
     auto in = make_event("evt-1", "rule-1", "agent-X");
+    in.detail_json = R"({"process":"notepad.exe","pid":1234})"; // route a' structured companion
     REQUIRE(store.insert_event(in));
 
     auto out = store.query_events();
     REQUIRE(out.size() == 1);
+    CHECK(out[0].detail_json == in.detail_json); // persisted + read back through the new column
     CHECK(out[0].event_id == in.event_id);
     CHECK(out[0].rule_id == in.rule_id);
     CHECK(out[0].agent_id == in.agent_id);
@@ -502,6 +942,143 @@ TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",
     REQUIRE(r.has_value());
     CHECK(*r == 0);
     CHECK(store.event_count() == 0);
+}
+
+TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations",
+          "[guaranteed_state_store][events][dex]") {
+    // Governance qa-B1: the batch path also projects ruleless observations into
+    // guardian_observations. A mixed batch (drift + observations) must project
+    // exactly the observation rows — and a projection failure must NOT roll back
+    // the batch (degrade-don't-destroy, UP-1).
+    GuaranteedStateStore store(":memory:");
+    std::vector<GuaranteedStateEventRow> batch;
+    auto obs = [](const std::string& id, const std::string& proc) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = R"({"subject":")" + proc + R"(","reason":"0xC0000005","platform":"windows"})";
+        e.timestamp = "2026-06-09T10:00:00Z";
+        return e;
+    };
+    batch.push_back(make_event("d1", "rule-1", "agent-A")); // drift — must NOT project
+    batch.push_back(obs("o1", "chrome.exe"));
+    batch.push_back(obs("o2", "Teams.exe"));
+    auto n = store.insert_events(batch);
+    REQUIRE(n.has_value());
+    CHECK(*n == 3);
+    auto rows = store.query_observations();
+    REQUIRE(rows.size() == 2); // only the two observations projected
+    CHECK(rows[0].subject != rows[1].subject);
+    for (const auto& r : rows)
+        CHECK((r.subject == "chrome.exe" || r.subject == "Teams.exe"));
+}
+
+TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the sentinel",
+          "[guaranteed_state_store][events][dex][security]") {
+    // Adversarial-review F1: the batch insert_events path (the preferred gRPC
+    // GuaranteedStatePush ingest) must apply the SAME sentinel guard as the
+    // single-row path — a batch carrying rule_id="__observation__" with a
+    // census-mapping event_type (drift.detected) must NOT mint a phantom
+    // (agent, __observation__) census row (§24). Enforce server-side, never trust
+    // the agent to pair the sentinel with a non-census event_type.
+    GuaranteedStateStore store(":memory:");
+    std::vector<GuaranteedStateEventRow> batch;
+    // A real rule's drift (SHOULD create a census row) + a hostile sentinel row
+    // with a census-mapping event_type (must NOT) in the same batch.
+    batch.push_back(make_event("real-1", "rule-real", "agent-A")); // event_type drift.detected
+    GuaranteedStateEventRow abuse;
+    abuse.event_id = "abuse-1";
+    abuse.rule_id = "__observation__";
+    abuse.agent_id = "agent-A";
+    abuse.event_type = "drift.detected"; // maps to a census state — the attack
+    abuse.severity = "high";
+    abuse.timestamp = "2026-06-09T10:00:00Z";
+    batch.push_back(abuse);
+    auto n = store.insert_events(batch);
+    REQUIRE(n.has_value());
+    CHECK(*n == 2); // both events recorded (the sentinel event itself is valid)
+    // The real rule got its census row…
+    CHECK(store.agent_rule_statuses("rule-real").size() == 1);
+    // …but the sentinel minted NONE (this is the F1 regression assertion).
+    CHECK(store.agent_rule_statuses("__observation__").empty());
+}
+
+TEST_CASE("GuaranteedStateStore: projected fields are length-clamped (server-side)",
+          "[guaranteed_state_store][dex][security]") {
+    // Governance sec-M1: the server must not trust an enrolled agent to clip —
+    // an oversized subject is clamped (256 B) so it cannot bloat the projection
+    // or the dashboard. UTF-8-safe so the clamp never tears a codepoint.
+    GuaranteedStateStore store(":memory:");
+    const std::string huge(5000, 'A');
+    GuaranteedStateEventRow c;
+    c.event_id = "big-1";
+    c.rule_id = "__observation__";
+    c.agent_id = "agent-A";
+    c.event_type = "process.crashed";
+    c.severity = "info";
+    c.detail_json = R"({"subject":")" + huge + R"(","reason":"0xC0000005","platform":"windows"})";
+    c.timestamp = "2026-06-09T10:00:00Z";
+    REQUIRE(store.insert_event(c));
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 1);
+    CHECK(obs[0].subject.size() <= 256);
+}
+
+TEST_CASE("GuaranteedStateStore: reaper deletes observations in lockstep with events",
+          "[guaranteed_state_store][dex][retention]") {
+    // Governance qa-B2: a stale observation (projected via insert_event, so it
+    // carries the parent event's ttl) is reaped; a fresh one survives. Drives the
+    // production observation-DELETE inline via a second connection (the same
+    // pattern the events-reaper test uses, since the cron thread's first tick
+    // outlasts the test budget) — exercising the real predicate against rows the
+    // real projection path created.
+    TempDbFile tmp;
+    GuaranteedStateStore store(tmp.path, /*retention_days=*/30);
+    auto obs = [&](const std::string& id) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = R"({"subject":"chrome.exe","reason":"0xC0000005","platform":"windows"})";
+        e.timestamp = "2026-06-09T10:00:00Z";
+        REQUIRE(store.insert_event(e));
+    };
+    obs("fresh");
+    obs("stale");
+    REQUIRE(store.query_observations().size() == 2);
+
+    {
+        sqlite3* h = nullptr;
+        REQUIRE(sqlite3_open_v2(tmp.path.string().c_str(), &h, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        // Age the stale projection row, then run the production observation reap SQL.
+        REQUIRE(sqlite3_exec(
+                    h, "UPDATE guardian_observations SET ttl_expires_at = 1 WHERE event_id='stale'",
+                    nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(h,
+                                   "DELETE FROM guardian_observations "
+                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
+                                   -1, &st, nullptr) == SQLITE_OK);
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        sqlite3_bind_int64(st, 1, now);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        CHECK(sqlite3_changes(h) == 1); // only the stale projection row
+        sqlite3_finalize(st);
+        sqlite3_close(h);
+    }
+
+    GuaranteedStateStore reopened(tmp.path, /*retention_days=*/30);
+    auto survivors = reopened.query_observations();
+    REQUIRE(survivors.size() == 1);
+    CHECK(survivors[0].event_id == "fresh");
 }
 
 // ── #452 §5 — retention reaper ────────────────────────────────────────────

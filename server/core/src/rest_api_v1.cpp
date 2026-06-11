@@ -356,6 +356,7 @@ const std::string& openapi_spec() {
           "guard_category": {"type": "string", "enum": ["event", "condition"]},
           "detected_value": {"type": "string"},
           "expected_value": {"type": "string"},
+          "detail_json": {"type": "string", "description": "Structured machine-readable detail, JSON keyed by event_type (route a'); empty for plain drift. For process.crashed: process/pid/kind/exception_code/symbolic/faulting_module/platform."},
           "remediation_action": {"type": "string"},
           "remediation_success": {"type": "boolean"},
           "detection_latency_us": {"type": "integer"},
@@ -4678,7 +4679,7 @@ void RestApiV1::register_routes(
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
     // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
-    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, guaranteed_state_store](
+    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, audit_fn, guaranteed_state_store](
                                                     const httplib::Request& req,
                                                     httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -4692,6 +4693,15 @@ void RestApiV1::register_routes(
         q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
         q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+        // Behavioral-PII access audit (governance compliance-F1): an agent-scoped
+        // query returns that device's signal history incl. detail_json (which apps
+        // a person runs) — the same behavioral data the dashboard per-device view
+        // audits as dex.device.view. Emit the SAME verb so a SIEM filter catches
+        // both surfaces. A query with NO agent_id filter is a bulk operational
+        // query (not individual-identifying) and is deliberately not audited here.
+        if (!q.agent_id.empty())
+            audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
+                     "DEX per-device events via REST /api/v1/guaranteed-state/events");
         if (req.has_param("limit")) {
             int v = 0;
             auto s = req.get_param_value("limit");
@@ -4728,6 +4738,7 @@ void RestApiV1::register_routes(
                     .add("guard_category", e.guard_category)
                     .add("detected_value", e.detected_value)
                     .add("expected_value", e.expected_value)
+                    .add("detail_json", e.detail_json)
                     .add("remediation_action", e.remediation_action)
                     .add("remediation_success", e.remediation_success)
                     .add("detection_latency_us", static_cast<int64_t>(e.detection_latency_us))

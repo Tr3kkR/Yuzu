@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — DEX drill-down (by app / by device)</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile). Pair to dex-overview.html.
+  Two drill-downs, toggled:
+   • BY APP  — blast radius of one application (distinct devices, over time,
+               faulting modules + exception codes, affected-device list).
+   • BY DEVICE — one device's crash history rendered HUMAN-FRIENDLY (time / app /
+               what-happened / module) — this is the form that CLOSES the deferred
+               UP-4 (crashes used to render as a raw __observation__ row).
+  Privacy: a device's crash history is employee-behavioral data (which apps a
+  person runs), so the per-device view is gated behind the same access as other PII.
+  OS-neutral vocabulary throughout. Fake data, consistent with the overview.
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#243553; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --white:#fff; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff; --slate:#6f86a6;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
+  .wrap{max-width:900px;margin:0 auto}
+  a.back{color:var(--accent);text-decoration:none;font-size:.74rem}
+  h2{font-size:1.15rem;margin:.5rem 0 .15rem;color:var(--white)}
+  h2 .mono{font-family:'JetBrains Mono',Consolas,monospace}
+  .sub{color:var(--muted);font-size:.78rem;margin-bottom:1rem}
+  .tabs{display:flex;gap:.4rem;margin-bottom:1rem;align-items:center}
+  .tab{background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:.4rem;padding:.3rem .8rem;font-size:.78rem;cursor:pointer}
+  .tab.active{color:var(--white);border-color:var(--accent)}
+
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.1rem 0 .45rem}
+  .strip{display:flex;flex-wrap:wrap;gap:.55rem}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.55rem .8rem;min-width:130px;flex:1}
+  .stat .n{font-size:1.4rem;font-weight:700;color:var(--white);line-height:1.1}
+  .stat .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .stat .sx{font-size:.62rem;color:var(--muted);margin-top:.12rem}
+  .n.good{color:var(--green)} .n.warn{color:var(--yellow)} .n.bad{color:var(--red)} .n.info{color:var(--lightblue)}
+  .stat.cov{border-color:rgba(165,214,255,.45)}
+
+  .trend{display:flex;align-items:flex-end;gap:.4rem;height:70px;margin-top:.4rem}
+  .tcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:.2rem}
+  .tbar{width:58%;background:var(--red);border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
+  .tcol small{font-size:.56rem;color:var(--muted)}
+
+  table{width:100%;border-collapse:collapse;font-size:.76rem;margin-top:.2rem}
+  th{text-align:left;padding:.4rem .5rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
+  td{padding:.4rem .5rem;border-bottom:1px solid var(--border)}
+  tr.click{cursor:pointer} tr.click:hover td{background:var(--surface)}
+  .name{color:var(--white);font-weight:600}
+  .mono{font-family:'JetBrains Mono',Consolas,monospace}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .muted{color:var(--muted)}
+  .os-win{color:var(--lightblue)}
+  .what{color:var(--yellow)}
+  .code{font-family:'JetBrains Mono',Consolas,monospace;color:var(--lightblue);font-size:.72rem}
+  .pill{font-size:.6rem;border:1px solid var(--border);border-radius:.3rem;padding:.05rem .35rem;color:var(--muted)}
+  .armed{color:var(--green)}
+  .privacy{font-size:.68rem;color:var(--lightblue);background:rgba(165,214,255,.06);border:1px solid rgba(165,214,255,.25);border-radius:.4rem;padding:.4rem .6rem;margin:.5rem 0}
+  .note{margin-top:1.3rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .note b{color:var(--lightblue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="dex-overview.html">&larr; Reliability overview</a>
+
+  <div class="tabs" style="margin-top:.5rem">
+    <span class="tab active" onclick="tab(this,'app')">By app &mdash; AcmeCRM.exe</span>
+    <span class="tab" onclick="tab(this,'device')">By device &mdash; WS-00472</span>
+  </div>
+
+  <!-- ═════════ BY APP ═════════ -->
+  <div id="app">
+    <h2><span class="mono">AcmeCRM.exe</span> <span class="pill">line-of-business</span></h2>
+    <div class="sub">Blast radius and failure shape for one application across the Windows fleet (7d).</div>
+
+    <div class="sech">Impact</div>
+    <div class="strip">
+      <div class="stat"><div class="n bad">14</div><div class="l">Crashes</div></div>
+      <div class="stat"><div class="n warn">9</div><div class="l">Devices affected</div><div class="sx">of 636 reporting</div></div>
+      <div class="stat"><div class="n">1.4%</div><div class="l">% of fleet</div><div class="sx">blast radius</div></div>
+      <div class="stat"><div class="n info">0xC0000005</div><div class="l">Top exception</div><div class="sx">Access violation</div></div>
+      <div class="stat cov"><div class="n">Mon</div><div class="l">Onset</div><div class="sx">spike after the 09:00 rollout</div></div>
+    </div>
+
+    <div class="sech">Crashes per day (7d)</div>
+    <div class="trend">
+      <div class="tcol"><div class="tbar" style="height:6px"></div><small>Th</small></div>
+      <div class="tcol"><div class="tbar" style="height:6px"></div><small>Fr</small></div>
+      <div class="tcol"><div class="tbar" style="height:0"></div><small>Sa</small></div>
+      <div class="tcol"><div class="tbar" style="height:0"></div><small>Su</small></div>
+      <div class="tcol"><div class="tbar" style="height:52px"></div><small>Mo</small></div>
+      <div class="tcol"><div class="tbar" style="height:40px"></div><small>Tu</small></div>
+      <div class="tcol"><div class="tbar" style="height:22px"></div><small>We</small></div>
+    </div>
+    <div class="sx" style="color:var(--muted);font-size:.62rem;margin-top:.2rem">Flat &rarr; spikes Monday: a regression introduced by a version rollout, not chronic instability.</div>
+
+    <div class="sech">Where it fails</div>
+    <div class="strip" style="align-items:flex-start">
+      <div style="flex:1;min-width:280px">
+        <table>
+          <thead><tr><th>Faulting module</th><th class="num">Crashes</th></tr></thead>
+          <tbody>
+            <tr><td class="mono name">AcmeCRM.dll</td><td class="num">11</td></tr>
+            <tr><td class="mono name">ntdll.dll</td><td class="num">2</td></tr>
+            <tr><td class="mono name">KERNELBASE.dll</td><td class="num">1</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="flex:1;min-width:280px">
+        <table>
+          <thead><tr><th>Exception</th><th class="num">Crashes</th></tr></thead>
+          <tbody>
+            <tr><td><span class="code">0xC0000005</span> <span class="what">Access violation</span></td><td class="num">12</td></tr>
+            <tr><td><span class="code">0xC0000409</span> <span class="what">Stack buffer overrun</span></td><td class="num">2</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="sech">Affected devices</div>
+    <table>
+      <thead><tr><th>Device</th><th>OS</th><th class="num">Crashes</th><th>First seen</th><th>Last seen</th></tr></thead>
+      <tbody>
+        <tr class="click" onclick="tab2('device')"><td class="name">WS-00472</td><td class="os-win">Windows 11</td><td class="num">5</td><td class="muted">Mon 09:12</td><td class="muted">3 min ago</td></tr>
+        <tr class="click" onclick="tab2('device')"><td class="name">WS-00913</td><td class="os-win">Windows 10</td><td class="num">3</td><td class="muted">Mon 10:40</td><td class="muted">1 hr ago</td></tr>
+        <tr class="click" onclick="tab2('device')"><td class="name">WS-01502</td><td class="os-win">Windows 11</td><td class="num">2</td><td class="muted">Mon 09:55</td><td class="muted">2 hr ago</td></tr>
+        <tr><td class="muted" colspan="5">+ 6 more devices &middot; 1 crash each</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ═════════ BY DEVICE ═════════ -->
+  <div id="device" style="display:none">
+    <h2><span class="mono">WS-00472</span></h2>
+    <div class="sub">One device's crash history. <a class="back" href="/viz/host/WS-00472">Open in fleet viz &rarr;</a></div>
+
+    <div class="privacy">&#128274; <b>Behavioral data.</b> A crash history reveals which applications a person runs &mdash;
+      treated as PII. This view is gated behind the same access control as other employee data, and every open is audit-logged.</div>
+
+    <div class="sech">Device reliability state</div>
+    <div class="strip">
+      <div class="stat"><div class="n bad">7</div><div class="l">Crashes (7d)</div></div>
+      <div class="stat"><div class="n warn">3</div><div class="l">Distinct apps</div></div>
+      <div class="stat cov"><div class="n armed" style="font-size:1.05rem">&#10003; armed</div><div class="l">Crash observer</div><div class="sx">reporting &middot; checked in 3 min ago</div></div>
+      <div class="stat"><div class="n info" style="font-size:1.05rem">Windows 11</div><div class="l">OS</div><div class="sx">build 26100</div></div>
+    </div>
+
+    <div class="sech">Crash history (7d)</div>
+    <table>
+      <thead><tr><th>When</th><th>Application</th><th>What happened</th><th>Faulting module</th></tr></thead>
+      <tbody>
+        <tr><td class="muted">today 14:41</td><td class="mono name">AcmeCRM.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">AcmeCRM.dll</td></tr>
+        <tr><td class="muted">today 11:20</td><td class="mono name">AcmeCRM.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">AcmeCRM.dll</td></tr>
+        <tr><td class="muted">Tue 16:58</td><td class="mono name">chrome.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">ntdll.dll</td></tr>
+        <tr><td class="muted">Tue 09:33</td><td class="mono name">AcmeCRM.exe</td><td class="what">Stack buffer overrun <span class="code">0xC0000409</span></td><td class="mono">AcmeCRM.dll</td></tr>
+        <tr><td class="muted">Mon 13:07</td><td class="mono name">AcmeCRM.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">AcmeCRM.dll</td></tr>
+        <tr><td class="muted">Mon 10:15</td><td class="mono name">Teams.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">KERNELBASE.dll</td></tr>
+        <tr><td class="muted">Mon 09:12</td><td class="mono name">AcmeCRM.exe</td><td class="what">Access violation <span class="code">0xC0000005</span></td><td class="mono">AcmeCRM.dll</td></tr>
+      </tbody>
+    </table>
+    <div class="sx" style="color:var(--muted);font-size:.62rem;margin-top:.25rem">Same friendly row the dashboard renders instead of the raw
+      <span class="mono">__observation__</span> event (closes the deferred UP-4). Structured fields come from the projected crash facts.</div>
+  </div>
+
+  <div class="note">
+    Both drill-downs read from the <b>same crash observations</b> as the overview &mdash; the app view groups by
+    application, the device view by device. No live probe; figures are from pushed crash reports. The per-device
+    history is <b>on-demand + access-controlled</b> (behavioral data). &nbsp;&mdash;&nbsp;<b>Useful shape?</b>
+    Anything you'd want on the app or device view that's missing?
+  </div>
+
+<script>
+  function tab(el,id){
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
+    ['app','device'].forEach(x=>document.getElementById(x).style.display=x===id?'':'none');
+  }
+  function tab2(id){
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.tab')[id==='device'?1:0].classList.add('active');
+    ['app','device'].forEach(x=>document.getElementById(x).style.display=x===id?'':'none');
+    window.scrollTo(0,0);
+  }
+</script>
+</div>
+</body>
+</html>

@@ -14,6 +14,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/dex_observer.hpp>
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -34,6 +35,7 @@ __declspec(allocate(".CRT$XCB"))
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
+#include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -533,6 +535,16 @@ public:
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
+        metrics_.describe("yuzu_agent_dex_observer_armed",
+                          "1 if the Guardian DEX signal observer is armed AND all its channel "
+                          "subscriptions are live, else 0. Tracks runtime health: a runtime "
+                          "EvtSubscribe error on any channel (EventLog restart / channel ACL "
+                          "change) flips it to 0 via the observer error callback. NOT whether the "
+                          "underlying reporters are enabled (a WER-disabled host stays armed=1 yet "
+                          "emits no crash events). Surfaced fleet-wide via the heartbeat rollup "
+                          "yuzu_fleet_agents_dex_observer_disarmed (the agent has no /metrics "
+                          "endpoint).",
+                          "gauge");
         // PKI PR3 (gov UP-9 / enterprise): make a stuck/failed per-agent mTLS
         // provisioning observable to fleet alerting, not just the agent log.
         metrics_.describe("yuzu_agent_cert_provision_failed_total",
@@ -614,6 +626,62 @@ public:
             spdlog::warn("Guardian engine start_local failed: {} — continuing without Guardian",
                          r.error());
         }
+
+        // 1c-bis. Fleet-wide DEX signal observer (Guardian DEX, multi-signal).
+        // RULELESS observations — records every catalogued reliability signal
+        // (crash, hang, service failure, bugcheck, boot duration, …; see
+        // dex_signal_catalog.cpp), independent of any rule. No-op off Windows.
+        // Armed pre-network; emit_guardian_event() self-guards on the Subscribe
+        // stream being up, so signals before first connect are dropped (like
+        // guard events pre-sink; durable buffering is A3).
+        // --dex-disable / YUZU_AGENT_DEX_DISABLE is a deploy-time opt-out: when set,
+        // the observer never arms and NO DEX signal telemetry is collected.
+        dex_observer_ = make_dex_observer();
+        // Runtime health flag — the single source of truth for the heartbeat arm tag.
+        // A shared_ptr<atomic> (NOT `this`) so the observer's error callback, which fires
+        // on an OS threadpool thread and may outlive this agent, can flip it to false
+        // without a use-after-free. A runtime EvtSubscribeActionError on ANY channel
+        // (EventLog restart / channel ACL change → that channel goes deaf after a
+        // successful start) flips it, so the next heartbeat reports armed=0 and the
+        // fleet `disarmed` gauge rises — the arm signal tracks runtime health, not just
+        // the initial arm (UP-1).
+        // Seeded OPTIMISTICALLY true: the error callback may fire DURING start() (once
+        // EvtSubscribe arms, before start() returns), so we must NOT blind-store the
+        // start() result afterwards — that would clobber a false the callback wrote in
+        // that window. The disable / not-armed branches clear it explicitly instead.
+        dex_health_ = std::make_shared<std::atomic<bool>>(true);
+        if (cfg_.dex_disable) {
+            dex_health_->store(false, std::memory_order_relaxed);
+            spdlog::info(
+                "dex_observer: disabled by --dex-disable — no DEX signal telemetry collected");
+        } else if (dex_observer_->start([this](const SignalObservation& obs) {
+                       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                       const auto seq = dex_seq_.fetch_add(1, std::memory_order_relaxed);
+                       // Include agent_id: the at-least-once event_id is a GLOBAL primary key
+                       // server-side, so two agents observing in the same ms (e.g. a bad
+                       // fleet-wide deploy) would otherwise mint identical ids and all but one
+                       // would be dropped at ingest — losing signals exactly when they matter.
+                       const std::string event_id = std::string(kObservationRuleSentinel) + "-" +
+                                                     cfg_.agent_id + "-" + std::to_string(now_ms) +
+                                                     "-" + std::to_string(seq);
+                       // dex_seq_ (incremented above) doubles as the per-agent observed-signal
+                       // total surfaced in the heartbeat → fleet rollup; no separate counter.
+                       emit_guardian_event(signal_observation_to_event(obs, event_id));
+                   },
+                   [h = dex_health_] { h->store(false, std::memory_order_relaxed); })) {
+            // Armed — leave dex_health_ as-is: true, or false if the error callback
+            // already fired during start(). Do NOT blind-store — see the seed comment.
+        } else {
+            dex_health_->store(false, std::memory_order_relaxed);
+            spdlog::debug("dex_observer: not armed on this platform — DEX signals disabled");
+        }
+        // Arm gauge: seeded from dex_health_ (so a during-start error is reflected) and
+        // re-synced from it at each heartbeat, so it tracks runtime subscription health,
+        // not just the initial arm (UP-1).
+        metrics_.gauge("yuzu_agent_dex_observer_armed")
+            .set(dex_health_->load(std::memory_order_relaxed) ? 1.0 : 0.0);
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1332,18 +1400,8 @@ public:
                         std::lock_guard lock(stream_write_mu_);
                         guardian_sink_stream_ = stream;
                     }
-                    guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
-                        pb::CommandResponse resp;
-                        resp.set_plugin("__guard__");
-                        resp.set_action("event");
-                        resp.set_status(pb::CommandResponse::SUCCESS);
-                        resp.set_payload(ev.SerializeAsString());
-                        std::lock_guard lock(stream_write_mu_);
-                        if (guardian_sink_stream_)
-                            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
-                        // else: link is down between reconnects — event dropped
-                        // (durable event buffering is Guardian A3).
-                    });
+                    guardian_->set_event_sink(
+                        [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
                 }
 
                 // 4b. Spawn OTA update check thread
@@ -1433,6 +1491,24 @@ public:
                             if (guardian_)
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+#if defined(_WIN32)
+                            // DEX signal observer (Windows only — no-op elsewhere). Both tags
+                            // are omitted when --dex-disable opted the agent out, so the server
+                            // rollups reflect genuine state, not opt-outs or non-Windows agents.
+                            // The agent has no /metrics endpoint; these heartbeat tags are the
+                            // ONLY path that makes a silently-deaf observer and the fleet signal
+                            // count observable (see AgentHealthStore::recompute_metrics).
+                            if (!cfg_.dex_disable) {
+                                const bool healthy =
+                                    dex_health_ &&
+                                    dex_health_->load(std::memory_order_relaxed);
+                                tags["yuzu.dex_observer_armed"] = healthy ? "1" : "0";
+                                tags["yuzu.dex_observed"] =
+                                    std::to_string(dex_seq_.load(std::memory_order_relaxed));
+                                metrics_.gauge("yuzu_agent_dex_observer_armed")
+                                    .set(healthy ? 1.0 : 0.0);
+                            }
+#endif
 
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
@@ -1818,14 +1894,25 @@ public:
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
-        if (guardian_)
-            guardian_->stop();
-        if (updater_)
-            updater_->stop();
-        // Cancel the Subscribe stream to unblock the Read() call
+        // Cancel the Subscribe stream FIRST. The Guardian drift workers and the DEX
+        // observer both emit through emit_guardian_event(), whose synchronous gRPC
+        // Write() BLOCKS on a stalled-but-not-dead stream (gateway up, not draining).
+        // guardian_->stop() / dex_observer_->stop() below DRAIN those emitters with an
+        // unbounded wait, so cancelling only after the drain lets an in-flight signal
+        // Write during shutdown wedge stop() forever (cpp-safety BLOCKING). TryCancel
+        // aborts the blocked Write; it does NOT tear the stream down — the stream holder
+        // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
+        // they stay live through both drains and emit_guardian_event's null-check under
+        // the lock remains UAF-safe.
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
         }
+        if (guardian_)
+            guardian_->stop();
+        if (dex_observer_)
+            dex_observer_->stop();
+        if (updater_)
+            updater_->stop();
         // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
         if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
             hctx->TryCancel();
@@ -1837,6 +1924,21 @@ public:
     std::vector<std::string> loaded_plugins() const override { return plugin_names_; }
 
 private:
+    // Serialize a Guardian event into the __guard__/event CommandResponse and write
+    // it through the current Subscribe stream. Shared by the GuardianEngine drift
+    // sink and the (ruleless) DEX signal observer. Drops the event if the link is
+    // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
+    void emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        pb::CommandResponse resp;
+        resp.set_plugin("__guard__");
+        resp.set_action("event");
+        resp.set_status(pb::CommandResponse::SUCCESS);
+        resp.set_payload(ev.SerializeAsString());
+        std::lock_guard lock(stream_write_mu_);
+        if (guardian_sink_stream_)
+            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+    }
+
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -1874,6 +1976,21 @@ private:
     // workers write through are still alive (H4 / #1209). Body-initialized in the
     // ctor (after kv_store_), so the later declaration does not affect construction.
     std::unique_ptr<GuardianEngine> guardian_;
+    // Fleet-wide DEX signal observer (multi-signal). Declared AFTER stream_write_mu_
+    // + guardian_sink_stream_ (same reasoning as guardian_): its OS-callbacks emit
+    // through emit_guardian_event(), so its dtor (which stop()s the subscriptions +
+    // drains in-flight callbacks) must run while the mutex + sink-stream holder are
+    // still alive. dex_seq_ disambiguates the at-least-once event_id for same-agent
+    // bursts within one millisecond; agent_id (folded into the id) disambiguates
+    // ACROSS agents so a fleet-wide signal wave doesn't collide on the global PK.
+    std::atomic<std::uint64_t> dex_seq_{0};
+    // Runtime arm/health of the DEX observer — flipped to false by the observer's
+    // error callback on a runtime subscription failure on any channel (UP-1). A
+    // shared_ptr<atomic> (not `this`) so a late OS-threadpool error callback stays
+    // UAF-safe. Read by the heartbeat thread to drive the `yuzu.dex_observer_armed`
+    // tag.
+    std::shared_ptr<std::atomic<bool>> dex_health_;
+    std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;

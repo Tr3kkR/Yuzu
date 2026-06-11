@@ -3366,8 +3366,10 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
-- **Response:** `data[]` of event objects.
+- **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 - **4xx:** `400` on non-integer or negative `limit` / `offset`.
+- **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
+- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. A query with no `agent_id` filter is a bulk operational query and is not individually audited.
 
 #### `GET /api/v1/guaranteed-state/status`
 

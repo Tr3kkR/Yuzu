@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1213,6 +1215,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, int> version_counts;
     double total_commands = 0.0;
     int healthy_count = 0;
+    int dex_observer_disarmed = 0;
+    double total_dex_observed = 0.0;
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1234,15 +1238,37 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!ver_val.empty())
             version_counts[ver_val]++;
 
-        auto cmd_val = get("yuzu.commands_executed");
-        if (!cmd_val.empty()) {
+        // std::stod does NOT throw on "inf"/"nan" — it returns the non-finite value,
+        // which a single (rogue/buggy) agent could use to poison a fleet-wide gauge for
+        // every operator until it ages out. Accept only finite, non-negative counts.
+        auto add_finite_count = [](double& acc, const std::string& s) {
             try {
-                total_commands += std::stod(cmd_val);
+                double v = std::stod(s);
+                if (std::isfinite(v) && v >= 0.0)
+                    acc += v;
             } catch (...) {}
-        }
+        };
+
+        auto cmd_val = get("yuzu.commands_executed");
+        if (!cmd_val.empty())
+            add_finite_count(total_commands, cmd_val);
+
+        // DEX signal observer: a Windows agent (DEX enabled) reporting "0" failed to
+        // arm (or a channel went deaf at runtime). The tag is only emitted by such
+        // agents (see agent heartbeat), so absent / other values are correctly not
+        // counted as a fault.
+        if (get("yuzu.dex_observer_armed") == "0")
+            ++dex_observer_disarmed;
+
+        auto dex_val = get("yuzu.dex_observed");
+        if (!dex_val.empty())
+            add_finite_count(total_dex_observed, dex_val);
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
+    metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
+        .set(static_cast<double>(dex_observer_disarmed));
+    metrics.gauge("yuzu_fleet_dex_observed_total").set(total_dex_observed);
 
     for (const auto& [os, count] : os_counts) {
         metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));

@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -265,6 +266,17 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
+                          "Windows agents (DEX enabled) reporting their DEX signal observer is not "
+                          "fully healthy (no channel armed, or a channel subscription dropped at "
+                          "runtime) — >0 means reliability telemetry is off or degraded on that "
+                          "many endpoints. (Per-channel partial-arm granularity is a follow-up; "
+                          "today this is the agent's own health flag.)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_dex_observed_total",
+                          "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
+                          "boot reports, …; sum of agent-reported counts since each agent "
+                          "started)", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -449,6 +461,15 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_proj_failures_total",
+                          "DEX observation projection failures. The source event is preserved "
+                          "(degrade-don't-destroy); only the derived guardian_observations read "
+                          "model row is lost. >0 means /dex is under-counting — investigate "
+                          "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_observations_reaped_total",
+                          "Cumulative DEX observation rows deleted by the retention reaper "
+                          "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
@@ -2140,6 +2161,12 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                    metrics_.gauge("yuzu_server_guardian_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_reaped_total()));
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
@@ -7391,6 +7418,33 @@ private:
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             });
 
+        // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
+        // over the crash-observation projection). Read-only; NO mock data — real
+        // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
+        dex_routes_ = std::make_unique<DexRoutes>();
+        dex_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(),
+            // Cross-store fleet denominator for the DEX rates: count online agents,
+            // and of those the Windows ones (the only OS with a crash collector
+            // today — the coverage-honest crash-free denominator). Real data; an
+            // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            [this]() -> DexFleet {
+                DexFleet f;
+                const auto ids = registry_.all_ids();
+                f.total_online = static_cast<int64_t>(ids.size());
+                for (const auto& id : ids) {
+                    if (auto s = registry_.get_session(id)) {
+                        std::string os = s->os;
+                        for (auto& c : os)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        if (os.find("win") != std::string::npos)
+                            ++f.windows_online;
+                    }
+                }
+                return f;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -8184,6 +8238,7 @@ private:
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
+    std::unique_ptr<DexRoutes> dex_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
