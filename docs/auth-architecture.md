@@ -45,6 +45,10 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   protected by the same 0600 file mode that backs `password_hash`.
   Encryption-at-rest (AES-256-GCM with key in `auth_kv`) is a follow-up;
   the `auth_kv` table is provisioned empty.
+  **ADR-0010 (2026-06-10) supersedes the `auth_kv` plan:** the mechanism is
+  `SecretCodec` (AES-256-GCM, DEK wrapped by the `KeyProvider`-custodied KEK),
+  landing with the `auth` store's Postgres migration. `auth_kv` will not be
+  used for this purpose.
 - **CLI flags / Config** — `--mfa-enforcement <optional|admin-only|required>`
   (PR 1 honours `optional` only), `--mfa-step-up-window-secs` (default
   300), `--mfa-login-pending-secs` (default 120).
