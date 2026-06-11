@@ -363,6 +363,14 @@ public:
     // issue a SQL `COUNT(*)` every scrape.
     uint64_t events_written_total() const noexcept { return events_written_.load(); }
     uint64_t events_reaped_total() const noexcept { return events_reaped_.load(); }
+    // DEX projection health (governance UP-1): projection failures degrade to
+    // event-only commits and are counted here so the read-model loss is
+    // alertable; the reap counter is the disposal-evidence twin of
+    // events_reaped_ for the guardian_observations table (compliance WS-E).
+    uint64_t observations_proj_failures_total() const noexcept {
+        return observations_proj_failures_.load();
+    }
+    uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -375,6 +383,8 @@ private:
 
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
+    std::atomic<uint64_t> observations_proj_failures_{0};
+    std::atomic<uint64_t> observations_reaped_{0};
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;

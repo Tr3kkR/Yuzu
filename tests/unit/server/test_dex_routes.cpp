@@ -217,7 +217,7 @@ TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + dev
     seed_crash(store, "e2", "WS-2", "chrome.exe", "chrome.dll", "windows", "2026-06-09T10:00:00Z");
     seed_hang(store, "e3", "WS-2", "chrome.exe", "2026-06-09T11:00:00Z");
 
-    auto html = render_dex_app_fragment(&store, "chrome.exe", "");
+    auto html = render_dex_app_fragment(&store, "chrome.exe", "all");
     CHECK(html.find("chrome.exe") != std::string::npos);
     CHECK(html.find("Devices affected") != std::string::npos);
     CHECK(html.find("Hangs") != std::string::npos); // crash + hang summary tiles
@@ -231,7 +231,7 @@ TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + dev
 
 TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
-    auto html = render_dex_app_fragment(&store, "nope.exe", "");
+    auto html = render_dex_app_fragment(&store, "nope.exe", "all");
     CHECK(html.find("No crashes") != std::string::npos);
 }
 
@@ -245,7 +245,7 @@ TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
                 "2026-06-09T10:00:00Z");
     seed_boot(store, "e3", "WS-7", 43210.0, "2026-06-09T08:00:00Z");
 
-    auto html = render_dex_device_fragment(&store, "WS-7", "");
+    auto html = render_dex_device_fragment(&store, "WS-7", "all");
     CHECK(html.find("Behavioral data") == std::string::npos); // banner removed (Dave 2026-06-10);
                                                               // the gate + audit remain route-side
     CHECK(html.find("Signal history") != std::string::npos);
@@ -263,7 +263,7 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "<b>evil</b>", "<img src=x>", "ntdll.dll", "windows",
                "2026-06-08T10:00:00Z");
-    auto html = render_dex_device_fragment(&store, "<b>evil</b>", "");
+    auto html = render_dex_device_fragment(&store, "<b>evil</b>", "all");
     CHECK(html.find("<b>evil</b>") == std::string::npos);
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
@@ -288,8 +288,8 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     auto fleet = []() { return DexFleet{4, 5}; };
     std::string audited;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
-                     const std::string&, const std::string& tid, const std::string&) {
-        audited = a + "|" + tid;
+                     const std::string& ttype, const std::string& tid, const std::string&) {
+        audited = a + "|" + ttype + "|" + tid; // capture target_type to pin the PascalCase fix
     };
 
     SECTION("authed shell + permitted fragments render") {
@@ -314,7 +314,7 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         auto dev = sink.Get("/fragments/dex/device?id=WS-1");
         REQUIRE(dev);
         CHECK(dev->body.find("Signal history") != std::string::npos);
-        CHECK(audited == "dex.device.view|WS-1"); // per-device open is audited (PII)
+        CHECK(audited == "dex.device.view|Agent|WS-1"); // per-device open audited (PII), PascalCase target_type
     }
 
     SECTION("unauthenticated shell redirects to /login") {

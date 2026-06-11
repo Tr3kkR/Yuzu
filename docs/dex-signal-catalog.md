@@ -220,3 +220,24 @@ killer) follow the same catalogue pattern.
 - The headline dashboard rate stays **crash-free devices** (crash-scoped);
   other signals get their own panels. Rates always pair with coverage
   (reporting Windows agents) and show "—" when the denominator is missing.
+
+## Testing methodology & evidence hygiene
+
+Extractors are verified two ways: pure unit fixtures (the field layouts encoded
+from provider manifests / real captured records) and a live **injection sweep**
+that writes synthetic events through the real `EvtSubscribe` path to confirm the
+end-to-end agent→server→`/dex` flow. Only **classic registered event sources**
+can be written this way (`Write-EventLog`); manifest providers
+(`Microsoft-Windows-*`) cannot be spoofed — which is also the security property
+that makes forged DEX signals hard.
+
+**Evidence-integrity rule (do this only on isolated rigs):** an injection sweep
+writes events from sources like `Service Control Manager`, `Tcpip`, `NETLOGON`,
+`disk`, and Defender into the host's *real* System/Application logs. On a managed
+production endpoint that would contaminate SIEM pipelines, trip EDR/IDS rules (a
+synthetic `machine-trust-failed` or threat detection reads as a real attack
+indicator), and corrupt forensic evidence. **Run injection sweeps only on
+isolated lab/test machines that are not managed endpoints, not ingested by a
+customer SIEM, and not a potential forensic-evidence source.** To exercise the
+collector on a real endpoint, trigger or wait for *genuine* events (restart a
+test service, run a disk check) rather than injecting security-provider events.

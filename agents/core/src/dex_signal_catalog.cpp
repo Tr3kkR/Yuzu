@@ -83,10 +83,19 @@ double parse_metric_ms(const std::string& s) {
 }
 
 // Cap free-text reason fields (service-start error strings etc.) so one chatty
-// provider can't bloat every wire event + projection row.
+// provider can't bloat every wire event + projection row. UTF-8-SAFE: resize is
+// byte-oriented and can bisect a multi-byte codepoint (localized service/update
+// strings routinely exceed the cap mid-sequence); a torn sequence makes
+// nlohmann's strict dump() throw, which the OS-callback catch(...) would swallow
+// — silently dropping the whole observation (governance cpp-B1). Trim back to a
+// codepoint boundary before appending the ellipsis.
 std::string clip(std::string s, std::size_t max = 160) {
     if (s.size() > max) {
         s.resize(max);
+        while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80)
+            s.pop_back(); // drop trailing UTF-8 continuation bytes
+        if (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0xC0)
+            s.pop_back(); // drop a now-orphaned lead byte
         s += "…";
     }
     return s;

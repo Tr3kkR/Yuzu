@@ -2,8 +2,9 @@
 
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
-/// 20-signal catalogue (crashes, hangs, service failures, device stability,
-/// boot performance, network/print/install signals; docs/dex-signal-catalog.md).
+/// 103-signal catalogue (crashes, hangs, service failures, device stability,
+/// boot/resume performance, network/identity/security/update/print signals;
+/// docs/dex-signal-catalog.md).
 /// A capability-limited READ MODEL over the one Guardian event store
 /// (guardian_observations projection): it reinterprets ruleless observations as
 /// fleet reliability. Separate from /guardian (which authors + enforces); this
@@ -54,18 +55,22 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          DexFleet fleet);
 
 /// Per-app drill-down fragment for `process_name` — crash + hang blast radius
-/// (devices) + faulting modules + exception codes + affected devices. `since`
-/// ISO cutoff. Pure + free so it is unit-testable directly against a seeded store.
+/// (devices) + faulting modules + exception codes + affected devices. `window`
+/// is the selector TOKEN ("24h"/"7d"/"30d"/"all"; default-resolved like the
+/// overview) so the drill-down is scoped to the SAME window as the row that
+/// linked here — counts match (governance C-S1/UP-11). Pure + free so it is
+/// unit-testable directly against a seeded store.
 std::string render_dex_app_fragment(const GuaranteedStateStore* store,
-                                    const std::string& process_name, const std::string& since);
+                                    const std::string& process_name, const std::string& window);
 
 /// Per-device drill-down fragment for `agent_id` — the unified multi-signal
 /// history (closes the deferred UP-4: friendly labelled rows, not raw
 /// __observation__ events). This is behavioral PII (which apps a person runs);
-/// the route gates it on Read and audit-logs each open. Pure + free so it is
+/// the route gates it on Read and audit-logs each open. `window` is the selector
+/// TOKEN (window-scoped to match the linking overview row). Pure + free so it is
 /// unit-testable directly.
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& since);
+                                       const std::string& agent_id, const std::string& window);
 
 /// DEX routes — /dex (page shell) + /fragments/dex/overview (HTMX fragment).
 class DexRoutes {

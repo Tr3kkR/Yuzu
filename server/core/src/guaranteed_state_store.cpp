@@ -132,6 +132,58 @@ bool GuaranteedStateStore::is_open() const {
     return db_ != nullptr;
 }
 
+namespace {
+// Migration {7} DDL, shared with the stale-schema self-heal below: a dev/UAT DB
+// that recorded {7} with a pre-release column variant can be rebuilt in place
+// (the table is a derived, forward-only read model — dropping it loses only
+// projection rows, never events).
+constexpr const char* kGobsDdl = R"(
+    -- DEX read-model PROJECTION of ruleless signal observations (the
+    -- 103-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
+    -- guaranteed_state_events (the single source of truth): written in the
+    -- SAME transaction as the event, so a redelivered event_id fails the
+    -- event PK and rolls back both → the projection inherits the dedup and
+    -- never double-counts (a projection FAILURE degrades to an event-only
+    -- commit — see insert_event). Column semantics are generic across types:
+    --   subject   = the failing entity (app/service/printer/update/SSID…)
+    --   reason    = failure code ("0xC0000005", "0x80070643", "timeout")
+    --   symbolic  = human name for reason ("ACCESS_VIOLATION", …)
+    --   component = secondary entity (faulting module, NIC, MAC…)
+    --   metric    = numeric payload (boot duration ms); 0 = none
+    -- Reaped in lockstep with the parent events via ttl_expires_at.
+    CREATE TABLE IF NOT EXISTS guardian_observations (
+        event_id        TEXT PRIMARY KEY,
+        agent_id        TEXT NOT NULL,
+        observed_at     TEXT NOT NULL,
+        obs_type        TEXT NOT NULL,
+        subject         TEXT NOT NULL DEFAULT '',
+        reason          TEXT NOT NULL DEFAULT '',
+        symbolic        TEXT NOT NULL DEFAULT '',
+        component       TEXT NOT NULL DEFAULT '',
+        metric          REAL NOT NULL DEFAULT 0,
+        platform        TEXT NOT NULL DEFAULT '',
+        ttl_expires_at  INTEGER NOT NULL DEFAULT 0
+    );
+    -- Aggregation indexes (governance perf-S2/S3). idx_gobs_type_time is
+    -- COVERING for the hot GROUP BYs (signal summary, crash summary, top
+    -- apps/devices, by-day): obs_type filter + observed_at range + the
+    -- agent_id/subject columns they aggregate — no per-row table lookups.
+    -- No platform index: nothing filters on platform alone, so it would be
+    -- pure write amplification on every ingest.
+    CREATE INDEX IF NOT EXISTS idx_gobs_subject
+        ON guardian_observations(subject);
+    CREATE INDEX IF NOT EXISTS idx_gobs_type_time
+        ON guardian_observations(obs_type, observed_at DESC, agent_id, subject);
+    CREATE INDEX IF NOT EXISTS idx_gobs_agent_time
+        ON guardian_observations(agent_id, observed_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_gobs_time
+        ON guardian_observations(observed_at DESC);
+    -- Partial index keyed for the reaper's `ttl_expires_at > 0` predicate.
+    CREATE INDEX IF NOT EXISTS idx_gobs_ttl
+        ON guardian_observations(ttl_expires_at) WHERE ttl_expires_at > 0;
+)";
+} // namespace
+
 void GuaranteedStateStore::create_tables() {
     static const std::vector<Migration> kMigrations = {
         {1, R"(
@@ -250,51 +302,23 @@ void GuaranteedStateStore::create_tables() {
             ALTER TABLE guaranteed_state_events
                 ADD COLUMN detail_json TEXT NOT NULL DEFAULT '';
         )"},
-        {7, R"(
-            -- DEX read-model PROJECTION of ruleless signal observations (the
-            -- 20-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
-            -- guaranteed_state_events (the single source of truth): written
-            -- atomically in the SAME transaction as the event, so a redelivered
-            -- event_id fails the event PK and rolls back both → the projection
-            -- inherits the dedup and never double-counts. Promotes the
-            -- detail_json UNIFORM facts into indexed columns the DEX aggregations
-            -- GROUP BY. Column semantics are generic across signal types:
-            --   subject   = the failing entity (app/service/printer/update/SSID…)
-            --   reason    = failure code ("0xC0000005", "0x80070643", "timeout")
-            --   symbolic  = human name for reason ("ACCESS_VIOLATION", …)
-            --   component = secondary entity (faulting module, NIC, MAC…)
-            --   metric    = numeric payload (boot duration ms); 0 = none
-            -- Reaped in lockstep with the parent events via ttl_expires_at — a
-            -- projection must never outlive its source row.
-            CREATE TABLE IF NOT EXISTS guardian_observations (
-                event_id        TEXT PRIMARY KEY,
-                agent_id        TEXT NOT NULL,
-                observed_at     TEXT NOT NULL,
-                obs_type        TEXT NOT NULL,
-                subject         TEXT NOT NULL DEFAULT '',
-                reason          TEXT NOT NULL DEFAULT '',
-                symbolic        TEXT NOT NULL DEFAULT '',
-                component       TEXT NOT NULL DEFAULT '',
-                metric          REAL NOT NULL DEFAULT 0,
-                platform        TEXT NOT NULL DEFAULT '',
-                ttl_expires_at  INTEGER NOT NULL DEFAULT 0
-            );
-            -- Aggregation indexes: per-subject (top apps), per-type recency (the
-            -- type-scoped GROUP BYs), per-device history, recency, per-OS split.
-            CREATE INDEX IF NOT EXISTS idx_gobs_subject
-                ON guardian_observations(subject);
-            CREATE INDEX IF NOT EXISTS idx_gobs_type_time
-                ON guardian_observations(obs_type, observed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_gobs_agent_time
-                ON guardian_observations(agent_id, observed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_gobs_time
-                ON guardian_observations(observed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_gobs_platform
-                ON guardian_observations(platform);
-            -- Partial index keyed for the reaper's `ttl_expires_at > 0` predicate.
-            CREATE INDEX IF NOT EXISTS idx_gobs_ttl
-                ON guardian_observations(ttl_expires_at) WHERE ttl_expires_at > 0;
-        )"},
+        {7, kGobsDdl},
+    };
+    // Stale-schema self-check (governance UP-2): a dev/UAT DB that ran an
+    // intermediate working-tree build may have RECORDED migration {7} with an
+    // older column set — CREATE TABLE IF NOT EXISTS will not heal columns, and
+    // every projection insert would then fail (degraded to event-only commits by
+    // the UP-1 fix, but silently lossy for the read model). Probe the expected
+    // columns and shout with the recovery step if they're missing. The table is
+    // a derived, forward-only read model: recovery = DROP TABLE + restart
+    // (re-creates empty; no backfill exists — see docs/user-manual/dex.md).
+    auto schema_ok = [this]() {
+        SqliteStmt probe;
+        return sqlite3_prepare_v2(
+                   db_,
+                   "SELECT subject, reason, symbolic, component, metric FROM guardian_observations "
+                   "LIMIT 0",
+                   -1, probe.addr(), nullptr) == SQLITE_OK;
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
         // Include enough detail in the log for an on-call operator to triage
@@ -309,6 +333,25 @@ void GuaranteedStateStore::create_tables() {
                       db_file ? db_file : "<unknown>");
         sqlite3_close(db_);
         db_ = nullptr;
+        return;
+    }
+    if (!schema_ok()) {
+        // Loud refuse, NOT auto-repair. A column mismatch can only occur on a
+        // dev/UAT DB that ran an intermediate pre-release {7} variant ({7} never
+        // shipped in another form), so the blast radius is a developer box. We
+        // deliberately do NOT auto-DROP: destructive schema action keyed off a
+        // column probe is a footgun for any future migration that changes these
+        // columns (it would then fire on production). The projection degrades to
+        // event-only commits (UP-1) and counts failures; the operator runs the
+        // one documented recovery command. See docs/user-manual/dex.md.
+        const char* db_file = sqlite3_db_filename(db_, "main");
+        spdlog::error(
+            "GuaranteedStateStore: guardian_observations carries a STALE column set "
+            "(a pre-release migration {{7}} variant) in {}. DEX projections will fail "
+            "(events are preserved; only the derived read model is lossy). Recovery: "
+            "stop the server, run `sqlite3 <db> \"DROP TABLE guardian_observations;\"`, "
+            "restart — the table is a derived, forward-only read model (no backfill).",
+            db_file ? db_file : "<unknown>");
     }
 }
 
@@ -656,12 +699,23 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     }
     stmt.reset(); // finalize the event INSERT before the projection + COMMIT
 
-    // DEX projection: ruleless observations only. Atomic with the event INSERT
-    // above (same txn) so it inherits the event_id dedup — a redelivered crash
-    // fails the event PK and rolls both back, never double-counting.
+    // DEX projection: ruleless observations only. Runs in the SAME txn so a
+    // redelivered event_id (which fails the event PK above) rolls both back —
+    // the projection inherits the at-least-once dedup. A projection FAILURE,
+    // however, must NOT take the event down with it: the event journal is the
+    // source of truth and the projection is a derived, forward-only read model
+    // (governance UP-1 — a persistent projection fault, e.g. a stale-schema dev
+    // DB, previously became a total observation-ingest outage that destroyed
+    // the source rows). Degrade: log + count, commit the event anyway. The
+    // counter feeds yuzu_server_guardian_proj_failures_total so the loss is
+    // alertable, never silent.
     if (is_reserved_rule_id(row.rule_id)) {
-        if (auto pr = project_observation_locked(row, ttl); !pr)
-            return std::unexpected(pr.error());
+        if (auto pr = project_observation_locked(row, ttl); !pr) {
+            observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::error("GuaranteedStateStore: observation projection failed "
+                          "(event kept, read-model row lost) event_id={} agent_id={}: {}",
+                          row.event_id, row.agent_id, pr.error());
+        }
     }
     if (txn.commit() != SQLITE_OK)
         return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
@@ -750,11 +804,17 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
         // batch on any later failure, so events and status never diverge.
         if (const char* state = event_state_from_type(row.event_type))
             upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
-        // DEX projection for ruleless observations — same path as insert_event so a
-        // crash that ever rode the batch path still projects (both-or-neither).
+        // DEX projection for ruleless observations — same degrade-don't-destroy
+        // contract as insert_event (UP-1/UP-15): a projection failure must never
+        // roll back the batch (which would take unrelated DRIFT events with it).
+        // Log + count, keep going.
         if (is_reserved_rule_id(row.rule_id)) {
-            if (auto pr = project_observation_locked(row, ttl); !pr)
-                return std::unexpected(pr.error()); // whole batch rolls back
+            if (auto pr = project_observation_locked(row, ttl); !pr) {
+                observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+                spdlog::error("GuaranteedStateStore: observation projection failed in batch "
+                              "(event kept) event_id={} agent_id={}: {}",
+                              row.event_id, row.agent_id, pr.error());
+            }
         }
     }
 
@@ -776,10 +836,26 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     // (process/exception_code/faulting_module) are read as a FALLBACK so events
     // from a PR-#1311-era agent still project (remove with that transition).
     nlohmann::json j = nlohmann::json::parse(row.detail_json, nullptr, /*allow_exceptions=*/false);
+    // Server-side length clamp (governance sec-M1): agent-side extractors clip,
+    // but the SERVER must not trust an enrolled agent — a compromised one could
+    // ship multi-MB strings that bloat the projection, explode GROUP-BY
+    // cardinality, and render multi-MB dashboard fragments. 256 bytes keeps the
+    // longest legitimate field (AppX package names, SCM error texts) intact.
+    constexpr std::size_t kProjFieldMax = 256;
     auto field = [&](const char* k) -> std::string {
         if (j.is_object())
-            if (auto it = j.find(k); it != j.end() && it->is_string())
-                return it->get<std::string>();
+            if (auto it = j.find(k); it != j.end() && it->is_string()) {
+                std::string v = it->get<std::string>();
+                if (v.size() > kProjFieldMax) {
+                    v.resize(kProjFieldMax);
+                    // Don't leave a torn UTF-8 sequence at the cut.
+                    while (!v.empty() && (static_cast<unsigned char>(v.back()) & 0xC0) == 0x80)
+                        v.pop_back();
+                    if (!v.empty() && (static_cast<unsigned char>(v.back()) & 0xC0) == 0xC0)
+                        v.pop_back();
+                }
+                return v;
+            }
         return {};
     };
     std::string subject = field("subject");
@@ -835,30 +911,29 @@ GuaranteedStateStore::query_observations(int limit) const {
     std::vector<GuardianObservationRow> rows;
     if (!db_)
         return rows;
-    sqlite3_stmt* stmt = nullptr;
+    SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_,
                            "SELECT event_id, agent_id, observed_at, obs_type, subject, "
                            "reason, symbolic, component, metric, platform "
                            "FROM guardian_observations "
                            "ORDER BY observed_at DESC, event_id DESC LIMIT ?",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+                           -1, stmt.addr(), nullptr) != SQLITE_OK)
         return rows;
-    sqlite3_bind_int64(stmt, 1, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    sqlite3_bind_int64(stmt.get(), 1, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         GuardianObservationRow r;
-        r.event_id = col_text(stmt, 0);
-        r.agent_id = col_text(stmt, 1);
-        r.observed_at = col_text(stmt, 2);
-        r.obs_type = col_text(stmt, 3);
-        r.subject = col_text(stmt, 4);
-        r.reason = col_text(stmt, 5);
-        r.symbolic = col_text(stmt, 6);
-        r.component = col_text(stmt, 7);
-        r.metric = sqlite3_column_double(stmt, 8);
-        r.platform = col_text(stmt, 9);
+        r.event_id = col_text(stmt.get(), 0);
+        r.agent_id = col_text(stmt.get(), 1);
+        r.observed_at = col_text(stmt.get(), 2);
+        r.obs_type = col_text(stmt.get(), 3);
+        r.subject = col_text(stmt.get(), 4);
+        r.reason = col_text(stmt.get(), 5);
+        r.symbolic = col_text(stmt.get(), 6);
+        r.component = col_text(stmt.get(), 7);
+        r.metric = sqlite3_column_double(stmt.get(), 8);
+        r.platform = col_text(stmt.get(), 9);
         rows.push_back(std::move(r));
     }
-    sqlite3_finalize(stmt);
     return rows;
 }
 
@@ -876,18 +951,17 @@ DexCrashSummary GuaranteedStateStore::dex_crash_summary(const std::string& since
     const char* sql = R"(
         SELECT COUNT(*), COUNT(DISTINCT agent_id), COUNT(DISTINCT subject)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'process.crashed' AND observed_at >= ?1
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return s;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        s.total_crashes = sqlite3_column_int64(st, 0);
-        s.distinct_devices = sqlite3_column_int64(st, 1);
-        s.distinct_apps = sqlite3_column_int64(st, 2);
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.get()) == SQLITE_ROW) {
+        s.total_crashes = sqlite3_column_int64(st.get(), 0);
+        s.distinct_devices = sqlite3_column_int64(st.get(), 1);
+        s.distinct_apps = sqlite3_column_int64(st.get(), 2);
     }
-    sqlite3_finalize(st);
     return s;
 }
 
@@ -906,26 +980,25 @@ GuaranteedStateStore::dex_top_apps(const std::string& since, int limit) const {
                COUNT(DISTINCT agent_id), MAX(observed_at)
         FROM guardian_observations
         WHERE obs_type IN ('process.crashed', 'process.hung')
-          AND (?1 = '' OR observed_at >= ?1)
+          AND observed_at >= ?1
         GROUP BY subject
         ORDER BY (crashes + hangs) DESC, subject ASC
         LIMIT ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 2, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexAppCrashCount a;
-        a.subject = col_text(st, 0);
-        a.crashes = sqlite3_column_int64(st, 1);
-        a.hangs = sqlite3_column_int64(st, 2);
-        a.distinct_devices = sqlite3_column_int64(st, 3);
-        a.last_seen = col_text(st, 4);
+        a.subject = col_text(st.get(), 0);
+        a.crashes = sqlite3_column_int64(st.get(), 1);
+        a.hangs = sqlite3_column_int64(st.get(), 2);
+        a.distinct_devices = sqlite3_column_int64(st.get(), 3);
+        a.last_seen = col_text(st.get(), 4);
         out.push_back(std::move(a));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -938,24 +1011,23 @@ GuaranteedStateStore::dex_top_modules(const std::string& since, int limit) const
     const char* sql = R"(
         SELECT component, COUNT(*), COUNT(DISTINCT subject)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'process.crashed' AND observed_at >= ?1
         GROUP BY component
         ORDER BY COUNT(*) DESC, component ASC
         LIMIT ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 2, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexModuleCrashCount m;
-        m.component = col_text(st, 0);
-        m.crashes = sqlite3_column_int64(st, 1);
-        m.distinct_apps = sqlite3_column_int64(st, 2);
+        m.component = col_text(st.get(), 0);
+        m.crashes = sqlite3_column_int64(st.get(), 1);
+        m.distinct_apps = sqlite3_column_int64(st.get(), 2);
         out.push_back(std::move(m));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -968,24 +1040,23 @@ GuaranteedStateStore::dex_top_devices(const std::string& since, int limit) const
     const char* sql = R"(
         SELECT agent_id, COUNT(*), MAX(observed_at)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'process.crashed' AND observed_at >= ?1
         GROUP BY agent_id
         ORDER BY COUNT(*) DESC, agent_id ASC
         LIMIT ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 2, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDeviceCrashCount d;
-        d.agent_id = col_text(st, 0);
-        d.crashes = sqlite3_column_int64(st, 1);
-        d.last_seen = col_text(st, 2);
+        d.agent_id = col_text(st.get(), 0);
+        d.crashes = sqlite3_column_int64(st.get(), 1);
+        d.last_seen = col_text(st.get(), 2);
         out.push_back(std::move(d));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -998,22 +1069,21 @@ GuaranteedStateStore::dex_crashes_by_os(const std::string& since) const {
     const char* sql = R"(
         SELECT platform, COUNT(*), COUNT(DISTINCT agent_id)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'process.crashed' AND observed_at >= ?1
         GROUP BY platform
         ORDER BY COUNT(*) DESC
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexOsCrashCount o;
-        o.platform = col_text(st, 0);
-        o.crashes = sqlite3_column_int64(st, 1);
-        o.distinct_devices = sqlite3_column_int64(st, 2);
+        o.platform = col_text(st.get(), 0);
+        o.crashes = sqlite3_column_int64(st.get(), 1);
+        o.distinct_devices = sqlite3_column_int64(st.get(), 2);
         out.push_back(std::move(o));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1026,21 +1096,20 @@ GuaranteedStateStore::dex_crashes_by_day(const std::string& since) const {
     const char* sql = R"(
         SELECT substr(observed_at, 1, 10) AS day, COUNT(*)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'process.crashed' AND observed_at >= ?1
         GROUP BY day
         ORDER BY day ASC
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDayCrashCount d;
-        d.day = col_text(st, 0);
-        d.crashes = sqlite3_column_int64(st, 1);
+        d.day = col_text(st.get(), 0);
+        d.crashes = sqlite3_column_int64(st.get(), 1);
         out.push_back(std::move(d));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1056,23 +1125,22 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     const char* sql = R"(
         SELECT obs_type, COUNT(*), COUNT(DISTINCT agent_id), MAX(observed_at)
         FROM guardian_observations
-        WHERE (?1 = '' OR observed_at >= ?1)
+        WHERE observed_at >= ?1
         GROUP BY obs_type
         ORDER BY COUNT(*) DESC, obs_type ASC
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexSignalCount c;
-        c.obs_type = col_text(st, 0);
-        c.count = sqlite3_column_int64(st, 1);
-        c.distinct_devices = sqlite3_column_int64(st, 2);
-        c.last_seen = col_text(st, 3);
+        c.obs_type = col_text(st.get(), 0);
+        c.count = sqlite3_column_int64(st.get(), 1);
+        c.distinct_devices = sqlite3_column_int64(st.get(), 2);
+        c.last_seen = col_text(st.get(), 3);
         out.push_back(std::move(c));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1086,19 +1154,18 @@ DexBootStats GuaranteedStateStore::dex_boot_stats(const std::string& since) cons
     const char* sql = R"(
         SELECT COUNT(*), AVG(metric), MAX(metric), COUNT(DISTINCT agent_id)
         FROM guardian_observations
-        WHERE obs_type = 'os.boot' AND metric > 0 AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'os.boot' AND metric > 0 AND observed_at >= ?1
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return s;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        s.boots = sqlite3_column_int64(st, 0);
-        s.avg_ms = sqlite3_column_double(st, 1);
-        s.max_ms = sqlite3_column_double(st, 2);
-        s.distinct_devices = sqlite3_column_int64(st, 3);
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.get()) == SQLITE_ROW) {
+        s.boots = sqlite3_column_int64(st.get(), 0);
+        s.avg_ms = sqlite3_column_double(st.get(), 1);
+        s.max_ms = sqlite3_column_double(st.get(), 2);
+        s.distinct_devices = sqlite3_column_int64(st.get(), 3);
     }
-    sqlite3_finalize(st);
     return s;
 }
 
@@ -1111,25 +1178,24 @@ GuaranteedStateStore::dex_slowest_boots(const std::string& since, int limit) con
     const char* sql = R"(
         SELECT agent_id, AVG(metric), MAX(metric), COUNT(*)
         FROM guardian_observations
-        WHERE obs_type = 'os.boot' AND metric > 0 AND (?1 = '' OR observed_at >= ?1)
+        WHERE obs_type = 'os.boot' AND metric > 0 AND observed_at >= ?1
         GROUP BY agent_id
         ORDER BY AVG(metric) DESC, agent_id ASC
         LIMIT ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 2, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDeviceBoot b;
-        b.agent_id = col_text(st, 0);
-        b.avg_ms = sqlite3_column_double(st, 1);
-        b.max_ms = sqlite3_column_double(st, 2);
-        b.boots = sqlite3_column_int64(st, 3);
+        b.agent_id = col_text(st.get(), 0);
+        b.avg_ms = sqlite3_column_double(st.get(), 1);
+        b.max_ms = sqlite3_column_double(st.get(), 2);
+        b.boots = sqlite3_column_int64(st.get(), 3);
         out.push_back(std::move(b));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1148,23 +1214,22 @@ DexEntitySummary GuaranteedStateStore::dex_app_summary(const std::string& proces
                COUNT(*), COUNT(DISTINCT agent_id), MIN(observed_at), MAX(observed_at)
         FROM guardian_observations
         WHERE obs_type IN ('process.crashed', 'process.hung')
-          AND subject = ?1 AND (?2 = '' OR observed_at >= ?2)
+          AND subject = ?1 AND observed_at >= ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return s;
-    sqlite3_bind_text(st, 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        s.crashes = sqlite3_column_int64(st, 0);
-        s.hangs = sqlite3_column_int64(st, 1);
-        s.signals = sqlite3_column_int64(st, 2);
-        s.distinct_devices = sqlite3_column_int64(st, 3);
+    sqlite3_bind_text(st.get(), 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.get()) == SQLITE_ROW) {
+        s.crashes = sqlite3_column_int64(st.get(), 0);
+        s.hangs = sqlite3_column_int64(st.get(), 1);
+        s.signals = sqlite3_column_int64(st.get(), 2);
+        s.distinct_devices = sqlite3_column_int64(st.get(), 3);
         s.distinct_apps = 1;
-        s.first_seen = col_text(st, 4);
-        s.last_seen = col_text(st, 5);
+        s.first_seen = col_text(st.get(), 4);
+        s.last_seen = col_text(st.get(), 5);
     }
-    sqlite3_finalize(st);
     return s;
 }
 
@@ -1178,25 +1243,24 @@ GuaranteedStateStore::dex_app_modules(const std::string& process_name, const std
     const char* sql = R"(
         SELECT component, COUNT(*), COUNT(DISTINCT subject)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND subject = ?1 AND (?2 = '' OR observed_at >= ?2)
+        WHERE obs_type = 'process.crashed' AND subject = ?1 AND observed_at >= ?2
         GROUP BY component
         ORDER BY COUNT(*) DESC, component ASC
         LIMIT ?3
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexModuleCrashCount m;
-        m.component = col_text(st, 0);
-        m.crashes = sqlite3_column_int64(st, 1);
-        m.distinct_apps = sqlite3_column_int64(st, 2);
+        m.component = col_text(st.get(), 0);
+        m.crashes = sqlite3_column_int64(st.get(), 1);
+        m.distinct_apps = sqlite3_column_int64(st.get(), 2);
         out.push_back(std::move(m));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1210,25 +1274,24 @@ GuaranteedStateStore::dex_app_exceptions(const std::string& process_name, const 
     const char* sql = R"(
         SELECT reason, symbolic, COUNT(*)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND subject = ?1 AND (?2 = '' OR observed_at >= ?2)
+        WHERE obs_type = 'process.crashed' AND subject = ?1 AND observed_at >= ?2
         GROUP BY reason, symbolic
         ORDER BY COUNT(*) DESC, reason ASC
         LIMIT ?3
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexExceptionCount e;
-        e.reason = col_text(st, 0);
-        e.symbolic = col_text(st, 1);
-        e.crashes = sqlite3_column_int64(st, 2);
+        e.reason = col_text(st.get(), 0);
+        e.symbolic = col_text(st.get(), 1);
+        e.crashes = sqlite3_column_int64(st.get(), 2);
         out.push_back(std::move(e));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1242,25 +1305,24 @@ GuaranteedStateStore::dex_app_devices(const std::string& process_name, const std
     const char* sql = R"(
         SELECT agent_id, COUNT(*), MAX(observed_at)
         FROM guardian_observations
-        WHERE obs_type = 'process.crashed' AND subject = ?1 AND (?2 = '' OR observed_at >= ?2)
+        WHERE obs_type = 'process.crashed' AND subject = ?1 AND observed_at >= ?2
         GROUP BY agent_id
         ORDER BY COUNT(*) DESC, agent_id ASC
         LIMIT ?3
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, process_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDeviceCrashCount d;
-        d.agent_id = col_text(st, 0);
-        d.crashes = sqlite3_column_int64(st, 1);
-        d.last_seen = col_text(st, 2);
+        d.agent_id = col_text(st.get(), 0);
+        d.crashes = sqlite3_column_int64(st.get(), 1);
+        d.last_seen = col_text(st.get(), 2);
         out.push_back(std::move(d));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1281,23 +1343,22 @@ DexEntitySummary GuaranteedStateStore::dex_device_summary(const std::string& age
                                    THEN subject END),
                MIN(observed_at), MAX(observed_at)
         FROM guardian_observations
-        WHERE agent_id = ?1 AND (?2 = '' OR observed_at >= ?2)
+        WHERE agent_id = ?1 AND observed_at >= ?2
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return s;
-    sqlite3_bind_text(st, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        s.crashes = sqlite3_column_int64(st, 0);
-        s.hangs = sqlite3_column_int64(st, 1);
-        s.signals = sqlite3_column_int64(st, 2);
-        s.distinct_apps = sqlite3_column_int64(st, 3);
+    sqlite3_bind_text(st.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.get()) == SQLITE_ROW) {
+        s.crashes = sqlite3_column_int64(st.get(), 0);
+        s.hangs = sqlite3_column_int64(st.get(), 1);
+        s.signals = sqlite3_column_int64(st.get(), 2);
+        s.distinct_apps = sqlite3_column_int64(st.get(), 3);
         s.distinct_devices = 1;
-        s.first_seen = col_text(st, 4);
-        s.last_seen = col_text(st, 5);
+        s.first_seen = col_text(st.get(), 4);
+        s.last_seen = col_text(st.get(), 5);
     }
-    sqlite3_finalize(st);
     return s;
 }
 
@@ -1314,31 +1375,30 @@ GuaranteedStateStore::dex_device_history(const std::string& agent_id, const std:
         SELECT event_id, agent_id, observed_at, obs_type, subject,
                reason, symbolic, component, metric, platform
         FROM guardian_observations
-        WHERE agent_id = ?1 AND (?2 = '' OR observed_at >= ?2)
+        WHERE agent_id = ?1 AND observed_at >= ?2
         ORDER BY observed_at DESC, event_id DESC
         LIMIT ?3
     )";
-    sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
-    sqlite3_bind_text(st, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, since.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, std::clamp(limit, 0, kMaxEventsLimit));
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_bind_text(st.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         GuardianObservationRow r;
-        r.event_id = col_text(st, 0);
-        r.agent_id = col_text(st, 1);
-        r.observed_at = col_text(st, 2);
-        r.obs_type = col_text(st, 3);
-        r.subject = col_text(st, 4);
-        r.reason = col_text(st, 5);
-        r.symbolic = col_text(st, 6);
-        r.component = col_text(st, 7);
-        r.metric = sqlite3_column_double(st, 8);
-        r.platform = col_text(st, 9);
+        r.event_id = col_text(st.get(), 0);
+        r.agent_id = col_text(st.get(), 1);
+        r.observed_at = col_text(st.get(), 2);
+        r.obs_type = col_text(st.get(), 3);
+        r.subject = col_text(st.get(), 4);
+        r.reason = col_text(st.get(), 5);
+        r.symbolic = col_text(st.get(), 6);
+        r.component = col_text(st.get(), 7);
+        r.metric = sqlite3_column_double(st.get(), 8);
+        r.platform = col_text(st.get(), 9);
         out.push_back(std::move(r));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -1630,13 +1690,16 @@ void GuaranteedStateStore::run_cleanup() {
         std::unique_lock lock(mtx_);
         if (!db_)
             continue;
-        sqlite3_stmt* cleanup_stmt = nullptr;
+        // sqlite3_changes() is race-free here: the whole cleanup holds mtx_ as a
+        // unique_lock (line above), so no concurrent step() runs on this shared
+        // connection (NOT a #1033 site — the count read is serialized by the lock).
+        SqliteStmt cleanup_stmt;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM guaranteed_state_events "
                                "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                               -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(cleanup_stmt, 1, now);
-            if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
+                               -1, cleanup_stmt.addr(), nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(cleanup_stmt.get(), 1, now);
+            if (sqlite3_step(cleanup_stmt.get()) == SQLITE_DONE) {
                 const auto deleted = sqlite3_changes(db_);
                 if (deleted > 0) {
                     events_reaped_.fetch_add(static_cast<uint64_t>(deleted),
@@ -1646,23 +1709,27 @@ void GuaranteedStateStore::run_cleanup() {
             } else {
                 spdlog::warn("GuaranteedStateStore: cleanup error: {}", sqlite3_errmsg(db_));
             }
-            sqlite3_finalize(cleanup_stmt);
         }
 
         // Reap the DEX projection in lockstep: a guardian_observations row carries
         // the same ttl_expires_at as its parent event, so it must never outlive it.
         // Best-effort + best-effort logging only (the events delete above is the
         // primary signal); errors here don't abort the cycle.
-        sqlite3_stmt* obs_stmt = nullptr;
+        SqliteStmt obs_stmt;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM guardian_observations "
                                "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                               -1, &obs_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(obs_stmt, 1, now);
-            if (sqlite3_step(obs_stmt) != SQLITE_DONE)
+                               -1, obs_stmt.addr(), nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(obs_stmt.get(), 1, now);
+            if (sqlite3_step(obs_stmt.get()) == SQLITE_DONE) {
+                // Disposal evidence twin of events_reaped_ (compliance WS-E): how
+                // many PII projection rows were reaped, exposed on /metrics.
+                observations_reaped_.fetch_add(
+                    static_cast<uint64_t>(sqlite3_changes(db_)), std::memory_order_relaxed);
+            } else {
                 spdlog::warn("GuaranteedStateStore: observation cleanup error: {}",
                              sqlite3_errmsg(db_));
-            sqlite3_finalize(obs_stmt);
+            }
         }
     }
 }

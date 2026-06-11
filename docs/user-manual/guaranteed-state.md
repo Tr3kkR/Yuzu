@@ -278,31 +278,31 @@ curl -H "Authorization: Bearer $YUZU_TOKEN" \
 
 > **Breaking: Guards now reach agents only via a deployed Baseline.** If you ran a pre-Baseline Guardian build, a Guard alone no longer enforces anywhere — the push fan-out and heartbeat reconcile source their rules from the union of member Guards of **deployed Baselines**. After upgrading, any Guard not in a deployed Baseline is **silently omitted from every agent push** and stops enforcing. To preserve enforcement: create a Baseline containing your active Guards and **Deploy** it (`/guardian` → Baselines). Until you do, the fleet converges to **zero** enforced Guards.
 
-## Crash observations (DEX)
+## DEX signal observations
 
-The agent runs a **fleet-wide crash recorder** for Digital Experience Monitoring (DEX). Unlike a Guard, it is **ruleless**: it records *any* process that crashes on a managed endpoint, with no rule, scope, or Baseline involved. On Windows it is an idle-until-crash subscription to the Application event log (Event ID 1000, "Application Error") — there is no polling and no streaming; the agent does nothing until Windows reports a crash, in keeping with Guardian's resource-light, network-kind posture.
+The agent runs a **fleet-wide DEX signal observer** for Digital Employee Experience. Unlike a Guard, it is **ruleless**: it records reliability/experience signals on a managed endpoint with no rule, scope, or Baseline involved. On Windows it subscribes to **103 catalogued signals** across 22 event-log channels (app crashes & hangs, service failures, device stability, boot/resume durations, disk/filesystem, network, identity/sign-in, security, updates, policy & management, printing — see **[`docs/dex-signal-catalog.md`](../dex-signal-catalog.md)** for the full catalogue). Each subscription is kernel-filtered and idle-until-signal — no polling, no streaming — in keeping with Guardian's resource-light, network-kind posture.
 
-A crash is emitted through the same event pipeline as drift but is distinguished by two markers — **not** a category field:
+Every observation is emitted through the same event pipeline as drift, distinguished by two markers — **not** a category field:
 
 - `rule_id` = the reserved sentinel **`__observation__`** (a ruleless observation belongs to no rule).
-- `event_type` = **`process.crashed`**.
+- `event_type` = the **obs_type** (e.g. `process.crashed`, `process.hung`, `service.crashed`, `os.boot`, `network.wifi_drop`, `logon.aad_token_error`).
 
-Query crashes with the existing events endpoint, filtering on the sentinel:
+The dedicated **[DEX dashboard](dex.md)** (`/dex`) is the operator-facing view over these observations (fleet reliability rates, grouped signal panels, per-app and per-device drill-downs). You can also query the raw events with the events endpoint, filtering on the sentinel:
 
 ```bash
 curl -H "Authorization: Bearer $YUZU_TOKEN" \
   "https://yuzu.example.com/api/v1/guaranteed-state/events?rule_id=__observation__"
 ```
 
-Each row carries `detected_value` packed as `"<proc> pid=<n> code=0x<NTSTATUS> <SYMBOLIC> module=<dll>"` (e.g. `notepad.exe pid=1234 code=0xC0000005 ACCESS_VIOLATION module=ntdll.dll`); `severity` is a fixed `info` (DEX applies its own experience framing and ignores Guardian severity); `expected_value` is empty (a crash has no desired state); `guard_type` is `"process"` (the collector kind, for filtering in mixed-event queries). Crashes inherit the same [retention](#retention) window as drift events.
+Each row carries a human `detected_value` sentence plus a structured **`detail_json`** with uniform keys (`subject`, `reason`, `symbolic`, `component`, `metric`, `platform`); `severity` is a fixed `info` (DEX applies its own experience framing and ignores Guardian severity); `expected_value` is empty (an observation has no desired state); `guard_type` is the obs_type's family (`process`, `service`, `os`, `network`, …). Observations inherit the same [retention](#retention) window as drift events.
 
-**Scope and limitations (slice 1):**
+**Scope and limitations:**
 
-- **Windows only.** The recorder is a no-op on Linux and macOS until those collectors land (gated behind broader Guardian work on those platforms).
-- **Windows 11 / Server 2022+ field layout.** Parsing targets the *named* `<Data>` layout those builds emit; older builds that emit positional fields may yield blank process / module names.
-- **Event ID 1000 only.** Native crashes — and the common .NET case, which also logs a native 1000 with code `0xE0434352` (surfaced as `CLR_EXCEPTION`) — are caught. The rich managed type / stack in the `.NET Runtime` 1026 event, and crashes that log *only* a 1026, are a deferred follow-up.
+- **Windows only.** The observer is a no-op on Linux and macOS until those collectors land (gated behind broader Guardian work on those platforms).
+- **Windows 11 / Server 2022+ field layout.** Extractors target the field layouts those builds emit; an unexpected layout degrades to a counted occurrence with empty subject rather than a dropped or crashing signal. Channels absent on a given SKU fail to arm individually and are skipped (the rest still collect).
+- **Forward-only.** Signals are captured from subscription time onward; events written before the agent armed (e.g. a bugcheck during boot) are not back-filled.
 
-**Privacy — what is collected.** For each crash the agent sends the **process name**, **PID**, **faulting module**, and **exception code** (plus its symbolic name). The full executable path is parsed but **deliberately not sent** (data minimisation). No command line, environment, memory, or user identity is collected. To opt a fleet — or an individual endpoint — out entirely, start the agent with **`--dex-disable`** (or set `YUZU_AGENT_DEX_DISABLE=1`): the recorder never arms and no crash telemetry is collected. This is a **deploy-time agent setting**, not a server-side runtime toggle. Whether recorders armed across the fleet is surfaced by `yuzu_fleet_agents_crash_observer_disarmed` (see [Observability](#observability)).
+**Privacy — what is collected.** Observations carry the failing entity (app/service/printer name, etc.), failure codes, and numeric metrics. User content is **dropped at the edge, before anything leaves the device**: usernames (profile/VPN/RDP/service-logon/Defender), file and document paths, DNS query names, URLs, AAD message text, and .NET stack frames are never extracted. To opt a fleet — or an individual endpoint — out entirely, start the agent with **`--dex-disable`** (or set `YUZU_AGENT_DEX_DISABLE=1`): the observer never arms and **no DEX signal telemetry of any kind is collected** (all 103 signals, all channels). This is a **deploy-time agent setting**, not a server-side runtime toggle. Whether observers armed across the fleet is surfaced by `yuzu_fleet_agents_dex_observer_disarmed` (see [Observability](#observability)). See the [DEX dashboard guide](dex.md) and the behavioral-telemetry / works-council posture in `docs/enterprise-readiness-soc2-first-customer.md`.
 
 ## Retention
 
@@ -315,8 +315,9 @@ Guardian surfaces readiness and event counts via the standard observability endp
 - `/healthz` (authenticated) reports `stores.guaranteed_state` **and `stores.baselines`** alongside the other store-health entries. If either `guaranteed-state.db` or `guardian-baselines.db` fails to open, the server reports `status = "degraded"`.
 - `/readyz` includes both `guaranteed_state_store` and `baseline_store` in the per-store readiness conjunction. A failed store takes the pod out of rotation.
 - `yuzu_server_guardian_baselines_total` reports the number of persisted Baselines.
-- `yuzu_fleet_agents_crash_observer_disarmed` (server) counts Windows agents — DEX enabled — whose crash recorder is **not currently armed**: it failed to arm at startup, or its subscription died at runtime (an EventLog-service restart or channel ACL change flips the agent's arm signal to 0 on the next heartbeat). `> 0` means crash telemetry is silently off on that many endpoints; investigate. Agents off Windows, or started with `--dex-disable`, are excluded, so this is a genuine fault count, not an opt-out count. **Caveat:** it does *not* detect a host where Windows Error Reporting is disabled (the recorder stays armed, but Windows never writes Event 1000) — verify coverage with a synthetic crash on a representative host. (Agents report arm-state in each heartbeat; the server rolls it up — the agent has no `/metrics` endpoint.)
-- `yuzu_fleet_crashes_observed_total` (server) is the fleet-wide sum of process crashes observed by DEX recorders since each agent started. It is a **resetting gauge, not a monotonic counter** — it drops when an agent restarts, so do not apply `rate()`/`increase()`. The per-crash records — with process, module, and exception code — live in the [events](#crash-observations-dex) store; a per-exception-type rollup lands with the DEX read-model.
+- `yuzu_fleet_agents_dex_observer_disarmed` (server) counts Windows agents — DEX enabled — whose signal observer is **not currently healthy**: it failed to arm at startup, or a channel subscription died at runtime (an EventLog-service restart or channel ACL change flips the agent's arm signal to 0 on the next heartbeat). `> 0` means reliability telemetry is off or degraded on that many endpoints; investigate. Agents off Windows, or started with `--dex-disable`, are excluded, so this is a genuine fault count, not an opt-out count. **Caveat:** it does *not* detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed) — verify coverage with a synthetic event on a representative host. (Agents report arm-state in each heartbeat; the server rolls it up — the agent has no `/metrics` endpoint.)
+- `yuzu_fleet_dex_observed_total` (server) is the fleet-wide sum of DEX signals observed since each agent started. It is a **resetting gauge, not a monotonic counter** — it drops when an agent restarts, so do not apply `rate()`/`increase()`. The per-signal records live in the [events](#dex-signal-observations) store and the `/dex` dashboard.
+- `yuzu_server_guardian_proj_failures_total` (server) counts DEX observation projection failures. The source event is always preserved (the read model degrades, never destroys); `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). `yuzu_server_guardian_observations_reaped_total` is the disposal-evidence counter for reaped DEX projection rows.
 - Broader Prometheus metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
 ## Related documentation

@@ -267,9 +267,11 @@ public:
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
-                          "Windows agents (DEX enabled) whose DEX signal observer failed to arm "
-                          "or lost a channel subscription — >0 means reliability telemetry is "
-                          "silently off (or partial) on that many endpoints",
+                          "Windows agents (DEX enabled) reporting their DEX signal observer is not "
+                          "fully healthy (no channel armed, or a channel subscription dropped at "
+                          "runtime) — >0 means reliability telemetry is off or degraded on that "
+                          "many endpoints. (Per-channel partial-arm granularity is a follow-up; "
+                          "today this is the agent's own health flag.)",
                           "gauge");
         metrics_.describe("yuzu_fleet_dex_observed_total",
                           "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
@@ -459,6 +461,15 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_proj_failures_total",
+                          "DEX observation projection failures. The source event is preserved "
+                          "(degrade-don't-destroy); only the derived guardian_observations read "
+                          "model row is lost. >0 means /dex is under-counting — investigate "
+                          "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_observations_reaped_total",
+                          "Cumulative DEX observation rows deleted by the retention reaper "
+                          "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
@@ -2150,6 +2161,12 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                    metrics_.gauge("yuzu_server_guardian_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_reaped_total()));
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")

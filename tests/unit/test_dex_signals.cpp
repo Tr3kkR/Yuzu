@@ -982,6 +982,30 @@ TEST_CASE("wave 3: dependency failure + port exhaustion + update download", "[de
     CHECK(dl->reason == "0x80244018");
 }
 
+TEST_CASE("PRIVACY/SAFETY: clip() of an over-long multibyte string yields valid JSON (cpp-B1)",
+          "[dex][parse][json]") {
+    // Governance cpp-B1: clip() must trim to a UTF-8 codepoint boundary before
+    // appending the ellipsis — a torn sequence would make signal_detail_json's
+    // dump() throw, and the OS-callback catch(...) would silently drop the whole
+    // observation. A localized update title (CJK, 3 bytes/char) longer than the
+    // 120-byte clip cap forces the cut mid-codepoint at many offsets.
+    std::string cjk = "x"; // leading ASCII byte forces the 120-byte cut to land
+    for (int i = 0; i < 80; ++i)                  // mid-codepoint in the CJK run
+        cjk += "更新"; // 6 bytes each → 481 bytes, well over the 120 cap
+    const auto o = extract_signal("System", "Microsoft-Windows-WindowsUpdateClient", 20, 2,
+                                  {{"errorCode", "0x80070643"}, {"updateTitle", cjk}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "update.failed");
+    // The whole wire mapping must round-trip without throwing on the clipped value.
+    const auto ev = signal_observation_to_event(*o, "evt-cjk");
+    auto j = nlohmann::json::parse(ev.detail_json()); // must not throw
+    const std::string subj = j.at("subject").get<std::string>();
+    CHECK(subj.size() <= 123); // clipped to <=120 byte boundary + 3-byte ellipsis
+    // No U+FFFD means clip() trimmed to a codepoint boundary — NOT that dump()'s
+    // replace handler papered over a torn sequence.
+    CHECK(subj.find("\xEF\xBF\xBD") == std::string::npos);
+}
+
 // ── Wire mapping (dex_event) ─────────────────────────────────────────────────
 
 namespace {

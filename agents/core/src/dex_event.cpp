@@ -42,7 +42,11 @@ std::string signal_detail_json(const SignalObservation& o) {
         if (!o.component.empty())
             j["faulting_module"] = o.component;
     }
-    return j.dump();
+    // error_handler_t::replace is defense-in-depth (governance cpp-B1): clip() is
+    // now UTF-8-safe, but should any future field ever carry invalid UTF-8, we
+    // substitute U+FFFD instead of throwing out of the OS-callback path and
+    // silently losing the observation.
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 gpb::GuaranteedStateEvent

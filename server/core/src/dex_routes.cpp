@@ -43,7 +43,7 @@ std::string esc(const std::string& s) {
 
 std::string num(int64_t n) { return std::to_string(n); }
 
-// The 70 catalogued signal types, GROUPED for display — the server-side mirror
+// The catalogued signal types (103 today), GROUPED for display — the server-side mirror
 // of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
 // signal). The All-signals panel renders EVERY entry, fired or not, so
 // operators see what the fleet is monitoring — not just what happened to fire
@@ -263,10 +263,14 @@ std::string mk_tile(const char* cls, const std::string& n, const std::string& la
     return t + "</div>";
 }
 
-// The htmx "back to overview" link shared by both drill-downs.
-std::string back_to_overview() {
-    return "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview\" hx-target=\"#guardian-detail\" "
-           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">&larr; Reliability overview</a>";
+// The htmx "back to overview" link shared by both drill-downs — preserves the
+// window so returning from a drill-down lands on the same window the user came
+// from (drill-downs are window-scoped; governance C-S1/UP-11).
+std::string back_to_overview(const std::string& window) {
+    const std::string qs = window.empty() ? std::string{} : "?window=" + window;
+    return "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview" + qs +
+           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+           "style=\"cursor:pointer;\">&larr; Reliability overview</a>";
 }
 
 // ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
@@ -420,8 +424,8 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // also show the group's event total so a hot family stands out collapsed.
     h += "<div class=\"gp-sech\">All signals</div>";
     h += "<div class=\"gp-note\">All " + std::to_string(dex_catalogued_type_count()) +
-         " monitored signal types are listed by group; a dash means no events in this "
-         "window.</div>";
+         " monitored signal types are listed by group (where the source channel exists on "
+         "the endpoint's Windows SKU); a dash means no events in this window.</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th class=\"gp-num\">Events</th>"
          "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
     auto find_sig = [&](const std::string& t) -> const DexSignalCount* {
@@ -497,7 +501,8 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             const std::string label =
                 a.subject.empty()
                     ? std::string("&lt;unknown&gt;")
-                    : drill_link("/fragments/dex/app", "name=" + url_encode(a.subject),
+                    : drill_link("/fragments/dex/app",
+                                 "name=" + url_encode(a.subject) + "&window=" + cur,
                                  esc(a.subject));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(a.crashes) +
                  "</td><td class=\"gp-num\">" + num(a.hangs) + "</td><td class=\"gp-num\">" +
@@ -525,7 +530,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                  "<th class=\"gp-num\">Boots</th></tr></thead><tbody>";
             for (const auto& b : slow) {
                 const std::string label = drill_link("/fragments/dex/device",
-                                                     "id=" + url_encode(b.agent_id),
+                                                     "id=" + url_encode(b.agent_id) + "&window=" + cur,
                                                      esc(b.agent_id));
                 h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + esc(fmt_ms(b.avg_ms)) +
                      "</td><td class=\"gp-num\">" + esc(fmt_ms(b.max_ms)) +
@@ -595,8 +600,9 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th class=\"gp-num\">Crashes</th>"
              "<th>Last seen</th></tr></thead><tbody>";
         for (const auto& d : devices) {
-            const std::string label =
-                drill_link("/fragments/dex/device", "id=" + url_encode(d.agent_id), esc(d.agent_id));
+            const std::string label = drill_link("/fragments/dex/device",
+                                                 "id=" + url_encode(d.agent_id) + "&window=" + cur,
+                                                 esc(d.agent_id));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
         }
@@ -607,13 +613,16 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
 }
 
 std::string render_dex_app_fragment(const GuaranteedStateStore* store,
-                                    const std::string& process_name, const std::string& since) {
+                                    const std::string& process_name, const std::string& window) {
+    // Window-scoped to match the overview row that linked here (C-S1/UP-11): the
+    // token (e.g. "7d") resolves to the same `since` cutoff the overview used.
+    const std::string since = iso_days_ago(window_to_days(window));
     if (!store)
-        return back_to_overview() +
+        return back_to_overview(window) +
                placeholder("Reliability data unavailable", "The signal store is not open.");
 
     const auto s = store->dex_app_summary(process_name, since);
-    std::string h = back_to_overview();
+    std::string h = back_to_overview(window);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(process_name) +
          "</h1></div><div class=\"gp-sub\">Crash &amp; hang blast radius across the "
          "fleet.</div></div></div>";
@@ -667,7 +676,8 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
              "<th>Last seen</th></tr></thead><tbody>";
         for (const auto& d : devs) {
             const std::string label =
-                drill_link("/fragments/dex/device", "id=" + url_encode(d.agent_id), esc(d.agent_id));
+                drill_link("/fragments/dex/device",
+                           "id=" + url_encode(d.agent_id) + "&window=" + window, esc(d.agent_id));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
         }
@@ -677,16 +687,18 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 }
 
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& since) {
+                                       const std::string& agent_id, const std::string& window) {
     // This is behavioral data (which apps a person runs): the access posture is
     // enforced server-side — permission-gated on GuaranteedState:Read and each
     // open audit-logged (dex.device.view) — without an on-page banner.
+    // Window-scoped to match the linking overview row (C-S1/UP-11).
+    const std::string since = iso_days_ago(window_to_days(window));
     if (!store)
-        return back_to_overview() +
+        return back_to_overview(window) +
                placeholder("Reliability data unavailable", "The signal store is not open.");
 
     const auto s = store->dex_device_summary(agent_id, since);
-    std::string h = back_to_overview();
+    std::string h = back_to_overview(window);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(agent_id) +
          "</h1></div><div class=\"gp-sub\">Device signal history.</div></div></div>";
     if (s.signals == 0)
@@ -774,7 +786,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
-        res.set_content(render_dex_app_fragment(store_, name, ""), "text/html; charset=utf-8");
+        const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
+        res.set_content(render_dex_app_fragment(store_, name, w), "text/html; charset=utf-8");
     });
 
     // -- Per-device drill-down (signal history; behavioral PII → audit each open). ?id=<agent_id> --
@@ -782,10 +795,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
         if (audit_fn_)
-            audit_fn_(req, "dex.device.view", "success", "agent", id,
+            audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
-        res.set_content(render_dex_device_fragment(store_, id, ""), "text/html; charset=utf-8");
+        res.set_content(render_dex_device_fragment(store_, id, w), "text/html; charset=utf-8");
     });
 }
 

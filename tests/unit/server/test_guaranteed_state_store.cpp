@@ -944,6 +944,113 @@ TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",
     CHECK(store.event_count() == 0);
 }
 
+TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations",
+          "[guaranteed_state_store][events][dex]") {
+    // Governance qa-B1: the batch path also projects ruleless observations into
+    // guardian_observations. A mixed batch (drift + observations) must project
+    // exactly the observation rows — and a projection failure must NOT roll back
+    // the batch (degrade-don't-destroy, UP-1).
+    GuaranteedStateStore store(":memory:");
+    std::vector<GuaranteedStateEventRow> batch;
+    auto obs = [](const std::string& id, const std::string& proc) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = R"({"subject":")" + proc + R"(","reason":"0xC0000005","platform":"windows"})";
+        e.timestamp = "2026-06-09T10:00:00Z";
+        return e;
+    };
+    batch.push_back(make_event("d1", "rule-1", "agent-A")); // drift — must NOT project
+    batch.push_back(obs("o1", "chrome.exe"));
+    batch.push_back(obs("o2", "Teams.exe"));
+    auto n = store.insert_events(batch);
+    REQUIRE(n.has_value());
+    CHECK(*n == 3);
+    auto rows = store.query_observations();
+    REQUIRE(rows.size() == 2); // only the two observations projected
+    CHECK(rows[0].subject != rows[1].subject);
+    for (const auto& r : rows)
+        CHECK((r.subject == "chrome.exe" || r.subject == "Teams.exe"));
+}
+
+TEST_CASE("GuaranteedStateStore: projected fields are length-clamped (server-side)",
+          "[guaranteed_state_store][dex][security]") {
+    // Governance sec-M1: the server must not trust an enrolled agent to clip —
+    // an oversized subject is clamped (256 B) so it cannot bloat the projection
+    // or the dashboard. UTF-8-safe so the clamp never tears a codepoint.
+    GuaranteedStateStore store(":memory:");
+    const std::string huge(5000, 'A');
+    GuaranteedStateEventRow c;
+    c.event_id = "big-1";
+    c.rule_id = "__observation__";
+    c.agent_id = "agent-A";
+    c.event_type = "process.crashed";
+    c.severity = "info";
+    c.detail_json = R"({"subject":")" + huge + R"(","reason":"0xC0000005","platform":"windows"})";
+    c.timestamp = "2026-06-09T10:00:00Z";
+    REQUIRE(store.insert_event(c));
+    auto obs = store.query_observations();
+    REQUIRE(obs.size() == 1);
+    CHECK(obs[0].subject.size() <= 256);
+}
+
+TEST_CASE("GuaranteedStateStore: reaper deletes observations in lockstep with events",
+          "[guaranteed_state_store][dex][retention]") {
+    // Governance qa-B2: a stale observation (projected via insert_event, so it
+    // carries the parent event's ttl) is reaped; a fresh one survives. Drives the
+    // production observation-DELETE inline via a second connection (the same
+    // pattern the events-reaper test uses, since the cron thread's first tick
+    // outlasts the test budget) — exercising the real predicate against rows the
+    // real projection path created.
+    TempDbFile tmp;
+    GuaranteedStateStore store(tmp.path, /*retention_days=*/30);
+    auto obs = [&](const std::string& id) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = R"({"subject":"chrome.exe","reason":"0xC0000005","platform":"windows"})";
+        e.timestamp = "2026-06-09T10:00:00Z";
+        REQUIRE(store.insert_event(e));
+    };
+    obs("fresh");
+    obs("stale");
+    REQUIRE(store.query_observations().size() == 2);
+
+    {
+        sqlite3* h = nullptr;
+        REQUIRE(sqlite3_open_v2(tmp.path.string().c_str(), &h, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        // Age the stale projection row, then run the production observation reap SQL.
+        REQUIRE(sqlite3_exec(
+                    h, "UPDATE guardian_observations SET ttl_expires_at = 1 WHERE event_id='stale'",
+                    nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(h,
+                                   "DELETE FROM guardian_observations "
+                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
+                                   -1, &st, nullptr) == SQLITE_OK);
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        sqlite3_bind_int64(st, 1, now);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        CHECK(sqlite3_changes(h) == 1); // only the stale projection row
+        sqlite3_finalize(st);
+        sqlite3_close(h);
+    }
+
+    GuaranteedStateStore reopened(tmp.path, /*retention_days=*/30);
+    auto survivors = reopened.query_observations();
+    REQUIRE(survivors.size() == 1);
+    CHECK(survivors[0].event_id == "fresh");
+}
+
 // ── #452 §5 — retention reaper ────────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: retention_days=0 disables TTL",
