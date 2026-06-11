@@ -89,9 +89,13 @@ Resolution order inside the script:
    precondition: a PostgreSQL 16 Windows service with role `yuzu` /
    password `yuzu` / database `yuzu_test`, bootstrapped **once** per
    runner (installer or `choco install postgresql16`, then
-   `createuser`/`createdb` as above). Prefer the runner-level env
-   override (path 1) if the box already runs Postgres with different
-   credentials.
+   `createuser`/`createdb` as above). When `psql` is on PATH the script
+   authenticates the conventional DSN with `SELECT 1` before exporting
+   it — a TCP listener with the wrong credentials produces a `::warning`
+   and no DSN rather than a false "ready". Without `psql` it falls back
+   to the bare TCP probe with a loud unverified-credential warning.
+   Prefer the runner-level env override (path 1) if the box already runs
+   Postgres with different credentials.
 5. Nothing found → `::warning`, exit 0.
 
 **Non-fatal by design (for now):** no test consumes the DSN until #1320

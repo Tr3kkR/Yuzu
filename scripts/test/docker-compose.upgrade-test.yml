@@ -49,7 +49,9 @@ services:
     environment:
       # Postgres substrate DSN (ADR-0006, #1318). Inert on the old-release
       # leg (and on the new leg until #1320 ships the consumer).
-      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
+      # ⚠ TEST-ONLY default password ('yuzu-app') — distinct from the
+      # superuser default by design (PR #1334 review, S1).
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     ports:
       - "8080"     # web dashboard + REST API (random host port via compose)
       - "50051"   # agent gRPC
@@ -110,15 +112,24 @@ services:
     pull_policy: build
     restart: "no"
     environment:
+      # ⚠ TEST-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: first-boot init refuses to run if
+      # they are equal (PR #1334 review, S1).
       POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-app}
     volumes:
       # Project-scoped like server-data, so the database also survives the
       # old→new image swap but stays isolated between parallel runs.
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       # -h 127.0.0.1 forces TCP — the init-phase temporary server is
-      # unix-socket-only, so a socket probe could pass mid-init.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      # unix-socket-only, so a socket probe could pass mid-init. psql
+      # SELECT 1 over the app DSN proves the app credential authenticates
+      # ($$ defers expansion to the container's shell). The psql leg
+      # dials the container's own hostname, NOT loopback: initdb leaves
+      # 'trust' auth on 127.0.0.1, so only a non-loopback connection
+      # actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 12

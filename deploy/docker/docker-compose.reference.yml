@@ -22,7 +22,12 @@
 ##
 ## Usage:
 ##   export YUZU_VERSION=0.10.0
-##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"   # store it in your secrets manager
+##   # Two DISTINCT credentials — store both in your secrets manager. The
+##   # superuser password stays inside the postgres service; the app role
+##   # password is what the server's DSN carries. They must differ (the
+##   # image's first-boot init refuses to run if they are equal).
+##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"   # postgres superuser
+##   export YUZU_DB_PASSWORD="$(openssl rand -hex 24)"         # yuzu app role
 ##   docker compose -f docker-compose.reference.yml up -d
 ##   docker compose -f docker-compose.reference.yml logs -f server
 ##
@@ -80,7 +85,10 @@ services:
       # flags. Pointing this at an external/managed Postgres instead of
       # the bundled service below is fully supported — replace the whole
       # DSN and drop the postgres service + depends_on if you do.
-      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (no insecure default in the reference template)}@postgres:5432/yuzu
+      # The DSN carries the APP role password (YUZU_DB_PASSWORD), never the
+      # superuser's — a leaked server environment must not disclose
+      # superuser credentials.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD; no insecure default in the reference template)}@postgres:5432/yuzu
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,6 +160,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (no insecure default in the reference template)}
+      # App role password — DISTINCT from the superuser password above.
+      # First-boot init refuses to run if they are equal or if this is
+      # unset. The server's YUZU_POSTGRES_DSN carries this credential.
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD)}
     volumes:
       # Database state — same persistence rules as server-data: back it up,
       # never `down -v` unless you intend to destroy it.
@@ -160,8 +172,14 @@ services:
       # -h 127.0.0.1 forces a TCP probe — during first-boot init the
       # temporary server listens on the unix socket only, so a socket
       # probe would report ready before the init scripts have run.
-      # -U yuzu -d yuzu also proves the app role/db exist.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      # pg_isready is the liveness baseline; the psql SELECT 1 over the
+      # exact app DSN proves the app credential authenticates (PR #1334
+      # review, S5). $$ defers expansion to the container's shell so the
+      # password never appears in `docker compose config` output. The
+      # psql leg dials the container's own hostname, NOT loopback:
+      # initdb leaves 'trust' auth on 127.0.0.1, so only a non-loopback
+      # connection actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 12

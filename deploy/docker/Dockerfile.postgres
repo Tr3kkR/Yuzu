@@ -28,11 +28,17 @@
 #
 # Runtime contract (consumed by the composes):
 #   POSTGRES_PASSWORD   required by the upstream entrypoint (superuser).
-#   YUZU_DB_USER        app role name        (default: yuzu)
+#   YUZU_DB_USER        app role name        (default: yuzu; must differ
+#                       from POSTGRES_USER — init refuses otherwise)
 #   YUZU_DB_NAME        app database name    (default: yuzu)
-#   YUZU_DB_PASSWORD    app role password    (default: POSTGRES_PASSWORD)
+#   YUZU_DB_PASSWORD    app role password    REQUIRED — must differ from
+#                       POSTGRES_PASSWORD. First-boot init refuses to run
+#                       if it is unset or equal to the superuser password
+#                       (a leaked app DSN must never disclose superuser
+#                       credentials — PR #1334 review, S1).
 #   Data dir: /var/lib/postgresql/data (mount a named volume).
-#   Healthcheck lives in the composes: pg_isready -h 127.0.0.1 -U yuzu -d yuzu
+#   Healthcheck lives in the composes: pg_isready -h 127.0.0.1 (liveness)
+#   && psql over the app DSN for SELECT 1 (proves the app credential).
 #   (-h 127.0.0.1 is load-bearing — during docker-entrypoint-initdb.d the
 #   temporary server listens on the unix socket only, so a TCP probe cannot
 #   false-positive mid-init).
@@ -45,8 +51,12 @@ ARG PG_BASE=postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb094
 # ── Stage 1: build pgvector against the exact server version ────────────
 FROM ${PG_BASE} AS pgvector-build
 
-# pgvector release tag — bump deliberately, never float.
+# pgvector release tag + the commit it resolved to at pin time — bump both
+# deliberately, never float. Tags are mutable refs; the commit SHA is the
+# actual pin (PR #1334 review). Resolved 2026-06-11 via
+#   git ls-remote https://github.com/pgvector/pgvector.git refs/tags/v0.8.2
 ARG PGVECTOR_VERSION=v0.8.2
+ARG PGVECTOR_COMMIT=cab9da72c04353f143bb06b42ab70a403daac64a
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git ca-certificates postgresql-server-dev-16 \
@@ -55,8 +65,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # OPTFLAGS="" strips pgvector's default -march=native — this image must be
 # portable across CPUs (and across the amd64/arm64 publish matrix), not
 # tuned to the build host. Same convention as the upstream pgvector image.
+# The rev-parse check fails the build if upstream ever moves the tag, so a
+# retagged v0.8.2 cannot silently change what we ship.
 RUN git clone --branch "${PGVECTOR_VERSION}" --depth 1 \
         https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && [ "$(git -C /tmp/pgvector rev-parse HEAD)" = "${PGVECTOR_COMMIT}" ] \
+       || { echo "pgvector tag ${PGVECTOR_VERSION} no longer points at pinned commit ${PGVECTOR_COMMIT}" >&2; exit 1; } \
     && make -C /tmp/pgvector OPTFLAGS="" -j"$(nproc)" \
     && make -C /tmp/pgvector install DESTDIR=/out
 

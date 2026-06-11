@@ -59,9 +59,14 @@ write_env_file() {
     echo "ok: ${ENV_FILE} already carries YUZU_POSTGRES_DSN — leaving it untouched"
     return 0
   fi
+  # Pre-create at 0600 so the file NEVER exists world-readable, even for a
+  # sub-second window between write and chmod (PR #1334 review, S3).
+  if [[ ! -f "$ENV_FILE" ]]; then
+    install -m 0600 /dev/null "$ENV_FILE"
+  fi
+  chmod 0600 "$ENV_FILE"
   # Append-or-create so other variables in the file survive.
   printf 'YUZU_POSTGRES_DSN=%s\n' "$dsn" >> "$ENV_FILE"
-  chmod 0600 "$ENV_FILE"
   # The yuzu service user may not exist yet on a bare provisioning run.
   chown "${SVC_USER}:${SVC_USER}" "$ENV_FILE" 2>/dev/null || true
   echo "ok: wrote YUZU_POSTGRES_DSN to ${ENV_FILE} (0600)"
@@ -89,9 +94,20 @@ if ! command -v psql >/dev/null 2>&1 \
 fi
 
 # Generate a credential only if the role doesn't exist yet; never reset an
-# existing role's password (idempotency).
-role_exists=$(sudo -u postgres psql -At -c \
-  "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" || true)
+# existing role's password (idempotency). The credential is freshly random
+# (openssl rand) — the app role NEVER shares a password with any superuser
+# (the local postgres superuser authenticates via peer auth, passwordless).
+#
+# Existence checks use psql -v / :'var' interpolation like the CREATEs —
+# never shell interpolation into SQL (PR #1334 review, S2). No `|| true`:
+# under `set -e` a failed query (cluster down, bad identifier) aborts the
+# script instead of masquerading as "role does not exist". psql variables
+# do not interpolate in -c strings, so the query comes via stdin.
+role_exists=$(sudo -u postgres psql -At -v ON_ERROR_STOP=1 \
+  -v yuzu_user="$DB_USER" <<'EOSQL'
+SELECT 1 FROM pg_roles WHERE rolname = :'yuzu_user'
+EOSQL
+)
 
 DB_PASSWORD=""
 if [[ "$role_exists" != "1" ]]; then
@@ -106,8 +122,11 @@ else
   echo "ok: role '${DB_USER}' already exists — password left unchanged"
 fi
 
-db_exists=$(sudo -u postgres psql -At -c \
-  "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" || true)
+db_exists=$(sudo -u postgres psql -At -v ON_ERROR_STOP=1 \
+  -v yuzu_db="$DB_NAME" <<'EOSQL'
+SELECT 1 FROM pg_database WHERE datname = :'yuzu_db'
+EOSQL
+)
 if [[ "$db_exists" != "1" ]]; then
   sudo -u postgres psql -v ON_ERROR_STOP=1 \
     -v yuzu_db="$DB_NAME" -v yuzu_user="$DB_USER" <<'EOSQL'

@@ -35,7 +35,10 @@ services:
       # so today it is inert and the server still boots without Postgres.
       # Env var (not a CLI flag) on purpose: the current binary would
       # reject an unknown --postgres-dsn flag.
-      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_POSTGRES_PASSWORD:-yuzu}@postgres:5432/yuzu
+      # ⚠ DEV-ONLY default password ('yuzu-app') — this compose is a local
+      # dev rig. Production deployments use docker-compose.reference.yml,
+      # which REQUIRES distinct YUZU_POSTGRES_PASSWORD + YUZU_DB_PASSWORD.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     volumes:
       - server-data:/var/lib/yuzu
     # File-descriptor headroom mirrors the systemd unit
@@ -58,15 +61,23 @@ services:
       dockerfile: deploy/docker/Dockerfile.postgres
     image: yuzu-postgres:local
     environment:
+      # ⚠ DEV-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: the image's first-boot init
+      # refuses to run if they are equal (PR #1334 review, S1).
       POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-app}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       # -h 127.0.0.1 forces a TCP probe — during first-boot init the
       # temporary server listens on the unix socket only, so a socket
       # probe would report ready before the init scripts have run.
-      # -U yuzu -d yuzu also proves the app role/db exist.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      # psql SELECT 1 over the app DSN proves the app credential
+      # authenticates ($$ defers expansion to the container's shell).
+      # The psql leg dials the container's own hostname, NOT loopback:
+      # initdb leaves 'trust' auth on 127.0.0.1, so only a non-loopback
+      # connection actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 12

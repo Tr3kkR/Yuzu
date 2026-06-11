@@ -118,7 +118,21 @@ if tcp_probe 127.0.0.1 5432; then
   # Convention documented in docs/ci-architecture.md: role yuzu / password
   # yuzu / db yuzu_test, created once at runner bootstrap. A bespoke setup
   # overrides via the pre-set-DSN path (1).
-  emit_dsn "postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test" "native cluster on 5432"
+  NATIVE_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
+  # A TCP listener alone proves nothing about the app credential — when
+  # psql is on PATH, authenticate the exact DSN we are about to export
+  # (PR #1334 review, S5). Fall back to the bare TCP probe + warning when
+  # psql is unavailable.
+  if command -v psql >/dev/null 2>&1; then
+    if psql "$NATIVE_DSN" -tA -c 'SELECT 1' >/dev/null 2>&1; then
+      emit_dsn "$NATIVE_DSN" "native cluster on 5432 (psql SELECT 1 verified)"
+      exit 0
+    fi
+    echo "::warning::ensure-postgres: something listens on 127.0.0.1:5432 but the conventional DSN failed 'psql SELECT 1' — not exporting YUZU_TEST_POSTGRES_DSN. Fix the runner bootstrap (role yuzu / password yuzu / db yuzu_test) or pre-set YUZU_TEST_POSTGRES_DSN." >&2
+    exit "$SOFT_EXIT"
+  fi
+  echo "::warning::ensure-postgres: psql not on PATH — exporting the conventional DSN on a TCP probe only (credential UNVERIFIED). Install psql on the runner for an authenticated readiness check." >&2
+  emit_dsn "$NATIVE_DSN" "native cluster on 5432 (TCP probe only — psql unavailable)"
   exit 0
 fi
 
