@@ -16,6 +16,7 @@ point it at a new release.
 | Tier | Image | Base |
 |------|-------|------|
 | Server | `ghcr.io/<owner>/yuzu-server-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
+| Postgres (server substrate, #1318) | `ghcr.io/<owner>/yuzu-postgres:<version>` | `postgres:16` + pgvector (no `-chisel` variant — same image production composes use) |
 | Gateway | `ghcr.io/<owner>/yuzu-gateway-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
 | Agents (×N, default 10) | `ghcr.io/<owner>/yuzu-agent-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
 
@@ -24,9 +25,10 @@ Files:
 - `deploy/docker/Dockerfile.server.chisel`
 - `deploy/docker/Dockerfile.gateway.chisel`
 - `deploy/docker/Dockerfile.agent.chisel`
-- `deploy/docker/docker-compose.demo.yml` — the three-tier stack
+- `deploy/docker/Dockerfile.postgres` (published by `docker-publish-postgres`, not the chisel job)
+- `deploy/docker/docker-compose.demo.yml` — the demo stack
 - `deploy/docker/demo-gateway-sys.config` — gateway upstream/listener config
-- `scripts/start-demo.sh` — the launcher (entry point)
+- `scripts/start-demo.sh` — the launcher (entry point; `--build` also builds/tags `yuzu-postgres`)
 
 ## Quick start
 

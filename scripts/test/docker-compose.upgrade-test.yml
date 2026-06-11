@@ -46,6 +46,12 @@ services:
   server:
     image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
     restart: "no"
+    environment:
+      # Postgres substrate DSN (ADR-0006, #1318). Inert on the old-release
+      # leg (and on the new leg until #1320 ships the consumer).
+      # ⚠ TEST-ONLY default password ('yuzu-app') — distinct from the
+      # superuser default by design (PR #1334 review, S1).
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     ports:
       - "8080"     # web dashboard + REST API (random host port via compose)
       - "50051"   # agent gRPC
@@ -82,6 +88,53 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── PostgreSQL (server storage substrate, ADR-0006, #1318) ───────────
+  # Built locally from Dockerfile.postgres (a ghcr yuzu-postgres pin can't
+  # work here: YUZU_VERSION is the OLD release on the first leg and a
+  # never-published -test tag on the second). The postgres service stays
+  # identical across both legs while the server image swaps around it —
+  # exactly the topology the ADR-0009 first-boot backfill upgrade
+  # assertions will exercise. The OLD release's server ignores
+  # YUZU_POSTGRES_DSN entirely; the env var below is inert until #1320.
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    # pull_policy: build — without it, the harness's `docker compose pull`
+    # step exits 1 trying to pull the local-only yuzu-postgres:local tag
+    # from a registry (verified). With it, pull skips this service and
+    # `up -d` builds it when missing.
+    pull_policy: build
+    restart: "no"
+    environment:
+      # ⚠ TEST-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: first-boot init refuses to run if
+      # they are equal (PR #1334 review, S1).
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-app}
+    volumes:
+      # Project-scoped like server-data, so the database also survives the
+      # old→new image swap but stays isolated between parallel runs.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init. psql
+      # SELECT 1 over the app DSN proves the app credential authenticates
+      # ($$ defers expansion to the container's shell). The psql leg
+      # dials the container's own hostname, NOT loopback: initdb leaves
+      # 'trust' auth on 127.0.0.1, so only a non-loopback connection
+      # actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   server-data:
+  postgres-data:
