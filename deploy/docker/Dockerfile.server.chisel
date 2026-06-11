@@ -95,6 +95,11 @@ RUN set -eux; \
 
 # See Dockerfile.agent.chisel for the per-slice rationale. The server needs no
 # plugin/DSO slices but is otherwise the same closure.
+# libpq5_libs replaced libsqlite3-0_libs in #1318 (Postgres substrate,
+# ADR-0006/0008) — the sqlite slice was vestigial (SQLite is statically
+# linked from vcpkg; verified via ldd on the published image, see
+# Dockerfile.server). libpq5_libs' essential slices (libgssapi-krb5-2,
+# libldap2) are resolved by chisel automatically.
 # Retry loop: `chisel cut` downloads the Ubuntu archive indices (main +
 # universe) over the network and the large universe index occasionally EOFs
 # mid-fetch. Retrying keeps release rebuilds reliable.
@@ -102,7 +107,7 @@ RUN set -eux; mkdir -p /rootfs; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
-      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs zlib1g_libs \
+      libstdc++6_libs libssl3t64_libs libpq5_libs zlib1g_libs \
       busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
       if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
