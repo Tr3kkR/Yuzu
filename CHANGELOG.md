@@ -118,6 +118,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`GuaranteedState:Read`) and audit-logged on open (behavioral data). A "DEX"
   nav link is in the dashboard chrome. NO mock data anywhere: real aggregations
   or explicit "no data" placeholders.
+- **DEX REST aggregation surface (`/api/v1/dex/*`) — agentic parity.** The DEX
+  dashboard rollups now have machine-readable equivalents so an agentic worker
+  sees the same read-model the dashboard does: `GET /api/v1/dex/signals` (the
+  catalogue rollup), `GET /api/v1/dex/scope` (per-OS signal coverage), and `GET
+  /api/v1/dex/signals/{obs_type}` (one signal's subjects / OS split /
+  most-affected devices / per-day trend). All gated on `GuaranteedState:Read`
+  with a `24h/7d/30d/all` `window` and a shared resolver so REST and the
+  dashboard can never drift on the window vocabulary. Audit boundary mirrors the
+  events endpoint: the rollup and scope are fleet aggregates (not audited); the
+  per-signal drill-down returns a behavioral devices list and emits
+  `dex.signal.view` on every call.
 - **Guardian DEX — 103-signal observation catalogue (waves 1–3).** The
   slice-1 crash recorder generalized into one catalogue-driven multi-channel
   observer (`dex_signal_catalog.{hpp,cpp}` + `dex_observer.{hpp,cpp}`,

@@ -337,6 +337,12 @@ std::string history_detail(const GuardianObservationRow& r) {
 
 } // namespace
 
+// Public wrappers over the internal window helpers (declared in dex_routes.hpp) so
+// the /api/v1/dex REST surface resolves the window token through the exact same
+// logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
+int dex_window_to_days(const std::string& window) { return window_to_days(window); }
+std::string dex_iso_since(int days) { return iso_days_ago(days); }
+
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
 std::string dex_window_token(int window_days) {

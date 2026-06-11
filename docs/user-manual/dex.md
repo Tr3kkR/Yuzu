@@ -95,6 +95,26 @@ opened from a panel inherit the window you were viewing, so the numbers match.
 > See the works-council / co-determination posture in
 > `docs/enterprise-readiness-soc2-first-customer.md`.
 
+## Agentic access (REST)
+
+Every aggregation on this page has a machine-readable equivalent under
+`/api/v1/dex/*` so an agentic worker sees the same DEX read-model the dashboard
+does (agentic-first parity):
+
+- **`GET /api/v1/dex/signals`** — the Catalogue rollup (every signal in the
+  window: count, blast radius, last seen).
+- **`GET /api/v1/dex/scope`** — the per-OS signal coverage that drives the
+  cross-OS captions.
+- **`GET /api/v1/dex/signals/{obs_type}`** — one signal's drill-down (subjects,
+  OS split, most-affected devices, per-day trend).
+
+All three take a `window` of `24h`/`7d`/`30d`/`all` and are gated on
+`GuaranteedState:Read`. The per-signal drill-down returns a most-affected
+**devices** list (behavioral) and is **audit-logged** (`dex.signal.view`) on
+every call, exactly like the dashboard view; the rollup and scope are fleet
+aggregates and are not audited. Full request/response shapes are in
+[`rest-api.md`](rest-api.md#dex-digital-employee-experience).
+
 ## Platform coverage
 
 The **Windows** collector is the most complete — it covers the full Windows

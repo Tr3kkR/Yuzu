@@ -43,6 +43,15 @@ struct DexFleet {
     int64_t total_online{0};
 };
 
+/// Shared window-selector resolvers — the single source of truth for how both the
+/// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
+/// token. `dex_window_to_days` maps "24h"/"7d"/"30d"/"all" (anything else → 7d) to
+/// a day count (0 = "all"); `dex_iso_since` turns that day count into an ISO-8601
+/// UTC cutoff ("" when days<=0 = "all"). Thin wrappers over the dashboard's
+/// internal helpers so REST and HTMX can never drift on the window vocabulary.
+int dex_window_to_days(const std::string& window);
+std::string dex_iso_since(int days);
+
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
 /// + trend, all from the crash projection. `since` is an ISO-8601 cutoff

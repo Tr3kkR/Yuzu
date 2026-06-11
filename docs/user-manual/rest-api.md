@@ -3402,6 +3402,41 @@ Guard authoring schema catalog — the static registry of `spark` / `assertion` 
 
 ---
 
+### DEX (Digital Employee Experience)
+
+The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. They read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row) and are gated on the same `GuaranteedState:Read` securable. All three accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`).
+
+**Audit boundary.** The catalogue rollup and per-OS scope are fleet aggregates and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
+
+#### `GET /api/v1/dex/signals`
+
+Whole-catalogue rollup — every observation type present in the window.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `window`.
+- **Response:** `data[]` of `{obs_type, count, distinct_devices, last_seen}`. `obs_type` is the stable machine key (e.g. `process.crashed`, `os.boot`); map your own labels. Not audited.
+
+#### `GET /api/v1/dex/scope`
+
+Per-OS signal coverage — how many distinct observation types each platform reports, with total event count (the live cross-OS coverage the dashboard derives).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `window`.
+- **Response:** `data[]` of `{platform, distinct_types, total_events}`. Not audited.
+
+#### `GET /api/v1/dex/signals/{obs_type}`
+
+One signal type's drill-down.
+
+- **Permission:** `GuaranteedState:Read`
+- **Path parameter:** `obs_type` — must match `[A-Za-z0-9._-]{1,64}`.
+- **Query parameters:** `window`; `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
+- **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
+- **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
+- **Audit (behavioral PII):** emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) on every successful access — see the audit boundary note above.
+
+---
+
 ### Patch Management
 
 **`GET /api/patches`** — Query missing/installed patches.
