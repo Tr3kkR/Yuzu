@@ -90,6 +90,9 @@ dc() {
 # collide with the debian/alpine production images of the same version (whose
 # compose healthchecks assume a bash userland the chiselled images don't have).
 img() { printf '%s/yuzu-%s-chisel:%s' "$REGISTRY" "$1" "$YUZU_VERSION"; }
+# yuzu-postgres has no -chisel variant — the demo runs the same release-pinned
+# substrate image production composes use (#1318).
+img_pg() { printf '%s/yuzu-postgres:%s' "$REGISTRY" "$YUZU_VERSION"; }
 
 # ── Image acquisition ──────────────────────────────────────────────────────
 build_images() {
@@ -100,11 +103,13 @@ build_images() {
     -f deploy/docker/Dockerfile.agent.chisel   .
   DOCKER_BUILDKIT=1 docker build -t "$(img gateway)" \
     -f deploy/docker/Dockerfile.gateway.chisel .
-  ok "Built $(img server), $(img gateway), $(img agent)"
+  DOCKER_BUILDKIT=1 docker build -t "$(img_pg)" \
+    -f deploy/docker/Dockerfile.postgres       .
+  ok "Built $(img server), $(img gateway), $(img agent), $(img_pg)"
 }
 
 images_present_locally() {
-  docker image inspect "$(img server)" "$(img gateway)" "$(img agent)" >/dev/null 2>&1
+  docker image inspect "$(img server)" "$(img gateway)" "$(img agent)" "$(img_pg)" >/dev/null 2>&1
 }
 
 ensure_images() {
