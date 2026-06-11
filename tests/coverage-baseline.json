@@ -1,9 +1,9 @@
 {
   "__doc": "Locked branch coverage baseline enforced by scripts/test/coverage-gate.sh. Regenerate with 'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' then commit this file alongside the change that earned the new baseline. Hardware fingerprint deliberately omitted \u2014 line-level coverage is compiler-deterministic, unlike perf timings.",
   "__schema": "coverage-baseline/v1",
-  "branch_percent": 26.8,
-  "captured_at": 1777101720,
-  "captured_commit": "40acd33255ef83ea262697308486bdd756d881e3",
-  "line_percent": 51.8,
+  "branch_percent": 31.6,
+  "captured_at": 1781203272,
+  "captured_commit": "4375116ccbf0ffa32212e4d33e96085564c85bbf",
+  "line_percent": 64.3,
   "slack_pp": 0.5
 }
