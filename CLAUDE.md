@@ -93,6 +93,12 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
+- **Linux:** `bison`, `flex` — vcpkg's libpq port (Postgres substrate, ADR-0006) builds
+  postgresql from source and cannot auto-acquire them on Linux (`sudo apt-get install -y
+  bison flex`)
+- **macOS:** `autoconf`, `automake`, `libtool` — same libpq port runs autoreconf
+  (`brew install autoconf automake libtool`)
+- **Windows:** no new packages — vcpkg auto-acquires winflexbison
 
 ### Quick start (setup script)
 ```bash
@@ -205,6 +211,7 @@ docs/             Architecture docs, conventions, roadmap, capability map
 - `builtin-baseline` is required because of the `version>=` constraint on abseil. Without it vcpkg resolves against HEAD.
 - OpenSSL is a **required dependency on every platform including Windows**. vcpkg's gRPC port compiles its TLS / JWT / PEM code paths against OpenSSL headers regardless of linkage mode, so `grpc.lib` has unresolved references to `BIO_*`, `EVP_*`, `PEM_*`, `X509_*`, `OPENSSL_sk_*` that must be satisfied by `libssl.lib` + `libcrypto.lib` at final link time. A previous iteration of `vcpkg.json` marked openssl `"platform": "!windows"` with a comment that gRPC would use schannel — that was aspirational, never actually wired up, and confirmed wrong by the #375 option D canary's LNK2019 errors. The comment and platform filter have been removed; openssl is an unconditional top-level dep.
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
+- **libpq (Postgres substrate, ADR-0006/0008): no cmake target carries static libpq's full closure.** `libpgcommon`/`libpgport` (scram/auth helpers) and OpenSSL appear only in `libpq.pc`'s `Libs.private`, so the meson `libpq_dep` block wires them explicitly (unix: cmake `FindPostgreSQL` + `find_library`; Windows: hand-wired per the #375 pattern below). On Windows libpq is a **DLL** (the triplet's static override covers the grpc stack only) and ships via the release zip's vcpkg-DLL sweep — see the ADR-0008 Correction (2026-06-10). `libpq_dep` is gated on `build_server` (the agent stays SQLite). Manifest pins `default-features: false, features: [openssl]`. Pure-C libpq carries no MSVC `detect_mismatch` records, so a wrong-CRT lib pick links silently — the buildtype-conditional `_vcpkg_lib_win` selection is load-bearing. Cold vcpkg builds need bison/flex (Linux) and autotools (macOS) — see Prerequisites.
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND `meson.build`'s Windows-specific `cxx.find_library()` hand-wired `protobuf_dep`/`grpcpp_dep` construction are the **only configuration we've found** that simultaneously avoids LNK2038 (meson cmake-dep bug) and LNK2005 (abseil DLL symbol conflicts). Do not simplify either half without reading `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375" — full timeline, every failed approach, and the #376 strategic escape (migrate off gRPC to QUIC) are there. Linux/macOS are unaffected.
 
 ## CI architecture

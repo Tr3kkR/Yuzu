@@ -85,6 +85,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **libpq (PostgreSQL client library) added as a build dependency on all
+  platforms (#1317, ADR-0006/ADR-0008).** This is the F0 link-proof canary for
+  the server's storage-substrate migration to PostgreSQL — **no product
+  behavior changes and no server-side Postgres usage in this release**; the
+  migration lands incrementally over future releases (advance notice:
+  ADR-0006). Building from source on Linux now requires `bison` and `flex`;
+  on macOS, `autoconf`/`automake`/`libtool` (Windows: none — vcpkg
+  auto-acquires winflexbison). The Windows release zip gains `libpq.dll` via
+  the existing vcpkg-DLL bundling.
+
 - **Subordinate-CA — root Yuzu's internal CA in your enterprise PKI (PKI PR6,
   M2).** Export the install CA's signing request (`GET /api/v1/ca/root-csr`,
   `Security:Read`), have your enterprise root sign it as a subordinate CA, then
