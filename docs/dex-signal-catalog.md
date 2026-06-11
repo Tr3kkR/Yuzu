@@ -192,18 +192,151 @@ and drops the overflow with ONE warn per (type, bucket). Storm-prone providers
 cannot flood the wire or the Guardian event store. Caps are deliberately
 generous for genuine incident rates.
 
-## macOS mapping (future collectors)
+## macOS collector (shipped — `dex_macos_collector.cpp`)
 
-The shape is OS-neutral; the planned macOS sources are:
+The shape is OS-neutral, so the macOS collector reuses the SAME obs_type strings,
+the SAME uniform `detail_json` keys, and the SAME wire mapping
+(`signal_observation_to_event`) — **zero server or dashboard change**; the
+signals render with their existing friendly labels and group under the existing
+display groups, with `platform="macos"` driving the by-OS panel. The collector is
+a drop-in `ISignalObserver` behind `make_dex_observer()` (`__APPLE__` branch),
+using FOUR privilege-light mechanisms that need **neither an Endpoint Security
+entitlement nor Full Disk Access** (the agent user's own
+`~/Library/Logs/DiagnosticReports`, the world-readable
+`/Library/Logs/DiagnosticReports`, the unified log via `log show`, and
+`diskutil`/`system_profiler` are all readable unprivileged):
 
-| obs_type | macOS source |
-|---|---|
-| `process.crashed` | DiagnosticReports `.ips` crash reports |
-| `process.hung` | spindump / `.hang` reports |
-| `os.power_loss` | shutdown-cause codes (`previous shutdown cause`) |
-| `os.boot` | `kern.boottime` + login-window timing |
-| `disk.error` / `fs.corruption` | `fsck` / IOKit error logs |
-| `update.failed` | `softwareupdate` history |
+1. a **kqueue `EVFILT_VNODE` folder-watch** over both DiagnosticReports
+   directories — idle until a report is written, then a rescan parses the new
+   file. ReportCrash writes atomically via a hidden `.<name>.ips` temp + rename,
+   so the watcher **skips all dotfiles** and only ever reads the final, complete
+   report (this avoids a half-written read AND a temp-path/final-path
+   double-count);
+2. a periodic **`sysctl(KERN_BOOTTIME)`** read → the `os.uptime_report` scalar;
+3. a periodic **unified-log poll** (`dex_macos_oslog.{hpp,cpp}`): on the same 60 s
+   kqueue timer it runs `log show --start <checkpoint> --predicate <p> --style
+   ndjson`, parses each JSON log event, and advances a checkpoint (with a
+   boundary-second dedup set for the inclusive `--start`). Deliberately a bounded
+   poll, NOT a persistent `log stream` child and NOT the Objective-C `OSLogStore`
+   framework — keeps the agent pure C++ and NFR-friendly (~0.7 s/poll; logd does
+   the filtering server-side so the agent never sees the firehose). This is the
+   macOS analogue of the Windows single `EvtSubscribe` mechanism: it unlocks the
+   "an event happened" signals that land in the log rather than in report files;
+4. a slow **IOKit/system-tool poll** (`dex_macos_iokit.{hpp,cpp}`): hourly it runs
+   `diskutil info` + `system_profiler SPPowerDataType` and emits **only on a
+   transition into a bad state** (poll-and-diff) — these are STATE not events. The
+   one heading (Hardware & storage) the unified log doesn't cover.
+
+The fiddly extraction is in the pure, framework-free `dex_macos_signals.cpp` /
+`dex_macos_oslog.cpp` / `dex_macos_iokit.cpp` (an `.ips` is two concatenated JSON
+documents; an ndjson log line is one JSON object; `diskutil`/`system_profiler`
+output is `Key: value` text), unit-tested on every host (incl. MSVC) against
+**real captured records** from a macOS 26.5 / Apple Silicon box
+(`test_dex_macos.cpp`).
+
+The signals below reuse existing Windows obs_types wherever one fits (friendly
+labels + correct heading for free), giving **coverage of ~10 of the 11 DEX
+headings unprivileged**. "live" = seen end-to-end on `/dex`; "real-record" =
+parser pinned to a captured record; "best-effort" = parser written to the known
+shape, awaiting a real failure specimen (the macOS analogue of the Windows
+manifest fixtures — a healthy box has no failures to fire them).
+
+The **11th heading, Security, is reachable unprivileged but not yet shipped**:
+XProtect detections and Gatekeeper blocks (→ `security.threat_detected`) live in
+the unified log (`XProtect*` / `syspolicyd`, readable without an entitlement —
+ESF is NOT required), but a healthy box only logs *scan activity* and unrelated
+"blocked" noise, so writing a low-false-positive parser needs a real detection /
+block specimen first. It is the next best-effort branch; shipping a guessed
+parser now would mistake routine scans for detections.
+
+| Heading | obs_type | macOS source | Status |
+|---|---|---|---|
+| Service/App Health | `process.crashed` | `.ips` crash (309/109/385) | **live** |
+| | `service.crashed` | unified log: launchd abnormal exit | **live** |
+| | `process.hung` | `.ips` spin/hang (288/388) | fixture |
+| | `process.resource_limit` | `.diag` cpu/wakeups/disk-write budget (macOS-only, "Other") | **live** |
+| System Stability | `os.bugcheck` | `.ips` kernel panic (210/110) | fixture |
+| | `memory.exhausted` | `.ips` JetsamEvent (298) | real-record |
+| Boot/startup/shutdown | `os.uptime_report` | `sysctl kern.boottime` | **live** |
+| Network | `network.wifi_drop` | unified log: symptomsd LQM / data-stall degradation | real-record |
+| Updates & installs | `update.failed` | unified log: softwareupdated error/fault | best-effort |
+| Printing | `print.failed` | unified log: cupsd error/fault | best-effort |
+| Policy & management | `mgmt.mdm_error` | unified log: mdmclient error/fault | best-effort |
+| Identity & logon | `logon.no_dc` | unified log: opendirectoryd error/fault | best-effort |
+| File system | `fs.corruption` | unified log: `com.apple.apfs` error/fault | best-effort |
+| Hardware & storage | `disk.smart_failure` | IOKit poll: `diskutil` SMART != Verified | real-record |
+| | `hw.error` (battery) | IOKit poll: `system_profiler` battery condition / capacity <80% | real-record |
+
+**Two fidelity notes (honest, vs Windows):** (1) `service.crashed` — launchd logs
+EVERY service exit, not only unexpected ones (Windows SCM 7031/7034 fire only on
+unexpected termination), so this is broader; it filters to abnormal exits and the
+rate cap clips a flapping service. (2) The error/fault-level system-process
+signals (update/print/mdm/logon/fs) are **occurrence-based and tightly
+predicated**: macOS over-uses "Error" level, so they fire only on real
+daemon-level failures (a routine client error — bad printer, missing user — logs
+at Default level and is correctly ignored), and the **raw eventMessage is never
+shipped** (it can carry usernames/paths) — only "this subsystem failed on this
+device". Lower per-signal richness, but low false-positive and privacy-safe.
+
+**Privacy at the edge (same contract as Windows):** a crash report's `procPath`,
+`parentProc`, thread register state, and image paths are NEVER surfaced — only
+basenames; OSLog raw messages from sensitive daemons are never shipped. Pinned by
+`[dex_macos][privacy]` tests.
+
+**Battery health is the one macOS-native signal with no Windows like-for-like**
+(the Windows catalogue has no battery signal); it rides the generic `hw.error`
+obs_type with subject="battery" so it renders under Hardware without a server
+change. A dedicated `hw.battery_degraded` obs_type + label would be a future
+polish (needs a `dex_signal_groups()` + drift-net edit).
+
+## macOS: what more is possible with ESF / Network Extension / other entitlements
+
+The unprivileged collector above covers ~10 of 11 headings. Acquiring privileges
+buys **fidelity and a few otherwise-hard signals — NOT breadth** (breadth is
+already reachable). Evidence gathered on the dev box (2026-06-11):
+
+**Endpoint Security** (reachable to *validate* via root + the Apple-shipped
+`/usr/bin/eslogger`, which carries `com.apple.developer.endpoint-security.client`
+— so ES needs root + FDA, NOT a custom Apple-granted entitlement to prototype;
+productionising needs an ES System Extension + that distribution entitlement,
+standard for this vendor class). ES exposes **104 event types**. DEX upgrades:
+- **Identity & logon — the biggest win:** `login_login/logout`,
+  `lw_session_login/logout`, `openssh_login`, `su`, `sudo`, `authentication`,
+  `authorization_judgement` — high-fidelity *structured* login/auth events, far
+  better than the best-effort opendirectoryd-error signal above.
+- **Security:** `xp_malware_detected/remediated` (XProtect), `gatekeeper_user_override`
+  — authoritative vs scraping `syspolicy` logs.
+- **Policy & management:** `profile_add/remove`.
+- **Service/App Health + File system:** `exec`/`exit` (gap-free) + file events —
+  mostly *completeness*; the report/log channels already catch user-visible
+  failures, so the extra is largely DEX-noise (and a firehose to filter).
+- **Cost beyond engineering:** ES gives file-level + real-time login/exec
+  visibility — a surveillance-*capability* escalation an EU works council treats
+  very differently from reading crash reports (co-determination triggers on
+  capability, not intent). Gate behind explicit customer/MDM opt-in.
+
+**Network Extension** (content filter / transparent proxy — entitlement + System
+Extension + MDM): the only thing buying *new* network capability — per-flow /
+per-app connectivity, **DNS-resolution timing**, latency. Collides with the
+no-continuous-streaming NFR (aggregate on-device). Note: much network *experience*
+is already unprivileged — `symptomsd` LQM/data-stalls (shipped above) + the
+`networkQuality` CLI — so this is only for the deepest per-flow KPIs.
+
+**MetricKit (`MXMetricManager`) — the one we CANNOT have:** the ideal APM feed
+(per-app launch time, hang rate, responsiveness, CPU/disk exceptions) is
+**per-app opt-in** — no API lets a fleet agent pull it for third-party apps. No
+privilege unlocks it. Approximations: agent-side aggregated sampling
+(`top`/`proc_pid_rusage`, unprivileged but NFR-heavy) or an embeddable Yuzu SDK.
+
+**Root / privileged IOKit:** `powermetrics` (detailed CPU/GPU/thermal/power),
+`spindump` (reliable hangs) — deepen System Stability / Hardware. **MDM authority:**
+the authoritative Policy & management source vs scraping `mdmclient`. **Full Disk
+Access:** other users' crash reports + full `OSLogStore` history — marginal.
+
+**Bottom line:** privileges deepen Identity/Security/Management fidelity and add
+per-flow network + complete process/file telemetry; they do **not** add headings
+and are **not required** for the ~10/11 unprivileged coverage. The one hard ceiling
+is clean per-app APM (MetricKit), which no entitlement crosses.
 
 Linux: journald-based collectors (coredumpctl, systemd unit failures, OOM
 killer) follow the same catalogue pattern.
