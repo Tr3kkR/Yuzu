@@ -1241,9 +1241,12 @@ void RestApiV1::register_routes(
              [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ApiToken", "Read"))
                      return;
-                 if (!token_store) {
+                 // #347 CH-3: a failed DB open must read as 503, never as an
+                 // empty list or 404 — is_open() distinguishes "no rows" from
+                 // "no database".
+                 if (!token_store || !token_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(error_json("storage unavailable", 503), "application/json");
                      return;
                  }
 
@@ -1275,9 +1278,9 @@ void RestApiV1::register_routes(
                                     const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(error_json("storage unavailable", 503), "application/json");
             return;
         }
 
@@ -1428,9 +1431,9 @@ void RestApiV1::register_routes(
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(error_json("storage unavailable", 503), "application/json");
             return;
         }
 
