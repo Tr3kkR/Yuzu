@@ -50,3 +50,21 @@ guard that exits 1 with an actionable message. CI workflow steps use
 `shell: pwsh` rather than `shell: powershell`. The
 `yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
 issue #517 for the migration history.
+
+## Running server tests locally (libpq.dll on PATH)
+
+Since #1320 PR 1 the server library links libpq, which is a **DLL** on
+Windows (the static triplet override covers the grpc stack only — see the
+`libpq_dep` block in the root `meson.build` and the ADR-0008 Correction).
+CI's test step prepends `vcpkg_installed/x64-windows/debug/bin` (debug) or
+`/bin` (release) to PATH before `meson test`; a developer shell must do
+the same or `yuzu_server_tests.exe` / `yuzu-server.exe` aborts at load
+with a libpq.dll-not-found error:
+
+```bash
+export PATH="$PWD/vcpkg_installed/x64-windows/debug/bin:$PATH"   # MSYS2 bash
+meson test -C build-windows --suite server --print-errorlogs
+```
+
+The release zip is unaffected — its vcpkg-DLL sweep bundles `libpq.dll`
+next to the binaries, same as `sqlite3.dll` and the OpenSSL DLLs.

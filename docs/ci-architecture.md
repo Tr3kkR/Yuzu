@@ -114,6 +114,13 @@ get the authenticated gate instead). Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.
 
+Local-dev note: to run the non-pg server tests on a machine with no
+Docker and no Postgres, invoke the test binary directly
+(`tests-build-server-*/yuzu_server_tests`) with `YUZU_TEST_POSTGRES_DSN`
+unset — the `[pg]` cases skip cleanly. The `/test` skill and CI
+deliberately hard-fail at the ensure-postgres step instead (that is the
+gate working, not a skill bug).
+
 Two operational notes for shared instances: the `yuzu-ci-postgres`
 container is shared across concurrent jobs on a runner — the migration
 runner's advisory locks are **cluster-wide**, so same-named stores in
