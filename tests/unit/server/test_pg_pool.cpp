@@ -93,9 +93,22 @@ TEST_CASE("PgPool exhaustion", "[pg][pool]") {
     CHECK_FALSE(static_cast<bool>(denied));
     CHECK(pool.last_error() == "pool exhausted (all connections leased)");
 
+    // Zero timeout: the deadline-is-already-past path returns immediately.
+    auto denied_now = pool.try_acquire_for(0ms);
+    CHECK_FALSE(static_cast<bool>(denied_now));
+
     held.reset();
     auto granted = pool.try_acquire_for(1000ms);
     CHECK(static_cast<bool>(granted));
+}
+
+TEST_CASE("PgPool size 0 clamps to 1", "[pg][pool]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 0}};
+    CHECK(pool.size() == 1);
+    auto lease = pool.acquire();
+    REQUIRE(static_cast<bool>(lease));
+    CHECK(select_1_works(lease.get()));
 }
 
 TEST_CASE("PgPool failed construction", "[pg][pool]") {
@@ -144,12 +157,18 @@ TEST_CASE("PgPool discards a connection lost mid-use", "[pg][pool]") {
         REQUIRE(res.status() == PGRES_TUPLES_OK);
     }
 
-    // Mid-"transaction" use of the severed connection fails...
-    {
-        PgResult begin{PQexec(victim.get(), "BEGIN")};
-        CHECK(begin.status() != PGRES_COMMAND_OK);
-        CHECK(PQstatus(victim.get()) != CONNECTION_OK);
+    // pg_terminate_backend returns when the signal is SENT, not when the
+    // backend has exited — poll until the client side observes the loss
+    // (cross-platform hardening; the window is tiny but nonzero on a
+    // native Windows service).
+    bool severed = false;
+    for (int i = 0; i < 100 && !severed; ++i) {
+        PgResult ping{PQexec(victim.get(), "SELECT 1")};
+        severed = ping.status() != PGRES_TUPLES_OK && PQstatus(victim.get()) != CONNECTION_OK;
+        if (!severed)
+            std::this_thread::sleep_for(50ms);
     }
+    CHECK(severed);
     const std::size_t open_before = pool.open();
     victim.reset(); // ...and release must close it, not pool it
     CHECK(pool.open() == open_before - 1);

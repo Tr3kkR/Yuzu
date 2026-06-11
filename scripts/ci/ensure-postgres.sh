@@ -22,7 +22,7 @@
 #      PostgreSQL 16 installed as a service with role yuzu / password yuzu
 #      / database yuzu_test; bootstrap once per runner, see
 #      docs/ci-architecture.md).
-#   5. Nothing found -> ::warning + exit 0.
+#   5. Nothing found -> ::error + exit 1.
 #
 # FATAL since #1320 PR 1: the pg substrate test suites ([pg] tags in the
 # server suite) consume YUZU_TEST_POSTGRES_DSN and skip when it is unset —
@@ -77,7 +77,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::warning::ensure-postgres: ${CONTAINER} container did not become ready in 60s" >&2
+  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 60s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -109,7 +109,7 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::warning::ensure-postgres: brew postgresql@16 cluster did not become ready (log: ${PGLOG})" >&2
+  echo "::error::ensure-postgres: brew postgresql@16 cluster did not become ready (log: ${PGLOG}) — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -128,7 +128,7 @@ if tcp_probe 127.0.0.1 5432; then
       emit_dsn "$NATIVE_DSN" "native cluster on 5432 (psql SELECT 1 verified)"
       exit 0
     fi
-    echo "::warning::ensure-postgres: something listens on 127.0.0.1:5432 but the conventional DSN failed 'psql SELECT 1' — not exporting YUZU_TEST_POSTGRES_DSN. Fix the runner bootstrap (role yuzu / password yuzu / db yuzu_test) or pre-set YUZU_TEST_POSTGRES_DSN." >&2
+    echo "::error::ensure-postgres: something listens on 127.0.0.1:5432 but the conventional DSN failed 'psql SELECT 1' — failing the job. Fix the runner bootstrap (role yuzu / password yuzu / db yuzu_test) or pre-set YUZU_TEST_POSTGRES_DSN." >&2
     exit "$SOFT_EXIT"
   fi
   echo "::warning::ensure-postgres: psql not on PATH — exporting the conventional DSN on a TCP probe only (credential UNVERIFIED). Install psql on the runner for an authenticated readiness check." >&2
@@ -137,5 +137,5 @@ if tcp_probe 127.0.0.1 5432; then
 fi
 
 # ── 5. Nothing available ─────────────────────────────────────────────────
-echo "::warning::ensure-postgres: no Postgres available (no docker, no brew, nothing on 127.0.0.1:5432) — YUZU_TEST_POSTGRES_DSN not set. Non-fatal until #1320; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+echo "::error::ensure-postgres: no Postgres available (no docker, no brew, nothing on 127.0.0.1:5432) — failing the job: the [pg] server tests require a database (SOFT_EXIT=1 since #1320 PR 1). See docs/ci-architecture.md 'Postgres for server tests'." >&2
 exit "$SOFT_EXIT"

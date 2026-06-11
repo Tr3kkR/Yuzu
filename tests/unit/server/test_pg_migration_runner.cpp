@@ -158,8 +158,20 @@ TEST_CASE("PgMigrationRunner failure handling", "[pg][migration]") {
         CHECK_FALSE(PgMigrationRunner::valid_store_name("semi;colon"));
     }
 
-    SECTION("null connection is an error for current_version, no-op for empty run") {
+    SECTION("reserved namespaces are rejected") {
+        CHECK_FALSE(PgMigrationRunner::valid_store_name("public"));
+        CHECK_FALSE(PgMigrationRunner::valid_store_name("information_schema"));
+        CHECK_FALSE(PgMigrationRunner::valid_store_name("pg_catalog"));
+        CHECK_FALSE(PgMigrationRunner::valid_store_name("pg_toast"));
+        CHECK_FALSE(PgMigrationRunner::valid_store_name("pg_anything"));
+        const std::vector<PgMigration> noop = {{1, "SELECT 1"}};
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "public", noop));
+    }
+
+    SECTION("null connection is an error, even with an empty migration list") {
         CHECK(PgMigrationRunner::current_version(nullptr, "store_a") == -1);
-        CHECK(PgMigrationRunner::run(nullptr, "store_a", {}));
+        // PR 3 feeds run() from Lease::get(), which is nullptr on an empty
+        // lease — success here would boot a store against nothing.
+        CHECK_FALSE(PgMigrationRunner::run(nullptr, "store_a", {}));
     }
 }

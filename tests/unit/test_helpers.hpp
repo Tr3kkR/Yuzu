@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <random>
@@ -57,7 +58,7 @@ namespace yuzu::test {
 /// created. Callers are responsible for creating parent directories and
 /// cleaning up (prefer `TempDbFile` RAII below for SQLite stores).
 inline std::filesystem::path unique_temp_path(std::string_view prefix = "yuzu-test-") {
-    static const std::uint64_t salt = []{
+    static const std::uint64_t salt = [] {
         std::mt19937_64 rng{std::random_device{}()};
         return rng();
     }();
@@ -99,10 +100,8 @@ struct TempDbFile {
     ~TempDbFile() noexcept {
         std::error_code ec;
         std::filesystem::remove(path, ec);
-        std::filesystem::remove(
-            std::filesystem::path(path.string() + "-wal"), ec);
-        std::filesystem::remove(
-            std::filesystem::path(path.string() + "-shm"), ec);
+        std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
+        std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
     }
 
     TempDbFile(const TempDbFile&) = delete;
@@ -179,13 +178,21 @@ public:
         if (db_name_.empty() || admin_dsn_.empty())
             return;
         yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
-        if (PQstatus(conn.get()) == CONNECTION_OK) {
-            // FORCE (PG 13+): terminate any connection a test leaked so the
-            // drop cannot fail and pile up databases on the shared instance.
-            const std::string drop =
-                "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
-            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            // Can't throw from a dtor — but a silent failure piles leaked
+            // yuzu_test_* databases onto a shared instance; say so.
+            std::fprintf(stderr, "PostgresTestDb: teardown admin connect failed — leaked %s\n",
+                         db_name_.c_str());
+            return;
         }
+        // FORCE (PG 13+; every supported leg pins 16): terminate any
+        // connection a test leaked so the drop cannot fail and pile up
+        // databases on the shared instance.
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+        if (!res.ok())
+            std::fprintf(stderr, "PostgresTestDb: DROP DATABASE failed — leaked %s: %s\n",
+                         db_name_.c_str(), PQerrorMessage(conn.get()));
     }
 
     PostgresTestDb(const PostgresTestDb&) = delete;
@@ -215,8 +222,7 @@ private:
     /// Re-emit `admin_dsn` as a keyword/value conninfo with dbname replaced.
     /// Round-trips through PQconninfoParse so both URI and keyword forms
     /// work. Returns empty on parse failure.
-    static std::string rewrite_dbname(const std::string& admin_dsn,
-                                      const std::string& new_db) {
+    static std::string rewrite_dbname(const std::string& admin_dsn, const std::string& new_db) {
         char* errmsg = nullptr;
         PQconninfoOption* opts = PQconninfoParse(admin_dsn.c_str(), &errmsg);
         if (opts == nullptr) {
@@ -252,12 +258,14 @@ private:
 /// Standard prologue for a Postgres-backed TEST_CASE: skip when no DSN is
 /// configured, fail when it is configured but broken, else bind `var` to a
 /// fresh ephemeral database. Requires Catch2 macros at the expansion site.
-#define YUZU_REQUIRE_PG_DB(var)                                                   \
-    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                              \
-        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");           \
-    }                                                                             \
-    yuzu::test::PostgresTestDb var;                                               \
-    INFO("PostgresTestDb: " << var.error());                                      \
+/// Expands to an unbraced `if` plus declarations — use only as a direct
+/// statement at block scope (never as the body of an if/loop).
+#define YUZU_REQUIRE_PG_DB(var)                                                                    \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    yuzu::test::PostgresTestDb var;                                                                \
+    INFO("PostgresTestDb: " << var.error());                                                       \
     REQUIRE(var.available())
 
 #endif // YUZU_TEST_ENABLE_PG

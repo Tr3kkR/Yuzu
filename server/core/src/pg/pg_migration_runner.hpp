@@ -21,7 +21,19 @@
 ///    applied version is re-read under that lock — the loser of the race
 ///    sees the winner's version and skips.
 ///  - Store names are SQL identifiers here, so they are restricted to
-///    `[a-z_][a-z0-9_]*`, max 63 bytes. Anything else is rejected.
+///    `[a-z_][a-z0-9_]*`, max 63 bytes, excluding the reserved namespaces
+///    `public`, `information_schema`, and the `pg_` prefix. Anything else
+///    is rejected.
+///
+/// Future-evolution note (mirrors the SQLite runner's ALTER-TABLE note):
+/// every migration runs inside a transaction, and the search_path
+/// mechanism REQUIRES that (`SET LOCAL` reverts at txn end). Statements
+/// that cannot run in a transaction block — `CREATE INDEX CONCURRENTLY`,
+/// `VACUUM`, `ALTER TYPE ... ADD VALUE` (pre-12 semantics) — cannot be
+/// expressed as a `PgMigration`. When a store needs one (likely for the
+/// response/audit-scale indexes), add an explicit non-transactional
+/// migration kind that schema-qualifies its table names instead of relying
+/// on search_path; do not weaken the transactional default.
 
 #include <string>
 #include <string_view>

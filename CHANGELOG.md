@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI server-test legs now require a reachable PostgreSQL 16**
+  (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
+  provision or verify one) — the new `[pg]`-tagged server tests for the
+  Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
+  development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
+  tests skip cleanly; when it is set but unreachable they fail. See
+  `docs/ci-architecture.md` "Postgres for server tests" for the local
+  one-liner.
+
 ### Breaking Changes
 
 - **The server now generates per-install default TLS certificates on first

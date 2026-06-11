@@ -48,7 +48,10 @@ public:
         /// `PQconnectdb`.
         std::string conninfo;
         /// Maximum simultaneously open connections (= max Postgres backend
-        /// processes this pool can consume).
+        /// processes this pool can consume). Connections are opened lazily
+        /// on demand and never reaped, so the steady-state backend count
+        /// equals the historical peak concurrency, not `size`. 0 is
+        /// clamped to 1.
         std::size_t size = 16;
         /// Applied to every connection attempt unless the conninfo already
         /// carries its own `connect_timeout`. libpq has NO client-side
@@ -62,9 +65,13 @@ public:
     /// returns an empty lease.
     explicit PgPool(Options opts);
 
-    /// Blocks until every outstanding lease has been returned, then closes
-    /// all connections. Threads blocked in `acquire()` are woken and receive
-    /// empty leases.
+    /// Blocks until every outstanding lease has been returned and every
+    /// thread blocked in `acquire()` has been woken (they receive empty
+    /// leases), then closes all connections. Two caller obligations:
+    ///  - a thread that holds a lease MUST NOT destroy the pool — the
+    ///    destructor waits for that very lease and self-deadlocks;
+    ///  - entering `acquire()` for the first time after the destructor has
+    ///    returned is a use-after-destroy like any other.
     ~PgPool();
 
     PgPool(const PgPool&) = delete;
@@ -123,13 +130,29 @@ public:
     [[nodiscard]] Lease acquire();
 
     /// As `acquire()`, but gives up after `timeout` when the pool is
-    /// exhausted and nothing is released in time.
+    /// exhausted and nothing is released in time. Bound caveat: a fresh
+    /// connection attempt is only STARTED before the deadline, but once
+    /// started it runs to completion — worst case is roughly
+    /// `timeout + connect_timeout_s`.
     [[nodiscard]] Lease try_acquire_for(std::chrono::milliseconds timeout);
 
     /// Pin one connection for a transaction: BEGIN, run `fn`, COMMIT when it
     /// returns true, ROLLBACK when it returns false or throws (the exception
     /// propagates). Returns false on acquire/BEGIN/COMMIT failure or when
     /// `fn` returned false.
+    ///
+    /// Store-contract notes (PR-3 consumers):
+    ///  - Reserve with_txn for multi-statement atomic units. A
+    ///    single-statement operation (e.g. the heartbeat
+    ///    `INSERT ... ON CONFLICT ... RETURNING`) should run on a plain
+    ///    `acquire()` lease under autocommit — with_txn would triple its
+    ///    round-trips (BEGIN/COMMIT).
+    ///  - Nesting with_txn (calling it from inside `fn`) acquires a SECOND
+    ///    connection: it deadlocks a size-1 pool and is rarely what you
+    ///    want — restructure instead.
+    ///  - A connection severed while idle (NAT/firewall reap) surfaces as a
+    ///    failed first statement; the pool discards it on release. Stores
+    ///    should treat one connection-level retry as routine.
     bool with_txn(const std::function<bool(PGconn*)>& fn);
 
     /// False when the conninfo failed to parse at construction.
@@ -168,6 +191,7 @@ private:
     std::size_t open_{0};       ///< established connections (leased + idle)
     std::size_t leased_{0};     ///< checked out right now
     std::size_t connecting_{0}; ///< reserved capacity, connect in flight
+    std::size_t waiters_{0};    ///< threads blocked inside acquire's wait
     bool shutdown_{false};
     std::string last_error_;
 };

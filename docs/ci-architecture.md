@@ -96,15 +96,32 @@ Resolution order inside the script:
    to the bare TCP probe with a loud unverified-credential warning.
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
-5. Nothing found → `::warning`, exit 1.
+5. Nothing found → `::error`, exit 1.
 
-**Fatal since #1320 PR 1 (`SOFT_EXIT=1`):** the pg substrate suites
-(`[pg]`-tagged cases in the server suite) consume the DSN and skip
-cleanly when it is unset — so a CI runner without a database would
-silently skip that coverage. The script therefore fails the job when no
-Postgres can be provisioned (paths 2–5 above). Locally the tests still
-skip when `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but
-unreachable they fail rather than skip.
+**Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
+the pg substrate suites (`[pg]`-tagged cases in the server suite)
+consume the DSN and skip cleanly when it is unset — so a runner without
+a database would silently skip that coverage. `exit "$SOFT_EXIT"`
+(= exit 1) is reached on every failure path: Docker container not ready
+in 60 s (path 2), brew cluster not ready (path 3), native-cluster
+credential failure when `psql` is available (path 4), and nothing found
+(path 5). The one non-fatal exception is path 4 without `psql`: a TCP
+probe alone produces a `::warning` and still exports the conventional
+DSN (credential **unverified** — wrong credentials then surface as
+downstream `[pg]` test failures; install `psql` on the runner's PATH,
+e.g. `C:\Program Files\PostgreSQL\16\bin` on `yuzu-local-windows`, to
+get the authenticated gate instead). Locally the tests still skip when
+`YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
+fail rather than skip.
+
+Two operational notes for shared instances: the `yuzu-ci-postgres`
+container is shared across concurrent jobs on a runner — the migration
+runner's advisory locks are **cluster-wide**, so same-named stores in
+different ephemeral test databases briefly serialize on each other
+(transaction-scoped locks: never deadlock, never cross-database
+corruption). And every test database is created/dropped per case by the
+`PostgresTestDb` fixture; a `yuzu_test_*` pile-up on a shared instance
+means teardown is failing and is logged to stderr by the fixture.
 
 ## Universal vcpkg cache-key contract
 

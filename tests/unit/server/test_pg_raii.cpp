@@ -181,8 +181,9 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii]") {
             PgTxn a{conn.get()};
             insert_row(conn.get(), 4);
             PgTxn b{std::move(a)};
-            // `a` destructs first here only if declared later; force order:
-            // destroy nothing yet — both fall out of scope, a is inert.
+            // Both guards leave scope here (b first, then a). Only b is
+            // armed — a was disarmed by the move — so exactly one ROLLBACK
+            // is issued.
         }
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 0); // b rolled back exactly once

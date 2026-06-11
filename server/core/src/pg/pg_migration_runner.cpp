@@ -6,6 +6,7 @@
 
 #include <libpq-fe.h>
 
+#include <cstdlib>
 #include <cstring>
 
 namespace yuzu::server::pg {
@@ -16,6 +17,13 @@ namespace {
 // takes; the second key is hashtext(store_name). Transaction-scoped
 // (pg_advisory_xact_lock), so a crashed runner can never leave the lock
 // behind. 0x79757A75 is "yuzu" read as big-endian ASCII.
+//
+// Advisory locks are CLUSTER-wide, not per-database: two runners migrating
+// the same store name in *different* databases on one Postgres instance
+// (e.g. two test binaries against the shared yuzu-ci-postgres container)
+// serialize on each other. That is benign — transaction-scoped locks
+// release on commit/abort/disconnect, so the worst case is brief
+// serialization, never deadlock or cross-database corruption.
 constexpr const char* kAdvisoryLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext($1::text))";
 
@@ -69,6 +77,15 @@ bool PgMigrationRunner::valid_store_name(std::string_view name) {
         if (!lower_or_underscore(c) && !(c >= '0' && c <= '9'))
             return false;
     }
+    // Reserved namespaces (Gate 3 arch/qe): "public" would land the store's
+    // tables next to public.schema_meta and shadow it via search_path;
+    // "information_schema" pollutes a system schema; Postgres itself
+    // rejects "pg_*" schemas (42939) but we fail it at validation so the
+    // error names the actual rule. Tightening this AFTER a store ships
+    // would be a breaking substrate change — hence locked down now, while
+    // the substrate has zero consumers.
+    if (name == "public" || name == "information_schema" || name.starts_with("pg_"))
+        return false;
     return true;
 }
 
@@ -113,7 +130,13 @@ int PgMigrationRunner::current_version(PGconn* conn, std::string_view store_name
 
 bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
                             const std::vector<PgMigration>& migrations) {
-    if (!conn || migrations.empty())
+    // Null connection is an error even with nothing to do — PR 3 feeds this
+    // from Lease::get(), which is nullptr on an empty lease; reporting
+    // success there would boot a store against a database it never reached
+    // (Gate 2 sec finding: fail-open).
+    if (!conn)
+        return false;
+    if (migrations.empty())
         return true;
     if (!valid_store_name(store_name)) {
         spdlog::error("PgMigrationRunner: invalid store name '{}' — must match "

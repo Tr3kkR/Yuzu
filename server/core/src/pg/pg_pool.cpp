@@ -4,6 +4,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server::pg {
@@ -42,7 +44,12 @@ PgPool::PgPool(Options opts)
             PQfreemem(errmsg);
         return;
     }
-    conninfo_has_timeout_ = conninfo_sets(parsed, "connect_timeout");
+    // PQconninfoParse does NOT consult the environment, so honour an
+    // operator's PGCONNECT_TIMEOUT explicitly — it should win over the
+    // pool's injected default, same as a conninfo-level setting.
+    const char* env_timeout = std::getenv("PGCONNECT_TIMEOUT");
+    conninfo_has_timeout_ = conninfo_sets(parsed, "connect_timeout") ||
+                            (env_timeout != nullptr && env_timeout[0] != '\0');
     PQconninfoFree(parsed);
     valid_ = true;
 }
@@ -51,10 +58,15 @@ PgPool::~PgPool() {
     std::unique_lock lk{mu_};
     shutdown_ = true;
     cv_.notify_all();
-    // Wait for every lease to come home and every in-flight connect to
-    // resolve; release() closes connections instead of pooling them once
-    // shutdown_ is set.
-    cv_.wait(lk, [this] { return leased_ == 0 && connecting_ == 0; });
+    // Wait for every lease to come home, every in-flight connect to
+    // resolve, AND every blocked acquirer to leave its wait — destroying
+    // mu_/cv_ while a woken waiter is still reacquiring the mutex inside
+    // cv_.wait would be UB (Gate 3 cpp-B1). release() closes connections
+    // instead of pooling them once shutdown_ is set; waiters observe
+    // shutdown_, decrement waiters_, notify, and return empty leases.
+    // Calling acquire() for the FIRST time after the destructor returns
+    // is a caller lifetime bug, same as any destroyed object.
+    cv_.wait(lk, [this] { return leased_ == 0 && connecting_ == 0 && waiters_ == 0; });
     while (!idle_.empty()) {
         PQfinish(idle_.front());
         idle_.pop_front();
@@ -79,6 +91,9 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     for (;;) {
         if (shutdown_) {
             last_error_ = "pool is shutting down";
+            // The destructor may be waiting on waiters_ == 0; make sure it
+            // re-evaluates after we leave (we may have just decremented).
+            cv_.notify_all();
             return {};
         }
         if (!idle_.empty()) {
@@ -87,10 +102,28 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             ++leased_;
             return Lease{this, c};
         }
+        // Deadline gate: never START a connect (or another wait) past the
+        // caller's deadline. An idle connection at/past the deadline is
+        // still taken above — that costs nothing.
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+            last_error_ = "pool exhausted (all connections leased)";
+            return {};
+        }
         if (open_ + connecting_ < size_) {
             ++connecting_;
             lk.unlock();
-            PGconn* c = connect_one(); // slow; deliberately outside the lock
+            PGconn* c = nullptr;
+            try {
+                c = connect_one(); // slow; deliberately outside the lock
+            } catch (...) {
+                // bad_alloc from error-string building: restore the
+                // reserved capacity or the destructor waits forever on
+                // connecting_ == 0 (Gate 3 cpp-S1).
+                lk.lock();
+                --connecting_;
+                cv_.notify_all();
+                throw;
+            }
             lk.lock();
             --connecting_;
             if (!c) {
@@ -109,15 +142,14 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             ++leased_;
             return Lease{this, c};
         }
-        if (deadline) {
-            if (cv_.wait_until(lk, *deadline) == std::cv_status::timeout && idle_.empty() &&
-                open_ + connecting_ >= size_ && !shutdown_) {
-                last_error_ = "pool exhausted (all connections leased)";
-                return {};
-            }
-        } else {
+        // waiters_ keeps the destructor from tearing the pool down while we
+        // are still inside the wait (it spins on waiters_ == 0).
+        ++waiters_;
+        if (deadline)
+            cv_.wait_until(lk, *deadline);
+        else
             cv_.wait(lk);
-        }
+        --waiters_;
     }
 }
 
@@ -163,7 +195,15 @@ void PgPool::release(PGconn* conn) noexcept {
         PQfinish(conn);
         --open_;
     } else {
-        idle_.push_back(conn);
+        try {
+            idle_.push_back(conn);
+        } catch (...) {
+            // release() is noexcept; a bad_alloc from the deque must not
+            // terminate — drop the connection instead (capacity frees up
+            // for a fresh connect).
+            PQfinish(conn);
+            --open_;
+        }
     }
     cv_.notify_all();
 }

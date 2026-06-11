@@ -119,6 +119,13 @@ private:
 ///
 /// Move-only (unlike `SqliteTxn`, which predates the need): moving transfers
 /// the rollback obligation; the moved-from guard is disarmed.
+///
+/// The guard borrows the connection — it must not outlive the `PgConn` /
+/// pool lease that owns it. Operational note: the destructor's ROLLBACK is
+/// a server round-trip with no client-side timeout; on a half-open
+/// connection it blocks until TCP gives up. If that ever bites, set a
+/// statement_timeout on the pool's connections (PR-3 consideration), not
+/// here.
 class PgTxn {
 public:
     explicit PgTxn(PGconn* conn) noexcept : conn_(conn) {}
