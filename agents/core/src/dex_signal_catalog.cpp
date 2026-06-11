@@ -1472,10 +1472,32 @@ std::string dex_channel_query(const std::string& channel) {
     return q;
 }
 
+namespace {
+// Windows event-log name matching is CASE-INSENSITIVE: a classic source
+// registered as "volsnap" renders as Provider Name='Volsnap', and the
+// kernel-side subscription still delivers it. The catalogue lookup must use
+// the same semantics or a delivered event is silently dropped post-delivery
+// (live-caught 2026-06-11 by the injection sweep: volsnap 25 delivered,
+// case-sensitive lookup missed). ASCII-only is correct here — provider and
+// channel names are ASCII identifiers.
+bool ascii_ieq(const std::string& a, std::string_view b) {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const char ca = a[i], cb = b[i];
+        const char la = (ca >= 'A' && ca <= 'Z') ? static_cast<char>(ca + 32) : ca;
+        const char lb = (cb >= 'A' && cb <= 'Z') ? static_cast<char>(cb + 32) : cb;
+        if (la != lb)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
 const SignalSpec* find_signal_spec(const std::string& channel, const std::string& provider,
                                    int event_id) {
     for (const auto& s : catalog_impl()) {
-        if (channel != s.channel || provider != s.provider)
+        if (!ascii_ieq(channel, s.channel) || !ascii_ieq(provider, s.provider))
             continue;
         if (s.event_ids.empty() ||
             std::find(s.event_ids.begin(), s.event_ids.end(), event_id) != s.event_ids.end())

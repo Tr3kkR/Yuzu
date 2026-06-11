@@ -478,6 +478,22 @@ TEST_CASE("extract_signal: uncatalogued events return nullopt", "[dex][parse]") 
     CHECK_FALSE(extract_signal("", "", 0, 0, {}));
 }
 
+TEST_CASE("extract_signal: provider/channel match is case-insensitive (Windows semantics)",
+          "[dex][parse][real]") {
+    // LIVE-CAUGHT (injection sweep 2026-06-11): the spec says "volsnap" but the
+    // log renders Provider Name='Volsnap' — Windows name matching is
+    // case-insensitive and delivered the event; a case-sensitive lookup dropped
+    // it post-delivery. Pin the rendered casing end-to-end.
+    const auto o = extract_signal("System", "Volsnap", 25, 2, {{"", "C:"}});
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.shadow_copies_lost");
+    // Channel casing too.
+    const auto c = extract_signal("SYSTEM", "service control manager", 7031, 2,
+                                  {{"param1", "Svc"}});
+    REQUIRE(c);
+    CHECK(c->obs_type == "service.crashed");
+}
+
 // ── REAL captured records (Win11 26100, harvested 2026-06-10) ────────────────
 // Full-chain pins (XML -> system fields + named data -> extract_signal) against
 // REAL event-log records from a live box — the same discipline as the crash
