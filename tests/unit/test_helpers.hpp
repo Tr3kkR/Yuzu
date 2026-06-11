@@ -36,6 +36,8 @@
 
 #if defined(YUZU_TEST_ENABLE_PG)
 #include <libpq-fe.h>
+
+#include "pg/pg_raii.hpp" // server suite only — include path carries server/core/src
 #endif
 
 namespace yuzu::test {
@@ -149,21 +151,21 @@ public:
         admin_dsn_ = admin;
         db_name_ = unique_db_name();
 
-        PGconn* conn = PQconnectdb(admin_dsn_.c_str());
-        if (PQstatus(conn) != CONNECTION_OK) {
-            error_ = std::string("admin connect failed: ") + PQerrorMessage(conn);
-            PQfinish(conn);
+        // RAII owners (server/core/src/pg/pg_raii.hpp): an allocation throw
+        // while building error_ must not leak the admin connection/result.
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            error_ = std::string("admin connect failed: ") + PQerrorMessage(conn.get());
             return;
         }
         const std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
-        PGresult* res = PQexec(conn, create.c_str());
-        const bool created = PQresultStatus(res) == PGRES_COMMAND_OK;
-        if (!created)
-            error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn);
-        PQclear(res);
-        PQfinish(conn);
-        if (!created)
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
+        if (!res.ok()) {
+            error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
             return;
+        }
+        res.reset();
+        conn.reset();
 
         dsn_ = rewrite_dbname(admin_dsn_, db_name_);
         if (dsn_.empty()) {
@@ -176,16 +178,14 @@ public:
     ~PostgresTestDb() {
         if (db_name_.empty() || admin_dsn_.empty())
             return;
-        PGconn* conn = PQconnectdb(admin_dsn_.c_str());
-        if (PQstatus(conn) == CONNECTION_OK) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
+        if (PQstatus(conn.get()) == CONNECTION_OK) {
             // FORCE (PG 13+): terminate any connection a test leaked so the
             // drop cannot fail and pile up databases on the shared instance.
             const std::string drop =
                 "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
-            PGresult* res = PQexec(conn, drop.c_str());
-            PQclear(res);
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
         }
-        PQfinish(conn);
     }
 
     PostgresTestDb(const PostgresTestDb&) = delete;
