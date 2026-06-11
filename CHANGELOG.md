@@ -85,6 +85,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX dashboard (`/dex`) — fleet reliability lens over a 103-signal
+  catalogue.** A new read-only dashboard reinterprets ruleless Guardian
+  observations as Digital Employee Experience: crash-free-device % and
+  crashes/1k-device-days headline rates (cross-store fleet denominator,
+  honest "—" when no agents report), an always-visible All-signals panel
+  (every monitored type across 12 groups — App reliability, Boot/start-up &
+  shutdown, Service health, System stability, Hardware & storage, File
+  system, Network, Identity & logon, Security & protection, Updates &
+  installs, Policy & management, Printing — quiet types as real-zero rows),
+  boot/resume performance panels (duration metrics), hang-aware top-apps,
+  and per-app / per-device drill-downs (the device view is permission-gated
+  and audit-logged: behavioral data). A "DEX" nav link is in the dashboard
+  chrome. NO mock data anywhere: real aggregations or explicit "no data"
+  placeholders.
+- **Guardian DEX — 103-signal observation catalogue (waves 1–3).** The
+  slice-1 crash recorder generalized into one catalogue-driven multi-channel
+  observer (`dex_signal_catalog.{hpp,cpp}` + `dex_observer.{hpp,cpp}`,
+  renamed from `crash_observer`): 103 obs_types / 22 event-log channels —
+  crashes (native + .NET), hangs, service failures (7 kinds), bugcheck/
+  power-loss/dirty-shutdown, boot/shutdown/resume durations + per-cause
+  degradation, disk SMART/controller/port-reset, NTFS + ESE corruption,
+  memory exhaustion, device/TPM/CPU-throttle, Wi-Fi/DHCP/VPN/SMB/DNS/port-
+  exhaustion, Entra ID token errors, Windows Hello/biometric errors, RDP
+  disconnects, machine-trust/Kerberos/LSA/TLS failures, Defender health,
+  BitLocker, certificate auto-enrollment, update check/download/install
+  failures, MDM/Intune errors, Group Policy failures, print failures, and
+  more (`docs/dex-signal-catalog.md`). Uniform `detail_json` keys mean a new
+  signal needs ZERO server change. Per-type rate caps (12–120/h) bound the
+  wire. **Privacy minimisation at the edge** ([privacy]-pinned tests): DNS
+  query names, print document names/owners, usernames (profile/VPN/RDP/
+  service-logon/restart-initiator/Defender), client addresses, user-profile
+  paths, AAD message texts, and .NET stack frames are never extracted.
+  Verified via real-record fixtures harvested from a live Win11 box plus a
+  synthetic event-stream injection sweep (34 classic-source events through
+  the real `EvtSubscribe` path; the sweep caught and fixed a case-
+  sensitivity bug in provider matching). Heartbeat tags/metrics renamed:
+  `yuzu_agent_dex_observer_armed`, `yuzu_fleet_agents_dex_observer_disarmed`,
+  `yuzu_fleet_dex_observed_total`.
 - **Guardian DEX — fleet-wide process-crash recorder (slice 1).** The agent now
   records Windows process crashes (Application event log, Event ID 1000,
   "Application Error") on managed endpoints as **ruleless** Digital Experience (DEX)

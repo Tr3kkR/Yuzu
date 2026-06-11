@@ -747,6 +747,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         };
         sub("{{TITLE}}", "Yuzu \xE2\x80\x94 DEX");
         sub("{{FRAGMENT}}", "/fragments/dex/overview");
+        // The shared shell marks Guardian as the active nav item; on /dex the
+        // DEX link is the active one. Plain string swaps on the static chrome.
+        sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
+            "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
+        sub("<a href=\"/dex\" class=\"nav-link\">DEX</a>",
+            "<a href=\"/dex\" class=\"nav-link active\">DEX</a>");
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(std::move(html), "text/html; charset=utf-8");
     });
