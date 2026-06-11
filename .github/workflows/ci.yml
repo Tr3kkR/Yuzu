@@ -322,6 +322,20 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
 
+      # Link-provenance assertion (#1331 review HIGH-2): prove the canary linked
+      # vcpkg's static libpq archive, not a system/dynamic libpq. Per ADR-0008
+      # ("Correction (2026-06-10)"): unix is static, Windows is deliberately a DLL.
+      - name: Assert canary libpq link provenance (static on Linux)
+        run: |
+          bin="build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu_pg_canary"
+          test -x "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
+          if ldd "$bin" | grep -qi 'libpq'; then
+            echo "::error::canary dynamically links libpq — expected vcpkg static archive (ADR-0008)"
+            ldd "$bin" | grep -i 'libpq'
+            exit 1
+          fi
+          echo "OK: no dynamic libpq dependency — static archive linked"
+
       - name: Test
         run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
 
@@ -540,6 +554,23 @@ jobs:
       - name: Build
         run: meson compile -C build-windows-${{ matrix.build_type }}
 
+      # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
+      # DELIBERATELY dynamic (triplet static override = grpc stack only; the
+      # release zip's vcpkg-DLL sweep ships libpq.dll like sqlite3/openssl —
+      # ADR-0008 "Correction (2026-06-10)"). Assert the import is present so a
+      # silent posture flip in either direction is caught.
+      - name: Assert canary libpq link provenance (DLL import on Windows)
+        run: |
+          bin="build-windows-${{ matrix.build_type }}/server/core/yuzu_pg_canary.exe"
+          test -f "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
+          deps="$(dumpbin -dependents "$bin")"
+          if ! echo "$deps" | grep -qi 'libpq.dll'; then
+            echo "::error::canary does not import libpq.dll — Windows linkage posture changed (expected dynamic per ADR-0008 Correction; if flipping to static, update this assert + the triplet override together)"
+            echo "$deps"
+            exit 1
+          fi
+          echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
+
       - name: Test
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
@@ -678,6 +709,20 @@ jobs:
 
       - name: Build
         run: meson compile -C build-macos
+
+      # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
+      # carry a system PostgreSQL, so prove the canary linked vcpkg's static
+      # archive rather than a system dylib resolved by cmake's FindPostgreSQL.
+      - name: Assert canary libpq link provenance (static on macOS)
+        run: |
+          bin="build-macos/server/core/yuzu_pg_canary"
+          test -x "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
+          if otool -L "$bin" | grep -qi 'libpq'; then
+            echo "::error::canary dynamically links libpq — expected vcpkg static archive (ADR-0008)"
+            otool -L "$bin" | grep -i 'libpq'
+            exit 1
+          fi
+          echo "OK: no dynamic libpq dependency — static archive linked"
 
       - name: Test
         run: meson test -C build-macos --print-errorlogs
@@ -863,6 +908,20 @@ jobs:
 
       - name: Build
         run: meson compile -C build-linux
+
+      # Link-provenance assertion (#1331 review HIGH-2) — same check as the
+      # self-hosted Linux leg; the GHA-hosted image ships PostgreSQL client
+      # libs, making this the leg most at risk of a system-libpq resolution.
+      - name: Assert canary libpq link provenance (static on Linux)
+        run: |
+          bin="build-linux/server/core/yuzu_pg_canary"
+          test -x "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
+          if ldd "$bin" | grep -qi 'libpq'; then
+            echo "::error::canary dynamically links libpq — expected vcpkg static archive (ADR-0008)"
+            ldd "$bin" | grep -i 'libpq'
+            exit 1
+          fi
+          echo "OK: no dynamic libpq dependency — static archive linked"
 
       # Test step intentionally absent — the canary's purpose is
       # workflow-regression detection on a fresh-disk runner, not test
