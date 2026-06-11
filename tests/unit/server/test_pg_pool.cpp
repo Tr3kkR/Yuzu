@@ -91,7 +91,7 @@ TEST_CASE("PgPool exhaustion", "[pg][pool]") {
 
     auto denied = pool.try_acquire_for(100ms);
     CHECK_FALSE(static_cast<bool>(denied));
-    CHECK(pool.last_error() == "pool exhausted (all connections leased)");
+    CHECK(pool.last_error() == "acquire timed out before a connection was available");
 
     // Zero timeout: the deadline-is-already-past path returns immediately.
     auto denied_now = pool.try_acquire_for(0ms);

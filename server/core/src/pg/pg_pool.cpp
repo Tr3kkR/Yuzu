@@ -106,7 +106,9 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
         // caller's deadline. An idle connection at/past the deadline is
         // still taken above — that costs nothing.
         if (deadline && std::chrono::steady_clock::now() >= *deadline) {
-            last_error_ = "pool exhausted (all connections leased)";
+            // Deliberately not "exhausted": the deadline can also expire
+            // before a connect was ever attempted (Gate 8 LOW).
+            last_error_ = "acquire timed out before a connection was available";
             return {};
         }
         if (open_ + connecting_ < size_) {
