@@ -3,6 +3,7 @@
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <ctime>
@@ -77,7 +78,7 @@ const std::vector<DexSignalGroup>& dex_signal_groups() {
           "memory.exhausted"}},
         {"Hardware & storage",
          {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
-          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset"}},
+          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset", "storage.low"}},
         {"File system",
          {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
           "fs.hive_recovered", "fs.autochk_ran"}},
@@ -167,6 +168,7 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "service.logon_failed") return "Service logon failure";
     if (obs_type == "service.recovery_failed") return "Service recovery failure";
     if (obs_type == "disk.smart_failure") return "Disk SMART warning";
+    if (obs_type == "storage.low") return "Disk nearly full"; // macOS collector (df poll)
     if (obs_type == "disk.port_reset") return "Storage port reset";
     if (obs_type == "fs.write_lost") return "Lost delayed write";
     if (obs_type == "fs.database_corrupt") return "Database corruption";
@@ -335,6 +337,785 @@ std::string history_detail(const GuardianObservationRow& r) {
 
 } // namespace
 
+// Public wrappers over the internal window helpers (declared in dex_routes.hpp) so
+// the /api/v1/dex REST surface resolves the window token through the exact same
+// logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
+int dex_window_to_days(const std::string& window) { return window_to_days(window); }
+std::string dex_iso_since(int days) { return iso_days_ago(days); }
+
+// Canonical window token from the (already-validated) window_days — safe to put
+// into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
+std::string dex_window_token(int window_days) {
+    return window_days == 1 ? "24h" : window_days == 30 ? "30d" : window_days == 0 ? "all" : "7d";
+}
+
+// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends). htmx core
+// attrs into the page mount — CSP-safe (no hx-on). Health/Trends are not built
+// yet → rendered as muted "soon" placeholders until their fragments exist.
+std::string dex_subnav(const std::string& active, int window_days) {
+    const std::string w = dex_window_token(window_days);
+    auto tab = [&](const char* id, const char* label, const char* frag) {
+        const std::string on = (active == id) ? " class=\"on\"" : "";
+        return "<a" + on + " hx-get=\"" + frag + "?window=" + w +
+               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+    };
+    return "<div class=\"gp-subnav\">" + tab("overview", "Overview", "/fragments/dex/overview") +
+           tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
+           tab("health", "Health score", "/fragments/dex/health") +
+           tab("trends", "Trends", "/fragments/dex/trends") + "</div>";
+}
+
+// Window chips for a given fragment path (reuses the overview pattern).
+std::string dex_window_chips(const char* frag, int window_days) {
+    const std::string cur = dex_window_token(window_days);
+    auto chip = [&](const char* w, const char* label) {
+        const std::string on = (cur == w) ? " on" : "";
+        return "<a class=\"gp-chip" + on + "\" hx-get=\"" + frag + "?window=" + w +
+               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+    };
+    return "<div class=\"gp-filters\">" + chip("24h", "24h") + chip("7d", "7d") +
+           chip("30d", "30d") + chip("all", "All") + "</div>";
+}
+
+// One family's rollup over the window (events, active count, blast radius, leader).
+struct DexFamilyRollup {
+    int64_t events = 0;
+    int active = 0;
+    int total = 0;
+    int64_t devices = 0;
+    const DexSignalCount* top = nullptr;
+    bool benign = false;
+};
+DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
+                                  const std::vector<DexSignalCount>& signals) {
+    DexFamilyRollup r;
+    r.total = static_cast<int>(g.types.size());
+    r.benign = std::string(g.name) == "Boot, start-up & shutdown";
+    for (const char* t : g.types) {
+        const DexSignalCount* c = nullptr;
+        for (const auto& s : signals)
+            if (s.obs_type == t) {
+                c = &s;
+                break;
+            }
+        if (!c)
+            continue;
+        r.events += c->count;
+        if (c->count > 0)
+            ++r.active;
+        if (c->distinct_devices > r.devices)
+            r.devices = c->distinct_devices;
+        if (!r.top || c->count > r.top->count)
+            r.top = c;
+    }
+    return r;
+}
+
+// DEX Catalogue — View 1: the 12 family cards (mockup dex-catalogue.html). Replaces
+// the flat All-signals table with a card grid that drills into a family, then a
+// signal. Reuses dex_signal_summary + dex_signal_groups; the per-signal drill
+// (View 3) needs a generic per-obs_type read-model and lands next.
+std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
+                                          const std::string& since, int window_days) {
+    if (!store)
+        return placeholder("Catalogue unavailable", "The signal observation store is not open.");
+    const std::string w = dex_window_token(window_days);
+    const auto signals = store->dex_signal_summary(since);
+
+    std::string h;
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("catalogue", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Signal catalogue</h1></div>"
+         "<div class=\"gp-sub\">All " +
+         std::to_string(dex_catalogued_type_count()) + " monitored signal types, grouped into " +
+         std::to_string(dex_signal_groups().size()) +
+         " families. Click a family to see its signals. Quiet families are dimmed but never "
+         "hidden &mdash; you see everything the fleet watches for.</div></div></div>";
+    h += dex_window_chips("/fragments/dex/catalogue", window_days);
+
+    h += "<div class=\"gp-fgrid\">";
+    for (const auto& g : dex_signal_groups()) {
+        const auto r = dex_family_rollup(g, signals);
+        const bool quiet = r.events == 0;
+        const char* tone = r.benign ? "ok" : (quiet ? "" : "warn");
+        h += "<a class=\"gp-fcard" + std::string(quiet ? " quiet" : "") +
+             "\" hx-get=\"/fragments/dex/catalogue/group?name=" + url_encode(g.name) +
+             "&window=" + w + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
+        h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(r.active) + " of " +
+             num(r.total) + " active</span></div>";
+        h += "<div class=\"fev " + std::string(tone) + "\">" + num(r.events) + "</div>";
+        h += "<div class=\"fmeta\">" + std::string(r.benign ? "reports" : "events") + " &middot; " +
+             num(r.devices) + " devices</div>";
+        if (r.benign)
+            h += "<div class=\"ftop\">mostly benign duration reports</div>";
+        else if (r.top && r.top->count > 0)
+            h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> leads (" +
+                 num(r.top->count) + ")</div>";
+        else
+            h += "<div class=\"ftop\">no events in this window</div>";
+        h += "</a>";
+    }
+    h += "</div>";
+    h += "<div class=\"gp-note\">Counts are over reporting devices. Quiet families are real zeros "
+         "(monitored, nothing happened), not missing data &mdash; a 0 on an OS that doesn't collect "
+         "a type reads as <b>not collected</b>, never <b>healthy</b>.</div>";
+
+    // Forward-compat: any obs_type a newer agent emits that isn't catalogued in a
+    // family yet surfaces here under "Other" — seen on the wire, just not curated
+    // into the 12 families. (Was the overview's "Other" group; it moved here with
+    // the rest of the per-type detail when the hub slimmed to summarise-and-link,
+    // so nothing the fleet reports is silently dropped.)
+    {
+        std::vector<const DexSignalCount*> extras;
+        for (const auto& sig : signals) {
+            bool known = false;
+            for (const auto& g : dex_signal_groups()) {
+                for (const char* t : g.types)
+                    if (sig.obs_type == t) {
+                        known = true;
+                        break;
+                    }
+                if (known)
+                    break;
+            }
+            if (!known)
+                extras.push_back(&sig);
+        }
+        if (!extras.empty()) {
+            h += "<div class=\"gp-sech\">Other (uncatalogued)</div>";
+            h += "<div class=\"gp-note\">Seen on the wire but not in a curated family yet (a newer "
+                 "agent emitted these). Listed so nothing the fleet reports is hidden.</div>";
+            h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Type</th>"
+                 "<th class=\"gp-num\">Events</th><th class=\"gp-num\">Devices</th><th>Last seen</th>"
+                 "</tr></thead><tbody>";
+            for (const auto* e : extras) {
+                h += "<tr><td>" + dex_signal_label(e->obs_type) +
+                     "</td><td class=\"gp-mute\" style=\"font-family:var(--mono)\">" +
+                     esc(e->obs_type) + "</td><td class=\"gp-num\">" + num(e->count) +
+                     "</td><td class=\"gp-num\">" + num(e->distinct_devices) +
+                     "</td><td class=\"gp-mute\">" + esc(e->last_seen) + "</td></tr>";
+            }
+            h += "</tbody></table>";
+        }
+    }
+    return h;
+}
+
+// DEX Catalogue — View 2: one family's signals (the visibility contract — every
+// catalogued type, quiet ones muted). `group_name` is allowlisted against
+// dex_signal_groups(); unknown names render an escaped placeholder.
+std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
+                                                const std::string& since, int window_days,
+                                                const std::string& group_name) {
+    if (!store)
+        return placeholder("Catalogue unavailable", "The signal observation store is not open.");
+    const DexSignalGroup* grp = nullptr;
+    for (const auto& g : dex_signal_groups())
+        if (group_name == g.name) {
+            grp = &g;
+            break;
+        }
+    if (!grp)
+        return placeholder("Unknown family", "No such signal family: " + esc(group_name));
+
+    const std::string w = dex_window_token(window_days);
+    const auto signals = store->dex_signal_summary(since);
+    const auto r = dex_family_rollup(*grp, signals);
+    auto find_sig = [&](const char* t) -> const DexSignalCount* {
+        for (const auto& s : signals)
+            if (s.obs_type == t)
+                return &s;
+        return nullptr;
+    };
+    auto tile = [](const char* cls, const std::string& n, const std::string& label,
+                   const std::string& sx) {
+        std::string t = "<div class=\"gp-tile\"><div class=\"n " + std::string(cls) + "\">" + n +
+                        "</div><div class=\"l\">" + label + "</div>";
+        if (!sx.empty())
+            t += "<div class=\"sx\">" + sx + "</div>";
+        return t + "</div>";
+    };
+
+    std::string h;
+    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w +
+         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; All families</a>";
+    h += dex_subnav("catalogue", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(group_name) +
+         "</h1></div><div class=\"gp-sub\">" + num(r.total) + " catalogued signal types &middot; " +
+         num(r.active) + " active in this window.</div></div></div>";
+
+    h += "<div class=\"gp-tiles\">";
+    h += tile(r.benign ? "ok" : (r.events > 0 ? "warn" : ""), num(r.events),
+              r.benign ? "Reports (window)" : "Events (window)", "");
+    h += tile("", num(r.devices), "Devices affected", "");
+    h += tile("info", num(r.active), "Active signals", "of " + num(r.total) + " monitored");
+    if (r.benign)
+        h += tile("ok", "benign", "Family character", "durations, not failures");
+    else if (r.top && r.top->count > 0)
+        h += tile("warn", dex_signal_label(r.top->obs_type), "Top signal",
+                  num(r.top->count) + " events");
+    h += "</div>";
+
+    h += "<div class=\"gp-sech\">Signals in this family</div>";
+    h += "<div class=\"gp-note\">Every catalogued type is listed &mdash; quiet (real-zero) rows are "
+         "muted, not hidden. Devices is the blast radius (distinct devices).</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Type</th>"
+         "<th class=\"gp-num\">Events</th><th class=\"gp-num\">Devices</th><th>Last seen</th>"
+         "</tr></thead><tbody>";
+    auto row = [&](const char* t, const DexSignalCount* c) {
+        // Every row drills into the per-signal-type view (View 3) — even quiet
+        // types (their drill honestly reads "no events").
+        const std::string drill = " hx-get=\"/fragments/dex/catalogue/signal?type=" +
+                                  url_encode(t) + "&window=" + w +
+                                  "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                                  "style=\"cursor:pointer\"";
+        if (c && c->count > 0)
+            h += "<tr" + drill + "><td>" + dex_signal_label(t) +
+                 "</td><td class=\"gp-mute\" style=\"font-family:var(--mono)\">" + esc(t) +
+                 "</td><td class=\"gp-num\">" + num(c->count) + "</td><td class=\"gp-num\">" +
+                 num(c->distinct_devices) + "</td><td class=\"gp-mute\">" + esc(c->last_seen) +
+                 "</td></tr>";
+        else
+            h += "<tr class=\"gp-mute\"" + drill + "><td>" + dex_signal_label(t) +
+                 "</td><td style=\"font-family:var(--mono)\">" + esc(t) +
+                 "</td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td><td>&mdash;</td></tr>";
+    };
+    for (const char* t : grp->types) // active first (visibility contract keeps all)
+        if (const auto* c = find_sig(t); c && c->count > 0)
+            row(t, c);
+    for (const char* t : grp->types)
+        if (const auto* c = find_sig(t); !c || c->count == 0)
+            row(t, c);
+    h += "</tbody></table>";
+    return h;
+}
+
+// DEX Catalogue — View 3: one signal type's drill-down (subjects, OS split,
+// most-affected devices, activity trend). Consumes the generic per-obs_type
+// read-model. `obs_type` is bound into SQL (injection-safe) and HTML-escaped in
+// markup. Coverage captions are DERIVED LIVE from dex_signal_by_os (no stale
+// "macOS 6 of 103").
+std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
+                                                 const std::string& since, int window_days,
+                                                 const std::string& obs_type) {
+    if (!store)
+        return placeholder("Catalogue unavailable", "The signal observation store is not open.");
+    if (obs_type.empty())
+        return placeholder("No signal selected", "Pick a signal type from a family.");
+    const std::string w = dex_window_token(window_days);
+
+    const char* family = nullptr;
+    for (const auto& g : dex_signal_groups()) {
+        for (const char* t : g.types)
+            if (obs_type == t) {
+                family = g.name;
+                break;
+            }
+        if (family)
+            break;
+    }
+
+    const auto subjects = store->dex_signal_subjects(obs_type, since, 15);
+    const auto by_os = store->dex_signal_by_os(obs_type, since);
+    const auto devices = store->dex_signal_devices(obs_type, since, 15);
+    const auto by_day = store->dex_signal_by_day(obs_type, since);
+
+    int64_t events = 0, devs = 0;
+    bool on_mac = false;
+    for (const auto& o : by_os) {
+        events += o.crashes; // generic event count
+        devs += o.distinct_devices;
+        if (o.platform.find("mac") != std::string::npos)
+            on_mac = true;
+    }
+    auto tile = [](const char* cls, const std::string& n, const std::string& label,
+                   const std::string& sx) {
+        std::string t = "<div class=\"gp-tile\"><div class=\"n " + std::string(cls) + "\">" + n +
+                        "</div><div class=\"l\">" + label + "</div>";
+        if (!sx.empty())
+            t += "<div class=\"sx\">" + sx + "</div>";
+        return t + "</div>";
+    };
+
+    std::string h;
+    if (family)
+        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue/group?name=" +
+             url_encode(family) + "&window=" + w +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; " + esc(family) +
+             "</a>";
+    else
+        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; Catalogue</a>";
+    h += dex_subnav("catalogue", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + dex_signal_label(obs_type) +
+         " <span style=\"font-family:var(--mono);font-size:0.9rem;color:var(--muted)\">" +
+         esc(obs_type) + "</span></h1></div><div class=\"gp-sub\">Blast radius and failure shape "
+         "for one signal type across the fleet.</div></div></div>";
+
+    h += "<div class=\"gp-tiles\">";
+    h += tile(events > 40 ? "bad" : (events > 0 ? "warn" : ""), num(events), "Events (window)", "");
+    h += tile("", num(devs), "Devices affected", "");
+    h += tile("info", on_mac ? "Windows + macOS" : "Windows only", "Collected on",
+              on_mac ? "cross-OS signal" : "no macOS collector for this type");
+    h += "</div>";
+
+    if (!by_day.empty()) {
+        int64_t mx = 1;
+        for (const auto& d : by_day)
+            if (d.crashes > mx)
+                mx = d.crashes;
+        h += "<div class=\"gp-sech\">Activity (window)</div>";
+        h += "<div style=\"display:flex;align-items:flex-end;gap:0.35rem;height:64px;margin:0.3rem "
+             "0\">";
+        for (const auto& d : by_day) {
+            int hpx = static_cast<int>(d.crashes * 56 / mx);
+            if (hpx < 2)
+                hpx = 2;
+            h += "<div style=\"flex:1;display:flex;flex-direction:column;align-items:center;"
+                 "gap:0.2rem\"><div title=\"" +
+                 esc(d.day) + ": " + num(d.crashes) +
+                 "\" style=\"width:60%;background:var(--accent);border-radius:2px 2px 0 0;height:" +
+                 std::to_string(hpx) + "px\"></div><small style=\"font-size:0.54rem;color:var(--muted)\">" +
+                 esc(d.day.size() >= 5 ? d.day.substr(5) : d.day) + "</small></div>";
+        }
+        h += "</div>";
+    }
+
+    h += "<div class=\"gp-sech\">Top subjects</div>";
+    if (subjects.empty()) {
+        h += placeholder("No data", "No events for this signal in the window.");
+    } else {
+        h += "<table class=\"gp-table\"><thead><tr><th>Subject</th><th class=\"gp-num\">Events</th>"
+             "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
+        for (const auto& s : subjects)
+            h += "<tr><td>" + esc(s.subject) + "</td><td class=\"gp-num\">" + num(s.count) +
+                 "</td><td class=\"gp-num\">" + num(s.distinct_devices) + "</td><td class=\"gp-mute\">" +
+                 esc(s.last_seen) + "</td></tr>";
+        h += "</tbody></table>";
+    }
+
+    h += "<div class=\"gp-sech\">By operating system</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th>OS</th><th class=\"gp-num\">Events</th>"
+         "<th class=\"gp-num\">Devices</th></tr></thead><tbody>";
+    if (by_os.empty())
+        h += "<tr class=\"gp-mute\"><td colspan=\"3\">No events on any OS in this window.</td></tr>";
+    for (const auto& o : by_os)
+        h += "<tr><td>" + esc(o.platform) + "</td><td class=\"gp-num\">" + num(o.crashes) +
+             "</td><td class=\"gp-num\">" + num(o.distinct_devices) + "</td></tr>";
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">An OS with no events for <span style=\"font-family:var(--mono)\">" +
+         esc(obs_type) + "</span> may simply <b>not collect</b> it &mdash; read within an OS, never "
+         "across; absence is not health.</div>";
+
+    h += "<div class=\"gp-sech\">Most-affected devices</div>";
+    h += "<div class=\"gp-note\" style=\"color:var(--accent)\">&#128274; Behavioral data &mdash; "
+         "which signals a device emits can reveal what a person runs. Access-gated + audit-logged."
+         "</div>";
+    if (devices.empty()) {
+        h += placeholder("No data", "No devices reported this signal in the window.");
+    } else {
+        h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th class=\"gp-num\">Events</th>"
+             "<th>Last seen</th></tr></thead><tbody>";
+        for (const auto& d : devices)
+            h += "<tr><td>" + esc(d.agent_id) + "</td><td class=\"gp-num\">" + num(d.crashes) +
+                 "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
+        h += "</tbody></table>";
+    }
+    return h;
+}
+
+// The composite-score weighting policy (mockup dex-health-score.html). Names MUST
+// match dex_signal_groups(). `severity` = how much a failure of this family hurts
+// experience; the four multipliers are the server-chosen weighting PRESETS. This
+// is policy (transparent + shown), not data — the DATA is the measured impact rate.
+struct DexFamilyWeight {
+    const char* name;
+    const char* severity; // "high" | "med" | "low"
+    double m_default, m_stability, m_productivity, m_security;
+};
+const std::vector<DexFamilyWeight>& dex_family_weights() {
+    static const std::vector<DexFamilyWeight> w = {
+        {"App reliability", "high", 1.0, 1.3, 1.1, 0.8},
+        {"System stability", "high", 1.0, 1.6, 0.9, 0.9},
+        {"Network", "med", 1.0, 0.8, 1.5, 0.9},
+        {"Service health", "med", 1.0, 1.2, 1.0, 0.9},
+        {"Updates & installs", "med", 1.0, 1.0, 1.1, 1.0},
+        {"Security & protection", "high", 1.0, 0.8, 0.7, 2.2},
+        {"Identity & logon", "med", 1.0, 0.9, 1.2, 1.6},
+        {"Hardware & storage", "med", 1.0, 1.4, 0.8, 0.9},
+        {"Printing", "low", 1.0, 0.6, 1.6, 0.6},
+        {"Boot, start-up & shutdown", "low", 1.0, 0.9, 1.5, 0.7},
+        {"Policy & management", "low", 1.0, 0.9, 0.9, 1.3},
+        {"File system", "low", 1.0, 1.3, 0.7, 0.9},
+    };
+    return w;
+}
+double dex_severity_points(const std::string& sev) {
+    return sev == "high" ? 12.0 : (sev == "med" ? 6.0 : 2.0);
+}
+double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset) {
+    if (preset == "stability")
+        return fw.m_stability;
+    if (preset == "productivity")
+        return fw.m_productivity;
+    if (preset == "security")
+        return fw.m_security;
+    return fw.m_default;
+}
+
+// The composite-health computation, shared by the Health page and the Overview
+// hub's health teaser. score = 100 − Σ deductions; -1 when N<=0 (suppressed, no
+// reporting agents → no fabricated 100).
+struct DexHealthResult {
+    double score = -1.0;
+    struct Ded {
+        std::string name, sev;
+        double deduction = 0.0;
+    };
+    std::vector<Ded> deds;
+};
+DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
+                                   const std::string& preset) {
+    DexHealthResult r;
+    if (N <= 0)
+        return r;
+    double total = 0.0;
+    for (const auto& fw : dex_family_weights()) {
+        const DexSignalGroup* g = nullptr;
+        for (const auto& grp : dex_signal_groups())
+            if (std::string(grp.name) == fw.name) {
+                g = &grp;
+                break;
+            }
+        const DexFamilyRollup rr = g ? dex_family_rollup(*g, signals) : DexFamilyRollup{};
+        double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+        if (impact > 1.0)
+            impact = 1.0;
+        const double ded = dex_severity_points(fw.severity) * dex_preset_mult(fw, preset) * impact;
+        r.deds.push_back({fw.name, fw.severity, ded});
+        total += ded;
+    }
+    r.score = std::clamp(100.0 - total, 0.0, 100.0);
+    return r;
+}
+
+// DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
+// score = 100 − Σ deductions; deduction(family) = severity points × preset
+// multiplier × measured impact rate (devices hit / reporting agents). Every
+// deduction traces to a real Catalogue rate — nothing invented. Suppressed (no
+// number) when there are no reporting agents (coverage honesty, no fake 100).
+std::string render_dex_health_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                       int window_days, DexFleet fleet,
+                                       const std::string& weighting) {
+    if (!store)
+        return placeholder("Health score unavailable", "The signal observation store is not open.");
+    const std::string w = dex_window_token(window_days);
+    const std::string preset =
+        (weighting == "stability" || weighting == "productivity" || weighting == "security")
+            ? weighting
+            : "default";
+
+    const auto signals = store->dex_signal_summary(since);
+    const auto summary = store->dex_crash_summary(since);
+    const int64_t N = fleet.windows_online; // scored over reporting Windows agents
+
+    std::string h;
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("health", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Experience health</h1></div>"
+         "<div class=\"gp-sub\">A single roll-up of the measured signal rates &mdash; it "
+         "<b>summarises</b>, it does not replace. Every number it rolls up stays independently "
+         "visible on the Catalogue.</div></div></div>";
+    h += dex_window_chips("/fragments/dex/health", window_days);
+    h += "<div class=\"gp-reversal\">&#9888;&#65039; <b>Derived &amp; secondary.</b> The measured "
+         "crash-free rate stays the headline; this composite rolls the measured family rates into "
+         "one number (a board slide / fleet-vs-fleet comparison), built transparent &mdash; every "
+         "deduction traces to a rate you can open.</div>";
+
+    // Measured headline stays primary.
+    h += "<div class=\"gp-sech\">Measured headline (unchanged &mdash; the real number)</div>";
+    h += "<div class=\"gp-primary\">";
+    if (N > 0) {
+        int64_t impacted = summary.distinct_devices > N ? N : summary.distinct_devices;
+        const double cf = 100.0 * static_cast<double>(N - impacted) / static_cast<double>(N);
+        h += "<div><div class=\"big\">" + std::format("{:.1f}%", cf) +
+             "</div><div class=\"lbl\">Crash-free devices</div></div>";
+    } else {
+        h += "<div><div class=\"big sec\" style=\"color:var(--muted)\">&mdash;</div>"
+             "<div class=\"lbl\">Crash-free &middot; no reporting agents</div></div>";
+    }
+    h += "<div class=\"vdiv\"></div><div><div class=\"big sec\">" + num(summary.total_crashes) +
+         "</div><div class=\"lbl\">Crashes (window)</div></div></div>";
+
+    // Composite gauge.
+    h += "<div class=\"gp-sech\">Composite index (derived from the measured family rates)</div>";
+    if (N == 0) {
+        h += placeholder("Index suppressed",
+                         "No reporting agents to score &mdash; a composite would be a fabricated "
+                         "100, so it is withheld rather than shown. It populates as agents report.");
+        return h;
+    }
+
+    const auto health = dex_compute_health(signals, N, preset);
+    const auto& deds = health.deds;
+    const double score = health.score;
+    const char* band_cls = score >= 90 ? "excellent" : score >= 75 ? "good" : score >= 60 ? "fair" : "poor";
+    const char* band_lbl = score >= 90 ? "Excellent" : score >= 75 ? "Good" : score >= 60 ? "Fair" : "Poor";
+    const char* arc = score >= 75 ? "#4ed27e" : score >= 60 ? "#ffcc00" : "#ff5765";
+
+    h += "<div class=\"gp-composite\"><div class=\"gp-gauge\"><svg width=\"140\" height=\"140\" "
+         "viewBox=\"0 0 140 140\"><circle cx=\"70\" cy=\"70\" r=\"60\" fill=\"none\" "
+         "stroke=\"#2d4068\" stroke-width=\"12\"/><circle cx=\"70\" cy=\"70\" r=\"60\" fill=\"none\" "
+         "stroke=\"" + std::string(arc) +
+         "\" stroke-width=\"12\" stroke-linecap=\"round\" stroke-dasharray=\"377\" "
+         "stroke-dashoffset=\"" + std::format("{:.0f}", 377.0 * (1.0 - score / 100.0)) +
+         "\" transform=\"rotate(-90 70 70)\"/></svg><div class=\"val\"><div class=\"num\">" +
+         std::format("{:.0f}", score) + "</div><div class=\"band band-" + band_cls + "\">" +
+         band_lbl + "</div></div></div>";
+    h += "<div style=\"flex:1;min-width:240px\"><span class=\"gp-derived\">derived &middot; "
+         "secondary</span><div class=\"gp-sub\" style=\"margin-top:0.3rem\">Scored over <b>" +
+         num(N) + "</b> reporting agents. Disarmed + offline are excluded, not scored healthy "
+         "&mdash; unknown, not 100.</div>";
+    auto pchip = [&](const char* p, const char* label) {
+        const std::string on = (preset == p) ? " on" : "";
+        return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/health?window=" + w +
+               "&weighting=" + p + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+               label + "</a>";
+    };
+    h += "<div class=\"gp-filters\"><span style=\"font-size:0.7rem;color:var(--muted)\">weighting:"
+         "</span>" + pchip("default", "Default") + pchip("stability", "Stability") +
+         pchip("productivity", "Productivity") + pchip("security", "Security") + "</div>";
+    h += "<div class=\"gp-sub\" style=\"font-size:0.62rem\">Presets round-trip to the server (hx-get "
+         "<span style=\"font-family:var(--mono)\">?weighting=</span>) &mdash; not a slider. The "
+         "number moves because the <i>weights</i> change; the measured rates don't.</div></div></div>";
+
+    // Decomposition (leads).
+    auto sorted = deds;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.deduction > b.deduction; });
+    static const char* kColors[] = {"#ff5765", "#ff7a52", "#ffae42", "#ffcc00", "#d6d34e", "#a9d34e",
+                                    "#7ed27e", "#4ed27e", "#4ed2a8", "#4ec3d2", "#4e9fd2", "#6f86a6"};
+    double maxD = 0.0001;
+    for (const auto& d : sorted)
+        maxD = std::max(maxD, d.deduction);
+    h += "<div class=\"gp-sech\">Why this score &mdash; what each family deducts</div>";
+    h += "<div class=\"gp-stack\"><span style=\"flex:" + std::format("{:.1f}", score) +
+         ";background:#243553;color:var(--fg)\">health " + std::format("{:.0f}", score) + "</span>";
+    int ci = 0;
+    for (const auto& d : sorted) {
+        if (d.deduction < 0.05)
+            continue;
+        h += "<span style=\"flex:" + std::format("{:.2f}", d.deduction) + ";background:" +
+             kColors[ci % 12] + "\" title=\"" + esc(d.name) + ": -" +
+             std::format("{:.1f}", d.deduction) + "\"></span>";
+        ++ci;
+    }
+    h += "</div>";
+    for (const auto& d : sorted) {
+        const bool zero = d.deduction < 0.05;
+        h += "<div class=\"gp-ded\"><span class=\"fam\">" + esc(d.name) + "</span><span class=\"wt "
+             "wt-" + d.sev + "\">" + d.sev + "</span><span><span class=\"bar\" style=\"display:block;"
+             "width:" + std::format("{:.0f}", std::max(2.0, d.deduction / maxD * 100.0)) +
+             "%\"></span></span><span class=\"pts\" style=\"color:" +
+             (zero ? "var(--muted)" : "var(--red)") + "\">&minus;" + std::format("{:.1f}", d.deduction) +
+             "</span></div>";
+    }
+    h += "<div class=\"gp-note\">Score = <b>100 &minus; weighted deductions</b>, one per family. "
+         "Weight = severity class &times; the active preset; deduction = weight &times; the family's "
+         "measured impact (devices hit / reporting agents). Nothing is invented &mdash; every "
+         "deduction traces to a rate on the Catalogue.</div>";
+
+    // Per-family sub-scores (catalogue order).
+    h += "<div class=\"gp-sech\">Per-family health</div><div class=\"gp-subgrid\">";
+    for (const auto& d : deds) {
+        const double ss = 100.0 - (d.deduction / maxD) * 22.0;
+        const char* sc = ss >= 90 ? "excellent" : ss >= 75 ? "good" : ss >= 60 ? "fair" : "poor";
+        h += "<div class=\"gp-sscore\"><div class=\"nm\">" + esc(d.name) + "</div><div class=\"vv "
+             "band-" + sc + "\">" + std::format("{:.0f}", ss) + "</div><div class=\"ds\">&minus;" +
+             std::format("{:.1f}", d.deduction) + " pts &middot; " + d.sev + " weight</div></div>";
+    }
+    h += "</div>";
+    h += "<div class=\"gp-note\">Score trend, weekly movers, and lowest-health devices need a stored "
+         "score history &mdash; a follow-on increment (no fabricated history shown here).</div>";
+    return h;
+}
+
+// obs_type → family index (into dex_signal_groups), or -1.
+int dex_family_index(const std::string& obs_type) {
+    int fi = 0;
+    for (const auto& g : dex_signal_groups()) {
+        for (const char* t : g.types)
+            if (obs_type == t)
+                return fi;
+        ++fi;
+    }
+    return -1;
+}
+// Inline-SVG sparkline from a daily series.
+std::string dex_sparkline(const std::vector<int64_t>& series, const char* color) {
+    if (series.empty())
+        return {};
+    const double wpx = 130, hpx = 28;
+    int64_t mx = 1;
+    for (auto v : series)
+        if (v > mx)
+            mx = v;
+    std::string pts;
+    for (std::size_t i = 0; i < series.size(); ++i) {
+        const double x = series.size() > 1 ? static_cast<double>(i) / (series.size() - 1) * wpx : 0;
+        const double y = hpx - static_cast<double>(series[i]) / mx * (hpx - 3) - 1;
+        if (!pts.empty())
+            pts += " ";
+        pts += std::format("{:.1f},{:.1f}", x, y);
+    }
+    return "<svg width=\"130\" height=\"28\" viewBox=\"0 0 130 28\"><polyline points=\"" + pts +
+           "\" fill=\"none\" stroke=\"" + color + "\" stroke-width=\"1.5\"/></svg>";
+}
+const char* dex_heat_color(double t) { // t in 0..1, within-row scaled
+    if (t <= 0.0)
+        return "#16233a";
+    if (t < 0.2)
+        return "#243f5e";
+    if (t < 0.4)
+        return "#2f6f7e";
+    if (t < 0.6)
+        return "#caa23b";
+    if (t < 0.8)
+        return "#e07a52";
+    return "#ff5765";
+}
+
+// DEX Trends — cross-OS comparison + per-family small-multiples + activity heatmap
+// (mockup dex-trends.html). The cross-OS scope is DERIVED LIVE from
+// dex_os_signal_scope (no stale "macOS 6 of 103"); rows are within-OS only.
+std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                       int window_days, DexFleet fleet) {
+    if (!store)
+        return placeholder("Trends unavailable", "The signal observation store is not open.");
+    const auto scope = store->dex_os_signal_scope(since);
+    const auto matrix = store->dex_signal_day_matrix(since);
+    const auto summary = store->dex_crash_summary(since);
+    const int64_t total_types = static_cast<int64_t>(dex_catalogued_type_count());
+
+    auto scope_of = [&](const char* p) -> const DexOsScope* {
+        for (const auto& s : scope)
+            if (s.platform.find(p) != std::string::npos)
+                return &s;
+        return nullptr;
+    };
+
+    std::string h;
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("trends", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Cross-OS &amp; signal trends"
+         "</h1></div><div class=\"gp-sub\">Coverage-honest by design: each OS collects a different "
+         "slice of the catalogue, so read <b>within</b> an OS, never across &mdash; fewer signals "
+         "means we observe less, not a healthier fleet.</div></div></div>";
+    h += dex_window_chips("/fragments/dex/trends", window_days);
+
+    // ── Cross-OS cards (live-derived scope) ──
+    h += "<div class=\"gp-sech\">By operating system</div><div class=\"gp-oscards\">";
+    auto os_card = [&](const char* key, const char* label, bool primary) {
+        const DexOsScope* s = scope_of(key);
+        const int64_t types = s ? s->distinct_types : 0;
+        const int64_t events = s ? s->total_events : 0;
+        const bool live = s != nullptr || (primary && fleet.windows_online > 0);
+        std::string c = "<div class=\"gp-oscard" + std::string(live ? "" : " pending") + "\">";
+        c += "<div class=\"os\">" + std::string(label) + " <span class=\"state " +
+             (!live ? "pending\">collector pending" : (types < total_types ? "limited\">live &middot; limited" : "live\">live")) +
+             "</span></div>";
+        c += "<div class=\"scope\">Collects <b>" + num(types) + "</b> of " + num(total_types) +
+             " signal types in this window</div>";
+        c += "<div class=\"gp-tiles\" style=\"margin-top:.6rem\">";
+        if (primary && fleet.windows_online > 0) {
+            int64_t impacted = summary.distinct_devices > fleet.windows_online ? fleet.windows_online : summary.distinct_devices;
+            const double cf = 100.0 * static_cast<double>(fleet.windows_online - impacted) /
+                              static_cast<double>(fleet.windows_online);
+            c += "<div class=\"gp-tile\"><div class=\"n good\">" + std::format("{:.1f}%", cf) +
+                 "</div><div class=\"l\">Crash-free</div></div>";
+            c += "<div class=\"gp-tile\"><div class=\"n\">" + num(fleet.windows_online) +
+                 "</div><div class=\"l\">Reporting</div></div>";
+        }
+        c += "<div class=\"gp-tile\"><div class=\"n " + std::string(live ? "" : "mute") + "\">" +
+             (live ? num(events) : "&mdash;") + "</div><div class=\"l\">Events (window)</div></div>";
+        c += "</div></div>";
+        return c;
+    };
+    h += os_card("win", "Windows", true);
+    h += os_card("mac", "macOS", false);
+    h += os_card("lin", "Linux", false);
+    h += "</div>";
+    h += "<div class=\"gp-note\">Each OS row is scoped to the types <b>it</b> collects &mdash; a "
+         "lower number on an OS that observes fewer types means narrower observation, <b>not</b> a "
+         "healthier fleet. Linux: journald collectors are pending.</div>";
+
+    // ── Aggregate the matrix into family × day ──
+    std::vector<std::string> days;
+    for (const auto& m : matrix)
+        if (days.empty() || days.back() != m.day)
+            days.push_back(m.day);
+    auto day_index = [&](const std::string& d) {
+        for (std::size_t i = 0; i < days.size(); ++i)
+            if (days[i] == d)
+                return static_cast<int>(i);
+        return -1;
+    };
+    const int nfam = static_cast<int>(dex_signal_groups().size());
+    std::vector<std::vector<int64_t>> cell(nfam, std::vector<int64_t>(days.size(), 0));
+    for (const auto& m : matrix) {
+        const int fi = dex_family_index(m.obs_type);
+        const int di = day_index(m.day);
+        if (fi >= 0 && di >= 0)
+            cell[fi][di] += m.count;
+    }
+
+    if (days.empty()) {
+        h += "<div class=\"gp-sech\">Signal families over time</div>";
+        h += placeholder("No activity yet", "No signals in this window to trend.");
+        return h;
+    }
+
+    // ── Small-multiples ──
+    h += "<div class=\"gp-sech\">Signal families over time</div><div class=\"gp-smgrid\">";
+    int fi = 0;
+    for (const auto& g : dex_signal_groups()) {
+        int64_t total = 0;
+        for (auto v : cell[fi])
+            total += v;
+        h += "<div class=\"gp-sm\"><div class=\"smh\"><span class=\"smn\">" + esc(g.name) +
+             "</span><span class=\"smv\">" + num(total) + "</span></div>" +
+             dex_sparkline(cell[fi], total > 0 ? "#00bceb" : "#3a4d6b") + "</div>";
+        ++fi;
+    }
+    h += "</div>";
+
+    // ── Heatmap (family × day, last up-to-14 days, row-scaled) ──
+    const int show_days = static_cast<int>(days.size()) > 14 ? 14 : static_cast<int>(days.size());
+    const int day0 = static_cast<int>(days.size()) - show_days;
+    h += "<div class=\"gp-sech\">Activity heatmap (family &times; day)</div>";
+    h += "<div class=\"gp-heat\">";
+    fi = 0;
+    for (const auto& g : dex_signal_groups()) {
+        int64_t rowmax = 1;
+        for (int d = day0; d < static_cast<int>(days.size()); ++d)
+            if (cell[fi][d] > rowmax)
+                rowmax = cell[fi][d];
+        h += "<div class=\"hrow\"><span class=\"hlbl\">" + esc(g.name) + "</span>";
+        for (int d = day0; d < static_cast<int>(days.size()); ++d) {
+            const double t = static_cast<double>(cell[fi][d]) / static_cast<double>(rowmax);
+            h += "<i style=\"background:" + std::string(dex_heat_color(cell[fi][d] > 0 ? t : 0.0)) +
+                 "\" title=\"" + esc(days[d]) + ": " + num(cell[fi][d]) + "\"></i>";
+        }
+        h += "</div>";
+        ++fi;
+    }
+    h += "</div>";
+    h += "<div class=\"gp-note\">Rows are scaled <b>independently</b> (within-family) so a small "
+         "family and a busy one both show their shape. Read a row left-to-right for a family's "
+         "trend.</div>";
+    return h;
+}
+
 std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days,
                                          DexFleet fleet) {
@@ -356,6 +1137,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     };
     std::string head;
     head += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    head += dex_subnav("overview", window_days);
     head += "<div class=\"gp-head\"><div>"
             "<div class=\"gp-titleline\"><h1>Digital Employee Experience</h1></div>"
             "<div class=\"gp-sub\">Fleet reliability from device signals (crashes, hangs, "
@@ -370,12 +1152,14 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     const auto signals = store->dex_signal_summary(since);
 
     const auto summary = store->dex_crash_summary(since);
-    const auto apps = store->dex_top_apps(since, 20);
-    const auto modules = store->dex_top_modules(since, 20);
-    const auto devices = store->dex_top_devices(since, 20);
-    const auto by_os = store->dex_crashes_by_os(since);
+    const auto apps = store->dex_top_apps(since, 8);
+    const auto devices = store->dex_top_devices(since, 8);
     const auto by_day = store->dex_crashes_by_day(since);
-    const auto boot = store->dex_boot_stats(since);
+    // Per-OS signal coverage: every OS that reported anything, with its distinct
+    // type count. Drives the By-OS table's LIVE "N of M types" (replaces the
+    // mockup's stale "macOS 6 of 103") and the cross-OS explore teaser.
+    const auto os_scope = store->dex_os_signal_scope(since);
+    const int64_t total_types = static_cast<int64_t>(dex_catalogued_type_count());
 
     // A stat tile; cls "unk" + "&mdash;" is the honest no-data state for a rate
     // whose denominator is missing (no fabricated number).
@@ -418,95 +1202,129 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += tile("unk", "&mdash;", "Crashes / 1k device-days",
                   window_days > 0 ? "no reporting agents" : "pick a window");
     }
-    h += tile("bad", num(summary.total_crashes), "Crashes", "");
-    h += tile("warn", num(summary.distinct_devices), "Devices impacted", "by crashes");
-    h += tile("info", num(fleet.windows_online), "Windows agents online",
-              num(fleet.total_online) + " total online");
+    h += tile("warn", num(summary.distinct_devices), "Devices impacted",
+              fleet.windows_online > 0 ? "of " + num(fleet.windows_online) + " reporting"
+                                       : "by crashes");
+    // Honest analog of the mockup's "Telemetry coverage" tile: we have no
+    // enrolled-fleet denominator, so we surface the reporting count itself
+    // (a device we can't hear from is unknown, not a fabricated coverage %).
+    h += tile("info", num(fleet.windows_online), "Agents reporting",
+              num(fleet.total_online) + " online across all OS");
     h += "</div>";
     h += "<div class=\"gp-note\">Rates are over <b>currently-reporting Windows agents</b> (the only "
          "OS with a signal collector today); offline agents are excluded, not counted as crash-free. "
          "macOS/Linux: collector pending.</div>";
 
-    // All signals — every catalogued type, fired or not, GROUPED (App
-    // reliability / Boot / Network / …), then any uncatalogued types the DB
-    // carries under "Other" (newer-agent forward-compat). Quiet rows render
-    // muted with a real zero — monitored, nothing happened. Group header rows
-    // also show the group's event total so a hot family stands out collapsed.
-    h += "<div class=\"gp-sech\">All signals</div>";
-    h += "<div class=\"gp-note\">All " + std::to_string(dex_catalogued_type_count()) +
-         " monitored signal types are listed by group (where the source channel exists on "
-         "the endpoint's Windows SKU); a dash means no events in this window.</div>";
-    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th class=\"gp-num\">Events</th>"
-         "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
-    auto find_sig = [&](const std::string& t) -> const DexSignalCount* {
-        for (const auto& sig : signals)
-            if (sig.obs_type == t)
-                return &sig;
-        return nullptr;
-    };
-    auto sig_row = [&](const std::string& obs_type, const DexSignalCount* c) {
-        if (c) {
-            h += "<tr><td>" + dex_signal_label(obs_type) + "</td><td class=\"gp-num\">" +
-                 num(c->count) + "</td><td class=\"gp-num\">" + num(c->distinct_devices) +
-                 "</td><td class=\"gp-mute\">" + esc(c->last_seen) + "</td></tr>";
-        } else {
-            h += "<tr class=\"gp-mute\"><td>" + dex_signal_label(obs_type) +
-                 "</td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
-                 "<td class=\"gp-mute\">&mdash;</td></tr>";
-        }
-    };
-    auto group_header = [&](const std::string& name, int64_t total) {
-        h += "<tr><td colspan=\"4\" style=\"font-weight:600;padding-top:.7rem;"
-             "border-bottom:1px solid var(--border);\">" + esc(name) +
-             (total > 0 ? " <span class=\"gp-mute\">&middot; " + num(total) + " events</span>"
-                        : "") +
-             "</td></tr>";
-    };
-    for (const auto& group : dex_signal_groups()) {
-        int64_t total = 0;
-        for (const char* t : group.types)
-            if (const auto* c = find_sig(t))
-                total += c->count;
-        group_header(group.name, total);
-        for (const char* t : group.types)
-            sig_row(t, find_sig(t));
-    }
-    // Uncatalogued extras (forward-compat) under "Other".
+    // ── Explore cards — the hub's links into the three deep pages, with live
+    // teaser figures (summarise + link; the detail lives on the deep page). ──
     {
-        std::vector<const DexSignalCount*> extras;
-        for (const auto& sig : signals) {
-            bool known = false;
-            for (const auto& group : dex_signal_groups()) {
-                for (const char* t : group.types)
-                    if (sig.obs_type == t) {
-                        known = true;
-                        break;
-                    }
-                if (known)
-                    break;
+        int active = 0;
+        for (const auto& s : signals)
+            if (s.count > 0)
+                ++active;
+        const DexSignalGroup* busiest = nullptr;
+        int64_t busiest_ev = 0;
+        for (const auto& g : dex_signal_groups()) {
+            const auto r = dex_family_rollup(g, signals);
+            if (r.events > busiest_ev) {
+                busiest_ev = r.events;
+                busiest = &g;
             }
-            if (!known)
-                extras.push_back(&sig);
         }
-        if (!extras.empty()) {
-            int64_t total = 0;
-            for (const auto* e : extras)
-                total += e->count;
-            group_header("Other", total);
-            for (const auto* e : extras)
-                sig_row(e->obs_type, e);
-        }
-    }
-    h += "</tbody></table>";
+        const auto health = dex_compute_health(signals, fleet.windows_online, "default");
 
-    // App reliability — crashes + hangs per app, blast radius, drill-down.
-    h += "<div class=\"gp-sech\">App reliability (crashes + hangs)</div>";
+        auto xcard = [&](const char* frag, const std::string& title, const std::string& big,
+                         const char* bigcls, const std::string& desc) {
+            return "<a class=\"gp-fcard\" hx-get=\"" + std::string(frag) + "?window=" + cur +
+                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\"><div class=\"fn\">" +
+                   title + "<span class=\"cnt\">open &rarr;</span></div><div class=\"fev " +
+                   std::string(bigcls) + "\">" + big + "</div><div class=\"ftop\">" + desc +
+                   "</div></a>";
+        };
+
+        h += "<div class=\"gp-sech\">Explore</div><div class=\"gp-fgrid\">";
+        h += xcard("/fragments/dex/catalogue", "Signal catalogue", num(total_types), "",
+                   num(active) + " active &middot; " + num(static_cast<int64_t>(dex_signal_groups().size())) +
+                       " families" +
+                       (busiest && busiest_ev > 0 ? " &middot; busiest <b>" + esc(busiest->name) + "</b>"
+                                                  : ""));
+        h += xcard("/fragments/dex/health", "Experience health",
+                   health.score < 0 ? std::string("&mdash;") : std::format("{:.0f}", health.score),
+                   health.score < 0 ? ""
+                   : health.score >= 75 ? "ok"
+                   : health.score >= 60 ? "warn"
+                                        : "bad",
+                   std::string("A derived, <b>secondary</b> roll-up of the measured rates") +
+                       (health.score < 0 ? " &mdash; suppressed (no reporting agents)" : ""));
+        std::string os_desc;
+        for (const auto& s : os_scope) {
+            if (!os_desc.empty())
+                os_desc += " &middot; ";
+            os_desc += esc(s.platform) + " " + num(s.distinct_types) + "/" + num(total_types);
+        }
+        if (os_desc.empty())
+            os_desc = "no signals reported yet";
+        h += xcard("/fragments/dex/trends", "Cross-OS &amp; trends",
+                   num(static_cast<int64_t>(os_scope.size())), "",
+                   "OS reporting &middot; " + os_desc + " types (read within an OS, never across)");
+        h += "</div>";
+    }
+
+    // Section header with a right-aligned "→ deep page" link. The hub
+    // SUMMARISES and links; the All-signals / Boot / modules detail moved to the
+    // Catalogue + App-reliability deep pages (this page no longer duplicates
+    // them). Inline flex/style is CSP-safe (style attrs allowed) and keeps the
+    // 16KB page-shell literal untouched.
+    auto sech_link = [&](const std::string& title, const std::string& url,
+                         const std::string& cta) {
+        return "<div class=\"gp-sech\" style=\"display:flex;align-items:baseline;gap:.6rem\">" +
+               title +
+               " <a style=\"margin-left:auto;font-weight:600;text-transform:none;letter-spacing:0\""
+               " hx-get=\"" + url + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + cta +
+               "</a></div>";
+    };
+
+    // ── Crashes per day (compact trend) — inline bars, no extra shell CSS. ──
+    h += sech_link("Crashes per day", "/fragments/dex/trends?window=" + cur,
+                   "all family trends &rarr;");
+    if (by_day.empty()) {
+        h += placeholder("No data", "No crashes in this window.");
+    } else {
+        int64_t maxc = 1;
+        for (const auto& d : by_day)
+            if (d.crashes > maxc)
+                maxc = d.crashes;
+        h += "<div style=\"display:flex;align-items:flex-end;gap:.4rem;height:84px;\">";
+        for (const auto& d : by_day) {
+            const int px = static_cast<int>(8 + 68 * d.crashes / maxc);
+            h += "<div style=\"flex:1;text-align:center;\">"
+                 "<div title=\"" + esc(d.day) + ": " + num(d.crashes) +
+                 "\" style=\"height:" + num(px) +
+                 "px;background:var(--red);opacity:.8;border-radius:2px 2px 0 0;\"></div>"
+                 "<div style=\"font-size:.55rem;color:var(--muted);\">" + esc(d.day.substr(5)) +
+                 "</div></div>";
+        }
+        h += "</div>";
+    }
+
+    // ── Top crashing apps │ Most-affected devices — side by side (mockup's
+    // 2-col). Inline grid is CSP-safe and avoids the shell CSS. ──
+    h += "<div style=\"display:grid;grid-template-columns:1fr 1fr;gap:1.1rem;"
+         "align-items:start\">";
+
+    // Left — top crashing apps. Hangs kept: a hung-but-not-crashed app still
+    // surfaces honestly rather than vanishing from the hub.
+    h += "<div>";
+    h += sech_link("Top crashing apps",
+                   "/fragments/dex/catalogue/group?name=" + url_encode("App reliability") +
+                       "&window=" + cur,
+                   "App reliability &rarr;");
     if (apps.empty()) {
         h += placeholder("No data", "No app crashes or hangs recorded.");
     } else {
         h += "<table class=\"gp-table\"><thead><tr><th>Application</th>"
              "<th class=\"gp-num\">Crashes</th><th class=\"gp-num\">Hangs</th>"
-             "<th class=\"gp-num\">Devices (blast radius)</th><th>Last seen</th></tr></thead><tbody>";
+             "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
         for (const auto& a : apps) {
             const std::string label =
                 a.subject.empty()
@@ -520,89 +1338,16 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                  "</td></tr>";
         }
         h += "</tbody></table>";
+        h += "<div class=\"gp-note\">Devices = blast radius (distinct devices), not event "
+             "count. Row &rarr; app detail.</div>";
     }
+    h += "</div>";
 
-    // Boot performance — every boot reports a duration (os.boot metric).
-    h += "<div class=\"gp-sech\">Boot performance</div>";
-    if (boot.boots == 0) {
-        h += placeholder("No data", "No boot reports in this window (logged a few minutes after "
-                                    "each boot).");
-    } else {
-        h += "<div class=\"gp-tiles\">";
-        h += tile("", esc(fmt_ms(boot.avg_ms)), "Average boot", num(boot.boots) + " boots");
-        h += tile("warn", esc(fmt_ms(boot.max_ms)), "Slowest boot", "");
-        h += tile("info", num(boot.distinct_devices), "Devices reporting boots", "");
-        h += "</div>";
-        const auto slow = store->dex_slowest_boots(since, 10);
-        if (!slow.empty()) {
-            h += "<table class=\"gp-table\"><thead><tr><th>Device</th>"
-                 "<th class=\"gp-num\">Avg boot</th><th class=\"gp-num\">Slowest</th>"
-                 "<th class=\"gp-num\">Boots</th></tr></thead><tbody>";
-            for (const auto& b : slow) {
-                const std::string label = drill_link("/fragments/dex/device",
-                                                     "id=" + url_encode(b.agent_id) + "&window=" + cur,
-                                                     esc(b.agent_id));
-                h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + esc(fmt_ms(b.avg_ms)) +
-                     "</td><td class=\"gp-num\">" + esc(fmt_ms(b.max_ms)) +
-                     "</td><td class=\"gp-num\">" + num(b.boots) + "</td></tr>";
-            }
-            h += "</tbody></table>";
-        }
-    }
-
-    // Crashes per day (trend) — inline bars, no extra shell CSS.
-    h += "<div class=\"gp-sech\">Crashes per day</div>";
-    if (by_day.empty()) {
-        h += placeholder("No data", "No crashes in this window.");
-    } else {
-        int64_t maxc = 1;
-        for (const auto& d : by_day)
-            if (d.crashes > maxc)
-                maxc = d.crashes;
-        h += "<div style=\"display:flex;align-items:flex-end;gap:.4rem;height:90px;\">";
-        for (const auto& d : by_day) {
-            const int px = static_cast<int>(8 + 74 * d.crashes / maxc);
-            h += "<div style=\"flex:1;text-align:center;\">"
-                 "<div title=\"" + esc(d.day) + ": " + num(d.crashes) +
-                 "\" style=\"height:" + num(px) +
-                 "px;background:var(--red);opacity:.8;border-radius:2px 2px 0 0;\"></div>"
-                 "<div style=\"font-size:.55rem;color:var(--muted);\">" + esc(d.day.substr(5)) +
-                 "</div></div>";
-        }
-        h += "</div>";
-    }
-
-    // By OS — coverage-normalised comparison comes with the rate; raw counts now.
-    h += "<div class=\"gp-sech\">Crashes by operating system</div>";
-    if (by_os.empty()) {
-        h += placeholder("No data", "No crashes carry an OS tag yet.");
-    } else {
-        h += "<table class=\"gp-table\"><thead><tr><th>OS</th><th class=\"gp-num\">Crashes</th>"
-             "<th class=\"gp-num\">Devices</th></tr></thead><tbody>";
-        for (const auto& o : by_os) {
-            const std::string label = o.platform.empty() ? std::string("&lt;unknown&gt;") : esc(o.platform);
-            h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(o.crashes) +
-                 "</td><td class=\"gp-num\">" + num(o.distinct_devices) + "</td></tr>";
-        }
-        h += "</tbody></table>";
-    }
-
-    // Top faulting modules (crash-scoped).
-    h += "<div class=\"gp-sech\">Top faulting modules</div>";
-    if (modules.empty()) {
-        h += placeholder("No data", "No faulting modules recorded.");
-    } else {
-        h += "<table class=\"gp-table\"><thead><tr><th>Module</th><th class=\"gp-num\">Crashes</th>"
-             "<th class=\"gp-num\">Distinct apps</th></tr></thead><tbody>";
-        for (const auto& m : modules) {
-            const std::string label = m.component.empty() ? std::string("&lt;unknown&gt;") : esc(m.component);
-            h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(m.crashes) +
-                 "</td><td class=\"gp-num\">" + num(m.distinct_apps) + "</td></tr>";
-        }
-        h += "</tbody></table>";
-    }
-
-    // Most-affected devices (crash-scoped).
+    // Right — most-affected devices (crash-scoped). No behavioral-data banner:
+    // the overview list isn't per-device audited (only the device drill-down is,
+    // route-side; Dave dropped the banner 2026-06-10), so an "audit-logged on
+    // open" claim here would be false. Rows drill into the audited device view.
+    h += "<div>";
     h += "<div class=\"gp-sech\">Most-affected devices</div>";
     if (devices.empty()) {
         h += placeholder("No data", "No affected devices recorded.");
@@ -618,6 +1363,61 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         }
         h += "</tbody></table>";
     }
+    h += "</div></div>"; // /device col + /2-col grid
+
+    // ── By operating system — a coverage teaser into Trends. Rows come from the
+    // LIVE per-OS signal scope (every OS that reported anything), so "N of M
+    // types" is derived, never the mockup's stale "macOS 6 of 103". Reporting +
+    // crash-free are Windows-only (no per-OS denominator elsewhere). Coverage %
+    // is omitted: we have no enrolled-fleet denominator, and a device we can't
+    // hear from is unknown, not healthy. ──
+    auto os_label = [](const std::string& p) -> std::string {
+        if (p == "windows")
+            return "Windows";
+        if (p == "macos")
+            return "macOS";
+        if (p == "linux")
+            return "Linux";
+        return p.empty() ? std::string("&lt;unknown&gt;") : esc(p);
+    };
+    h += sech_link("By operating system", "/fragments/dex/trends?window=" + cur,
+                   "full cross-OS &amp; trends &rarr;");
+    if (os_scope.empty()) {
+        h += placeholder("No data", "No signals carry an OS tag yet.");
+    } else {
+        h += "<table class=\"gp-table\"><thead><tr><th>OS</th><th class=\"gp-num\">Reporting</th>"
+             "<th class=\"gp-num\">Crash-free</th><th>Signal scope</th></tr></thead><tbody>";
+        for (const auto& s : os_scope) {
+            const bool is_win = (s.platform == "windows");
+            std::string reporting = "<span class=\"gp-mute\">&mdash;</span>";
+            std::string crashfree = "<span class=\"gp-mute\">&mdash;</span>";
+            if (is_win && fleet.windows_online > 0) {
+                int64_t impacted = summary.distinct_devices;
+                if (impacted > fleet.windows_online)
+                    impacted = fleet.windows_online;
+                const double pct = 100.0 * static_cast<double>(fleet.windows_online - impacted) /
+                                   static_cast<double>(fleet.windows_online);
+                reporting = num(fleet.windows_online);
+                crashfree = std::format("{:.1f}%", pct);
+            }
+            h += "<tr><td>" + os_label(s.platform) + "</td><td class=\"gp-num\">" + reporting +
+                 "</td><td class=\"gp-num\">" + crashfree + "</td><td class=\"gp-mute\">" +
+                 num(s.distinct_types) + " of " + num(total_types) + " types &middot; " +
+                 num(s.total_events) + " events</td></tr>";
+        }
+        h += "</tbody></table>";
+        h += "<div class=\"gp-note\">Read <b>within</b> an OS, never across &mdash; a narrower "
+             "signal scope (fewer types collected) makes an OS look calmer without being healthier. "
+             "Reporting + crash-free are Windows-only today; macOS/Linux collectors are limited / "
+             "pending.</div>";
+    }
+
+    // ── Hub footer — what this page is. ──
+    h += "<div class=\"gp-note\">DEX is a <b>read model over the one Guardian event store</b> "
+         "&mdash; it reinterprets the signals agents already report as experience; it owns no "
+         "second store. This page is the <b>hub</b>: the measured crash-free rate stays the "
+         "headline, and the three cards above open the full catalogue, the health roll-up, and the "
+         "cross-OS trends.</div>";
 
     return h;
 }
@@ -788,6 +1588,78 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string since = iso_days_ago(window_days);
         const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
         res.set_content(render_dex_overview_fragment(store_, since, window_days, fleet),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --
+    sink.Get("/fragments/dex/catalogue", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string since = iso_days_ago(window_days);
+        res.set_content(render_dex_catalogue_fragment(store_, since, window_days),
+                        "text/html; charset=utf-8");
+    });
+    sink.Get("/fragments/dex/catalogue/group",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const int window_days =
+                     window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+                 const std::string since = iso_days_ago(window_days);
+                 const std::string name =
+                     req.has_param("name") ? req.get_param_value("name") : "";
+                 res.set_content(
+                     render_dex_catalogue_group_fragment(store_, since, window_days, name),
+                     "text/html; charset=utf-8");
+             });
+    sink.Get("/fragments/dex/catalogue/signal",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const int window_days =
+                     window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+                 const std::string since = iso_days_ago(window_days);
+                 const std::string type =
+                     req.has_param("type") ? req.get_param_value("type") : "";
+                 // The per-signal view lists the most-affected DEVICES for this
+                 // obs_type — individual-identifying behavioral data. Audit each
+                 // open, mirroring /fragments/dex/device, so the "audit-logged on
+                 // open" banner the fragment shows is true and the SOC 2
+                 // compensating control applies (governance B4).
+                 if (audit_fn_)
+                     audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
+                               "DEX per-signal most-affected devices");
+                 res.set_content(
+                     render_dex_catalogue_signal_fragment(store_, since, window_days, type),
+                     "text/html; charset=utf-8");
+             });
+
+    // -- Health score: derived/secondary composite (?weighting=<preset>) --
+    sink.Get("/fragments/dex/health", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string since = iso_days_ago(window_days);
+        const std::string weighting =
+            req.has_param("weighting") ? req.get_param_value("weighting") : "default";
+        const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
+        res.set_content(
+            render_dex_health_fragment(store_, since, window_days, fleet, weighting),
+            "text/html; charset=utf-8");
+    });
+
+    // -- Trends: cross-OS comparison + per-family small-multiples + heatmap --
+    sink.Get("/fragments/dex/trends", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string since = iso_days_ago(window_days);
+        const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
+        res.set_content(render_dex_trends_fragment(store_, since, window_days, fleet),
                         "text/html; charset=utf-8");
     });
 

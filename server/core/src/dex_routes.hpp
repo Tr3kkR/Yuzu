@@ -43,6 +43,15 @@ struct DexFleet {
     int64_t total_online{0};
 };
 
+/// Shared window-selector resolvers — the single source of truth for how both the
+/// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
+/// token. `dex_window_to_days` maps "24h"/"7d"/"30d"/"all" (anything else → 7d) to
+/// a day count (0 = "all"); `dex_iso_since` turns that day count into an ISO-8601
+/// UTC cutoff ("" when days<=0 = "all"). Thin wrappers over the dashboard's
+/// internal helpers so REST and HTMX can never drift on the window vocabulary.
+int dex_window_to_days(const std::string& window);
+std::string dex_iso_since(int days);
+
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
 /// + trend, all from the crash projection. `since` is an ISO-8601 cutoff
@@ -53,6 +62,37 @@ struct DexFleet {
 std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days,
                                          DexFleet fleet);
+
+/// Catalogue View 1 — the 12 family cards (mockup dex-catalogue.html), each a drill
+/// into its family. Reuses dex_signal_summary + dex_signal_groups. Pure + free.
+std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
+                                          const std::string& since, int window_days);
+
+/// Catalogue View 2 — one family's signals (visibility contract: every catalogued
+/// type, quiet ones muted). `group_name` is allowlisted against dex_signal_groups().
+std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
+                                                const std::string& since, int window_days,
+                                                const std::string& group_name);
+
+/// Catalogue View 3 — one signal type's drill-down (subjects, OS split, devices,
+/// trend), over the generic per-obs_type read-model. `obs_type` is SQL-bound +
+/// HTML-escaped; cross-OS captions are derived live (no stale coverage counts).
+std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
+                                                 const std::string& since, int window_days,
+                                                 const std::string& obs_type);
+
+/// Health score — the derived/SECONDARY composite (score = 100 − Σ weighted
+/// per-family deductions; every deduction traces to a measured rate). `weighting`
+/// is one of the allowlisted presets (default/stability/productivity/security);
+/// `fleet` supplies the reporting-agent denominator (score suppressed when 0).
+std::string render_dex_health_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                       int window_days, DexFleet fleet,
+                                       const std::string& weighting);
+
+/// Trends — cross-OS comparison (scope derived live from dex_os_signal_scope) +
+/// per-family small-multiples + a family×day activity heatmap (within-row scaled).
+std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                       int window_days, DexFleet fleet);
 
 /// Per-app drill-down fragment for `process_name` — crash + hang blast radius
 /// (devices) + faulting modules + exception codes + affected devices. `window`

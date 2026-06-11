@@ -11,36 +11,72 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## What you see
+## The four views
 
-**Headline reliability (measured, not a score).** The top tiles are
-industry-standard *measured rates*, not a synthetic 0–100 number:
+DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
+links* into three deep pages. A shared sub-nav switches between **Overview ·
+Catalogue · Health score · Trends**; the window selector (below) applies to all
+four.
 
-- **Crash-free devices %** — the share of reporting Windows devices with no app
-  crash in the window.
-- **Crashes / 1,000 device-days** — crash frequency normalised by fleet size and
-  window length.
+### Overview (the hub)
 
-Both are computed over **currently-reporting Windows agents only** (the only OS
-with a collector today). Offline agents are *excluded* from the denominator, not
-counted as healthy — so the number can't be inflated by broken telemetry. When
-no agents are reporting, the tile honestly shows **—** rather than a fabricated
-rate.
+An at-a-glance executive summary that routes into the deep pages — it summarises
+and links, it does not duplicate their detail.
 
-**All signals (grouped).** Every one of the monitored signal types is listed,
-organised into groups (App reliability, Boot/start-up & shutdown, Service
-health, System stability, Hardware & storage, File system, Network, Identity &
-logon, Security & protection, Updates & installs, Policy & management, Printing).
-A type that fired shows its event and device counts; a type that has been quiet
-shows a dashed zero — **monitored, nothing happened** is real information, not a
-gap. (Signal sources that don't exist on a given Windows SKU simply stay at zero
-on those endpoints.)
+- **Headline reliability (measured, not a score).** Four tiles of
+  industry-standard *measured rates*, never a synthetic 0–100 number:
+  - **Crash-free devices %** — the share of reporting Windows devices with no app
+    crash in the window.
+  - **Crashes / 1,000 device-days** — crash frequency normalised by fleet size
+    and window length.
+  - **Devices impacted** — distinct devices with a crash in the window.
+  - **Agents reporting** — the count of currently-reporting agents. This is the
+    honest stand-in for "telemetry coverage": a device we can't hear from is
+    *unknown*, not healthy, so DEX shows the reporting count rather than
+    fabricate a coverage percentage from a fleet size it doesn't know.
 
-**Panels.** App reliability (crashes + hangs per application, with blast
-radius), boot/resume performance (average and slowest durations), a crash trend,
-per-OS split, top faulting modules, and most-affected devices.
+  The rates are computed over **currently-reporting Windows agents only** (the
+  OS with the most complete collector). Offline agents are *excluded* from the
+  denominator, not counted as healthy — so the number can't be inflated by
+  broken telemetry. When no agents are reporting, the tile honestly shows **—**
+  rather than a fabricated rate.
+- **Explore cards** open the three deep pages, each with a live teaser figure.
+- **Crashes per day**, then **top crashing apps** (with blast radius)
+  side-by-side with **most-affected devices**, and a **by-operating-system**
+  summary whose *signal scope* ("N of the monitored types") is derived live so a
+  narrower-coverage OS is never mistaken for a healthier one.
 
-**Window selector.** `24h / 7d / 30d / All` rescopes every panel. Drill-downs
+### Catalogue
+
+Every monitored signal type, organised into 12 families (App reliability,
+Boot/start-up & shutdown, Service health, System stability, Hardware & storage,
+File system, Network, Identity & logon, Security & protection, Updates &
+installs, Policy & management, Printing). A family card shows how many of its
+types are active; opening a family lists **every** type — one that fired shows
+its event and device counts, a quiet one shows a dashed zero, because
+**monitored, nothing happened** is real information, not a gap. (Signal sources
+that don't exist on a given OS or SKU simply stay at zero on those endpoints.)
+Each type drills into a per-type view: top subjects, the live OS split, the
+most-affected devices, and an activity trend. Any signal a newer agent emits
+that isn't catalogued yet appears under **Other**, so nothing the fleet reports
+is hidden.
+
+### Health score
+
+A **transparent, secondary** composite (0–100) derived from the measured rates —
+explicitly *not* the headline (the measured crash-free % stays primary). The
+score is `100 − Σ weighted deductions`, and the page shows the full
+decomposition: the per-family deductions and the weighting preset in force
+(default / stability / productivity / security). With no reporting agents the
+score is **suppressed**, never a fabricated 100.
+
+### Trends
+
+Cross-OS comparison cards — each carrying its **live signal scope**, so an OS
+with a narrower collector reads as *less observed*, not healthier — plus
+per-family small-multiple sparklines and a family×day activity heatmap.
+
+**Window selector.** `24h / 7d / 30d / All` rescopes every view. Drill-downs
 opened from a panel inherit the window you were viewing, so the numbers match.
 
 ## Drill-downs
@@ -49,6 +85,8 @@ opened from a panel inherit the window you were viewing, so the numbers match.
   the fleet: faulting modules, exception codes, and which devices are affected.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels).
+- **Per-signal-type** — from the Catalogue, open any type for its top subjects,
+  live OS split, most-affected devices, and trend.
 
 > **Per-device history is behavioral data.** A device's signal history reveals
 > which applications a person runs. Access is gated on `GuaranteedState:Read`
@@ -57,11 +95,40 @@ opened from a panel inherit the window you were viewing, so the numbers match.
 > See the works-council / co-determination posture in
 > `docs/enterprise-readiness-soc2-first-customer.md`.
 
+## Agentic access (REST)
+
+Every aggregation on this page has a machine-readable equivalent under
+`/api/v1/dex/*` so an agentic worker sees the same DEX read-model the dashboard
+does (agentic-first parity):
+
+- **`GET /api/v1/dex/signals`** — the Catalogue rollup (every signal in the
+  window: count, blast radius, last seen).
+- **`GET /api/v1/dex/scope`** — the per-OS signal coverage that drives the
+  cross-OS captions.
+- **`GET /api/v1/dex/signals/{obs_type}`** — one signal's drill-down (subjects,
+  OS split, most-affected devices, per-day trend).
+
+All three take a `window` of `24h`/`7d`/`30d`/`all` and are gated on
+`GuaranteedState:Read`. The per-signal drill-down returns a most-affected
+**devices** list (behavioral) and is **audit-logged** (`dex.signal.view`) on
+every call, exactly like the dashboard view; the rollup and scope are fleet
+aggregates and are not audited. Full request/response shapes are in
+[`rest-api.md`](rest-api.md#dex-digital-employee-experience).
+
 ## Platform coverage
 
-DEX collectors are **Windows-only** today. macOS and Linux endpoints report no
-DEX signals — the dashboard says so inline, and their devices simply do not
-contribute to the rates. macOS/Linux collectors are a planned follow-up.
+The **Windows** collector is the most complete — it covers the full Windows
+signal catalogue. A **macOS** collector ships too, but is deliberately
+*limited*: an unprivileged collector that reuses the same OS-neutral signal
+types and covers roughly ten of the eleven experience headings (crashes and
+hangs, resource pressure, service failures, boot/resume reports, storage
+pressure, battery health, and more). **Linux** endpoints report no DEX signals
+yet — a collector is a planned follow-up. Because the by-OS and cross-OS views
+label each OS with its live *signal scope*, a fleet running a narrower collector
+reads as **less observed**, never as healthier; the rates are read *within* an
+OS, never across. The exact macOS source mapping — and what additional fidelity
+the Endpoint Security Framework or other entitlements would unlock — is in
+[`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 
 ## Turning it off
 
@@ -73,8 +140,9 @@ are named roadmap items (see the enterprise-readiness plan).
 
 ## No mock data
 
-Every panel renders real aggregations or an explicit "no data" placeholder —
-never sample or fabricated values. A zero is a measured zero.
+Every view renders real aggregations or an explicit "no data" placeholder —
+never sample or fabricated values. A zero is a measured zero, and a rate with no
+denominator shows **—**, not a guess.
 
 ## Recovery — empty or stale DEX projection
 

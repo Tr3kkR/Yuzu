@@ -287,7 +287,7 @@ Every observation is emitted through the same event pipeline as drift, distingui
 - `rule_id` = the reserved sentinel **`__observation__`** (a ruleless observation belongs to no rule).
 - `event_type` = the **obs_type** (e.g. `process.crashed`, `process.hung`, `service.crashed`, `os.boot`, `network.wifi_drop`, `logon.aad_token_error`).
 
-The dedicated **[DEX dashboard](dex.md)** (`/dex`) is the operator-facing view over these observations (fleet reliability rates, grouped signal panels, per-app and per-device drill-downs). You can also query the raw events with the events endpoint, filtering on the sentinel:
+The dedicated **[DEX dashboard](dex.md)** (`/dex`) is the operator-facing view over these observations — a hub of measured reliability rates that links into a signal **Catalogue**, a derived **Health score**, and cross-OS **Trends**, with per-app and per-device drill-downs. You can also query the raw events with the events endpoint, filtering on the sentinel:
 
 ```bash
 curl -H "Authorization: Bearer $YUZU_TOKEN" \

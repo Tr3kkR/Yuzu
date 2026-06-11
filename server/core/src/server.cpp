@@ -7957,7 +7957,9 @@ private:
                     return {command_id, sent};
                 },
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
-                ca_store_.get(), [this]() { return publish_crl(); });
+                ca_store_.get(), [this]() { return publish_crl(); },
+                // ar-S1: DEX read tools (parity with /api/v1/dex/*).
+                guaranteed_state_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------

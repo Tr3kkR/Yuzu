@@ -570,6 +570,74 @@ TEST_CASE("GuaranteedStateStore: DEX crash aggregations", "[guaranteed_state_sto
     CHECK(recent.distinct_devices == 2); // agent-B + agent-C
 }
 
+TEST_CASE("GuaranteedStateStore: generic per-obs_type drill-down + OS scope",
+          "[guaranteed_state_store][dex][signals]") {
+    // The catalogue View-3 read-model: subjects / OS-split / devices / trend for
+    // ANY obs_type (not crash-scoped), plus per-OS coverage scope.
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& subject, const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = type;
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = ts;
+        REQUIRE(store.insert_event(r));
+    };
+    obs("w1", "agent-A", "network.wifi_drop", "CorpNet", "windows", "2026-06-08T10:00:00Z");
+    obs("w2", "agent-A", "network.wifi_drop", "CorpNet", "windows", "2026-06-08T11:00:00Z");
+    obs("w3", "agent-B", "network.wifi_drop", "Guest", "windows", "2026-06-09T10:00:00Z");
+    obs("w4", "mac-1", "network.wifi_drop", "Wi-Fi", "macos", "2026-06-09T11:00:00Z");
+    obs("c1", "mac-1", "process.crashed", "Safari", "macos", "2026-06-09T12:00:00Z");
+
+    auto subj = store.dex_signal_subjects("network.wifi_drop");
+    REQUIRE(subj.size() == 3);
+    CHECK(subj[0].subject == "CorpNet");
+    CHECK(subj[0].count == 2);
+    CHECK(subj[0].distinct_devices == 1);
+
+    auto os = store.dex_signal_by_os("network.wifi_drop");
+    REQUIRE(os.size() == 2);
+    CHECK(os[0].platform == "windows");
+    CHECK(os[0].crashes == 3); // generic event count
+    CHECK(os[1].platform == "macos");
+    CHECK(os[1].crashes == 1);
+
+    auto devs = store.dex_signal_devices("network.wifi_drop");
+    REQUIRE(devs.size() == 3);
+    CHECK(devs[0].agent_id == "agent-A");
+    CHECK(devs[0].crashes == 2);
+
+    auto days = store.dex_signal_by_day("network.wifi_drop");
+    REQUIRE(days.size() == 2);
+    CHECK(days[0].day == "2026-06-08");
+    CHECK(days[0].crashes == 2);
+
+    // Per-OS scope: windows collects 1 type (3 events); macOS collects 2 types
+    // (2 events). Ordered by total events desc.
+    auto scope = store.dex_os_signal_scope();
+    REQUIRE(scope.size() == 2);
+    CHECK(scope[0].platform == "windows");
+    CHECK(scope[0].distinct_types == 1);
+    CHECK(scope[0].total_events == 3);
+    CHECK(scope[1].platform == "macos");
+    CHECK(scope[1].distinct_types == 2);
+    CHECK(scope[1].total_events == 2);
+
+    // day × obs_type matrix (the Trends source): grouped by (day, obs_type).
+    auto mat = store.dex_signal_day_matrix();
+    REQUIRE(mat.size() == 3);
+    CHECK(mat[0].day == "2026-06-08");
+    CHECK(mat[0].obs_type == "network.wifi_drop");
+    CHECK(mat[0].count == 2);
+    CHECK(mat[2].day == "2026-06-09");
+    CHECK(mat[2].obs_type == "process.crashed");
+    CHECK(mat[2].count == 1);
+}
+
 TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_state_store][crash][dex]") {
     GuaranteedStateStore store(":memory:");
     auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
