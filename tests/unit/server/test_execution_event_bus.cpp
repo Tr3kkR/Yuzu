@@ -24,6 +24,7 @@
                       // on MSVC's STL (Linux libstdc++ + libc++ both happen
                       // to include it indirectly, masking the omission).
 #include <atomic>
+#include <cstdint>
 #include <thread>
 #include <vector>
 
@@ -160,11 +161,15 @@ TEST_CASE("execution_event_bus — GC collects an expired terminal channel "
     // destroying the std::mutex inside it — while a lock_guard still owned
     // that mutex (the map held the only shared_ptr). The unlock of the
     // freed mutex aborted the whole server on MSVC and is UB everywhere.
-    // Under ASan this test flags the use-after-free directly; without
-    // sanitizers it pins the collection path the older gc tests never
-    // reached (they only exercised the not-collected branches).
-    ExecutionEventBus bus;
+    //
+    // Detection: only MSVC's STL fails this deterministically (its unlock
+    // validates ownership and aborts). On POSIX the bad unlock lands inside
+    // uninstrumented libpthread, so ASan and TSan both stay silent — the
+    // Windows CI leg is the enforcement point. Either way this pins the
+    // collection path the older gc tests never reached (they only exercised
+    // the not-collected branches).
     std::int64_t fake_now = 1'000'000; // past the throttle vs last_gc=0
+    ExecutionEventBus bus;             // declared after the clock state it borrows
     bus.set_clock_fn([&] { return fake_now; });
 
     // Terminal event, no subscribers — exactly the channel shape GC targets.
@@ -173,10 +178,12 @@ TEST_CASE("execution_event_bus — GC collects an expired terminal channel "
 
     // Advance past retention + GC throttle so the sweep both runs and
     // finds exec-1 expired.
-    fake_now += ExecutionEventBus::kRetentionAfterTerminalSec * 1000 +
-                ExecutionEventBus::kMinGcIntervalMs + 1;
+    constexpr std::int64_t kAdvance =
+        ExecutionEventBus::kRetentionAfterTerminalSec * 1000 +
+        ExecutionEventBus::kMinGcIntervalMs + 1;
 
     SECTION("direct gc_terminal_channels() call") {
+        fake_now += kAdvance;
         CHECK(bus.gc_terminal_channels() == 1);
         CHECK(bus.channel_count() == 0);
         CHECK(bus.gc_channels_total() == 1);
@@ -184,10 +191,41 @@ TEST_CASE("execution_event_bus — GC collects an expired terminal channel "
     SECTION("publish-driven opportunistic sweep (production trigger)") {
         // In production the sweep fires from publish() on an unrelated
         // execution — the crash signature from the UAT rig.
+        fake_now += kAdvance;
         bus.publish("exec-2", "agent-transition", "{}");
         CHECK(bus.channel_count() == 1); // exec-1 collected, exec-2 live
         CHECK(bus.gc_channels_total() == 1);
         CHECK(bus.snapshot("exec-1").empty());
+    }
+    SECTION("multi-victim sweep parks every collected channel") {
+        // The dead vector must keep ALL victims alive past their locks,
+        // not just the first.
+        bus.publish("exec-2", "execution-completed", "{}", /*is_terminal=*/true);
+        bus.publish("exec-3", "execution-completed", "{}", /*is_terminal=*/true);
+        REQUIRE(bus.channel_count() == 3);
+        fake_now += kAdvance;
+        CHECK(bus.gc_terminal_channels() == 3);
+        CHECK(bus.channel_count() == 0);
+        CHECK(bus.gc_channels_total() == 3);
+    }
+    SECTION("expired channel with a live subscriber survives the sweep") {
+        // Pins the listeners.empty() predicate that both GC passes share —
+        // the same condition the pass-2 re-check applies when a subscriber
+        // lands between the passes. (The true between-pass interleaving
+        // needs a thread race and is covered by the CH-1 chaos scenario.)
+        fake_now += kAdvance;
+        auto sub = bus.subscribe("exec-1", [](const ExecutionEvent&) {});
+        CHECK(bus.gc_terminal_channels() == 0);
+        CHECK(bus.channel_count() == 1);
+
+        bus.unsubscribe("exec-1", sub);
+        // Within kMinGcIntervalMs of the sweep above — throttled no-op.
+        CHECK(bus.gc_terminal_channels() == 0);
+        CHECK(bus.channel_count() == 1);
+
+        fake_now += ExecutionEventBus::kMinGcIntervalMs + 1;
+        CHECK(bus.gc_terminal_channels() == 1); // collected once unsubscribed
+        CHECK(bus.channel_count() == 0);
     }
 }
 
