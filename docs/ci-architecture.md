@@ -96,12 +96,15 @@ Resolution order inside the script:
    to the bare TCP probe with a loud unverified-credential warning.
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
-5. Nothing found → `::warning`, exit 0.
+5. Nothing found → `::warning`, exit 1.
 
-**Non-fatal by design (for now):** no test consumes the DSN until #1320
-lands the server-side Postgres substrate. When the first Postgres-backed
-store test ships, flip `SOFT_EXIT=1` in the script so a missing database
-fails the job instead of silently skipping coverage.
+**Fatal since #1320 PR 1 (`SOFT_EXIT=1`):** the pg substrate suites
+(`[pg]`-tagged cases in the server suite) consume the DSN and skip
+cleanly when it is unset — so a CI runner without a database would
+silently skip that coverage. The script therefore fails the job when no
+Postgres can be provisioned (paths 2–5 above). Locally the tests still
+skip when `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but
+unreachable they fail rather than skip.
 
 ## Universal vcpkg cache-key contract
 

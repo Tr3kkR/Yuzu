@@ -24,13 +24,13 @@
 #      docs/ci-architecture.md).
 #   5. Nothing found -> ::warning + exit 0.
 #
-# NON-FATAL (path 5) on purpose: no test consumes the DSN until #1320 lands
-# the server-side Postgres substrate. When the first Postgres-backed store
-# test ships, flip SOFT_EXIT to 1 so a missing database fails the job
-# instead of silently skipping coverage.
+# FATAL since #1320 PR 1: the pg substrate test suites ([pg] tags in the
+# server suite) consume YUZU_TEST_POSTGRES_DSN and skip when it is unset —
+# so a runner without a database would silently skip that coverage. A
+# missing/unready Postgres now fails the job instead.
 set -euo pipefail
 
-SOFT_EXIT=0   # flip to 1 when #1320's tests consume YUZU_TEST_POSTGRES_DSN
+SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 
 # Same pinned multi-arch image as deploy/docker/Dockerfile.postgres's base.
 PG_IMAGE="postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb0942a77e012fe74f016c114c3e25b8"
