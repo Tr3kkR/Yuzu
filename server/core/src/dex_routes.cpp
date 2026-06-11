@@ -77,7 +77,7 @@ const std::vector<DexSignalGroup>& dex_signal_groups() {
           "memory.exhausted"}},
         {"Hardware & storage",
          {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
-          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset"}},
+          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset", "storage.low"}},
         {"File system",
          {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
           "fs.hive_recovered", "fs.autochk_ran"}},
@@ -167,6 +167,7 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "service.logon_failed") return "Service logon failure";
     if (obs_type == "service.recovery_failed") return "Service recovery failure";
     if (obs_type == "disk.smart_failure") return "Disk SMART warning";
+    if (obs_type == "storage.low") return "Disk nearly full"; // macOS collector (df poll)
     if (obs_type == "disk.port_reset") return "Storage port reset";
     if (obs_type == "fs.write_lost") return "Lost delayed write";
     if (obs_type == "fs.database_corrupt") return "Database corruption";

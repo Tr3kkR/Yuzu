@@ -364,3 +364,60 @@ TEST_CASE("no battery (desktop) produces no signal", "[dex_macos][iokit]") {
     CHECK_FALSE(h.valid);
     CHECK_FALSE(macos::battery_observation(h).has_value());
 }
+
+// ── Resource pressure: disk / thermal / memory ───────────────────────────────
+
+TEST_CASE("healthy disk produces no storage.low", "[dex_macos][iokit][resource]") {
+    // Real `df -k /System/Volumes/Data` line (macOS 26.5; note the inode columns).
+    const char* df =
+        "Filesystem    1024-blocks      Used Available Capacity iused      ifree %iused  Mounted on\n"
+        "/dev/disk3s5    239311296  65734056 138099176    33%  616214 1380991760    0%   /System/Volumes/Data\n";
+    const auto u = macos::parse_disk_usage(df);
+    REQUIRE(u.valid);
+    CHECK(u.capacity_pct == 33);          // first %-token, not the trailing %iused
+    CHECK(u.available_kb == 138099176LL); // token before capacity
+    CHECK_FALSE(macos::disk_observation(u, "Macintosh HD").has_value());
+}
+
+TEST_CASE("nearly-full disk maps to storage.low", "[dex_macos][iokit][resource]") {
+    const char* by_pct =
+        "/dev/disk3s5 239311296 230000000 9311296 96% 1 2 0% /System/Volumes/Data\n";
+    const auto u1 = macos::parse_disk_usage(by_pct);
+    auto o1 = macos::disk_observation(u1, "Macintosh HD");
+    REQUIRE(o1.has_value());
+    CHECK(o1->obs_type == "storage.low");
+    CHECK(o1->reason == "96% full");
+    CHECK(o1->metric == 96.0);
+
+    // Triggered by absolute free bytes (<5 GiB) even at a modest capacity %.
+    const char* by_free =
+        "/dev/disk3s5 239311296 235000000 4000000 61% 1 2 0% /System/Volumes/Data\n";
+    const auto u2 = macos::parse_disk_usage(by_free);
+    CHECK(macos::disk_observation(u2, "Macintosh HD").has_value());
+}
+
+TEST_CASE("thermal throttle maps to hw.cpu_throttled", "[dex_macos][iokit][resource]") {
+    // Real healthy pmset output.
+    CHECK_FALSE(
+        macos::thermal_observation("Note: No thermal warning level has been recorded\n").has_value());
+    // Throttled form.
+    const auto o = macos::thermal_observation(
+        "CPU_Scheduler_Limit \t= 100\nCPU_Available_CPUs \t= 8\nCPU_Speed_Limit \t= 70\n");
+    REQUIRE(o.has_value());
+    CHECK(o->obs_type == "hw.cpu_throttled");
+    CHECK(o->metric == 70.0);
+    // Full speed (100) is not throttled.
+    CHECK_FALSE(macos::thermal_observation("CPU_Speed_Limit \t= 100\n").has_value());
+}
+
+TEST_CASE("low memory maps to memory.exhausted", "[dex_macos][iokit][resource]") {
+    // Real healthy output.
+    CHECK_FALSE(
+        macos::memory_pressure_observation("System-wide memory free percentage: 54%\n").has_value());
+    const auto o =
+        macos::memory_pressure_observation("System-wide memory free percentage: 6%\n");
+    REQUIRE(o.has_value());
+    CHECK(o->obs_type == "memory.exhausted");
+    CHECK(o->subject == "system");
+    CHECK(o->metric == 6.0);
+}

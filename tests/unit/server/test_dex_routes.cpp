@@ -67,7 +67,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: empty store still lists ALL 103 monitored signal types, grouped",
+TEST_CASE("DEX overview: empty store still lists ALL 104 monitored signal types, grouped",
           "[dex][routes]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -103,7 +103,7 @@ TEST_CASE("DEX overview: empty store still lists ALL 103 monitored signal types,
           "App dependency error", "App activation failure", "COM server failure",
           "Error dialog shown", "App blocked shutdown", "Service hung",
           "Service start timeout", "Service logon failure", "Service recovery failure",
-          "Disk SMART warning", "Storage port reset", "Lost delayed write",
+          "Disk SMART warning", "Disk nearly full", "Storage port reset", "Lost delayed write",
           "Database corruption", "Device start failure", "CPU throttled",
           "Wi-Fi connect failure", "DHCP failure", "VPN failure", "File share failure",
           "Name conflict", "No domain controller", "Kerberos error",
@@ -125,7 +125,8 @@ TEST_CASE("DEX overview: empty store still lists ALL 103 monitored signal types,
           "Policy extension failure", "MDM/Intune error"})
         CHECK(html.find(label) != std::string::npos);
 
-    CHECK(html.find("All 103 monitored signal types") != std::string::npos);
+    // 103 Windows catalogue types + the macOS-collector `storage.low` (Hardware).
+    CHECK(html.find("All 104 monitored signal types") != std::string::npos);
     // No fabricated numbers: quiet rows carry a literal zero count.
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }

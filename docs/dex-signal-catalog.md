@@ -222,10 +222,13 @@ entitlement nor Full Disk Access** (the agent user's own
    the filtering server-side so the agent never sees the firehose). This is the
    macOS analogue of the Windows single `EvtSubscribe` mechanism: it unlocks the
    "an event happened" signals that land in the log rather than in report files;
-4. a slow **IOKit/system-tool poll** (`dex_macos_iokit.{hpp,cpp}`): hourly it runs
-   `diskutil info` + `system_profiler SPPowerDataType` and emits **only on a
-   transition into a bad state** (poll-and-diff) — these are STATE not events. The
-   one heading (Hardware & storage) the unified log doesn't cover.
+4. an **IOKit/system-tool poll** (`dex_macos_iokit.{hpp,cpp}`): two cadences —
+   hourly `diskutil info` + `system_profiler SPPowerDataType` (battery/SMART,
+   slow-changing) and every 10 min `df` + `pmset -g therm` + `memory_pressure -Q`
+   (disk/thermal/memory, fluctuating). Emits **only on a transition into a bad
+   state** (poll-and-diff: latch on, suppress while it persists, re-arm on
+   recovery) — these are STATE not events. Covers Hardware & storage (which the
+   unified log doesn't) plus the employee-felt "full / hot / low-memory" states.
 
 The fiddly extraction is in the pure, framework-free `dex_macos_signals.cpp` /
 `dex_macos_oslog.cpp` / `dex_macos_iokit.cpp` (an `.ips` is two concatenated JSON
@@ -256,7 +259,7 @@ parser now would mistake routine scans for detections.
 | | `process.hung` | `.ips` spin/hang (288/388) | fixture |
 | | `process.resource_limit` | `.diag` cpu/wakeups/disk-write budget (macOS-only, "Other") | **live** |
 | System Stability | `os.bugcheck` | `.ips` kernel panic (210/110) | fixture |
-| | `memory.exhausted` | `.ips` JetsamEvent (298) | real-record |
+| | `memory.exhausted` | `.ips` JetsamEvent (298, kill) + `memory_pressure -Q` <10% free (warning) | real-record |
 | Boot/startup/shutdown | `os.uptime_report` | `sysctl kern.boottime` | **live** |
 | Network | `network.wifi_drop` | unified log: symptomsd LQM / data-stall degradation | real-record |
 | Updates & installs | `update.failed` | unified log: softwareupdated error/fault | best-effort |
@@ -266,6 +269,16 @@ parser now would mistake routine scans for detections.
 | File system | `fs.corruption` | unified log: `com.apple.apfs` error/fault | best-effort |
 | Hardware & storage | `disk.smart_failure` | IOKit poll: `diskutil` SMART != Verified | real-record |
 | | `hw.error` (battery) | IOKit poll: `system_profiler` battery condition / capacity <80% | real-record |
+| | `storage.low` | IOKit poll: `df` Data volume >=90% full or <5 GiB free (macOS-only obs_type, "Disk nearly full") | real-record |
+| | `hw.cpu_throttled` | IOKit poll: `pmset -g therm` CPU speed cap <100% | real-record |
+
+**Boot duration (deliberately NOT shipped):** macOS exposes boot *start*
+(`kern.boottime`) but no clean unprivileged boot-*complete* marker — the UI-ready
+events (loginwindow/WindowServer) age out of the unified-log store within days, so
+they can't be differenced on a long-uptime machine, and there is no boot-duration
+event to parse. Rather than ship a fragile, unvalidatable parser, `os.boot`
+(duration) stays Windows-only; the Boot heading carries `os.uptime_report` on
+macOS.
 
 **Two fidelity notes (honest, vs Windows):** (1) `service.crashed` — launchd logs
 EVERY service exit, not only unexpected ones (Windows SCM 7031/7034 fire only on

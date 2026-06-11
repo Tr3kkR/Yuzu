@@ -63,7 +63,8 @@ constexpr std::uintptr_t kTimerIdent = 2; // EVFILT_TIMER ident — periodic saf
 constexpr int kRescanSeconds = 60;        // backstop a missed vnode event
 constexpr int kMaxReadRetries = 3;        // bounded retries on an unreadable (mid-write) file
 constexpr std::int64_t kUptimeIntervalSeconds = 3600; // os.uptime_report cadence (trendable)
-constexpr std::int64_t kIokitIntervalSeconds = 3600;  // battery/SMART poll cadence (slow-changing)
+constexpr std::int64_t kIokitIntervalSeconds = 3600;    // battery/SMART poll cadence (slow-changing)
+constexpr std::int64_t kResourceIntervalSeconds = 600;  // disk/thermal/memory cadence (fluctuating)
 
 std::int64_t now_unix() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -292,6 +293,10 @@ private:
         last_iokit_poll_ = 0;
         smart_bad_reported_ = false;
         battery_bad_reported_ = false;
+        last_resource_poll_ = 0;
+        disk_low_reported_ = false;
+        thermal_reported_ = false;
+        mem_pressure_reported_ = false;
         armed_ = 0;
     }
 
@@ -378,6 +383,47 @@ private:
             emit(std::move(*batt_obs));
         } else if (!batt_obs) {
             battery_bad_reported_ = false;
+        }
+    }
+
+    // Resource-pressure poll (disk / thermal / memory) on a faster cadence than
+    // battery/SMART — these fluctuate. Same poll-and-diff latch discipline: emit on
+    // the transition into a bad state, suppress while it persists, re-arm on
+    // recovery. The commands are sub-second. Healthy machine → nothing emitted.
+    void maybe_poll_resources() {
+        const std::int64_t now = now_unix();
+        if (now - last_resource_poll_ < kResourceIntervalSeconds)
+            return;
+        last_resource_poll_ = now;
+
+        // Disk: the writable Data volume (the read-only system volume reads ~full
+        // by design and would mislead).
+        const auto disk =
+            macos::parse_disk_usage(capture_command("/bin/df -k /System/Volumes/Data"));
+        auto disk_obs = macos::disk_observation(disk, "Macintosh HD");
+        if (disk_obs && !disk_low_reported_) {
+            disk_low_reported_ = true;
+            emit(std::move(*disk_obs));
+        } else if (!disk_obs) {
+            disk_low_reported_ = false;
+        }
+
+        auto therm_obs =
+            macos::thermal_observation(capture_command("/usr/bin/pmset -g therm 2>/dev/null"));
+        if (therm_obs && !thermal_reported_) {
+            thermal_reported_ = true;
+            emit(std::move(*therm_obs));
+        } else if (!therm_obs) {
+            thermal_reported_ = false;
+        }
+
+        auto mem_obs = macos::memory_pressure_observation(
+            capture_command("/usr/bin/memory_pressure -Q 2>/dev/null"));
+        if (mem_obs && !mem_pressure_reported_) {
+            mem_pressure_reported_ = true;
+            emit(std::move(*mem_obs));
+        } else if (!mem_obs) {
+            mem_pressure_reported_ = false;
         }
     }
 
@@ -490,8 +536,9 @@ private:
             maybe_emit_uptime();   // interval-gated scalar (first emit ~kRescanSeconds in)
             process_new_reports(); // vnode change or periodic timer
             if (is_timer) {
-                poll_oslog();      // unified-log poll (bounded ~0.7s popen)
-                maybe_poll_iokit(); // hardware-health poll (interval-gated, hourly)
+                poll_oslog();          // unified-log poll (bounded ~0.7s popen)
+                maybe_poll_iokit();    // battery/SMART poll (interval-gated, hourly)
+                maybe_poll_resources(); // disk/thermal/memory poll (interval-gated, 10 min)
             }
         }
     }
@@ -512,6 +559,10 @@ private:
     std::int64_t last_iokit_poll_ = 0;                        // 0 = never; first timer tick polls
     bool smart_bad_reported_ = false;                         // SMART/battery poll-and-diff latches
     bool battery_bad_reported_ = false;
+    std::int64_t last_resource_poll_ = 0;                     // disk/thermal/memory cadence
+    bool disk_low_reported_ = false;                          // resource poll-and-diff latches
+    bool thermal_reported_ = false;
+    bool mem_pressure_reported_ = false;
     std::thread thread_;
     int armed_ = 0;
 };
