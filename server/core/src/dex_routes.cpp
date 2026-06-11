@@ -1617,6 +1617,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string since = iso_days_ago(window_days);
                  const std::string type =
                      req.has_param("type") ? req.get_param_value("type") : "";
+                 // The per-signal view lists the most-affected DEVICES for this
+                 // obs_type — individual-identifying behavioral data. Audit each
+                 // open, mirroring /fragments/dex/device, so the "audit-logged on
+                 // open" banner the fragment shows is true and the SOC 2
+                 // compensating control applies (governance B4).
+                 if (audit_fn_)
+                     audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
+                               "DEX per-signal most-affected devices");
                  res.set_content(
                      render_dex_catalogue_signal_fragment(store_, since, window_days, type),
                      "text/html; charset=utf-8");

@@ -38,7 +38,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <exception>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -126,19 +128,28 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
+// RAII owner for a popen pipe: pclose runs on every exit path, including an
+// exception thrown by the caller's read loop (string growth → bad_alloc) or by a
+// sink callback invoked mid-read. Governance B1: a manual pclose with a throwing
+// statement between popen and the close leaks the pipe AND lets the exception
+// escape the worker thread → std::terminate. The deleter is noexcept(pclose).
+using PipeHandle = std::unique_ptr<FILE, decltype(&::pclose)>;
+inline PipeHandle open_pipe(const std::string& cmd) {
+    return PipeHandle(::popen(cmd.c_str(), "r"), &::pclose);
+}
+
 // Run a command and capture its full stdout (bounded — these are one-shot status
 // tools: diskutil, system_profiler). "" on popen failure. The commands are
 // internal literals (no user input) so there is no injection surface.
 std::string capture_command(const std::string& cmd) {
-    FILE* pipe = ::popen(cmd.c_str(), "r");
+    PipeHandle pipe = open_pipe(cmd);
     if (!pipe)
         return {};
     std::string out;
     char buf[4096];
-    while (std::fgets(buf, sizeof(buf), pipe))
+    while (std::fgets(buf, sizeof(buf), pipe.get()))
         out += buf;
-    ::pclose(pipe);
-    return out;
+    return out; // pclose runs via PipeHandle dtor (also on an exceptional unwind)
 }
 
 // Report filenames (not paths) directly in `dir` — excludes the "Retired"
@@ -216,11 +227,26 @@ public:
             ++watched;
         }
 
-        // Stop trigger + periodic safety rescan.
+        // Stop trigger + periodic safety rescan. The EVFILT_USER stop filter is
+        // load-bearing for clean shutdown: if its registration fails, stop()'s
+        // NOTE_TRIGGER is a no-op and join() hangs forever (governance cs-S1).
+        // Treat a registration error as fatal to arming and tidy up.
         struct kevent ctl[2]{};
         EV_SET(&ctl[0], kStopIdent, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
         EV_SET(&ctl[1], kTimerIdent, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, kRescanSeconds, nullptr);
-        ::kevent(kq_, ctl, 2, nullptr, 0, nullptr);
+        if (::kevent(kq_, ctl, 2, nullptr, 0, nullptr) < 0) {
+            spdlog::warn("dex_observer(macos): cannot register stop/timer kevents (errno={}) — DEX "
+                         "collection disabled (clean shutdown could not be guaranteed)",
+                         errno);
+            for (const int fd : dir_fds_)
+                ::close(fd);
+            dir_fds_.clear();
+            ::close(kq_);
+            kq_ = -1;
+            sink_ = nullptr;
+            on_error_ = nullptr;
+            return false;
+        }
 
         if (watched == 0) {
             spdlog::warn("dex_observer(macos): no DiagnosticReports directory watchable — "
@@ -470,7 +496,10 @@ private:
         const std::string cmd = "/usr/bin/log show --start '" + oslog_checkpoint_ +
                                 "' --predicate '" + macos::oslog_predicate() +
                                 "' --style ndjson 2>/dev/null";
-        FILE* pipe = ::popen(cmd.c_str(), "r");
+        // B1: RAII — emit() (an arbitrary sink callback) runs inside this read
+        // loop, so a throw there must still pclose and must not escape the worker
+        // thread (run() also wraps a top-level catch).
+        PipeHandle pipe = open_pipe(cmd);
         if (!pipe) {
             spdlog::warn("dex_observer(macos): popen(log show) failed — unified-log poll skipped");
             return;
@@ -479,7 +508,7 @@ private:
         std::unordered_set<std::string> seen_at_newest;
         std::string acc;
         char buf[16384];
-        while (std::fgets(buf, sizeof(buf), pipe)) {
+        while (std::fgets(buf, sizeof(buf), pipe.get())) {
             acc += buf;
             if (acc.empty() || acc.back() != '\n')
                 continue; // a long line split across reads — keep accumulating
@@ -505,12 +534,36 @@ private:
             if (ts == newest_ts)
                 seen_at_newest.insert(std::move(line));
         }
-        ::pclose(pipe);
+        // pclose runs via PipeHandle dtor at scope end. Advancing the checkpoint
+        // only after a clean read means a throw mid-loop re-polls the same window
+        // next tick (no lost events).
         oslog_checkpoint_ = std::move(newest_ts);
         oslog_seen_at_checkpoint_ = std::move(seen_at_newest);
     }
 
     void run() {
+        // B1: a single top-level catch so NO exception from a poll, a parser, or a
+        // sink callback can escape the worker thread (which would be std::terminate
+        // and kill the whole agent process — the Windows engine catches in its OS
+        // callback; this thread must do the same). On a caught throw we flip the
+        // runtime-health flag and stop collecting rather than crash the agent.
+        try {
+            run_loop();
+        } catch (const std::exception& e) {
+            spdlog::error("dex_observer(macos): worker thread caught exception ({}) — collection "
+                          "stopping (agent stays up)",
+                          e.what());
+            if (on_error_)
+                on_error_();
+        } catch (...) {
+            spdlog::error("dex_observer(macos): worker thread caught unknown exception — collection "
+                          "stopping (agent stays up)");
+            if (on_error_)
+                on_error_();
+        }
+    }
+
+    void run_loop() {
         for (;;) {
             struct kevent ev{};
             const int n = ::kevent(kq_, nullptr, 0, &ev, 1, nullptr);

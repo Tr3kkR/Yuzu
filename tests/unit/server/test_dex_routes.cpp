@@ -471,6 +471,14 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(dev);
         CHECK(dev->body.find("Signal history") != std::string::npos);
         CHECK(audited == "dex.device.view|Agent|WS-1"); // per-device open audited (PII), PascalCase target_type
+
+        // The per-signal Catalogue view lists most-affected DEVICES for an
+        // obs_type (behavioral data) AND shows an "audit-logged on open" banner —
+        // so the route MUST audit each open, mirroring the device view (gov B4).
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(audited == "dex.signal.view|ObsType|process.crashed");
     }
 
     SECTION("unauthenticated shell redirects to /login") {
@@ -497,6 +505,13 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(dev);
         CHECK(dev->status == 403);
         CHECK(audited.empty()); // perm gate runs BEFORE the audit + render
+
+        // Same for the per-signal device list — perm gate before audit/render, so
+        // a denied caller neither sees data nor produces an audit row (gov B4).
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 403);
+        CHECK(audited.empty());
     }
 
     SECTION("hostile ?window= is canonicalised, never reflected into markup (Gate-8 XSS)") {

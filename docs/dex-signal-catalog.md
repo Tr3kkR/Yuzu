@@ -12,7 +12,11 @@ the uniform `detail_json` keys generically, the `/dex` signal panel GROUP-BYs
 whatever types exist, and unknown types render with a raw-label fallback under
 "Other"). The dashboard groups the catalogue into 12 display groups; the
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
-sync (the paired drift-net tests fail loudly if not).
+sync (the paired drift-net tests fail loudly if not). The server display
+catalogue totals **104** entries: these 103 Windows types **+ the one macOS-only
+type `storage.low`** the macOS collector adds (see "macOS collector" below). The
+Windows agent catalogue stays 103; the macOS collector reuses the same obs_types
+plus that single addition.
 
 Channels that do not exist on a given SKU fail to arm individually and are
 logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is

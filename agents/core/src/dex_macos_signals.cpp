@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <string>
 #include <string_view>
 
@@ -114,7 +115,10 @@ double leading_number(const std::string& s) {
     try {
         std::size_t used = 0;
         const double v = std::stod(s, &used);
-        return used > 0 ? v : 0.0;
+        // std::stod returns ±Inf/NaN for "inf"/"nan"/overflow WITHOUT throwing, so
+        // the catch never fires — guard explicitly or a non-finite value poisons
+        // the metric gauge (governance B2; the prior Windows std::stod lesson).
+        return (used > 0 && std::isfinite(v)) ? v : 0.0;
     } catch (...) {
         return 0.0;
     }

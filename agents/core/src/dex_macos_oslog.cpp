@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cmath>
 #include <string>
 #include <string_view>
 
@@ -41,9 +42,16 @@ bool is_intentional_signal(std::string_view sig) {
     return false;
 }
 
+// Non-finite guard: std::stod returns ±Inf/NaN for "inf"/"nan"/overflow WITHOUT
+// throwing, so a non-finite literal would flow straight into o.metric and poison
+// the gauge (governance B2 — the recurring std::stod lesson).
+double finite_or_zero(double v) {
+    return std::isfinite(v) ? v : 0.0;
+}
+
 double leading_ms(std::string_view s) {
     try {
-        return std::stod(std::string(s)); // "2761ms" → 2761
+        return finite_or_zero(std::stod(std::string(s))); // "2761ms" → 2761
     } catch (...) {
         return 0.0;
     }
@@ -70,7 +78,7 @@ double double_after(const std::string& msg, std::string_view key) {
     if (p == std::string::npos)
         return 0.0;
     try {
-        return std::stod(msg.substr(p + key.size()));
+        return finite_or_zero(std::stod(msg.substr(p + key.size())));
     } catch (...) {
         return 0.0;
     }
@@ -97,14 +105,24 @@ std::optional<SignalObservation> parse_oslog_event(const std::string& line) {
             std::string sig = msg.substr(p + 7);
             if (const std::size_t e = sig.find_first_of(", "); e != std::string::npos)
                 sig = sig.substr(0, e);
+            // Privacy (UP-6): a signal token is a short "SIG*" name. If the format
+            // is unexpected, DROP rather than ship the raw message tail as `reason`
+            // — that tail can carry paths/usernames the happy path never emits.
+            if (sig.rfind("SIG", 0) != 0 || sig.size() > 16)
+                return std::nullopt;
             if (is_intentional_signal(sig))
                 return std::nullopt; // a managed stop, not a crash
             o.reason = sig; // e.g. SIGSEGV
             o.kind = "signal";
         } else if (const std::size_t q = msg.find("exit("); q != std::string::npos) {
             std::string code = msg.substr(q + 5);
-            if (const std::size_t e = code.find(')'); e != std::string::npos)
-                code = code.substr(0, e);
+            const std::size_t e = code.find(')');
+            if (e == std::string::npos)
+                return std::nullopt; // unexpected format — don't ship a raw tail (UP-6)
+            code = code.substr(0, e);
+            // Exit codes are numeric; anything else is an unexpected format → drop.
+            if (code.empty() || code.find_first_not_of("-0123456789") != std::string::npos)
+                return std::nullopt;
             if (code == "0")
                 return std::nullopt; // clean exit — not a failure
             o.reason = "exit(" + code + ")";

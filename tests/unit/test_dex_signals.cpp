@@ -87,7 +87,12 @@ TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catal
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    CHECK(types.size() == std::size(kAllObsTypes)); // the catalogue contract: 103 signals
+    // The Windows AGENT catalogue contract: exactly 103 obs_types. The SERVER's
+    // display catalogue (dex_signal_groups(), pinned at 104 by test_dex_routes.cpp)
+    // is intentionally one larger — it adds the macOS-only `storage.low`, which the
+    // Windows agent never emits. The two counts therefore differ by the macOS-only
+    // set BY DESIGN; each side's drift-net still bites for its own additions.
+    CHECK(types.size() == std::size(kAllObsTypes)); // 103 Windows signals
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
 }

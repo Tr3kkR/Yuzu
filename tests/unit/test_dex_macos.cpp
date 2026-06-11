@@ -18,6 +18,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <string>
 
 using namespace yuzu::agent;
@@ -252,6 +253,45 @@ TEST_CASE("non-launchd / unparseable oslog lines are dropped", "[dex_macos][oslo
     // the predicate is non-empty and references each source class it understands
     for (const char* needle : {"launchd", "symptomsd", "softwareupdated", "apfs"})
         CHECK(macos::oslog_predicate().find(needle) != std::string::npos);
+}
+
+TEST_CASE("oslog non-finite runtime metric is clamped to 0 (no gauge poison)",
+          "[dex_macos][oslog][robust]") {
+    // std::stod("inf"/"nan") returns ±Inf/NaN WITHOUT throwing — governance B2.
+    // A poisoned "ran for" value must not reach the metric gauge; the crash is
+    // still reported, just with metric 0.
+    for (const char* runtime : {"infms", "nanms", "1e400ms"}) {
+        const std::string l =
+            std::string(R"({"processImagePath":"\/sbin\/launchd",)") +
+            R"("subsystem":"system\/com.apple.foo [1]","timestamp":"2026-06-11 10:00:00.0+0100",)" +
+            R"("eventMessage":"exited due to signal SIGSEGV, ran for )" + runtime + R"("})";
+        const auto obs = macos::parse_oslog_event(l);
+        REQUIRE(obs.has_value());
+        CHECK(obs->reason == "SIGSEGV");
+        CHECK(std::isfinite(obs->metric));
+        CHECK(obs->metric == 0.0);
+    }
+}
+
+TEST_CASE("malformed launchd termination drops rather than leaking the message tail",
+          "[dex_macos][oslog][privacy]") {
+    // UP-6: when the signal/exit token is not a recognisable short form, the
+    // parser must DROP (return nullopt) instead of shipping the raw tail — which
+    // can carry a path or username — as `reason`.
+    const char* base =
+        R"({"processImagePath":"\/sbin\/launchd","subsystem":"system\/com.apple.foo [1]",)"
+        R"("timestamp":"2026-06-11 10:00:00.0+0100","eventMessage":")";
+    // a "signal " with a non-SIG tail (simulated PII) must not be emitted
+    CHECK_FALSE(macos::parse_oslog_event(
+                    std::string(base) + R"(exited due to signal /Users/alice/secret leaked"})")
+                    .has_value());
+    // an "exit(" with a non-numeric / unclosed code must not be emitted
+    CHECK_FALSE(macos::parse_oslog_event(
+                    std::string(base) + R"(exited due to exit(/Users/bob/path"})")
+                    .has_value());
+    // the legitimate short forms still parse (no false negatives)
+    CHECK(macos::parse_oslog_event(std::string(base) + R"(exited due to signal SIGSEGV"})")
+              .has_value()); // no trailing ", ran for" — still valid
 }
 
 // ── OSLog breadth: symptomsd network degradation + system-process errors ─────
