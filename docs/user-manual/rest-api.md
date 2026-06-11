@@ -558,6 +558,8 @@ Remove a role assignment from this management group.
 
 API tokens provide non-interactive authentication for scripts and automation. Tokens are scoped to the creating user's permissions. The raw token string is returned exactly once at creation time and cannot be retrieved afterward.
 
+**Storage failure:** if the server's token store is unavailable (its database failed to open — bad data directory, permissions), all three token endpoints return `503` with message `storage unavailable` rather than `404` or an empty list, so automation can distinguish a server-side outage from a missing token.
+
 #### `GET /api/v1/tokens`
 
 List the current user's API tokens. Raw token values are never returned.
