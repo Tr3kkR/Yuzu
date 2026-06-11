@@ -17,13 +17,14 @@ static const std::vector<std::string> kAllowedKeys = {
     "guardian_event_retention_days", // days to keep guaranteed-state events
     "auto_approve_enabled",          // "true" or "false"
     "log_level",                     // trace|debug|info|warn|error
-    "oidc_issuer",             // OIDC issuer URL
-    "oidc_client_id",          // OIDC client ID
-    "oidc_client_secret",      // OIDC client secret (encrypted at rest via SQLite)
-    "oidc_redirect_uri",       // OIDC redirect URI
-    "oidc_admin_group",        // OIDC admin group ID
-    "oidc_skip_tls_verify",    // "true" or "false"
-    "plugin_signing_required", // see plugin_signing::kPluginSigningRequiredKey — must match
+    "oidc_issuer",                   // OIDC issuer URL
+    "oidc_client_id",                // OIDC client ID
+    "oidc_client_secret",            // OIDC client secret — stored PLAINTEXT today; envelope
+                                     // encryption lands with the Postgres migration (ADR-0010)
+    "oidc_redirect_uri",             // OIDC redirect URI
+    "oidc_admin_group",              // OIDC admin group ID
+    "oidc_skip_tls_verify",          // "true" or "false"
+    "plugin_signing_required",       // see plugin_signing::kPluginSigningRequiredKey — must match
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
@@ -93,18 +94,22 @@ std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all() const {
 
     std::lock_guard lock(mu_);
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT key, value, updated_by, updated_at FROM runtime_config ORDER BY key",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(
+            db_, "SELECT key, value, updated_by, updated_at FROM runtime_config ORDER BY key", -1,
+            &stmt, nullptr) != SQLITE_OK)
         return results;
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         RuntimeConfigEntry e;
         auto k = sqlite3_column_text(stmt, 0);
-        if (k) e.key = reinterpret_cast<const char*>(k);
+        if (k)
+            e.key = reinterpret_cast<const char*>(k);
         auto v = sqlite3_column_text(stmt, 1);
-        if (v) e.value = reinterpret_cast<const char*>(v);
+        if (v)
+            e.value = reinterpret_cast<const char*>(v);
         auto u = sqlite3_column_text(stmt, 2);
-        if (u) e.updated_by = reinterpret_cast<const char*>(u);
+        if (u)
+            e.updated_by = reinterpret_cast<const char*>(u);
         e.updated_at = sqlite3_column_int64(stmt, 3);
         results.push_back(std::move(e));
     }
@@ -118,9 +123,9 @@ std::optional<RuntimeConfigEntry> RuntimeConfigStore::get(const std::string& key
 
     std::lock_guard lock(mu_);
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT key, value, updated_by, updated_at FROM runtime_config WHERE key = ?",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(
+            db_, "SELECT key, value, updated_by, updated_at FROM runtime_config WHERE key = ?", -1,
+            &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
 
     sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
@@ -129,11 +134,14 @@ std::optional<RuntimeConfigEntry> RuntimeConfigStore::get(const std::string& key
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         RuntimeConfigEntry e;
         auto k = sqlite3_column_text(stmt, 0);
-        if (k) e.key = reinterpret_cast<const char*>(k);
+        if (k)
+            e.key = reinterpret_cast<const char*>(k);
         auto v = sqlite3_column_text(stmt, 1);
-        if (v) e.value = reinterpret_cast<const char*>(v);
+        if (v)
+            e.value = reinterpret_cast<const char*>(v);
         auto u = sqlite3_column_text(stmt, 2);
-        if (u) e.updated_by = reinterpret_cast<const char*>(u);
+        if (u)
+            e.updated_by = reinterpret_cast<const char*>(u);
         e.updated_at = sqlite3_column_int64(stmt, 3);
         result = std::move(e);
     }
@@ -149,8 +157,8 @@ std::string RuntimeConfigStore::get_value(const std::string& key) const {
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
-                                                          const std::string& value,
-                                                          const std::string& updated_by) {
+                                                         const std::string& value,
+                                                         const std::string& updated_by) {
     if (!db_)
         return std::unexpected("store not open");
 
@@ -176,7 +184,7 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
 
     if (key == "log_level") {
         static const std::vector<std::string> valid_levels = {"trace", "debug", "info", "warn",
-                                                               "error"};
+                                                              "error"};
         if (std::find(valid_levels.begin(), valid_levels.end(), value) == valid_levels.end())
             return std::unexpected("value must be one of: trace, debug, info, warn, error");
     }
@@ -220,8 +228,8 @@ bool RuntimeConfigStore::remove(const std::string& key) {
 
     std::lock_guard lock(mu_);
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM runtime_config WHERE key = ?", -1, &stmt,
-                           nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "DELETE FROM runtime_config WHERE key = ?", -1, &stmt, nullptr) !=
+        SQLITE_OK)
         return false;
 
     sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);

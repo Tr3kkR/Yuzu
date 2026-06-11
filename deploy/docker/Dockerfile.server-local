@@ -11,8 +11,10 @@
 
 FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 
+# libpq5 replaced libsqlite3-0 in #1318 — mirrors Dockerfile.server stage 3
+# (SQLite is statically linked from vcpkg; see the comment there).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libsqlite3-0 ca-certificates \
+    libssl3 libpq5 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     && mkdir -p /var/lib/yuzu /etc/yuzu \
