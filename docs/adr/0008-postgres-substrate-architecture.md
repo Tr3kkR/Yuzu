@@ -72,3 +72,23 @@ is built and verified **before** the substrate timeline is committed — the #37
 - `vcpkg.json` gains `libpq`; `meson.build` wires a `libpq_dep` with `include_type: 'system'`.
   The Windows static-link result from the canary can still reshape the timeline (fallback:
   dynamic libpq / dynamic Windows server) — which is exactly why the canary is first.
+
+## Correction (2026-06-10) — Windows linkage is dynamic, and that was already the norm
+
+The F0 canary (PR #1331, #1317) surfaced a false premise in this ADR's Context and Decision:
+`triplets/x64-windows.cmake` does **not** force static linkage globally — its base is
+`VCPKG_LIBRARY_LINKAGE dynamic`, with a static override scoped to the gRPC stack only
+(`abseil|grpc|protobuf|upb|re2|c-ares|utf8-range`, the #375 fix). OpenSSL and sqlite3 are
+already DLLs on Windows, bundled into the release zip by the vcpkg-bin DLL sweep
+(`release.yml` packaging step). "We already static-link OpenSSL" above is therefore wrong
+for Windows, and "the MSVC triplet forces static linkage" describes only the gRPC stack.
+
+What the canary actually proved — and what the #375 lesson actually requires — is that
+libpq **builds at the pinned baseline and links on MSVC with no LNK2005/LNK2038-class
+errors**. It does, as a DLL + import lib, consistent with the existing Windows shipping
+model: `libpq.dll` rides the same release-zip DLL sweep as `sqlite3.dll` and the OpenSSL
+DLLs. **Decision consequence: the substrate proceeds with dynamic libpq on Windows.** If a
+future requirement forces static libpq (e.g. single-file server distribution), add `libpq`
+to the triplet's static-override regex and re-run the canary — the meson wiring already
+lists the static closure (pgcommon/pgport + system libs) so no build-graph change is needed.
+Linux/macOS remain fully static as assumed.
