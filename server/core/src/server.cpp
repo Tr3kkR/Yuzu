@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_blast_radius.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -1527,6 +1528,44 @@ public:
                 // shared path. Gateway service exists only in gateway mode.
                 if (gateway_service_)
                     gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
+
+                // D3 fleet-incident alerting (docs/dex-brd-coverage.md): N
+                // distinct devices reporting the same (obs_type, subject)
+                // inside the window → one operator notification + one
+                // webhook/offload event per cooldown. Wired before traffic
+                // (set-before-traffic contract on the detector).
+                blast_radius_detector_.set_on_incident([this](const BlastRadiusIncident& inc) {
+                    const std::string what = inc.subject.empty()
+                                                 ? inc.obs_type
+                                                 : inc.obs_type + " '" + inc.subject + "'";
+                    const std::string title = "Fleet incident: " + what + " on " +
+                                              std::to_string(inc.device_count) + " devices";
+                    const std::string message =
+                        std::to_string(inc.device_count) + " distinct devices reported " +
+                        what + " within the last " + std::to_string(inc.window_seconds / 60) +
+                        " minutes. See /dex for the drill-down.";
+                    spdlog::warn("BlastRadius: {}", title);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Same dual-sink discipline as agent.registered (HP-1/UP-6):
+                    // build the body once, guard each sink separately.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.blast_radius"},
+                                                  {"obs_type", inc.obs_type},
+                                                  {"subject", inc.subject},
+                                                  {"device_count", inc.device_count},
+                                                  {"window_seconds", inc.window_seconds}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.blast_radius", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.blast_radius", body);
+                    }
+                });
+                agent_service_.set_blast_radius_detector(&blast_radius_detector_);
+                if (gateway_service_)
+                    gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
             }
         }
 
@@ -8202,6 +8241,10 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    /// D3 fleet-incident detector — fed by the shared Guardian ingest (both
+    /// paths); its on_incident sink fans out to notification + webhook +
+    /// offload. Plain member (no heap): in-memory derived state only.
+    BlastRadiusDetector blast_radius_detector_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
     DefaultCertSet default_cert_set_;

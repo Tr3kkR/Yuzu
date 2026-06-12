@@ -83,7 +83,7 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 | 29 | App crashes — foreground vs background (RFP Q) | **Covered** | Strong answer today: `app.error_popup` (Application Popup 26) = the dialog the user actually saw; `process.crashed` without paired popup = silent/background. Crash type + faulting module + per-device impact all in `/dex` |
 | 30 | App usage pattern analysis | Planned | **B1/B2** usage metering + **B4** analytics |
 | 31 | Java usage (version, time, parent apps) (RFP Q) | Planned | **B5** — TAR process births already record java/javaw launches + parent; add version enrich + report |
-| 32 | App anomalies + blast radius | Planned | **D3** — N distinct devices emitting same (obs_type, subject) in window → alert. Projection already supports the GROUP BY |
+| 32 | App anomalies + blast radius | **Covered** (D3, 2026-06-12) | `BlastRadiusDetector` at the shared Guardian ingest chokepoint (both direct + gateway paths): ≥5 distinct devices, same (obs_type, subject), 15-min window → operator notification + `dex.blast_radius` webhook/offload event, 1 h per-pair cooldown |
 | 33 | Application auto discovery | **Covered** | installed_apps plugin (installed) + TAR process births (actually-running) |
 | 34 | Foreground vs background app time | Planned | **B1** foreground tracker |
 
@@ -257,7 +257,7 @@ operator (MCP tools, A1–A4 invariants, machine-readable errors). The BRD's −
 | 134 | Proactive issue resolution (−60%) | **Partial** | Guardian enforce + policy engine + agentic workers |
 | 135 | Automated diagnostics | **Covered** | diagnostics plugin + MCP — an agentic worker runs full diagnostic sweeps today |
 | 136 | Proactive alerts (+ raise ticket) | **Partial** | Notifications + webhooks + SSE live; metric thresholds → A3/F1 |
-| 137 | Crash/down detection + blast radius (RFP Q) | Planned | **D3** |
+| 137 | Crash/down detection + blast radius (RFP Q) | **Covered** (D3, 2026-06-12) | See row 32 — same detector; thresholds hardcoded sane defaults until F1 makes them operator-configurable |
 | 138 | Real-time end-user recommendations (reboot nudge etc.) | Deferred | Was **D2** — dropped 2026-06-12 (user-facing interaction out for now); machinery (`os.uptime_report` + interaction plugin) exists when revisited |
 
 ### Cat 19 — Employee Sentiment (rows 139–143)
@@ -352,7 +352,7 @@ at PR-to-dev time.
 |---|---|---|---|
 | **D1** | **Windows state-poll collector** (`dex_win_poll`): `storage.low` parity (fixed-drive free-space poll, ≥90% full or <5 GiB) + battery health (`hw.error` subject=battery when FullCharged/Designed <80%, via IOCTL_BATTERY). Poll-and-latch (emit on transition), mirrors the proven macOS IOKit-poll pattern. Zero server change — both obs_types already in the display catalogue | 20, 21 | **SHIPPED 2026-06-12** — agent suite green (526 cases); live-fire pending a real low-disk/degraded-battery specimen |
 | ~~D2~~ | ~~Reboot-nudge content pack~~ | 138 | **Dropped 2026-06-12** — user-facing interaction out for now |
-| D3 | Blast-radius alerting: server-side detector — N distinct devices, same (obs_type, subject), sliding window → NotificationStore + webhook event | 32, 137, 27 | Pure server; projection query exists |
+| D3 | Blast-radius alerting: server-side detector — N distinct devices, same (obs_type, subject), sliding window → NotificationStore + webhook event | 32, 137, 27 | **SHIPPED 2026-06-12** (`dex_blast_radius.{hpp,cpp}` at the shared ingest chokepoint; server suite green, 2278 cases). Thresholds (5 devices / 15 min / 1 h cooldown) hardcoded until F1 |
 | D4 | Failed-logon counts: scheduled Security-log 4625 counts per device (no usernames/IPs) | 67 | **Decided 2026-06-12: build counts-only**; needs agent privilege-model procedure |
 | D5 | Driver inventory action (wmi/hardware plugin): installed driver list w/ versions + date | 115 | Small plugin addition |
 
