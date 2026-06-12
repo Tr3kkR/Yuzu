@@ -375,6 +375,9 @@ yuzu_server_core_lib = static_library(
     # header-only; canary_main.cpp is the separate yuzu_pg_canary exe below.
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
+    # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
+    # secret columns. Depends on the yuzu_key_provider leaf target above.
+    'src/pg/secret_codec.cpp',
     'src/rate_limiter.cpp',
     'src/cert_reloader.cpp',
     'src/x509_ca.cpp',
