@@ -63,6 +63,11 @@ struct RestGsHarness {
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
 
+    // When false, perm_fn denies (403) — lets a test prove the permission gate
+    // runs BEFORE any audit emission on the DEX read surface (default grants,
+    // preserving every other test's behaviour).
+    bool grant_perms{true};
+
     std::vector<AuditRecord> audit_log;
 
     RestApiV1 api;
@@ -84,10 +89,14 @@ struct RestGsHarness {
             return s;
         };
 
-        // perm_fn always grants — RBAC is exercised in test_rbac_store.cpp.
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool {
-            return true;
+        // perm_fn grants unless grant_perms is flipped off (then 403, mirroring
+        // the production perm_fn) — RBAC proper is exercised in test_rbac_store.cpp.
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            if (grant_perms)
+                return true;
+            res.status = 403;
+            return false;
         };
 
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
@@ -125,6 +134,23 @@ struct RestGsHarness {
         // sqlite WAL/SHM siblings
         fs::remove(db_path.string() + "-wal");
         fs::remove(db_path.string() + "-shm");
+    }
+
+    // Seed one ruleless DEX observation (the __observation__ projection the DEX
+    // aggregations read — matches seed_signal in test_dex_routes.cpp). subject +
+    // platform land in detail_json so dex_signal_subjects / _by_os pick them up.
+    void seed_obs(const std::string& id, const std::string& agent, const std::string& obs_type,
+                  const std::string& subject, const std::string& platform, const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = obs_type;
+        e.severity = "info";
+        e.detail_json =
+            "{\"subject\":\"" + subject + "\",\"platform\":\"" + platform + "\"}";
+        e.timestamp = ts;
+        REQUIRE(store->insert_event(e).has_value());
     }
 
     static std::string make_rule_body(const std::string& rule_id, const std::string& name,
@@ -589,4 +615,135 @@ TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_sta
                              {{"If-None-Match", etag}});
     REQUIRE(cached);
     CHECK(cached->status == 304);
+}
+
+// ── DEX read-model aggregation surface (/api/v1/dex/*) — ar-S1 agentic parity ─
+//
+// The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
+// per-OS scope are fleet aggregates and must NOT audit; the per-signal drill-down
+// returns a most-affected DEVICES list (agent_ids — behavioral) and MUST emit the
+// same dex.signal.view verb the dashboard fragment does. Both halves are asserted.
+
+TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audited",
+          "[rest][dex][signals]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "WS-1", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/signals?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+
+    int64_t crashed_count = -1, crashed_devices = -1;
+    bool saw_boot = false;
+    for (const auto& row : j["data"]) {
+        if (row["obs_type"].get<std::string>() == "process.crashed") {
+            crashed_count = row["count"].get<int64_t>();
+            crashed_devices = row["distinct_devices"].get<int64_t>();
+        }
+        if (row["obs_type"].get<std::string>() == "os.boot")
+            saw_boot = true;
+    }
+    CHECK(crashed_count == 2);
+    CHECK(crashed_devices == 2);
+    CHECK(saw_boot);
+    // Fleet aggregate — no individual-identifying access, so no audit.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "MB-1", "storage.low", "disk", "macos", "2026-06-10T12:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/scope?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+
+    int64_t macos_types = -1;
+    for (const auto& row : j["data"]) {
+        if (row["platform"].get<std::string>() == "macos")
+            macos_types = row["distinct_types"].get<int64_t>();
+    }
+    CHECK(macos_types == 2); // process.crashed + storage.low
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + returns the shape",
+          "[rest][dex][signals][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["obs_type"].get<std::string>() == "process.crashed");
+    REQUIRE(j["data"]["subjects"].is_array());
+    REQUIRE(j["data"]["by_os"].is_array());
+    REQUIRE(j["data"]["devices"].is_array());
+    REQUIRE(j["data"]["by_day"].is_array());
+    CHECK(j["data"]["devices"].size() == 2); // WS-1 + WS-2
+    CHECK(j["data"]["subjects"][0]["subject"].get<std::string>() == "chrome.exe");
+
+    // Behavioral-PII access → exactly one dex.signal.view, same target shape as
+    // the /fragments/dex/catalogue/signal route (governance B4).
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& a = h.audit_log[0];
+    CHECK(a.action == "dex.signal.view");
+    CHECK(a.result == "success");
+    CHECK(a.target_type == "ObsType");
+    CHECK(a.target_id == "process.crashed");
+}
+
+TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",
+          "[rest][dex][signals]") {
+    RestGsHarness h; // empty store
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["subjects"].empty());
+    CHECK(j["data"]["devices"].empty());
+    // The operator requested an individual-identifying view; audit the access
+    // regardless of whether the read-model happened to hold matching rows.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.signal.view");
+}
+
+TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[rest][dex][signals]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    // Validation precedes audit — a rejected malformed request leaves no trace
+    // of a behavioral-view access that never happened.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[rest][dex][signals]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
+          "[rest][dex][rbac]") {
+    RestGsHarness h;
+    h.grant_perms = false; // perm_fn denies → 403
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // No audit emission on a denied request — the permission check is the first
+    // statement in the handler, before the dex.signal.view audit.
+    CHECK(h.audit_log.empty());
 }

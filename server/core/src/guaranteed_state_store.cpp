@@ -1151,6 +1151,180 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     return out;
 }
 
+std::vector<DexSubjectCount>
+GuaranteedStateStore::dex_signal_subjects(const std::string& obs_type, const std::string& since,
+                                          int limit) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexSubjectCount> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT subject, COUNT(*), COUNT(DISTINCT agent_id), MAX(observed_at)
+        FROM guardian_observations
+        WHERE obs_type = ?1 AND observed_at >= ?2 AND subject <> ''
+        GROUP BY subject
+        ORDER BY COUNT(*) DESC, subject ASC
+        LIMIT ?3
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexSubjectCount c;
+        c.subject = col_text(st.get(), 0);
+        c.count = sqlite3_column_int64(st.get(), 1);
+        c.distinct_devices = sqlite3_column_int64(st.get(), 2);
+        c.last_seen = col_text(st.get(), 3);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<DexOsCrashCount>
+GuaranteedStateStore::dex_signal_by_os(const std::string& obs_type, const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexOsCrashCount> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT platform, COUNT(*), COUNT(DISTINCT agent_id)
+        FROM guardian_observations
+        WHERE obs_type = ?1 AND observed_at >= ?2
+        GROUP BY platform
+        ORDER BY COUNT(*) DESC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexOsCrashCount c;
+        c.platform = col_text(st.get(), 0);
+        c.crashes = sqlite3_column_int64(st.get(), 1); // generic event count
+        c.distinct_devices = sqlite3_column_int64(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<DexDeviceCrashCount>
+GuaranteedStateStore::dex_signal_devices(const std::string& obs_type, const std::string& since,
+                                         int limit) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexDeviceCrashCount> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT agent_id, COUNT(*), MAX(observed_at)
+        FROM guardian_observations
+        WHERE obs_type = ?1 AND observed_at >= ?2
+        GROUP BY agent_id
+        ORDER BY COUNT(*) DESC, agent_id ASC
+        LIMIT ?3
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexDeviceCrashCount c;
+        c.agent_id = col_text(st.get(), 0);
+        c.crashes = sqlite3_column_int64(st.get(), 1); // generic event count
+        c.last_seen = col_text(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<DexDayCrashCount>
+GuaranteedStateStore::dex_signal_by_day(const std::string& obs_type, const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexDayCrashCount> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT substr(observed_at, 1, 10) AS day, COUNT(*)
+        FROM guardian_observations
+        WHERE obs_type = ?1 AND observed_at >= ?2
+        GROUP BY day
+        ORDER BY day ASC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexDayCrashCount c;
+        c.day = col_text(st.get(), 0);
+        c.crashes = sqlite3_column_int64(st.get(), 1); // generic event count
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<DexOsScope> GuaranteedStateStore::dex_os_signal_scope(const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexOsScope> out;
+    if (!db_)
+        return out;
+    // Per-OS coverage: how many distinct signal types each platform reports +
+    // its total events. Drives the live "macOS collects N of 104" caption
+    // (replaces the mockups' stale hardcoded counts).
+    const char* sql = R"(
+        SELECT platform, COUNT(DISTINCT obs_type), COUNT(*)
+        FROM guardian_observations
+        WHERE observed_at >= ?1 AND platform <> ''
+        GROUP BY platform
+        ORDER BY COUNT(*) DESC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexOsScope c;
+        c.platform = col_text(st.get(), 0);
+        c.distinct_types = sqlite3_column_int64(st.get(), 1);
+        c.total_events = sqlite3_column_int64(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+std::vector<DexDaySignal>
+GuaranteedStateStore::dex_signal_day_matrix(const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexDaySignal> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT substr(observed_at, 1, 10) AS day, obs_type, COUNT(*)
+        FROM guardian_observations
+        WHERE observed_at >= ?1
+        GROUP BY day, obs_type
+        ORDER BY day ASC, obs_type ASC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexDaySignal c;
+        c.day = col_text(st.get(), 0);
+        c.obs_type = col_text(st.get(), 1);
+        c.count = sqlite3_column_int64(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
 DexBootStats GuaranteedStateStore::dex_boot_stats(const std::string& since) const {
     std::shared_lock lock(mtx_);
     DexBootStats s;

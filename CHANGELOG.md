@@ -97,20 +97,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **DEX dashboard (`/dex`) — fleet reliability lens over a 103-signal
-  catalogue.** A new read-only dashboard reinterprets ruleless Guardian
-  observations as Digital Employee Experience: crash-free-device % and
-  crashes/1k-device-days headline rates (cross-store fleet denominator,
-  honest "—" when no agents report), an always-visible All-signals panel
-  (every monitored type across 12 groups — App reliability, Boot/start-up &
-  shutdown, Service health, System stability, Hardware & storage, File
-  system, Network, Identity & logon, Security & protection, Updates &
-  installs, Policy & management, Printing — quiet types as real-zero rows),
-  boot/resume performance panels (duration metrics), hang-aware top-apps,
-  and per-app / per-device drill-downs (the device view is permission-gated
-  and audit-logged: behavioral data). A "DEX" nav link is in the dashboard
-  chrome. NO mock data anywhere: real aggregations or explicit "no data"
-  placeholders.
+- **macOS DEX collector — limited, unprivileged.** The DEX observer now ships a
+  macOS collector (`dex_macos_collector.cpp` + the pure parsers
+  `dex_macos_{signals,oslog,iokit}.{hpp,cpp}`) using four privilege-light
+  mechanisms — a kqueue `DiagnosticReports` folder-watch (`.ips`/`.diag`
+  crashes/hangs/panics/jetsam), a `sysctl(KERN_BOOTTIME)` uptime scalar, an
+  incremental `log show` unified-log poll, and an IOKit/system-tool poll
+  (SMART/battery/disk/thermal/memory). It reuses the OS-neutral obs_types, so no
+  server or dashboard change is needed beyond one macOS-only type — `storage.low`
+  (disk nearly full) — bringing the catalogue to **104**. Covers ~10 of 11 DEX
+  experience headings unprivileged; the Security heading (XProtect/Gatekeeper) is
+  not yet shipped. Privacy is minimised at the edge (faulting-image basenames
+  only, never raw log message bodies; per-type rate caps; non-finite metric
+  guards). Obeys the same `--dex-disable` kill switch as Windows. Linux endpoints
+  still report no DEX signals. Source mapping + the Endpoint-Security entitlement
+  roadmap: `docs/dex-signal-catalog.md`.
+- **DEX dashboard (`/dex`) — a hub plus three deep pages.** The read-only fleet-
+  reliability lens over the Guardian observation catalogue is structured as a
+  **hub** (measured crash-free-device % and crashes/1k-device-days, honest "—"
+  when no agents report) that summarises and links into three deep pages:
+  **Catalogue** (all 104 monitored signal types across 12 families — App
+  reliability, Boot/start-up & shutdown, Service health, System stability,
+  Hardware & storage, File system, Network, Identity & logon, Security &
+  protection, Updates & installs, Policy & management, Printing — quiet types as
+  real-zero rows, with per-type drill-down and an "Other" bucket for uncatalogued
+  types a newer agent emits), **Health score** (a transparent, *secondary* 0–100
+  composite — `100 − Σ weighted deductions` — suppressed, never fabricated, when
+  no agents report), and **Trends** (cross-OS comparison cards carrying each OS's
+  live signal scope, per-family sparklines, and a guard×day activity heatmap). A
+  24h/7d/30d/All window selector applies to every view; per-app and per-device
+  drill-downs (and the per-signal device list) are permission-gated
+  (`GuaranteedState:Read`) and audit-logged on open (behavioral data). A "DEX"
+  nav link is in the dashboard chrome. NO mock data anywhere: real aggregations
+  or explicit "no data" placeholders.
+- **DEX REST + MCP aggregation surface (`/api/v1/dex/*`, MCP `*_dex_signal*`
+  tools) — agentic parity.** The DEX dashboard rollups now have machine-readable
+  equivalents on both agentic planes so a worker sees the same read-model the
+  dashboard does. REST: `GET /api/v1/dex/signals` (the catalogue rollup), `GET
+  /api/v1/dex/scope` (per-OS signal coverage), and `GET
+  /api/v1/dex/signals/{obs_type}` (one signal's subjects / OS split /
+  most-affected devices / per-day trend). MCP: the matching `list_dex_signals`,
+  `get_dex_signal_scope`, and `get_dex_signal_detail` read tools. All gated on
+  `GuaranteedState:Read` with a `24h/7d/30d/all` `window` and a shared resolver
+  so REST, MCP and the dashboard can never drift on the window vocabulary. Audit
+  boundary mirrors the events endpoint across all three surfaces: the rollup and
+  scope are fleet aggregates (not audited as a view); the per-signal drill-down
+  returns a behavioral devices list and emits `dex.signal.view` on every call.
 - **Guardian DEX — 103-signal observation catalogue (waves 1–3).** The
   slice-1 crash recorder generalized into one catalogue-driven multi-channel
   observer (`dex_signal_catalog.{hpp,cpp}` + `dex_observer.{hpp,cpp}`,

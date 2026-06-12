@@ -87,7 +87,12 @@ TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catal
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    CHECK(types.size() == std::size(kAllObsTypes)); // the catalogue contract: 103 signals
+    // The Windows AGENT catalogue contract: exactly 103 obs_types. The SERVER's
+    // display catalogue (dex_signal_groups(), pinned at 104 by test_dex_routes.cpp)
+    // is intentionally one larger — it adds the macOS-only `storage.low`, which the
+    // Windows agent never emits. The two counts therefore differ by the macOS-only
+    // set BY DESIGN; each side's drift-net still bites for its own additions.
+    CHECK(types.size() == std::size(kAllObsTypes)); // 103 Windows signals
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
 }
@@ -1112,9 +1117,20 @@ TEST_CASE("make_dex_observer is never null", "[crash][factory]") {
     auto obs = make_dex_observer();
     REQUIRE(obs != nullptr);
     CHECK(obs->armed_channels() == 0); // not started yet
-#if !defined(_WIN32)
-    // Off Windows the engine is a no-op until the Linux/macOS collector slices
-    // land (gated behind broader Guardian Linux/macOS work).
+#if defined(__APPLE__)
+    // The macOS collector slice has landed, so make_dex_observer() is no longer a
+    // no-op off Windows — it returns the kqueue/sysctl/OSLog collector. Whether
+    // start() actually arms depends on the runtime (a DiagnosticReports directory
+    // must be watchable), so we don't assert its return; we exercise the
+    // start()/stop() lifecycle to confirm it neither crashes nor hangs (the
+    // EVFILT_USER stop path — governance cs-S1). The signal parsers themselves
+    // are covered by the [dex_macos] suite.
+    bool fired = false;
+    (void)obs->start([&](const SignalObservation&) { fired = true; });
+    obs->stop();
+#elif !defined(_WIN32)
+    // On Linux the engine is still a no-op until that collector slice lands
+    // (gated behind broader Guardian Linux work).
     bool fired = false;
     CHECK_FALSE(obs->start([&](const SignalObservation&) { fired = true; }));
     obs->stop();

@@ -3,26 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mockup — DEX reliability overview (crash-only MVP)</title>
+<title>Mockup — DEX overview (hub)</title>
 <!--
-  STANDALONE MOCKUP (throwaway, no compile). Real dashboard palette (navy),
-  reuses the guardian-overview.html conventions. Fake data.
+  STANDALONE MOCKUP (throwaway, no compile). The /dex LANDING PAGE, reworked as a
+  HUB: an at-a-glance executive summary that routes into the three deep pages
+  (dex-catalogue.html, dex-health-score.html, dex-trends.html). Supersedes the
+  old crash-only overview.
 
-  DEX = a capability-limited READ MODEL over the one Guardian event store. This is
-  the crash-only RELIABILITY lens (the only DEX-shaped signal that exists today —
-  process.crashed). Design rules baked in from the grill:
-   • MEASURED RATE headline, NOT a synthetic 0-100 score (composite is deferred
-     until a 2nd signal exists to composite — shown as a locked placeholder).
-   • COVERAGE-HONESTY: every experience number is paired with a coverage number;
-     disarmed/offline devices are EXCLUDED from the crash-free denominator (not
-     counted as healthy); rates are NEVER compared across populations with
-     different coverage (the per-OS caveat).
-   • OS-NEUTRAL vocabulary (App crash / App not responding / Kernel panic / Low
-     memory) — never WER/ETW/event-ID terms. macOS + Linux are first-class in the
-     layout though their collectors are a later slice (shown "collector pending").
-   • Device + App + Module entity. No employee/location slicing (deferred).
-   • Idle-until-crash: crashes are sparse, pushed only when they happen — no extra
-     fleet traffic, same network-kind discipline as Guardian.
+  Hub principle: summarise + link, don't duplicate. Each section shows the
+  headline figure and a "->" into the page that owns the detail.
+   - Measured headline stays PRIMARY = crash-free devices (the real number).
+   - Three EXPLORE cards make the deep pages first-class, not buried.
+   - Composite health appears as a DERIVED teaser, never the headline.
+   - Cross-OS teaser carries the coverage caveat (macOS = 6 of 103 types).
+   - Coverage-honesty everywhere; unreachable devices excluded, not "healthy".
+  Fake data, consistent across all four mockups.
 -->
 <style>
   :root{
@@ -32,89 +27,145 @@
   }
   *{box-sizing:border-box}
   body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
-  .wrap{max-width:900px;margin:0 auto}
-  h2{font-size:1.1rem;margin:0 0 .15rem;color:var(--white)}
-  .sub{color:var(--muted);font-size:.78rem;margin-bottom:1rem}
-  .win{display:flex;gap:.3rem;align-items:center;font-size:.7rem;color:var(--muted);margin-bottom:1rem}
-  .win b{border:1px solid var(--border);border-radius:.3rem;padding:.1rem .45rem;cursor:pointer;color:var(--muted)}
-  .win b.on{color:var(--white);border-color:var(--accent)}
-  .win .spacer{margin-left:auto}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:1.4rem;margin:0;color:var(--white);font-weight:700}
+  .sub{color:var(--muted);font-size:.78rem;margin-top:.3rem}
+  a{color:var(--accent);text-decoration:none}
 
-  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.1rem 0 .45rem}
-  .strip{display:flex;flex-wrap:wrap;gap:.55rem}
-  .stat{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.55rem .8rem;min-width:140px;flex:1}
-  .stat .n{font-size:1.45rem;font-weight:700;color:var(--white);line-height:1.1}
-  .stat .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-  .stat .sx{font-size:.62rem;color:var(--muted);margin-top:.12rem}
-  .n.good{color:var(--green)} .n.warn{color:var(--yellow)} .n.bad{color:var(--red)} .n.info{color:var(--lightblue)}
-  /* coverage tile — the load-bearing honesty caveat; visually distinct (info) */
-  .stat.cov{border-color:rgba(165,214,255,.45);background:linear-gradient(180deg,rgba(165,214,255,.06),transparent)}
-  .stat.locked{border-style:dashed;opacity:.7}
-  .stat.locked .n{color:var(--slate)}
+  .subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border);padding-bottom:.7rem;margin-bottom:1rem;flex-wrap:wrap}
+  .subnav a{font-size:.78rem;color:var(--muted);border:1px solid transparent;border-radius:.35rem;padding:.22rem .6rem}
+  .subnav a.on{color:var(--white);border-color:var(--accent)}
+  .subnav .sp{margin-left:auto;font-size:.7rem;color:var(--muted)}
 
-  /* crashes-per-day trend (single series; one signal) */
-  .trend{display:flex;align-items:flex-end;gap:.4rem;height:84px;margin-top:.5rem}
+  .topline{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap}
+  .filters{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+  .chip{font-size:.7rem;padding:.22rem .6rem;border-radius:.35rem;border:1px solid var(--border);color:var(--muted);background:var(--surface);cursor:pointer}
+  .chip.on{color:var(--white);border-color:var(--accent)}
+
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.4rem 0 .55rem;display:flex;align-items:baseline;gap:.6rem}
+  .sech a{font-size:.66rem;font-weight:600;margin-left:auto;text-transform:none;letter-spacing:0}
+
+  /* measured headline tiles */
+  .tiles{display:flex;flex-wrap:wrap;gap:.55rem}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.6rem .85rem;min-width:150px;flex:1}
+  .tile .n{font-size:1.5rem;font-weight:700;color:var(--white);line-height:1.1}
+  .tile .n.good{color:var(--green)} .tile .n.warn{color:var(--yellow)} .tile .n.bad{color:var(--red)} .tile .n.info{color:var(--lightblue)}
+  .tile .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .tile .sx{font-size:.62rem;color:var(--muted);margin-top:.12rem}
+  .tile .meas{font-size:.56rem;color:var(--green);border:1px solid rgba(78,210,126,.45);border-radius:.3rem;padding:.02rem .35rem;margin-left:.3rem;vertical-align:middle}
+  .tile.cov{border-color:rgba(165,214,255,.45);background:linear-gradient(180deg,rgba(165,214,255,.06),transparent)}
+
+  /* explore cards — the prominent links to the 3 deep pages */
+  .explore{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.7rem}
+  .xcard{display:block;background:var(--surface);border:1px solid var(--border);border-radius:.6rem;padding:.85rem 1rem;
+    color:var(--fg);transition:border-color .12s,transform .12s}
+  .xcard:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .xcard .xh{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+  .xcard .xt{font-size:.92rem;color:var(--white);font-weight:600}
+  .xcard .xcta{font-size:.7rem;color:var(--accent)}
+  .xcard .xbig{display:flex;align-items:baseline;gap:.5rem;margin:.45rem 0 .2rem}
+  .xcard .xn{font-size:1.6rem;font-weight:700;color:var(--white);line-height:1}
+  .xcard .xn.good{color:var(--green)} .xcard .xn.warn{color:var(--yellow)}
+  .xcard .xpill{font-size:.56rem;color:var(--slate);border:1px solid var(--border);border-radius:.3rem;padding:.02rem .35rem}
+  .xcard .xdesc{font-size:.66rem;color:var(--muted);margin-top:.35rem;border-top:1px solid var(--border);padding-top:.4rem}
+  .xcard .xdesc b{color:var(--lightblue)}
+  .ring{flex-shrink:0}
+
+  /* crashes-per-day trend */
+  .trend{display:flex;align-items:flex-end;gap:.4rem;height:84px;margin-top:.3rem}
   .tcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:.2rem}
   .tbar{width:58%;background:var(--red);border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
   .tcol small{font-size:.56rem;color:var(--muted)}
 
-  /* signal-type chips — shows the catalogue the layout grows into */
-  .sigrow{display:flex;flex-wrap:wrap;gap:.5rem}
-  .sig{background:var(--surface);border:1px solid var(--border);border-radius:.45rem;padding:.45rem .7rem;min-width:150px;flex:1}
-  .sig .st{font-size:.72rem;color:var(--white);font-weight:600}
-  .sig .sv{font-size:1.15rem;font-weight:700;color:var(--white)}
-  .sig .sp{font-size:.6rem;color:var(--muted)}
-  .sig.pending{opacity:.55;border-style:dashed}
-  .sig.pending .sv{color:var(--slate);font-size:.74rem;font-weight:600}
-
-  table{width:100%;border-collapse:collapse;font-size:.76rem;margin-top:.2rem}
-  th{text-align:left;padding:.4rem .5rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
-  td{padding:.4rem .5rem;border-bottom:1px solid var(--border)}
+  table{width:100%;border-collapse:collapse;font-size:.78rem;margin-top:.1rem}
+  th{text-align:left;padding:.42rem .55rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
+  td{padding:.42rem .55rem;border-bottom:1px solid var(--border)}
   tr.click{cursor:pointer} tr.click:hover td{background:var(--surface)}
-  .name{color:var(--white);font-weight:600}
-  .num{text-align:right;font-variant-numeric:tabular-nums}
-  .muted{color:var(--muted)}
-  .pill{font-size:.6rem;border:1px solid var(--border);border-radius:.3rem;padding:.05rem .35rem;color:var(--muted)}
-  .os-win{color:var(--lightblue)} .os-mac{color:var(--fg)} .os-lin{color:var(--green)}
-  .cov-bad{color:var(--yellow)} .cov-none{color:var(--slate)}
+  .name{color:var(--white);font-weight:600} .num{text-align:right;font-variant-numeric:tabular-nums} .muted{color:var(--muted)}
+  .pill{font-size:.58rem;border:1px solid var(--border);border-radius:.3rem;padding:.05rem .35rem;color:var(--muted)}
   .barcell{display:flex;align-items:center;gap:.45rem}
   .minibar{height:8px;border-radius:2px;background:var(--red);min-width:2px;opacity:.8}
+  .os-win{color:var(--lightblue)} .os-mac{color:var(--fg)} .os-lin{color:var(--slate)}
+  .cov-none{color:var(--slate)}
 
-  .caveat{font-size:.68rem;color:var(--yellow);background:rgba(255,204,0,.07);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .6rem;margin-top:.45rem}
-  .note{margin-top:1.3rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .privacy{font-size:.68rem;color:var(--lightblue);background:rgba(165,214,255,.06);border:1px solid rgba(165,214,255,.25);border-radius:.4rem;padding:.4rem .6rem;margin:.5rem 0}
+  .caveat{font-size:.68rem;color:var(--yellow);background:rgba(255,204,0,.07);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .6rem;margin:.5rem 0}
+  .note{margin-top:1.4rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
   .note b{color:var(--lightblue)}
-  a.dl{color:var(--accent);text-decoration:none}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}
+  @media(max-width:720px){.cols{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h2>Digital Employee Experience &mdash; Reliability</h2>
-  <div class="sub">A read-model over crash observations agents already report (idle-until-crash &mdash; no extra
-    fleet traffic). Figures are <b style="color:var(--lightblue)">measured</b>, not a synthetic score. Scope today:
-    the <b style="color:var(--lightblue)">Windows fleet</b> &mdash; the only OS with a reliability collector wired
-    (macOS &amp; Linux are below, collector pending).</div>
-
-  <div class="win">window:
-    <b>24h</b><b class="on">7d</b><b>30d</b>
-    <span class="spacer"></span>
-    <span>updated 2 min ago</span>
+  <div class="subnav">
+    <a class="on" href="dex-overview.html">Overview</a>
+    <a href="dex-catalogue.html">Catalogue</a>
+    <a href="dex-health-score.html">Health score</a>
+    <a href="dex-trends.html">Trends</a>
+    <span class="sp">Windows fleet &middot; 636 of 690 reporting (92%)</span>
   </div>
 
-  <!-- ───────── Headline: measured rate + coverage ───────── -->
+  <div class="topline">
+    <div>
+      <h1>Digital Employee Experience</h1>
+      <div class="sub">Fleet reliability from device signals the agents already report (idle-until-event &mdash;
+        no extra traffic). Figures are <b style="color:var(--lightblue)">measured</b>, not a synthetic score.</div>
+    </div>
+    <div class="filters">
+      <span style="font-size:.7rem;color:var(--muted)">window:</span>
+      <span class="chip" onclick="win(this)">24h</span><span class="chip on" onclick="win(this)">7d</span><span class="chip" onclick="win(this)">30d</span>
+    </div>
+  </div>
+
+  <!-- ───── Measured headline (primary) ───── -->
   <div class="sech">Reliability &mdash; measured (Windows fleet, 7d)</div>
-  <div class="strip">
-    <div class="stat"><div class="n good">97.2%</div><div class="l">Crash-free devices</div><div class="sx">618 of 636 reporting</div></div>
-    <div class="stat"><div class="n">12.3</div><div class="l">Crashes / 1k device-days</div><div class="sx">55 crashes &middot; 4,452 device-days</div></div>
-    <div class="stat"><div class="n warn">18</div><div class="l">Devices impacted</div><div class="sx">of 636 reporting</div></div>
-    <div class="stat cov"><div class="n info">92%</div><div class="l">Telemetry coverage</div><div class="sx">636 of 690 Windows reporting<br>&minus;12 observer disarmed &middot; &minus;42 offline (excluded)</div></div>
-    <div class="stat locked"><div class="n">&#128274;</div><div class="l">Reliability score</div><div class="sx">locked &mdash; needs &ge;2 signal<br>types (+ hangs, restarts)</div></div>
+  <div class="tiles">
+    <div class="tile"><div class="n good">97.2%</div><div class="l">Crash-free devices<span class="meas">measured</span></div><div class="sx">618 of 636 reporting</div></div>
+    <div class="tile"><div class="n">12.3</div><div class="l">Crashes / 1k device-days</div><div class="sx">55 crashes &middot; 4,452 device-days</div></div>
+    <div class="tile"><div class="n warn">18</div><div class="l">Devices impacted</div><div class="sx">of 636 reporting</div></div>
+    <div class="tile cov"><div class="n info">92%</div><div class="l">Telemetry coverage</div><div class="sx">636 of 690 Windows &middot; &minus;12 disarmed, &minus;42 offline (excluded)</div></div>
   </div>
-  <div class="caveat">Rates are computed only over the <b>636 reporting</b> devices. The 12 disarmed observers
-    + 42 offline devices are <b>excluded</b>, not counted as crash-free &mdash; a device we can't hear from is
-    <b>unknown</b>, not healthy. Raising coverage is the first lever, not the score.</div>
+  <div class="caveat">Rates are over the <b>636 reporting</b> devices only. Disarmed + offline devices are
+    <b>excluded</b>, not counted crash-free &mdash; a device we can&rsquo;t hear from is <b>unknown</b>, not healthy.</div>
 
-  <!-- ───────── Crashes per day ───────── -->
-  <div class="sech">Crashes per day (7d)</div>
+  <!-- ───── Explore cards: the 3 deep pages ───── -->
+  <div class="sech">Explore</div>
+  <div class="explore">
+
+    <a class="xcard" href="dex-catalogue.html">
+      <div class="xh"><span class="xt">Signal catalogue</span><span class="xcta">Browse &rarr;</span></div>
+      <div class="xbig"><span class="xn">103</span><span class="muted" style="font-size:.72rem">signal types &middot; 12 families</span></div>
+      <div class="xdesc"><b>27 active</b> in the last 7 days &middot; busiest: <b>Network</b> (433) &middot;
+        every monitored type stays visible, quiet or not.</div>
+    </a>
+
+    <a class="xcard" href="dex-health-score.html">
+      <div class="xh"><span class="xt">Experience health</span><span class="xcta">Breakdown &rarr;</span></div>
+      <div class="xbig">
+        <svg class="ring" width="46" height="46" viewBox="0 0 46 46">
+          <circle cx="23" cy="23" r="19" fill="none" stroke="#2d4068" stroke-width="5"/>
+          <circle cx="23" cy="23" r="19" fill="none" stroke="#4ed27e" stroke-width="5" stroke-linecap="round"
+            stroke-dasharray="119" stroke-dashoffset="19" transform="rotate(-90 23 23)"/>
+        </svg>
+        <span class="xn good">84</span><span class="xn warn" style="font-size:.9rem;align-self:center">Good</span>
+        <span class="xpill">derived</span>
+      </div>
+      <div class="xdesc">A transparent roll-up of all the measured rates &mdash; <b>secondary</b> to the 97.2% above.
+        <b>&minus;7</b> in App reliability vs last week (AcmeCRM.exe).</div>
+    </a>
+
+    <a class="xcard" href="dex-trends.html">
+      <div class="xh"><span class="xt">Cross-OS &amp; trends</span><span class="xcta">Compare &rarr;</span></div>
+      <div class="xbig"><span class="xn">3</span><span class="muted" style="font-size:.72rem">OS fleets &middot; per-family trends</span></div>
+      <div class="xdesc">Windows <b>103</b> types &middot; macOS <b>6</b> types (live, limited) &middot; Linux pending.
+        Read <b>down a column, never across</b> &mdash; coverage differs.</div>
+    </a>
+
+  </div>
+
+  <!-- ───── Crashes per day ───── -->
+  <div class="sech">Crashes per day (7d) <a href="dex-trends.html">all family trends &rarr;</a></div>
   <div class="trend">
     <div class="tcol"><div class="tbar" style="height:34px"></div><small>Th</small></div>
     <div class="tcol"><div class="tbar" style="height:20px"></div><small>Fr</small></div>
@@ -124,93 +175,64 @@
     <div class="tcol"><div class="tbar" style="height:72px"></div><small>Tu</small></div>
     <div class="tcol"><div class="tbar" style="height:30px"></div><small>We</small></div>
   </div>
-  <div class="sx" style="color:var(--muted);font-size:.62rem;margin-top:.2rem">Monday spike = a bad AcmeCRM.exe rollout (see Top apps).</div>
+  <div class="sx" style="color:var(--muted);font-size:.62rem;margin-top:.2rem">Monday spike = a bad AcmeCRM.exe rollout (see top apps).</div>
 
-  <!-- ───────── Signal types (the catalogue the layout grows into) ───────── -->
-  <div class="sech">Reliability signals</div>
-  <div class="sigrow">
-    <div class="sig"><div class="st">App crash</div><div class="sv">55</div><div class="sp">live &middot; 18 devices</div></div>
-    <div class="sig pending"><div class="st">App not responding</div><div class="sv">collector pending</div><div class="sp">next signal</div></div>
-    <div class="sig pending"><div class="st">Kernel panic / restart</div><div class="sv">collector pending</div><div class="sp">unlocks the score</div></div>
-    <div class="sig pending"><div class="st">Low memory</div><div class="sv">collector pending</div><div class="sp">roadmap</div></div>
+  <!-- ───── Top apps + most-affected devices, side by side ───── -->
+  <div class="cols">
+    <div>
+      <div class="sech">Top crashing apps <a href="dex-catalogue.html">App reliability &rarr;</a></div>
+      <table>
+        <thead><tr><th>Application</th><th class="num">Crashes</th><th>Blast radius</th><th>Last seen</th></tr></thead>
+        <tbody>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">AcmeCRM.exe <span class="pill">LOB</span></td><td class="num">14</td><td><div class="barcell"><span class="minibar" style="width:16px"></span>9 dev</div></td><td class="muted">3 min ago</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">chrome.exe</td><td class="num">12</td><td><div class="barcell"><span class="minibar" style="width:20px"></span>11 dev</div></td><td class="muted">12 min ago</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">Teams.exe</td><td class="num">8</td><td><div class="barcell"><span class="minibar" style="width:11px"></span>6 dev</div></td><td class="muted">26 min ago</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">Outlook.exe</td><td class="num">7</td><td><div class="barcell"><span class="minibar" style="width:9px"></span>5 dev</div></td><td class="muted">1 hr ago</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">explorer.exe</td><td class="num">5</td><td><div class="barcell"><span class="minibar" style="width:9px"></span>5 dev</div></td><td class="muted">4 hr ago</td></tr>
+        </tbody>
+      </table>
+      <div class="sx" style="color:var(--muted);font-size:.6rem;margin-top:.25rem">Blast radius = distinct devices, not crash count. Row &rarr; app detail.</div>
+    </div>
+
+    <div>
+      <div class="sech">Most-affected devices</div>
+      <div class="privacy">&#128274; <b>Behavioral data</b> &mdash; access-gated + audit-logged on open.</div>
+      <table>
+        <thead><tr><th>Device</th><th>OS</th><th class="num">Crashes</th><th>Top app</th></tr></thead>
+        <tbody>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">WS-00472</td><td class="os-win">Win 11</td><td class="num">7</td><td class="muted">AcmeCRM.exe</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">WS-01188</td><td class="os-win">Win 11</td><td class="num">5</td><td class="muted">chrome.exe</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">WS-00913</td><td class="os-win">Win 10</td><td class="num">4</td><td class="muted">AcmeCRM.exe</td></tr>
+          <tr class="click" onclick="location.href='dex-detail.html'"><td class="name">WS-02240</td><td class="os-win">Win 11</td><td class="num">3</td><td class="muted">Teams.exe</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <!-- ───────── Top crashing apps ───────── -->
-  <div class="sech">Top crashing apps</div>
+  <!-- ───── By OS (compact teaser into Trends) ───── -->
+  <div class="sech">By operating system <a href="dex-trends.html">full cross-OS &amp; trends &rarr;</a></div>
   <table>
-    <thead><tr><th>Application</th><th class="num">Crashes</th><th>Devices affected (blast radius)</th>
-      <th class="num">% of fleet</th><th>Last seen</th></tr></thead>
+    <thead><tr><th>OS</th><th class="num">Reporting</th><th class="num">Coverage</th><th class="num">Crash-free</th><th>Signal scope</th></tr></thead>
     <tbody>
-      <tr class="click"><td class="name">AcmeCRM.exe <span class="pill">line-of-business</span></td><td class="num">14</td>
-        <td><div class="barcell"><span class="minibar" style="width:16px"></span>9 devices</div></td><td class="num">1.4%</td><td class="muted">3 min ago</td></tr>
-      <tr class="click"><td class="name">chrome.exe</td><td class="num">12</td>
-        <td><div class="barcell"><span class="minibar" style="width:20px"></span>11 devices</div></td><td class="num">1.7%</td><td class="muted">12 min ago</td></tr>
-      <tr class="click"><td class="name">Teams.exe</td><td class="num">8</td>
-        <td><div class="barcell"><span class="minibar" style="width:11px"></span>6 devices</div></td><td class="num">0.9%</td><td class="muted">26 min ago</td></tr>
-      <tr class="click"><td class="name">Outlook.exe</td><td class="num">7</td>
-        <td><div class="barcell"><span class="minibar" style="width:9px"></span>5 devices</div></td><td class="num">0.8%</td><td class="muted">1 hr ago</td></tr>
-      <tr class="click"><td class="name">explorer.exe</td><td class="num">5</td>
-        <td><div class="barcell"><span class="minibar" style="width:9px"></span>5 devices</div></td><td class="num">0.8%</td><td class="muted">4 hr ago</td></tr>
+      <tr><td class="os-win">Windows</td><td class="num">636</td><td class="num">92%</td><td class="num">97.2%</td><td class="muted">103 types &middot; 12 families</td></tr>
+      <tr><td class="os-mac">macOS</td><td class="num">128</td><td class="num">90%</td><td class="num">98.4%<sup>*</sup></td><td class="muted">6 types (live, limited)</td></tr>
+      <tr><td class="os-lin">Linux</td><td class="num cov-none">0</td><td class="num cov-none">&mdash;</td><td class="num cov-none">&mdash;</td><td class="cov-none">collector pending</td></tr>
     </tbody>
   </table>
-  <div class="sx" style="color:var(--muted);font-size:.62rem;margin-top:.25rem">Blast radius = distinct devices, not crash count.
-    AcmeCRM.exe has fewer devices but high concentration &rarr; a deploy regression, not broad instability. Row &rarr; app detail.</div>
-
-  <!-- ───────── Top faulting modules + Most-affected devices, side by side ───────── -->
-  <div class="sech">Top faulting modules</div>
-  <table>
-    <thead><tr><th>Module</th><th class="num">Crashes</th><th class="num">Distinct apps</th><th>Likely meaning</th></tr></thead>
-    <tbody>
-      <tr><td class="name">ntdll.dll</td><td class="num">16</td><td class="num">7</td><td class="muted">generic / heap &amp; loader</td></tr>
-      <tr><td class="name">AcmeCRM.dll</td><td class="num">11</td><td class="num">1</td><td class="muted">app's own code</td></tr>
-      <tr><td class="name">KERNELBASE.dll</td><td class="num">7</td><td class="num">5</td><td class="muted">unhandled exception escape</td></tr>
-      <tr><td class="name">nvwgf2umx.dll</td><td class="num">5</td><td class="num">3</td><td class="muted">GPU user-mode driver</td></tr>
-      <tr><td class="name muted">&lt;unknown&gt;</td><td class="num">4</td><td class="num">3</td><td class="muted">no module in report</td></tr>
-    </tbody>
-  </table>
-
-  <div class="sech">Most-affected devices</div>
-  <table>
-    <thead><tr><th>Device</th><th>OS</th><th class="num">Crashes</th><th>Top app</th><th>Last seen</th></tr></thead>
-    <tbody>
-      <tr class="click"><td class="name">WS-00472</td><td class="os-win">Windows 11</td><td class="num">7</td><td>AcmeCRM.exe</td><td class="muted">3 min ago</td></tr>
-      <tr class="click"><td class="name">WS-01188</td><td class="os-win">Windows 11</td><td class="num">5</td><td>chrome.exe</td><td class="muted">40 min ago</td></tr>
-      <tr class="click"><td class="name">WS-00913</td><td class="os-win">Windows 10</td><td class="num">4</td><td>AcmeCRM.exe</td><td class="muted">1 hr ago</td></tr>
-      <tr class="click"><td class="name">WS-02240</td><td class="os-win">Windows 11</td><td class="num">3</td><td>Teams.exe</td><td class="muted">2 hr ago</td></tr>
-    </tbody>
-  </table>
-
-  <!-- ───────── By OS (coverage-normalized; the cross-OS caveat) ───────── -->
-  <div class="sech">By operating system</div>
-  <table>
-    <thead><tr><th>OS</th><th class="num">Devices reporting</th><th class="num">Coverage</th>
-      <th class="num">Crash-free</th><th class="num">Crashes / 1k dev-days</th></tr></thead>
-    <tbody>
-      <tr><td class="os-win">Windows</td><td class="num">636</td><td class="num">92% <span class="muted">(636/690)</span></td>
-        <td class="num">97.2%</td><td class="num">12.3</td></tr>
-      <tr><td class="os-mac">macOS</td><td class="num cov-none">0</td><td class="num cov-none">collector pending</td>
-        <td class="num cov-none">&mdash;</td><td class="num cov-none">&mdash;</td></tr>
-      <tr><td class="os-lin">Linux</td><td class="num cov-none">0</td><td class="num cov-none">collector pending</td>
-        <td class="num cov-none">&mdash;</td><td class="num cov-none">&mdash;</td></tr>
-    </tbody>
-  </table>
-  <div class="caveat">Per-OS rates are <b>within-OS only</b>. Don't read across rows: a lower crash count on an OS
-    with lower coverage means we're hearing less, <b>not</b> that it's healthier. macOS/Linux show &mdash; because
-    no collector is wired yet (same dashboard, data-only when it lands).</div>
+  <div class="caveat"><sup>*</sup>macOS&rsquo; 98.4% is over its <b>6-signal scope</b> only &mdash; <b>not</b> comparable to
+    Windows&rsquo; 103-type 97.2%. macOS looking better here means narrower observation, not a healthier fleet. Read
+    within an OS, never across.</div>
 
   <div class="note">
-    DEX is a <b>read model over the one Guardian event store</b> &mdash; it reinterprets crash observations as
-    experience; it does not own a second store. Headline is a <b>measured rate</b>, never a synthetic 0&ndash;100
-    score (that's locked until a 2nd signal &mdash; hangs / restarts &mdash; exists to composite). Every rate is
-    paired with <b>coverage</b>, and unreachable devices are excluded, not assumed healthy.
-    &nbsp;&mdash;&nbsp;<b>Good direction?</b> Right headline numbers? Anything to add/drop before I port to the dashboard?
+    DEX is a <b>read model over the one Guardian event store</b> &mdash; it reinterprets the signals agents already
+    report as experience; it owns no second store. This page is the <b>hub</b>: the measured crash-free rate stays the
+    headline, and the three cards above open the catalogue (all 103 signals), the health roll-up, and the cross-OS
+    trends. &nbsp;&mdash;&nbsp;<b>Right balance of summary vs. links?</b> Anything you&rsquo;d promote onto the hub
+    itself?
   </div>
 
 <script>
-  document.querySelectorAll('.win b').forEach(b=>b.onclick=function(){
-    document.querySelectorAll('.win b').forEach(x=>x.classList.remove('on'));b.classList.add('on');});
-  document.querySelectorAll('tr.click').forEach(r=>r.onclick=function(){
-    location.href='dex-detail.html';});
+  function win(b){document.querySelectorAll('.filters .chip').forEach(x=>x.classList.remove('on'));b.classList.add('on');}
 </script>
 </div>
 </body>

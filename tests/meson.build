@@ -115,6 +115,7 @@ agent_test_exe = executable(
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_dex_signals.cpp',
+    'unit/test_dex_macos.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_agent_csr.cpp',
