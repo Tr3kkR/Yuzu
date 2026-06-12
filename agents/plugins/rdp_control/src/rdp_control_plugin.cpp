@@ -92,16 +92,67 @@ private:
     SC_HANDLE h_;
 };
 
+/// RAII owner for an HKEY (RegCloseKey on scope exit). `put()` yields the
+/// out-param for RegCreateKeyExW/RegOpenKeyExW.
+class RegKey {
+public:
+    RegKey() = default;
+    ~RegKey() {
+        if (h_) RegCloseKey(h_);
+    }
+    RegKey(const RegKey&) = delete;
+    RegKey& operator=(const RegKey&) = delete;
+    PHKEY put() { return &h_; }
+    HKEY get() const { return h_; }
+    explicit operator bool() const { return h_ != nullptr; }
+
+private:
+    HKEY h_ = nullptr;
+};
+
+/// RAII owner for a COM interface pointer (Release on scope exit). `put()`
+/// yields the out-param for CoCreateInstance.
+template <class T>
+class ComPtr {
+public:
+    ComPtr() = default;
+    ~ComPtr() {
+        if (p_) p_->Release();
+    }
+    ComPtr(const ComPtr&) = delete;
+    ComPtr& operator=(const ComPtr&) = delete;
+    T** put() { return &p_; }
+    T* operator->() const { return p_; }
+    explicit operator bool() const { return p_ != nullptr; }
+
+private:
+    T* p_ = nullptr;
+};
+
+/// RAII owner for a BSTR (SysFreeString on scope exit).
+class BStr {
+public:
+    explicit BStr(const wchar_t* s) : b_(SysAllocString(s)) {}
+    ~BStr() {
+        if (b_) SysFreeString(b_);
+    }
+    BStr(const BStr&) = delete;
+    BStr& operator=(const BStr&) = delete;
+    BSTR get() const { return b_; }
+    explicit operator bool() const { return b_ != nullptr; }
+
+private:
+    BSTR b_;
+};
+
 /// Write fDenyTSConnections. Returns ERROR_SUCCESS or the Win32 error.
 LONG set_deny_ts_connections(DWORD deny) {
-    HKEY key = nullptr;
+    RegKey key;
     LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kTerminalServerKey, 0, nullptr, 0, KEY_SET_VALUE,
-                              nullptr, &key, nullptr);
+                              nullptr, key.put(), nullptr);
     if (rc != ERROR_SUCCESS) return rc;
-    rc = RegSetValueExW(key, kDenyValueName, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&deny),
-                        sizeof(deny));
-    RegCloseKey(key);
-    return rc;
+    return RegSetValueExW(key.get(), kDenyValueName, 0, REG_DWORD,
+                          reinterpret_cast<const BYTE*>(&deny), sizeof(deny));
 }
 
 /// Read fDenyTSConnections. Returns ERROR_SUCCESS or the Win32 error.
@@ -111,43 +162,32 @@ LONG get_deny_ts_connections(DWORD& deny) {
                         nullptr, &deny, &size);
 }
 
-/// Acquire INetFwPolicy2 (caller must Release; only inside a live ComInit).
-HRESULT get_fw_policy(INetFwPolicy2** policy) {
+/// Acquire INetFwPolicy2 into an owning ComPtr (only inside a live ComInit).
+HRESULT get_fw_policy(ComPtr<INetFwPolicy2>& policy) {
     return CoCreateInstance(__uuidof(NetFwPolicy2), nullptr, CLSCTX_INPROC_SERVER,
-                            __uuidof(INetFwPolicy2), reinterpret_cast<void**>(policy));
+                            __uuidof(INetFwPolicy2), reinterpret_cast<void**>(policy.put()));
 }
 
 /// Enable/disable the Remote Desktop rule group across all profiles.
 HRESULT set_rdp_firewall_group(bool enable) {
-    INetFwPolicy2* policy = nullptr;
-    HRESULT hr = get_fw_policy(&policy);
+    ComPtr<INetFwPolicy2> policy;
+    HRESULT hr = get_fw_policy(policy);
     if (FAILED(hr)) return hr;
-    BSTR group = SysAllocString(kRdpFirewallGroup);
-    if (!group) {
-        policy->Release();
-        return E_OUTOFMEMORY;
-    }
-    hr = policy->EnableRuleGroup(NET_FW_PROFILE2_ALL, group,
-                                 enable ? VARIANT_TRUE : VARIANT_FALSE);
-    SysFreeString(group);
-    policy->Release();
-    return hr;
+    BStr group{kRdpFirewallGroup};
+    if (!group) return E_OUTOFMEMORY;
+    return policy->EnableRuleGroup(NET_FW_PROFILE2_ALL, group.get(),
+                                   enable ? VARIANT_TRUE : VARIANT_FALSE);
 }
 
-/// Query whether the Remote Desktop rule group is enabled (any profile).
+/// Query whether the Remote Desktop rule group is enabled (all profiles).
 HRESULT get_rdp_firewall_group(bool& enabled) {
-    INetFwPolicy2* policy = nullptr;
-    HRESULT hr = get_fw_policy(&policy);
+    ComPtr<INetFwPolicy2> policy;
+    HRESULT hr = get_fw_policy(policy);
     if (FAILED(hr)) return hr;
-    BSTR group = SysAllocString(kRdpFirewallGroup);
-    if (!group) {
-        policy->Release();
-        return E_OUTOFMEMORY;
-    }
+    BStr group{kRdpFirewallGroup};
+    if (!group) return E_OUTOFMEMORY;
     VARIANT_BOOL on = VARIANT_FALSE;
-    hr = policy->IsRuleGroupEnabled(NET_FW_PROFILE2_ALL, group, &on);
-    SysFreeString(group);
-    policy->Release();
+    hr = policy->IsRuleGroupEnabled(NET_FW_PROFILE2_ALL, group.get(), &on);
     enabled = (on != VARIANT_FALSE);
     return hr;
 }
