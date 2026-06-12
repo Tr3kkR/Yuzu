@@ -97,6 +97,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: in-product fleet performance view (`/dex` → Performance tab).** A
+  fifth DEX tab answers "where do I watch fleet CPU in the product" without
+  Grafana: fleet-now cards (avg/p50/p90/max + the reporting population) for
+  CPU utilization, memory commit and disk I/O latency — the same numbers as
+  the `yuzu_fleet_perf_*` Prometheus gauges, computed at render time over
+  registry heartbeat state with **zero new storage** — plus **cohort
+  benchmarking**: fleet-relative percentiles per cohort of an operator-chosen
+  tag key (e.g. `model`, `image`), the Aternity model. Honesty rules
+  throughout: a metric nobody reported is absent (never 0), cohorts under 10
+  reporting devices withhold percentiles ("n too small"), and devices without
+  the chosen key appear as an explicit "(untagged)" residual. Every aggregate
+  drills to the device list behind it (worst-by-metric, not-reporting,
+  cohort members), and each device links on to its drill-down. The read model
+  is first-class on all three surfaces: new
+  `GET /api/v1/dex/perf/{fleet,cohorts,devices}` REST endpoints and three MCP
+  tools (`get_dex_perf_fleet`, `get_dex_perf_cohorts`,
+  `list_dex_perf_devices`), all `GuaranteedState:Read`-gated. Trend charts
+  (retained history) are deliberately deferred to the Postgres-backed series
+  store (F2b). Perf telemetry remains Windows-agents-only in this release;
+  the population caption carries that scope.
 - **DEX: alert routing + tunable blast-radius thresholds (Settings → DEX
   alerts).** Operators can now route individual DEX signal types to alerts:
   each routed observation raises an operator notification and fires a new

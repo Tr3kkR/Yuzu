@@ -326,6 +326,13 @@ public:
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
 
+    /// Copy of the current per-agent snapshots, excluding entries staler than
+    /// `staleness` (the same contract recompute_metrics prunes by — pass the
+    /// same value so the /dex Performance read model and the Prometheus gauges
+    /// see the same population). Render-time cost: one fleet-sized copy per
+    /// operator click — acceptable; do NOT call on a hot path.
+    std::vector<AgentHealthSnapshot> snapshot(std::chrono::seconds staleness) const;
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;

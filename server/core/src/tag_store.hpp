@@ -72,6 +72,14 @@ public:
     /// Returns distinct values for a given tag key.
     std::vector<std::string> get_distinct_values(const std::string& key) const;
 
+    /// Returns the distinct tag keys present on any device (F2a cohort picker).
+    std::vector<std::string> get_distinct_keys() const;
+
+    /// Bulk agent_id→value map for one key — ONE query instead of a per-agent
+    /// get_tag loop (the F2a perf snapshot provider walks the whole fleet per
+    /// render; N point lookups would be the NFR anti-pattern).
+    std::unordered_map<std::string, std::string> get_values_for_key(const std::string& key) const;
+
     /// Validation: key max 64 chars [a-zA-Z0-9_.:-], value max 448 bytes
     static bool validate_key(const std::string& key);
     static bool validate_value(const std::string& value);

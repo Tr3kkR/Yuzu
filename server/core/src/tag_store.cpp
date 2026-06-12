@@ -393,4 +393,47 @@ std::vector<std::string> TagStore::get_distinct_values(const std::string& key) c
     return result;
 }
 
+std::vector<std::string> TagStore::get_distinct_keys() const {
+    std::shared_lock lock(mtx_);
+    std::vector<std::string> result;
+    if (!db_)
+        return result;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT DISTINCT key FROM tags ORDER BY key", -1, &stmt,
+                           nullptr) != SQLITE_OK)
+        return result;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto t = sqlite3_column_text(stmt, 0);
+        if (t)
+            result.emplace_back(reinterpret_cast<const char*>(t));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::unordered_map<std::string, std::string>
+TagStore::get_values_for_key(const std::string& key) const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, std::string> result;
+    if (!db_)
+        return result;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT agent_id, value FROM tags WHERE key = ?", -1, &stmt,
+                           nullptr) != SQLITE_OK)
+        return result;
+
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto id = sqlite3_column_text(stmt, 0);
+        auto val = sqlite3_column_text(stmt, 1);
+        if (id && val)
+            result.emplace(reinterpret_cast<const char*>(id), reinterpret_cast<const char*>(val));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
 } // namespace yuzu::server

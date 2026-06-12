@@ -64,6 +64,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -7632,6 +7633,63 @@ private:
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             });
 
+        // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
+        // perf tags (validated through the SAME dex_perf_rules the Prometheus
+        // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
+        // TagStore (operator tags, ONE bulk query per render — not N point
+        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
+        // first, then the tag store. Shared by the /dex Performance fragments,
+        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
+        // three can never disagree.
+        auto dex_perf_fn = [this](const std::string& cohort_key) -> DexPerfSnapshot {
+            DexPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            std::unordered_map<std::string, std::string> cohort_values;
+            if (tag_store_) {
+                snap.available_keys = tag_store_->get_distinct_keys();
+                if (!cohort_key.empty())
+                    cohort_values = tag_store_->get_values_for_key(cohort_key);
+            }
+            // Same staleness the recompute_metrics sweep prunes by — the tab and
+            // the yuzu_fleet_perf_* gauges see the same population.
+            const auto health = health_store_.snapshot(std::chrono::seconds{90});
+            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
+            by_id.reserve(health.size());
+            for (const auto& h : health)
+                by_id[h.agent_id] = &h;
+            for (const auto& id : registry_.all_ids()) {
+                auto s = registry_.get_session(id);
+                if (!s)
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = id;
+                std::string os = s->os;
+                for (auto& c : os)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                d.is_windows = os.find("win") != std::string::npos;
+                if (auto it = by_id.find(id); it != by_id.end()) {
+                    const auto& tags = it->second->status_tags;
+                    auto get = [&](const char* k) -> std::string {
+                        auto t = tags.find(k);
+                        return t != tags.end() ? t->second : std::string{};
+                    };
+                    d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                    d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                    d.disk_lat_ms =
+                        detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                }
+                if (!cohort_key.empty()) {
+                    auto it = s->scopable_tags.find(cohort_key);
+                    if (it != s->scopable_tags.end())
+                        d.cohort = it->second;
+                    else if (auto cv = cohort_values.find(id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                }
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
         // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
@@ -7677,7 +7735,9 @@ private:
                 for (const auto& r : response_store_->query(command_id))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
-            });
+            },
+            // F2a: the shared fleet perf snapshot provider (defined above).
+            dex_perf_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -8083,7 +8143,11 @@ private:
                 // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
                 forward_gateway_pending();
                 return sent;
-            }));
+            }),
+            // F2a: the shared fleet perf snapshot provider — the same closure
+            // the /dex Performance fragments and the MCP perf tools use, so
+            // REST, dashboard and MCP can never disagree.
+            dex_perf_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -8193,7 +8257,10 @@ private:
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
                 ca_store_.get(), [this]() { return publish_crl(); },
                 // ar-S1: DEX read tools (parity with /api/v1/dex/*).
-                guaranteed_state_store_.get());
+                guaranteed_state_store_.get(),
+                // F2a: the shared fleet perf snapshot provider (one closure,
+                // three surfaces — fragments, REST, MCP).
+                dex_perf_fn);
         }
 
         // -- Listen -----------------------------------------------------------

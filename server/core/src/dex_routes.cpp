@@ -257,6 +257,18 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// F2a: cohort tag-key validation — mirrors TagStore::validate_key (max 64,
+// [a-zA-Z0-9_.:-]) so an arbitrary `?key=` can never reach the snapshot
+// provider or markup. Validation here (not a TagStore dep) keeps DexRoutes
+// decoupled; the alphabets are pinned together by a unit test.
+bool valid_tag_key(const std::string& key) {
+    if (key.empty() || key.size() > 64)
+        return false;
+    return key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                 "abcdefghijklmnopqrstuvwxyz0123456789_.:-") ==
+           std::string::npos;
+}
+
 // An htmx drill-down link: clickable text that swaps the fragment into the shared
 // page mount. htmx core attrs only (CSP-safe; no hx-on). `disp` is already
 // html-escaped; `qs` is the already-encoded query string.
@@ -372,7 +384,8 @@ std::string dex_subnav(const std::string& active, int window_days) {
     return "<div class=\"gp-subnav\">" + tab("overview", "Overview", "/fragments/dex/overview") +
            tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
            tab("health", "Health score", "/fragments/dex/health") +
-           tab("trends", "Trends", "/fragments/dex/trends") + "</div>";
+           tab("trends", "Trends", "/fragments/dex/trends") +
+           tab("perf", "Performance", "/fragments/dex/perf") + "</div>";
 }
 
 // Window chips for a given fragment path (reuses the overview pattern).
@@ -1753,17 +1766,18 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
-                    std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn));
+                    std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
+                    std::move(perf_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     store_ = store;
@@ -1771,6 +1785,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     audit_fn_ = std::move(audit_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
+    perf_fn_ = std::move(perf_fn);
 
     // -- Page shell (auth-only static chrome; the fragment it loads gates on Read) --
     sink.Get("/dex", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1906,6 +1921,74 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
         res.set_content(render_dex_device_fragment(store_, id, w), "text/html; charset=utf-8");
+    });
+
+    // -- F2a: fleet Performance tab (now-view over registry heartbeat state) ---
+    //
+    // Render-time aggregation, ZERO new storage. Gates on GuaranteedState:Read
+    // like the sibling DEX fragments. NOT audited: the fleet/cohort views are
+    // aggregates, and the devices drill lists machine-health telemetry (CPU /
+    // commit / disk latency — device state, not behavioral data about what a
+    // person runs; the behavioral surfaces — per-device signal history and the
+    // per-app procperf view — keep their per-open audit rows).
+    sink.Get("/fragments/dex/perf", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Cohort tag key: validated to the TagStore key alphabet so garbage
+        // never reaches the provider or markup; invalid/absent falls back to
+        // the conventional default ("model" — the asset-tagging recipe's key).
+        std::string key = req.has_param("key") ? req.get_param_value("key") : "model";
+        if (!valid_tag_key(key))
+            key = "model";
+        res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
+                        "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/dex/perf/devices", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const DexPerfMetric metric = dex_perf_metric_from_token(
+            req.has_param("metric") ? req.get_param_value("metric") : "cpu");
+        const bool not_reporting = req.has_param("filter") &&
+                                   req.get_param_value("filter") == "not_reporting";
+        std::string cohort_key;
+        std::optional<std::string> cohort_filter;
+        if (req.has_param("cohort_key")) {
+            cohort_key = req.get_param_value("cohort_key");
+            if (!valid_tag_key(cohort_key))
+                cohort_key.clear();
+            else
+                cohort_filter = req.has_param("cohort_value")
+                                    ? req.get_param_value("cohort_value")
+                                    : std::string{}; // "" = the untagged residual
+        }
+        int limit = 50;
+        if (req.has_param("limit")) {
+            try {
+                limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
+            } catch (...) {}
+        }
+        res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
+                                                         not_reporting, cohort_filter, limit,
+                                                         window_days),
+                        "text/html; charset=utf-8");
     });
 
     // -- A4: device perf panel — live federated TAR query + result poll --------

@@ -23,6 +23,8 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "dex_perf_model.hpp"
+
 #include <httplib.h>
 
 #include <cstddef>
@@ -170,6 +172,24 @@ std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output);
 /// "no history" note. Server-rendered SVG — no JS, CSP-safe.
 std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 
+// ── F2a: fleet Performance tab (now-view over registry heartbeat state) ─────
+
+/// PURE: the /fragments/dex/perf content — fleet-now cards (same stats as the
+/// yuzu_fleet_perf_* gauges, via the shared dex_perf_rules) + the cohort
+/// benchmarking tables for `snap.cohort_key`. Every aggregate is a drill: the
+/// metric cards open the worst-devices list, the Reporting card opens the
+/// not-reporting list, cohort rows open their device list. NO window chips —
+/// the page is a now-view (trend charts are F2b, Postgres-gated).
+std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days);
+
+/// PURE: the /fragments/dex/perf/devices drill — the ONE device list serving
+/// every Performance-page drill (worst-by-metric / not-reporting / cohort
+/// membership). Rows link to the per-device drill-down.
+std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
+                                             bool not_reporting,
+                                             const std::optional<std::string>& cohort_filter,
+                                             int limit, int window_days);
+
 /// DEX routes — /dex (page shell) + /fragments/dex/overview (HTMX fragment).
 class DexRoutes {
 public:
@@ -203,6 +223,11 @@ public:
     using ResponsesFn =
         std::function<std::vector<DexAgentResponse>(const std::string& command_id)>;
 
+    /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
+    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
+    /// empty → the Performance tab renders an honest "unavailable" placeholder.
+    using PerfFn = DexPerfFn;
+
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
     /// Guardian read surface — a dedicated DEX:Read perm is deferred). `store` may
@@ -211,14 +236,16 @@ public:
     /// degrades to an honest "unavailable" note).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         PerfFn perf_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         PerfFn perf_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -228,6 +255,7 @@ private:
     AuditFn audit_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
+    PerfFn perf_fn_;
 };
 
 } // namespace yuzu::server

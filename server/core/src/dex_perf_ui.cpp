@@ -1,0 +1,267 @@
+/// @file dex_perf_ui.cpp
+/// F2a: the /dex Performance tab renderers — PURE functions over a
+/// DexPerfSnapshot (fleet-now cards + cohort benchmarking + the one devices
+/// drill). Split from dex_routes.cpp (which registers the routes) to keep the
+/// big TU from growing; the tiny markup helpers are deliberately re-declared
+/// in this TU's anonymous namespace, same pattern as the sibling DEX TUs.
+///
+/// Product UI: HTMX, server-rendered, dark-theme only, htmx core attrs only
+/// (CSP blocks hx-on). NO window chips here — this page is a now-view over
+/// registry heartbeat state (trend charts are F2b, Postgres-gated). Honesty:
+/// absent metrics render "—" (never 0), aggregates carry their reporting
+/// population, sub-floor cohorts render "n too small", untagged devices are
+/// an explicit residual row.
+
+#include "dex_routes.hpp"
+
+#include "web_utils.hpp"
+
+#include <cctype>
+#include <format>
+#include <string>
+#include <vector>
+
+namespace yuzu::server {
+
+// Shared with dex_routes.cpp (declared in dex_routes.hpp).
+std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_window_token(int window_days);
+
+namespace {
+
+std::string esc(const std::string& s) { return html_escape(s); }
+
+// Percent-encode for a query-string value (RFC 3986 unreserved kept literal).
+std::string url_encode(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+std::string placeholder(const std::string& title, const std::string& sub) {
+    return "<div class=\"gp-placeholder\"><b>" + esc(title) + "</b>" + esc(sub) + "</div>";
+}
+
+std::string drill(const std::string& path_qs, const std::string& disp) {
+    return "<a hx-get=\"" + path_qs + "\" hx-target=\"#guardian-detail\" "
+           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" + disp + "</a>";
+}
+
+std::string fmt_pct(double v) { return std::format("{:.1f}%", v); }
+std::string fmt_lat(double v) { return std::format("{:.1f} ms", v); }
+
+/// "p50 6.2% · p90 24.8% · max 96.1%" — the stat strip under a fleet card.
+std::string stat_strip(const DexPerfStat& s, bool lat) {
+    auto f = [&](double v) { return lat ? fmt_lat(v) : fmt_pct(v); };
+    return "p50 " + f(s.p50) + " &middot; p90 " + f(s.p90) + " &middot; max " + f(s.max);
+}
+
+/// One clickable fleet-now card. `big` and `strip` are pre-escaped/formatted.
+std::string fleet_card(const char* label, const std::string& big, const std::string& strip,
+                       const std::string& drill_qs, const char* drill_label) {
+    return "<div class=\"gp-tile\"><div class=\"n\">" + big + "</div><div class=\"l\">" +
+           std::string(label) + "</div><div class=\"sx\">" + strip + "<br>" +
+           drill("/fragments/dex/perf/devices?" + drill_qs, std::string("&rarr; ") + drill_label) +
+           "</div></div>";
+}
+
+/// "+42%" / "−21%" delta pill of a cohort p50 against the fleet p50 (empty
+/// when either side is missing or the fleet p50 is ~0).
+std::string delta_pill(const std::optional<DexPerfStat>& cohort,
+                       const std::optional<DexPerfStat>& fleet) {
+    if (!cohort || !fleet || fleet->p50 < 1e-9)
+        return {};
+    const double pct = (cohort->p50 - fleet->p50) / fleet->p50 * 100.0;
+    const char* color = pct > 5.0 ? "var(--red)" : pct < -5.0 ? "var(--green)" : "var(--muted)";
+    return " <span style=\"font-size:.85em;color:" + std::string(color) + ";\">" +
+           std::format("{}{:.0f}%", pct > 0 ? "+" : "", pct) + "</span>";
+}
+
+/// "6.2% / 24.8%" cohort cell (p50 / p90), or the suppression dash.
+std::string cohort_cell(const std::optional<DexPerfStat>& s, bool lat,
+                        const std::optional<DexPerfStat>& fleet) {
+    if (!s)
+        return "&mdash;";
+    auto f = [&](double v) { return lat ? fmt_lat(v) : fmt_pct(v); };
+    return f(s->p50) + " / " + f(s->p90) + delta_pill(s, fleet);
+}
+
+} // namespace
+
+std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days) {
+    const std::string w = dex_window_token(window_days);
+    const auto now = dex_perf_fleet_now(snap);
+
+    std::string h;
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("perf", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Fleet performance</h1>"
+         "</div><div class=\"gp-sub\">Continuous device telemetry (30&nbsp;s on-device sampling) "
+         "rolled up across the fleet &mdash; the levels, where Trends shows the events. Every "
+         "aggregate carries its reporting population; click any card or cohort to open the "
+         "devices behind it.</div></div></div>";
+
+    // ── Fleet now ──
+    h += "<div class=\"gp-sech\">Fleet now (last rollup cycle)</div>";
+    if (now.reporting == 0) {
+        h += placeholder("No perf telemetry yet",
+                         "No device reported a perf heartbeat this cycle. Perf telemetry is "
+                         "collected by Windows agents (TAR perf capture source); devices appear "
+                         "here within a heartbeat of coming online.");
+    } else {
+        h += "<div class=\"gp-tiles\">";
+        if (now.cpu)
+            h += fleet_card("CPU utilization (avg)", fmt_pct(now.cpu->avg),
+                            stat_strip(*now.cpu, false), "metric=cpu&window=" + w,
+                            "worst devices by CPU");
+        if (now.commit)
+            h += fleet_card("Memory commit (avg)", fmt_pct(now.commit->avg),
+                            stat_strip(*now.commit, false), "metric=commit&window=" + w,
+                            "worst devices by commit");
+        if (now.disk_lat)
+            h += fleet_card("Disk I/O latency (avg)", fmt_lat(now.disk_lat->avg),
+                            stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
+                            "worst devices by disk latency");
+        h += fleet_card("Reporting", std::to_string(now.reporting),
+                        "of " + std::to_string(now.windows_online) + " Windows online",
+                        "filter=not_reporting&window=" + w, "devices not reporting");
+        h += "</div>";
+        h += "<div class=\"gp-note\">Perf telemetry is collected by <b>Windows agents only</b> "
+             "today &mdash; macOS and Linux devices are absent from these numbers, not zero. "
+             "The Reporting card is the denominator for every stat above. The same numbers are "
+             "exported as the <span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> "
+             "Prometheus gauges.</div>";
+    }
+
+    // ── Cohort benchmarking ──
+    h += "<div class=\"gp-sech\">Cohort benchmarking</div>";
+    if (snap.available_keys.empty()) {
+        h += placeholder("No tags on the fleet yet",
+                         "Cohorts are the distinct values of an operator-chosen tag key (e.g. "
+                         "model, image, location). Tag the fleet via the REST tag API or the "
+                         "asset-tagging recipe, and the comparison appears here.");
+        return h;
+    }
+
+    // Key picker — htmx submits the select's own name=value on change.
+    h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
+         "hx-get=\"/fragments/dex/perf?window=" + w + "\" hx-target=\"#guardian-detail\" "
+         "hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+         "border-radius:.35rem;padding:.15rem .4rem;\">";
+    bool key_listed = false;
+    for (const auto& k : snap.available_keys) {
+        const bool on = (k == snap.cohort_key);
+        key_listed = key_listed || on;
+        h += "<option value=\"" + esc(k) + "\"" + (on ? " selected" : "") + ">" + esc(k) +
+             "</option>";
+    }
+    if (!key_listed) // requested key has no tagged devices — show it anyway, honestly
+        h += "<option value=\"" + esc(snap.cohort_key) + "\" selected>" + esc(snap.cohort_key) +
+             " (no devices tagged)</option>";
+    h += "</select></div>";
+
+    const auto cohorts = dex_perf_cohorts(snap);
+    if (cohorts.empty()) {
+        h += placeholder("No reporting devices to benchmark",
+                         "Cohort comparison needs devices reporting perf this cycle.");
+        return h;
+    }
+
+    h += "<table class=\"gp-table\"><thead><tr><th>Cohort (" + esc(snap.cohort_key) +
+         ")</th><th>Devices</th><th>CPU p50 / p90</th><th>Commit p50 / p90</th>"
+         "<th>Disk lat p50 / p90</th></tr></thead><tbody>";
+    for (const auto& c : cohorts) {
+        const std::string label = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
+        const std::string qs = "cohort_key=" + url_encode(snap.cohort_key) +
+                               "&amp;cohort_value=" + url_encode(c.cohort) + "&amp;window=" + w;
+        h += "<tr><td>" + drill("/fragments/dex/perf/devices?" + qs, label) + "</td><td>" +
+             std::to_string(c.devices) + "</td>";
+        if (c.suppressed) {
+            h += "<td colspan=\"3\" class=\"gp-mute\">&mdash; (n too small: fewer than " +
+                 std::to_string(kDexCohortFloor) + " reporting devices)</td>";
+        } else {
+            h += "<td>" + cohort_cell(c.cpu, false, now.cpu) + "</td><td>" +
+                 cohort_cell(c.commit, false, now.commit) + "</td><td>" +
+                 cohort_cell(c.disk_lat, true, now.disk_lat) + "</td>";
+        }
+        h += "</tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">Percentiles compare within the chosen key&rsquo;s cohorts; the "
+         "&Delta; against the fleet p50 marks cohorts running hot. Cohorts under " +
+         std::to_string(kDexCohortFloor) +
+         " reporting devices withhold percentiles (statistical floor); devices without the key "
+         "always appear as the explicit (untagged) residual.</div>";
+    return h;
+}
+
+std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
+                                             bool not_reporting,
+                                             const std::optional<std::string>& cohort_filter,
+                                             int limit, int window_days) {
+    const std::string w = dex_window_token(window_days);
+    const auto rows = dex_perf_device_list(snap, metric, not_reporting, cohort_filter, limit);
+
+    std::string title;
+    if (not_reporting)
+        title = "Devices not reporting performance";
+    else if (cohort_filter)
+        title = (cohort_filter->empty() ? "(untagged)" : esc(*cohort_filter)) +
+                std::string(" &mdash; devices");
+    else {
+        const char* m = metric == DexPerfMetric::kCommit    ? "memory commit"
+                        : metric == DexPerfMetric::kDiskLat ? "disk latency"
+                                                            : "CPU";
+        title = std::string("Worst devices by current ") + m;
+    }
+
+    std::string h;
+    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf?window=" + w +
+         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+         "style=\"cursor:pointer;\">&larr; Fleet performance</a>";
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
+         "</h1></div><div class=\"gp-sub\">Values are each device&rsquo;s current heartbeat "
+         "sample &mdash; the same data the fleet cards aggregate, so this list and the cards "
+         "can never disagree.</div></div></div>";
+
+    if (rows.empty())
+        return h + placeholder(not_reporting ? "Everyone is reporting" : "No devices",
+                               not_reporting
+                                   ? "Every online Windows agent contributed a perf sample "
+                                     "this cycle."
+                                   : "No reporting devices match this view.");
+
+    h += "<table class=\"gp-table\"><thead><tr><th>#</th><th>Device</th><th>Cohort</th>"
+         "<th>CPU</th><th>Commit</th><th>Disk lat</th><th>vs fleet</th></tr></thead><tbody>";
+    int i = 1;
+    for (const auto& r : rows) {
+        auto cell = [](const std::optional<double>& v, bool lat) {
+            return v ? (lat ? fmt_lat(*v) : fmt_pct(*v)) : std::string("&mdash;");
+        };
+        h += "<tr><td class=\"gp-mute\">" + std::to_string(i++) + "</td><td>" +
+             drill("/fragments/dex/device?id=" + url_encode(r.agent_id) + "&amp;window=" + w,
+                   esc(r.agent_id)) +
+             "</td><td>" + (r.cohort.empty() ? "<span class=\"gp-mute\">(untagged)</span>"
+                                             : esc(r.cohort)) +
+             "</td><td>" + cell(r.cpu_pct, false) + "</td><td>" + cell(r.commit_pct, false) +
+             "</td><td>" + cell(r.disk_lat_ms, true) + "</td><td>" +
+             (r.fleet_pctile >= 0 ? std::to_string(r.fleet_pctile) + "th pctile"
+                                  : std::string("&mdash;")) +
+             "</td></tr>";
+    }
+    h += "</tbody></table>";
+    return h;
+}
+
+} // namespace yuzu::server

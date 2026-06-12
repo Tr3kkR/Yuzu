@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "custom_properties_store.hpp"
+#include "dex_perf_rules.hpp"
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
 #include "tag_store.hpp"
@@ -1207,6 +1208,19 @@ void AgentHealthStore::remove(const std::string& agent_id) {
     snapshots_.erase(agent_id);
 }
 
+std::vector<AgentHealthSnapshot> AgentHealthStore::snapshot(std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<AgentHealthSnapshot> out;
+    out.reserve(snapshots_.size());
+    for (const auto& [id, snap] : snapshots_) {
+        if ((now - snap.last_seen) > staleness)
+            continue; // same staleness contract recompute_metrics prunes by
+        out.push_back(snap);
+    }
+    return out;
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);
@@ -1283,27 +1297,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!dex_val.empty())
             add_finite_count(total_dex_observed, dex_val);
 
-        // A4 perf tags. Same forged-value posture as add_finite_count: accept
-        // only finite, non-negative values so one rogue agent cannot poison a
-        // fleet percentile with inf/nan/negatives. Percentages have a semantic
-        // bound, so a >100% claim CLAMPS (a lie, not an outlier); latency has
-        // none, so an absurd-but-finite claim (1e308 ms/IO) is REJECTED above
-        // a sanity ceiling — clamping would still poison avg with the ceiling.
-        auto collect_finite = [&](std::vector<double>& out, const std::string& key,
-                                  double clamp_hi, double reject_above) {
-            const auto s = get(key);
-            if (s.empty())
-                return;
-            try {
-                double v = std::stod(s);
-                if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
-                    out.push_back(clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v);
-            } catch (...) {}
-        };
-        constexpr double kMaxSaneLatMs = 1.0e6; // 1000 s per IO — beyond absurd
-        collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
-        collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
-        collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, kMaxSaneLatMs);
+        // A4 perf tags — validation rules live in dex_perf_rules.hpp, SHARED
+        // with the F2a /dex Performance read model so the Prometheus gauges
+        // and the in-product view can never disagree on the same sample.
+        if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct)))
+            perf_cpu.push_back(*v);
+        if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct)))
+            perf_commit.push_back(*v);
+        if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs)))
+            perf_disk_lat.push_back(*v);
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1337,15 +1339,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         double sum = 0.0;
         for (double v : vals)
             sum += v;
-        // True nearest-rank: index ceil(p·n)−1. floor((n−1)·p) looks similar but
-        // under-reports high percentiles in small fleets (n=2 → p90 = the MIN).
-        auto rank = [&](double p) {
-            const auto idx = static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
-            return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
-        };
         metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
-        metrics.gauge(family, {{"stat", "p50"}}).set(rank(0.50));
-        metrics.gauge(family, {{"stat", "p90"}}).set(rank(0.90));
+        metrics.gauge(family, {{"stat", "p50"}}).set(nearest_rank(vals, 0.50));
+        metrics.gauge(family, {{"stat", "p90"}}).set(nearest_rank(vals, 0.90));
         metrics.gauge(family, {{"stat", "max"}}).set(vals.back());
     };
     metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_cpu.size()));
