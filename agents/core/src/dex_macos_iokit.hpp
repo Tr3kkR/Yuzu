@@ -10,10 +10,11 @@
  *   - `diskutil info <disk>`        → `disk.smart_failure` (SMART status != Verified)
  *   - `system_profiler SPPowerDataType` → `hw.error` (battery condition / capacity)
  *
- * Battery health has NO Windows like-for-like (the Windows catalogue has no
- * battery signal) — it is the macOS-native Hardware signal; it rides the generic
- * `hw.error` obs_type (Hardware group, "Hardware error" label) with subject =
- * "battery" so it renders correctly without a server change.
+ * Battery health rides the generic `hw.error` obs_type (Hardware group,
+ * "Hardware error" label) with subject = "battery" so it renders correctly
+ * without a server change. The Windows state poll (dex_win_poll) mirrors the
+ * same obs_type + below-80%-of-design threshold, so both platforms render
+ * identically.
  *
  * These are STATE, not events — the collector polls on a slow cadence and emits
  * only on a transition to a bad state (poll-and-diff lives in the engine). Pure +

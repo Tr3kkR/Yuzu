@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_blast_radius.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -297,6 +298,21 @@ public:
                           "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
                           "boot reports, …; sum of agent-reported counts since each agent "
                           "started)", "gauge");
+        // D3 blast-radius detector observability (gov SRE OBS-1 / compliance S1).
+        metrics_.describe("yuzu_server_dex_blast_radius_incidents_total",
+                          "Fleet-incident alerts fired (≥min_devices distinct devices, same "
+                          "obs_type+subject, within the window)", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_fires_dropped_total",
+                          "Incident fires suppressed by the global per-minute fan-out rate cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_entries_dropped_total",
+                          "Sightings dropped because the global tracked-entry memory budget was "
+                          "exhausted", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_evicted_total",
+                          "(obs_type,subject) pairs LRU-evicted to admit a new pair at the cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
+                          "Current count of tracked (obs_type,subject) pairs", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -1547,6 +1563,45 @@ public:
                 // shared path. Gateway service exists only in gateway mode.
                 if (gateway_service_)
                     gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
+
+                // D3 fleet-incident alerting (docs/dex-brd-coverage.md): N
+                // distinct devices reporting the same (obs_type, subject)
+                // inside the window → one operator notification + one
+                // webhook/offload event per cooldown. Wired before traffic
+                // (set-before-traffic contract on the detector).
+                blast_radius_detector_.set_on_incident([this](const BlastRadiusIncident& inc) {
+                    const std::string what = inc.subject.empty()
+                                                 ? inc.obs_type
+                                                 : inc.obs_type + " '" + inc.subject + "'";
+                    const std::string title = "Fleet incident: " + what + " on " +
+                                              std::to_string(inc.device_count) + " devices";
+                    const std::string message =
+                        std::to_string(inc.device_count) + " distinct devices reported " +
+                        what + " within the last " + std::to_string(inc.window_seconds / 60) +
+                        " minutes. See /dex for the drill-down.";
+                    spdlog::warn("BlastRadius: {}", title);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Same dual-sink discipline as agent.registered (HP-1/UP-6):
+                    // build the body once, guard each sink separately.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.blast_radius"},
+                                                  {"obs_type", inc.obs_type},
+                                                  {"subject", inc.subject},
+                                                  {"device_count", inc.device_count},
+                                                  {"window_seconds", inc.window_seconds}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.blast_radius", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.blast_radius", body);
+                    }
+                });
+                blast_radius_detector_.set_metrics(&metrics_);
+                agent_service_.set_blast_radius_detector(&blast_radius_detector_);
+                if (gateway_service_)
+                    gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
             }
         }
 
@@ -2401,6 +2456,15 @@ public:
         // so no thread is inside notify_exec_tracker holding the borrowed
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
+
+        // Same contract for the blast-radius detector: both service impls
+        // borrow it by raw pointer and call observe() from the ingest path the
+        // drain above quiesced. Null before any member teardown (gov
+        // cpp-safety/architect/consistency — the detector destructs early by
+        // member-decl order, so this removes the only reliance on drain timing).
+        agent_service_.set_blast_radius_detector(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_blast_radius_detector(nullptr);
 
         // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
@@ -8177,6 +8241,15 @@ private:
     yuzu::MetricsRegistry metrics_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
+    /// direct Subscribe path via agent_service_ and the gateway path via
+    /// gateway_service_). Its on_incident sink fans out to notification +
+    /// webhook + offload. Plain member (no heap): in-memory derived state only.
+    /// DECLARED BEFORE its borrowers (agent_service_ / gateway_service_ /
+    /// agent_server_) so it destructs AFTER them — the detector must outlive any
+    /// ingest thread that holds its raw pointer (gov cpp-safety/architect). stop()
+    /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
+    BlastRadiusDetector blast_radius_detector_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;

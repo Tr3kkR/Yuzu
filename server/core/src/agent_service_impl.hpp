@@ -44,6 +44,7 @@ class ExecutionTracker;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class GuaranteedStateStore;
+class BlastRadiusDetector;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -95,6 +96,12 @@ public:
     /// build a Guardian store.
     void set_guaranteed_state_store(GuaranteedStateStore* store) {
         guaranteed_state_store_ = store;
+    }
+    /// Fleet-wide DEX incident detector (blast radius, coverage-map D3) — the
+    /// shared Guardian ingest feeds it each ruleless observation. nullptr
+    /// disables detection. Set-before-traffic, like the store setters above.
+    void set_blast_radius_detector(BlastRadiusDetector* detector) {
+        blast_radius_detector_ = detector;
     }
 
     /// UAT 2026-05-12: after a fresh agent registers, the next
@@ -313,6 +320,7 @@ private:
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    BlastRadiusDetector* blast_radius_detector_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached

@@ -116,12 +116,15 @@ agent_test_exe = executable(
     'unit/test_guard_file.cpp',
     'unit/test_dex_signals.cpp',
     'unit/test_dex_macos.cpp',
+    'unit/test_dex_win_poll.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
+    'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
@@ -139,6 +142,10 @@ test(
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
+if host_machine.system() == 'windows'
+  # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
+  tar_test_deps += cxx.find_library('iphlpapi')
+endif
 
 tar_test_exe = executable(
   'yuzu_tar_tests',
@@ -148,12 +155,14 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_tar_perf.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
@@ -221,6 +230,7 @@ if build_server
       'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
+      'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
       'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',

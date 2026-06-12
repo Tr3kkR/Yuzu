@@ -1,0 +1,244 @@
+# Netprobe Plugin Definitions — active network measurement (BRD E1)
+#
+# Recurrence is the scheduler's job: run these on an interval against your
+# key resources (gateway, DNS, the Yuzu server, a SaaS edge) and the response
+# store keeps the RTT/jitter/loss history for trending.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
+  id: network.probe.icmp
+  displayName: ICMP RTT Probe
+  version: 1.0.0
+  description: >
+    Measure ICMP echo round-trip time, jitter (population stddev), and packet
+    loss to up to 4 comma-separated targets. Native (no shell-out):
+    IcmpSendEcho on Windows (unprivileged, whole-millisecond granularity),
+    unprivileged ICMP datagram sockets on macOS/Linux (on Linux gated by
+    net.ipv4.ping_group_range — a refused socket reports status
+    "not-permitted", never fake loss). IPv4 targets only. Worst case with
+    maximum parameters is about 2 minutes; defaults finish in seconds.
+  tags: [network, probe, latency, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: netprobe
+    action: icmp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [targets]
+    properties:
+      targets:
+        type: string
+        displayName: Targets
+        description: Comma-separated hostnames or IPv4 literals (max 4).
+      count:
+        type: int32
+        displayName: Samples
+        description: Echo samples per target (1-10, default 5).
+        default: 5
+      timeout_ms:
+        type: int32
+        displayName: Timeout (ms)
+        description: Per-sample timeout in milliseconds (100-3000, default 1000).
+        default: 1000
+
+  result:
+    columns:
+      - name: target
+        type: string
+      - name: proto
+        type: string
+      - name: sent
+        type: int32
+      - name: ok
+        type: int32
+      - name: min_ms
+        type: string
+      - name: avg_ms
+        type: string
+      - name: max_ms
+        type: string
+      - name: jitter_ms
+        type: string
+      - name: loss_pct
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Probe ICMP round-trip time to {{targets}}"
+
+  approval:
+    mode: auto
+
+  permissions:
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [netprobe]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
+  id: network.probe.tcp
+  displayName: TCP Connect RTT Probe
+  version: 1.0.0
+  description: >
+    Measure TCP connect-time round-trip latency, jitter, and connection
+    failure rate to up to 4 comma-separated targets on a chosen port
+    (default 443). Sub-millisecond timing, unprivileged on every platform —
+    the pragmatic probe for resources that drop ICMP (VPN gateways, SaaS
+    edges, internal services).
+  tags: [network, probe, latency, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: netprobe
+    action: tcp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [targets]
+    properties:
+      targets:
+        type: string
+        displayName: Targets
+        description: Comma-separated hostnames or IP literals (max 4).
+      port:
+        type: int32
+        displayName: Port
+        description: TCP port to connect to (default 443).
+        default: 443
+      count:
+        type: int32
+        displayName: Samples
+        description: Connect samples per target (1-10, default 5).
+        default: 5
+      timeout_ms:
+        type: int32
+        displayName: Timeout (ms)
+        description: Per-sample timeout in milliseconds (100-3000, default 1000).
+        default: 1000
+
+  result:
+    columns:
+      - name: target
+        type: string
+      - name: proto
+        type: string
+      - name: sent
+        type: int32
+      - name: ok
+        type: int32
+      - name: min_ms
+        type: string
+      - name: avg_ms
+        type: string
+      - name: max_ms
+        type: string
+      - name: jitter_ms
+        type: string
+      - name: loss_pct
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Probe TCP connect time to {{targets}}"
+
+  approval:
+    mode: auto
+
+  permissions:
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [netprobe]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
+  id: network.probe.dns
+  displayName: DNS Resolution Timing
+  version: 1.0.0
+  description: >
+    Measure name-resolution wall time (getaddrinfo) for up to 4
+    comma-separated names, reporting milliseconds, status, and the number of
+    addresses returned. Failing or slow resolution is one of the
+    highest-impact "everything is broken" employee experiences.
+  tags: [network, probe, dns, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: netprobe
+    action: dns
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [targets]
+    properties:
+      targets:
+        type: string
+        displayName: Names
+        description: Comma-separated DNS names to resolve (max 4).
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: resolve_ms
+        type: string
+      - name: status
+        type: string
+      - name: addresses
+        type: int32
+
+  readablePayload: "Time DNS resolution of {{targets}}"
+
+  approval:
+    mode: auto
+
+  permissions:
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [netprobe]
+
+status:
+  phase: active
