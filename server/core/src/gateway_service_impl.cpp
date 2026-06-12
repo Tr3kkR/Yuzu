@@ -628,7 +628,7 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* /*contex
     if (guaranteed_state_store_) {
         // Shared one-true-path ingest (same fn the direct Subscribe loop uses).
         ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
-                                 blast_radius_detector_);
+                                 blast_radius_detector_, dex_alert_router_);
     } else {
         spdlog::warn("[gateway] ForwardGuardianMessage: no guaranteed-state store wired — "
                      "dropping event from agent {}",

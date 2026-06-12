@@ -335,6 +335,59 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── BRD A2: top-N per-application resource samples ───────────────
+        // Rides the same collect_perf tick as the device sampler; aggregated
+        // by IMAGE NAME (app-level — per-PID detail lives on process_live),
+        // top-10 by CPU ∪ top-10 by working set per tick (<= 20 rows/30 s).
+        // NAMES ONLY — no command lines (privacy default); operator redaction
+        // patterns apply to the name; own `procperf_enabled` toggle so per-app
+        // visibility can be disabled while device-level sampling stays on
+        // (works-council posture).
+        {
+            .name = "procperf",
+            .dollar_name = "ProcPerf",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,  "ntsysinfo",
+                 "One NtQuerySystemInformation(SystemProcessInformation) "
+                 "snapshot per tick — image name, CPU times, working set for "
+                 "every process; no PDH, no WMI, no per-process handles."},
+                {"linux",   OsSupportStatus::kPlanned,    "procfs",
+                 "/proc/[pid]/stat utime+stime + VmRSS."},
+                {"macos",   OsSupportStatus::kPlanned,    "libproc",
+                 "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 604800, // 7 days × ≤20 rows/30 s ≈ 400k small rows
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"name",        "TEXT"},
+                        {"instances",   "INTEGER"},
+                        {"cpu_pct",     "REAL"},
+                        {"ws_bytes",    "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days, per (hour, app)
+                    .columns = {
+                        {"hour_ts",       "INTEGER"},
+                        {"name",          "TEXT"},
+                        {"samples",       "INTEGER"},
+                        {"instances_max", "INTEGER"},
+                        {"cpu_avg",       "REAL"},
+                        {"cpu_max",       "REAL"},
+                        {"ws_avg_bytes",  "INTEGER"},
+                        {"ws_max_bytes",  "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -610,6 +663,20 @@ SELECT (ts / 3600) * 3600, COUNT(*),
 FROM perf_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 3600) * 3600)";
+        }
+    }
+
+    // ── Per-app perf rollups (BRD A2) — per (hour, app name) ─────────────
+    if (source_name == "procperf") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max,
+    cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
+SELECT (ts / 3600) * 3600, name, COUNT(*), MAX(instances),
+       AVG(cpu_pct), MAX(cpu_pct),
+       CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
+FROM procperf_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, name)";
         }
     }
 

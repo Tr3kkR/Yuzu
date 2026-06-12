@@ -17,6 +17,7 @@
 namespace yuzu::server {
 class GuaranteedStateStore;
 class BlastRadiusDetector;
+class DexAlertRouter;
 }
 
 namespace yuzu::server::detail {
@@ -35,8 +36,13 @@ namespace pb = ::yuzu::agent::v1;
 /// observation so fleet-wide incident detection sees both the direct and the
 /// gateway path through this one chokepoint (docs/dex-brd-coverage.md D3).
 /// nullptr disables detection (tests / detector-less configs).
+///
+/// `alert_router` (optional, F1): fed the same ruleless observations so
+/// operator-routed per-signal alerts also cover both wire paths. nullptr
+/// disables routing.
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp,
-                              BlastRadiusDetector* blast_radius = nullptr);
+                              BlastRadiusDetector* blast_radius = nullptr,
+                              DexAlertRouter* alert_router = nullptr);
 
 } // namespace yuzu::server::detail
