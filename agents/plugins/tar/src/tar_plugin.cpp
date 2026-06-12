@@ -23,6 +23,7 @@
 #include "tar_collectors.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_perf.hpp"
 #include "tar_schema_registry.hpp"
 #include "tar_aggregator.hpp"
 #include "tar_sql_executor.hpp"
@@ -238,9 +239,11 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",    "query",         "snapshot",       "export",
-                                     "configure", "collect_fast",  "collect_slow",   "rollup",
-                                     "sql",       "compatibility", "fleet_snapshot", nullptr};
+        static const char* acts[] = {"status",       "query",         "snapshot",
+                                     "export",       "configure",     "collect_fast",
+                                     "collect_slow", "collect_perf",  "rollup",
+                                     "sql",          "compatibility", "fleet_snapshot",
+                                     nullptr};
         return acts;
     }
 
@@ -291,6 +294,21 @@ public:
             slow_interval);
         ctx.register_trigger("tar.slow", "interval", slow_config);
 
+        // Perf sampler (BRD A1): 30 s default. perf_interval_seconds = 0
+        // disables registration entirely; the per-source perf_enabled config
+        // gates collection at run time (both honoured — the trigger seam is
+        // the cheap off-switch, the source gate is the operator-facing one).
+        int perf_interval = 30;
+        try {
+            perf_interval = std::stoi(db_->get_config("perf_interval_seconds", "30"));
+        } catch (...) {}
+        if (perf_interval > 0) {
+            auto perf_config = std::format(
+                R"({{"interval_seconds":{},"plugin":"tar","action":"collect_perf","parameters":{{}}}})",
+                perf_interval);
+            ctx.register_trigger("tar.perf", "interval", perf_config);
+        }
+
         // Register rollup trigger (15-minute aggregation cycle)
         auto rollup_config = std::format(
             R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})");
@@ -304,6 +322,7 @@ public:
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
         ctx.unregister_trigger("tar.fast");
         ctx.unregister_trigger("tar.slow");
+        ctx.unregister_trigger("tar.perf");
         ctx.unregister_trigger("tar.rollup");
         db_.reset();
         spdlog::info("TAR plugin shut down");
@@ -319,6 +338,8 @@ public:
             return do_collect_fast(ctx);
         if (action == "collect_slow")
             return do_collect_slow(ctx);
+        if (action == "collect_perf")
+            return do_collect_perf(ctx);
         if (action == "status")
             return do_status(ctx);
         if (action == "query")
@@ -346,6 +367,7 @@ private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
+    yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -418,6 +440,48 @@ private:
     int do_collect_fast(yuzu::CommandContext& ctx) {
         std::lock_guard lock(collect_mu_);
         return collect_fast_impl(ctx);
+    }
+
+    // ── collect_perf: device performance sample (BRD A1) ─────────────────────
+    // Reads raw kernel counters, derives one perf_live row from the delta vs
+    // the previous reading (held in memory — first tick after start is the
+    // baseline and records nothing). Total work per tick: a handful of
+    // syscalls + one SQLite insert; no allocation-heavy paths.
+    int do_collect_perf(yuzu::CommandContext& ctx) {
+        std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write
+        if (!source_enabled(*db_, "perf")) {
+            ctx.write_output("tar|collect_perf|0|source_disabled");
+            return 0;
+        }
+        const auto cur = yuzu::tar::read_perf_counters();
+        const auto sample = yuzu::tar::derive_sample(prev_perf_, cur);
+        prev_perf_ = cur;
+        if (!cur.valid) {
+            ctx.write_output("tar|collect_perf|0|unsupported_platform");
+            return 0;
+        }
+        if (!sample.valid) {
+            ctx.write_output("tar|collect_perf|0|baseline");
+            return 0;
+        }
+        yuzu::tar::PerfRow row;
+        row.ts = cur.ts_epoch;
+        row.snapshot_id = next_snapshot_id();
+        row.cpu_pct = sample.cpu_pct;
+        row.mem_used_pct = sample.mem_used_pct;
+        row.commit_pct = sample.commit_pct;
+        row.disk_read_bps = sample.disk_read_bps;
+        row.disk_write_bps = sample.disk_write_bps;
+        row.disk_read_lat_us = sample.disk_read_lat_us;
+        row.disk_write_lat_us = sample.disk_write_lat_us;
+        row.net_rx_bps = sample.net_rx_bps;
+        row.net_tx_bps = sample.net_tx_bps;
+        if (!db_->insert_perf_sample(row)) {
+            ctx.write_output("error|perf insert failed");
+            return 1;
+        }
+        ctx.write_output("tar|collect_perf|1|sample_recorded");
+        return 0;
     }
 
     // ── collect_slow: services + users ────────────────────────────────────────

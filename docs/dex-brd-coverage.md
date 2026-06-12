@@ -59,9 +59,9 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 13 | CPU utilization (real-time + historical + alerts) | Planned | **A1** sampling, **A3** threshold→observation, **A4** rollup |
-| 14 | Memory utilization | Planned | A1/A3/A4 (failure event `memory.exhausted` already live) |
-| 15 | Disk I/O latency & throughput | Planned | A1 (PhysicalDisk counters); failure events `disk.error`/`disk.port_reset` already live |
+| 13 | CPU utilization (real-time + historical + alerts) | **Partial → strong** (A1, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly, operator-SQL queryable). Threshold alerts → **A3**, fleet rollup → **A4** |
+| 14 | Memory utilization | **Partial → strong** (A1, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event already live |
+| 15 | Disk I/O latency & throughput | **Partial → strong** (A1, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live |
 | 16 | Network latency & packet loss | **Partial → strong** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1 |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
@@ -103,7 +103,7 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 42 | Bandwidth usage (device + app) | Planned | Device-level: **A1** interface counters. Per-app: **E3** stretch |
+| 42 | Bandwidth usage (device + app) | **Partial** (A1, 2026-06-12) | Device-level continuous rx/tx B/s shipped (summed non-loopback interfaces). Per-app: **E3** stretch |
 | 43 | VPN / gateway latency | **Covered** (E1, 2026-06-12) | Probe the gateway/concentrator address (`network.probe.icmp`/`tcp`); `network.vpn_failed` failure events live |
 | 44 | Network jitter | **Covered** (E1, 2026-06-12) | Population stddev over probe samples, per target |
 | 45 | RTT to key (configurable) resources | **Covered** (E1, 2026-06-12) | Operator-chosen targets (max 4/invocation), scheduler-driven recurrence, response-store history |
@@ -366,7 +366,7 @@ recompute (the established agent-metrics surface).
 
 | Slice | Content | BRD rows |
 |---|---|---|
-| A1 | TAR perf sampler: PDH counters — CPU %, memory committed/available, disk latency + throughput, per-interface network bytes; 30 s cadence; `perf_samples` table + retention | 13–16, 42, 127 |
+| A1 | TAR perf sampler — CPU %, memory used/commit %, disk latency + throughput, network bytes; 30 s cadence; `perf_live` + `perf_hourly` warehouse tiers | 13–16, 42, 127 — **SHIPPED 2026-06-12**: raw kernel counters (GetSystemTimes / GlobalMemoryStatusEx + GetPerformanceInfo / IOCTL_DISK_PERFORMANCE / GetIfTable2 — no PDH, no WMI, no shell-out), trigger-engine scheduled (no new thread), per-source enable + interval config, 7 d raw / 31 d hourly retention, operator-SQL queryable; Linux/macOS collectors kPlanned in the registry |
 | A2 | Top-N per-process samples (CPU + working set, top 10 per tick) with cmdline redaction reuse | 22, 27 |
 | A3 | Threshold→observation: hysteresis/latch breach detection → `perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` observations (rate-capped, alert-routable like every other signal) | 13–15, 124 |
 | A4 | Fleet rollup: heartbeat aggregate piggyback + server recompute → Prometheus gauges + `/dex` device drill-down sparklines (federated TAR query) | 98–100, 126 |

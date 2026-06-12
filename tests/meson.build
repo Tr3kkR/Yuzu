@@ -142,6 +142,10 @@ test(
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
+if host_machine.system() == 'windows'
+  # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
+  tar_test_deps += cxx.find_library('iphlpapi')
+endif
 
 tar_test_exe = executable(
   'yuzu_tar_tests',
@@ -151,12 +155,14 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_tar_perf.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [

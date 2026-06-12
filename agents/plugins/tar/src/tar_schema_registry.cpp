@@ -272,6 +272,69 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── Perf (BRD A1 — continuous device performance sampling) ──────
+        // One derived row per sample interval (default 30 s): CPU %, memory
+        // used/commit %, summed disk throughput + per-IO latency, summed
+        // non-loopback network throughput. Raw samples stay on-device
+        // (ADR-0004); the hourly tier carries avg/max for trend queries.
+        {
+            .name = "perf",
+            .dollar_name = "Perf",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,  "ntcounters",
+                 "Raw kernel counters — GetSystemTimes, GlobalMemoryStatusEx + "
+                 "GetPerformanceInfo, IOCTL_DISK_PERFORMANCE, GetIfTable2. "
+                 "No PDH, no WMI, no shell-out. Some virtual disks do not "
+                 "answer IOCTL_DISK_PERFORMANCE — disk columns read 0 there."},
+                {"linux",   OsSupportStatus::kPlanned,    "procfs",
+                 "/proc/stat, /proc/meminfo, /proc/diskstats, /proc/net/dev."},
+                {"macos",   OsSupportStatus::kPlanned,    "host_statistics",
+                 "host_processor_info / host_statistics64 + IOKit counters."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 604800, // 7 days of 30 s samples ≈ 20k rows
+                    .columns = {
+                        {"ts",                "INTEGER"},
+                        {"snapshot_id",       "INTEGER"},
+                        {"cpu_pct",           "REAL"},
+                        {"mem_used_pct",      "REAL"},
+                        {"commit_pct",        "REAL"},
+                        {"disk_read_bps",     "INTEGER"},
+                        {"disk_write_bps",    "INTEGER"},
+                        {"disk_read_lat_us",  "INTEGER"},
+                        {"disk_write_lat_us", "INTEGER"},
+                        {"net_rx_bps",        "INTEGER"},
+                        {"net_tx_bps",        "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days
+                    .columns = {
+                        {"hour_ts",            "INTEGER"},
+                        {"samples",            "INTEGER"},
+                        {"cpu_avg",            "REAL"},
+                        {"cpu_max",            "REAL"},
+                        {"mem_avg",            "REAL"},
+                        {"mem_max",            "REAL"},
+                        {"commit_avg",         "REAL"},
+                        {"read_bps_avg",       "INTEGER"},
+                        {"write_bps_avg",      "INTEGER"},
+                        {"read_lat_us_avg",    "INTEGER"},
+                        {"write_lat_us_avg",   "INTEGER"},
+                        {"read_lat_us_max",    "INTEGER"},
+                        {"write_lat_us_max",   "INTEGER"},
+                        {"rx_bps_avg",         "INTEGER"},
+                        {"tx_bps_avg",         "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -363,8 +426,8 @@ std::string generate_warehouse_ddl() {
 
             for (const auto& col : g.columns) {
                 ddl << ",\n    " << col.name << " " << col.sql_type;
-                // ts columns and counts get NOT NULL
-                if (col.sql_type == "INTEGER") {
+                // Numeric columns default to 0, text to '' — all NOT NULL.
+                if (col.sql_type == "INTEGER" || col.sql_type == "REAL") {
                     ddl << " NOT NULL DEFAULT 0";
                 } else {
                     ddl << " NOT NULL DEFAULT ''";
@@ -529,6 +592,24 @@ SELECT (ts / 86400) * 86400, user, domain,
 FROM user_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 86400) * 86400, user, domain)";
+        }
+    }
+
+    // ── Perf rollups (BRD A1) ───────────────────────────────────────────
+    if (source_name == "perf") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO perf_hourly (hour_ts, samples, cpu_avg, cpu_max, mem_avg, mem_max, commit_avg,
+    read_bps_avg, write_bps_avg, read_lat_us_avg, write_lat_us_avg,
+    read_lat_us_max, write_lat_us_max, rx_bps_avg, tx_bps_avg)
+SELECT (ts / 3600) * 3600, COUNT(*),
+       AVG(cpu_pct), MAX(cpu_pct), AVG(mem_used_pct), MAX(mem_used_pct), AVG(commit_pct),
+       CAST(AVG(disk_read_bps) AS INTEGER), CAST(AVG(disk_write_bps) AS INTEGER),
+       CAST(AVG(disk_read_lat_us) AS INTEGER), CAST(AVG(disk_write_lat_us) AS INTEGER),
+       MAX(disk_read_lat_us), MAX(disk_write_lat_us),
+       CAST(AVG(net_rx_bps) AS INTEGER), CAST(AVG(net_tx_bps) AS INTEGER)
+FROM perf_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600)";
         }
     }
 

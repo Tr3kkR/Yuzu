@@ -665,6 +665,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"tar.configure", "Update TAR collection intervals and retention settings"},
         {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
         {"tar.collect_slow", "Run slow collectors (services + users + installed apps)"},
+        {"tar.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
     };
     return m;
 }
