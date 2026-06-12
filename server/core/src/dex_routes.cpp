@@ -902,8 +902,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
     auto sorted = deds;
     std::sort(sorted.begin(), sorted.end(),
               [](const auto& a, const auto& b) { return a.deduction > b.deduction; });
-    static const char* kColors[] = {"#ff5765", "#ff7a52", "#ffae42", "#ffcc00", "#d6d34e", "#a9d34e",
-                                    "#7ed27e", "#4ed27e", "#4ed2a8", "#4ec3d2", "#4e9fd2", "#6f86a6"};
+    // One color per display family (13) — sized to dex_signal_groups() so two
+    // families never share a swatch; index by std::size, not a literal.
+    static const char* kColors[] = {"#ff5765", "#ff7a52", "#ffae42", "#ffcc00", "#d6d34e",
+                                    "#a9d34e", "#7ed27e", "#4ed27e", "#4ed2a8", "#4ec3d2",
+                                    "#4e9fd2", "#6f86a6", "#b48ead"};
     double maxD = 0.0001;
     for (const auto& d : sorted)
         maxD = std::max(maxD, d.deduction);
@@ -915,7 +918,8 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
         if (d.deduction < 0.05)
             continue;
         h += "<span style=\"flex:" + std::format("{:.2f}", d.deduction) + ";background:" +
-             kColors[ci % 12] + "\" title=\"" + esc(d.name) + ": -" +
+             kColors[static_cast<std::size_t>(ci) % std::size(kColors)] + "\" title=\"" +
+             esc(d.name) + ": -" +
              std::format("{:.1f}", d.deduction) + "\"></span>";
         ++ci;
     }
@@ -1516,15 +1520,20 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         return back_to_overview(window) +
                placeholder("Reliability data unavailable", "The signal store is not open.");
 
-    // A4: lazy-loaded device perf panel — the route behind the hx-get runs the
-    // live federated TAR query (and answers honestly when it can't). Rendered
-    // for EVERY device, signals or not: a quiet device still has perf history.
+    // A4: click-to-load device perf panel. Deliberately NOT auto-loaded: the
+    // route behind the hx-get dispatches a real tar.sql to the device AND
+    // probes Execution:Execute (which audit-logs a denial) — auto-loading
+    // would fire a command + possible denied-audit row on every page view by
+    // every operator (grill finding 1). A click is an attempted action, so
+    // both side effects become honest. Rendered for EVERY device, signals or
+    // not: a quiet device still has perf history.
     const std::string perf_panel =
         "<div class=\"gp-sech\">Device performance (hourly, on-device warehouse)</div>"
-        "<div hx-get=\"/fragments/dex/device/perf?agent_id=" +
+        "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
+        "hx-get=\"/fragments/dex/device/perf?agent_id=" +
         url_encode(agent_id) +
-        "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" class=\"gp-note\">"
-        "Loading device performance&hellip;</div>";
+        "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load performance</button> "
+        "<span class=\"gp-mute\">runs a live read-only query on the device</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
@@ -1603,9 +1612,14 @@ std::optional<double> cell_double(const std::string& s) {
 // Inline sparkline SVG (server-rendered, CSP-safe, no JS). Y auto-scales to the
 // series range; a flat series draws a midline. Emits only formatted numbers —
 // markup-safe by construction.
-std::string sparkline_svg(const std::vector<double>& vals, const char* stroke) {
-    if (vals.empty())
+std::string sparkline_svg(const std::vector<double>& in_vals, const char* stroke) {
+    if (in_vals.empty())
         return "";
+    // A single sample can't draw a line segment (an invisible chart next to
+    // real now/min/max text) — duplicate it into a flat 2-point line.
+    std::vector<double> vals = in_vals;
+    if (vals.size() == 1)
+        vals.push_back(vals[0]);
     constexpr double kW = 240.0, kH = 36.0, kPad = 2.0;
     const double lo = *std::min_element(vals.begin(), vals.end());
     const double hi = *std::max_element(vals.begin(), vals.end());
@@ -1613,9 +1627,8 @@ std::string sparkline_svg(const std::vector<double>& vals, const char* stroke) {
     const std::size_t n = vals.size();
     std::string pts;
     for (std::size_t i = 0; i < n; ++i) {
-        const double x = n == 1 ? kW / 2.0
-                                : kPad + (kW - 2 * kPad) * static_cast<double>(i) /
-                                      static_cast<double>(n - 1);
+        const double x =
+            kPad + (kW - 2 * kPad) * static_cast<double>(i) / static_cast<double>(n - 1);
         const double frac = flat ? 0.5 : (vals[i] - lo) / (hi - lo);
         const double y = kH - kPad - (kH - 2 * kPad) * frac;
         pts += std::format("{:.1f},{:.1f} ", x, y);

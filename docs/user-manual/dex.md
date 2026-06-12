@@ -87,9 +87,10 @@ opened from a panel inherit the window you were viewing, so the numbers match.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the
-  device's own hourly perf rollups. The panel runs a **live, read-only TAR
-  query on the device when you open it** — the raw samples stay in the
-  on-device edge warehouse (federated model) until an operator asks. It
+  device's own hourly perf rollups. The panel is **click-to-load** and runs a
+  **live, read-only TAR query on the device** when you load it — the raw
+  samples stay in the on-device edge warehouse (federated model) until an
+  operator asks, and merely viewing a device page never dispatches anything. It
   therefore needs the device online, the TAR perf sampler enabled, and (beyond
   `GuaranteedState:Read`) the **`Execution:Execute`** permission — without it
   the panel shows a note instead. Each query is audit-logged

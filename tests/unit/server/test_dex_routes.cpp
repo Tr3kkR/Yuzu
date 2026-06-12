@@ -618,7 +618,7 @@ TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
     CHECK(html.find("hx-on") == std::string::npos); // CSP rule: never hx-on
 }
 
-TEST_CASE("DEX device fragment embeds the lazy perf panel", "[dex][perf][render]") {
+TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf][render]") {
     GuaranteedStateStore store(":memory:");
     // With signals AND without - a quiet device still has perf history.
     const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
@@ -626,7 +626,13 @@ TEST_CASE("DEX device fragment embeds the lazy perf panel", "[dex][perf][render]
     seed_crash(store, "e1", "WS-9", "app.exe", "m.dll", "windows", "2026-06-09T10:00:00Z");
     const auto busy = render_dex_device_fragment(&store, "WS-9", "7d");
     CHECK(busy.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
-    CHECK(busy.find("hx-trigger=\"load\"") != std::string::npos);
+    // Click-to-load, NEVER auto-load: the route dispatches a real command and
+    // probes Execute (which audit-logs denials) — auto-loading would fire both
+    // on every page view (grill finding 1). Pin the button + the absence of an
+    // hx-trigger="load" auto-fire anywhere in the fragment.
+    CHECK(busy.find("<button") != std::string::npos);
+    CHECK(busy.find("Load performance") != std::string::npos);
+    CHECK(busy.find("hx-trigger=\"load\"") == std::string::npos);
 }
 
 TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",

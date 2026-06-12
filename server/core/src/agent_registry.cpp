@@ -1280,22 +1280,25 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
         // A4 perf tags. Same forged-value posture as add_finite_count: accept
         // only finite, non-negative values so one rogue agent cannot poison a
-        // fleet percentile with inf/nan/negatives. Percentages additionally
-        // clamp to 100 (a >100% claim is a lie, not an outlier).
+        // fleet percentile with inf/nan/negatives. Percentages have a semantic
+        // bound, so a >100% claim CLAMPS (a lie, not an outlier); latency has
+        // none, so an absurd-but-finite claim (1e308 ms/IO) is REJECTED above
+        // a sanity ceiling — clamping would still poison avg with the ceiling.
         auto collect_finite = [&](std::vector<double>& out, const std::string& key,
-                                  double clamp_hi) {
+                                  double clamp_hi, double reject_above) {
             const auto s = get(key);
             if (s.empty())
                 return;
             try {
                 double v = std::stod(s);
-                if (std::isfinite(v) && v >= 0.0)
+                if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
                     out.push_back(clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v);
             } catch (...) {}
         };
-        collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0);
-        collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0);
-        collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0);
+        constexpr double kMaxSaneLatMs = 1.0e6; // 1000 s per IO — beyond absurd
+        collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
+        collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
+        collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, kMaxSaneLatMs);
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1329,8 +1332,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         double sum = 0.0;
         for (double v : vals)
             sum += v;
+        // True nearest-rank: index ceil(p·n)−1. floor((n−1)·p) looks similar but
+        // under-reports high percentiles in small fleets (n=2 → p90 = the MIN).
         auto rank = [&](double p) {
-            return vals[static_cast<std::size_t>(static_cast<double>(n - 1) * p)];
+            const auto idx = static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
+            return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
         };
         metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
         metrics.gauge(family, {{"stat", "p50"}}).set(rank(0.50));

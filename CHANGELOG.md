@@ -109,11 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (2) The `/dex` per-device drill-down gains a **device performance panel**:
   CPU / memory / disk-latency sparklines over the device's hourly warehouse
   rollups, fetched by a live read-only `$Perf_Hourly` TAR query dispatched to
-  the device when the panel opens (raw samples stay on-device — the federated
-  model). Server-rendered SVG, no JS. Needs the device online and
-  `Execution:Execute` (the panel says so honestly otherwise); each query is
-  audit-logged (`dex.device.perf.query`). Agents with `--dex-disable` ship no
-  perf tags.
+  the device when you **click Load performance** (click-to-load — viewing a
+  device page alone never dispatches a command; raw samples stay on-device —
+  the federated model). Server-rendered SVG, no JS. Needs the device online
+  and `Execution:Execute` (the panel says so honestly otherwise); each query
+  is audit-logged (`dex.device.perf.query`). Agents with `--dex-disable` ship
+  no perf tags.
 - **DEX: sustained performance-breach alerts (Performance signal family).** The
   Windows state poller now samples CPU, commit charge, and disk service time
   every 120 s (raw kernel counters — `GetSystemTimes`, `GetPerformanceInfo`,

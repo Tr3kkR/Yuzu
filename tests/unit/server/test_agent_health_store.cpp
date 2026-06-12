@@ -100,21 +100,22 @@ public:
             if (!dex_val.empty())
                 add_finite_count(total_dex_observed, dex_val);
 
-            // A4 perf tags — finite, non-negative, percentages clamped to 100.
+            // A4 perf tags — finite, non-negative; percentages clamp at 100,
+            // latency rejects above the sanity ceiling (absurd-but-finite).
             auto collect_finite = [&](std::vector<double>& out, const std::string& key,
-                                      double clamp_hi) {
+                                      double clamp_hi, double reject_above) {
                 const auto s = get(key);
                 if (s.empty())
                     return;
                 try {
                     double v = std::stod(s);
-                    if (std::isfinite(v) && v >= 0.0)
+                    if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
                         out.push_back(clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v);
                 } catch (...) {}
             };
-            collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0);
-            collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0);
-            collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0);
+            collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
+            collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
+            collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, 1.0e6);
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -145,7 +146,9 @@ public:
             for (double v : vals)
                 sum += v;
             auto rank = [&](double p) {
-                return vals[static_cast<std::size_t>(static_cast<double>(n - 1) * p)];
+                const auto idx =
+                    static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
+                return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
             };
             metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
             metrics.gauge(family, {{"stat", "p50"}}).set(rank(0.50));
@@ -368,6 +371,10 @@ TEST_CASE("AgentHealthStore: rogue perf values cannot poison fleet percentiles",
     // A >100% CPU claim is a lie, not an outlier — clamped to 100, so it can
     // shift max to the clamp but never to an absurd magnitude.
     store.upsert("liar", {{"yuzu.perf_cpu_pct", "9000"}});
+    // Latency has NO semantic bound to clamp to — an absurd-but-finite claim
+    // (1e308 passes the isfinite check!) is REJECTED above the sanity ceiling,
+    // otherwise one agent drags avg/max to nonsense (grill finding 2).
+    store.upsert("lat-liar", {{"yuzu.perf_disk_lat_ms", "1e308"}});
     store.recompute_metrics(metrics, std::chrono::seconds(60));
 
     CHECK(metrics.gauge("yuzu_fleet_perf_reporting").value() == 2.0); // good + liar
@@ -375,4 +382,18 @@ TEST_CASE("AgentHealthStore: rogue perf values cannot poison fleet percentiles",
     CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "avg"}}).value() == 75.0);
     CHECK(std::isfinite(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "avg"}}).value()));
     CHECK(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "avg"}}).value() == 3.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "max"}}).value() == 3.0);
+}
+
+TEST_CASE("AgentHealthStore: true nearest-rank percentiles in tiny fleets",
+          "[health_store][perf]") {
+    // floor((n-1)·p) would return the MIN as p90 for n=2 — the regression the
+    // grill caught. True nearest-rank (ceil(p·n)−1) returns the max.
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    store.upsert("a", {{"yuzu.perf_cpu_pct", "10.0"}});
+    store.upsert("b", {{"yuzu.perf_cpu_pct", "90.0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p50"}}).value() == 10.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p90"}}).value() == 90.0);
 }
