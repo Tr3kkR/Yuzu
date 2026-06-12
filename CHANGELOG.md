@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI server-test legs now require a reachable PostgreSQL 16**
+  (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
+  provision or authenticate one — except the documented psql-less TCP-probe
+  fallback on a native cluster) — the new `[pg]`-tagged server tests for the
+  Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
+  development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
+  tests skip cleanly; when it is set but unreachable they fail. See
+  `docs/ci-architecture.md` "Postgres for server tests" for the local
+  one-liner.
+
 ### Breaking Changes
 
 - **The server now generates per-install default TLS certificates on first
@@ -85,6 +97,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **macOS DEX collector — limited, unprivileged.** The DEX observer now ships a
+  macOS collector (`dex_macos_collector.cpp` + the pure parsers
+  `dex_macos_{signals,oslog,iokit}.{hpp,cpp}`) using four privilege-light
+  mechanisms — a kqueue `DiagnosticReports` folder-watch (`.ips`/`.diag`
+  crashes/hangs/panics/jetsam), a `sysctl(KERN_BOOTTIME)` uptime scalar, an
+  incremental `log show` unified-log poll, and an IOKit/system-tool poll
+  (SMART/battery/disk/thermal/memory). It reuses the OS-neutral obs_types, so no
+  server or dashboard change is needed beyond one macOS-only type — `storage.low`
+  (disk nearly full) — bringing the catalogue to **104**. Covers ~10 of 11 DEX
+  experience headings unprivileged; the Security heading (XProtect/Gatekeeper) is
+  not yet shipped. Privacy is minimised at the edge (faulting-image basenames
+  only, never raw log message bodies; per-type rate caps; non-finite metric
+  guards). Obeys the same `--dex-disable` kill switch as Windows. Linux endpoints
+  still report no DEX signals. Source mapping + the Endpoint-Security entitlement
+  roadmap: `docs/dex-signal-catalog.md`.
+- **DEX dashboard (`/dex`) — a hub plus three deep pages.** The read-only fleet-
+  reliability lens over the Guardian observation catalogue is structured as a
+  **hub** (measured crash-free-device % and crashes/1k-device-days, honest "—"
+  when no agents report) that summarises and links into three deep pages:
+  **Catalogue** (all 104 monitored signal types across 12 families — App
+  reliability, Boot/start-up & shutdown, Service health, System stability,
+  Hardware & storage, File system, Network, Identity & logon, Security &
+  protection, Updates & installs, Policy & management, Printing — quiet types as
+  real-zero rows, with per-type drill-down and an "Other" bucket for uncatalogued
+  types a newer agent emits), **Health score** (a transparent, *secondary* 0–100
+  composite — `100 − Σ weighted deductions` — suppressed, never fabricated, when
+  no agents report), and **Trends** (cross-OS comparison cards carrying each OS's
+  live signal scope, per-family sparklines, and a guard×day activity heatmap). A
+  24h/7d/30d/All window selector applies to every view; per-app and per-device
+  drill-downs (and the per-signal device list) are permission-gated
+  (`GuaranteedState:Read`) and audit-logged on open (behavioral data). A "DEX"
+  nav link is in the dashboard chrome. NO mock data anywhere: real aggregations
+  or explicit "no data" placeholders.
+- **DEX REST + MCP aggregation surface (`/api/v1/dex/*`, MCP `*_dex_signal*`
+  tools) — agentic parity.** The DEX dashboard rollups now have machine-readable
+  equivalents on both agentic planes so a worker sees the same read-model the
+  dashboard does. REST: `GET /api/v1/dex/signals` (the catalogue rollup), `GET
+  /api/v1/dex/scope` (per-OS signal coverage), and `GET
+  /api/v1/dex/signals/{obs_type}` (one signal's subjects / OS split /
+  most-affected devices / per-day trend). MCP: the matching `list_dex_signals`,
+  `get_dex_signal_scope`, and `get_dex_signal_detail` read tools. All gated on
+  `GuaranteedState:Read` with a `24h/7d/30d/all` `window` and a shared resolver
+  so REST, MCP and the dashboard can never drift on the window vocabulary. Audit
+  boundary mirrors the events endpoint across all three surfaces: the rollup and
+  scope are fleet aggregates (not audited as a view); the per-signal drill-down
+  returns a behavioral devices list and emits `dex.signal.view` on every call.
+- **Guardian DEX — 103-signal observation catalogue (waves 1–3).** The
+  slice-1 crash recorder generalized into one catalogue-driven multi-channel
+  observer (`dex_signal_catalog.{hpp,cpp}` + `dex_observer.{hpp,cpp}`,
+  renamed from `crash_observer`): 103 obs_types / 22 event-log channels —
+  crashes (native + .NET), hangs, service failures (7 kinds), bugcheck/
+  power-loss/dirty-shutdown, boot/shutdown/resume durations + per-cause
+  degradation, disk SMART/controller/port-reset, NTFS + ESE corruption,
+  memory exhaustion, device/TPM/CPU-throttle, Wi-Fi/DHCP/VPN/SMB/DNS/port-
+  exhaustion, Entra ID token errors, Windows Hello/biometric errors, RDP
+  disconnects, machine-trust/Kerberos/LSA/TLS failures, Defender health,
+  BitLocker, certificate auto-enrollment, update check/download/install
+  failures, MDM/Intune errors, Group Policy failures, print failures, and
+  more (`docs/dex-signal-catalog.md`). Uniform `detail_json` keys mean a new
+  signal needs ZERO server change. Per-type rate caps (12–120/h) bound the
+  wire. **Privacy minimisation at the edge** ([privacy]-pinned tests): DNS
+  query names, print document names/owners, usernames (profile/VPN/RDP/
+  service-logon/restart-initiator/Defender), client addresses, user-profile
+  paths, AAD message texts, and .NET stack frames are never extracted.
+  Verified via real-record fixtures harvested from a live Win11 box plus a
+  synthetic event-stream injection sweep (34 classic-source events through
+  the real `EvtSubscribe` path; the sweep caught and fixed a case-
+  sensitivity bug in provider matching). Heartbeat tags/metrics renamed:
+  `yuzu_agent_dex_observer_armed`, `yuzu_fleet_agents_dex_observer_disarmed`,
+  `yuzu_fleet_dex_observed_total`.
+- **Guardian DEX — fleet-wide process-crash recorder (slice 1).** The agent now
+  records Windows process crashes (Application event log, Event ID 1000,
+  "Application Error") on managed endpoints as **ruleless** Digital Experience (DEX)
+  observations, independent of any Guardian rule. It is an idle-until-crash
+  `EvtSubscribe` to the Application channel — no polling, no streaming. Scope is
+  Windows-only and Event-1000-only this slice (pure-.NET crashes that emit only a
+  `.NET Runtime` 1026, and hosts with Windows Error Reporting disabled, are not yet
+  captured). A crash is emitted through the existing Guardian event pipeline and
+  distinguished by `rule_id=__observation__` (a reserved sentinel) plus
+  `event_type=process.crashed` — not a category field; query it via
+  `GET /api/v1/guaranteed-state/events?rule_id=__observation__`. The recorder is a
+  no-op off Windows. Agents report crash-recorder arm-state and observed-crash count
+  in their heartbeat; the server rolls these up into
+  `yuzu_fleet_agents_dex_observer_disarmed` (Windows agents whose observer is not
+  armed — failed to arm at startup or lost its subscription at runtime; `> 0` means
+  reliability telemetry is silently off there) and `yuzu_fleet_dex_observed_total` (a
+  resetting gauge, not a monotonic counter). [Metric names generalised from the
+  earlier `*_crash_observer_disarmed` / `*_crashes_observed_total` when the crash
+  recorder became the 103-signal observer — both pre-release.] A deploy-time opt-out,
+  `--dex-disable` / `YUZU_AGENT_DEX_DISABLE`, collects no crash telemetry. The full executable path is
+  parsed but deliberately not sent (data minimisation). See
+  `docs/user-manual/guaranteed-state.md#dex-signal-observations` and the
+  [DEX dashboard](docs/user-manual/dex.md) (the slice-1 recorder is now one of
+  the 103 catalogued signals).
+- **libpq (PostgreSQL client library) added as a build dependency on all
+  platforms (#1317, ADR-0006/ADR-0008).** This is the F0 link-proof canary for
+  the server's storage-substrate migration to PostgreSQL — **no product
+  behavior changes and no server-side Postgres usage in this release**; the
+  migration lands incrementally over future releases (advance notice:
+  ADR-0006). Building from source on Linux now requires `bison` and `flex`;
+  on macOS, `autoconf`/`automake`/`libtool` (Windows: none — vcpkg
+  auto-acquires winflexbison). The Windows release zip gains `libpq.dll` via
+  the existing vcpkg-DLL bundling.
 - **Subordinate-CA — root Yuzu's internal CA in your enterprise PKI (PKI PR6,
   M2).** Export the install CA's signing request (`GET /api/v1/ca/root-csr`,
   `Security:Read`), have your enterprise root sign it as a subordinate CA, then

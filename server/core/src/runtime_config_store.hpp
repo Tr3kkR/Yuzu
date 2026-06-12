@@ -22,7 +22,9 @@ struct RuntimeConfigEntry {
 
 /// Persistent runtime configuration overrides.
 /// Stores key/value pairs in SQLite that override startup defaults.
-/// Only a fixed set of safe keys are allowed (no secrets).
+/// Only a fixed set of allowed keys is accepted. One of them
+/// (oidc_client_secret) IS a secret and is stored plaintext today —
+/// its envelope encryption lands with the Postgres migration (ADR-0010).
 class RuntimeConfigStore {
 public:
     explicit RuntimeConfigStore(const std::filesystem::path& db_path);

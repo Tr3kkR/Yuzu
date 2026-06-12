@@ -552,6 +552,12 @@ struct McpTestServer {
     bool crl_publish_succeeds_{true};
     int crl_publish_calls_{0};
 
+    /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
+    /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
+    /// exercised. Default nullptr keeps every existing test on the no-store path
+    /// (tools report "Guaranteed State store unavailable").
+    yuzu::server::GuaranteedStateStore* guaranteed_state_store_for_test{nullptr};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
@@ -656,7 +662,8 @@ private:
                 if (!crl_publish_succeeds_)
                     return std::nullopt;
                 return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
-            });
+            },
+            /*guaranteed_state_store=*/guaranteed_state_store_for_test);
     }
 };
 
@@ -704,7 +711,7 @@ TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
     CHECK(body["result"].empty()); // {}
 }
 
-// ── 3. tools/list — verify 23 tools ─────────────────────────────────────────
+// ── 3. tools/list — verify the advertised tool set ──────────────────────────
 
 TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integration]") {
     McpTestServer ts;
@@ -741,9 +748,10 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
 
     // Spot-check specific tool names are present
     std::vector<std::string> expected_names = {
-        "list_agents",      "get_agent_details",     "query_audit_log",
-        "list_definitions", "get_definition",        "query_responses",
-        "validate_scope",   "preview_scope_targets", "list_pending_approvals"};
+        "list_agents",       "get_agent_details",     "query_audit_log",
+        "list_definitions",  "get_definition",        "query_responses",
+        "validate_scope",    "preview_scope_targets", "list_pending_approvals",
+        "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail"};
     for (const auto& name : expected_names) {
         bool found = false;
         for (const auto& tool : tools) {
@@ -834,6 +842,157 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
+// The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
+// per-OS scope are fleet aggregates (only the generic mcp.<tool> tool-call audit
+// fires); the per-signal detail returns a most-affected DEVICES list (agent_ids
+// — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
+// catches the dashboard, REST and MCP behavioral-access surfaces alike.
+
+// Seed one ruleless DEX observation (the __observation__ projection the DEX
+// aggregations read) — subject + platform land in detail_json.
+static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
+                         const std::string& agent, const std::string& obs_type,
+                         const std::string& subject, const std::string& platform,
+                         const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = obs_type;
+    e.severity = "info";
+    e.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + platform + "\"}";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":40,"params":{"name":"list_dex_signals","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    bool found = false;
+    for (const auto& r : rows) {
+        if (r["obs_type"] == "process.crashed") {
+            CHECK(r["count"].get<int>() == 2);
+            CHECK(r["distinct_devices"].get<int>() == 2);
+            found = true;
+        }
+    }
+    CHECK(found);
+    // Fleet aggregate — only the generic tool-call audit, never dex.signal.view.
+    CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "o3", "MB-1", "storage.low", "disk", "macos", "2026-06-10T12:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":41,"params":{"name":"get_dex_signal_scope","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    int macos_types = -1;
+    for (const auto& r : rows)
+        if (r["platform"] == "macos")
+            macos_types = r["distinct_types"].get<int>();
+    CHECK(macos_types == 2); // process.crashed + storage.low
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":42,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["obs_type"] == "process.crashed");
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2); // WS-1 + WS-2
+    REQUIRE(payload["subjects"].is_array());
+    CHECK(payload["subjects"][0]["subject"] == "chrome.exe");
+
+    // Behavioral access → dex.signal.view fired, THEN the generic tool-call audit
+    // (same dual-audit convention as revoke_certificate).
+    REQUIRE(ts.audit_log.size() >= 2);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.signal.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":43,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"foo!bar"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // Validation precedes the audit — no dex.signal.view for a view that never ran.
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":44,"params":{"name":"list_dex_signals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 // ── 5. tools/call with unknown tool — kMethodNotFound ───────────────────────

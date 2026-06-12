@@ -72,12 +72,15 @@ jobs:
       - name: Verify build dependencies
         run: |
           MISSING=""
-          for cmd in gcc-13 g++-13 cmake ninja meson ccache pkg-config rpmbuild; do
+          # bison/flex: vcpkg's libpq port builds postgresql from source and
+          # cannot auto-acquire them on Linux (gov #1331 — do not rely on the
+          # machine-wide side effect of ci.yml's apt step).
+          for cmd in gcc-13 g++-13 cmake ninja meson ccache pkg-config rpmbuild bison flex; do
             command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
           done
           if [ -n "$MISSING" ]; then
             echo "::error::Missing tools on self-hosted runner:$MISSING"
-            echo "Install with: sudo apt-get install -y ccache rpm"
+            echo "Install with: sudo apt-get install -y ccache rpm bison flex"
             exit 1
           fi
 
@@ -744,7 +747,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja ccache pipx
+          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
+          # ADR-0006) runs autoreconf during its build and the hosted macOS
+          # image doesn't ship autotools.
+          brew install cmake ninja ccache pipx autoconf automake libtool
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
@@ -1232,6 +1238,171 @@ jobs:
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ── yuzu-postgres — the server's storage substrate image ─────────────
+  # Postgres 16 + pgvector + app role/db init (ADR-0006/0007/0008, #1318).
+  # Mirrors docker-publish (login / metadata / SBOM / attestation / cosign)
+  # with three differences:
+  #   1. No needs on build-linux/build-gateway — the image contains no Yuzu
+  #      build artifacts (it's postgres + pgvector + init SQL), so a core
+  #      build failure is irrelevant to it. It IS in the release job's
+  #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
+  #      so a release must not publish if this image failed to.
+  #   2. Multi-arch linux/amd64,linux/arm64 (the demo/viz rigs are arm64).
+  #      The arm64 leg runs under QEMU on the amd64 self-hosted runner —
+  #      cheap here (apt install + one small C extension compile), unlike
+  #      the chisel jobs' full vcpkg-from-source builds.
+  #   3. Distinct local buildcache path (postgres suffix).
+  docker-publish-postgres:
+    name: "Publish postgres image"
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # QEMU + docker-container driver for the multi-arch (amd64+arm64)
+      # manifest-list push — same rationale as docker-publish-chisel.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          driver: docker-container
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN — see docker-publish for the full rationale.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
+          # Tag convention mirrors docker-publish / scripts/docker-release.sh:
+          #   - stable (no -alpha/-beta/-rc suffix): :X.Y.Z + :X.Y + :latest
+          #   - pre-release:                         :X.Y.Z-suffix only
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=yuzu-postgres
+            org.opencontainers.image.description=Yuzu server storage substrate — PostgreSQL 16 + pgvector (ADR-0006)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.postgres
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Distinct local buildcache path — never collides with the
+          # server/gateway/chisel caches on this runner.
+          cache-from: type=local,src=/mnt/d/docker-buildcache/postgres
+          cache-to: type=local,dest=/mnt/d/docker-buildcache/postgres,mode=max
+          # Disable buildx's own provenance/sbom attestation — we emit
+          # GitHub-native attestations + cosign signatures below (single
+          # verification path, same as docker-publish).
+          provenance: false
+          sbom: false
+
+      # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
+      - name: Generate image SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: yuzu-postgres-image.cdx.json
+          artifact-name: yuzu-postgres-image.cdx.json
+          upload-artifact: false
+
+      - name: Generate image SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: yuzu-postgres-image.spdx.json
+          artifact-name: yuzu-postgres-image.spdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-postgres-image-sbom
+          path: |
+            yuzu-postgres-image.cdx.json
+            yuzu-postgres-image.spdx.json
+          retention-days: 3
+
+      # ── SLSA build provenance (by image digest) ─────────────────────
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
+        run: |
+          # cosign v3.0+ auto-detects the OIDC issuer from the workflow's
+          # id-token; an explicit --oidc-issuer is redundant and a hard
+          # error in v3 (see docker-publish for the #495 history).
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Image summary
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## Published \`yuzu-postgres\` image (multi-arch)"
+            echo ""
+            echo '```'
+            echo "$META_TAGS"
+            echo '```'
+            echo ""
+            echo "**Digest:** \`$BUILD_DIGEST\`"
+            echo ""
+            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Signed with cosign keyless + SLSA provenance attestation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── Chiselled demo images — server + gateway + agent, multi-arch ─────
   # Publishes the FROM-scratch chiselled Ubuntu 26.04 demo images to GHCR
   # under a distinct `-chisel` repo suffix (see docs/demo-environment.md).
@@ -1612,7 +1783,10 @@ jobs:
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"
-    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
+    # docker-publish-postgres is in the needs: the composes release-pin
+    # ghcr.io/.../yuzu-postgres:X.Y.Z (#1318), so publishing a release
+    # whose postgres image failed to push would ship broken composes.
+    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

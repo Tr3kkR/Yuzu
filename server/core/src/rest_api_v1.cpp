@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "guardian_rule_spec.hpp"
@@ -356,6 +357,7 @@ const std::string& openapi_spec() {
           "guard_category": {"type": "string", "enum": ["event", "condition"]},
           "detected_value": {"type": "string"},
           "expected_value": {"type": "string"},
+          "detail_json": {"type": "string", "description": "Structured machine-readable detail, JSON keyed by event_type (route a'); empty for plain drift. For process.crashed: process/pid/kind/exception_code/symbolic/faulting_module/platform."},
           "remediation_action": {"type": "string"},
           "remediation_success": {"type": "boolean"},
           "detection_latency_us": {"type": "integer"},
@@ -589,6 +591,17 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}": {
       "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
+        R"json(,
+    "/dex/signals": {
+      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d; any other value resolves to 7d).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/scope": {
+      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/signals/{obs_type}": {
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
     }
   }
 })json";
@@ -4678,7 +4691,7 @@ void RestApiV1::register_routes(
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
     // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
-    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, guaranteed_state_store](
+    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, audit_fn, guaranteed_state_store](
                                                     const httplib::Request& req,
                                                     httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -4692,6 +4705,15 @@ void RestApiV1::register_routes(
         q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
         q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+        // Behavioral-PII access audit (governance compliance-F1): an agent-scoped
+        // query returns that device's signal history incl. detail_json (which apps
+        // a person runs) — the same behavioral data the dashboard per-device view
+        // audits as dex.device.view. Emit the SAME verb so a SIEM filter catches
+        // both surfaces. A query with NO agent_id filter is a bulk operational
+        // query (not individual-identifying) and is deliberately not audited here.
+        if (!q.agent_id.empty())
+            audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
+                     "DEX per-device events via REST /api/v1/guaranteed-state/events");
         if (req.has_param("limit")) {
             int v = 0;
             auto s = req.get_param_value("limit");
@@ -4728,6 +4750,7 @@ void RestApiV1::register_routes(
                     .add("guard_category", e.guard_category)
                     .add("detected_value", e.detected_value)
                     .add("expected_value", e.expected_value)
+                    .add("detail_json", e.detail_json)
                     .add("remediation_action", e.remediation_action)
                     .add("remediation_success", e.remediation_success)
                     .add("detection_latency_us", static_cast<int64_t>(e.detection_latency_us))
@@ -4738,6 +4761,168 @@ void RestApiV1::register_routes(
             list_json(arr.str(), static_cast<int64_t>(rows.size()), static_cast<int64_t>(q.offset)),
             "application/json");
     });
+
+    // ── DEX read-model aggregation surface (/api/v1/dex/*) ────────────────────
+    //
+    // Agentic-first parity (governance ar-S1): the DEX dashboard's catalogue
+    // rollup, per-signal drill-down and per-OS coverage were dashboard-only
+    // HTMX fragments — an agentic worker had no machine-readable equivalent.
+    // These three GETs expose the SAME store aggregations the fragments render,
+    // JSON-shaped, gated on the same GuaranteedState:Read securable, and resolve
+    // the `window` token through the shared dex_window_to_days/dex_iso_since
+    // helpers so REST and the dashboard can never drift on the window vocabulary.
+    //
+    // Audit boundary mirrors GET /guaranteed-state/events exactly: the catalogue
+    // rollup and per-OS scope are fleet aggregates (not individual-identifying)
+    // and are NOT audited; the per-signal drill-down returns a most-affected
+    // DEVICES list (agent_ids — behavioral, individual-identifying) and emits the
+    // same dex.signal.view verb the /fragments/dex/catalogue/signal route does.
+
+    // GET /dex/signals — whole-catalogue rollup (every obs_type in the window,
+    // with event count + blast radius). Aggregate; not audited.
+    sink.Get("/api/v1/dex/signals", [perm_fn, guaranteed_state_store](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        auto rows = guaranteed_state_store->dex_signal_summary(since);
+        JArr arr;
+        for (const auto& r : rows) {
+            arr.add(JObj()
+                        .add("obs_type", r.obs_type)
+                        .add("count", r.count)
+                        .add("distinct_devices", r.distinct_devices)
+                        .add("last_seen", r.last_seen));
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
+                        "application/json");
+    });
+
+    // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
+    // platform reports, and total events). Aggregate; not audited.
+    sink.Get("/api/v1/dex/scope", [perm_fn, guaranteed_state_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        auto rows = guaranteed_state_store->dex_os_signal_scope(since);
+        JArr arr;
+        for (const auto& r : rows) {
+            arr.add(JObj()
+                        .add("platform", r.platform)
+                        .add("distinct_types", r.distinct_types)
+                        .add("total_events", r.total_events));
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
+                        "application/json");
+    });
+
+    // GET /dex/signals/{obs_type} — one signal type's drill-down: top subjects,
+    // per-OS split, most-affected devices, and the per-day trend. The devices[]
+    // array names agent_ids exhibiting this signal (behavioral, individual-
+    // identifying) so this endpoint emits dex.signal.view — parity with the
+    // /fragments/dex/catalogue/signal route (governance B4) and the agent_id-
+    // filtered /guaranteed-state/events audit. obs_type is validated here (not by
+    // the route regex) so malformed input yields a clear 400 rather than a silent
+    // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
+    // read-model has no such observations — it is not an entity-not-found).
+    sink.Get(R"(/api/v1/dex/signals/([^/]+))",
+             [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const std::string obs_type = req.matches[1].str();
+                 // obs_type is the catalogue's machine key: lowercase dotted
+                 // segments (process.crashed, os.boot, app.sxs_error, ...). Accept
+                 // [A-Za-z0-9._-] up to 64 chars; reject anything else as 400.
+                 const bool ok =
+                     !obs_type.empty() && obs_type.size() <= 64 &&
+                     obs_type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                                "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                         std::string::npos;
+                 if (!ok) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid obs_type"), "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                 int limit = 50;
+                 if (req.has_param("limit")) {
+                     int v = 0;
+                     auto s = req.get_param_value("limit");
+                     [[maybe_unused]] auto [_, ec] =
+                         std::from_chars(s.data(), s.data() + s.size(), v);
+                     if (ec != std::errc{} || v < 0) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid limit"), "application/json");
+                         return;
+                     }
+                     limit = std::min(v, 500);
+                 }
+                 // Behavioral-PII access audit: the devices[] list below names the
+                 // agent_ids exhibiting this signal. Emit the same verb the
+                 // dashboard per-signal view does so a SIEM filter catches both.
+                 audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
+                          "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}");
+
+                 JArr subjects;
+                 for (const auto& s : guaranteed_state_store->dex_signal_subjects(obs_type, since,
+                                                                                  limit)) {
+                     subjects.add(JObj()
+                                      .add("subject", s.subject)
+                                      .add("count", s.count)
+                                      .add("distinct_devices", s.distinct_devices)
+                                      .add("last_seen", s.last_seen));
+                 }
+                 JArr by_os;
+                 for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                     // DexOsCrashCount.crashes carries the generic event count for
+                     // the generalised per-obs_type read (see the store header).
+                     by_os.add(JObj()
+                                   .add("platform", o.platform)
+                                   .add("count", o.crashes)
+                                   .add("distinct_devices", o.distinct_devices));
+                 }
+                 JArr devices;
+                 for (const auto& d : guaranteed_state_store->dex_signal_devices(obs_type, since,
+                                                                                 limit)) {
+                     devices.add(JObj()
+                                     .add("agent_id", d.agent_id)
+                                     .add("count", d.crashes)
+                                     .add("last_seen", d.last_seen));
+                 }
+                 JArr by_day;
+                 for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
+                     by_day.add(JObj().add("day", d.day).add("count", d.crashes));
+                 }
+                 res.set_content(ok_json(JObj()
+                                             .add("obs_type", obs_type)
+                                             .raw("subjects", subjects.str())
+                                             .raw("by_os", by_os.str())
+                                             .raw("devices", devices.str())
+                                             .raw("by_day", by_day.str())
+                                             .str()),
+                                 "application/json");
+             });
 
     // GET /status, /status/:agent_id, /alerts — placeholders that respond
     // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4

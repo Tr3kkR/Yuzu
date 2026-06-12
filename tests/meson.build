@@ -114,12 +114,15 @@ agent_test_exe = executable(
     'unit/test_guardian_engine.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
+    'unit/test_dex_signals.cpp',
+    'unit/test_dex_macos.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
@@ -217,6 +220,7 @@ if build_server
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_guardian_routes.cpp',
+      'unit/server/test_dex_routes.cpp',
       'unit/server/test_guardian_form_render.cpp',
       'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',
@@ -263,6 +267,9 @@ if build_server
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',
+      'unit/server/test_pg_raii.cpp',
+      'unit/server/test_pg_pool.cpp',
+      'unit/server/test_pg_migration_runner.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -279,7 +286,11 @@ if build_server
     # C4743 (vtable size mismatch) and the linked binary crashes with
     # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
     # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
-    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
+    #
+    # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
+    # test_helpers.hpp — only the server suite links libpq, so the guard
+    # keeps the agent/tar suites (which share the header) libpq-free.
+    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

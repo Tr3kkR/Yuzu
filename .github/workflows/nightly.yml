@@ -76,9 +76,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -137,6 +140,14 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-asan
 
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
+      # Idempotent persistent `yuzu-ci-postgres` docker container on
+      # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
+      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
+      # fails the job here, before the test step.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
+
       - name: Test
         run: meson test -C build-linux-asan --print-errorlogs
 
@@ -191,9 +202,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -314,6 +328,11 @@ jobs:
             -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
           file /tmp/libgai_sync_shim.so
 
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318) — same
+      # idempotent docker-container step as ci.yml's linux job.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
+
       - name: Test
         id: test
         env:
@@ -416,9 +435,12 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg lock timeout: all nightly jobs share one self-hosted box and one
+          # cron fire time, so concurrent installs race the dpkg lock (gov #1331 UP-9).
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
+            pkg-config curl zip unzip tar python3-pip ccache \
+            bison flex
           # requirements-ci.txt is hash-pinned (includes gcovr for the
           # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -484,6 +506,11 @@ jobs:
 
       - name: Build
         run: meson compile -C build-linux-coverage
+
+      # Postgres 16 for server tests (ADR-0006 decision 8, #1318) — same
+      # idempotent docker-container step as ci.yml's linux job.
+      - name: Ensure Postgres 16 (server tests)
+        run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
         run: meson test -C build-linux-coverage --print-errorlogs

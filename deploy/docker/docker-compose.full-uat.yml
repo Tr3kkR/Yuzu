@@ -49,6 +49,12 @@ services:
       - "5"
       - "--analytics-batch-size"
       - "50"
+    environment:
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags. ⚠ DEV/UAT-ONLY default
+      # password ('yuzu-app') — distinct from the superuser default.
+      - YUZU_POSTGRES_DSN=postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     ports:
       - "8080:8080"     # Web dashboard + REST API
       - "50052:50052"   # gRPC (management)
@@ -61,6 +67,38 @@ services:
     depends_on:
       clickhouse:
         condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ────────────────────
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    container_name: yuzu-uat-postgres
+    environment:
+      # ⚠ DEV/UAT-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: first-boot init refuses to run if
+      # they are equal (PR #1334 review, S1).
+      - POSTGRES_PASSWORD=${YUZU_POSTGRES_PASSWORD:-yuzu}
+      - YUZU_DB_PASSWORD=${YUZU_DB_PASSWORD:-yuzu-app}
+    volumes:
+      - postgres-uat-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init. psql
+      # SELECT 1 over the app DSN proves the app credential authenticates
+      # ($$ defers expansion to the container's shell). The psql leg
+      # dials the container's own hostname, NOT loopback: initdb leaves
+      # 'trust' auth on 127.0.0.1, so only a non-loopback connection
+      # actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Erlang Gateway ─────────────────────────────────────────────────────
@@ -134,6 +172,7 @@ services:
 
 volumes:
   server-data:
+  postgres-uat-data:
   prometheus-uat-data:
   grafana-uat-data:
   clickhouse-uat-data:
