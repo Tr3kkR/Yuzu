@@ -119,10 +119,12 @@ agent_test_exe = executable(
     'unit/test_dex_win_poll.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
+    'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],

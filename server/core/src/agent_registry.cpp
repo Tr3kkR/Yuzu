@@ -490,6 +490,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.processors", "Installed CPUs with model, cores, threads, clock speed"},
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
+        {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},
@@ -562,6 +563,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // netstat
         {"netstat.netstat_list",
          "Active TCP/UDP connections and listening sockets with owning PID"},
+        // netprobe
+        {"netprobe.icmp", "ICMP round-trip time, jitter, and loss to targets"},
+        {"netprobe.tcp", "TCP connect-time RTT, jitter, and loss to targets (default port 443)"},
+        {"netprobe.dns", "DNS resolution timing per name"},
         // device_identity
         {"device_identity.device_name", "Machine hostname"},
         {"device_identity.domain", "DNS/AD domain and join status"},

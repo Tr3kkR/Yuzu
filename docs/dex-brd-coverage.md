@@ -62,7 +62,7 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 | 13 | CPU utilization (real-time + historical + alerts) | Planned | **A1** sampling, **A3** threshold→observation, **A4** rollup |
 | 14 | Memory utilization | Planned | A1/A3/A4 (failure event `memory.exhausted` already live) |
 | 15 | Disk I/O latency & throughput | Planned | A1 (PhysicalDisk counters); failure events `disk.error`/`disk.port_reset` already live |
-| 16 | Network latency & packet loss | Planned | **E1** active probes; A1 carries interface counters |
+| 16 | Network latency & packet loss | **Partial → strong** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1 |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
 | 19 | CPU throttling (incl. cause + duration) | **Partial** | `hw.cpu_throttled` (Kernel-Processor-Power 37) live; occurrence + firmware cause, no duration. Duration → A1 trend overlay |
@@ -104,15 +104,15 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
 | 42 | Bandwidth usage (device + app) | Planned | Device-level: **A1** interface counters. Per-app: **E3** stretch |
-| 43 | VPN / gateway latency | **Partial** | `network.vpn_failed` (failure) live; latency → **E1** probes targeting the gateway |
-| 44 | Network jitter | Planned | **E1** — stddev over repeated probes |
-| 45 | RTT to key (configurable) resources | Planned | **E1** |
+| 43 | VPN / gateway latency | **Covered** (E1, 2026-06-12) | Probe the gateway/concentrator address (`network.probe.icmp`/`tcp`); `network.vpn_failed` failure events live |
+| 44 | Network jitter | **Covered** (E1, 2026-06-12) | Population stddev over probe samples, per target |
+| 45 | RTT to key (configurable) resources | **Covered** (E1, 2026-06-12) | Operator-chosen targets (max 4/invocation), scheduler-driven recurrence, response-store history |
 | 46 | Connection drops per session | **Partial** | `network.wifi_drop`, `session.rdp_disconnected`, TAR connection diffs live; per-session attribution loose |
 | 47 | Intel Wi-Fi / Thunderbolt analytics | **Descoped** | §3 |
 | 48 | Real-time call/video insights (Teams/Zoom QoS) | **Descoped** | §3 |
 | 49 | Per-app network metrics | Stretch | **E3** (ETW TCPIP / WFP accounting — heavy) |
 | 50 | Device discovery (network inventory) | **Covered** | discovery plugin |
-| 51 | Latency across network paths | Planned | **E1** multi-target probes |
+| 51 | Latency across network paths | **Covered** (E1, 2026-06-12) | Multi-target probes; per-path = one definition invocation per path set |
 
 ### Cat 6 — Mobile Experience Monitoring (rows 52–58)
 
@@ -399,7 +399,7 @@ Until W0 lands, B ships behind a simple default-off config flag.
 
 | Slice | Content | BRD rows |
 |---|---|---|
-| E1 | Probe module: ICMP/TCP RTT + DNS resolve timing to operator-configured targets, scheduled; jitter = stddev; results trend in response store | 16, 43–45, 51 |
+| E1 | Probe module: ICMP/TCP RTT + DNS resolve timing to operator-configured targets, scheduled; jitter = stddev; results trend in response store | 16, 43–45, 51 — **SHIPPED 2026-06-12**: netprobe plugin (icmp/tcp/dns, native no-shell-out, caps 4 targets × 10 samples × 3 s) + 3 definitions; complements the shell-out `network_actions.ping` reachability check; MSVC build + POSIX syntax-check green, agent suite 537 cases; IPv6 targets tracked follow-up |
 | E2 | Wi-Fi signal quality poll + interface counters surfacing (with A1) | 46, 42 |
 | E3 | Per-app network accounting (ETW TCPIP) | 49 — stretch |
 
