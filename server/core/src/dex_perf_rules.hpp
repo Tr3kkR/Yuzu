@@ -17,6 +17,7 @@
 /// still poison the average with the ceiling value.
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -39,13 +40,20 @@ inline constexpr double kPerfMaxSaneLatMs = 1.0e6;
 /// accepted value (percentages); `reject_above` drops absurd-but-finite
 /// claims (latency). Returns nullopt on empty/garbage/non-finite/negative/
 /// rejected input — the caller must treat that as "did not report", never 0.
+///
+/// Full-token parse (governance G3): stod("42.5xyz") returns 42.5, and stod
+/// is LC_NUMERIC-sensitive — under a comma-decimal global locale "42.5"
+/// silently parses as 42 (value distortion, not rejection). Requiring
+/// pos == size() rejects both. stod+pos rather than from_chars because
+/// libc++ on Apple Clang 15 lacks floating-point from_chars.
 inline std::optional<double> parse_perf_tag(const std::string& s, double clamp_hi,
                                             double reject_above) {
     if (s.empty() || s.size() > 32)
         return std::nullopt;
     try {
-        const double v = std::stod(s);
-        if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
+        std::size_t pos = 0;
+        const double v = std::stod(s, &pos);
+        if (pos == s.size() && std::isfinite(v) && v >= 0.0 && v <= reject_above)
             return clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v;
     } catch (...) {}
     return std::nullopt;
@@ -61,13 +69,28 @@ inline std::optional<double> parse_perf_disk_lat_ms(const std::string& s) {
     return parse_perf_tag(s, 0.0, kPerfMaxSaneLatMs);
 }
 
-/// True nearest-rank percentile: index ceil(p·n)−1 into a SORTED, non-empty
-/// vector. floor((n−1)·p) looks similar but under-reports high percentiles in
-/// small fleets (n=2 → p90 = the MIN) — the A4 grill fix, pinned by tests.
+/// True nearest-rank percentile (the QUANTILE direction: p → value): index
+/// ceil(p·n)−1 into a SORTED, non-empty vector. floor((n−1)·p) looks similar
+/// but under-reports high percentiles in small fleets (n=2 → p90 = the MIN) —
+/// the A4 grill fix, pinned by tests. See percentile_rank for the inverse.
 inline double nearest_rank(const std::vector<double>& sorted_vals, double p) {
+    assert(!sorted_vals.empty()); // documented precondition — both callers guard
     const auto n = sorted_vals.size();
     const auto idx = static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
     return sorted_vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
+}
+
+/// Percentile RANK (the inverse direction: value → rank): the share of
+/// reported values ≤ v, as 0..100. This is "this device sits at the fleet's
+/// Nth percentile" — a different question from nearest_rank's quantile, and
+/// the two deliberately coexist (G3 architect: keep the contrast explicit).
+/// Returns -1 on an empty population.
+inline int percentile_rank(const std::vector<double>& sorted_vals, double v) {
+    if (sorted_vals.empty())
+        return -1;
+    const auto at_or_below = static_cast<double>(
+        std::upper_bound(sorted_vals.begin(), sorted_vals.end(), v) - sorted_vals.begin());
+    return static_cast<int>(at_or_below / static_cast<double>(sorted_vals.size()) * 100.0);
 }
 
 } // namespace yuzu::server::detail

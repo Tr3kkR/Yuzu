@@ -95,6 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ops tooling that relied on the prior "soft delete leaves MFA intact"
   behavior must update.
 
+### Fixed
+
+- **macOS agents are no longer counted as Windows in DEX denominators.** The
+  OS check used a substring match, and "darwin" contains "win" — so on mixed
+  fleets every macOS agent inflated the Windows-online denominator behind the
+  DEX crash-free rate and the Performance tab's Reporting card, and appeared
+  in the "devices not reporting performance" drill as a phantom Windows
+  device. Both sites now match the OS prefix.
+
 ### Added
 
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**

@@ -1655,12 +1655,27 @@ std::vector<std::string> split_pipe(const std::string& line) {
 
 // One finite, non-negative double out of an agent-supplied cell; nullopt on
 // garbage so the whole row is skipped (a forged cell must not render).
+//
+// Bounded above by kMaxSaneCell (1e15): every consumer either renders the
+// value or casts it to int64_t, and a finite-but-huge double (1e30) makes the
+// float→int conversion UNDEFINED BEHAVIOR per [conv.fpint] — remote-agent-
+// controlled UB (governance G3 BLOCKING, cpp-safety + cpp-expert consensus).
+// 1e15 comfortably covers every legitimate cell (epoch seconds, sample
+// counts, working-set bytes up to ~1 PB) and is exactly representable.
+//
+// Full-token parse: stod("42.5xyz") returns 42.5 and stod is LC_NUMERIC-
+// sensitive; requiring pos == size() rejects trailing garbage AND turns a
+// comma-decimal-locale mis-parse of "42.5" into a rejection instead of a
+// silent value distortion (G3 cpp-expert). libc++ on Apple Clang has no FP
+// from_chars, so stod+pos is the portable form.
 std::optional<double> cell_double(const std::string& s) {
+    constexpr double kMaxSaneCell = 1.0e15;
     if (s.empty() || s.size() > 32)
         return std::nullopt;
     try {
-        const double v = std::stod(s);
-        if (std::isfinite(v) && v >= 0.0)
+        std::size_t pos = 0;
+        const double v = std::stod(s, &pos);
+        if (pos == s.size() && std::isfinite(v) && v >= 0.0 && v <= kMaxSaneCell)
             return v;
     } catch (...) {}
     return std::nullopt;

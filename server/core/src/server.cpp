@@ -359,10 +359,12 @@ public:
         // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
         // no agent reports — never a fabricated zero).
         metrics_.describe("yuzu_fleet_perf_reporting",
-                          "Agents whose latest heartbeat carried CPU/commit perf tags (the "
-                          "population behind yuzu_fleet_perf_cpu_pct and _commit_pct). The "
-                          "disk-latency gauge may cover a SUBSET — agents on virtual disks that "
-                          "don't answer IOCTL_DISK_PERFORMANCE omit that tag", "gauge");
+                          "Agents whose latest heartbeat carried at least ONE perf tag — the "
+                          "same any-of-three definition the /dex Performance tab's Reporting "
+                          "card uses, so the two always agree. Each per-metric gauge may cover "
+                          "a SUBSET of this population (its {stat} series carry their own n via "
+                          "the tab/REST; e.g. agents on virtual disks that don't answer "
+                          "IOCTL_DISK_PERFORMANCE omit the disk-latency tag)", "gauge");
         metrics_.describe("yuzu_fleet_perf_cpu_pct",
                           "Fleet device CPU busy % over each agent's last heartbeat interval, "
                           "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
@@ -2173,6 +2175,11 @@ public:
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                // G6 SRE: the sweep body is a serial budget shared with the
+                // SECURITY-relevant revocation sweep below — a stall here (e.g.
+                // a locked tags.db inside the cohort gauge publish) delays
+                // revoked-agent teardown by the same amount. Make it visible.
+                const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
@@ -2357,6 +2364,15 @@ public:
                                         .count();
                     metrics_.gauge("yuzu_server_uptime_seconds").set(static_cast<double>(uptime_s));
                 }
+                // G6 SRE: sweep-body duration (excludes the sleep) — the
+                // revocation sweep above shares this serial budget, so a stall
+                // (locked tags.db, slow fleet walk) is a security-relevant
+                // delay, not just stale metrics.
+                metrics_
+                    .histogram("yuzu_server_reaper_sweep_duration_seconds")
+                    .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           sweep_start)
+                                 .count());
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
@@ -7694,7 +7710,7 @@ private:
         // first, then the tag store. Shared by the /dex Performance fragments,
         // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
         // three can never disagree.
-        auto dex_perf_fn = [this](const std::string& cohort_key) -> DexPerfSnapshot {
+        auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
             DexPerfSnapshot snap;
             snap.cohort_key = cohort_key;
             std::unordered_map<std::string, std::string> cohort_values;
@@ -7707,8 +7723,10 @@ private:
                 cohort_values = tag_store_->get_values_for_key(cohort_key);
             }
             // Same staleness the recompute_metrics sweep prunes by — the tab and
-            // the yuzu_fleet_perf_* gauges see the same population.
-            const auto health = health_store_.snapshot(std::chrono::seconds{90});
+            // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
+            // copies ONLY the perf tags (G3 performance S1 — the copy runs under
+            // the heartbeat-upsert mutex).
+            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
             std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
             by_id.reserve(health.size());
             for (const auto& h : health)
@@ -7722,7 +7740,11 @@ private:
                 std::string os = s->os;
                 for (auto& c : os)
                     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                d.is_windows = os.find("win") != std::string::npos;
+                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
+                // match classifies every macOS agent as Windows (G4 UP-1
+                // BLOCKING). Agents report "windows" / "darwin" / "linux"
+                // (agents/core/src/agent.cpp kAgentOs).
+                d.is_windows = os.starts_with("win");
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -7735,13 +7757,94 @@ private:
                         detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
                 }
                 if (!cohort_key.empty()) {
-                    auto it = s->scopable_tags.find(cohort_key);
-                    if (it != s->scopable_tags.end())
-                        d.cohort = it->second;
-                    else if (auto cv = cohort_values.find(id); cv != cohort_values.end())
+                    // STORE-FIRST precedence — deliberately the OPPOSITE of
+                    // evaluate_scope's agent-first order: a benchmark cohort is
+                    // an operator-declared comparison population, so a rogue
+                    // agent must not self-assign into "executive-laptops" and
+                    // drag its p90 (G4 UP-5). The store already carries honest
+                    // agents' tags via sync_agent_tags, so store-first loses
+                    // nothing; the in-memory fallback only covers a tag not yet
+                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
+                    // are unvalidated at session ingest) so oversized/garbage
+                    // bytes never become a cohort label.
+                    if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
                         d.cohort = cv->second;
+                    } else if (auto it = s->scopable_tags.find(cohort_key);
+                               it != s->scopable_tags.end() &&
+                               TagStore::validate_value(it->second)) {
+                        d.cohort = it->second;
+                    }
                 }
                 snap.devices.push_back(std::move(d));
+            }
+            // C-S1 (consistency): the fleet yuzu_fleet_perf_* gauges aggregate
+            // EVERY fresh health snapshot; an agent whose Subscribe session was
+            // reaped while its heartbeat is still <90s old must therefore also
+            // appear here, or the tab and the gauges disagree about the same
+            // sweep. Session-less devices carry values but no OS/cohort context
+            // (is_windows=false keeps them out of the Windows denominator;
+            // store-side cohort still resolves).
+            std::unordered_set<std::string> seen;
+            seen.reserve(snap.devices.size());
+            for (const auto& d : snap.devices)
+                seen.insert(d.agent_id);
+            for (const auto& h : health) {
+                if (seen.contains(h.agent_id))
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = h.agent_id;
+                auto get = [&](const char* k) -> std::string {
+                    auto t = h.status_tags.find(k);
+                    return t != h.status_tags.end() ? t->second : std::string{};
+                };
+                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                if (!cohort_key.empty())
+                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+        // G3 performance S2: a 5s TTL memo keyed by cohort key. Heartbeat data
+        // changes on a ~30s cadence, so every consumer (operator clicks, agentic
+        // pollers, per-device drills, the 15s gauge sweep) can share one build
+        // per key per 5s — bounding the fleet-walk + tag-query cost no matter
+        // how hard the REST surface is polled. Consumers may therefore see a
+        // snapshot up to 5s stale; that is well inside the heartbeat cadence.
+        struct DexPerfMemo {
+            std::mutex mu;
+            struct Entry {
+                std::chrono::steady_clock::time_point at;
+                DexPerfSnapshot snap;
+            };
+            std::unordered_map<std::string, Entry> by_key;
+        };
+        auto dex_perf_memo = std::make_shared<DexPerfMemo>();
+        auto dex_perf_fn = [memo = dex_perf_memo,
+                            dex_perf_uncached](const std::string& cohort_key) -> DexPerfSnapshot {
+            constexpr auto kTtl = std::chrono::seconds{5};
+            constexpr std::size_t kMaxMemoEntries = 8; // "", default key, export key, picker keys
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lk(memo->mu);
+                if (auto it = memo->by_key.find(cohort_key);
+                    it != memo->by_key.end() && now - it->second.at < kTtl)
+                    return it->second.snap;
+            }
+            auto snap = dex_perf_uncached(cohort_key);
+            {
+                std::lock_guard lk(memo->mu);
+                if (memo->by_key.size() >= kMaxMemoEntries &&
+                    !memo->by_key.contains(cohort_key)) {
+                    auto oldest = memo->by_key.begin();
+                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
+                        if (it->second.at < oldest->second.at)
+                            oldest = it;
+                    memo->by_key.erase(oldest);
+                }
+                memo->by_key[cohort_key] = {now, snap};
             }
             return snap;
         };
@@ -7770,7 +7873,9 @@ private:
                         std::string os = s->os;
                         for (auto& c : os)
                             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        if (os.find("win") != std::string::npos)
+                        // starts_with, NOT find — "darwin" contains "win"
+                        // (G4 UP-1; pre-existing here, fixed with the sibling).
+                        if (os.starts_with("win"))
                             ++f.windows_online;
                     }
                 }

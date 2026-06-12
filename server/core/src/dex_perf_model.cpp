@@ -223,24 +223,19 @@ DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,
         }
     }
 
-    // Nearest-rank position: share of reported values <= v (same definition
-    // dex_perf_device_list uses — "Nth percentile" means one thing).
-    auto pctile = [](std::vector<double>& vals, double v) -> int {
-        if (vals.empty())
-            return -1;
-        std::sort(vals.begin(), vals.end());
-        const auto at_or_below = static_cast<double>(
-            std::upper_bound(vals.begin(), vals.end(), v) - vals.begin());
-        return static_cast<int>(at_or_below / static_cast<double>(vals.size()) * 100.0);
-    };
     const bool cohort_ok = ctx.cohort_n >= kDexCohortFloor;
     auto fill = [&](DexPerfMetricContext& m, std::optional<double> v, std::vector<double>& fleet,
                     std::vector<double>& cohort) {
         m.value = v;
+        // Sort once; make_stat's internal sort is then a no-op pass and
+        // percentile_rank (the shared value→rank helper, dex_perf_rules.hpp)
+        // requires sorted input.
+        std::sort(fleet.begin(), fleet.end());
+        std::sort(cohort.begin(), cohort.end());
         if (v) {
-            m.fleet_pctile = pctile(fleet, *v);
+            m.fleet_pctile = detail::percentile_rank(fleet, *v);
             if (cohort_ok)
-                m.cohort_pctile = pctile(cohort, *v);
+                m.cohort_pctile = detail::percentile_rank(cohort, *v);
         }
         m.fleet = make_stat(fleet);
         m.cohort = cohort_ok ? make_stat(cohort) : std::nullopt;
@@ -260,21 +255,13 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
 
     // Percentile context: every reported value of the sort metric, fleet-wide
     // (NOT filtered) — "this device sits at the fleet's Nth percentile" must
-    // mean the same thing from every drill.
+    // mean the same thing from every drill. Rank via the shared
+    // detail::percentile_rank (value→rank; see dex_perf_rules.hpp).
     std::vector<double> fleet_vals;
     for (const auto& d : snap.devices)
         if (auto v = metric_value(d, metric))
             fleet_vals.push_back(*v);
     std::sort(fleet_vals.begin(), fleet_vals.end());
-
-    auto fleet_pctile = [&](double v) -> int {
-        if (fleet_vals.empty())
-            return -1;
-        // Rank = share of reported values <= v (nearest-rank inverse).
-        const auto at_or_below = static_cast<double>(
-            std::upper_bound(fleet_vals.begin(), fleet_vals.end(), v) - fleet_vals.begin());
-        return static_cast<int>(at_or_below / static_cast<double>(fleet_vals.size()) * 100.0);
-    };
 
     std::vector<DexPerfDeviceRow> rows;
     for (const auto& d : snap.devices) {
@@ -296,7 +283,7 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
         r.commit_pct = d.commit_pct;
         r.disk_lat_ms = d.disk_lat_ms;
         if (auto v = metric_value(d, metric))
-            r.fleet_pctile = fleet_pctile(*v);
+            r.fleet_pctile = detail::percentile_rank(fleet_vals, *v);
         rows.push_back(std::move(r));
     }
 

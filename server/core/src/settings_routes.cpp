@@ -1797,7 +1797,10 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
             "cohorts &mdash; top 50 by population, 10-device statistical floor, a "
             "<code>_clipped</code> gauge makes any capping visible. Empty disables the export "
-            "(the default). Fleet-level gauges are always exported.</p>";
+            "(the default). Fleet-level gauges are always exported. <b>The key's tag values "
+            "become Prometheus labels</b> visible to whatever scrapes /metrics &mdash; choose "
+            "keys whose values are non-sensitive organizational identifiers (hardware model, "
+            "image name), never personnel-relevant strings.</p>";
     html += "<form hx-post=\"/api/settings/dex-alerts/cohort-export\" "
             "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">"
             "<div class=\"form-row\"><label>Export tag key</label>"
@@ -2631,10 +2634,12 @@ void SettingsRoutes::register_routes(
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
             return;
         }
-        // The key arrives urlencoded (':' → %3A is in the tag-key alphabet);
-        // decode, then validate against the SAME rule the TagStore enforces.
-        // Empty disables the export — that is a valid, auditable choice.
-        const std::string key = url_decode(extract_form_value(req.body, "export_key"));
+        // extract_form_value already percent-decodes (':' → %3A is in the
+        // tag-key alphabet) — do NOT decode twice (G2 sec-L1: a double decode
+        // diverges from the sibling POSTs; validate_key runs after and fails
+        // closed either way). Empty disables the export — a valid, auditable
+        // choice.
+        const std::string key = extract_form_value(req.body, "export_key");
         if (!key.empty() && !TagStore::validate_key(key)) {
             res.status = 400;
             res.set_header(

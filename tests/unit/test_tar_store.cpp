@@ -447,6 +447,39 @@ TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
     CHECK(r->rows[0][0] == "1");
 }
 
+TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays authorizer-compatible",
+          "[tar][store][sandbox][procperf][pin]") {
+    // The server's /dex per-app panel dispatches this exact SQL shape
+    // (dex_routes.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
+    // procperf_hourly). No other test runs aggregates through the REAL
+    // authorizer on this table — an authorizer tightening that drops
+    // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
+    // the panel with no CI signal (governance G3 quality-engineer).
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max, "
+        "cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes) VALUES "
+        "(3600, 'Teams.exe', 120, 6, 8.4, 41.2, 2040109465, 3328599654), "
+        "(7200, 'Teams.exe', 120, 5, 4.0, 20.0, 1000000000, 2000000000)"));
+    auto r = t.db.execute_user_query(
+        "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
+        "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
+        "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "FROM procperf_hourly WHERE hour_ts >= 0 "
+        "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == "Teams.exe");
+    CHECK(r->rows[0][1] == "240");  // SUM(samples)
+    CHECK(r->rows[0][7] == "2");    // COUNT(*) hours
+    // Column names ride the schema line the server parser locates fields by.
+    REQUIRE(r->columns.size() == 8);
+    CHECK(r->columns[0] == "name");
+    CHECK(r->columns[3] == "cpu_avg");
+    CHECK(r->columns[5] == "ws_avg");
+}
+
 TEST_CASE("execute_user_query: UNION across two allowlisted tables is permitted",
           "[tar][store][sandbox][security]") {
     auto t = make_test_db();

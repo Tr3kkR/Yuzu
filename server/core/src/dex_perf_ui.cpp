@@ -96,8 +96,6 @@ std::string cohort_cell(const std::optional<DexPerfStat>& s, bool lat,
     return f(s->p50) + " / " + f(s->p90) + delta_pill(s, fleet);
 }
 
-} // namespace
-
 // "1.9 GB" / "390 MB" human form for a working-set byte count.
 std::string fmt_bytes(double b) {
     if (b >= 1024.0 * 1024.0 * 1024.0)
@@ -106,6 +104,8 @@ std::string fmt_bytes(double b) {
         return std::format("{:.0f} MB", b / (1024.0 * 1024.0));
     return std::format("{:.0f} KB", b / 1024.0);
 }
+
+} // namespace
 
 std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
                                       const std::string& window) {

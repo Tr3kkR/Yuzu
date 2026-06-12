@@ -103,9 +103,10 @@ struct DexPerfCohortRow {
 std::vector<DexPerfCohortRow> dex_perf_cohorts(const DexPerfSnapshot& snap);
 
 /// One row of the devices drill (worst-by-metric / cohort membership /
-/// not-reporting). `fleet_pctile` is the device's nearest-rank percentile
-/// position for the sort metric across all reporting devices (-1 when the
-/// device did not report that metric, e.g. the not-reporting filter).
+/// not-reporting). `fleet_pctile` is the device's PERCENTILE RANK (share of
+/// reported values ≤ v, via detail::percentile_rank — the inverse of the
+/// nearest_rank quantile the {stat} gauges use) for the sort metric across
+/// all reporting devices; -1 when the device did not report that metric.
 struct DexPerfDeviceRow {
     std::string agent_id;
     std::string cohort;
@@ -146,7 +147,7 @@ struct DexPerfMetricContext {
     std::optional<double> value;        ///< the device's current sample
     std::optional<DexPerfStat> fleet;   ///< fleet distribution (all reporters)
     std::optional<DexPerfStat> cohort;  ///< cohort distribution; nullopt below floor
-    int fleet_pctile{-1};               ///< nearest-rank position; -1 = no value
+    int fleet_pctile{-1};               ///< percentile rank (share ≤ v); -1 = no value
     int cohort_pctile{-1};
 };
 

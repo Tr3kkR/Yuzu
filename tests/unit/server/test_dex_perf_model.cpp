@@ -13,11 +13,13 @@
  *    agent ids are HTML-escaped (no stored XSS); suppression text renders.
  *  - routes: GuaranteedState:Read gate; honest "unavailable" without a provider.
  */
+#include "agent_registry.hpp"
 #include "dex_perf_model.hpp"
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "rest_api_v1.hpp"
+#include "runtime_config_store.hpp"
 #include "tag_store.hpp"
 #include "test_route_sink.hpp"
 
@@ -366,6 +368,21 @@ TEST_CASE("device_context: pctiles, cohort floor, honest absence", "[dex][perf][
         auto ctx = dex_perf_device_context(snap, "nope");
         CHECK_FALSE(ctx.found);
     }
+    SECTION("floor boundary: n=9 withholds, n=10 grants (the off-by-one pin)") {
+        auto nine = two_cohorts(9, 0);
+        auto c9 = dex_perf_device_context(nine, "a-0");
+        CHECK(c9.cohort_n == 9);
+        CHECK(c9.cpu.cohort_pctile == -1);
+        CHECK_FALSE(c9.cpu.cohort);
+        CHECK(dex_perf_cohorts(nine)[0].suppressed);
+
+        auto ten = two_cohorts(10, 0);
+        auto c10 = dex_perf_device_context(ten, "a-0");
+        CHECK(c10.cohort_n == 10);
+        CHECK(c10.cpu.cohort_pctile >= 0);
+        REQUIRE(c10.cpu.cohort);
+        CHECK_FALSE(dex_perf_cohorts(ten)[0].suppressed);
+    }
     SECTION("online but not reporting: found, not reporting, no pctiles") {
         snap.devices.push_back(dev("quiet", std::nullopt, std::nullopt, std::nullopt, "a"));
         auto ctx = dex_perf_device_context(snap, "quiet");
@@ -391,6 +408,15 @@ TEST_CASE("device context strips render: honest notes + cohort drill + escape",
                                                    "model", "7d");
         CHECK(html.find("No perf heartbeat") != std::string::npos);
         CHECK(html.find("pctile") == std::string::npos);
+    }
+    SECTION("device reporting ONLY cpu: other strips skip honestly, no fake bars") {
+        auto part = two_cohorts(12, 0);
+        part.devices.push_back(dev("cpu-only", 50.0, std::nullopt, std::nullopt, "a"));
+        auto html = render_dex_device_perf_context(dex_perf_device_context(part, "cpu-only"),
+                                                   "model", "7d");
+        CHECK(html.find("CPU utilization") != std::string::npos);
+        CHECK(html.find("Memory commit") == std::string::npos);   // no value → no bar
+        CHECK(html.find("Disk I/O latency") == std::string::npos);
     }
     SECTION("sub-floor cohort: comparison withheld with the floor named") {
         // NB: not named `small` — windows headers #define small to char.
@@ -440,6 +466,66 @@ TEST_CASE("procperf parse: schema-by-name, validation, clamps", "[dex][perf][pro
         CHECK(r[0].name == "ok.exe");
         CHECK(r[0].cpu_avg == 100.0);
     }
+    SECTION("huge-but-finite count cells are rejected BEFORE the int64 cast (UB pin)") {
+        // G3 BLOCKING (cpp-safety + cpp-expert): static_cast<int64_t>(1e30) is
+        // UB per [conv.fpint]. cell_double's 1e15 ceiling must reject these —
+        // this row crashing under UBSan is the regression signal.
+        const std::string huge =
+            "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+            "ub.exe|1e30|1|5|5|100|100|1\n"  // samples unrepresentable in int64
+            "ub2.exe|10|9e18|5|5|100|100|1\n" // instances likewise
+            "ub3.exe|10|1|5|5|100|100|1e300\n" // hours likewise
+            "ok.exe|10|1|5|5|100|100|1\n";
+        auto r = parse_dex_procperf_output(huge);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].name == "ok.exe");
+    }
+    SECTION("trailing garbage in a numeric cell rejects the row (full-token stod)") {
+        const std::string tail =
+            "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+            "tail.exe|10xyz|1|5|5|100|100|1\n"
+            "ok.exe|10|1|5.5|5.5|100|100|1\n";
+        auto r = parse_dex_procperf_output(tail);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].name == "ok.exe");
+        CHECK(r[0].cpu_avg == 5.5);
+    }
+    SECTION("CRLF line endings parse identically (real Windows agent output)") {
+        const std::string crlf =
+            "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\r\n"
+            "Teams.exe|10|1|5|5|100|100|1\r\n";
+        auto r = parse_dex_procperf_output(crlf);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].name == "Teams.exe");
+    }
+    SECTION("reordered schema columns resolve by NAME, not position") {
+        const std::string reordered =
+            "__schema__|hours|name|ws_max|ws_avg|cpu_max|cpu_avg|instances_max|samples\n"
+            "24|Teams.exe|200|100|9.9|5.5|3|480\n";
+        auto r = parse_dex_procperf_output(reordered);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].name == "Teams.exe");
+        CHECK(r[0].hours == 24);
+        CHECK(r[0].samples == 480);
+        CHECK(r[0].instances_max == 3);
+        CHECK(r[0].cpu_avg == 5.5);
+    }
+    SECTION("row cap: only the first 100 valid rows are kept (DoS guard pin)") {
+        std::string many = "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n";
+        for (int i = 0; i < 120; ++i)
+            many += "app" + std::to_string(i) + ".exe|10|1|5|5|100|100|1\n";
+        CHECK(parse_dex_procperf_output(many).size() == 100);
+    }
+}
+
+TEST_CASE("perf tag parsing: full-token stod pin (trailing garbage + locale shield)",
+          "[dex][perf][rules][pin]") {
+    // G3 cpp-expert: stod("42.5xyz") returns 42.5; under a comma-decimal
+    // locale "42.5" parses as 42 with pos < size. pos==size rejects both —
+    // a mis-parse becomes a rejection, never a silent value distortion.
+    CHECK_FALSE(rules::parse_perf_cpu_pct("42.5xyz"));
+    CHECK_FALSE(rules::parse_perf_cpu_pct("1e3;DROP"));
+    CHECK(rules::parse_perf_cpu_pct("42.5") == 42.5);
 }
 
 TEST_CASE("procperf render: app drill links + escape + the soft empty state",
@@ -767,6 +853,18 @@ TEST_CASE("device fragment: strips + the own-click applications button ride alon
     CHECK(html.find("Load applications") != std::string::npos);
 }
 
+TEST_CASE("dex_cohort_export_key is an allowlisted runtime setting",
+          "[dex][perf][export][pin]") {
+    // UAT live-fire 2026-06-12 caught the settings POST 500ing because the
+    // key was never added to RuntimeConfigStore's allowlist — the handler is
+    // only as real as the store behind it. Pin every runtime_config key the
+    // DEX settings handlers write.
+    for (const char* key : {"dex_alert_routing", "dex_blast_min_devices",
+                            "dex_blast_window_seconds", "dex_blast_cooldown_seconds",
+                            "dex_cohort_export_key"})
+        CHECK(RuntimeConfigStore::is_allowed_key(key));
+}
+
 TEST_CASE("tag-key alphabet stays pinned to TagStore::validate_key",
           "[dex][perf][routes][pin]") {
     // dex_routes.cpp validates ?key= with a local copy of the TagStore key
@@ -777,4 +875,81 @@ TEST_CASE("tag-key alphabet stays pinned to TagStore::validate_key",
     CHECK_FALSE(TagStore::validate_key(""));
     CHECK_FALSE(TagStore::validate_key("has space"));
     CHECK_FALSE(TagStore::validate_key(std::string(65, 'a')));
+}
+
+TEST_CASE("the route's valid_tag_key copy AGREES with TagStore::validate_key (C-S3)",
+          "[dex][perf][routes][pin]") {
+    // The previous pin only exercised the TagStore side. Drive each alphabet
+    // class through the FRAGMENT route and assert the provider received the
+    // key iff the store would accept it — now drift in EITHER copy fails.
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::string requested_key;
+    DexRoutes::PerfFn perf = [&](const std::string& key) {
+        requested_key = key;
+        return DexPerfSnapshot{};
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, {}, {},
+                           {}, perf);
+
+    struct Case {
+        const char* raw;     // urlencoded query value
+        const char* decoded; // what the route sees
+    };
+    // Accepted classes: alnum, '_', '.', ':' (%3A), '-'
+    for (const Case& c : {Case{"model", "model"}, Case{"a.b%3Ac-d_e", "a.b:c-d_e"},
+                          Case{"UPPER9", "UPPER9"}}) {
+        requested_key.clear();
+        REQUIRE(sink.Get(std::string("/fragments/dex/perf?key=") + c.raw));
+        CHECK(TagStore::validate_key(c.decoded));
+        CHECK(requested_key == c.decoded); // route accepted exactly what the store would
+    }
+    // Rejected classes fall back to the default key.
+    for (const char* raw : {"has%20space", "semi%3Bcolon", "slash%2Fkey",
+                            // 65 chars — over the store's 64 cap
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}) {
+        requested_key.clear();
+        REQUIRE(sink.Get(std::string("/fragments/dex/perf?key=") + raw));
+        CHECK(requested_key == kDexDefaultCohortKey);
+    }
+}
+
+TEST_CASE("AgentHealthStore: perf_snapshot prunes to perf tags; reporting = any-of-three",
+          "[dex][perf][health][pin]") {
+    yuzu::server::detail::AgentHealthStore store;
+    google::protobuf::Map<std::string, std::string> commit_only;
+    commit_only["yuzu.perf_commit_pct"] = "50";
+    commit_only["yuzu.os"] = "windows";
+    commit_only["yuzu.commands_executed"] = "7";
+    store.upsert("commit-only", commit_only);
+    google::protobuf::Map<std::string, std::string> no_perf;
+    no_perf["yuzu.os"] = "windows";
+    store.upsert("no-perf", no_perf);
+
+    SECTION("perf_snapshot carries ONLY the perf tags (heartbeat-mutex copy bound)") {
+        auto snaps = store.perf_snapshot(std::chrono::seconds{90});
+        REQUIRE(snaps.size() == 2);
+        for (const auto& s : snaps) {
+            CHECK_FALSE(s.status_tags.contains("yuzu.os"));
+            CHECK_FALSE(s.status_tags.contains("yuzu.commands_executed"));
+            if (s.agent_id == "commit-only") {
+                CHECK(s.status_tags.contains("yuzu.perf_commit_pct"));
+            } else {
+                CHECK(s.status_tags.empty());
+            }
+        }
+    }
+    SECTION("C-S2: a commit-only reporter counts in yuzu_fleet_perf_reporting") {
+        yuzu::MetricsRegistry metrics;
+        store.recompute_metrics(metrics, std::chrono::seconds{90});
+        auto text = metrics.serialize();
+        CHECK(text.find("yuzu_fleet_perf_reporting 1") != std::string::npos);
+        // The cpu family is absent (nobody reported cpu) — absent, not zero.
+        CHECK(text.find("yuzu_fleet_perf_cpu_pct") == std::string::npos);
+    }
 }

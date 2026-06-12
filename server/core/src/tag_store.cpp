@@ -1,5 +1,6 @@
 #include "tag_store.hpp"
 #include "migration_runner.hpp"
+#include "sqlite_raii.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -393,23 +394,31 @@ std::vector<std::string> TagStore::get_distinct_values(const std::string& key) c
     return result;
 }
 
+// The two F2a accessors use SqliteStmt (RAII) rather than this file's older
+// manual-finalize idiom: their row loops allocate (emplace can throw
+// bad_alloc between prepare and finalize), so the guaranteed finalize is
+// load-bearing, not style (governance G3 cpp-safety).
+
 std::vector<std::string> TagStore::get_distinct_keys() const {
     std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT DISTINCT key FROM tags ORDER BY key", -1, &stmt,
-                           nullptr) != SQLITE_OK)
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, "SELECT DISTINCT key FROM tags ORDER BY key", -1, stmt.addr(),
+                           nullptr) != SQLITE_OK) {
+        // G4 UP-3: a silent empty result here collapses the cohort picker with
+        // zero operator signal — at least leave a trail.
+        spdlog::warn("TagStore::get_distinct_keys prepare failed: {}", sqlite3_errmsg(db_));
         return result;
+    }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        auto t = sqlite3_column_text(stmt, 0);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        auto t = sqlite3_column_text(stmt.get(), 0);
         if (t)
             result.emplace_back(reinterpret_cast<const char*>(t));
     }
-    sqlite3_finalize(stmt);
     return result;
 }
 
@@ -420,19 +429,23 @@ TagStore::get_values_for_key(const std::string& key) const {
     if (!db_)
         return result;
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT agent_id, value FROM tags WHERE key = ?", -1, &stmt,
-                           nullptr) != SQLITE_OK)
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, "SELECT agent_id, value FROM tags WHERE key = ?", -1, stmt.addr(),
+                           nullptr) != SQLITE_OK) {
+        // G4 UP-3: an empty map here silently renders every device
+        // "(untagged)" and collapses the cohort gauges — leave a trail.
+        spdlog::warn("TagStore::get_values_for_key('{}') prepare failed: {}", key,
+                     sqlite3_errmsg(db_));
         return result;
+    }
 
-    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        auto id = sqlite3_column_text(stmt, 0);
-        auto val = sqlite3_column_text(stmt, 1);
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        auto id = sqlite3_column_text(stmt.get(), 0);
+        auto val = sqlite3_column_text(stmt.get(), 1);
         if (id && val)
             result.emplace(reinterpret_cast<const char*>(id), reinterpret_cast<const char*>(val));
     }
-    sqlite3_finalize(stmt);
     return result;
 }
 

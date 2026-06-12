@@ -59,9 +59,9 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 13 | CPU utilization (real-time + historical + alerts) | **Partial — strong** (A1+A3+A4, 2026-06-12) | Historical: 30 s sampling → `perf_live`/`perf_hourly` edge warehouse (7 d raw + 31 d hourly) + per-device sparklines on the `/dex` device drill-down (live federated TAR query). Real-time fleet view: heartbeat utilization tags → `yuzu_fleet_perf_cpu_pct{stat}` Prometheus gauges (avg/p50/p90/max + population) — **external (Grafana), NOT in-product**. Alerts: `perf.cpu_sustained` breach observation (A3). Stays Partial until the in-product fleet-level view lands (→ F2, dex-trends mockup) — "where do I watch fleet CPU in the product" currently answers "your monitoring stack" |
-| 14 | Memory utilization | **Partial — strong** (A1+A3+A4, 2026-06-12) | Used % + commit-charge % sampled with row 13; device sparkline (used %) + `yuzu_fleet_perf_commit_pct{stat}` fleet gauges (external) + `perf.memory_pressure` breach observation + `memory.exhausted` failure event. Same F2 gap as row 13 |
-| 15 | Disk I/O latency & throughput | **Partial — strong** (A1+A3+A4, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; device latency sparkline + `yuzu_fleet_perf_disk_lat_ms{stat}` fleet gauges (external) + `perf.disk_latency_high` breach observation + `disk.error`/`disk.port_reset` events. Same F2 gap |
+| 13 | CPU utilization (real-time + historical + alerts) | **Covered** (A1+A3+A4+F2a, 2026-06-12) | Historical: 30 s sampling → `perf_live`/`perf_hourly` edge warehouse (7 d raw + 31 d hourly) + per-device sparklines on the `/dex` device drill-down (live federated TAR query). Real-time fleet view: **in-product `/dex` Performance tab** (fleet-now avg/p50/p90/max + reporting population, F2a) AND the `yuzu_fleet_perf_cpu_pct{stat}` Prometheus gauges for Grafana. Alerts: `perf.cpu_sustained` breach observation (A3). Residual: retained in-product *trend charts* → F2b (Postgres-backed series store). Windows agents only |
+| 14 | Memory utilization | **Covered** (A1+A3+A4+F2a, 2026-06-12) | Used % + commit-charge % sampled with row 13; device sparkline (used %) + in-product Performance tab + `yuzu_fleet_perf_commit_pct{stat}` gauges + `perf.memory_pressure` breach observation + `memory.exhausted` failure event. Same F2b trend residual as row 13 |
+| 15 | Disk I/O latency & throughput | **Covered** (A1+A3+A4+F2a, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; device latency sparkline + in-product Performance tab + `yuzu_fleet_perf_disk_lat_ms{stat}` gauges + `perf.disk_latency_high` breach observation + `disk.error`/`disk.port_reset` events. Same F2b trend residual |
 | 16 | Network latency & packet loss | **Partial** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1. Measurement shipped, alerting not |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
@@ -189,8 +189,8 @@ The agent runs fine *inside* VDI guests; what's descoped is hypervisor/broker/vR
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 98 | Overall device benchmarking | **Partial** (A4, 2026-06-12) | Fleet-relative percentiles live as Prometheus gauges (`yuzu_fleet_perf_*{stat="p50"/"p90"}` — the Aternity model, not synthetic benchmark suites). Per-device-vs-fleet comparison view → F2 |
-| 99 | Hardware benchmarking | Planned | Cohort comparison by hardware model via tags/props over the A4 percentile machinery — F2 |
+| 98 | Overall device benchmarking | **Covered** (A4+F2a, 2026-06-12) | Fleet-relative percentiles (the Aternity model, not synthetic benchmark suites): in-product per-device-vs-fleet/cohort percentile strips on the device drill-down (F2a PR2) + the Performance tab + `yuzu_fleet_perf_*{stat}` gauges. Residual: vs-cohort *over time* → F2b |
+| 99 | Hardware benchmarking | **Partial** (F2a, 2026-06-12) | Cohort benchmarking by operator-chosen tag key (e.g. `model` via the asset-tagging recipe) on the Performance tab + REST/MCP + opt-in per-cohort Prometheus export (10-device floor, top-50 cap). Honest scope: cohorts come from tags, not auto-discovered hardware inventory; retained cohort trend history → F2b |
 | 100 | Software benchmarking | Planned | Same, per-app once A2 lands |
 | 101 | Boot time | **Covered** | `os.boot` ms metric, trendable |
 | 102 | Login/logout times | **Partial** | See row 36 — C2 |

@@ -1208,7 +1208,8 @@ void AgentHealthStore::remove(const std::string& agent_id) {
     snapshots_.erase(agent_id);
 }
 
-std::vector<AgentHealthSnapshot> AgentHealthStore::snapshot(std::chrono::seconds staleness) const {
+std::vector<AgentHealthSnapshot>
+AgentHealthStore::perf_snapshot(std::chrono::seconds staleness) const {
     std::lock_guard lock(mu_);
     const auto now = std::chrono::steady_clock::now();
     std::vector<AgentHealthSnapshot> out;
@@ -1216,7 +1217,18 @@ std::vector<AgentHealthSnapshot> AgentHealthStore::snapshot(std::chrono::seconds
     for (const auto& [id, snap] : snapshots_) {
         if ((now - snap.last_seen) > staleness)
             continue; // same staleness contract recompute_metrics prunes by
-        out.push_back(snap);
+        // Copy ONLY the perf tags (G3 performance S1): the full status_tags
+        // map is ~12 entries × 2 strings per agent, and this copy runs under
+        // the SAME mutex every heartbeat upsert needs — at 10k agents a full
+        // deep copy stalls the heartbeat path for tens of milliseconds.
+        AgentHealthSnapshot s;
+        s.agent_id = snap.agent_id;
+        s.last_seen = snap.last_seen;
+        for (const char* k : {kPerfTagCpuPct, kPerfTagCommitPct, kPerfTagDiskLatMs}) {
+            if (auto it = snap.status_tags.find(k); it != snap.status_tags.end())
+                s.status_tags.emplace(it->first, it->second);
+        }
+        out.push_back(std::move(s));
     }
     return out;
 }
@@ -1250,6 +1262,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     double total_dex_observed = 0.0;
     // A4: per-agent device-utilization samples from the heartbeat perf tags.
     std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
+    // C-S2: the reporting population counts agents contributing ANY of the
+    // three metrics — the same reports_any definition DexPerfFleetNow uses,
+    // so the gauge and the Performance tab's Reporting card agree.
+    int perf_reporting = 0;
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1300,12 +1316,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // A4 perf tags — validation rules live in dex_perf_rules.hpp, SHARED
         // with the F2a /dex Performance read model so the Prometheus gauges
         // and the in-product view can never disagree on the same sample.
-        if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct)))
+        bool perf_reported_any = false;
+        if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct))) {
             perf_cpu.push_back(*v);
-        if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct)))
+            perf_reported_any = true;
+        }
+        if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct))) {
             perf_commit.push_back(*v);
-        if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs)))
+            perf_reported_any = true;
+        }
+        if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs))) {
             perf_disk_lat.push_back(*v);
+            perf_reported_any = true;
+        }
+        if (perf_reported_any)
+            ++perf_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1344,7 +1369,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         metrics.gauge(family, {{"stat", "p90"}}).set(nearest_rank(vals, 0.90));
         metrics.gauge(family, {{"stat", "max"}}).set(vals.back());
     };
-    metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_cpu.size()));
+    metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_reporting));
     set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);

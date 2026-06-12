@@ -285,8 +285,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
-     R"j("cohort_key":{"type":"string","description":"Restrict to one cohort of this tag key"},)j"
-     R"j("cohort_value":{"type":"string","description":"Cohort value (empty string = untagged residual)"},)j"
+     R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
+     R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j"},
 
@@ -1946,8 +1946,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::optional<std::string> cohort_filter;
                     if (args.contains("cohort_value") && args["cohort_value"].is_string())
                         cohort_filter = args["cohort_value"].get<std::string>();
-                    const int limit =
-                        std::clamp(param_int32(args, "limit", 50), 1, 500);
+                    // C-S4: the REST sibling 400s on limit <= 0 — a tool that
+                    // claims to "mirror" it must not silently clamp to 1.
+                    const int raw_limit = param_int32(args, "limit", 50);
+                    if (raw_limit <= 0) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid limit"),
+                                        "application/json");
+                        return;
+                    }
+                    const int limit = (std::min)(raw_limit, 500);
                     JArr arr;
                     for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
                                                               not_reporting, cohort_filter,
