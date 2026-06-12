@@ -13,10 +13,13 @@ whatever types exist, and unknown types render with a raw-label fallback under
 "Other"). The dashboard groups the catalogue into 12 display groups; the
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not). The server display
-catalogue totals **104** entries: these 103 Windows types **+ the one macOS-only
-type `storage.low`** the macOS collector adds (see "macOS collector" below). The
-Windows agent catalogue stays 103; the macOS collector reuses the same obs_types
-plus that single addition.
+catalogue totals **104** entries: the 103 Windows event-catalogue types **+
+`storage.low`** (one display entry, now emitted by BOTH platforms from two
+sources — the macOS IOKit poll and the Windows state poll, see those sections
+below; it began macOS-only).
+The Windows *event* catalogue stays 103; the state-poll signals (`storage.low`,
+battery via `hw.error`) ride alongside it without catalogue entries, exactly
+like the macOS poll mechanisms.
 
 Channels that do not exist on a given SKU fail to arm individually and are
 logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
@@ -176,6 +179,26 @@ Task Scheduler (channel disabled by default), DCOM 10016 + WMI-Activity 5858
 (noise), app start-times / audio glitches / NCSI (need ETW collectors, not
 event IDs — collector-gated future work).
 
+## Windows state poll (shipped 2026-06-12 — `dex_win_poll.cpp`)
+
+The event engine is blind to bad *states* the OS never logs: a volume filling
+up and a battery wearing out have no Event Log record. `dex_win_poll` is the
+Windows analogue of the macOS IOKit poll — a companion thread owned by the
+Windows DEX observer (started only when at least one event channel armed),
+ticking every 60 s and polling on two cadences with the same **poll-and-latch**
+discipline (emit on the transition INTO a bad state, suppress while it
+persists, re-arm on recovery; the latch replaces a rate cap). First poll on the
+first tick, never at-arm. BRD rows 20–21 (`docs/dex-brd-coverage.md`, slice D1).
+
+| obs_type | Source | Cadence | Threshold |
+|---|---|---|---|
+| `storage.low` | `GetDiskFreeSpaceExW` over lettered `DRIVE_FIXED` volumes (per-volume latch; unreadable/locked volumes skipped — never a signal) | 10 min | >= 90% used OR < 5 GiB free (identical to macOS) |
+| `hw.error` (subject=`battery`) | battery device interface + `IOCTL_BATTERY_QUERY_INFORMATION` (DesignedCapacity / FullChargedCapacity / CycleCount; `GENERIC_READ` only) | hourly | full-charge < 80% of design (identical to macOS); no battery / zero design capacity never emits |
+
+The decision functions are pure and unit-tested on every host
+(`test_dex_win_poll.cpp`); the Win32 mechanism is the impure shell, mirroring
+the macOS pure-parser/impure-engine split.
+
 ## Privacy / works-council contract
 
 Extractors drop user content **at the edge, before anything leaves the
@@ -273,7 +296,7 @@ parser now would mistake routine scans for detections.
 | File system | `fs.corruption` | unified log: `com.apple.apfs` error/fault | best-effort |
 | Hardware & storage | `disk.smart_failure` | IOKit poll: `diskutil` SMART != Verified | real-record |
 | | `hw.error` (battery) | IOKit poll: `system_profiler` battery condition / capacity <80% | real-record |
-| | `storage.low` | IOKit poll: `df` Data volume >=90% full or <5 GiB free (macOS-only obs_type, "Disk nearly full") | real-record |
+| | `storage.low` | IOKit poll: `df` Data volume >=90% full or <5 GiB free ("Disk nearly full"; same obs_type + thresholds as the Windows state poll) | real-record |
 | | `hw.cpu_throttled` | IOKit poll: `pmset -g therm` CPU speed cap <100% | real-record |
 
 **Boot duration (deliberately NOT shipped):** macOS exposes boot *start*
@@ -300,11 +323,12 @@ device". Lower per-signal richness, but low false-positive and privacy-safe.
 basenames; OSLog raw messages from sensitive daemons are never shipped. Pinned by
 `[dex_macos][privacy]` tests.
 
-**Battery health is the one macOS-native signal with no Windows like-for-like**
-(the Windows catalogue has no battery signal); it rides the generic `hw.error`
-obs_type with subject="battery" so it renders under Hardware without a server
-change. A dedicated `hw.battery_degraded` obs_type + label would be a future
-polish (needs a `dex_signal_groups()` + drift-net edit).
+**Battery health now has a Windows like-for-like** (the Windows state poll,
+2026-06-12): both platforms ride the generic `hw.error` obs_type with
+subject="battery" and the same below-80%-of-design threshold, so they render
+identically under Hardware without a server change. A dedicated
+`hw.battery_degraded` obs_type + label remains a future polish (needs a
+`dex_signal_groups()` + drift-net edit).
 
 ## macOS: what more is possible with ESF / Network Extension / other entitlements
 

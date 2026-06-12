@@ -16,6 +16,7 @@
 
 namespace yuzu::server {
 class GuaranteedStateStore;
+class BlastRadiusDetector;
 }
 
 namespace yuzu::server::detail {
@@ -29,7 +30,13 @@ namespace pb = ::yuzu::agent::v1;
 ///   other   → logged and dropped (the channel is generic; a future "status"
 ///             message must not crash this path).
 /// Never touches the response store / executions drawer.
+///
+/// `blast_radius` (optional): fed each successfully-inserted RULELESS
+/// observation so fleet-wide incident detection sees both the direct and the
+/// gateway path through this one chokepoint (docs/dex-brd-coverage.md D3).
+/// nullptr disables detection (tests / detector-less configs).
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
-                              const pb::CommandResponse& resp);
+                              const pb::CommandResponse& resp,
+                              BlastRadiusDetector* blast_radius = nullptr);
 
 } // namespace yuzu::server::detail

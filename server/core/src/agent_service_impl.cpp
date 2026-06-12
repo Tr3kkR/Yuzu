@@ -1036,7 +1036,8 @@ grpc::Status AgentServiceImpl::Subscribe(
             // cert-bound from this Subscribe session. Always skip the
             // response-store / executions path.
             if (guaranteed_state_store_)
-                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
+                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
+                                         blast_radius_detector_);
             continue;
         }
         // Solicited __guard__ replies (push_rules / reconcile carry a command_id)

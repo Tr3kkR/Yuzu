@@ -75,7 +75,7 @@ const char* event_state_from_type(const std::string& t) {
 // Must stay in sync with the agent's kObservationRuleSentinel (shared-constant +
 // cross-check is a tracked follow-up).
 bool is_reserved_rule_id(const std::string& rule_id) {
-    return rule_id == "__observation__";
+    return rule_id == kObservationRuleId;
 }
 
 } // namespace

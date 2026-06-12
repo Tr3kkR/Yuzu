@@ -33,6 +33,7 @@ class HeartbeatIngestion;
 class AnalyticsEventStore;
 class AuditStore;
 class GuaranteedStateStore;
+class BlastRadiusDetector;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -81,6 +82,13 @@ public:
         guaranteed_state_store_ = store;
     }
 
+    /// Fleet-wide DEX incident detector (blast radius, coverage-map D3) — the
+    /// shared ingest feeds it ruleless observations from gateway-connected
+    /// agents, same as the direct path. nullptr disables detection.
+    void set_blast_radius_detector(BlastRadiusDetector* detector) {
+        blast_radius_detector_ = detector;
+    }
+
     /// PR5d: per-agent CSR signer. Same signature as
     /// AgentServiceImpl::AgentCertSigner; server.cpp wires BOTH to the SAME
     /// `sign_agent_csr`, so they cannot semantically drift (a type change breaks
@@ -127,6 +135,7 @@ private:
     AnalyticsEventStore* analytics_store_{nullptr};
     AuditStore* audit_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    BlastRadiusDetector* blast_radius_detector_{nullptr};
     AgentCertSigner agent_cert_signer_;
 
     // Map of gateway session_id -> agent_id for validation.
