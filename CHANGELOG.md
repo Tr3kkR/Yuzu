@@ -97,6 +97,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
+  `KeyProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
+  no store writes secret columns yet).** Secret columns in PostgreSQL are
+  AES-256-GCM-encrypted app-side under a fresh per-value DEK; the DEK is
+  wrapped by the install's KEK, which lives behind the `KeyProvider` seam
+  (`secrets-kek-v<N>.key`, 0600, generated on first codec init with a
+  temp-fsync-rename atomic write) and never enters the database. Identity-
+  bound AAD makes blobs non-relocatable across rows/columns (canonical
+  length-prefixed serialization; kek_version rides the wrap layer only, so
+  rotation re-wraps DEK headers without touching payloads). The `secrets`
+  schema's `kek_meta` table registers non-secret KEK fingerprints; boot
+  verification fails closed with distinct `kek_unresolvable` / `kek_corrupt`
+  operator tokens (backup-skew and dual-server misconfigurations refuse
+  loudly). KEK lifecycle: rotation (incremental, interruptible, per-row CAS),
+  `oldest_kek_version_in_use` completion signal, retirement refused while a
+  version is active or referenced with `retired_at` destruction evidence.
+  Audit verbs `kek.generated`/`kek.rotated`/`kek.retired`/
+  `secret.decrypt_failure` and per-store failure-class counters ship as
+  wiring seams for the per-store migration PRs. Operator guidance (the
+  DB+keys-dir restore-pairing invariant, rotation, break-glass) lives in
+  `docs/user-manual/server-admin.md` "Key management (secrets KEK)". The
+  gated stores (`auth` TOTP, `webhooks`, `offload_targets`, OIDC client
+  secret) adopt the codec as each migrates to Postgres.
+
 - **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
   UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
   Three deliverables ahead of the substrate's fail-closed flip: (1) the
