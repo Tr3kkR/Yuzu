@@ -3,7 +3,7 @@
  *
  * Covers descriptors (name, version, actions, ABI) and validation logic for:
  *   http_client, content_dist, interaction, agent_logging, storage,
- *   registry, wmi
+ *   registry, wmi, rdp_control
  *
  * Also covers service name validation (duplicated from TriggerEngine).
  *
@@ -326,6 +326,7 @@ DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")
 DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear")
 DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
+DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)
@@ -592,6 +593,36 @@ TEST_CASE("wmi: empty and garbage namespaces rejected",
     CHECK_FALSE(test_is_valid_wmi_namespace(""));
     CHECK_FALSE(test_is_valid_wmi_namespace("not_a_namespace"));
     CHECK_FALSE(test_is_valid_wmi_namespace("root\\cimv2; DROP TABLE"));
+}
+
+// ============================================================================
+// Section 7b: rdp_control state validation (mirrors rdp_control_plugin
+// anonymous ns — keep in sync with is_valid_rdp_state)
+// ============================================================================
+
+namespace {
+
+/// Mirror of rdp_control_plugin.cpp: is_valid_rdp_state
+bool test_is_valid_rdp_state(std::string_view state) {
+    return state == "enable" || state == "disable";
+}
+
+} // namespace
+
+TEST_CASE("rdp_control: valid states accepted",
+          "[plugins][rdp_control][validation]") {
+    CHECK(test_is_valid_rdp_state("enable"));
+    CHECK(test_is_valid_rdp_state("disable"));
+}
+
+TEST_CASE("rdp_control: invalid states rejected",
+          "[plugins][rdp_control][validation]") {
+    CHECK_FALSE(test_is_valid_rdp_state(""));
+    CHECK_FALSE(test_is_valid_rdp_state("Enable"));   // case-sensitive
+    CHECK_FALSE(test_is_valid_rdp_state("DISABLE"));
+    CHECK_FALSE(test_is_valid_rdp_state("on"));
+    CHECK_FALSE(test_is_valid_rdp_state("off"));
+    CHECK_FALSE(test_is_valid_rdp_state("enable; rm -rf /"));
 }
 
 // ============================================================================
