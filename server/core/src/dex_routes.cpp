@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <format>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp);
@@ -1514,12 +1516,23 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         return back_to_overview(window) +
                placeholder("Reliability data unavailable", "The signal store is not open.");
 
+    // A4: lazy-loaded device perf panel — the route behind the hx-get runs the
+    // live federated TAR query (and answers honestly when it can't). Rendered
+    // for EVERY device, signals or not: a quiet device still has perf history.
+    const std::string perf_panel =
+        "<div class=\"gp-sech\">Device performance (hourly, on-device warehouse)</div>"
+        "<div hx-get=\"/fragments/dex/device/perf?agent_id=" +
+        url_encode(agent_id) +
+        "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" class=\"gp-note\">"
+        "Loading device performance&hellip;</div>";
+
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(agent_id) +
          "</h1></div><div class=\"gp-sub\">Device signal history.</div></div></div>";
     if (s.signals == 0)
-        return h + placeholder("No signals", "No reliability signals recorded for this device.");
+        return h + placeholder("No signals", "No reliability signals recorded for this device.") +
+               perf_panel;
 
     const auto history = store->dex_device_history(agent_id, since, 100);
     h += "<div class=\"gp-sech\">Reliability</div><div class=\"gp-tiles\">";
@@ -1542,25 +1555,203 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
              "</td></tr>";
     }
     h += "</tbody></table>";
+    h += perf_panel;
+    return h;
+}
+
+// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+
+namespace {
+
+// The canned per-device warehouse query — last 48 hourly rollups, reversed to
+// chronological at parse. `$Perf_Hourly` is the operator-SQL dollar name; the
+// agent translates it and runs it through TarDatabase::execute_user_query (the
+// read-only authorizer chokepoint, #760/#631), exactly like operator SQL from
+// the TAR page. The raw samples never leave the device until this on-demand,
+// per-device, permission-gated query (ADR-0004 federated model).
+constexpr const char* kDexPerfSql =
+    "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
+    "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48";
+
+std::vector<std::string> split_pipe(const std::string& line) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (true) {
+        const auto bar = line.find('|', pos);
+        if (bar == std::string::npos) {
+            out.push_back(line.substr(pos));
+            return out;
+        }
+        out.push_back(line.substr(pos, bar - pos));
+        pos = bar + 1;
+    }
+}
+
+// One finite, non-negative double out of an agent-supplied cell; nullopt on
+// garbage so the whole row is skipped (a forged cell must not render).
+std::optional<double> cell_double(const std::string& s) {
+    if (s.empty() || s.size() > 32)
+        return std::nullopt;
+    try {
+        const double v = std::stod(s);
+        if (std::isfinite(v) && v >= 0.0)
+            return v;
+    } catch (...) {}
+    return std::nullopt;
+}
+
+// Inline sparkline SVG (server-rendered, CSP-safe, no JS). Y auto-scales to the
+// series range; a flat series draws a midline. Emits only formatted numbers —
+// markup-safe by construction.
+std::string sparkline_svg(const std::vector<double>& vals, const char* stroke) {
+    if (vals.empty())
+        return "";
+    constexpr double kW = 240.0, kH = 36.0, kPad = 2.0;
+    const double lo = *std::min_element(vals.begin(), vals.end());
+    const double hi = *std::max_element(vals.begin(), vals.end());
+    const bool flat = (hi - lo) < 1e-9;
+    const std::size_t n = vals.size();
+    std::string pts;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double x = n == 1 ? kW / 2.0
+                                : kPad + (kW - 2 * kPad) * static_cast<double>(i) /
+                                      static_cast<double>(n - 1);
+        const double frac = flat ? 0.5 : (vals[i] - lo) / (hi - lo);
+        const double y = kH - kPad - (kH - 2 * kPad) * frac;
+        pts += std::format("{:.1f},{:.1f} ", x, y);
+    }
+    return std::format("<svg viewBox=\"0 0 240 36\" width=\"240\" height=\"36\" "
+                       "preserveAspectRatio=\"none\" role=\"img\" aria-hidden=\"true\">"
+                       "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"1.5\" "
+                       "points=\"{}\"/></svg>",
+                       stroke, pts);
+}
+
+} // namespace
+
+std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output) {
+    std::vector<DexPerfPoint> out;
+    // Column indices into DATA rows, located by name from the __schema__ line
+    // (schema cell i names data cell i-1 — the "__schema__" marker is cell 0).
+    int col_ts = -1, col_cpu = -1, col_mem = -1, col_rlat = -1, col_wlat = -1;
+    bool have_schema = false;
+    std::size_t pos = 0;
+    int rows = 0;
+    while (pos < output.size() && rows < 200) {
+        const auto nl = output.find('\n', pos);
+        std::string line =
+            output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return out; // agent-side error payload — nothing to parse
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto cols = split_pipe(line);
+            for (int i = 1; i < static_cast<int>(cols.size()); ++i) {
+                if (cols[i] == "hour_ts") col_ts = i - 1;
+                else if (cols[i] == "cpu_avg") col_cpu = i - 1;
+                else if (cols[i] == "mem_avg") col_mem = i - 1;
+                else if (cols[i] == "read_lat_us_avg") col_rlat = i - 1;
+                else if (cols[i] == "write_lat_us_avg") col_wlat = i - 1;
+            }
+            if (col_ts < 0 || col_cpu < 0 || col_mem < 0 || col_rlat < 0 || col_wlat < 0)
+                return out; // wrong shape — refuse rather than guess
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        const int need = (std::max)({col_ts, col_cpu, col_mem, col_rlat, col_wlat});
+        if (static_cast<int>(cells.size()) <= need)
+            continue; // trailer ("total|N") or a torn row
+        const auto ts = cell_double(cells[static_cast<std::size_t>(col_ts)]);
+        const auto cpu = cell_double(cells[static_cast<std::size_t>(col_cpu)]);
+        const auto mem = cell_double(cells[static_cast<std::size_t>(col_mem)]);
+        const auto rl = cell_double(cells[static_cast<std::size_t>(col_rlat)]);
+        const auto wl = cell_double(cells[static_cast<std::size_t>(col_wlat)]);
+        if (!ts || !cpu || !mem || !rl || !wl)
+            continue;
+        ++rows;
+        DexPerfPoint p;
+        p.hour_ts = static_cast<std::int64_t>(*ts);
+        p.cpu_avg = std::clamp(*cpu, 0.0, 100.0);
+        p.mem_avg = std::clamp(*mem, 0.0, 100.0);
+        // Worse of read/write avg per-IO service time, µs → ms.
+        p.disk_lat_ms = (std::max)(*rl, *wl) / 1000.0;
+        out.push_back(p);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const DexPerfPoint& a, const DexPerfPoint& b) { return a.hour_ts < b.hour_ts; });
+    return out;
+}
+
+std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
+    if (points.empty())
+        return "<div class=\"gp-note\">No performance history on this device yet &mdash; the "
+               "TAR perf sampler may be disabled, or this platform has no collector.</div>";
+
+    struct Row {
+        const char* label;
+        const char* stroke;
+        const char* unit;
+        int prec;
+        std::vector<double> vals;
+    };
+    std::vector<Row> series = {
+        {"CPU busy", "#58a6ff", "%", 0, {}},
+        {"Memory used", "#3fb950", "%", 0, {}},
+        {"Disk latency", "#d29922", " ms", 1, {}},
+    };
+    for (const auto& p : points) {
+        series[0].vals.push_back(p.cpu_avg);
+        series[1].vals.push_back(p.mem_avg);
+        series[2].vals.push_back(p.disk_lat_ms);
+    }
+
+    std::string h = "<div>";
+    for (const auto& r : series) {
+        const double now = r.vals.back();
+        const double lo = *std::min_element(r.vals.begin(), r.vals.end());
+        const double hi = *std::max_element(r.vals.begin(), r.vals.end());
+        h += "<div style=\"display:flex;align-items:center;gap:0.75rem;padding:0.3rem 0\">"
+             "<div style=\"min-width:7.5rem\" class=\"gp-mute\">" +
+             std::string(r.label) + "</div>" + sparkline_svg(r.vals, r.stroke) +
+             std::format("<span class=\"gp-mute\" style=\"font-size:0.8rem\">now {0:.{3}f}{2} "
+                         "&middot; min {1:.{3}f}{2} &middot; max {4:.{3}f}{2}</span>",
+                         now, lo, r.unit, r.prec, hi) +
+             "</div>";
+    }
+    h += std::format("<div class=\"gp-note\">{} hourly rollups from the device&rsquo;s edge "
+                     "warehouse (data stays on-device; fetched live for this view).</div>",
+                     points.size());
+    h += "</div>";
     return h;
 }
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn) {
+                                GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
-                    std::move(audit_fn));
+                    std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn) {
+                                GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     store_ = store;
     fleet_fn_ = std::move(fleet_fn);
     audit_fn_ = std::move(audit_fn);
+    dispatch_fn_ = std::move(dispatch_fn);
+    responses_fn_ = std::move(responses_fn);
 
     // -- Page shell (auth-only static chrome; the fragment it loads gates on Read) --
     sink.Get("/dex", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1696,6 +1887,128 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
         res.set_content(render_dex_device_fragment(store_, id, w), "text/html; charset=utf-8");
+    });
+
+    // -- A4: device perf panel — live federated TAR query + result poll --------
+    //
+    // The panel mechanically EXECUTES a (canned, server-authored) tar.sql on the
+    // device, so beyond GuaranteedState:Read it requires the same securable the
+    // TAR SQL page does (Execution:Execute). The Execute check is PROBED against
+    // a throwaway response so a read-only operator gets an honest in-panel note
+    // instead of a swallowed 403 (htmx leaves the target untouched on 4xx).
+    auto note = [](httplib::Response& res, const std::string& text) {
+        res.set_content("<div class=\"gp-note\">" + text + "</div>", "text/html; charset=utf-8");
+    };
+    auto can_execute = [this](const httplib::Request& req) {
+        httplib::Response probe;
+        return perm_fn_(req, probe, "Execution", "Execute");
+    };
+    auto pending_div = [](const std::string& command_id, const std::string& agent_id,
+                          int attempt) {
+        return "<div hx-get=\"/fragments/dex/device/perf/result?command_id=" +
+               url_encode(command_id) + "&amp;agent_id=" + url_encode(agent_id) +
+               "&amp;n=" + std::to_string(attempt) +
+               "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\" class=\"gp-note\">"
+               "Querying the device&rsquo;s edge warehouse&hellip;</div>";
+    };
+
+    sink.Get("/fragments/dex/device/perf", [this, note, can_execute,
+                                            pending_div](const httplib::Request& req,
+                                                         httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!can_execute(req)) {
+            note(res, "Live device performance needs the <b>Execute</b> permission &mdash; "
+                      "this panel runs a read-only TAR query on the device.");
+            return;
+        }
+        if (!dispatch_fn_ || !responses_fn_) {
+            note(res, "Live device query unavailable on this server.");
+            return;
+        }
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        if (id.empty()) {
+            res.status = 400;
+            return;
+        }
+        std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
+        const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+        if (audit_fn_)
+            audit_fn_(req, "dex.device.perf.query", sent > 0 ? "success" : "no_agents", "Agent",
+                      id, "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
+                              " agent(s) command_id=" + command_id);
+        if (sent == 0) {
+            note(res, "Device offline &mdash; the live performance query needs a connected "
+                      "agent.");
+            return;
+        }
+        res.set_content(pending_div(command_id, id, 1), "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/dex/device/perf/result", [this, note, can_execute, pending_div](
+                                                      const httplib::Request& req,
+                                                      httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        // Same Execute posture as the dispatching route — the result data rides
+        // an Execute-surface command, and gating both halves stops a read-only
+        // principal polling someone else's command_id through this route.
+        if (!can_execute(req)) {
+            note(res, "Live device performance needs the <b>Execute</b> permission.");
+            return;
+        }
+        if (!responses_fn_) {
+            note(res, "Live device query unavailable on this server.");
+            return;
+        }
+        const std::string command_id =
+            req.has_param("command_id") ? req.get_param_value("command_id") : "";
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        // Only tar dispatches are pollable here, only for the named agent —
+        // narrows what a guessed/stolen command_id can read via this route.
+        if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
+            res.status = 400;
+            return;
+        }
+        int attempt = 1;
+        if (req.has_param("n")) {
+            try {
+                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30);
+            } catch (...) {}
+        }
+        const DexAgentResponse* with_output = nullptr;
+        const DexAgentResponse* failed = nullptr;
+        const auto rows = responses_fn_(command_id);
+        for (const auto& r : rows) {
+            if (r.agent_id != id)
+                continue; // another agent's rows are never rendered here
+            if (!r.output.empty())
+                with_output = &r; // data rides RUNNING rows (response-store contract)
+            else if (r.status >= 2)
+                failed = &r; // FAILURE / TIMEOUT / REJECTED terminal frame
+        }
+        if (with_output) {
+            // An agent-side error payload ("error|…") parses to empty — surface
+            // it distinctly from "no history" (escaped + truncated: agent bytes).
+            if (with_output->output.starts_with("error|")) {
+                note(res, "The device reported an error: " +
+                              esc(with_output->output.substr(6, 200)));
+                return;
+            }
+            res.set_content(render_dex_perf_panel(parse_dex_perf_output(with_output->output)),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (failed) {
+            note(res, "Query failed on the device: " + esc(failed->error_detail.substr(0, 200)));
+            return;
+        }
+        if (attempt >= 20) {
+            note(res, "No response from the device (timed out) &mdash; it may have gone "
+                      "offline. Reload the page to retry.");
+            return;
+        }
+        res.set_content(pending_div(command_id, id, attempt + 1), "text/html; charset=utf-8");
     });
 }
 

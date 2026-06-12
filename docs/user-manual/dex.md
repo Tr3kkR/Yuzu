@@ -85,7 +85,15 @@ opened from a panel inherit the window you were viewing, so the numbers match.
 - **Per-application** — click an app to see its crash/hang blast radius across
   the fleet: faulting modules, exception codes, and which devices are affected.
 - **Per-device** — click a device to see its unified signal history (every
-  signal type on one timeline, with friendly labels).
+  signal type on one timeline, with friendly labels) plus a **device
+  performance** panel: CPU, memory, and disk-latency sparklines built from the
+  device's own hourly perf rollups. The panel runs a **live, read-only TAR
+  query on the device when you open it** — the raw samples stay in the
+  on-device edge warehouse (federated model) until an operator asks. It
+  therefore needs the device online, the TAR perf sampler enabled, and (beyond
+  `GuaranteedState:Read`) the **`Execution:Execute`** permission — without it
+  the panel shows a note instead. Each query is audit-logged
+  (`dex.device.perf.query`).
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 
@@ -177,12 +185,32 @@ thresholds are a planned follow-up. Detector activity is observable via the
 `yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
 [Webhooks](rest-api.md#event-subscriptions-webhooks).
 
+## Fleet performance rollup (Prometheus)
+
+Each Windows agent ships its current utilization — CPU busy %, commit-charge %
+of limit, and per-IO disk latency, derived over its heartbeat interval — as
+heartbeat tags. The server aggregates the latest value from every reporting
+agent into fleet gauges on `/metrics`:
+
+| Gauge | Meaning |
+|---|---|
+| `yuzu_fleet_perf_reporting` | how many agents contributed this cycle (read the others against this population) |
+| `yuzu_fleet_perf_cpu_pct{stat}` | fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
+| `yuzu_fleet_perf_commit_pct{stat}` | fleet memory pressure (commit % of limit), same stats |
+| `yuzu_fleet_perf_disk_lat_ms{stat}` | fleet per-IO disk service time in ms, same stats |
+
+When no agent reports a metric the series goes **absent**, never a fabricated
+zero. Values are validated server-side (non-finite and negative readings are
+rejected; percentages clamp at 100) so a single misbehaving agent cannot poison
+a fleet percentile. Agents with `--dex-disable` ship no perf tags at all.
+
 ## Turning it off
 
 DEX collection is a **deploy-time agent setting**. Start the agent with
 **`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
 observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
-off the DEX event observer and the Windows state poll, but the TAR performance
+off the DEX event observer, the Windows state poll, and the heartbeat perf
+tags (the fleet rollup above), but the TAR performance
 sampler is a separate subsystem — disable it with `perf_enabled=false` (see
 [TAR configuration](tar.md#configuration)). There is no server-side runtime
 toggle today; per-category collection toggles and an individual-view kill switch

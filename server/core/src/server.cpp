@@ -301,6 +301,20 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
+        // no agent reports — never a fabricated zero).
+        metrics_.describe("yuzu_fleet_perf_reporting",
+                          "Agents whose latest heartbeat carried device-utilization perf tags "
+                          "(the population behind the yuzu_fleet_perf_* gauges)", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cpu_pct",
+                          "Fleet device CPU busy % over each agent's last heartbeat interval, "
+                          "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_commit_pct",
+                          "Fleet commit-charge % of limit (memory pressure), by {stat}: "
+                          "avg / p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_disk_lat_ms",
+                          "Fleet per-IO disk service time in ms, by {stat}: avg / p50 / p90 / max",
+                          "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -7507,7 +7521,27 @@ private:
                 }
                 return f;
             },
-            audit_fn);
+            audit_fn,
+            // A4 device perf panel: canned tar.sql dispatch through the shared
+            // chokepoint (untracked path — empty execution_id, same posture as
+            // the dashboard TAR SQL surface).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)

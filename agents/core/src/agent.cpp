@@ -36,6 +36,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
+#include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -1449,6 +1450,11 @@ public:
                         // last produced — important so a flapping link
                         // doesn't leave the server reading a stale slot.
                         uint64_t last_attached_seq = 0;
+                        // A4: previous perf-counter reading for the heartbeat's
+                        // device-utilization tags (deriving a rate needs two
+                        // readings; lambda-local so a reconnect re-baselines and
+                        // the first heartbeat of a session ships no stale rate).
+                        win::PerfBreachCounters hb_prev_perf;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1509,6 +1515,33 @@ public:
                                     .set(healthy ? 1.0 : 0.0);
                             }
 #endif
+                            // A4 fleet perf rollup: ship the device's current
+                            // utilization as heartbeat tags — the agent has no
+                            // /metrics endpoint, so this is the ONLY channel by
+                            // which fleet perf gauges exist (see
+                            // AgentHealthStore::recompute_metrics). Derived over
+                            // the heartbeat interval from the same raw counter
+                            // reads as the A3 breach detector. The first
+                            // heartbeat of a session only baselines (invalid
+                            // sample -> tags omitted; the server simply doesn't
+                            // count this agent that cycle). Gated like the DEX
+                            // observer: --dex-disable means no DEX telemetry of
+                            // any kind. Off-Windows the read is valid=false
+                            // until those collectors land, so no tags ship.
+                            if (!cfg_.dex_disable) {
+                                const auto cur = win::read_perf_breach_counters();
+                                const auto ps = win::derive_breach_sample(hb_prev_perf, cur);
+                                hb_prev_perf = cur;
+                                if (ps.valid) {
+                                    tags["yuzu.perf_cpu_pct"] =
+                                        std::format("{:.1f}", ps.cpu_pct);
+                                    tags["yuzu.perf_commit_pct"] =
+                                        std::format("{:.1f}", ps.commit_pct);
+                                    if (ps.disk_valid)
+                                        tags["yuzu.perf_disk_lat_ms"] =
+                                            std::format("{:.2f}", ps.disk_lat_ms);
+                                }
+                            }
 
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what

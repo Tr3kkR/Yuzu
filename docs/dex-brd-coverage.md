@@ -59,9 +59,9 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 13 | CPU utilization (real-time + historical + alerts) | **Partial** (A1+A3, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly). Threshold alerting live (A3): `perf.cpu_sustained` breach observation (≥90% busy 10 min, hysteresis latch, `dex_perf_breach`) — alert-routable like every signal, feeds blast-radius. **Still NO dashboard chart / fleet rollup** (→ A4). Honest framing: collected + alerted, not yet visualized |
-| 14 | Memory utilization | **Partial** (A1+A3, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event live; `perf.memory_pressure` breach observation live (A3, commit ≥90% of limit 10 min). Same A4 visualization gap as row 13 |
-| 15 | Disk I/O latency & throughput | **Partial** (A1+A3, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live; `perf.disk_latency_high` breach observation live (A3, ≥25 ms/IO 10 min). Same A4 gap |
+| 13 | CPU utilization (real-time + historical + alerts) | **Covered** (A1+A3+A4, 2026-06-12) | Historical: 30 s sampling → `perf_live`/`perf_hourly` edge warehouse (7 d raw + 31 d hourly) + per-device sparklines on the `/dex` device drill-down (live federated TAR query). Real-time: heartbeat utilization tags → `yuzu_fleet_perf_cpu_pct{stat}` Prometheus gauges (avg/p50/p90/max + population). Alerts: `perf.cpu_sustained` breach observation (A3). Residual nicety: an in-product fleet-level trend chart (→ F2, coordinates with the dex-trends mockup) |
+| 14 | Memory utilization | **Covered** (A1+A3+A4, 2026-06-12) | Used % + commit-charge % sampled with row 13; device sparkline (used %) + `yuzu_fleet_perf_commit_pct{stat}` fleet gauges + `perf.memory_pressure` breach observation + `memory.exhausted` failure event. Same F2 residual as row 13 |
+| 15 | Disk I/O latency & throughput | **Covered** (A1+A3+A4, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; device latency sparkline + `yuzu_fleet_perf_disk_lat_ms{stat}` fleet gauges + `perf.disk_latency_high` breach observation + `disk.error`/`disk.port_reset` events. Same F2 residual |
 | 16 | Network latency & packet loss | **Partial** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1. Measurement shipped, alerting not |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
@@ -189,8 +189,8 @@ The agent runs fine *inside* VDI guests; what's descoped is hypervisor/broker/vR
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 98 | Overall device benchmarking | Planned | **A4/F2** — fleet-relative percentiles (the Aternity model), not synthetic benchmark suites |
-| 99 | Hardware benchmarking | Planned | Same — cohort comparison by hardware model via tags/props |
+| 98 | Overall device benchmarking | **Partial** (A4, 2026-06-12) | Fleet-relative percentiles live as Prometheus gauges (`yuzu_fleet_perf_*{stat="p50"/"p90"}` — the Aternity model, not synthetic benchmark suites). Per-device-vs-fleet comparison view → F2 |
+| 99 | Hardware benchmarking | Planned | Cohort comparison by hardware model via tags/props over the A4 percentile machinery — F2 |
 | 100 | Software benchmarking | Planned | Same, per-app once A2 lands |
 | 101 | Boot time | **Covered** | `os.boot` ms metric, trendable |
 | 102 | Login/logout times | **Partial** | See row 36 — C2 |
@@ -369,7 +369,7 @@ recompute (the established agent-metrics surface).
 | A1 | TAR perf sampler — CPU %, memory used/commit %, disk latency + throughput, network bytes; 30 s cadence; `perf_live` + `perf_hourly` warehouse tiers | 13–16, 42, 127 — **SHIPPED 2026-06-12**: raw kernel counters (GetSystemTimes / GlobalMemoryStatusEx + GetPerformanceInfo / IOCTL_DISK_PERFORMANCE / GetIfTable2 — no PDH, no WMI, no shell-out), trigger-engine scheduled (no new thread), per-source enable + interval config, 7 d raw / 31 d hourly retention, operator-SQL queryable; Linux/macOS collectors kPlanned in the registry |
 | A2 | Top-N per-process samples (CPU + working set, top 10 per tick) with cmdline redaction reuse | 22, 27 |
 | A3 | Threshold→observation: hysteresis/latch breach detection → `perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` observations (rate-capped, alert-routable like every other signal) | 13–15, 124 — **SHIPPED 2026-06-12**: agent-core `dex_perf_breach.{hpp,cpp}` (pure sustained-breach hysteresis latch + minimal counter reads) driven by the `dex_win_poll` state poller on a 120 s third cadence (5-sample sustain = 10 min, fire-once-with-window-avg, exit-threshold re-arm); new "Performance" display family server-side (groups + labels + health weight, drift-nets repinned 104→107); emission bounded by construction (~4/h/type worst case), no rate cap needed; thresholds hardcoded until F1 (the D3 precedent) |
-| A4 | Fleet rollup: heartbeat aggregate piggyback + server recompute → Prometheus gauges + `/dex` device drill-down sparklines (federated TAR query) | 98–100, 126 |
+| A4 | Fleet rollup: heartbeat aggregate piggyback + server recompute → Prometheus gauges + `/dex` device drill-down sparklines (federated TAR query) | 98–100, 126 — **SHIPPED 2026-06-12**: agent heartbeat ships `yuzu.perf_{cpu_pct,commit_pct,disk_lat_ms}` tags (derived per heartbeat interval from the A3 counter reads; omitted on `--dex-disable`/off-Windows/first beat); `AgentHealthStore::recompute_metrics` → `yuzu_fleet_perf_{cpu_pct,commit_pct,disk_lat_ms}{stat=avg/p50/p90/max}` + `yuzu_fleet_perf_reporting` (absent-when-unreported, forged-value rejection, pct clamp); `/dex` device drill-down gains a lazy perf panel — canned `$Perf_Hourly` tar.sql dispatched live to the device through the shared dispatch chokepoint, polled via the response store, rendered as server-side SVG sparklines (CSP-safe, no JS); Execute-gated with honest in-panel degrade notes (offline / no permission / no history / timeout), `dex.device.perf.query` audit |
 | A5 | GPU Engine counters; NPU best-effort | 17, 18, 24 |
 
 ### W0 — Telemetry collection controls (deprioritised 2026-06-12: retrofit, not gate)

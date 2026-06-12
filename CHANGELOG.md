@@ -97,6 +97,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: fleet performance rollup + device perf sparklines.** Two new surfaces
+  over the device perf telemetry: (1) every Windows agent ships its current
+  utilization (CPU busy %, commit-charge % of limit, per-IO disk latency —
+  derived over its heartbeat interval) as heartbeat tags, and the server
+  aggregates the fleet into Prometheus gauges
+  **`yuzu_fleet_perf_{cpu_pct,commit_pct,disk_lat_ms}{stat="avg"|"p50"|"p90"|"max"}`**
+  plus **`yuzu_fleet_perf_reporting`** (the contributing population). Series go
+  absent — never a fabricated zero — when nobody reports; non-finite/negative
+  values from a rogue agent are rejected and percentages clamp at 100.
+  (2) The `/dex` per-device drill-down gains a **device performance panel**:
+  CPU / memory / disk-latency sparklines over the device's hourly warehouse
+  rollups, fetched by a live read-only `$Perf_Hourly` TAR query dispatched to
+  the device when the panel opens (raw samples stay on-device — the federated
+  model). Server-rendered SVG, no JS. Needs the device online and
+  `Execution:Execute` (the panel says so honestly otherwise); each query is
+  audit-logged (`dex.device.perf.query`). Agents with `--dex-disable` ship no
+  perf tags.
 - **DEX: sustained performance-breach alerts (Performance signal family).** The
   Windows state poller now samples CPU, commit charge, and disk service time
   every 120 s (raw kernel counters — `GetSystemTimes`, `GetPerformanceInfo`,

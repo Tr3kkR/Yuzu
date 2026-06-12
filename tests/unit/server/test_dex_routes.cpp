@@ -548,3 +548,224 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(dev->body.find("alert(1)") == std::string::npos);
     }
 }
+
+// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+
+TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",
+          "[dex][perf][parse]") {
+    // Rows arrive DESC (the canned query's ORDER BY); parse must sort ASC and
+    // skip the "total|N" trailer + map columns by NAME from the schema line.
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "7200|55.5|60.1|3000|1000\n"
+                            "3600|20.0|40.0|500|2500\n"
+                            "total|2\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 2);
+    CHECK(pts[0].hour_ts == 3600);
+    CHECK(pts[0].cpu_avg == 20.0);
+    CHECK(pts[0].disk_lat_ms == 2.5); // worse of read/write, us -> ms
+    CHECK(pts[1].hour_ts == 7200);
+    CHECK(pts[1].mem_avg == 60.1);
+    CHECK(pts[1].disk_lat_ms == 3.0);
+}
+
+TEST_CASE("DEX perf parse: column order is schema-driven, not positional",
+          "[dex][perf][parse]") {
+    const std::string out = "__schema__|cpu_avg|hour_ts|write_lat_us_avg|mem_avg|read_lat_us_avg\n"
+                            "75.0|3600|0|50.0|0\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 1);
+    CHECK(pts[0].cpu_avg == 75.0);
+    CHECK(pts[0].hour_ts == 3600);
+    CHECK(pts[0].mem_avg == 50.0);
+}
+
+TEST_CASE("DEX perf parse: error payload / wrong shape / garbage rows never render",
+          "[dex][perf][parse]") {
+    CHECK(parse_dex_perf_output("error|no such table").empty());
+    CHECK(parse_dex_perf_output("").empty());
+    // Schema missing a required column -> refuse rather than guess.
+    CHECK(parse_dex_perf_output("__schema__|hour_ts|cpu_avg\n3600|50\n").empty());
+    // Garbage cells: non-finite / negative / non-numeric rows are skipped;
+    // a >100% percentage is clamped (forged data must not distort the chart).
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "3600|inf|50|0|0\n"
+                            "3600|-5|50|0|0\n"
+                            "3600|garbage|50|0|0\n"
+                            "7200|9000|50|0|0\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 1);
+    CHECK(pts[0].cpu_avg == 100.0); // clamped
+}
+
+TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
+          "[dex][perf][render]") {
+    CHECK(render_dex_perf_panel({}).find("No performance history") != std::string::npos);
+
+    std::vector<DexPerfPoint> pts;
+    for (int i = 0; i < 5; ++i)
+        pts.push_back({3600 * (i + 1), 10.0 * (i + 1), 42.0, 1.5});
+    const auto html = render_dex_perf_panel(pts);
+    CHECK(html.find("<svg") != std::string::npos); // server-rendered SVG, no JS
+    CHECK(html.find("<polyline") != std::string::npos);
+    CHECK(html.find("CPU busy") != std::string::npos);
+    CHECK(html.find("Memory used") != std::string::npos);
+    CHECK(html.find("Disk latency") != std::string::npos);
+    CHECK(html.find("now 50%") != std::string::npos); // CPU last value
+    CHECK(html.find("min 10%") != std::string::npos);
+    CHECK(html.find("max 50%") != std::string::npos);
+    CHECK(html.find("5 hourly rollups") != std::string::npos);
+    CHECK(html.find("hx-on") == std::string::npos); // CSP rule: never hx-on
+}
+
+TEST_CASE("DEX device fragment embeds the lazy perf panel", "[dex][perf][render]") {
+    GuaranteedStateStore store(":memory:");
+    // With signals AND without - a quiet device still has perf history.
+    const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
+    CHECK(quiet.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
+    seed_crash(store, "e1", "WS-9", "app.exe", "m.dll", "windows", "2026-06-09T10:00:00Z");
+    const auto busy = render_dex_device_fragment(&store, "WS-9", "7d");
+    CHECK(busy.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
+    CHECK(busy.find("hx-trigger=\"load\"") != std::string::npos);
+}
+
+TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
+          "[dex][perf][routes][rbac]") {
+    GuaranteedStateStore store(":memory:");
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string& tid, const std::string&) {
+        audited = a + "|" + r + "|" + tid;
+    };
+
+    // Fake dispatch + response store.
+    int dispatched = 0;
+    std::string seen_sql;
+    int fake_sent = 1;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ++dispatched;
+        CHECK(plugin == "tar");
+        CHECK(action == "sql");
+        REQUIRE(ids.size() == 1);
+        seen_sql = params.count("sql") ? params.at("sql") : "";
+        return {"tar-deadbeef", fake_sent};
+    };
+    std::vector<DexAgentResponse> fake_rows;
+    auto responses = [&](const std::string& command_id) {
+        CHECK(command_id == "tar-deadbeef");
+        return fake_rows;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, dispatch, responses);
+
+    SECTION("dispatch returns the polling stub + audits the query") {
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(dispatched == 1);
+        CHECK(seen_sql.find("$Perf_Hourly") != std::string::npos);
+        CHECK(r->body.find("/fragments/dex/device/perf/result?command_id=tar-deadbeef") !=
+              std::string::npos);
+        CHECK(audited == "dex.device.perf.query|success|WS-1");
+    }
+
+    SECTION("offline device renders the honest note, no polling") {
+        fake_sent = 0;
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->body.find("Device offline") != std::string::npos);
+        CHECK(r->body.find("hx-trigger") == std::string::npos);
+    }
+
+    SECTION("result poll: pending -> re-poll with n+1; data -> panel; error -> note") {
+        auto pending =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(pending);
+        CHECK(pending->body.find("&amp;n=2") != std::string::npos); // re-poll bumps the attempt
+
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "3600|33|44|0|0\n",
+                      ""}};
+        auto done =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(done);
+        CHECK(done->body.find("<svg") != std::string::npos);
+        CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
+
+        fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
+        auto err =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(err);
+        CHECK(err->body.find("reported an error") != std::string::npos);
+        CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+    }
+
+    SECTION("result poll: another agent's rows never render; timeout is honest") {
+        fake_rows = {{"OTHER-AGENT", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "3600|33|44|0|0\n",
+                      ""}};
+        auto r =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<svg") == std::string::npos); // filtered out
+
+        auto timeout = sink.Get(
+            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=20");
+        REQUIRE(timeout);
+        CHECK(timeout->body.find("timed out") != std::string::npos);
+        CHECK(timeout->body.find("hx-trigger") == std::string::npos);
+    }
+
+    SECTION("non-tar command_id is rejected - this route polls only tar dispatches") {
+        auto r = sink.Get(
+            "/fragments/dex/device/perf/result?command_id=script_exec-123&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+
+    SECTION("read-only operator gets the in-panel Execute note, no dispatch") {
+        auto readOnly = [](const httplib::Request&, httplib::Response& res,
+                           const std::string& securable, const std::string& op) {
+            if (securable == "Execution" && op == "Execute") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        yuzu::server::test::TestRouteSink sink2;
+        DexRoutes routes2;
+        routes2.register_routes(sink2, okAuth, readOnly, &store, fleet, audit, dispatch,
+                                responses);
+        auto r = sink2.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200); // in-panel note, NOT a swallowed 403
+        CHECK(r->body.find("Execute") != std::string::npos);
+        CHECK(dispatched == 0);
+        auto poll = sink2.Get(
+            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(poll);
+        CHECK(poll->body.find("Execute") != std::string::npos); // result leg gated too
+    }
+
+    SECTION("no dispatch/responses wiring degrades to the unavailable note") {
+        yuzu::server::test::TestRouteSink sink3;
+        DexRoutes routes3;
+        routes3.register_routes(sink3, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink3.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->body.find("unavailable") != std::string::npos);
+    }
+}
