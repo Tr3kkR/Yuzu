@@ -167,6 +167,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (operator-configurable thresholds are the F1 follow-up). The TAR perf
   warehouse remains the historical record of the same counters; this is the
   alerting leg.
+- **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
+  UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
+  Three deliverables ahead of the substrate's fail-closed flip: (1) the
+  provisioning helper `install-server-postgres.sh` now ships in the server
+  `.deb`/`.rpm` (at `/usr/share/yuzu/scripts/`, invoked **non-fatally** from
+  the package post-install hooks) and in the Linux/macOS release tarballs
+  (`scripts/`); (2) operator backup/restore documentation now covers
+  PostgreSQL state — `pg_dump --format=custom`/`pg_restore` procedures for
+  native and Docker deployments in `docs/user-manual/server-admin.md` (new
+  "PostgreSQL Substrate" section) and `upgrading.md`, including the ADR-0010
+  **restore-pairing invariant** (database and `KeyProvider` keys-dir backups
+  restore *together*; runbook tracked in #1341) and an explicit warning never
+  to `tar` a live `postgres-data` volume; (3) the native UAT rig
+  (`scripts/start-UAT.sh`) now stands up a `yuzu-postgres:local` sidecar
+  container on loopback `:15433` with per-run random, distinct
+  superuser/app-role credentials, exports `YUZU_POSTGRES_DSN` to the server,
+  and tears the container down on `stop` — a missing docker/sidecar is a
+  warning, not a failure, until the #1320 PR 3 fail-closed boot lands
+  (`PG_SOFT_FAIL` flag). The rig's agent-registration poll timeout also
+  rises 30s → 60s (the fleet-health gauge needs a first heartbeat + a
+  recompute window — measured ~37s; the stack was healthy, the poll was
+  just too tight).
 - **DEX: continuous device performance sampling (TAR `perf` warehouse tier).**
   Every Windows agent now samples CPU busy %, memory used % + commit-charge %,
   per-IO disk service time (µs) + read/write throughput, and non-loopback

@@ -543,7 +543,8 @@ enrolled:
         // the gateway ProxyRegister path so both issuance sites are crash-safe.
         std::optional<std::pair<std::string, std::string>> issued;
         try {
-            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
+                                        CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
             spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
         } catch (...) {
