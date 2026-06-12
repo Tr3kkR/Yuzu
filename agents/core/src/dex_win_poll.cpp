@@ -63,6 +63,7 @@ bool latch_should_emit(bool currently_bad, bool reading_valid, bool& reported) {
 
 #if defined(_WIN32)
 
+#include "dex_perf_breach.hpp"  // sustained perf-breach detection (BRD A3)
 #include "guard_win_handle.hpp" // <windows.h> + ScopedWinHandle RAII
 
 #include <initguid.h>  // make the DEFINE_GUIDs below *definitions* (DECLSPEC_SELECTANY)
@@ -227,14 +228,20 @@ private:
             const std::int64_t now = now_unix();
             last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
             last_battery_poll_ = now - kBatteryIntervalSeconds + kFirstPollDelaySeconds;
+            last_perf_poll_ = now - kPerfSampleIntervalSeconds + kFirstPollDelaySeconds;
         }
         for (;;) {
-            // Sleep until the EARLIEST next-due poll, not a fixed short tick —
-            // ~6 thread wakes/hour instead of 60 (kind to the endpoint,
-            // especially on battery). stop() interrupts the wait via the cv.
+            // Sleep until the EARLIEST next-due poll, not a fixed short tick.
+            // The A3 perf sample dominates the cadence (~30 wakes/hour at
+            // 120 s); each wake is a handful of plain kernel reads — sustained-
+            // breach detection inherently needs the sampling, and 120 s halves
+            // the wake cost of a 60 s tick for identical detection latency.
+            // stop() interrupts the wait via the cv.
             // (std::min) — windows.h's min/max macros are in scope in this TU.
-            const std::int64_t next = (std::min)(last_disk_poll_ + kDiskIntervalSeconds,
-                                                 last_battery_poll_ + kBatteryIntervalSeconds);
+            const std::int64_t next =
+                (std::min)({last_disk_poll_ + kDiskIntervalSeconds,
+                            last_battery_poll_ + kBatteryIntervalSeconds,
+                            last_perf_poll_ + kPerfSampleIntervalSeconds});
             const auto wait_s =
                 std::chrono::seconds((std::max)(next - now_unix(), std::int64_t{1}));
             {
@@ -250,6 +257,10 @@ private:
             if (now - last_battery_poll_ >= kBatteryIntervalSeconds) {
                 last_battery_poll_ = now;
                 poll_battery();
+            }
+            if (now - last_perf_poll_ >= kPerfSampleIntervalSeconds) {
+                last_perf_poll_ = now;
+                poll_perf();
             }
         }
     }
@@ -274,6 +285,24 @@ private:
         // the latch and re-fire a degraded-battery observation next poll.
         if (latch_should_emit(obs.has_value(), health.valid, battery_bad_reported_))
             emit(std::move(*obs));
+    }
+
+    // A3 sustained perf breaches: sample → derive vs the previous sample →
+    // per-metric hysteresis latch (dex_perf_breach). The first sample after
+    // arm (and after any invalid read) only re-baselines — breach_update
+    // handles the invalid-sample reset, so no special-casing here. Emission
+    // is bounded by the sustain/recover windows; no rate cap needed.
+    void poll_perf() {
+        const PerfBreachCounters cur = read_perf_breach_counters();
+        const PerfBreachSample s = derive_breach_sample(prev_perf_, cur);
+        prev_perf_ = cur;
+        if (auto avg = breach_update(cpu_breach_, s.cpu_pct, s.valid, kCpuBreach))
+            emit(cpu_sustained_observation(*avg));
+        if (auto avg = breach_update(mem_breach_, s.commit_pct, s.valid, kMemoryBreach))
+            emit(memory_pressure_observation(*avg));
+        if (auto avg = breach_update(disk_breach_, s.disk_lat_ms, s.valid && s.disk_valid,
+                                     kDiskLatBreach))
+            emit(disk_latency_observation(*avg));
     }
 
     // Stamp platform + delivery time centrally (an empty platform would vanish
@@ -302,8 +331,11 @@ private:
     SignalSink sink_; // set before the thread starts, cleared after join — stable in run()
     std::int64_t last_disk_poll_ = 0;
     std::int64_t last_battery_poll_ = 0;
+    std::int64_t last_perf_poll_ = 0;
     std::unordered_map<std::string, bool> disk_low_reported_; // per-volume latch
     bool battery_bad_reported_ = false;
+    PerfBreachCounters prev_perf_; // valid=false until the first read re-baselines
+    BreachState cpu_breach_, mem_breach_, disk_breach_;
 };
 
 } // namespace

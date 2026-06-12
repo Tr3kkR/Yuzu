@@ -97,6 +97,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: sustained performance-breach alerts (Performance signal family).** The
+  Windows state poller now samples CPU, commit charge, and disk service time
+  every 120 s (raw kernel counters — `GetSystemTimes`, `GetPerformanceInfo`,
+  `IOCTL_DISK_PERFORMANCE`; no PDH, no WMI, no shell-out) and emits a DEX
+  observation when a metric stays bad for a sustained window:
+  **`perf.cpu_sustained`** (≥90% busy for 10 min), **`perf.memory_pressure`**
+  (commit charge ≥90% of limit for 10 min), **`perf.disk_latency_high`**
+  (≥25 ms per IO for 10 min). Each fires once per episode with the window
+  average as its metric and re-arms only after a sustained recovery below a
+  lower exit threshold (hysteresis — a flapping metric cannot spam the feed;
+  worst case ~4 observations/hour/type). The signals ride every existing alert
+  surface (SSE, webhooks, blast-radius detection) and land in a new
+  **"Performance"** family on the `/dex` Catalogue and Health views (display
+  catalogue now 107 entries). Thresholds are fixed in this release
+  (operator-configurable thresholds are the F1 follow-up). The TAR perf
+  warehouse remains the historical record of the same counters; this is the
+  alerting leg.
 - **DEX: continuous device performance sampling (TAR `perf` warehouse tier).**
   Every Windows agent now samples CPU busy %, memory used % + commit-charge %,
   per-IO disk service time (µs) + read/write throughput, and non-loopback
@@ -108,9 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tar collect_perf` action and `configure` keys **`perf_enabled`** (default
   `true`) and **`perf_interval_seconds`** (default 30; `0` disables the trigger
   entirely). Queryable via `tar.sql`. Linux (`/proc`) and macOS
-  (`host_statistics`) collectors are planned. Threshold-breach alerting (A3) and
-  fleet rollup (A4) are follow-on slices — today's data is collection +
-  raw-SQL query, no dashboard or alert yet.
+  (`host_statistics`) collectors are planned. Threshold-breach alerting shipped
+  alongside (see "sustained performance-breach alerts" above); fleet rollup
+  (A4) is a follow-on slice — today's data is collection + raw-SQL query +
+  breach alerts, no dashboard chart yet.
 - **DEX: fleet blast-radius incident alerting.** When ≥5 distinct devices report
   the same DEX signal `(obs_type, subject)` within a 15-minute sliding window,
   the server raises an operator notification (severity `warn`) and fires a new
@@ -129,9 +147,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full or <5 GiB free, 10-min cadence, via `GetDiskFreeSpaceExW`) and `hw.error`
   (battery full-charge capacity <80% of design, hourly, via `IOCTL_BATTERY`)
   on the transition into a bad state (latched; re-arms only on a valid healthy
-  reading). Thresholds match the macOS IOKit poll; zero server change. The DEX
-  display catalogue is now 104 entries, with `storage.low` and battery
-  (`hw.error`) emitted on both Windows and macOS.
+  reading). Thresholds match the macOS IOKit poll; zero server change.
+  `storage.low` and battery (`hw.error`) are now emitted on both Windows and
+  macOS (final display-catalogue count for this release: see the Performance
+  family entry above).
 - **Network probes (`netprobe` plugin).** Active RTT, jitter, and packet-loss
   measurement to operator-chosen targets using native system calls (no
   shell-out): `network.probe.icmp` (ICMP echo — `IcmpSendEcho` on Windows,

@@ -44,7 +44,7 @@ std::string esc(const std::string& s) {
 
 std::string num(int64_t n) { return std::to_string(n); }
 
-// The catalogued signal types (103 today), GROUPED for display — the server-side mirror
+// The catalogued signal types (107 today), GROUPED for display — the server-side mirror
 // of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
 // signal). The All-signals panel renders EVERY entry, fired or not, so
 // operators see what the fleet is monitoring — not just what happened to fire
@@ -79,6 +79,8 @@ const std::vector<DexSignalGroup>& dex_signal_groups() {
         {"Hardware & storage",
          {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
           "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset", "storage.low"}},
+        {"Performance",
+         {"perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high"}},
         {"File system",
          {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
           "fs.hive_recovered", "fs.autochk_ran"}},
@@ -226,6 +228,10 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "update.download_failed") return "Update download failure";
     if (obs_type == "gpo.cse_failed") return "Policy extension failure";
     if (obs_type == "mgmt.mdm_error") return "MDM/Intune error";
+    // A3 sustained perf breaches (2026-06-12) — Windows state poll (dex_perf_breach)
+    if (obs_type == "perf.cpu_sustained") return "Sustained high CPU";
+    if (obs_type == "perf.memory_pressure") return "Memory pressure";
+    if (obs_type == "perf.disk_latency_high") return "High disk latency";
     return esc(obs_type); // forward-compatible fallback
 }
 
@@ -411,7 +417,7 @@ DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
     return r;
 }
 
-// DEX Catalogue — View 1: the 12 family cards (mockup dex-catalogue.html). Replaces
+// DEX Catalogue — View 1: the 13 family cards (mockup dex-catalogue.html). Replaces
 // the flat All-signals table with a card grid that drills into a family, then a
 // signal. Reuses dex_signal_summary + dex_signal_groups; the per-signal drill
 // (View 3) needs a generic per-obs_type read-model and lands next.
@@ -462,7 +468,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     // Forward-compat: any obs_type a newer agent emits that isn't catalogued in a
     // family yet surfaces here under "Other" — seen on the wire, just not curated
-    // into the 12 families. (Was the overview's "Other" group; it moved here with
+    // into the 13 families. (Was the overview's "Other" group; it moved here with
     // the rest of the per-type detail when the hub slimmed to summarise-and-link,
     // so nothing the fleet reports is silently dropped.)
     {
@@ -743,6 +749,7 @@ const std::vector<DexFamilyWeight>& dex_family_weights() {
         {"Security & protection", "high", 1.0, 0.8, 0.7, 2.2},
         {"Identity & logon", "med", 1.0, 0.9, 1.2, 1.6},
         {"Hardware & storage", "med", 1.0, 1.4, 0.8, 0.9},
+        {"Performance", "med", 1.0, 1.1, 1.5, 0.7},
         {"Printing", "low", 1.0, 0.6, 1.6, 0.6},
         {"Boot, start-up & shutdown", "low", 1.0, 0.9, 1.5, 0.7},
         {"Policy & management", "low", 1.0, 0.9, 0.9, 1.3},

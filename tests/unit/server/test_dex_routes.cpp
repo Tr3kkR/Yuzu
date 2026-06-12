@@ -67,7 +67,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quiet ones too",
+TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quiet ones too",
           "[dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -82,11 +82,11 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quie
     std::string html;
     for (const char* family :
          {"App reliability", "Boot, start-up & shutdown", "Service health", "System stability",
-          "Hardware & storage", "File system", "Network", "Identity & logon",
+          "Hardware & storage", "Performance", "File system", "Network", "Identity & logon",
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
         html += render_dex_catalogue_group_fragment(&store, "", 7, family);
 
-    // All 104 labels.
+    // All 107 labels.
     for (const char* label :
          {// wave 1
           "App crash", "App hang", "Service crash", "Service start failure",
@@ -123,11 +123,13 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quie
           "Entra ID token error", "Authentication error", "TLS failure",
           "Threat removal failure", "Protection engine error", "BitLocker error",
           "Certificate enrollment failure", "Update check failure", "Update download failure",
-          "Policy extension failure", "MDM/Intune error"})
+          "Policy extension failure", "MDM/Intune error",
+          // A3 sustained perf breaches (Windows state poll, dex_perf_breach)
+          "Sustained high CPU", "Memory pressure", "High disk latency"})
         CHECK(html.find(label) != std::string::npos);
 
     // No fabricated numbers: quiet rows carry a literal zero count. (The "All
-    // 104 monitored signal types" headline is asserted on Catalogue View 1 by
+    // 107 monitored signal types" headline is asserted on Catalogue View 1 by
     // the "lists every family + the sub-nav" test below.)
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
@@ -138,7 +140,7 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
-    CHECK(html.find("All 104 monitored signal types") != std::string::npos);
+    CHECK(html.find("All 107 monitored signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -220,6 +222,10 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
     CHECK(html.find("derived &middot; secondary") != std::string::npos);
     CHECK(html.find("Why this score") != std::string::npos);
     CHECK(html.find("weighting:") != std::string::npos); // server-round-tripped presets
+    // Every display family carries a weight entry (a family missing from
+    // dex_family_weights silently never contributes to the score) — pin the
+    // A3 addition via its per-family sub-score card.
+    CHECK(html.find("Performance") != std::string::npos);
 
     // No reporting agents → suppressed (NEVER a fabricated 100).
     const auto suppressed = render_dex_health_fragment(&store, "", 7, DexFleet{}, "default");
@@ -260,8 +266,8 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
     CHECK(html.find("Signal families over time") != std::string::npos);  // small-multiples
     CHECK(html.find("Activity heatmap") != std::string::npos);           // heatmap
     CHECK(html.find("App reliability") != std::string::npos);            // a family row
-    // DERIVED-LIVE scope caption — "of 104 signal types", not the mockup's stale 6
-    CHECK(html.find("of 104 signal types") != std::string::npos);
+    // DERIVED-LIVE scope caption — "of 107 signal types", not the mockup's stale 6
+    CHECK(html.find("of 107 signal types") != std::string::npos);
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",

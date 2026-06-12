@@ -48,10 +48,11 @@ and links, it does not duplicate their detail.
 
 ### Catalogue
 
-Every monitored signal type, organised into 12 families (App reliability,
+Every monitored signal type, organised into 13 families (App reliability,
 Boot/start-up & shutdown, Service health, System stability, Hardware & storage,
-File system, Network, Identity & logon, Security & protection, Updates &
-installs, Policy & management, Printing). A family card shows how many of its
+Performance, File system, Network, Identity & logon, Security & protection,
+Updates & installs, Policy & management, Printing). A family card shows how
+many of its
 types are active; opening a family lists **every** type — one that fired shows
 its event and device counts, a quiet one shows a dashed zero, because
 **monitored, nothing happened** is real information, not a gap. (Signal sources
@@ -122,7 +123,15 @@ signal catalogue. Alongside the event-log observer, Windows also runs a
 **state poll** that emits `storage.low` (a fixed volume ≥90% full or under
 5 GiB free) and battery health (`hw.error`, when full-charge capacity drops
 below 80% of design) — the same two signals, and the same thresholds, the
-macOS collector emits, so they render identically across both platforms. A
+macOS collector emits, so they render identically across both platforms. The
+same poll also watches for **sustained performance breaches** (the
+"Performance" family): `perf.cpu_sustained` (≥90% busy for 10 minutes),
+`perf.memory_pressure` (commit charge ≥90% of limit for 10 minutes), and
+`perf.disk_latency_high` (average ≥25 ms per IO for 10 minutes). Each fires
+**once** per episode with the window average as its metric and re-arms only
+after a sustained recovery, so a flapping metric cannot spam the feed;
+thresholds are fixed in this release (operator-configurable thresholds are the
+F1 follow-up, same as the blast-radius detector's). A
 **macOS** collector ships too, but is deliberately *limited*: an unprivileged
 collector that reuses the same OS-neutral signal types and covers roughly ten
 of the eleven experience headings (crashes and hangs, resource pressure,

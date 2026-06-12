@@ -59,9 +59,9 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 13 | CPU utilization (real-time + historical + alerts) | **Partial** (A1, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly). **Collected + raw-SQL queryable only — NO dashboard chart, NO threshold alert yet** (dashboard/rollup → A4, threshold alerts → A3). Honest PoC framing: data exists, visualization does not |
-| 14 | Memory utilization | **Partial** (A1, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event already live. Same A3/A4 gap as row 13 |
-| 15 | Disk I/O latency & throughput | **Partial** (A1, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live. Same A3/A4 gap |
+| 13 | CPU utilization (real-time + historical + alerts) | **Partial** (A1+A3, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly). Threshold alerting live (A3): `perf.cpu_sustained` breach observation (≥90% busy 10 min, hysteresis latch, `dex_perf_breach`) — alert-routable like every signal, feeds blast-radius. **Still NO dashboard chart / fleet rollup** (→ A4). Honest framing: collected + alerted, not yet visualized |
+| 14 | Memory utilization | **Partial** (A1+A3, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event live; `perf.memory_pressure` breach observation live (A3, commit ≥90% of limit 10 min). Same A4 visualization gap as row 13 |
+| 15 | Disk I/O latency & throughput | **Partial** (A1+A3, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live; `perf.disk_latency_high` breach observation live (A3, ≥25 ms/IO 10 min). Same A4 gap |
 | 16 | Network latency & packet loss | **Partial** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1. Measurement shipped, alerting not |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
@@ -235,7 +235,7 @@ The agent runs fine *inside* VDI guests; what's descoped is hypervisor/broker/vR
 | 121 | Root cause analysis | **Partial** | Faulting module/exception code = RCA entry point; deep RCA is the agentic-worker story (MCP read tools) |
 | 122 | Real-time monitoring | **Covered** | SSE event bus, live dashboards |
 | 123 | Dashboard customisation | Deferred | Server-rendered fixed layouts + filters; a custom dashboard builder is contrary to the product's HTMX-first design — revisit on demand |
-| 124 | Real-time alerts on thresholds | Planned | **A3** (breach→observation) + **F1** (alert routing config) |
+| 124 | Real-time alerts on thresholds | **Partial** (A3, 2026-06-12) | Breach→observation live for the perf trio (`perf.cpu_sustained` / `perf.memory_pressure` / `perf.disk_latency_high` — hysteresis latch, hardcoded sane defaults); rides every alert surface (SSE, webhooks, blast-radius). Operator-configurable thresholds + routing → **F1** |
 | 125 | App non-usage data for license harvesting (RFP Q) | Planned | **B4** — capability map §27.5 reclamation candidates |
 | 126 | Integration with monitoring tools | **Covered** | Prometheus-native `/metrics` |
 | 127 | Data aggregation & granularity | **Partial** | Response store aggregation + TAR scope-walking SQL + federated edge model; A-wave adds the numeric dimension |
@@ -256,7 +256,7 @@ operator (MCP tools, A1–A4 invariants, machine-readable errors). The BRD's −
 | 133 | Performance optimisation | **Partial** | Measure (A) + remediate (instructions/Guardian) loop |
 | 134 | Proactive issue resolution (−60%) | **Partial** | Guardian enforce + policy engine + agentic workers |
 | 135 | Automated diagnostics | **Covered** | diagnostics plugin + MCP — an agentic worker runs full diagnostic sweeps today |
-| 136 | Proactive alerts (+ raise ticket) | **Partial** | Notifications + webhooks + SSE live; metric thresholds → A3/F1 |
+| 136 | Proactive alerts (+ raise ticket) | **Partial** | Notifications + webhooks + SSE live; perf metric thresholds live (A3, 2026-06-12); routing config → F1 |
 | 137 | Crash/down detection + blast radius (RFP Q) | **Covered** (D3, 2026-06-12) | See row 32 — same detector; thresholds hardcoded sane defaults until F1 makes them operator-configurable |
 | 138 | Real-time end-user recommendations (reboot nudge etc.) | Deferred | Was **D2** — dropped 2026-06-12 (user-facing interaction out for now); machinery (`os.uptime_report` + interaction plugin) exists when revisited |
 
@@ -368,7 +368,7 @@ recompute (the established agent-metrics surface).
 |---|---|---|
 | A1 | TAR perf sampler — CPU %, memory used/commit %, disk latency + throughput, network bytes; 30 s cadence; `perf_live` + `perf_hourly` warehouse tiers | 13–16, 42, 127 — **SHIPPED 2026-06-12**: raw kernel counters (GetSystemTimes / GlobalMemoryStatusEx + GetPerformanceInfo / IOCTL_DISK_PERFORMANCE / GetIfTable2 — no PDH, no WMI, no shell-out), trigger-engine scheduled (no new thread), per-source enable + interval config, 7 d raw / 31 d hourly retention, operator-SQL queryable; Linux/macOS collectors kPlanned in the registry |
 | A2 | Top-N per-process samples (CPU + working set, top 10 per tick) with cmdline redaction reuse | 22, 27 |
-| A3 | Threshold→observation: hysteresis/latch breach detection → `perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` observations (rate-capped, alert-routable like every other signal) | 13–15, 124 |
+| A3 | Threshold→observation: hysteresis/latch breach detection → `perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` observations (rate-capped, alert-routable like every other signal) | 13–15, 124 — **SHIPPED 2026-06-12**: agent-core `dex_perf_breach.{hpp,cpp}` (pure sustained-breach hysteresis latch + minimal counter reads) driven by the `dex_win_poll` state poller on a 120 s third cadence (5-sample sustain = 10 min, fire-once-with-window-avg, exit-threshold re-arm); new "Performance" display family server-side (groups + labels + health weight, drift-nets repinned 104→107); emission bounded by construction (~4/h/type worst case), no rate cap needed; thresholds hardcoded until F1 (the D3 precedent) |
 | A4 | Fleet rollup: heartbeat aggregate piggyback + server recompute → Prometheus gauges + `/dex` device drill-down sparklines (federated TAR query) | 98–100, 126 |
 | A5 | GPU Engine counters; NPU best-effort | 17, 18, 24 |
 

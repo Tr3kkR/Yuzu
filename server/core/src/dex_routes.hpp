@@ -63,7 +63,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days,
                                          DexFleet fleet);
 
-/// Catalogue View 1 — the 12 family cards (mockup dex-catalogue.html), each a drill
+/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue.html), each a drill
 /// into its family. Reuses dex_signal_summary + dex_signal_groups. Pure + free.
 std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                                           const std::string& since, int window_days);
