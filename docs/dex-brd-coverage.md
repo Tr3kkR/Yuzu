@@ -235,7 +235,7 @@ The agent runs fine *inside* VDI guests; what's descoped is hypervisor/broker/vR
 | 121 | Root cause analysis | **Partial** | Faulting module/exception code = RCA entry point; deep RCA is the agentic-worker story (MCP read tools) |
 | 122 | Real-time monitoring | **Covered** | SSE event bus, live dashboards |
 | 123 | Dashboard customisation | Deferred | Server-rendered fixed layouts + filters; a custom dashboard builder is contrary to the product's HTMX-first design — revisit on demand |
-| 124 | Real-time alerts on thresholds | **Partial** (A3, 2026-06-12) | Breach→observation live for the perf trio (`perf.cpu_sustained` / `perf.memory_pressure` / `perf.disk_latency_high` — hysteresis latch, hardcoded sane defaults); rides every alert surface (SSE, webhooks, blast-radius). Operator-configurable thresholds + routing → **F1** |
+| 124 | Real-time alerts on thresholds | **Covered** (A3+F1, 2026-06-12) | Breach→observation live for the perf trio (A3 hysteresis latch); F1 adds operator routing (any signal type → notification + `dex.signal` webhook, per-device cooldown) and live-tunable blast-radius thresholds (Settings → DEX alerts, applied without restart). Residual: the A3 agent-side breach *thresholds* (90 %/10 min etc.) stay fixed — server→agent threshold distribution needs a config-push channel (deferred, documented) |
 | 125 | App non-usage data for license harvesting (RFP Q) | Planned | **B4** — capability map §27.5 reclamation candidates |
 | 126 | Integration with monitoring tools | **Covered** | Prometheus-native `/metrics` |
 | 127 | Data aggregation & granularity | **Partial** | Response store aggregation + TAR scope-walking SQL + federated edge model; A-wave adds the numeric dimension |
@@ -256,7 +256,7 @@ operator (MCP tools, A1–A4 invariants, machine-readable errors). The BRD's −
 | 133 | Performance optimisation | **Partial** | Measure (A) + remediate (instructions/Guardian) loop |
 | 134 | Proactive issue resolution (−60%) | **Partial** | Guardian enforce + policy engine + agentic workers |
 | 135 | Automated diagnostics | **Covered** | diagnostics plugin + MCP — an agentic worker runs full diagnostic sweeps today |
-| 136 | Proactive alerts (+ raise ticket) | **Partial** | Notifications + webhooks + SSE live; perf metric thresholds live (A3, 2026-06-12); routing config → F1 |
+| 136 | Proactive alerts (+ raise ticket) | **Covered** (A3+F1, 2026-06-12) | Notifications + webhooks + SSE live; perf thresholds alert (A3); F1 routing config lets the operator pick which signal types raise tickets (`dex.signal` webhook → ITSM), per-device cooldown + fan-out caps |
 | 137 | Crash/down detection + blast radius (RFP Q) | **Covered** (D3, 2026-06-12) | See row 32 — same detector; thresholds hardcoded sane defaults until F1 makes them operator-configurable |
 | 138 | Real-time end-user recommendations (reboot nudge etc.) | Deferred | Was **D2** — dropped 2026-06-12 (user-facing interaction out for now); machinery (`os.uptime_report` + interaction plugin) exists when revisited |
 
@@ -416,7 +416,7 @@ Until W0 lands, B ships behind a simple default-off config flag.
 
 | Slice | Content | BRD rows |
 |---|---|---|
-| F1 | Alert routing config: which observation types / thresholds notify + webhook | 124, 136 |
+| F1 | Alert routing config: which observation types / thresholds notify + webhook | 124, 136 — **SHIPPED 2026-06-12**: `dex_alert_router.{hpp,cpp}` server-side per-signal router at the shared guardian_ingest chokepoint (both wire paths) — routed obs_type → notification + `dex.signal` webhook/offload event, per-(type,agent) 1 h cooldown, bounded cooldown map, per-minute fan-out cap, Prometheus `yuzu_server_dex_alerts_*`; `BlastRadiusDetector::update_alert_shape` makes the D3 trio live-tunable (clamped; DoS bounds stay fixed); Settings → DEX alerts panel (admin-gated, audited, applies live via runtime_config keys `dex_alert_routing` + `dex_blast_*`); default = nothing routed. **Deferred remainder:** agent-side A3 breach thresholds stay compile-time — distributing them needs a server→agent config channel (candidates: Guardian push config payload, agent-core configure action); revisit with W0 |
 | F2 | Fleet-relative benchmarking views (percentiles by cohort/tag; vanilla-vs-layered cohort diff) + session responsiveness composite | 38, 98–100, 103 |
 | F3 | GDPR: RTBF delete + per-device data view + operator-set retention + pseudonymization | 110 |
 | F4 | ~~Survey campaigns + sentiment trends~~ — **deferred 2026-06-12** with the user-facing-interaction decision | 139–143 |

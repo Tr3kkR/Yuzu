@@ -46,6 +46,10 @@ std::string esc(const std::string& s) {
 
 std::string num(int64_t n) { return std::to_string(n); }
 
+} // namespace — the catalogue accessors below are PUBLIC (declared in
+  // dex_routes.hpp) since F1: the Settings → DEX alerts panel renders the
+  // routable-type list from the same single source of truth.
+
 // The catalogued signal types (107 today), GROUPED for display — the server-side mirror
 // of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
 // signal). The All-signals panel renders EVERY entry, fired or not, so
@@ -53,10 +57,6 @@ std::string num(int64_t n) { return std::to_string(n); }
 // in the window. Types present in the DB but absent here (a newer agent's
 // signal) are appended under "Other" with the raw-label fallback, so the panel
 // never hides data.
-struct DexSignalGroup {
-    const char* name;
-    std::vector<const char*> types;
-};
 
 const std::vector<DexSignalGroup>& dex_signal_groups() {
     static const std::vector<DexSignalGroup> kGroups = {
@@ -236,6 +236,8 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "perf.disk_latency_high") return "High disk latency";
     return esc(obs_type); // forward-compatible fallback
 }
+
+namespace {
 
 // Percent-encode for a query-string value (RFC 3986 unreserved set kept literal).
 // Used to put an arbitrary subject / agent_id into a drill-down hx-get URL.

@@ -46,6 +46,21 @@ void BlastRadiusDetector::set_on_incident(std::function<void(const BlastRadiusIn
 
 void BlastRadiusDetector::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
 
+void BlastRadiusDetector::update_alert_shape(int min_devices, int window_seconds,
+                                             int cooldown_seconds) {
+    std::lock_guard lock(mu_);
+    cfg_.min_devices = std::clamp(min_devices, 2, 100000);
+    cfg_.window_seconds = std::clamp(window_seconds, 60, 86400);
+    cfg_.cooldown_seconds = std::clamp(cooldown_seconds, 0, 7 * 86400);
+    spdlog::info("BlastRadius: alert shape updated — min_devices={} window={}s cooldown={}s",
+                 cfg_.min_devices, cfg_.window_seconds, cfg_.cooldown_seconds);
+}
+
+BlastRadiusConfig BlastRadiusDetector::alert_shape() const {
+    std::lock_guard lock(mu_);
+    return cfg_;
+}
+
 void BlastRadiusDetector::inc_metric(const char* name) {
     if (metrics_)
         metrics_->counter(name).increment();

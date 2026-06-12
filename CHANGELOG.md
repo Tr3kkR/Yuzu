@@ -97,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: alert routing + tunable blast-radius thresholds (Settings → DEX
+  alerts).** Operators can now route individual DEX signal types to alerts:
+  each routed observation raises an operator notification and fires a new
+  **`dex.signal`** webhook/offload event (`obs_type`, `subject`, `agent_id`),
+  once per device per hour per type, with a global per-minute fan-out cap.
+  Nothing is routed by default. The same panel makes the fleet blast-radius
+  thresholds (min devices / window / cooldown) **operator-tunable, applied
+  live** — no restart (memory and fan-out bounds remain fixed; they are DoS
+  posture, not policy). Routing is evaluated at the shared observation-ingest
+  chokepoint, so directly-connected and gateway-routed agents are covered
+  identically. Changes are audit-logged (`settings.dex_alerts.*`) and
+  persisted in runtime config; router activity is observable via
+  `yuzu_server_dex_alerts_*` metrics. The agent-side A3 breach thresholds
+  (90 % CPU / 10 min etc.) remain fixed in this release.
 - **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
   Each Windows agent now records, on the same 30 s perf tick, the **top 10
   applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)

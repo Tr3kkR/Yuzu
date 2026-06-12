@@ -6,6 +6,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
@@ -35,7 +36,7 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp,
-                              BlastRadiusDetector* blast_radius) {
+                              BlastRadiusDetector* blast_radius, DexAlertRouter* alert_router) {
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
@@ -92,12 +93,17 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // receipt time, not the agent's clock — "blast radius" is about
         // simultaneity as the FLEET experiences it, and a skewed agent clock
         // must not smear the window.
-        if (blast_radius && ev_row.rule_id == kObservationRuleId) {
+        if ((blast_radius || alert_router) && ev_row.rule_id == kObservationRuleId) {
             const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
-            blast_radius->observe(ev_row.event_type,
-                                  blast_subject_from_detail(ev_row.detail_json), agent_id, now);
+            const auto subject = blast_subject_from_detail(ev_row.detail_json);
+            if (blast_radius)
+                blast_radius->observe(ev_row.event_type, subject, agent_id, now);
+            // F1: operator-routed per-signal alerts — same chokepoint, same
+            // both-paths coverage, same clamped subject (sec-M1).
+            if (alert_router)
+                alert_router->observe(ev_row.event_type, subject, agent_id, now);
         }
         return;
     }

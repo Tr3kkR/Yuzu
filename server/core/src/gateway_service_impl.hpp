@@ -33,6 +33,7 @@ class AnalyticsEventStore;
 class AuditStore;
 class GuaranteedStateStore;
 class BlastRadiusDetector;
+class DexAlertRouter;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -88,6 +89,11 @@ public:
         blast_radius_detector_ = detector;
     }
 
+    /// Operator-routed per-signal alerting (coverage-map F1) — fed alongside
+    /// the blast-radius detector at the same ingest chokepoint. nullptr
+    /// disables routing.
+    void set_dex_alert_router(DexAlertRouter* router) { dex_alert_router_ = router; }
+
     /// PR5d: per-agent CSR signer. Same signature as
     /// AgentServiceImpl::AgentCertSigner; server.cpp wires BOTH to the SAME
     /// `sign_agent_csr`, so they cannot semantically drift (a type change breaks
@@ -135,6 +141,7 @@ private:
     AuditStore* audit_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
+    DexAlertRouter* dex_alert_router_{nullptr};
     AgentCertSigner agent_cert_signer_;
 
     // Map of gateway session_id -> agent_id for validation.

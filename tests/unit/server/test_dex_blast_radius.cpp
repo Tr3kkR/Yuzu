@@ -344,3 +344,33 @@ TEST_CASE("blast: works with no metrics wired (metrics optional)", "[dex][blast]
     CHECK_NOTHROW(d.observe("process.crashed", "x.exe", "a", 1000));
     CHECK_NOTHROW(d.observe("process.crashed", "x.exe", "b", 1001)); // budget-dropped sighting
 }
+
+TEST_CASE("blast: F1 runtime alert-shape update applies live and clamps", "[dex][blast][f1]") {
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 5;
+    BlastRadiusDetector d(cfg);
+    int fired = 0;
+    d.set_on_incident([&](const BlastRadiusIncident& inc) {
+        ++fired;
+        CHECK(inc.device_count >= 2);
+    });
+
+    // Two devices at min_devices=5: no incident.
+    d.observe("process.crashed", "x.exe", "a", 1000);
+    d.observe("process.crashed", "x.exe", "b", 1001);
+    CHECK(fired == 0);
+
+    // Operator drops the threshold to 2 (Settings -> DEX alerts) — the NEXT
+    // sighting tips the already-tracked pair without a restart.
+    d.update_alert_shape(/*min_devices=*/2, /*window=*/900, /*cooldown=*/3600);
+    d.observe("process.crashed", "x.exe", "b", 1002);
+    CHECK(fired == 1);
+
+    // Clamps: a hostile/typo'd 0-device, 1-second config cannot make the
+    // detector fire per-observation — floors are 2 devices / 60 s.
+    d.update_alert_shape(0, 1, -5);
+    const auto shape = d.alert_shape();
+    CHECK(shape.min_devices == 2);
+    CHECK(shape.window_seconds == 60);
+    CHECK(shape.cooldown_seconds == 0);
+}

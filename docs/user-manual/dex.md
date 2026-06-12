@@ -178,13 +178,34 @@ Each incident fires two things:
 | `device_count` | distinct devices that reported the pair within the window |
 | `window_seconds` | the detection window (900 for the 15-minute default) |
 
-A standing incident re-alerts at most once per hour (per-pair cooldown), and a
-global per-minute fan-out cap keeps a correlated multi-subject incident (e.g. a
-bad update crashing many apps at once) from flooding your ITSM. The thresholds
-(5 devices / 15 min / 1 h) are fixed in this release; operator-configurable
-thresholds are a planned follow-up. Detector activity is observable via the
+A standing incident re-alerts at most once per cooldown period (per-pair), and
+a global per-minute fan-out cap keeps a correlated multi-subject incident (e.g.
+a bad update crashing many apps at once) from flooding your ITSM. The
+thresholds (default **5 devices / 15 min window / 1 h cooldown**) are
+**operator-tunable under Settings → DEX alerts** and apply immediately — no
+restart. The memory and fan-out bounds are not configurable (they are DoS
+posture, not policy). Detector activity is observable via the
 `yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
 [Webhooks](rest-api.md#event-subscriptions-webhooks).
+
+## Routing signals to alerts
+
+Beyond fleet incidents, you can route **individual signal types** to alerts
+under **Settings → DEX alerts**: tick the types you care about (grouped by the
+same families as the Catalogue) and each routed observation raises an operator
+notification and fires the **`dex.signal`** webhook/offload event
+(`obs_type`, `subject`, `agent_id`) — **once per device per hour** per type, so
+a flapping device cannot spam, with a global per-minute fan-out cap underneath.
+**Nothing is routed by default**; blast-radius incidents always alert
+regardless. Good candidates are the low-volume, high-meaning types — the
+`perf.*` sustained breaches (already latch-bounded at the agent),
+`os.bugcheck`, `disk.smart_failure`, `security.rtp_disabled`. Routing a chatty
+type (e.g. `process.crashed` on a large fleet) is safe for the server but
+noisy for you. Changes apply live and are audit-logged
+(`settings.dex_alerts.routing`); router activity is observable via the
+`yuzu_server_dex_alerts_*` Prometheus metrics. The A3 perf-breach *thresholds*
+themselves (90 % CPU / 10 min etc.) remain fixed agent-side in this release —
+server-to-agent threshold distribution is a planned follow-up.
 
 ## Fleet performance rollup (Prometheus)
 

@@ -25,6 +25,7 @@
 
 #include <httplib.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -46,6 +47,25 @@ struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
 };
+
+/// One display family of the server-side signal catalogue. PUBLIC since F1:
+/// the Settings → DEX alerts panel renders the routable-type list from this
+/// same single source of truth (the /dex Catalogue's grouping).
+struct DexSignalGroup {
+    const char* name;
+    std::vector<const char*> types;
+};
+
+/// The catalogued signal types, grouped for display — the server-side mirror
+/// of the agent catalogue (keep in sync; the paired drift-net tests bite).
+const std::vector<DexSignalGroup>& dex_signal_groups();
+
+/// Total catalogued display types (sum over the groups).
+std::size_t dex_catalogued_type_count();
+
+/// Friendly display label for an obs_type; unknown types fall back to the
+/// HTML-escaped raw obs_type (forward-compatible, render-safe).
+std::string dex_signal_label(const std::string& obs_type);
 
 /// Shared window-selector resolvers — the single source of truth for how both the
 /// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window

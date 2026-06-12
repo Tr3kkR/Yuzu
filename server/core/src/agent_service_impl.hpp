@@ -44,6 +44,7 @@ class FleetTopologyStore;
 class HeartbeatIngestion;
 class GuaranteedStateStore;
 class BlastRadiusDetector;
+class DexAlertRouter;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -102,6 +103,10 @@ public:
     void set_blast_radius_detector(BlastRadiusDetector* detector) {
         blast_radius_detector_ = detector;
     }
+    /// Operator-routed per-signal alerting (coverage-map F1) — fed alongside
+    /// the blast-radius detector at the same ingest chokepoint. nullptr
+    /// disables routing. Set-before-traffic.
+    void set_dex_alert_router(DexAlertRouter* router) { dex_alert_router_ = router; }
 
     /// UAT 2026-05-12: after a fresh agent registers, the next
     /// `/api/v1/viz/fleet/topology` call must not return a snapshot
@@ -318,6 +323,7 @@ private:
     InventoryStore* inventory_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
+    DexAlertRouter* dex_alert_router_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached
