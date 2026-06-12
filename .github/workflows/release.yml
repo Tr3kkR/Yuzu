@@ -160,6 +160,11 @@ jobs:
           # Plugin shared libraries
           find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
 
+          # Postgres provisioning helper (ADR-0006, #1320) — tarball installs
+          # run it manually; .deb/.rpm invoke it from their post-install hooks.
+          mkdir -p "${STAGING}/scripts"
+          cp scripts/install-server-postgres.sh "${STAGING}/scripts/"
+
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
       - name: Build .deb packages
@@ -955,6 +960,11 @@ jobs:
 
           # Plugin dylibs
           find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
+
+          # Postgres provisioning helper (ADR-0006, #1320) — tarball installs
+          # run it manually (script's local mode covers Homebrew postgresql@16).
+          mkdir -p "${STAGING}/scripts"
+          cp scripts/install-server-postgres.sh "${STAGING}/scripts/"
 
           tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
 
