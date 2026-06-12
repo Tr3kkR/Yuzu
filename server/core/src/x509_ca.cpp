@@ -776,6 +776,32 @@ std::optional<std::string> fingerprint_sha256(std::string_view cert_pem) {
     return out;
 }
 
+std::optional<std::string> issuer_key_id(std::string_view cert_pem) {
+    X509_ptr cert = load_cert(cert_pem);
+    if (!cert) {
+        log_ssl_errors("issuer_key_id load");
+        return std::nullopt;
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int n = 0;
+    // Digest of the subjectPublicKey BIT STRING — NOT the whole cert — so the value
+    // is stable across a subordinate re-key (same key, different issuer cert).
+    if (X509_pubkey_digest(cert.get(), EVP_sha256(), md.data(), &n) != 1) {
+        log_ssl_errors("issuer_key_id digest");
+        return std::nullopt;
+    }
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(n * 3);
+    for (unsigned int i = 0; i < n; ++i) {
+        if (i)
+            out += ':';
+        out += kHex[md[i] >> 4];
+        out += kHex[md[i] & 0x0F];
+    }
+    return out;
+}
+
 bool is_valid_ip_literal(const std::string& s) {
     if (s.empty())
         return false;
@@ -1029,6 +1055,7 @@ std::optional<std::vector<uint8_t>> build_crl(std::string_view, std::string_view
     return std::nullopt;
 }
 std::optional<std::string> fingerprint_sha256(std::string_view) { return unavailable(); }
+std::optional<std::string> issuer_key_id(std::string_view) { return unavailable(); }
 std::optional<CertDetails> parse_certificate(std::string_view) {
     (void)unavailable();
     return std::nullopt;

@@ -358,6 +358,10 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                         {"revoked_at", r.revoked_at},
                         {"revocation_reason", r.revocation_reason},
                         {"issued_by", r.issued_by},
+                        // #1296: stable key-based CA identity (invariant across a
+                        // subordinate re-key) so an inventory consumer can group
+                        // "issued by this CA" correctly. Empty on pre-v5 rows.
+                        {"issuer_key_id", r.issuer_key_id},
                     });
                 }
                 nlohmann::json meta = {{"api_version", "v1"},

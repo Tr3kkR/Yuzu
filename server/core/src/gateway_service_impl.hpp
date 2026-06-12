@@ -21,6 +21,7 @@
 #include "gateway.grpc.pb.h"
 #include "management.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 
 // Forward declarations
@@ -88,7 +89,7 @@ public:
     /// closing the gap where through-gateway agents never received one. nullptr
     /// (default) = no issuance (tests / CA inactive), identical to direct.
     using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
-        const std::string& csr_pem, const std::string& agent_id)>;
+        const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
     void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
 
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,

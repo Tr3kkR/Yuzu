@@ -215,6 +215,26 @@ struct ScopedKeyZero {
     ~ScopedKeyZero() { yuzu::secure_zero(s); }
 };
 
+// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+// detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
+// Register gate — never charset-checked — and is audited verbatim. Without this,
+// an agent_id like `x via=direct` could forge the very `via=` discriminator
+// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
+// every control byte and structural delimiter (space, '=', ',') with '_'; the
+// identity is preserved verbatim in its own audit columns (principal/target_id)
+// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -1838,12 +1858,12 @@ public:
             // exception out of a sync gRPC handler on the exposed one-way-TLS agent
             // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
             std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&)>
-                cert_signer = [this](const std::string& csr_pem,
-                                     const std::string& agent_id)
+                const std::string&, const std::string&, CertIssuanceSource)>
+                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                     CertIssuanceSource src)
                 -> std::optional<std::pair<std::string, std::string>> {
                 try {
-                    return sign_agent_csr(csr_pem, agent_id);
+                    return sign_agent_csr(csr_pem, agent_id, src);
                 } catch (const std::exception& e) {
                     spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
                                   agent_id);
@@ -2538,7 +2558,13 @@ private:
     /// key is loaded transiently and zeroed before return (incl. exception
     /// unwind) so the crown jewel is not resident for the process lifetime.
     std::optional<std::pair<std::string, std::string>>
-    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id) {
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id,
+                   CertIssuanceSource src) {
+        // #1290: forensic discriminator on the issuance audit — was this minted on a
+        // direct agent connection or relayed by a (potentially compromised) gateway?
+        // The exact population an incident responder scopes when bulk-revoking after
+        // a gateway compromise (the PR5 R-5 confused-deputy compensating control).
+        const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
         auto root = ca_store_->get_root();
@@ -2598,7 +2624,9 @@ private:
                                                  .action = "ca.cert.reissue_blocked",
                                                  .target_type = "AgentCertificate",
                                                  .target_id = rev.serial_hex,
-                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .detail = "reason=revoked_identity cn=" +
+                                                           detail::audit_token(agent_id) +
+                                                           " via=" + via,
                                                  .result = "denied"});
                     }
                     return std::nullopt;
@@ -2691,6 +2719,14 @@ private:
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;
+        // #1296: stamp the STABLE key-based CA identity (and the issuance-time cert
+        // fingerprint, which agent rows previously left blank) so an "issued by this
+        // CA" inventory query survives a subordinate re-key. issuer_key_id hashes the
+        // root's public key (invariant across the re-key); both are best-effort
+        // forensic metadata — a derivation miss does not block issuance.
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
         if (!ca_store_->record_issued(rec)) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
@@ -2706,7 +2742,8 @@ private:
         }
         // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
         // storms / CSR floods (the audit row below is the forensic record).
-        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}}).increment();
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}, {"via", via}})
+            .increment();
 
         if (audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
@@ -2715,7 +2752,9 @@ private:
                                      .action = "ca.cert.issued",
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
-                                     .detail = "purpose=agent cn=" + agent_id,
+                                     .detail =
+                                         "purpose=agent cn=" + detail::audit_token(agent_id) +
+                                         " via=" + via,
                                      // gov consistency: "success" (not "ok") so a
                                      // SIEM filter on ca.% AND result=success
                                      // catches issuance alongside revoke/publish.
@@ -2823,10 +2862,14 @@ private:
         // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
         // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
         // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
-        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint). A
-        // stable key-based CA identity (SubjectKeyIdentifier) is the tracked
-        // follow-up (#1296); nothing in the admission/revocation/CRL paths keys on
-        // the fingerprint, so the two-fingerprints-one-key state is safe today.
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint).
+        //
+        // #1296 resolves the "issued by this CA" query landmine: ca_issued.issuer_key_id
+        // is the STABLE key-based identity (pki::issuer_key_id — a hash of the public
+        // key). Because THIS import keeps the key, that id is unchanged across the
+        // switch, so leaves issued before AND after share one issuer_key_id and
+        // CaStore::list_issued_by_key_id returns the whole population with NO rewrite
+        // here. (issuer_fingerprint stays split two-for-one-key, by design.)
         CaRoot updated = *root;
         updated.cert_pem = intermediate_pem;
         updated.chain_pem = parent_chain_pem;
@@ -2932,6 +2975,12 @@ private:
         rec.next_update =
             std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
                 .count();
+        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+        // cert fingerprint plus the STABLE key id (invariant across a subordinate
+        // re-key) so the CRL history is attributable to the key, not just a cert.
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
         if (!ca_store_->record_crl(rec)) {
             // B-1 (#1240): do NOT report success on a persistence failure. Returning
             // the freshly-built DER here would make the revoke handler audit
