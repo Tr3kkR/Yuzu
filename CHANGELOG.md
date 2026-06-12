@@ -98,10 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
-  `KeyProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
+  `KekProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
   no store writes secret columns yet).** Secret columns in PostgreSQL are
   AES-256-GCM-encrypted app-side under a fresh per-value DEK; the DEK is
-  wrapped by the install's KEK, which lives behind the `KeyProvider` seam
+  wrapped by the install's KEK, which lives behind the `KekProvider` seam
+  (a dedicated interface implemented by `FileKeyProvider` alongside the CA
+  `KeyProvider` contract)
   (`secrets-kek-v<N>.key`, 0600, generated on first codec init with a
   temp-fsync-rename atomic write) and never enters the database. Identity-
   bound AAD makes blobs non-relocatable across rows/columns (canonical

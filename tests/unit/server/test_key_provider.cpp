@@ -28,24 +28,13 @@ using namespace yuzu::server;
 
 namespace {
 
-struct TempDir {
-    std::filesystem::path path;
-    TempDir() : path(yuzu::test::unique_temp_path("kp-")) {}
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-};
-
 constexpr const char* kSampleKey =
     "-----BEGIN PRIVATE KEY-----\nMIGHAgEA...test...\n-----END PRIVATE KEY-----\n";
 
 } // namespace
 
 TEST_CASE("FileKeyProvider: store/load roundtrip", "[key_provider]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
 
     auto ref = provider.store_key("ca-root", kSampleKey);
@@ -63,7 +52,7 @@ TEST_CASE("FileKeyProvider: store/load roundtrip", "[key_provider]") {
 #ifndef _WIN32
 TEST_CASE("FileKeyProvider: stored key is 0600", "[key_provider][posix]") {
     namespace fs = std::filesystem;
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     auto ref = provider.store_key("k", kSampleKey);
     REQUIRE(ref);
@@ -77,7 +66,7 @@ TEST_CASE("FileKeyProvider: stored key is 0600", "[key_provider][posix]") {
 #endif
 
 TEST_CASE("FileKeyProvider: rejects unsafe key_id (traversal)", "[key_provider][security]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     REQUIRE_FALSE(provider.store_key("../evil", kSampleKey));
     REQUIRE_FALSE(provider.store_key("a/b", kSampleKey));
@@ -90,7 +79,7 @@ TEST_CASE("FileKeyProvider: rejects unsafe key_id (traversal)", "[key_provider][
 }
 
 TEST_CASE("FileKeyProvider: refuses refs outside base dir", "[key_provider][security]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     REQUIRE(provider.store_key("k", kSampleKey));
 
@@ -103,7 +92,7 @@ TEST_CASE("FileKeyProvider: refuses refs outside base dir", "[key_provider][secu
 }
 
 TEST_CASE("FileKeyProvider: rejects empty and oversized keys", "[key_provider][negative]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     REQUIRE_FALSE(provider.store_key("k", ""));
     const std::string huge(1024 * 1024 + 1, 'x'); // > kMaxKeyPemSize
@@ -113,7 +102,7 @@ TEST_CASE("FileKeyProvider: rejects empty and oversized keys", "[key_provider][n
 }
 
 TEST_CASE("FileKeyProvider: delete removes the key", "[key_provider]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     auto ref = provider.store_key("temp", kSampleKey);
     REQUIRE(ref);
@@ -138,7 +127,7 @@ std::vector<std::uint8_t> bytes_of(std::string_view s) {
 TEST_CASE("FileKeyProvider: generate_kek mints a 32-byte key, resolve finds it",
           "[key_provider][kek]") {
     namespace fs = std::filesystem;
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
 
     REQUIRE_FALSE(provider.resolve_kek("secrets-kek-v1"));
@@ -163,7 +152,7 @@ TEST_CASE("FileKeyProvider: generate_kek mints a 32-byte key, resolve finds it",
 }
 
 TEST_CASE("FileKeyProvider: wrap/unwrap round-trip binds the wrap AAD", "[key_provider][kek]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     auto ref = provider.generate_kek("secrets-kek-v1");
     REQUIRE(ref);
@@ -211,7 +200,7 @@ TEST_CASE("FileKeyProvider: wrap/unwrap round-trip binds the wrap AAD", "[key_pr
 
 TEST_CASE("FileKeyProvider: unknown / wrong-size / deleted KEK is unresolvable",
           "[key_provider][kek][negative]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     std::array<std::uint8_t, 32> dek{};
     const auto aad = bytes_of("aad");
@@ -241,7 +230,7 @@ TEST_CASE("FileKeyProvider: unknown / wrong-size / deleted KEK is unresolvable",
 
 TEST_CASE("FileKeyProvider: kek_check_value is deterministic and key-distinct",
           "[key_provider][kek]") {
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     auto r1 = provider.generate_kek("secrets-kek-v1");
     auto r2 = provider.generate_kek("secrets-kek-v2");
@@ -269,7 +258,7 @@ TEST_CASE("FileKeyProvider: concurrent wrap vs delete_kek never resurrects a del
     // evicts the resident copy under one lock, so a racing wrap either
     // succeeds (pre-delete) or reports unresolvable — it must never re-cache
     // the deleted key from a stale file read.
-    TempDir dir;
+    yuzu::test::TempDir dir;
     FileKeyProvider provider(dir.path);
     auto ref = provider.generate_kek("secrets-kek-v1");
     REQUIRE(ref);

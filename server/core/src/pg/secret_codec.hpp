@@ -86,6 +86,9 @@ public:
     /// on the discriminant, never on message wording — governance qe-B1).
     /// The kind name is also the stable startup-log token operators alert
     /// on; `message` is the human-readable detail.
+    /// The canonical fatal startup line is
+    /// `to_string(kind) + ": " + message` — `message` does NOT repeat the
+    /// token, so wiring code composes exactly one prefix (CON-S2).
     struct InitError {
         enum class Kind {
             kek_unresolvable, ///< registered version has no key material (backup skew / wrong dir / second server)
@@ -105,7 +108,11 @@ public:
         std::string store; ///< Postgres schema / store namespace
         std::string table;
         std::string column;
-        std::string row_pk; ///< canonical bytes — BIGINT via encode_bigint_pk
+        /// Canonical pk bytes: BIGINT via encode_bigint_pk; TEXT pks pass
+        /// the raw string bytes directly (byte-identical to what the
+        /// binary-format libpq rotation scan reads back). Never decimal-
+        /// format a BIGINT pk.
+        std::string row_pk;
     };
     /// Canonical 8-byte-BE encoding for BIGINT primary keys.
     [[nodiscard]] static std::string encode_bigint_pk(std::int64_t pk);
@@ -171,11 +178,16 @@ public:
 
     // ── KEK lifecycle (ADR §3) ──────────────────────────────────────────────
 
-    /// Mint `secrets-kek-v<N+1>`, register its fingerprint, then re-wrap
-    /// every registered row (rewrap_all). Returns the new version. Rotation
-    /// is incremental and interruptible — a crash mid-rotation is resumed by
-    /// calling rewrap_all(); re-runs detect already-rotated rows by the blob
-    /// header version, never by value.
+    /// Mint `secrets-kek-v<N+1>`, register its fingerprint (mint+register
+    /// is serialized under the substrate advisory lock and one transaction),
+    /// then re-wrap every registered row (rewrap_all). Returns the new
+    /// version. Rotation is incremental and interruptible — a crash
+    /// mid-rotation is resumed by calling rewrap_all(); re-runs detect
+    /// already-rotated rows by the blob header version, never by value.
+    /// NOTE: if an error is returned AFTER the new version registered (a
+    /// rewrap_all failure), active_version_ has already advanced — new
+    /// encrypts use the new KEK; call rewrap_all() to finish, never
+    /// rotate_kek again.
     [[nodiscard]] std::expected<std::uint32_t, std::string> rotate_kek(PGconn* conn);
 
     /// Re-wrap every registered row not already on the active version.
@@ -221,8 +233,9 @@ public:
     /// Cumulative decrypt-failure counts keyed by (store, failure class) —
     /// the backing data for
     /// `yuzu_server_secret_decrypt_failures_total{store, failure_class}`
-    /// (docs/observability-conventions.md); the metrics endpoint reads this
-    /// when the codec is wired into ServerImpl.
+    /// (named per the docs/observability-conventions.md rules; register it
+    /// there when the wiring PR exposes it); the metrics endpoint reads
+    /// this when the codec is wired into ServerImpl.
     [[nodiscard]] std::vector<std::pair<std::pair<std::string, FailureClass>, std::uint64_t>>
     decrypt_failure_counts() const;
 

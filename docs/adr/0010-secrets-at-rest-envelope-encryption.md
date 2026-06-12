@@ -370,7 +370,7 @@ already fixed in the governance amendment round, which his review predates.)
 The first implementation PR ships the mechanism as specified, with four recorded
 deltas (none weakens a normative rule):
 
-1. **The seam is its own interface.** The five KEK methods live on a separate
+1. **The seam is its own interface.** The six KEK methods live on a separate
    `KekProvider` interface rather than growing `KeyProvider` (interface
    segregation): the raw-PEM CA/TLS custody contract and the wrap/unwrap secrets
    contract are disjoint, and the realistic split deployment — KMS/PKCS#11 for

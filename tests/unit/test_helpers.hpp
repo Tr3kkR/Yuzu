@@ -87,6 +87,23 @@ inline std::filesystem::path unique_temp_path(std::string_view prefix = "yuzu-te
 /// is a lower-level primitive exposed for tests that do not own a SQLite
 /// file (e.g. KV-store tests which open via `KvStore::open(path)` and do
 /// not generate WAL/SHM directly).
+/// RAII temp DIRECTORY for tests that need a private scratch dir (e.g. a
+/// FileKeyProvider base dir). Created lazily by the consumer; recursively
+/// removed on destruction. Promoted from per-file copies in
+/// test_key_provider.cpp / test_secret_codec.cpp (governance CON-S4 — the
+/// promote-at-second-user rule; test_default_certs.cpp's local copy migrates
+/// opportunistically).
+struct TempDir {
+    std::filesystem::path path;
+    TempDir() : path(unique_temp_path("yuzu-test-dir-")) {}
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+};
+
 struct TempDbFile {
     std::filesystem::path path;
 

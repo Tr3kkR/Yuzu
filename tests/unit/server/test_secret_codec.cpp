@@ -35,17 +35,6 @@ using yuzu::server::pg::SecretCodec;
 
 namespace {
 
-struct TempDir {
-    std::filesystem::path path;
-    TempDir() : path(yuzu::test::unique_temp_path("sc-keys-")) {}
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-};
-
 PgConn connect(const std::string& dsn) {
     PgConn conn{PQconnectdb(dsn.c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -124,7 +113,7 @@ TEST_CASE("SecretCodec: encode_bigint_pk is fixed 8-byte BE", "[secrets]") {
 }
 
 TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets]") {
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
@@ -135,7 +124,7 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -168,7 +157,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
 
 TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     PgConn conn = connect(db.dsn());
     {
         FileKeyProvider provider(keys.path);
@@ -177,7 +166,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     }
 
     SECTION("missing KEK file (backup skew / dual server) -> kek_unresolvable") {
-        TempDir other_keys; // empty keys dir, same database
+        yuzu::test::TempDir other_keys; // empty keys dir, same database
         FileKeyProvider provider(other_keys.path);
         SecretCodec codec(provider);
         auto r = codec.init(conn.get());
@@ -204,7 +193,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -241,7 +230,7 @@ TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][s
 
 TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -289,7 +278,7 @@ TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -343,7 +332,7 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -463,7 +452,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk path)",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -523,7 +512,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
 TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard, zero-row column",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -598,7 +587,7 @@ TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard
 
 TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB(db);
-    TempDir keys;
+    yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());

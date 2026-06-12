@@ -150,6 +150,9 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
     // Owner-only directory so the brief pre-chmod window on the temp file is not
     // exposed to other local users.
     fs::permissions(base_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (ec)
+        spdlog::warn("key_provider: could not set 0700 on {}: {}", base_dir_.string(),
+                     ec.message()); // UP-13: files are 0600, so exposure is listing-only
 
     const fs::path tmp = base_dir_ / (std::string(key_id) + ".key.tmp." + random_suffix());
 
@@ -266,18 +269,24 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
     // std::filesystem::rename cannot request); FlushFileBuffers above plus
     // NTFS metadata journaling is the available posture there.
     {
+        // Failure here propagates (governance LOW-1): the rename has already
+        // happened, so the caller treats this as a failed store — for
+        // generate_kek that means no fingerprint is registered, and the next
+        // boot safely ADOPTS the on-disk file instead of orphaning it.
+        bool dir_synced = false;
         const int dfd = ::open(base_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (dfd >= 0) {
 #ifdef __APPLE__
-            if (::fcntl(dfd, F_FULLFSYNC) != 0)
-                (void)::fsync(dfd);
+            dir_synced = ::fcntl(dfd, F_FULLFSYNC) == 0 || ::fsync(dfd) == 0;
 #else
-            (void)::fsync(dfd);
+            dir_synced = ::fsync(dfd) == 0;
 #endif
             (void)::close(dfd);
-        } else {
-            spdlog::warn("key_provider: could not fsync {} after rename: {}", base_dir_.string(),
-                         std::strerror(errno));
+        }
+        if (!dir_synced) {
+            spdlog::error("key_provider: could not fsync {} after rename: {}", base_dir_.string(),
+                          std::strerror(errno));
+            return false;
         }
     }
 #endif

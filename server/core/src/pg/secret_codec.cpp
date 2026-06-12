@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 
@@ -225,8 +226,18 @@ void SecretCodec::emit_audit(std::string_view verb, const std::string& detail_js
         std::lock_guard lock{mu_};
         hook = audit_hook_;
     }
-    if (hook)
+    if (!hook)
+        return;
+    try {
         hook(verb, detail_json);
+    } catch (const std::exception& e) {
+        // An audit-sink failure must never escape into a decrypt error path
+        // or abort a rotation mid-flight (UP-5). Hooks must also not
+        // re-enter the codec's lifecycle operations.
+        spdlog::error("secret_codec: audit hook threw: {}", e.what());
+    } catch (...) {
+        spdlog::error("secret_codec: audit hook threw a non-exception");
+    }
 }
 
 std::uint32_t SecretCodec::active_kek_version() const {
@@ -548,7 +559,7 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
         if (!ref)
             return std::unexpected{InitError{
                 InitError::Kind::kek_unresolvable,
-                "kek_unresolvable: registered KEK '" + key_id +
+                "registered KEK '" + key_id +
                     "' does not resolve through the KekProvider. Causes: keys directory older "
                     "than the database (backup skew — restore DB and keys dir as a PAIR), wrong "
                     "keys directory, or a second server instance sharing this database (one KEK "
@@ -560,7 +571,7 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
             !std::equal(kcv->begin(), kcv->end(), expected->begin()))
             return std::unexpected{InitError{
                 InitError::Kind::kek_corrupt,
-                "kek_corrupt: KEK '" + key_id +
+                "KEK '" + key_id +
                     "' resolves but its check value does not match the registered fingerprint "
                     "(torn/corrupt key file or foreign key material — NOT row tamper). Restore "
                     "the keys directory from the backup paired with this database"}};
@@ -594,8 +605,28 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
     if (cur == 0)
         return std::unexpected{"rotate: init() has not run"};
 
+    if (cur == std::numeric_limits<std::uint32_t>::max())
+        return std::unexpected{"rotate: kek_version space exhausted"}; // UP-7
+
     const std::uint32_t next = cur + 1;
     const std::string key_id = kek_key_id(next);
+
+    // The ENTIRE mint+register sequence runs inside one transaction holding
+    // the same advisory lock as init() (governance NEW-H1): without it, two
+    // racing rotations could interleave so that the conflict-loser's
+    // cleanup deleted the key file the winner had just registered —
+    // permanent loss of every row rewrapped under it. Under the lock, a
+    // second rotation cannot even observe the winner's key file until the
+    // winner's fingerprint row is committed.
+    if (!exec_ok(conn, "BEGIN", "BEGIN (rotate)"))
+        return std::unexpected{"rotate: BEGIN failed"};
+    PgTxn txn{conn};
+    {
+        PgResult lock{PQexec(conn, kKekLockSql)};
+        if (lock.status() != PGRES_TUPLES_OK)
+            return std::unexpected{std::string{"rotate: advisory lock failed: "} +
+                                   PQerrorMessage(conn)};
+    }
     // Adopt-or-generate, mirroring first boot (sec-M3): a crash between a
     // prior rotation's generate_kek and its fingerprint INSERT leaves an
     // orphan key file, and generate_kek correctly refuses to overwrite it —
@@ -635,16 +666,22 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
         return std::unexpected{std::string{"rotate: fingerprint INSERT failed: "} +
                                PQerrorMessage(conn)};
     if (std::strcmp(PQcmdTuples(ins.get()), "1") != 0) {
-        // A concurrent rotation registered this version first. If WE minted
-        // the key file just now it is an orphan with a non-matching
-        // fingerprint — remove it or the next boot fails as kek_corrupt. If
-        // we ADOPTED the file, it may be the legitimately registered one
-        // (same-host racer) — never delete it; boot verification arbitrates.
+        // A row for this version already exists (a rotation on ANOTHER
+        // server committed before we took the lock — the unsupported
+        // dual-keys-dir topology, or a version minted while we were down).
+        // If WE minted the key file just now it is OUR orphan with a
+        // non-matching fingerprint — remove it or the next boot fails as
+        // kek_corrupt. If we ADOPTED an existing file it may be the
+        // legitimately registered one — never delete it; boot verification
+        // arbitrates (NEW-H1: under the advisory lock a same-dir racer can
+        // no longer reach this branch with our file registered).
         if (!adopted)
             (void)provider_.delete_kek(*ref);
-        return std::unexpected{"rotate: concurrent rotation detected for " + key_id +
-                               " — re-run rotation"};
+        return std::unexpected{"rotate: kek_version v" + std::to_string(next) +
+                               " is already registered — re-run rotation"};
     }
+    if (!txn.commit())
+        return std::unexpected{"rotate: COMMIT failed"};
 
     {
         std::lock_guard lock{mu_};
@@ -676,6 +713,7 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
 
     std::size_t rewrapped_count = 0;
     std::size_t cas_skipped = 0;
+    std::size_t malformed_skipped = 0;
     for (const auto& col : columns) {
         const std::string select = "SELECT \"" + col.pk_column + "\", \"" + col.column +
                                    "\" FROM " + rel_name(col) + " WHERE \"" + col.column +
@@ -704,9 +742,20 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
                 col.store, col.table, col.column,
                 std::string{reinterpret_cast<const char*>(pk_p), static_cast<std::size_t>(pk_len)}};
             auto new_blob = rewrap(id, blob, target);
-            if (!new_blob)
+            if (!new_blob) {
+                if (new_blob.error().cls == FailureClass::malformed_blob) {
+                    // A garbage/pre-migration value is already undecryptable;
+                    // hard-failing here would let one poisoned row wedge the
+                    // whole rotation lifecycle forever (UP-3). Skip it — the
+                    // rewrap() call has already audited and counted it, and
+                    // retirement stays blocked only if the row's header bytes
+                    // actually reference the old version.
+                    ++malformed_skipped;
+                    continue;
+                }
                 return std::unexpected{"rewrap_all: rewrap failed for a row of " + rel_name(col) +
                                        ": " + new_blob.error().message};
+            }
 
             // Compare-and-swap (ADR §3): a plain write would silently revert
             // a concurrent operator secret-update to the old value.
@@ -732,6 +781,10 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
     if (cas_skipped > 0)
         spdlog::info("secret_codec: rewrap_all skipped {} row(s) updated concurrently",
                      cas_skipped);
+    if (malformed_skipped > 0)
+        spdlog::error("secret_codec: rewrap_all skipped {} MALFORMED row(s) — already "
+                      "undecryptable; investigate via the secret.decrypt_failure audit trail",
+                      malformed_skipped);
     spdlog::info("secret_codec: rewrap_all re-wrapped {} row(s) to v{}", rewrapped_count, target);
     return rewrapped_count;
 }
@@ -797,7 +850,14 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
         if (res.status() != PGRES_TUPLES_OK)
             return std::unexpected{"retire: reference scan of " + rel_name(col) +
                                    " failed: " + PQerrorMessage(conn)};
-        if (PQntuples(res.get()) == 1 && std::atoll(PQgetvalue(res.get(), 0, 0)) > 0)
+        // Strict parse, refuse on garbage: this gate guards permanent key
+        // destruction, so an unparseable count must fail CLOSED (CON-S3).
+        const auto refs_count =
+            PQntuples(res.get()) == 1 ? parse_u32(PQgetvalue(res.get(), 0, 0)) : std::nullopt;
+        if (!refs_count)
+            return std::unexpected{"retire: unparseable reference count from " + rel_name(col) +
+                                   " — refusing"};
+        if (*refs_count > 0)
             return std::unexpected{"retire: refusing — " + rel_name(col) +
                                    " still holds blob(s) wrapped under v" +
                                    std::to_string(version) +
