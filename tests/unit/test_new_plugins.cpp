@@ -617,6 +617,17 @@ std::string_view test_derive_rdp_verdict(bool deny_known, bool deny_allows, bool
     return (deny_allows && fw_enabled && svc_running) ? "on" : "off";
 }
 
+/// Mirror of rdp_control_plugin.cpp: classify_fw_hr — keep in sync. The HRESULT
+/// constants are S_OK=0, S_FALSE=1 (we avoid <windows.h> in this TU). The
+/// security-critical rule: S_FALSE (group absent) is NOT success — it must map
+/// to "group_not_found", never be accepted as a confirmed read (H2).
+enum class TestFwResult { Ok, GroupNotFound, Error };
+TestFwResult test_classify_fw_hr(long hr) {
+    if (hr == 0L) return TestFwResult::Ok;          // S_OK
+    if (hr == 1L) return TestFwResult::GroupNotFound; // S_FALSE
+    return TestFwResult::Error;
+}
+
 } // namespace
 
 TEST_CASE("rdp_control: valid states accepted",
@@ -657,6 +668,21 @@ TEST_CASE("rdp_control: verdict is 'off' when all gates readable but one closed"
     CHECK(test_derive_rdp_verdict(true, true, true, false, true, true) == "off");   // fw disabled
     CHECK(test_derive_rdp_verdict(true, true, true, true, true, false) == "off");   // svc not running
     CHECK(test_derive_rdp_verdict(true, false, true, false, true, false) == "off"); // all closed
+}
+
+TEST_CASE("rdp_control: S_FALSE firewall HRESULT is NOT success (H2 fail-safe)",
+          "[plugins][rdp_control][validation]") {
+    // S_OK is the only success; S_FALSE (group absent) must classify as
+    // group_not_found so an enable is never a silent no-op reported ok and a
+    // status read never derives "off" from an unreadable gate.
+    CHECK(test_classify_fw_hr(0L) == TestFwResult::Ok);              // S_OK
+    CHECK(test_classify_fw_hr(1L) == TestFwResult::GroupNotFound);   // S_FALSE
+    CHECK(test_classify_fw_hr(static_cast<long>(0x80004005)) == TestFwResult::Error); // E_FAIL
+    CHECK(test_classify_fw_hr(static_cast<long>(0x80070005)) == TestFwResult::Error); // E_ACCESSDENIED
+    // The H2 inversion guard: a group-not-found firewall read feeds fw_known=false
+    // into the verdict, which must yield "unknown", never "off".
+    const bool fw_known = (test_classify_fw_hr(1L) == TestFwResult::Ok); // false
+    CHECK(test_derive_rdp_verdict(true, true, fw_known, false, true, true) == "unknown");
 }
 
 // ============================================================================
@@ -737,7 +763,7 @@ TEST_CASE("all plugins: action strings are non-empty and unique",
     // Build a list of plugin names to try loading
     std::vector<std::string> plugin_names = {
         "http_client", "content_dist", "interaction", "agent_logging",
-        "storage", "registry", "wmi"
+        "storage", "registry", "wmi", "rdp_control"
     };
 
     for (const auto& name : plugin_names) {
@@ -766,7 +792,7 @@ TEST_CASE("all plugins: ABI version is exactly YUZU_PLUGIN_ABI_VERSION",
           "[plugins][descriptor][invariants]") {
     std::vector<std::string> plugin_names = {
         "http_client", "content_dist", "interaction", "agent_logging",
-        "storage", "registry", "wmi"
+        "storage", "registry", "wmi", "rdp_control"
     };
 
     for (const auto& name : plugin_names) {

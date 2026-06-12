@@ -26,6 +26,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <format>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -70,7 +71,12 @@ public:
     // CoUninitialize (unbalanced). Parity with ScHandle below.
     ComInit(const ComInit&) = delete;
     ComInit& operator=(const ComInit&) = delete;
-    bool ok() const { return SUCCEEDED(hr_); }
+    // RPC_E_CHANGED_MODE means COM was already initialised on this thread in a
+    // different apartment (e.g. an STA from a prior plugin on the pool thread).
+    // That is usable — in-proc COM works regardless of apartment — so treat it as
+    // ok. The dtor still only CoUninitialize()s when WE initialised (SUCCEEDED),
+    // which excludes RPC_E_CHANGED_MODE, so the ref count stays balanced.
+    bool ok() const { return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE; }
 
 private:
     HRESULT hr_;
@@ -148,8 +154,9 @@ private:
 /// Write fDenyTSConnections. Returns ERROR_SUCCESS or the Win32 error.
 LONG set_deny_ts_connections(DWORD deny) {
     RegKey key;
-    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kTerminalServerKey, 0, nullptr, 0, KEY_SET_VALUE,
-                              nullptr, key.put(), nullptr);
+    // OPEN (do not create) the Terminal Server key — it always exists on Windows;
+    // a security gate must fail rather than fabricate the key if it is absent.
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kTerminalServerKey, 0, KEY_SET_VALUE, key.put());
     if (rc != ERROR_SUCCESS) return rc;
     return RegSetValueExW(key.get(), kDenyValueName, 0, REG_DWORD,
                           reinterpret_cast<const BYTE*>(&deny), sizeof(deny));
@@ -192,6 +199,21 @@ HRESULT get_rdp_firewall_group(bool& enabled) {
     return hr;
 }
 
+// Classify an INetFwPolicy2 EnableRuleGroup/IsRuleGroupEnabled HRESULT.
+// CRITICAL: these return S_FALSE — which PASSES SUCCEEDED() — when the rule
+// group does NOT exist (e.g. a hardened image without the built-in Remote
+// Desktop group). Treating that as success is a fail-safe inversion: an
+// enable becomes a silent no-op reported "ok", and a status read reports the
+// gate "disabled/confirmed" when it was actually unreadable. So S_OK alone is
+// success; S_FALSE is "group not found" (gate UNKNOWN, never confirmed); any
+// other HRESULT is an error. Pure + mirrored in test_new_plugins.cpp.
+enum class FwResult { Ok, GroupNotFound, Error };
+FwResult classify_fw_hr(HRESULT hr) {
+    if (hr == S_OK) return FwResult::Ok;
+    if (hr == S_FALSE) return FwResult::GroupNotFound;
+    return FwResult::Error;
+}
+
 /// Query TermService state. Returns ERROR_SUCCESS or the Win32 error.
 LONG get_term_service_state(DWORD& state) {
     ScHandle scm{OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT)};
@@ -208,17 +230,41 @@ LONG get_term_service_state(DWORD& state) {
     return ERROR_SUCCESS;
 }
 
-/// Start TermService if not already running. Returns ERROR_SUCCESS,
-/// ERROR_SERVICE_ALREADY_RUNNING (treated as success by callers), or the
-/// Win32 error.
+/// Start TermService and wait (bounded) until it is actually SERVICE_RUNNING.
+/// StartServiceW returns once the service's main thread is created — normally at
+/// SERVICE_START_PENDING — so a dispatched start is NOT a confirmed running
+/// service (and may still fail initialisation). Returns ERROR_SUCCESS only on a
+/// confirmed RUNNING state; ERROR_SERVICE_REQUEST_TIMEOUT if still pending after
+/// the deadline; ERROR_SERVICE_NOT_ACTIVE if it left the pending/running set; or
+/// the Win32 error.
 LONG start_term_service() {
     ScHandle scm{OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT)};
     if (!scm) return static_cast<LONG>(GetLastError());
     ScHandle svc{
         OpenServiceW(scm.get(), L"TermService", SERVICE_START | SERVICE_QUERY_STATUS)};
     if (!svc) return static_cast<LONG>(GetLastError());
-    if (StartServiceW(svc.get(), 0, nullptr)) return ERROR_SUCCESS;
-    return static_cast<LONG>(GetLastError());
+
+    if (!StartServiceW(svc.get(), 0, nullptr)) {
+        const LONG err = static_cast<LONG>(GetLastError());
+        if (err != ERROR_SERVICE_ALREADY_RUNNING)
+            return err;
+    }
+    // Poll to a confirmed RUNNING state (bounded ~10s).
+    constexpr int kMaxWaitMs = 10000;
+    constexpr int kPollMs = 250;
+    for (int waited = 0; waited <= kMaxWaitMs; waited += kPollMs) {
+        SERVICE_STATUS_PROCESS ssp{};
+        DWORD needed = 0;
+        if (!QueryServiceStatusEx(svc.get(), SC_STATUS_PROCESS_INFO,
+                                  reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed))
+            return static_cast<LONG>(GetLastError());
+        if (ssp.dwCurrentState == SERVICE_RUNNING)
+            return ERROR_SUCCESS;
+        if (ssp.dwCurrentState != SERVICE_START_PENDING)
+            return ERROR_SERVICE_NOT_ACTIVE; // stopped/paused unexpectedly
+        Sleep(kPollMs);
+    }
+    return ERROR_SERVICE_REQUEST_TIMEOUT;
 }
 
 const char* service_state_name(DWORD state) {
@@ -290,6 +336,14 @@ private:
             ctx.write_output("error|invalid state (use enable or disable)");
             return 1;
         }
+        // Serialize the multi-step transition (registry -> firewall -> service):
+        // a retry-enable racing a window-close disable on the same agent must not
+        // interleave so a stale enable's registry write lands last and leaves RDP
+        // reachable after the disable reported overall|ok. Defence-in-depth; the
+        // wire-level per-device guarantee is a platform follow-up.
+        static std::mutex set_state_mu;
+        std::lock_guard<std::mutex> set_state_lock(set_state_mu);
+
         const bool enable = (state == "enable");
         bool all_ok = true;
 
@@ -302,28 +356,41 @@ private:
             all_ok = false;
         }
 
-        // 2. Firewall — the Remote Desktop rule group, all profiles.
+        // 2. Firewall — the Remote Desktop rule group, all profiles. S_FALSE
+        //    (group absent) passes SUCCEEDED but is a silent no-op — classify it
+        //    as group_not_found and fail the step, never report ok (H2).
         {
             ComInit com;
             if (!com.ok()) {
                 ctx.write_output("firewall_status|error:com_init");
                 all_ok = false;
-            } else if (HRESULT hr = set_rdp_firewall_group(enable); SUCCEEDED(hr)) {
-                ctx.write_output("firewall_status|ok");
             } else {
-                ctx.write_output(
-                    std::format("firewall_status|error:0x{:08x}", static_cast<uint32_t>(hr)));
-                all_ok = false;
+                HRESULT hr = set_rdp_firewall_group(enable);
+                switch (classify_fw_hr(hr)) {
+                    case FwResult::Ok:
+                        ctx.write_output("firewall_status|ok");
+                        break;
+                    case FwResult::GroupNotFound:
+                        ctx.write_output("firewall_status|error:group_not_found");
+                        all_ok = false;
+                        break;
+                    case FwResult::Error:
+                        ctx.write_output(std::format("firewall_status|error:0x{:08x}",
+                                                     static_cast<uint32_t>(hr)));
+                        all_ok = false;
+                        break;
+                }
             }
         }
 
-        // 3. Service — ensure TermService is running on enable; on disable the
-        //    registry + firewall gates block new connections, so the service is
-        //    deliberately left alone (and enforce-stopping security-adjacent
-        //    services is the pattern the Guardian denylist exists to prevent).
+        // 3. Service — ensure TermService is RUNNING on enable (start + poll); on
+        //    disable the registry + firewall gates block new connections, so the
+        //    service is deliberately left alone (and enforce-stopping security-
+        //    adjacent services is the pattern the Guardian denylist exists to
+        //    prevent).
         if (enable) {
             LONG rc = start_term_service();
-            if (rc == ERROR_SUCCESS || rc == ERROR_SERVICE_ALREADY_RUNNING) {
+            if (rc == ERROR_SUCCESS) {
                 ctx.write_output("service_status|running");
             } else {
                 ctx.write_output(std::format("service_status|error:{}", rc));
@@ -354,13 +421,20 @@ private:
         bool fw_known = false;
         {
             ComInit com;
+            HRESULT hr = S_OK;
             if (!com.ok()) {
                 ctx.write_output("firewall_group|error:com_init");
                 all_known = false;
-            } else if (HRESULT hr = get_rdp_firewall_group(fw_enabled); SUCCEEDED(hr)) {
+            } else if (hr = get_rdp_firewall_group(fw_enabled); classify_fw_hr(hr) == FwResult::Ok) {
                 fw_known = true;
                 ctx.write_output(
                     std::format("firewall_group|{}", fw_enabled ? "enabled" : "disabled"));
+            } else if (classify_fw_hr(hr) == FwResult::GroupNotFound) {
+                // Group absent: the gate is UNREADABLE, not "confirmed disabled".
+                // Leave fw_known=false so the verdict derives "unknown", never
+                // "off" (H2 — preserves the fail-safe contract).
+                ctx.write_output("firewall_group|group_not_found");
+                all_known = false;
             } else {
                 ctx.write_output(
                     std::format("firewall_group|error:0x{:08x}", static_cast<uint32_t>(hr)));

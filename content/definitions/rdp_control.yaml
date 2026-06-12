@@ -5,6 +5,20 @@
 # disables it again at the end. The agent service account must be a member of
 # the local Administrators group (this is NOT the default install) — a
 # non-elevated agent returns reg_status|error:5 on every set_state.
+#
+# ENFORCEMENT REALITY (read before relying on the gate below): the only control
+# enforced on EVERY dispatch path is the `Execution:Execute` RBAC permission.
+# `approval.mode: role-gated` is enforced ONLY on the governed
+# POST /api/instructions/{id}/execute path; the raw dispatch paths
+# (POST /api/command, MCP execute_instruction) do NOT load this definition, so
+# they apply neither the approval workflow nor `executeRoles`. `executeRoles`
+# is advisory (not consumed by the server today) and `endpoint-admin` is a
+# content-convention label, not a server RBAC role (those are
+# Administrator/PlatformEngineer/Operator). Net: anyone holding
+# `Execution:Execute` (incl. an MCP token defaulting scope to __all__) can run
+# this. Restrict `Execution:Execute` and MCP token scope accordingly, and keep
+# the Guardian fDenyTSConnections backstop deployed. Enforcing definition-level
+# governance on raw dispatch is tracked as a platform follow-up (issue #1401).
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -77,7 +91,10 @@ metadata:
     be read (e.g. a non-elevated agent); rdp=off when all gates are readable
     but at least one is closed. A non-zero command exit code also signals an
     unreadable gate — callers verifying a state change should check the exit
-    code and the per-gate rows, not the rdp summary alone.
+    code and the per-gate rows, not the rdp summary alone. SCOPE: the firewall
+    check covers only the built-in Remote Desktop rule group; a custom inbound
+    3389 allow-rule is out of scope, so rdp=off means "at least one MANAGED gate
+    is closed", not "3389 is unreachable by every possible rule".
   tags: [rdp, remote-desktop, windows, posture]
 spec:
   type: question
