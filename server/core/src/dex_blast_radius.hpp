@@ -43,6 +43,14 @@ struct BlastRadiusConfig {
     int window_seconds{900};     ///< sliding window (15 min)
     int cooldown_seconds{3600};  ///< per-pair re-alert suppression (1 h)
     std::size_t max_pairs{4096}; ///< tracked (obs_type, subject) pairs cap
+    /// Global cap on tracked (pair, agent) sightings — the MEMORY bound. The
+    /// pair cap bounds map keys, not entries: a coordinated hostile fleet
+    /// spraying distinct subjects inside its rate caps could otherwise grow
+    /// the agent sets toward hundreds of MB. 100k entries ≈ ~5 MB worst.
+    /// At the budget, NEW sightings go untracked (existing ones still
+    /// refresh), so an established incident keeps counting and a saturated
+    /// detector under-counts rather than over-allocates.
+    std::size_t max_total_entries{100000};
 };
 
 struct BlastRadiusIncident {
@@ -88,6 +96,8 @@ private:
     std::function<void(const BlastRadiusIncident&)> on_incident_;
     std::mutex mu_;
     std::unordered_map<std::string, Pair> pairs_; ///< key: obs_type + '\x1f' + subject
+    std::size_t total_entries_{0};                ///< tracked (pair, agent) sightings
+    bool entry_budget_warned_{false};
 };
 
 } // namespace yuzu::server

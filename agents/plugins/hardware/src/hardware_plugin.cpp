@@ -691,20 +691,18 @@ int do_drivers(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__linux__)
-    auto lsmod = run_command("lsmod 2>/dev/null");
+    // Read /proc/modules directly — it is the exact source lsmod pretty-prints,
+    // so a shell-out (fork/exec + /bin/sh dependency) buys nothing. First
+    // whitespace-separated field per line is the module name.
+    std::ifstream modules("/proc/modules");
     int idx = 0;
-    if (!lsmod.empty()) {
-        std::istringstream ss(lsmod);
-        std::string line;
-        std::getline(ss, line); // header: Module Size Used by
-        while (std::getline(ss, line)) {
-            std::istringstream ls(line);
-            std::string module;
-            ls >> module;
-            if (!module.empty())
-                ctx.write_output(
-                    std::format("driver|{}|{}|||kernel|module", idx++, module));
-        }
+    std::string line;
+    while (std::getline(modules, line)) {
+        std::istringstream ls(line);
+        std::string module;
+        ls >> module;
+        if (!module.empty())
+            ctx.write_output(std::format("driver|{}|{}|||kernel|module", idx++, module));
     }
     if (idx == 0)
         ctx.write_output("driver|0|unknown||||");

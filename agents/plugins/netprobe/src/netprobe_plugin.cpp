@@ -227,6 +227,11 @@ struct IcmpSession {
         fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
         if (fd < 0)
             permitted = !(errno == EACCES || errno == EPERM || errno == EPROTONOSUPPORT);
+        // Randomize the starting sequence: on macOS concurrent ICMP dgram
+        // sockets can see each other's echo replies, and two sessions both
+        // counting from 0 could cross-match a reply (and record a bogus RTT).
+        seq = static_cast<std::uint16_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF);
     }
     ~IcmpSession() {
         if (fd >= 0)

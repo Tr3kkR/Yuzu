@@ -426,6 +426,15 @@ Until W0 lands, B ships behind a simple default-off config flag.
 
 ## 5. Standing notes
 
+- **Syscalls over shell-outs (directive, 2026-06-12):** every new collector and
+  plugin action uses native APIs wherever one exists; a shell-out needs an
+  explicit justification (e.g. the macOS `log show` poll, where logd's
+  server-side filtering is the lighter option). Pre-existing shell-outs
+  (`network_actions` ping/flush_dns, hardware-plugin lsblk/system_profiler
+  paths) are cleanup candidates, not precedent. NFR bar for everything in this
+  plan: exceptionally kind to the endpoint and the network, highly performant,
+  highly lightweight — bounded memory, minimal thread wakes, capped fan-out.
+
 - **Works council (recalibrated 2026-06-12):** a design consideration to bear in
   mind and retrofit, not a gate. B-wave usage metering ships behind a default-off
   flag; W0 toggles, aggregate-first views, and the individual-view kill switch

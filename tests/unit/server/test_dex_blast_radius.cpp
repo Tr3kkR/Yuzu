@@ -161,6 +161,46 @@ TEST_CASE("blast: at the pair cap a NEW pair is dropped, established pairs keep 
     CHECK(cap.incidents[1].subject == "fresh.exe");
 }
 
+TEST_CASE("blast: the global entry budget bounds memory, frees as entries age out",
+          "[dex][blast]") {
+    Capture cap;
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 2;
+    cfg.window_seconds = 900;
+    cfg.cooldown_seconds = 3600;
+    cfg.max_total_entries = 4;
+    BlastRadiusDetector d(cfg);
+    cap.wire(d);
+
+    // Budget fills: pair X takes 2 entries (fires), pair Y takes 2 (fires).
+    d.observe("process.crashed", "x.exe", "a", 1000);
+    d.observe("process.crashed", "x.exe", "b", 1001);
+    d.observe("process.crashed", "y.exe", "c", 1002);
+    d.observe("process.crashed", "y.exe", "d", 1003);
+    REQUIRE(cap.incidents.size() == 2);
+
+    // Budget exhausted: a NEW pair's sightings go untracked — no false fire,
+    // no allocation growth.
+    d.observe("process.crashed", "z.exe", "e", 1004);
+    d.observe("process.crashed", "z.exe", "f", 1005);
+    CHECK(cap.incidents.size() == 2);
+
+    // Refreshing an EXISTING entry is never blocked by the budget.
+    d.observe("process.crashed", "x.exe", "a", 1006);
+    CHECK(cap.incidents.size() == 2); // still in cooldown, but tracked fine
+
+    // Once stale entries prune (budget frees when a pair is TOUCHED past the
+    // window — untouched stale pairs keep their slots until touched or
+    // cap-swept), the budget recovers and new pairs track again.
+    const std::int64_t later = 1000 + 3600 + 1000;
+    d.observe("process.crashed", "x.exe", "a", later); // prunes X's 2 stale entries
+    d.observe("process.crashed", "y.exe", "c", later); // prunes Y's 2 stale entries
+    d.observe("process.crashed", "z.exe", "e", later + 1);
+    d.observe("process.crashed", "z.exe", "f", later + 2);
+    REQUIRE(cap.incidents.size() == 3);
+    CHECK(cap.incidents[2].subject == "z.exe");
+}
+
 TEST_CASE("blast: a re-entrant observe from the callback does not deadlock", "[dex][blast]") {
     BlastRadiusConfig cfg;
     cfg.min_devices = 2;

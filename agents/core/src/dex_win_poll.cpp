@@ -196,17 +196,28 @@ public:
 
 private:
     void run() {
+        // First poll 60 s after arm (never at-arm — arm-time work delays agent
+        // startup), then each poll keeps its own cadence.
+        {
+            const std::int64_t now = now_unix();
+            last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
+            last_battery_poll_ = now - kBatteryIntervalSeconds + kFirstPollDelaySeconds;
+        }
         for (;;) {
+            // Sleep until the EARLIEST next-due poll, not a fixed short tick —
+            // ~6 thread wakes/hour instead of 60 (kind to the endpoint,
+            // especially on battery). stop() interrupts the wait via the cv.
+            // (std::min) — windows.h's min/max macros are in scope in this TU.
+            const std::int64_t next = (std::min)(last_disk_poll_ + kDiskIntervalSeconds,
+                                                 last_battery_poll_ + kBatteryIntervalSeconds);
+            const auto wait_s =
+                std::chrono::seconds((std::max)(next - now_unix(), std::int64_t{1}));
             {
                 std::unique_lock lk(mu_);
-                cv_.wait_for(lk, std::chrono::seconds(kTickSeconds),
-                             [this] { return stopping_; });
-                if (stopping_)
+                if (cv_.wait_for(lk, wait_s, [this] { return stopping_; }))
                     return;
             }
             const std::int64_t now = now_unix();
-            // last_* start at 0 → both polls run on the FIRST tick (60 s after
-            // arm, never at-arm — arm-time work delays agent startup).
             if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
                 last_disk_poll_ = now;
                 poll_disks();
@@ -259,7 +270,7 @@ private:
         }
     }
 
-    static constexpr int kTickSeconds = 60;
+    static constexpr std::int64_t kFirstPollDelaySeconds = 60;
     static constexpr std::int64_t kDiskIntervalSeconds = 600;     // 10 min
     static constexpr std::int64_t kBatteryIntervalSeconds = 3600; // hourly
 

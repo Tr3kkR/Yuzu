@@ -46,10 +46,12 @@ void BlastRadiusDetector::sweep_stale_locked(std::int64_t now_unix) {
     const std::int64_t horizon =
         now_unix - std::max(cfg_.window_seconds, cfg_.cooldown_seconds);
     for (auto it = pairs_.begin(); it != pairs_.end();) {
-        if (it->second.last_touch < horizon)
+        if (it->second.last_touch < horizon) {
+            total_entries_ -= it->second.agents.size();
             it = pairs_.erase(it);
-        else
+        } else {
             ++it;
+        }
     }
 }
 
@@ -80,12 +82,29 @@ void BlastRadiusDetector::observe(const std::string& obs_type, const std::string
         // Prune sightings that fell out of the window, then record this one.
         const std::int64_t window_start = now_unix - cfg_.window_seconds;
         for (auto a = p.agents.begin(); a != p.agents.end();) {
-            if (a->second < window_start)
+            if (a->second < window_start) {
                 a = p.agents.erase(a);
-            else
+                --total_entries_;
+            } else {
                 ++a;
+            }
         }
-        p.agents[agent_id] = now_unix;
+        if (auto a = p.agents.find(agent_id); a != p.agents.end()) {
+            a->second = now_unix; // refresh — never blocked by the budget
+        } else if (total_entries_ < cfg_.max_total_entries) {
+            p.agents.emplace(agent_id, now_unix);
+            ++total_entries_;
+        } else {
+            // Entry budget exhausted (memory bound) — the new sighting goes
+            // untracked; the budget frees as stale entries prune on touch or
+            // sweep. Saturated = under-count, never over-allocate.
+            if (!entry_budget_warned_) {
+                entry_budget_warned_ = true;
+                spdlog::warn("BlastRadius: tracked-sighting budget ({}) exhausted — new "
+                             "sightings untracked until stale entries age out",
+                             cfg_.max_total_entries);
+            }
+        }
         p.last_touch = now_unix;
 
         // last_alert == 0 means "never alerted" — it must not read as an
