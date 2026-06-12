@@ -22,15 +22,15 @@
 #      PostgreSQL 16 installed as a service with role yuzu / password yuzu
 #      / database yuzu_test; bootstrap once per runner, see
 #      docs/ci-architecture.md).
-#   5. Nothing found -> ::warning + exit 0.
+#   5. Nothing found -> ::error + exit 1.
 #
-# NON-FATAL (path 5) on purpose: no test consumes the DSN until #1320 lands
-# the server-side Postgres substrate. When the first Postgres-backed store
-# test ships, flip SOFT_EXIT to 1 so a missing database fails the job
-# instead of silently skipping coverage.
+# FATAL since #1320 PR 1: the pg substrate test suites ([pg] tags in the
+# server suite) consume YUZU_TEST_POSTGRES_DSN and skip when it is unset —
+# so a runner without a database would silently skip that coverage. A
+# missing/unready Postgres now fails the job instead.
 set -euo pipefail
 
-SOFT_EXIT=0   # flip to 1 when #1320's tests consume YUZU_TEST_POSTGRES_DSN
+SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 
 # Same pinned multi-arch image as deploy/docker/Dockerfile.postgres's base.
 PG_IMAGE="postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb0942a77e012fe74f016c114c3e25b8"
@@ -60,6 +60,15 @@ fi
 
 # ── 2. Docker (self-hosted Linux) ────────────────────────────────────────
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  # Digest-drift guard: the container is persistent (--restart
+  # unless-stopped), so a PG_IMAGE pin bump would otherwise never reach
+  # runners that already have one — tests would silently keep running the
+  # old Postgres. Recreate when the recorded image differs.
+  EXISTING_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$EXISTING_IMAGE" && "$EXISTING_IMAGE" != "$PG_IMAGE" ]]; then
+    echo "ensure-postgres: ${CONTAINER} image ${EXISTING_IMAGE} != pinned ${PG_IMAGE} — recreating" >&2
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
     docker start "$CONTAINER" >/dev/null 2>&1 || docker run -d \
       --name "$CONTAINER" \
@@ -77,7 +86,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::warning::ensure-postgres: ${CONTAINER} container did not become ready in 60s" >&2
+  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 60s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -109,7 +118,7 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::warning::ensure-postgres: brew postgresql@16 cluster did not become ready (log: ${PGLOG})" >&2
+  echo "::error::ensure-postgres: brew postgresql@16 cluster did not become ready (log: ${PGLOG}) — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -128,7 +137,7 @@ if tcp_probe 127.0.0.1 5432; then
       emit_dsn "$NATIVE_DSN" "native cluster on 5432 (psql SELECT 1 verified)"
       exit 0
     fi
-    echo "::warning::ensure-postgres: something listens on 127.0.0.1:5432 but the conventional DSN failed 'psql SELECT 1' — not exporting YUZU_TEST_POSTGRES_DSN. Fix the runner bootstrap (role yuzu / password yuzu / db yuzu_test) or pre-set YUZU_TEST_POSTGRES_DSN." >&2
+    echo "::error::ensure-postgres: something listens on 127.0.0.1:5432 but the conventional DSN failed 'psql SELECT 1' — failing the job. Fix the runner bootstrap (role yuzu / password yuzu / db yuzu_test) or pre-set YUZU_TEST_POSTGRES_DSN." >&2
     exit "$SOFT_EXIT"
   fi
   echo "::warning::ensure-postgres: psql not on PATH — exporting the conventional DSN on a TCP probe only (credential UNVERIFIED). Install psql on the runner for an authenticated readiness check." >&2
@@ -137,5 +146,5 @@ if tcp_probe 127.0.0.1 5432; then
 fi
 
 # ── 5. Nothing available ─────────────────────────────────────────────────
-echo "::warning::ensure-postgres: no Postgres available (no docker, no brew, nothing on 127.0.0.1:5432) — YUZU_TEST_POSTGRES_DSN not set. Non-fatal until #1320; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+echo "::error::ensure-postgres: no Postgres available (no docker, no brew, nothing on 127.0.0.1:5432) — failing the job: the [pg] server tests require a database (SOFT_EXIT=1 since #1320 PR 1). See docs/ci-architecture.md 'Postgres for server tests'." >&2
 exit "$SOFT_EXIT"

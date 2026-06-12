@@ -267,6 +267,9 @@ if build_server
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',
+      'unit/server/test_pg_raii.cpp',
+      'unit/server/test_pg_pool.cpp',
+      'unit/server/test_pg_migration_runner.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -283,7 +286,11 @@ if build_server
     # C4743 (vtable size mismatch) and the linked binary crashes with
     # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
     # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
-    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
+    #
+    # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
+    # test_helpers.hpp — only the server suite links libpq, so the guard
+    # keeps the agent/tar suites (which share the header) libpq-free.
+    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here
