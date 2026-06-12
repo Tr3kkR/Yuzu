@@ -97,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: device drill-down performance extensions.** The `/dex` per-device
+  page gains (1) **vs-fleet / vs-cohort percentile strips** — the device's
+  current heartbeat CPU / memory commit / disk latency placed against the
+  current fleet p50–p90 band (marker turns red above fleet p90), with its
+  cohort position when the cohort meets the 10-device floor; rendered live
+  from registry state, no query dispatched; and (2) a **per-application
+  panel** over the device's opt-in `$ProcPerf_Hourly` edge tier (A2), behind
+  its **own** "Load applications" click with its **own audit action
+  `dex.device.procperf.query`** — usage-class reads stay separately countable
+  from machine-health reads. App rows cross-link to the app reliability
+  drill. An empty result renders the truthful message (per-app sampling is
+  off by default, or no hourly rollup yet — the device's read-only query
+  surface deliberately hides plugin config, so the server does not guess
+  which).
 - **DEX: in-product fleet performance view (`/dex` → Performance tab).** A
   fifth DEX tab answers "where do I watch fleet CPU in the product" without
   Grafana: fleet-now cards (avg/p50/p90/max + the reporting population) for

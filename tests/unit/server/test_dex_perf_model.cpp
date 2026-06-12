@@ -16,6 +16,7 @@
 #include "dex_perf_model.hpp"
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
+#include "guaranteed_state_store.hpp"
 #include "rest_api_v1.hpp"
 #include "tag_store.hpp"
 #include "test_route_sink.hpp"
@@ -322,6 +323,135 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     }
 }
 
+// ── PR2: device context (percentile strips) ──────────────────────────────────
+
+TEST_CASE("device_context: pctiles, cohort floor, honest absence", "[dex][perf][model][device]") {
+    auto snap = two_cohorts(12, 4); // cpu: a={10..21}, b={40..43}
+
+    SECTION("device in an above-floor cohort gets both comparisons") {
+        auto ctx = dex_perf_device_context(snap, "a-11"); // cpu 21, top of cohort a
+        CHECK(ctx.found);
+        CHECK(ctx.reporting);
+        CHECK(ctx.cohort == "a");
+        CHECK(ctx.cohort_n == 12);
+        REQUIRE(ctx.cpu.value);
+        CHECK(*ctx.cpu.value == 21.0);
+        REQUIRE(ctx.cpu.fleet);
+        CHECK(ctx.cpu.fleet->n == 16);
+        CHECK(ctx.cpu.fleet_pctile == 75); // 12 of 16 values <= 21
+        CHECK(ctx.cpu.cohort_pctile == 100);
+        REQUIRE(ctx.cpu.cohort);
+        CHECK(ctx.cpu.cohort->n == 12);
+    }
+    SECTION("sub-floor cohort withholds the cohort comparison — floor applies everywhere") {
+        auto ctx = dex_perf_device_context(snap, "b-0");
+        CHECK(ctx.cohort == "b");
+        CHECK(ctx.cohort_n == 4);
+        CHECK(ctx.cpu.fleet_pctile > 0);
+        CHECK(ctx.cpu.cohort_pctile == -1);
+        CHECK_FALSE(ctx.cpu.cohort);
+    }
+    SECTION("offline device: found=false") {
+        auto ctx = dex_perf_device_context(snap, "nope");
+        CHECK_FALSE(ctx.found);
+    }
+    SECTION("online but not reporting: found, not reporting, no pctiles") {
+        snap.devices.push_back(dev("quiet", std::nullopt, std::nullopt, std::nullopt, "a"));
+        auto ctx = dex_perf_device_context(snap, "quiet");
+        CHECK(ctx.found);
+        CHECK_FALSE(ctx.reporting);
+        CHECK(ctx.cpu.fleet_pctile == -1);
+    }
+}
+
+TEST_CASE("device context strips render: honest notes + cohort drill + escape",
+          "[dex][perf][render][device]") {
+    auto snap = two_cohorts(12, 0);
+    SECTION("reporting device renders bands + fleet pctile + cohort link") {
+        auto html = render_dex_device_perf_context(dex_perf_device_context(snap, "a-0"), "model",
+                                                   "7d");
+        CHECK(html.find("This device vs fleet") != std::string::npos);
+        CHECK(html.find("th</b> pctile") != std::string::npos);
+        CHECK(html.find("cohort_value=a") != std::string::npos); // drill to the cohort list
+    }
+    SECTION("not-reporting device gets an honest note, no fake bars") {
+        snap.devices.push_back(dev("quiet", std::nullopt, std::nullopt, std::nullopt, "a"));
+        auto html = render_dex_device_perf_context(dex_perf_device_context(snap, "quiet"),
+                                                   "model", "7d");
+        CHECK(html.find("No perf heartbeat") != std::string::npos);
+        CHECK(html.find("pctile") == std::string::npos);
+    }
+    SECTION("sub-floor cohort: comparison withheld with the floor named") {
+        // NB: not named `small` — windows headers #define small to char.
+        auto tiny = two_cohorts(0, 4);
+        tiny.devices.push_back(
+            dev("solo", 50.0, 50.0, 1.0, "<i>x</i>")); // 1-device cohort, hostile value
+        for (int i = 0; i < 12; ++i) // fleet context so fleet stats exist
+            tiny.devices.push_back(dev("f-" + std::to_string(i), 10.0, 40.0, 1.0, "other"));
+        auto html = render_dex_device_perf_context(dex_perf_device_context(tiny, "solo"),
+                                                   "model", "7d");
+        CHECK(html.find("Cohort comparison withheld") != std::string::npos);
+        CHECK(html.find("<i>x</i>") == std::string::npos); // never unescaped
+    }
+}
+
+// ── PR2: per-app parse + render ──────────────────────────────────────────────
+
+TEST_CASE("procperf parse: schema-by-name, validation, clamps", "[dex][perf][procperf]") {
+    const std::string ok =
+        "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+        "Teams.exe|2880|6|8.4|41.2|2040109465|3328599654|24\n"
+        "chrome.exe|2880|14|5.3|36.7|2576980377|4294967296|24\n"
+        "total|2\n";
+    auto rows = parse_dex_procperf_output(ok);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].name == "Teams.exe");
+    CHECK(rows[0].samples == 2880);
+    CHECK(rows[0].instances_max == 6);
+    CHECK(rows[0].cpu_avg == 8.4);
+    CHECK(rows[0].hours == 24);
+
+    SECTION("error payload → empty") {
+        CHECK(parse_dex_procperf_output("error|no such table").empty());
+    }
+    SECTION("wrong shape → refuse rather than guess") {
+        CHECK(parse_dex_procperf_output("__schema__|name|bogus\nx|1\n").empty());
+    }
+    SECTION("forged rows are skipped per-field, valid rows survive") {
+        const std::string forged =
+            "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+            "inf-cpu.exe|10|1|inf|5|100|100|1\n"  // non-finite → skipped
+            "pb-ws.exe|10|1|5|5|9e15|9e15|1\n"    // >1 PiB working set → skipped
+            "|10|1|5|5|100|100|1\n"               // empty name → skipped
+            "ok.exe|10|1|250|5|100|100|1\n";      // >100% cpu → CLAMPED, kept
+        auto r = parse_dex_procperf_output(forged);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].name == "ok.exe");
+        CHECK(r[0].cpu_avg == 100.0);
+    }
+}
+
+TEST_CASE("procperf render: app drill links + escape + the soft empty state",
+          "[dex][perf][procperf][render]") {
+    std::vector<DexProcPerfRow> rows(1);
+    rows[0].name = "<img src=x>";
+    rows[0].samples = 10;
+    rows[0].cpu_avg = 5.0;
+    rows[0].ws_avg_bytes = 2.0e9;
+    rows[0].ws_max_bytes = 3.0e9;
+    rows[0].hours = 24;
+    auto html = render_dex_procperf_panel(rows, "7d");
+    CHECK(html.find("<img src=x>") == std::string::npos); // agent bytes escaped
+    CHECK(html.find("&lt;img") != std::string::npos);
+    CHECK(html.find("/fragments/dex/app?name=") != std::string::npos); // cross-link
+    CHECK(html.find("names only") != std::string::npos);
+
+    // The SOFT truthful empty state: off-by-default OR no rollup yet — both said.
+    auto empty = render_dex_procperf_panel({}, "7d");
+    CHECK(empty.find("off by default") != std::string::npos);
+    CHECK(empty.find("no hourly rollup has completed yet") != std::string::npos);
+}
+
 // ── REST surface (/api/v1/dex/perf/*) ────────────────────────────────────────
 
 namespace {
@@ -453,6 +583,107 @@ TEST_CASE("REST /dex/perf/*: no provider wired → 503", "[dex][perf][rest]") {
         REQUIRE(res);
         CHECK(res->status == 503);
     }
+}
+
+TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
+          "[dex][perf][procperf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    // Grants Read but denies Execution:Execute — the probed-Execute posture.
+    auto readOnlyPerm = [](const httplib::Request&, httplib::Response& res,
+                           const std::string& type, const std::string& op) {
+        if (type == "Execution" && op == "Execute") {
+            res.status = 403;
+            return false;
+        }
+        return true;
+    };
+    auto fleet = []() { return DexFleet{}; };
+    std::vector<std::string> audited;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
+                     const std::string&, const std::string& tid,
+                     const std::string&) { audited.push_back(a + "|" + tid); };
+    std::string dispatched_sql;
+    DexRoutes::DispatchFn dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        auto it = params.find("sql");
+        dispatched_sql = it != params.end() ? it->second : "";
+        return {"tar-abc123", 1};
+    };
+    const std::string output =
+        "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+        "Teams.exe|2880|6|8.4|41.2|2040109465|3328599654|24\n";
+    DexRoutes::ResponsesFn responses =
+        [&](const std::string& command_id) -> std::vector<DexAgentResponse> {
+        if (command_id == "tar-abc123")
+            return {{"WS-1", 0, output, ""}};
+        return {};
+    };
+
+    SECTION("dispatch fires the usage-class audit verb + the $ProcPerf_Hourly canned SQL") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, dispatch, responses);
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1&window=7d");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("/fragments/dex/device/procperf/result") != std::string::npos);
+        REQUIRE(audited.size() == 1);
+        CHECK(audited[0] == "dex.device.procperf.query|WS-1"); // NOT dex.device.perf.query
+        CHECK(dispatched_sql.find("$ProcPerf_Hourly") != std::string::npos);
+        CHECK(dispatched_sql.find("GROUP BY name") != std::string::npos);
+    }
+    SECTION("read-only operator gets the honest in-panel note, nothing dispatched/audited") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, readOnlyPerm, nullptr, fleet, audit, dispatch,
+                               responses);
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Execute") != std::string::npos);
+        CHECK(audited.empty());
+        CHECK(dispatched_sql.empty());
+    }
+    SECTION("result route renders the parsed panel; non-tar command_ids are rejected") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, dispatch, responses);
+        auto ok = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-abc123&agent_id=WS-1&window=7d");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(ok->body.find("Teams.exe") != std::string::npos);
+        auto bad = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=cmd-abc123&agent_id=WS-1");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+    }
+}
+
+TEST_CASE("device fragment: strips + the own-click applications button ride along",
+          "[dex][perf][routes][device]") {
+    // The device drill route feeds the strips from the perf snapshot; the
+    // per-app button must carry its OWN route (not the machine-health one).
+    auto snap = two_cohorts(12, 0);
+    auto html = render_dex_device_fragment(nullptr, "a-0", "7d", &snap);
+    // Null store → placeholder (store-gated), but the panel block isn't reached.
+    CHECK(html.find("unavailable") != std::string::npos);
+
+    GuaranteedStateStore store(":memory:");
+    html = render_dex_device_fragment(&store, "a-0", "7d", &snap);
+    CHECK(html.find("This device vs fleet") != std::string::npos);
+    CHECK(html.find("/fragments/dex/device/procperf?agent_id=a-0") != std::string::npos);
+    CHECK(html.find("Load applications") != std::string::npos);
+    // Without a snapshot the strips are omitted, the button still renders.
+    html = render_dex_device_fragment(&store, "a-0", "7d", nullptr);
+    CHECK(html.find("This device vs fleet") == std::string::npos);
+    CHECK(html.find("Load applications") != std::string::npos);
 }
 
 TEST_CASE("tag-key alphabet stays pinned to TagStore::validate_key",

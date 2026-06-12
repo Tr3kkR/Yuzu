@@ -1525,7 +1525,8 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 }
 
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& window) {
+                                       const std::string& agent_id, const std::string& window,
+                                       const DexPerfSnapshot* perf_snap) {
     // This is behavioral data (which apps a person runs): the access posture is
     // enforced server-side — permission-gated on GuaranteedState:Read and each
     // open audit-logged (dex.device.view) — without an on-page banner.
@@ -1542,13 +1543,33 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     // every operator (grill finding 1). A click is an attempted action, so
     // both side effects become honest. Rendered for EVERY device, signals or
     // not: a quiet device still has perf history.
-    const std::string perf_panel =
+    std::string perf_panel =
         "<div class=\"gp-sech\">Device performance (hourly, on-device warehouse)</div>"
         "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
         "hx-get=\"/fragments/dex/device/perf?agent_id=" +
         url_encode(agent_id) +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load performance</button> "
         "<span class=\"gp-mute\">runs a live read-only query on the device</span></div>";
+
+    // PR2: vs-fleet/cohort percentile strips — render-time registry state, no
+    // dispatch, no extra permission, so they render directly (no click).
+    if (perf_snap) {
+        perf_panel += render_dex_device_perf_context(
+            dex_perf_device_context(*perf_snap, agent_id), perf_snap->cohort_key, window);
+    }
+
+    // PR2: per-app panel behind its OWN click + OWN audit action
+    // (dex.device.procperf.query) — usage-class reads stay separately
+    // countable from the machine-health load above (works-council access-audit
+    // posture; the W0 kill switch gets a one-button seam).
+    perf_panel +=
+        "<div class=\"gp-sech\">Top applications (this device, last 24 h)</div>"
+        "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
+        "hx-get=\"/fragments/dex/device/procperf?agent_id=" +
+        url_encode(agent_id) + "&amp;window=" + window +
+        "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load applications</button> "
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; audited "
+        "separately &mdash; per-app is usage-class telemetry</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
@@ -1596,6 +1617,27 @@ namespace {
 constexpr const char* kDexPerfSql =
     "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
     "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48";
+
+// PR2: the canned per-app query (A2 `$ProcPerf_Hourly` tier) — last 24 h
+// aggregated per application, top 25 by sample-weighted CPU. Runs through the
+// same read-only authorizer chokepoint (aggregate functions are permitted;
+// #760/#631). The epoch cutoff is computed server-side and embedded as a
+// literal — no SQL date functions, no user input. AS aliases pin the schema
+// line names the parser locates columns by.
+std::string dex_procperf_sql() {
+    const auto cutoff = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        86400;
+    return std::format(
+        "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
+        "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
+        "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "FROM $ProcPerf_Hourly WHERE hour_ts >= {} "
+        "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25",
+        cutoff);
+}
 
 std::vector<std::string> split_pipe(const std::string& line) {
     std::vector<std::string> out;
@@ -1718,6 +1760,82 @@ std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output) {
     }
     std::sort(out.begin(), out.end(),
               [](const DexPerfPoint& a, const DexPerfPoint& b) { return a.hour_ts < b.hour_ts; });
+    return out;
+}
+
+std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output) {
+    std::vector<DexProcPerfRow> out;
+    // Same defensive contract as parse_dex_perf_output: columns by NAME from
+    // the __schema__ line (schema cell i names data cell i-1), per-field
+    // validation, malformed rows skipped, bounded row count.
+    int col_name = -1, col_samples = -1, col_inst = -1, col_cpu_avg = -1, col_cpu_max = -1,
+        col_ws_avg = -1, col_ws_max = -1, col_hours = -1;
+    bool have_schema = false;
+    std::size_t pos = 0;
+    int rows = 0;
+    constexpr double kMaxSaneWsBytes = 1.125899906842624e15; // 1 PiB — beyond absurd
+    while (pos < output.size() && rows < 100) {
+        const auto nl = output.find('\n', pos);
+        std::string line =
+            output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return out; // agent-side error payload — nothing to parse
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto cols = split_pipe(line);
+            for (int i = 1; i < static_cast<int>(cols.size()); ++i) {
+                if (cols[i] == "name") col_name = i - 1;
+                else if (cols[i] == "samples") col_samples = i - 1;
+                else if (cols[i] == "instances_max") col_inst = i - 1;
+                else if (cols[i] == "cpu_avg") col_cpu_avg = i - 1;
+                else if (cols[i] == "cpu_max") col_cpu_max = i - 1;
+                else if (cols[i] == "ws_avg") col_ws_avg = i - 1;
+                else if (cols[i] == "ws_max") col_ws_max = i - 1;
+                else if (cols[i] == "hours") col_hours = i - 1;
+            }
+            if (col_name < 0 || col_samples < 0 || col_inst < 0 || col_cpu_avg < 0 ||
+                col_cpu_max < 0 || col_ws_avg < 0 || col_ws_max < 0 || col_hours < 0)
+                return out; // wrong shape — refuse rather than guess
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        const int need = (std::max)({col_name, col_samples, col_inst, col_cpu_avg, col_cpu_max,
+                                     col_ws_avg, col_ws_max, col_hours});
+        if (static_cast<int>(cells.size()) <= need)
+            continue; // trailer ("total|N") or a torn row
+        const auto& name = cells[static_cast<std::size_t>(col_name)];
+        if (name.empty() || name.size() > 256)
+            continue; // a forged/torn name cell must not render
+        const auto samples = cell_double(cells[static_cast<std::size_t>(col_samples)]);
+        const auto inst = cell_double(cells[static_cast<std::size_t>(col_inst)]);
+        const auto cpu_avg = cell_double(cells[static_cast<std::size_t>(col_cpu_avg)]);
+        const auto cpu_max = cell_double(cells[static_cast<std::size_t>(col_cpu_max)]);
+        const auto ws_avg = cell_double(cells[static_cast<std::size_t>(col_ws_avg)]);
+        const auto ws_max = cell_double(cells[static_cast<std::size_t>(col_ws_max)]);
+        const auto hours = cell_double(cells[static_cast<std::size_t>(col_hours)]);
+        if (!samples || !inst || !cpu_avg || !cpu_max || !ws_avg || !ws_max || !hours)
+            continue;
+        if (*ws_avg > kMaxSaneWsBytes || *ws_max > kMaxSaneWsBytes)
+            continue; // forged working-set claim — reject the row
+        ++rows;
+        DexProcPerfRow r;
+        r.name = name;
+        r.samples = static_cast<std::int64_t>(*samples);
+        r.instances_max = static_cast<std::int64_t>(*inst);
+        r.cpu_avg = std::clamp(*cpu_avg, 0.0, 100.0); // a >100% share is a lie
+        r.cpu_max = std::clamp(*cpu_max, 0.0, 100.0);
+        r.ws_avg_bytes = *ws_avg;
+        r.ws_max_bytes = *ws_max;
+        r.hours = static_cast<std::int64_t>(*hours);
+        out.push_back(std::move(r));
+    }
     return out;
 }
 
@@ -1920,7 +2038,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (audit_fn_)
             audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
-        res.set_content(render_dex_device_fragment(store_, id, w), "text/html; charset=utf-8");
+        // PR2: feed the percentile strips from the perf snapshot (default
+        // cohort key — the strips compare against the conventional cohort).
+        std::optional<DexPerfSnapshot> snap;
+        if (perf_fn_)
+            snap = perf_fn_("model");
+        res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
+                        "text/html; charset=utf-8");
     });
 
     // -- F2a: fleet Performance tab (now-view over registry heartbeat state) ---
@@ -2112,6 +2236,128 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         res.set_content(pending_div(command_id, id, attempt + 1), "text/html; charset=utf-8");
     });
+
+    // -- PR2: per-app panel — OWN click, OWN audit class ------------------------
+    //
+    // Same dispatch/poll shape as the perf panel above, but a separate route
+    // pair with its own audit action (`dex.device.procperf.query`): per-app is
+    // usage-class telemetry (what people run), and the audit trail must keep
+    // usage reads separately countable from machine-health reads (grill
+    // decision 5; works-council access-audit posture; W0 kill-switch seam).
+    auto procperf_pending = [](const std::string& command_id, const std::string& agent_id,
+                               int attempt, const std::string& w) {
+        return "<div hx-get=\"/fragments/dex/device/procperf/result?command_id=" +
+               url_encode(command_id) + "&amp;agent_id=" + url_encode(agent_id) +
+               "&amp;n=" + std::to_string(attempt) + "&amp;window=" + w +
+               "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\" class=\"gp-note\">"
+               "Querying the device&rsquo;s edge warehouse&hellip;</div>";
+    };
+
+    sink.Get("/fragments/dex/device/procperf",
+             [this, note, can_execute, procperf_pending](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!can_execute(req)) {
+                     note(res, "Per-application data needs the <b>Execute</b> permission "
+                               "&mdash; this panel runs a read-only TAR query on the device.");
+                     return;
+                 }
+                 if (!dispatch_fn_ || !responses_fn_) {
+                     note(res, "Live device query unavailable on this server.");
+                     return;
+                 }
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (id.empty()) {
+                     res.status = 400;
+                     return;
+                 }
+                 // Canonicalise before the token can reach markup (Gate-8 XSS).
+                 const std::string w = window_token(window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d"));
+                 std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
+                 const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+                 if (audit_fn_)
+                     audit_fn_(req, "dex.device.procperf.query",
+                               sent > 0 ? "success" : "no_agents", "Agent", id,
+                               "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
+                                   std::to_string(sent) + " agent(s) command_id=" + command_id);
+                 if (sent == 0) {
+                     note(res, "Device offline &mdash; the live per-app query needs a connected "
+                               "agent.");
+                     return;
+                 }
+                 res.set_content(procperf_pending(command_id, id, 1, w),
+                                 "text/html; charset=utf-8");
+             });
+
+    sink.Get("/fragments/dex/device/procperf/result",
+             [this, note, can_execute, procperf_pending](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 // Same Execute posture as the dispatching route (stops a
+                 // read-only principal polling someone else's command_id).
+                 if (!can_execute(req)) {
+                     note(res, "Per-application data needs the <b>Execute</b> permission.");
+                     return;
+                 }
+                 if (!responses_fn_) {
+                     note(res, "Live device query unavailable on this server.");
+                     return;
+                 }
+                 const std::string command_id =
+                     req.has_param("command_id") ? req.get_param_value("command_id") : "";
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
+                     res.status = 400;
+                     return;
+                 }
+                 const std::string w = window_token(window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d"));
+                 int attempt = 1;
+                 if (req.has_param("n")) {
+                     try {
+                         attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30);
+                     } catch (...) {}
+                 }
+                 const DexAgentResponse* with_output = nullptr;
+                 const DexAgentResponse* failed = nullptr;
+                 const auto rows = responses_fn_(command_id);
+                 for (const auto& r : rows) {
+                     if (r.agent_id != id)
+                         continue; // another agent's rows are never rendered here
+                     if (!r.output.empty())
+                         with_output = &r; // data rides RUNNING rows
+                     else if (r.status >= 2)
+                         failed = &r;
+                 }
+                 if (with_output) {
+                     if (with_output->output.starts_with("error|")) {
+                         note(res, "The device reported an error: " +
+                                       esc(with_output->output.substr(6, 200)));
+                         return;
+                     }
+                     res.set_content(render_dex_procperf_panel(
+                                         parse_dex_procperf_output(with_output->output), w),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 if (failed) {
+                     note(res, "Query failed on the device: " +
+                                   esc(failed->error_detail.substr(0, 200)));
+                     return;
+                 }
+                 if (attempt >= 20) {
+                     note(res, "No response from the device (timed out) &mdash; it may have "
+                               "gone offline. Reload the page to retry.");
+                     return;
+                 }
+                 res.set_content(procperf_pending(command_id, id, attempt + 1, w),
+                                 "text/html; charset=utf-8");
+             });
 }
 
 } // namespace yuzu::server

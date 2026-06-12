@@ -138,6 +138,75 @@ std::vector<DexPerfCohortRow> dex_perf_cohorts(const DexPerfSnapshot& snap) {
     return rows;
 }
 
+DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,
+                                             const std::string& agent_id) {
+    DexPerfDeviceContext ctx;
+    const DexPerfDevice* me = nullptr;
+    for (const auto& d : snap.devices) {
+        if (d.agent_id == agent_id) {
+            me = &d;
+            break;
+        }
+    }
+    if (!me)
+        return ctx;
+    ctx.found = true;
+    ctx.reporting = reports_any(*me);
+    ctx.cohort = me->cohort;
+
+    std::vector<double> fleet_cpu, fleet_commit, fleet_disk;
+    std::vector<double> coh_cpu, coh_commit, coh_disk;
+    for (const auto& d : snap.devices) {
+        if (!reports_any(d))
+            continue;
+        const bool in_cohort = (d.cohort == me->cohort);
+        if (in_cohort)
+            ++ctx.cohort_n;
+        if (d.cpu_pct) {
+            fleet_cpu.push_back(*d.cpu_pct);
+            if (in_cohort)
+                coh_cpu.push_back(*d.cpu_pct);
+        }
+        if (d.commit_pct) {
+            fleet_commit.push_back(*d.commit_pct);
+            if (in_cohort)
+                coh_commit.push_back(*d.commit_pct);
+        }
+        if (d.disk_lat_ms) {
+            fleet_disk.push_back(*d.disk_lat_ms);
+            if (in_cohort)
+                coh_disk.push_back(*d.disk_lat_ms);
+        }
+    }
+
+    // Nearest-rank position: share of reported values <= v (same definition
+    // dex_perf_device_list uses — "Nth percentile" means one thing).
+    auto pctile = [](std::vector<double>& vals, double v) -> int {
+        if (vals.empty())
+            return -1;
+        std::sort(vals.begin(), vals.end());
+        const auto at_or_below = static_cast<double>(
+            std::upper_bound(vals.begin(), vals.end(), v) - vals.begin());
+        return static_cast<int>(at_or_below / static_cast<double>(vals.size()) * 100.0);
+    };
+    const bool cohort_ok = ctx.cohort_n >= kDexCohortFloor;
+    auto fill = [&](DexPerfMetricContext& m, std::optional<double> v, std::vector<double>& fleet,
+                    std::vector<double>& cohort) {
+        m.value = v;
+        if (v) {
+            m.fleet_pctile = pctile(fleet, *v);
+            if (cohort_ok)
+                m.cohort_pctile = pctile(cohort, *v);
+        }
+        m.fleet = make_stat(fleet);
+        m.cohort = cohort_ok ? make_stat(cohort) : std::nullopt;
+    };
+    fill(ctx.cpu, me->cpu_pct, fleet_cpu, coh_cpu);
+    fill(ctx.commit, me->commit_pct, fleet_commit, coh_commit);
+    fill(ctx.disk_lat, me->disk_lat_ms, fleet_disk, coh_disk);
+    return ctx;
+}
+
 std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, DexPerfMetric metric,
                                                    bool not_reporting,
                                                    const std::optional<std::string>& cohort_filter,

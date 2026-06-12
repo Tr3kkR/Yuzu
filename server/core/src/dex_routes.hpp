@@ -134,9 +134,11 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 /// __observation__ events). This is behavioral PII (which apps a person runs);
 /// the route gates it on Read and audit-logs each open. `window` is the selector
 /// TOKEN (window-scoped to match the linking overview row). Pure + free so it is
-/// unit-testable directly.
+/// unit-testable directly. `perf_snap` (PR2, may be null) feeds the vs-fleet/
+/// cohort percentile strips; null omits the strips section (feature unwired).
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& window);
+                                       const std::string& agent_id, const std::string& window,
+                                       const DexPerfSnapshot* perf_snap = nullptr);
 
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
@@ -171,6 +173,47 @@ std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output);
 /// now/min/max facts) from parsed points. Empty input renders the honest
 /// "no history" note. Server-rendered SVG — no JS, CSP-safe.
 std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
+
+// ── F2a PR2: device drill perf extensions ────────────────────────────────────
+
+/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
+/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
+struct DexProcPerfRow {
+    std::string name; ///< image name — agent bytes, HTML-escape at render
+    std::int64_t samples{0};
+    std::int64_t instances_max{0};
+    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
+    double cpu_max{0.0};
+    double ws_avg_bytes{0.0};
+    double ws_max_bytes{0.0};
+    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
+};
+
+/// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
+/// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
+/// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
+/// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
+/// outlier); working-set bytes above 1 PiB are rejected as forged.
+std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output);
+
+/// PURE: render the per-application panel from parsed rows. App names link to
+/// the existing app reliability drill (per-app perf ↔ per-app crashes cross-
+/// link). Empty input renders the SOFT truthful empty state: the device's
+/// read-only query surface deliberately hides plugin config, so the server
+/// cannot distinguish "procperf disabled (the default)" from "enabled, no
+/// rollup yet" — the message says both honestly (the crisp distinction needs
+/// the tar-plugin source_state meta table, a filed follow-up).
+std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
+                                      const std::string& window);
+
+/// PURE: render the "this device vs fleet & cohort" percentile strips —
+/// current heartbeat values against the CURRENT registry distributions
+/// (now-vs-now; no retained history). Cohort comparison is withheld below the
+/// kDexCohortFloor with an honest caption; a non-reporting device renders an
+/// honest note, never empty bars.
+std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
+                                           const std::string& cohort_key,
+                                           const std::string& window);
 
 // ── F2a: fleet Performance tab (now-view over registry heartbeat state) ─────
 

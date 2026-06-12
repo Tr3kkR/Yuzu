@@ -98,6 +98,128 @@ std::string cohort_cell(const std::optional<DexPerfStat>& s, bool lat,
 
 } // namespace
 
+// "1.9 GB" / "390 MB" human form for a working-set byte count.
+std::string fmt_bytes(double b) {
+    if (b >= 1024.0 * 1024.0 * 1024.0)
+        return std::format("{:.1f} GB", b / (1024.0 * 1024.0 * 1024.0));
+    if (b >= 1024.0 * 1024.0)
+        return std::format("{:.0f} MB", b / (1024.0 * 1024.0));
+    return std::format("{:.0f} KB", b / 1024.0);
+}
+
+std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
+                                      const std::string& window) {
+    if (rows.empty()) {
+        // The SOFT truthful empty state (grill decision 5/A): the read-only
+        // operator-SQL surface deliberately hides tar.db config, so the server
+        // cannot distinguish "disabled" from "enabled, no rollup yet". Say both.
+        return "<div class=\"gp-note\"><b>No per-app samples in the last 24 hours.</b> "
+               "Per-application sampling (<span style=\"font-family:var(--mono)\">"
+               "procperf_enabled</span>) is <b>off by default</b> on every device &mdash; it is a "
+               "separate, usage-class collection because it observes what people run, not just "
+               "how the machine behaves &mdash; or sampling is on but no hourly rollup has "
+               "completed yet. Device-level performance above is unaffected either way.</div>";
+    }
+    std::string h = "<table class=\"gp-table\"><thead><tr><th>Application</th><th>Avg CPU</th>"
+                    "<th>Peak CPU</th><th>Avg working set</th><th>Peak working set</th>"
+                    "<th>Max instances</th><th>Hours seen</th></tr></thead><tbody>";
+    for (const auto& r : rows) {
+        h += "<tr><td>" +
+             drill("/fragments/dex/app?name=" + url_encode(r.name) + "&amp;window=" + window,
+                   esc(r.name)) +
+             "</td><td>" + fmt_pct(r.cpu_avg) + "</td><td>" + fmt_pct(r.cpu_max) + "</td><td>" +
+             fmt_bytes(r.ws_avg_bytes) + "</td><td>" + fmt_bytes(r.ws_max_bytes) + "</td><td>" +
+             std::to_string(r.instances_max) + "</td><td>" + std::to_string(r.hours) +
+             "</td></tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">Top applications by CPU &cup; working set, 30&nbsp;s samples "
+         "rolled up hourly on the device; process <b>names only</b> &mdash; command lines are "
+         "never collected. Raw rows stay on the device (fetched live for this view). Click an "
+         "application to open its reliability drill &mdash; per-app performance and per-app "
+         "crashes cross-link.</div>";
+    return h;
+}
+
+std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
+                                           const std::string& cohort_key,
+                                           const std::string& window) {
+    std::string h = "<div class=\"gp-sech\">This device vs fleet &amp; cohort "
+                    "<span class=\"gp-mute\">(current heartbeat vs current distributions)</span>"
+                    "</div>";
+    if (!ctx.found)
+        return h + "<div class=\"gp-note\">Device is not online &mdash; no current sample to "
+                   "compare.</div>";
+    if (!ctx.reporting)
+        return h + "<div class=\"gp-note\">No perf heartbeat from this device this cycle "
+                   "&mdash; nothing to compare yet.</div>";
+
+    struct StripRow {
+        const char* label;
+        const DexPerfMetricContext* m;
+        bool lat;
+    };
+    const StripRow strips[] = {
+        {"CPU utilization", &ctx.cpu, false},
+        {"Memory commit", &ctx.commit, false},
+        {"Disk I/O latency", &ctx.disk_lat, true},
+    };
+    h += "<div style=\"border:1px solid var(--border);border-radius:.55rem;padding:.6rem 1rem\">";
+    for (const auto& s : strips) {
+        if (!s.m->value || !s.m->fleet)
+            continue; // device or fleet lacks this metric — skip the row, no fake bar
+        const auto& f = *s.m->fleet;
+        const double top = (std::max)(f.max, *s.m->value);
+        auto x = [&](double v) {
+            return top < 1e-9 ? 0.0 : (std::min)(98.0, v / top * 100.0);
+        };
+        const bool hot = *s.m->value > f.p90;
+        auto fmt = [&](double v) { return s.lat ? fmt_lat(v) : fmt_pct(v); };
+        std::string pv = "device " + fmt(*s.m->value) + " &rarr; fleet <b>" +
+                         std::to_string(s.m->fleet_pctile) + "th</b> pctile";
+        if (s.m->cohort_pctile >= 0)
+            pv += " &middot; cohort <b>" + std::to_string(s.m->cohort_pctile) + "th</b>";
+        h += "<div style=\"display:grid;grid-template-columns:9rem 1fr 17rem;gap:.8rem;"
+             "align-items:center;margin:.45rem 0;font-size:.85rem\">"
+             "<span>" + std::string(s.label) + "</span>"
+             "<span style=\"position:relative;display:block;height:12px;border-radius:4px;"
+             "background:var(--surface2,#243553)\">"
+             "<span style=\"position:absolute;top:0;bottom:0;left:" +
+             std::format("{:.1f}", x(f.p50)) + "%;width:" +
+             std::format("{:.1f}", (std::max)(0.5, x(f.p90) - x(f.p50))) +
+             "%;background:rgba(0,188,235,.22);border-left:1px solid rgba(0,188,235,.5);"
+             "border-right:1px solid rgba(0,188,235,.5)\"></span>"
+             "<span style=\"position:absolute;top:-2px;bottom:-2px;width:3px;border-radius:2px;"
+             "left:" + std::format("{:.1f}", x(*s.m->value)) + "%;background:" +
+             (hot ? "var(--red,#ff5765)" : "var(--yellow,#ffcc00)") + "\"></span></span>"
+             "<span class=\"gp-mute\" style=\"text-align:right\">" + pv + "</span></div>";
+    }
+    h += "</div>";
+
+    // Cohort caption — honest about which comparison the numbers are against.
+    const bool cohort_shown = ctx.cpu.cohort_pctile >= 0 || ctx.commit.cohort_pctile >= 0 ||
+                              ctx.disk_lat.cohort_pctile >= 0;
+    if (cohort_shown) {
+        const std::string label = ctx.cohort.empty() ? "(untagged)" : esc(ctx.cohort);
+        h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
+             "(red when above fleet p90). Cohort = " +
+             drill("/fragments/dex/perf/devices?cohort_key=" + url_encode(cohort_key) +
+                       "&amp;cohort_value=" + url_encode(ctx.cohort) + "&amp;window=" + window,
+                   label) +
+             " <span class=\"gp-mute\">(" + std::to_string(ctx.cohort_n) +
+             " reporting devices, key " + esc(cohort_key) + ")</span></div>";
+    } else {
+        h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
+             "(red when above fleet p90). Cohort comparison withheld &mdash; " +
+             (ctx.cohort_n < kDexCohortFloor
+                  ? "this device's cohort has only " + std::to_string(ctx.cohort_n) +
+                        " reporting devices (floor " + std::to_string(kDexCohortFloor) + ")"
+                  : std::string("no cohort resolved")) +
+             ".</div>";
+    }
+    return h;
+}
+
 std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days) {
     const std::string w = dex_window_token(window_days);
     const auto now = dex_perf_fleet_now(snap);

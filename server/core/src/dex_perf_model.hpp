@@ -111,6 +111,36 @@ enum class DexPerfMetric { kCpu, kCommit, kDiskLat };
 DexPerfMetric dex_perf_metric_from_token(const std::string& token);
 const char* dex_perf_metric_token(DexPerfMetric m);
 
+/// One metric of a device's now-vs-now comparison (PR2 percentile strips):
+/// the device's current heartbeat value against the CURRENT fleet and cohort
+/// distributions from the same snapshot — no retained history, no extra
+/// federated query (grill decision 7).
+struct DexPerfMetricContext {
+    std::optional<double> value;        ///< the device's current sample
+    std::optional<DexPerfStat> fleet;   ///< fleet distribution (all reporters)
+    std::optional<DexPerfStat> cohort;  ///< cohort distribution; nullopt below floor
+    int fleet_pctile{-1};               ///< nearest-rank position; -1 = no value
+    int cohort_pctile{-1};
+};
+
+/// A device's comparison context for the drill-down strips. `cohort` is the
+/// device's value for snap.cohort_key (""= untagged); `cohort_n` counts the
+/// cohort's REPORTING devices (the same count dex_perf_cohorts shows), and
+/// cohort stats/percentiles are withheld below kDexCohortFloor — the floor
+/// rule applies everywhere or nowhere.
+struct DexPerfDeviceContext {
+    bool found{false};     ///< agent_id present in the snapshot (online)
+    bool reporting{false}; ///< contributed at least one metric this cycle
+    std::string cohort;
+    int64_t cohort_n{0};
+    DexPerfMetricContext cpu;
+    DexPerfMetricContext commit;
+    DexPerfMetricContext disk_lat;
+};
+
+DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,
+                                             const std::string& agent_id);
+
 /// The ONE device list that serves every drill (grill decision: metric card →
 /// worst devices; Reporting card → not-reporting; cohort/untagged row → that
 /// cohort's devices):
