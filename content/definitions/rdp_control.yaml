@@ -2,7 +2,9 @@
 #
 # Built for change-gated remote access: an ITSM system (e.g. ServiceNow)
 # enables RDP on two devices at the start of an approved change window and
-# disables it again at the end. See integrations/servicenow/README.md.
+# disables it again at the end. The agent service account must be a member of
+# the local Administrators group (this is NOT the default install) — a
+# non-elevated agent returns reg_status|error:5 on every set_state.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -18,7 +20,8 @@ metadata:
     disables the firewall rule group (the service is left running; the
     registry and firewall gates block new connections). Per-step status is
     reported; overall=ok only when every step succeeded — callers must retry
-    until confirmed, especially on disable.
+    until confirmed, especially on disable. NOTE: disable blocks NEW
+    connections only; it does not terminate an already-established RDP session.
   tags: [rdp, remote-desktop, windows, configuration, change-window]
 spec:
   type: action
@@ -69,8 +72,12 @@ metadata:
   description: >
     Report the current Remote Desktop posture of a Windows endpoint:
     fDenyTSConnections registry value, Remote Desktop firewall rule group
-    state, TermService state, and the derived rdp=on/off verdict (on only
-    when all three gates confirm open).
+    state, TermService state, and the derived rdp verdict. rdp=on only when
+    all three gates are readable and open; rdp=unknown when any gate could not
+    be read (e.g. a non-elevated agent); rdp=off when all gates are readable
+    but at least one is closed. A non-zero command exit code also signals an
+    unreadable gate — callers verifying a state change should check the exit
+    code and the per-gate rows, not the rdp summary alone.
   tags: [rdp, remote-desktop, windows, posture]
 spec:
   type: question

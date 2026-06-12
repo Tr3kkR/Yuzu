@@ -607,6 +607,16 @@ bool test_is_valid_rdp_state(std::string_view state) {
     return state == "enable" || state == "disable";
 }
 
+/// Mirror of rdp_control_plugin.cpp: derive_rdp_verdict — keep in sync.
+/// "on" only when every gate is readable and open; "unknown" when any gate is
+/// unreadable; "off" when all readable but at least one closed.
+std::string_view test_derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
+                                         bool fw_enabled, bool svc_known, bool svc_running) {
+    if (!deny_known || !fw_known || !svc_known)
+        return "unknown";
+    return (deny_allows && fw_enabled && svc_running) ? "on" : "off";
+}
+
 } // namespace
 
 TEST_CASE("rdp_control: valid states accepted",
@@ -623,6 +633,30 @@ TEST_CASE("rdp_control: invalid states rejected",
     CHECK_FALSE(test_is_valid_rdp_state("on"));
     CHECK_FALSE(test_is_valid_rdp_state("off"));
     CHECK_FALSE(test_is_valid_rdp_state("enable; rm -rf /"));
+}
+
+TEST_CASE("rdp_control: verdict is 'on' only when all gates readable and open",
+          "[plugins][rdp_control][validation]") {
+    // all readable + all open -> on
+    CHECK(test_derive_rdp_verdict(true, true, true, true, true, true) == "on");
+}
+
+TEST_CASE("rdp_control: verdict is 'unknown' when any gate is unreadable",
+          "[plugins][rdp_control][validation]") {
+    // The security-relevant case: a failed read must NOT report "off"/safe.
+    CHECK(test_derive_rdp_verdict(false, true, true, true, true, true) == "unknown");
+    CHECK(test_derive_rdp_verdict(true, true, false, true, true, true) == "unknown");
+    CHECK(test_derive_rdp_verdict(true, true, true, true, false, true) == "unknown");
+    // unknown dominates even when the readable gates look closed
+    CHECK(test_derive_rdp_verdict(false, false, true, false, true, false) == "unknown");
+}
+
+TEST_CASE("rdp_control: verdict is 'off' when all gates readable but one closed",
+          "[plugins][rdp_control][validation]") {
+    CHECK(test_derive_rdp_verdict(true, false, true, true, true, true) == "off");   // deny=1
+    CHECK(test_derive_rdp_verdict(true, true, true, false, true, true) == "off");   // fw disabled
+    CHECK(test_derive_rdp_verdict(true, true, true, true, true, false) == "off");   // svc not running
+    CHECK(test_derive_rdp_verdict(true, false, true, false, true, false) == "off"); // all closed
 }
 
 // ============================================================================

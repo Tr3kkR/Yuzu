@@ -39,15 +39,10 @@
 #include <windows.h>
 
 #include <netfw.h>
+#include <oleauto.h> // SysAllocString / SysFreeString
 #endif
 
 namespace {
-
-// Mirrored in tests/unit/test_new_plugins.cpp (validation-mirror pattern —
-// keep the two copies in sync).
-bool is_valid_rdp_state(std::string_view state) {
-    return state == "enable" || state == "disable";
-}
 
 #ifdef _WIN32
 
@@ -57,12 +52,24 @@ constexpr const wchar_t* kDenyValueName = L"fDenyTSConnections";
 // firewall rule group (resolved by Windows from FirewallAPI.dll).
 constexpr const wchar_t* kRdpFirewallGroup = L"@FirewallAPI.dll,-28752";
 
+// Mirrored in tests/unit/test_new_plugins.cpp (validation-mirror pattern —
+// keep the two copies in sync). Kept inside #ifdef _WIN32 because its only
+// caller (do_set_state) is Windows-only; on Linux/macOS it would be an
+// uncalled static function and trip -Wunused-function under warning_level=3.
+bool is_valid_rdp_state(std::string_view state) {
+    return state == "enable" || state == "disable";
+}
+
 class ComInit {
 public:
     ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
     ~ComInit() {
         if (SUCCEEDED(hr_)) CoUninitialize();
     }
+    // Non-copyable: a copy would duplicate hr_ and both destructors would call
+    // CoUninitialize (unbalanced). Parity with ScHandle below.
+    ComInit(const ComInit&) = delete;
+    ComInit& operator=(const ComInit&) = delete;
     bool ok() const { return SUCCEEDED(hr_); }
 
 private:
@@ -185,6 +192,21 @@ const char* service_state_name(DWORD state) {
         case SERVICE_CONTINUE_PENDING: return "continue_pending";
         default:                       return "unknown";
     }
+}
+
+// Pure RDP verdict derivation, taking only the three gate outcomes as bools so
+// it is unit-testable cross-platform (mirrored in test_new_plugins.cpp). Returns
+// "on" only when every gate is READABLE and OPEN; "unknown" when any gate could
+// not be read (never report "off" on missing data — a security-critical "is
+// remote access open?" check must distinguish "confirmed closed" from "couldn't
+// tell"); "off" when all gates are readable but at least one is closed.
+// Kept inside #ifdef _WIN32 (its only caller, do_status, is Windows-only) to
+// avoid -Wunused-function on Linux/macOS.
+const char* derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
+                               bool fw_enabled, bool svc_known, bool svc_running) {
+    if (!deny_known || !fw_known || !svc_known)
+        return "unknown";
+    return (deny_allows && fw_enabled && svc_running) ? "on" : "off";
 }
 #endif
 
@@ -316,11 +338,14 @@ private:
             all_known = false;
         }
 
-        // Derived verdict: "on" only when every gate confirms open. Anything
-        // unknown or closed reports "off" — fail toward the safe answer.
-        const bool rdp_on = deny_known && deny == 0 && fw_known && fw_enabled && svc_known &&
-                            svc_state == SERVICE_RUNNING;
-        ctx.write_output(std::format("rdp|{}", rdp_on ? "on" : "off"));
+        // Derived verdict. "on" only when every gate is readable and open;
+        // "unknown" when any gate could not be read (a caller filtering on the
+        // rdp row alone must not read a failed read as "off"/safe); "off" when
+        // all gates are readable but at least one is closed. The non-zero exit
+        // code also flags any unreadable gate for callers keying on status.
+        const char* verdict = derive_rdp_verdict(deny_known, deny == 0, fw_known, fw_enabled,
+                                                 svc_known, svc_state == SERVICE_RUNNING);
+        ctx.write_output(std::format("rdp|{}", verdict));
         return all_known ? 0 : 1;
     }
 #endif
