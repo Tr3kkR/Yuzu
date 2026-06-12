@@ -85,10 +85,10 @@ Resolution order inside the script:
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@16` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
-4. **Native cluster on `127.0.0.1:5432`** — the `yuzu-local-windows`
-   precondition: a PostgreSQL 16 Windows service with role `yuzu` /
-   password `yuzu` / database `yuzu_test`, bootstrapped **once** per
-   runner (installer or `choco install postgresql16`, then
+4. **Native cluster on `127.0.0.1:5432`** — the generic self-hosted
+   Windows precondition: a PostgreSQL 16 Windows service with role
+   `yuzu` / password `yuzu` / database `yuzu_test`, bootstrapped
+   **once** per runner (installer or `choco install postgresql16`, then
    `createuser`/`createdb` as above). When `psql` is on PATH the script
    authenticates the conventional DSN with `SELECT 1` before exporting
    it — a TCP listener with the wrong credentials produces a `::warning`
@@ -96,6 +96,19 @@ Resolution order inside the script:
    to the bare TCP probe with a loud unverified-credential warning.
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
+
+   **`yuzu-local-windows` (Shulgi) as bootstrapped 2026-06-12 uses
+   path 1, not path 4:** the box already ran a foreign PostgreSQL 15 on
+   5432 (unknown credentials, left untouched), and the EDB GUI installer
+   fails in non-interactive SSH sessions — so PG **16.14 binaries-zip**
+   lives at `C:\yuzu-ci\pg16`, data dir `C:\yuzu-ci\pgdata16`, service
+   `postgresql-x64-16-yuzu-ci` (auto-start, `NT AUTHORITY\NetworkService`),
+   loopback-only on **5433**, superuser `yuzu`/`yuzu` (initdb-time, scram),
+   database `yuzu_test`. The machine-level
+   `YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test`
+   feeds resolution path 1 — which always wins before the docker probe,
+   so the leg stays deterministic whether or not the box's (usually
+   headless-down) Docker Desktop engine happens to be running.
 5. Nothing found → `::error`, exit 1.
 
 **Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
