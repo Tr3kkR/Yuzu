@@ -85,6 +85,22 @@ TEST_CASE("valid_probe_target: junk is rejected", "[netprobe]") {
     CHECK(valid_probe_target(std::string(253, 'a'))); // boundary
 }
 
+TEST_CASE("sanitize_for_output: strips pipe/newline injection from invalid targets", "[netprobe]") {
+    // The pipe-injection vector (gov sec/plugin-dev/qe): an invalid target is
+    // echoed into the pipe-delimited output row; '|' and CR/LF would forge
+    // fields / rows / log lines. sanitize keeps only the probe charset.
+    CHECK(sanitize_for_output("a|injected|field") == "ainjectedfield");
+    CHECK(sanitize_for_output("a\nrtt|fake|0|0|0|0|0|0|0|ok") == "arttfake0000000ok");
+    CHECK(sanitize_for_output("host\r\nX") == "hostX");
+    // Legitimate charset survives unchanged.
+    CHECK(sanitize_for_output("gateway.corp-1.example.com") == "gateway.corp-1.example.com");
+    // Nothing survivable → a fixed placeholder, never an empty field.
+    CHECK(sanitize_for_output("|||") == "<invalid>");
+    CHECK(sanitize_for_output("") == "<invalid>");
+    // Bounded length.
+    CHECK(sanitize_for_output(std::string(200, 'a')).size() == 64);
+}
+
 TEST_CASE("split_targets: trims, drops empties, caps fan-out", "[netprobe]") {
     auto t = split_targets(" a.example , b.example ,, c.example ", 4);
     REQUIRE(t.size() == 3);

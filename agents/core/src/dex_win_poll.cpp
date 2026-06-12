@@ -1,6 +1,7 @@
 #include "dex_win_poll.hpp"
 
 #include <algorithm>
+#include <format>
 #include <string>
 #include <utility>
 
@@ -21,10 +22,10 @@ std::optional<SignalObservation> low_disk_observation(const DiskLevel& level,
     SignalObservation o;
     o.obs_type = "storage.low";
     o.subject = volume.empty() ? "disk" : volume;
-    o.reason = std::to_string(used_pct) + "% full";
+    o.reason = std::format("{}% full", used_pct);
     o.metric = static_cast<double>(used_pct);
-    o.sentence = "Disk nearly full: " + o.reason + " (" +
-                 std::to_string(level.free_bytes / (1024 * 1024)) + " MB free) on " + o.subject;
+    o.sentence = std::format("Disk nearly full: {} ({} MB free) on {}", o.reason,
+                             level.free_bytes / (1024 * 1024), o.subject);
     return o;
 }
 
@@ -38,11 +39,22 @@ std::optional<SignalObservation> battery_observation(const BatteryHealth& h) {
     SignalObservation o;
     o.obs_type = "hw.error"; // generic Hardware obs_type — mirrors the macOS battery signal
     o.subject = "battery";
-    o.reason = "capacity " + std::to_string(pct) + "%";
+    o.reason = std::format("capacity {}%", pct);
     o.metric = static_cast<double>(pct);
-    o.sentence = "Battery health degraded: " + o.reason +
-                 (h.cycle_count > 0 ? " (" + std::to_string(h.cycle_count) + " cycles)" : "");
+    o.sentence = std::format("Battery health degraded: {}{}", o.reason,
+                             h.cycle_count > 0 ? std::format(" ({} cycles)", h.cycle_count)
+                                               : std::string{});
     return o;
+}
+
+bool latch_should_emit(bool currently_bad, bool reading_valid, bool& reported) {
+    if (currently_bad && !reported) {
+        reported = true;
+        return true; // transition into bad — emit once
+    }
+    if (!currently_bad && reading_valid)
+        reported = false; // re-arm only on a valid healthy reading
+    return false;
 }
 
 } // namespace yuzu::agent::win
@@ -70,6 +82,17 @@ std::optional<SignalObservation> battery_observation(const BatteryHealth& h) {
 
 namespace yuzu::agent::win {
 namespace {
+
+// RAII owner for the HDEVINFO device-info set. Local to this TU (NOT in
+// guard_win_handle.hpp) because HDEVINFO / SetupDiDestroyDeviceInfoList come
+// from <setupapi.h>, which the other guard TUs that share that header don't
+// pull. HDEVINFO is a PVOID like HANDLE; failure sentinel INVALID_HANDLE_VALUE
+// maps to empty via the ScopedWinHandle norm(). Releases on every exit path,
+// including a throwing allocation between acquire and use (gov cpp-safety).
+inline void devinfo_destroy_(HANDLE h) {
+    ::SetupDiDestroyDeviceInfoList(reinterpret_cast<HDEVINFO>(h));
+}
+using DevInfoHandle = detail::ScopedWinHandle<&devinfo_destroy_>;
 
 std::int64_t now_unix() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -118,20 +141,23 @@ std::vector<DiskReading> read_fixed_disks() {
 // stays false → never emits, mirroring the macOS parser contract.
 BatteryHealth read_battery() {
     BatteryHealth h;
-    HDEVINFO devs = ::SetupDiGetClassDevsW(&GUID_DEVICE_BATTERY, nullptr, nullptr,
-                                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (devs == INVALID_HANDLE_VALUE)
+    // RAII owner: SetupDiDestroyDeviceInfoList runs on every exit path, including
+    // the throwing std::vector allocation below (gov cpp-safety). norm() maps the
+    // INVALID_HANDLE_VALUE failure sentinel to empty.
+    DevInfoHandle devs{::SetupDiGetClassDevsW(&GUID_DEVICE_BATTERY, nullptr, nullptr,
+                                              DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)};
+    if (!devs)
         return h;
     SP_DEVICE_INTERFACE_DATA did{};
     did.cbSize = sizeof(did);
-    if (::SetupDiEnumDeviceInterfaces(devs, nullptr, &GUID_DEVICE_BATTERY, 0, &did)) {
+    if (::SetupDiEnumDeviceInterfaces(devs.get(), nullptr, &GUID_DEVICE_BATTERY, 0, &did)) {
         DWORD needed = 0;
-        ::SetupDiGetDeviceInterfaceDetailW(devs, &did, nullptr, 0, &needed, nullptr);
+        ::SetupDiGetDeviceInterfaceDetailW(devs.get(), &did, nullptr, 0, &needed, nullptr);
         if (needed >= sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
             std::vector<unsigned char> buf(needed);
             auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
             detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-            if (::SetupDiGetDeviceInterfaceDetailW(devs, &did, detail, needed, nullptr,
+            if (::SetupDiGetDeviceInterfaceDetailW(devs.get(), &did, detail, needed, nullptr,
                                                    nullptr)) {
                 detail::EventHandle bat{::CreateFileW(detail->DevicePath, GENERIC_READ,
                                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -162,7 +188,6 @@ BatteryHealth read_battery() {
             }
         }
     }
-    ::SetupDiDestroyDeviceInfoList(devs);
     return h;
 }
 
@@ -229,30 +254,26 @@ private:
         }
     }
 
-    // Poll-and-diff latch discipline (the macOS engine's): emit on the
-    // transition INTO a bad state, suppress while it persists, re-arm on
-    // recovery — a disk that stays full must not re-fire every 10 minutes.
+    // Poll-and-latch via the pure latch_should_emit helper (gov UP-5): emit on
+    // the transition INTO a bad state, suppress while it persists, re-arm only
+    // on a valid healthy reading. read_fixed_disks skips unreadable volumes, so
+    // every volume reaching the latch had a valid reading → reading_valid=true.
     void poll_disks() {
         for (const auto& r : read_fixed_disks()) {
             auto obs = low_disk_observation(r.level, r.volume);
             bool& reported = disk_low_reported_[r.volume];
-            if (obs && !reported) {
-                reported = true;
+            if (latch_should_emit(obs.has_value(), /*reading_valid=*/true, reported))
                 emit(std::move(*obs));
-            } else if (!obs) {
-                reported = false;
-            }
         }
     }
 
     void poll_battery() {
-        auto obs = battery_observation(read_battery());
-        if (obs && !battery_bad_reported_) {
-            battery_bad_reported_ = true;
+        const BatteryHealth health = read_battery();
+        auto obs = battery_observation(health);
+        // reading_valid = health.valid: a transient IOCTL failure must not clear
+        // the latch and re-fire a degraded-battery observation next poll.
+        if (latch_should_emit(obs.has_value(), health.valid, battery_bad_reported_))
             emit(std::move(*obs));
-        } else if (!obs) {
-            battery_bad_reported_ = false;
-        }
     }
 
     // Stamp platform + delivery time centrally (an empty platform would vanish

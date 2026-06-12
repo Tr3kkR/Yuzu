@@ -92,6 +92,25 @@ inline bool valid_probe_target(const std::string& t) {
     return true;
 }
 
+/// Sanitize a target string for emission into the pipe-delimited output
+/// protocol when it has FAILED validation (the only path that would otherwise
+/// reflect raw operator input — gov sec/plugin-dev/qe). Keeps only the
+/// probe-target charset [A-Za-z0-9._-], drops everything else (notably '|',
+/// CR, LF — the field/row/log separators), and caps length. Returns
+/// "<invalid>" if nothing survives, so the row never carries an empty or
+/// forged field. Valid targets never go through here (they are already
+/// charset-clean by valid_probe_target).
+inline std::string sanitize_for_output(const std::string& t) {
+    std::string out;
+    for (char c : t) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_')
+            out.push_back(c);
+        if (out.size() >= 64)
+            break;
+    }
+    return out.empty() ? std::string{"<invalid>"} : out;
+}
+
 /// Split a comma-separated target list: trims ASCII whitespace, drops
 /// empties, caps at `max_n` (silently — the cap is a fan-out bound, not an
 /// error). Validation is per-target via valid_probe_target at the call site

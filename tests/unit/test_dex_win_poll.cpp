@@ -115,3 +115,50 @@ TEST_CASE("battery: cycle count omitted from sentence when unknown", "[dex_win_p
     REQUIRE(o);
     CHECK(o->sentence.find("cycles") == std::string::npos);
 }
+
+// ── Poll-and-latch transition logic (gov UP-5 / qe S2) ──────────────────────
+
+TEST_CASE("latch: emits once on entry to bad state, suppresses while it persists",
+          "[dex_win_poll]") {
+    bool reported = false;
+    // Healthy → no emit, latch stays clear.
+    CHECK(!win::latch_should_emit(/*bad=*/false, /*reading_valid=*/true, reported));
+    CHECK(!reported);
+    // Transition into bad → emit once, latch sets.
+    CHECK(win::latch_should_emit(true, true, reported));
+    CHECK(reported);
+    // Still bad → suppressed.
+    CHECK(!win::latch_should_emit(true, true, reported));
+    CHECK(!win::latch_should_emit(true, true, reported));
+    // Recovery (valid healthy reading) → re-arms.
+    CHECK(!win::latch_should_emit(false, true, reported));
+    CHECK(!reported);
+    // Bad again → emits again.
+    CHECK(win::latch_should_emit(true, true, reported));
+    CHECK(reported);
+}
+
+TEST_CASE("latch: a transient INVALID reading does not clear the latch (no flap)",
+          "[dex_win_poll]") {
+    bool reported = false;
+    REQUIRE(win::latch_should_emit(true, true, reported)); // armed on a real bad reading
+    REQUIRE(reported);
+    // A failed read (battery IOCTL busy) surfaces as !bad + !valid — must NOT
+    // re-arm, or the next poll would re-fire the same degraded-battery signal.
+    CHECK(!win::latch_should_emit(/*bad=*/false, /*reading_valid=*/false, reported));
+    CHECK(reported); // still latched
+    CHECK(!win::latch_should_emit(false, false, reported));
+    CHECK(reported);
+    // A genuine valid healthy reading finally re-arms.
+    CHECK(!win::latch_should_emit(false, true, reported));
+    CHECK(!reported);
+}
+
+TEST_CASE("latch: independent latch state per subject", "[dex_win_poll]") {
+    bool c_drive = false, d_drive = false;
+    CHECK(win::latch_should_emit(true, true, c_drive));  // C: full → emit
+    CHECK(!win::latch_should_emit(true, true, c_drive)); // C: still full → quiet
+    CHECK(win::latch_should_emit(true, true, d_drive));  // D: full → emit (independent)
+    CHECK(c_drive);
+    CHECK(d_drive);
+}

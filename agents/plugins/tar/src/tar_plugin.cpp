@@ -445,20 +445,28 @@ private:
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
     // Reads raw kernel counters, derives one perf_live row from the delta vs
     // the previous reading (held in memory — first tick after start is the
-    // baseline and records nothing). Total work per tick: a handful of
-    // syscalls + one SQLite insert; no allocation-heavy paths.
+    // baseline and records nothing).
+    //
+    // The counter read (32 PhysicalDrive opens + GetIfTable2) runs OUTSIDE
+    // collect_mu_ (gov UP-6): that mutex also serialises collect_fast/slow and
+    // fleet_snapshot, so a slow/hung disk IOCTL under the lock would stall them
+    // and the /viz hot path. Only the prev_perf_ read-modify-write needs the
+    // lock; next_snapshot_id is atomic and insert_perf_sample takes its own.
     int do_collect_perf(yuzu::CommandContext& ctx) {
-        std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write
         if (!source_enabled(*db_, "perf")) {
             ctx.write_output("tar|collect_perf|0|source_disabled");
             return 0;
         }
-        const auto cur = yuzu::tar::read_perf_counters();
-        const auto sample = yuzu::tar::derive_sample(prev_perf_, cur);
-        prev_perf_ = cur;
+        const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
         if (!cur.valid) {
             ctx.write_output("tar|collect_perf|0|unsupported_platform");
             return 0;
+        }
+        yuzu::tar::PerfSample sample;
+        {
+            std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
+            sample = yuzu::tar::derive_sample(prev_perf_, cur);
+            prev_perf_ = cur;
         }
         if (!sample.valid) {
             ctx.write_output("tar|collect_perf|0|baseline");

@@ -196,6 +196,7 @@ TEST_CASE("TAR warehouse retention: row-count tier uses OFFSET delete pattern",
     // the tier suffix — perf_live is time-based (a fixed-cadence sampler
     // keeps a time window, so the window must not shrink if an operator
     // raises the sample rate), while the event-diff live tiers are row-count.
+    int seen = 0;
     for (const auto& src : capture_sources()) {
         for (const auto& g : src.granularities) {
             if (g.retention_type != RetentionType::kRowCount)
@@ -206,8 +207,10 @@ TEST_CASE("TAR warehouse retention: row-count tier uses OFFSET delete pattern",
             REQUIRE_FALSE(sql.empty());
             CHECK(sql.find("OFFSET") != std::string::npos);
             CHECK(sql.find("DELETE FROM " + table) != std::string::npos);
+            ++seen;
         }
     }
+    REQUIRE(seen > 0); // guard against a vacuous pass if no kRowCount tier exists
 }
 
 TEST_CASE("TAR warehouse retention: time-based tier uses ts cutoff",
@@ -216,6 +219,7 @@ TEST_CASE("TAR warehouse retention: time-based tier uses ts cutoff",
     // predicate against the granularity's timestamp column (this includes
     // perf_live — see the row-count test above for why that tier is
     // time-based).
+    int seen = 0;
     for (const auto& src : capture_sources()) {
         for (const auto& g : src.granularities) {
             if (g.retention_type != RetentionType::kTimeBased) continue;
@@ -225,8 +229,10 @@ TEST_CASE("TAR warehouse retention: time-based tier uses ts cutoff",
             REQUIRE_FALSE(sql.empty());
             CHECK(sql.find("DELETE FROM " + table) != std::string::npos);
             CHECK(sql.find("<") != std::string::npos);
+            ++seen;
         }
     }
+    REQUIRE(seen > 0); // guard against a vacuous pass if no kTimeBased tier exists
 }
 
 TEST_CASE("TAR warehouse retention: each granularity retains independently",

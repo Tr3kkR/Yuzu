@@ -20,14 +20,23 @@
  * reporting; one that ended needs no late alert).
  *
  * Bounds (a compromised enrolled agent must not balloon server memory): the
- * pair map is capped — stale pairs are swept on demand and a brand-new pair
- * arriving at the cap is dropped (counted, logged at debug). Per-pair agent
- * sets are pruned to the window on every touch.
+ * pair map is capped — stale pairs are swept on demand, and at the cap the
+ * least-recently-touched pair that has NOT reached the incident threshold is
+ * evicted to admit a new one (so spray of fresh subjects evicts stale sprayed
+ * pairs; any pair already at `>= min_devices` is exempt, protecting both
+ * established and slow-building incidents — only an all-incidents map falls
+ * back to evicting the overall LRU). Per-pair agent sets are pruned to
+ * the window, throttled so a hot pair under a real fleet incident does not run
+ * an O(agents) prune on every ingest (the cost that would otherwise stall ALL
+ * Guardian ingest at the worst moment — gov UP-1/perf). A global
+ * incident-fire rate cap bounds the notification + webhook fan-out under a
+ * correlated multi-subject incident (gov UP-2).
  *
  * Threading: observe() is called concurrently from gRPC ingest threads —
  * internal mutex; the callback is invoked OUTSIDE the lock (it does SQLite +
- * webhook dispatch). set_on_incident() follows the set-before-traffic
- * contract (wired once at boot, like the other service-impl setters).
+ * webhook dispatch). set_on_incident() / set_metrics() follow the
+ * set-before-traffic contract (wired once at boot, like the other service-impl
+ * setters).
  */
 
 #include <cstdint>
@@ -35,6 +44,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server {
 
@@ -51,6 +64,18 @@ struct BlastRadiusConfig {
     /// refresh), so an established incident keeps counting and a saturated
     /// detector under-counts rather than over-allocates.
     std::size_t max_total_entries{100000};
+    /// Minimum seconds between any two per-pair window-prunes (gov UP-1/perf):
+    /// the prune is O(agents-in-pair); at fleet scale a hot incident pair would
+    /// otherwise run it on every ingest under the global lock, stalling all
+    /// Guardian ingest. A few seconds of window staleness is irrelevant to a
+    /// 5-device / 900s threshold.
+    int prune_interval_seconds{30};
+    /// Global cap on incident FIRES per rolling minute (gov UP-2): bounds the
+    /// synchronous notification insert + webhook/offload fan-out under a
+    /// correlated multi-subject incident (a bad patch crashing many apps).
+    /// Excess fires are dropped (counted) — the per-pair cooldown still applies
+    /// underneath, so this only clips a genuine multi-subject burst.
+    int max_fires_per_minute{20};
 };
 
 struct BlastRadiusIncident {
@@ -75,6 +100,12 @@ public:
     /// (set-before-traffic contract); not synchronised against observe().
     void set_on_incident(std::function<void(const BlastRadiusIncident&)> cb);
 
+    /// Wire Prometheus metrics (set-before-traffic). nullptr = no metrics
+    /// (tests). Surfaces incidents fired, fan-out drops, budget/pair drops, and
+    /// the live pair count so a silently-saturated detector is observable
+    /// (gov SRE OBS-1 / compliance S1).
+    void set_metrics(yuzu::MetricsRegistry* metrics);
+
     /// Record one observation sighting. Cheap (hash-map ops under one mutex);
     /// fires the incident callback (outside the lock) when this sighting tips
     /// the pair over the threshold and the pair is not in cooldown.
@@ -86,18 +117,33 @@ private:
         std::unordered_map<std::string, std::int64_t> agents; ///< agent_id → last seen
         std::int64_t last_alert{0};
         std::int64_t last_touch{0};
+        std::int64_t last_prune{0}; ///< last window-prune (throttle, gov UP-1)
     };
 
     // Caller holds mu_. Sweep pairs whose last touch fell out of both the
-    // window and the cooldown; used when the map hits max_pairs.
-    void sweep_stale_locked(std::int64_t now_unix);
+    // window and the cooldown. Returns true if at least one pair was freed.
+    bool sweep_stale_locked(std::int64_t now_unix);
+
+    // Caller holds mu_. Evict the single least-recently-touched pair to admit a
+    // new one when the cap holds after a sweep (gov UP-3 — never silently drop
+    // a fresh real incident; the LRU victim is the stalest sprayed pair).
+    void evict_lru_locked();
+
+    // Caller holds mu_. Rolling-minute incident-fire budget (gov UP-2).
+    bool fire_budget_ok_locked(std::int64_t now_unix);
+
+    // Counter bump helpers (no-op when metrics_ unset).
+    void inc_metric(const char* name);
 
     BlastRadiusConfig cfg_;
     std::function<void(const BlastRadiusIncident&)> on_incident_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
     std::mutex mu_;
     std::unordered_map<std::string, Pair> pairs_; ///< key: obs_type + '\x1f' + subject
     std::size_t total_entries_{0};                ///< tracked (pair, agent) sightings
     bool entry_budget_warned_{false};
+    std::int64_t fire_minute_start_{0}; ///< current rolling-minute bucket
+    int fire_minute_count_{0};          ///< fires in the current bucket
 };
 
 } // namespace yuzu::server

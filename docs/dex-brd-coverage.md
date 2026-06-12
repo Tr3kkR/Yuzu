@@ -59,15 +59,15 @@ Row numbers are the BRD's own (Main tab). Plan references (A1, B2, D1…) point 
 
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
-| 13 | CPU utilization (real-time + historical + alerts) | **Partial → strong** (A1, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly, operator-SQL queryable). Threshold alerts → **A3**, fleet rollup → **A4** |
-| 14 | Memory utilization | **Partial → strong** (A1, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event already live |
-| 15 | Disk I/O latency & throughput | **Partial → strong** (A1, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live |
-| 16 | Network latency & packet loss | **Partial → strong** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1 |
+| 13 | CPU utilization (real-time + historical + alerts) | **Partial** (A1, 2026-06-12) | 30 s raw-counter sampling → `perf_live`/`perf_hourly` in the TAR edge warehouse (7 d raw + 31 d hourly). **Collected + raw-SQL queryable only — NO dashboard chart, NO threshold alert yet** (dashboard/rollup → A4, threshold alerts → A3). Honest PoC framing: data exists, visualization does not |
+| 14 | Memory utilization | **Partial** (A1, 2026-06-12) | Used % + commit-charge % sampled with row 13; `memory.exhausted` failure event already live. Same A3/A4 gap as row 13 |
+| 15 | Disk I/O latency & throughput | **Partial** (A1, 2026-06-12) | Per-IO service time (µs) + read/write B/s via IOCTL_DISK_PERFORMANCE; `disk.error`/`disk.port_reset` events live. Same A3/A4 gap |
+| 16 | Network latency & packet loss | **Partial** (E1, 2026-06-12) | netprobe icmp/tcp probes give RTT + loss to chosen targets on a schedule; per-interface counters → A1, threshold alerting → A3/F1. Measurement shipped, alerting not |
 | 17 | GPU utilization | Planned | **A5** (GPU Engine counters) |
 | 18 | NPU utilization | Stretch | A5 — Windows NPU counter surface is immature; detect presence via hardware inventory first |
 | 19 | CPU throttling (incl. cause + duration) | **Partial** | `hw.cpu_throttled` (Kernel-Processor-Power 37) live; occurrence + firmware cause, no duration. Duration → A1 trend overlay |
 | 20 | Disk size & utilization (+ low-space alert) | **Covered** (D1, 2026-06-12) | Size via hardware plugin `disks`; low-space alert via `storage.low` Windows state poll (`dex_win_poll`) — thresholds identical to macOS |
-| 21 | Battery health (cycles, capacity, degradation) | **Covered** (D1, 2026-06-12) | IOCTL battery query (DesignedCapacity / FullChargedCapacity / CycleCount) → `hw.error` subject=battery below 80% of design; degradation *trend* over time → A-wave |
+| 21 | Battery health (cycles, capacity, degradation) | **Partial** (D1, 2026-06-12) | IOCTL battery query (DesignedCapacity / FullChargedCapacity / CycleCount) → `hw.error` subject=battery below 80% of design. Single-threshold breach event ships; **degradation *trend* over time is NOT yet built** (→ A-wave) — the part competitor hardware-health views emphasize |
 
 ### Cat 3 — Application Usage & Performance Metrics (rows 22–34)
 

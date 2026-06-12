@@ -62,6 +62,15 @@ struct BatteryHealth {
 /// missing reading must never read as a failure).
 YUZU_EXPORT std::optional<SignalObservation> battery_observation(const BatteryHealth& health);
 
+/// Poll-and-latch transition decision (pure, unit-tested). `reported` is the
+/// per-subject latch state, updated in place. Returns true exactly on the
+/// transition INTO a bad state (emit once), suppresses while it persists, and
+/// re-arms ONLY when a VALID reading shows healthy — a transient read failure
+/// (`reading_valid == false`) must not clear the latch and re-fire (gov UP-5).
+/// Disk callers pass `reading_valid = true` (unreadable volumes are skipped
+/// before the latch); battery passes the reading's validity.
+YUZU_EXPORT bool latch_should_emit(bool currently_bad, bool reading_valid, bool& reported);
+
 /// A running state poll. start() launches the poll thread (disk every 10 min,
 /// battery hourly; first poll on the first 60 s tick — timer-driven, never
 /// at-arm, the macOS lesson); stop() joins it. Single-owner; the Windows DEX

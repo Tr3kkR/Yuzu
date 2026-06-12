@@ -14,8 +14,9 @@ whatever types exist, and unknown types render with a raw-label fallback under
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not). The server display
 catalogue totals **104** entries: the 103 Windows event-catalogue types **+
-`storage.low`**, which began macOS-only and is now emitted by BOTH platforms
-(the macOS IOKit poll and the Windows state poll — see those sections below).
+`storage.low`** (one display entry, now emitted by BOTH platforms from two
+sources — the macOS IOKit poll and the Windows state poll, see those sections
+below; it began macOS-only).
 The Windows *event* catalogue stays 103; the state-poll signals (`storage.low`,
 battery via `hw.error`) ride alongside it without catalogue entries, exactly
 like the macOS poll mechanisms.

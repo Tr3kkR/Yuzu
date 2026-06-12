@@ -21,7 +21,7 @@
  *
  * Output rows:
  *   rtt|<target>|<proto>|<sent>|<ok>|<min_ms>|<avg_ms>|<max_ms>|<jitter_ms>|<loss_pct>|<status>
- *   dns|<name>|<resolve_ms>|<status>|<addresses>
+ *   dns|<name>|<resolve_ms>|<status: ok | error:N | invalid-target>|<address count>
  * Timing fields are 1-decimal strings (the result-column system has no float
  * type; the DSL coerces float-strings for workflow conditions). Jitter is the
  * population stddev of successful samples (netprobe_stats.hpp, unit-tested).
@@ -69,6 +69,7 @@ namespace {
 using yuzu::netprobe::clamp_param;
 using yuzu::netprobe::compute_stats;
 using yuzu::netprobe::split_targets;
+using yuzu::netprobe::sanitize_for_output;
 using yuzu::netprobe::valid_probe_target;
 
 constexpr std::size_t kMaxTargets = 4;
@@ -324,7 +325,7 @@ int do_icmp(yuzu::CommandContext& ctx, yuzu::Params params) {
     IcmpSession session;
     for (const auto& target : targets) {
         if (!valid_probe_target(target)) {
-            row.write_empty(target, "icmp", "invalid-target");
+            row.write_empty(sanitize_for_output(target), "icmp", "invalid-target");
             continue;
         }
         if (!session.ok()) {
@@ -374,7 +375,7 @@ int do_tcp(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     for (const auto& target : targets) {
         if (!valid_probe_target(target)) {
-            row.write_empty(target, proto, "invalid-target");
+            row.write_empty(sanitize_for_output(target), proto, "invalid-target");
             continue;
         }
         auto dst = resolve_first(target, AF_UNSPEC);
@@ -401,7 +402,7 @@ int do_dns(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     for (const auto& name : names) {
         if (!valid_probe_target(name)) {
-            ctx.write_output(std::format("dns|{}|0.0|invalid-target|0", name));
+            ctx.write_output(std::format("dns|{}|0.0|invalid-target|0", sanitize_for_output(name)));
             continue;
         }
         addrinfo hints{};

@@ -132,33 +132,39 @@ TEST_CASE("blast: empty subject is a valid pair key", "[dex][blast]") {
     CHECK(cap.incidents[0].subject.empty());
 }
 
-TEST_CASE("blast: at the pair cap a NEW pair is dropped, established pairs keep working",
+TEST_CASE("blast: at the pair cap the LRU pair is evicted to admit a new one (gov UP-3)",
           "[dex][blast]") {
+    // A saturated map must NOT silently suppress a fresh real incident. The
+    // victim is the least-recently-touched pair; a live incident (touched on
+    // every sighting) is never the victim.
     Capture cap;
     BlastRadiusConfig cfg;
     cfg.min_devices = 2;
     cfg.max_pairs = 2;
+    cfg.window_seconds = 900;
+    cfg.cooldown_seconds = 3600;
     BlastRadiusDetector d(cfg);
     cap.wire(d);
 
-    d.observe("process.crashed", "real-incident.exe", "a", 1000);
-    d.observe("process.crashed", "other.exe", "b", 1000);
-    // Cap reached; a sprayed synthetic subject must not evict the live pairs.
-    d.observe("process.crashed", "sprayed-1.exe", "x", 1001);
-    d.observe("process.crashed", "sprayed-1.exe", "y", 1002);
-    CHECK(cap.incidents.empty()); // the sprayed pair was never tracked
+    // Live incident "real.exe" + a quiet pair fill the cap.
+    d.observe("process.crashed", "real.exe", "a", 1000);
+    d.observe("process.crashed", "real.exe", "b", 1001); // fires
+    REQUIRE(cap.incidents.size() == 1);
+    d.observe("process.crashed", "quiet.exe", "q", 1002);
 
-    d.observe("process.crashed", "real-incident.exe", "c", 1010);
-    REQUIRE(cap.incidents.size() == 1); // the established pair still fires
-    CHECK(cap.incidents[0].subject == "real-incident.exe");
-
-    // Once the old pairs go stale (past window AND cooldown), the sweep frees
-    // room and new pairs are tracked again.
-    const std::int64_t later = 1000 + 3600 + 1000;
-    d.observe("process.crashed", "fresh.exe", "x", later);
-    d.observe("process.crashed", "fresh.exe", "y", later + 1);
+    // Keep the incident hot so "quiet.exe" is the unambiguous LRU victim, then a
+    // NEW pair arrives at the cap and is ADMITTED (not dropped — gov UP-3).
+    d.observe("process.crashed", "real.exe", "c", 1100);
+    d.observe("process.crashed", "fresh.exe", "x", 1101); // evicts quiet.exe
+    d.observe("process.crashed", "fresh.exe", "y", 1102); // fresh.exe fires → it was admitted
     REQUIRE(cap.incidents.size() == 2);
     CHECK(cap.incidents[1].subject == "fresh.exe");
+
+    // The live incident survived eviction: after the cooldown it re-fires.
+    d.observe("process.crashed", "real.exe", "d", 1000 + 3600 + 10);
+    d.observe("process.crashed", "real.exe", "e", 1000 + 3600 + 11);
+    REQUIRE(cap.incidents.size() == 3);
+    CHECK(cap.incidents[2].subject == "real.exe"); // never evicted
 }
 
 TEST_CASE("blast: the global entry budget bounds memory, frees as entries age out",
@@ -249,4 +255,92 @@ TEST_CASE("blast subject: sec-M1 clamp is UTF-8 safe", "[dex][blast]") {
     const std::string out = blast_subject_from_detail(json2);
     CHECK(out.size() == 255); // the é was dropped whole at the boundary
     CHECK(out == std::string(255, 'a'));
+}
+
+// ── Hardening-round additions (gov UP-1/UP-2) ───────────────────────────────
+
+TEST_CASE("blast: global per-minute fan-out cap clips a correlated burst", "[dex][blast]") {
+    Capture cap;
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 2;
+    cfg.max_fires_per_minute = 3;
+    cfg.window_seconds = 900;
+    BlastRadiusDetector d(cfg);
+    cap.wire(d);
+
+    // 5 distinct subjects each cross the threshold within the same minute (a bad
+    // patch crashing many apps). Only 3 incidents fire; the rest are clipped.
+    for (int s = 0; s < 5; ++s) {
+        const std::string subj = "app" + std::to_string(s) + ".exe";
+        d.observe("process.crashed", subj, "a", 2000);
+        d.observe("process.crashed", subj, "b", 2001);
+    }
+    CHECK(cap.incidents.size() == 3);
+
+    // Next minute, the budget resets — a fresh subject fires again.
+    d.observe("process.crashed", "later.exe", "a", 2000 + 60);
+    d.observe("process.crashed", "later.exe", "b", 2000 + 61);
+    CHECK(cap.incidents.size() == 4);
+}
+
+TEST_CASE("blast: a budget-CLIPPED incident fires when the bucket frees, not after a cooldown",
+          "[dex][blast]") {
+    // gov Gate-8 sec MEDIUM: a pair clipped by the per-minute cap must NOT arm
+    // the per-pair cooldown — it re-attempts and fires the moment the budget
+    // frees, rather than going silent for a full cooldown on an unsent alert.
+    Capture cap;
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 2;
+    cfg.max_fires_per_minute = 1;
+    cfg.cooldown_seconds = 3600;
+    cfg.window_seconds = 900;
+    BlastRadiusDetector d(cfg);
+    cap.wire(d);
+
+    // Two subjects cross threshold in the same minute; only the first fires.
+    d.observe("process.crashed", "first.exe", "a", 3000);
+    d.observe("process.crashed", "first.exe", "b", 3001); // fires (budget 1/1)
+    d.observe("process.crashed", "clipped.exe", "a", 3002);
+    d.observe("process.crashed", "clipped.exe", "b", 3003); // clipped
+    REQUIRE(cap.incidents.size() == 1);
+
+    // Next minute, a fresh sighting of the clipped pair fires — proving its
+    // cooldown was NOT armed by the clip (else it would stay silent ~1h).
+    d.observe("process.crashed", "clipped.exe", "a", 3000 + 60);
+    REQUIRE(cap.incidents.size() == 2);
+    CHECK(cap.incidents[1].subject == "clipped.exe");
+}
+
+TEST_CASE("blast: prune throttle keeps a hot pair countable without per-call pruning",
+          "[dex][blast]") {
+    // The throttle (gov UP-1) must not change observable detection: a pair that
+    // crosses the threshold still fires regardless of prune cadence.
+    Capture cap;
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 3;
+    cfg.window_seconds = 900;
+    cfg.prune_interval_seconds = 30;
+    BlastRadiusDetector d(cfg);
+    cap.wire(d);
+
+    // Three distinct devices within a few seconds — inside the window, inside
+    // one prune interval. Must fire on the 3rd.
+    d.observe("process.crashed", "chrome.exe", "a", 5000);
+    d.observe("process.crashed", "chrome.exe", "b", 5001);
+    CHECK(cap.incidents.empty());
+    d.observe("process.crashed", "chrome.exe", "c", 5002);
+    REQUIRE(cap.incidents.size() == 1);
+    CHECK(cap.incidents[0].device_count == 3);
+}
+
+TEST_CASE("blast: works with no metrics wired (metrics optional)", "[dex][blast]") {
+    // set_metrics is never called — every inc_metric path must be a safe no-op.
+    BlastRadiusConfig cfg;
+    cfg.min_devices = 2;
+    cfg.max_total_entries = 1; // force the entries_dropped metric path
+    BlastRadiusDetector d(cfg);
+    int fired = 0;
+    d.set_on_incident([&](const BlastRadiusIncident&) { ++fired; });
+    CHECK_NOTHROW(d.observe("process.crashed", "x.exe", "a", 1000));
+    CHECK_NOTHROW(d.observe("process.crashed", "x.exe", "b", 1001)); // budget-dropped sighting
 }

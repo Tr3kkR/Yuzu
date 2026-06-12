@@ -79,7 +79,9 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
     authorRoles: [content-author]
 
   compatibility:
@@ -167,7 +169,9 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
     authorRoles: [content-author]
 
   compatibility:
@@ -227,7 +231,9 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    # Network-reconnaissance primitive (RTT/reachability to arbitrary internal
+    # hosts) - admin-only, matching the discovery plugin precedent (gov sec).
+    executeRoles: [endpoint-admin]
     authorRoles: [content-author]
 
   compatibility:

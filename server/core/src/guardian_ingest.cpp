@@ -86,12 +86,13 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         }
         // Fleet-wide incident detection — RULELESS observations only, and only
         // AFTER the event committed (a rolled-back duplicate must never count a
-        // device twice). Sentinel match mirrors is_reserved_rule_id in the
-        // store (shared-constant cross-check is a tracked follow-up). The
-        // window uses server receipt time, not the agent's clock — "blast
-        // radius" is about simultaneity as the FLEET experiences it, and a
-        // skewed agent clock must not smear the window.
-        if (blast_radius && ev_row.rule_id == "__observation__") {
+        // device twice). Uses the SHARED kObservationRuleId constant, same one
+        // is_reserved_rule_id keys on, so the feed gate and the projection guard
+        // can't desync (gov architect/consistency). The window uses server
+        // receipt time, not the agent's clock — "blast radius" is about
+        // simultaneity as the FLEET experiences it, and a skewed agent clock
+        // must not smear the window.
+        if (blast_radius && ev_row.rule_id == kObservationRuleId) {
             const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
