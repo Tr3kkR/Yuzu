@@ -39,8 +39,12 @@
 #include <string_view>
 #include <vector>
 
-struct pg_conn; // PGconn — avoid pulling libpq-fe.h into every includer
-using PGconn = pg_conn;
+// Real header, not a forward-declare: `PGconn` is a typedef of libpq's
+// PRIVATE struct tag `pg_conn`, and re-declaring a third party's internal
+// name pins it — a libpq rename would break the build here last and least
+// legibly. The include costs nothing in practice: every consumer of this
+// header also pulls pg_raii.hpp/pg_pool.hpp, which include it directly.
+#include <libpq-fe.h>
 
 namespace yuzu::server::pg {
 

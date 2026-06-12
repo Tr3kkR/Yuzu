@@ -36,6 +36,8 @@
 #include <string_view>
 
 #if defined(YUZU_TEST_ENABLE_PG)
+#include <format>
+
 #include <libpq-fe.h>
 
 #include "pg/pg_raii.hpp" // server suite only — include path carries server/core/src
@@ -181,8 +183,7 @@ public:
         if (PQstatus(conn.get()) != CONNECTION_OK) {
             // Can't throw from a dtor — but a silent failure piles leaked
             // yuzu_test_* databases onto a shared instance; say so.
-            std::fprintf(stderr, "PostgresTestDb: teardown admin connect failed — leaked %s\n",
-                         db_name_.c_str());
+            log_leak("teardown admin connect failed", nullptr);
             return;
         }
         // FORCE (PG 13+; every supported leg pins 16): terminate any
@@ -191,8 +192,7 @@ public:
         const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
         if (!res.ok())
-            std::fprintf(stderr, "PostgresTestDb: DROP DATABASE failed — leaked %s: %s\n",
-                         db_name_.c_str(), PQerrorMessage(conn.get()));
+            log_leak("DROP DATABASE failed", PQerrorMessage(conn.get()));
     }
 
     PostgresTestDb(const PostgresTestDb&) = delete;
@@ -209,6 +209,22 @@ public:
     [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
 
 private:
+    // std::format + fputs, never printf-family (docs/cpp-conventions.md;
+    // std::print is unavailable on GCC 13 libstdc++ / Apple Clang 15 — same
+    // portable form as canary_main.cpp). Called from the dtor, so formatting
+    // must not throw out: fall back to a static message on bad_alloc.
+    void log_leak(const char* what, const char* detail) const noexcept {
+        try {
+            const std::string msg =
+                detail != nullptr
+                    ? std::format("PostgresTestDb: {} — leaked {}: {}\n", what, db_name_, detail)
+                    : std::format("PostgresTestDb: {} — leaked {}\n", what, db_name_);
+            std::fputs(msg.c_str(), stderr);
+        } catch (...) {
+            std::fputs("PostgresTestDb: teardown failed — leaked a yuzu_test_* database\n", stderr);
+        }
+    }
+
     static std::string unique_db_name() {
         static const std::uint64_t salt = [] {
             std::mt19937_64 rng{std::random_device{}()};
