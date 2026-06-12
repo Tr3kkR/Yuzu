@@ -562,7 +562,7 @@ All authentication and authorization errors use the standard JSON envelope:
 ```
 
 HTTP status codes:
-- `401 Unauthorized` — No valid authentication provided (missing/invalid token)
+- `401 Unauthorized` — No valid authentication provided (missing/invalid token). Also returned when the token store itself is unavailable: authentication fails closed rather than revealing storage state. If valid tokens suddenly return `401`, check `/readyz` for `api_token_store` before rotating credentials.
 - `403 Forbidden` — Authentication valid but operation not permitted (scope/tier/role restriction)
 - `503 Service Unavailable` — Required backend unavailable: TagStore for scope verification, or the API token store database failed to open at startup (token CRUD routes)
 

@@ -721,7 +721,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other store-down guard so message-grep alerting stays unified. The
   identical-404 anti-enumeration response for not-found vs not-owner is
   unchanged. Mid-request I/O errors on a connection that opened successfully
-  remain a tracked residual on #347.
+  are tracked as #1383.
 - **Agents enrolling *through the gateway* now receive a per-agent client
   certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
   per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the
