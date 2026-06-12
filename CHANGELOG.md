@@ -116,8 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `oldest_kek_version_in_use` completion signal, retirement refused while a
   version is active or referenced with `retired_at` destruction evidence.
   Audit verbs `kek.generated`/`kek.rotated`/`kek.retired`/
-  `secret.decrypt_failure` and per-store failure-class counters ship as
-  wiring seams for the per-store migration PRs. Operator guidance (the
+  `secret.decrypt_failure` and per-store failure-class counters are defined
+  as wiring seams — no audit events or metrics are emitted until the
+  per-store migration PRs wire them. Operator guidance (the
   DB+keys-dir restore-pairing invariant, rotation, break-glass) lives in
   `docs/user-manual/server-admin.md` "Key management (secrets KEK)". The
   gated stores (`auth` TOTP, `webhooks`, `offload_targets`, OIDC client

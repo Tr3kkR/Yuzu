@@ -145,6 +145,12 @@ public:
     /// operators triage separately from "DB down". Any failure is the
     /// startup_failed() class: a loudly-down server over one silently
     /// serving with unreadable secrets.
+    ///
+    /// WIRING OBLIGATION (governance Pattern E): an init() error must abort
+    /// the server (startup_failed). If the codec is ever constructed with
+    /// init() deferred, `active_kek_version() > 0` must join the /readyz and
+    /// /healthz stores_ok conjunctions — a constructed-but-uninitialized
+    /// codec fails every encrypt.
     [[nodiscard]] std::expected<void, InitError> init(PGconn* conn);
 
     /// Newest non-retired KEK version (encrypts use this). 0 before init.
