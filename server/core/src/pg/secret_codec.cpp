@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 
 namespace yuzu::server::pg {
@@ -29,6 +31,19 @@ constexpr std::string_view kKekIdPrefix = "secrets-kek-v";
 
 std::string kek_key_id(std::uint32_t version) {
     return std::string{kKekIdPrefix} + std::to_string(version);
+}
+
+/// Strict u32 parse for values read back from the database. atoll would
+/// silently return 0 on garbage and truncate >2^32 (cpp-B1).
+std::optional<std::uint32_t> parse_u32(const char* text) {
+    if (text == nullptr)
+        return std::nullopt;
+    std::string_view sv{text};
+    std::uint32_t v = 0;
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+    if (ec != std::errc{} || ptr != sv.data() + sv.size())
+        return std::nullopt;
+    return v;
 }
 
 bool exec_ok(PGconn* conn, const char* sql, std::string_view what) {
@@ -175,6 +190,20 @@ std::string_view SecretCodec::to_string(FailureClass cls) {
     return "unknown";
 }
 
+std::string_view SecretCodec::to_string(InitError::Kind kind) {
+    switch (kind) {
+    case InitError::Kind::kek_unresolvable:
+        return "kek_unresolvable";
+    case InitError::Kind::kek_corrupt:
+        return "kek_corrupt";
+    case InitError::Kind::provider_failure:
+        return "provider_failure";
+    case InitError::Kind::db_error:
+        return "db_error";
+    }
+    return "unknown";
+}
+
 std::string SecretCodec::encode_bigint_pk(std::int64_t pk) {
     std::array<std::uint8_t, 8> be{};
     const auto u = static_cast<std::uint64_t>(pk);
@@ -183,7 +212,7 @@ std::string SecretCodec::encode_bigint_pk(std::int64_t pk) {
     return {reinterpret_cast<const char*>(be.data()), be.size()};
 }
 
-SecretCodec::SecretCodec(KeyProvider& provider) : provider_(provider) {}
+SecretCodec::SecretCodec(KekProvider& provider) : provider_(provider) {}
 
 void SecretCodec::set_audit_hook(AuditHook hook) {
     std::lock_guard lock{mu_};
@@ -243,6 +272,17 @@ SecretCodec::Error SecretCodec::fail(const SecretId& id, FailureClass cls,
     return err;
 }
 
+SecretCodec::Error SecretCodec::fail_encrypt(const SecretId& id, FailureClass cls,
+                                             std::string_view what) {
+    Error err;
+    err.cls = cls;
+    err.message = std::string{to_string(cls)} + ": " + std::string{what} + " (" + id.store + "." +
+                  id.table + "." + id.column + ")";
+    spdlog::error("secret_codec: encrypt failed — {} (caller must abort the transaction)",
+                  err.message);
+    return err;
+}
+
 std::expected<std::vector<std::uint8_t>, SecretCodec::Error>
 SecretCodec::encrypt(const SecretId& id, std::span<const std::uint8_t> plaintext) {
     std::uint32_t version = 0;
@@ -254,16 +294,16 @@ SecretCodec::encrypt(const SecretId& id, std::span<const std::uint8_t> plaintext
             key_ref = it->second;
     }
     if (version == 0 || key_ref.empty())
-        return std::unexpected{fail(id, FailureClass::kek_unresolvable, version,
-                                    "no active KEK (init() not run or failed)")};
+        return std::unexpected{fail_encrypt(id, FailureClass::kek_unresolvable,
+                                            "no active KEK (init() not run or failed)")};
 
     // Fresh DEK + fresh data nonce per value per encryption (ADR §1).
     SecureBuffer dek{32};
     std::array<std::uint8_t, 12> data_nonce{};
     if (RAND_bytes(dek.data(), static_cast<int>(dek.size())) != 1 ||
         RAND_bytes(data_nonce.data(), static_cast<int>(data_nonce.size())) != 1)
-        return std::unexpected{
-            fail(id, FailureClass::crypto_failure, version, "RAND_bytes failed minting DEK/nonce")};
+        return std::unexpected{fail_encrypt(id, FailureClass::crypto_failure,
+                                            "RAND_bytes failed minting DEK/nonce")};
 
     std::vector<std::uint8_t> blob(kCiphertextOffset + plaintext.size());
     blob[0] = kBlobVersion;
@@ -277,7 +317,7 @@ SecretCodec::encrypt(const SecretId& id, std::span<const std::uint8_t> plaintext
                                               std::span<std::uint8_t, 16>{data_tag});
     if (rc != detail::GcmResult::ok)
         return std::unexpected{
-            fail(id, FailureClass::crypto_failure, version, "payload encrypt failed (EVP)")};
+            fail_encrypt(id, FailureClass::crypto_failure, "payload encrypt failed (EVP)")};
 
     const auto wrapped = provider_.wrap_dek(
         key_ref, std::span<const std::uint8_t, 32>{dek.data(), 32}, wrap_aad(id, version));
@@ -285,7 +325,7 @@ SecretCodec::encrypt(const SecretId& id, std::span<const std::uint8_t> plaintext
         const FailureClass cls = wrapped.error() == KekError::unresolvable
                                      ? FailureClass::kek_unresolvable
                                      : FailureClass::crypto_failure;
-        return std::unexpected{fail(id, cls, version, "DEK wrap failed")};
+        return std::unexpected{fail_encrypt(id, cls, "DEK wrap failed")};
     }
 
     std::memcpy(blob.data() + kWrapNonceOffset, wrapped->nonce.data(), 12);
@@ -402,34 +442,40 @@ SecretCodec::rewrap(const SecretId& id, std::span<const std::uint8_t> blob,
     return out;
 }
 
-std::expected<void, std::string> SecretCodec::init(PGconn* conn) {
+std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
     static const std::vector<PgMigration> kMigrations = {
+        // kcv_alg: after a provider swap, versions minted by a
+        // non-exportable provider derive their check value differently
+        // (ADR-0010 §2) — the boot fingerprint check must know per-version
+        // how to compare (arch-4).
         {1, "CREATE TABLE kek_meta ("
             "  kek_version BIGINT PRIMARY KEY,"
             "  kcv         BYTEA NOT NULL,"
+            "  kcv_alg     TEXT NOT NULL DEFAULT 'sha256',"
             "  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),"
             "  retired_at  TIMESTAMPTZ"
             ")"},
     };
+    const auto db_err = [](std::string msg) {
+        return std::unexpected{InitError{InitError::Kind::db_error, std::move(msg)}};
+    };
     if (!PgMigrationRunner::run(conn, "secrets", kMigrations))
-        return std::unexpected{"secrets schema migration failed"};
+        return db_err("secrets schema migration failed");
 
     if (!exec_ok(conn, "BEGIN", "BEGIN (kek init)"))
-        return std::unexpected{"kek init: BEGIN failed"};
+        return db_err("kek init: BEGIN failed");
     PgTxn txn{conn};
     {
         PgResult lock{PQexec(conn, kKekLockSql)};
         if (lock.status() != PGRES_TUPLES_OK)
-            return std::unexpected{std::string{"kek init: advisory lock failed: "} +
-                                   PQerrorMessage(conn)};
+            return db_err(std::string{"kek init: advisory lock failed: "} + PQerrorMessage(conn));
     }
 
     PgResult rows{PQexec(conn, "SELECT kek_version, encode(kcv, 'hex'),"
                                "       (retired_at IS NOT NULL)::int"
                                " FROM secrets.kek_meta ORDER BY kek_version")};
     if (rows.status() != PGRES_TUPLES_OK)
-        return std::unexpected{std::string{"kek init: kek_meta read failed: "} +
-                               PQerrorMessage(conn)};
+        return db_err(std::string{"kek init: kek_meta read failed: "} + PQerrorMessage(conn));
 
     std::map<std::uint32_t, std::string> refs;
     std::uint32_t max_live = 0;
@@ -450,13 +496,19 @@ std::expected<void, std::string> SecretCodec::init(PGconn* conn) {
         } else {
             ref = provider_.generate_kek(key_id);
             if (!ref)
-                return std::unexpected{
-                    "kek init: KEK generation failed (CSPRNG or key storage) — refusing to start "
-                    "without a secrets KEK"};
+                return std::unexpected{InitError{
+                    InitError::Kind::provider_failure,
+                    "kek init: KEK generation failed (CSPRNG or key storage) — refusing to "
+                    "start without a secrets KEK"}};
         }
         const auto kcv = provider_.kek_check_value(*ref);
         if (!kcv)
-            return std::unexpected{"kek init: check-value computation failed for new KEK"};
+            return std::unexpected{InitError{
+                InitError::Kind::provider_failure,
+                "kek init: check-value computation failed for '" + key_id +
+                    "'. If this install previously crashed during first boot, the key file may "
+                    "be torn — nothing is encrypted under an unregistered KEK, so deleting that "
+                    "file and restarting is safe"}};
 
         const std::string kcv_hex = to_hex(std::span<const std::uint8_t>{*kcv});
         const char* values[] = {kcv_hex.c_str()};
@@ -465,10 +517,10 @@ std::expected<void, std::string> SecretCodec::init(PGconn* conn) {
                                   " VALUES (1, decode($1, 'hex'))",
                                   1, nullptr, values, nullptr, nullptr, 0)};
         if (!ins.ok())
-            return std::unexpected{std::string{"kek init: fingerprint INSERT failed: "} +
-                                   PQerrorMessage(conn)};
+            return db_err(std::string{"kek init: fingerprint INSERT failed: "} +
+                          PQerrorMessage(conn));
         if (!txn.commit())
-            return std::unexpected{"kek init: COMMIT failed"};
+            return db_err("kek init: COMMIT failed");
 
         {
             std::lock_guard lock{mu_};
@@ -483,41 +535,45 @@ std::expected<void, std::string> SecretCodec::init(PGconn* conn) {
     // Boot verification (ADR §2): every registered, non-retired version must
     // resolve through the provider to material matching its fingerprint.
     for (int i = 0; i < n; ++i) {
-        const auto version = static_cast<std::uint32_t>(std::atoll(PQgetvalue(rows.get(), i, 0)));
+        const auto version = parse_u32(PQgetvalue(rows.get(), i, 0));
+        if (!version)
+            return db_err("kek init: unparseable kek_version in kek_meta");
         const std::string kcv_hex = PQgetvalue(rows.get(), i, 1);
         const bool retired = std::strcmp(PQgetvalue(rows.get(), i, 2), "1") == 0;
         if (retired)
             continue;
 
-        const std::string key_id = kek_key_id(version);
+        const std::string key_id = kek_key_id(*version);
         const auto ref = provider_.resolve_kek(key_id);
         if (!ref)
-            return std::unexpected{
+            return std::unexpected{InitError{
+                InitError::Kind::kek_unresolvable,
                 "kek_unresolvable: registered KEK '" + key_id +
-                "' does not resolve through the KeyProvider. Causes: keys directory older than "
-                "the database (backup skew — restore DB and keys dir as a PAIR), wrong keys "
-                "directory, or a second server instance sharing this database (one KEK per "
-                "database; see ADR-0010 §2)"};
+                    "' does not resolve through the KekProvider. Causes: keys directory older "
+                    "than the database (backup skew — restore DB and keys dir as a PAIR), wrong "
+                    "keys directory, or a second server instance sharing this database (one KEK "
+                    "per database; see ADR-0010 §2)"}};
 
         const auto kcv = provider_.kek_check_value(*ref);
         const auto expected = from_hex(kcv_hex);
         if (!kcv || !expected || expected->size() != kcv->size() ||
             !std::equal(kcv->begin(), kcv->end(), expected->begin()))
-            return std::unexpected{
+            return std::unexpected{InitError{
+                InitError::Kind::kek_corrupt,
                 "kek_corrupt: KEK '" + key_id +
-                "' resolves but its check value does not match the registered fingerprint "
-                "(torn/corrupt key file or foreign key material — NOT row tamper). Restore the "
-                "keys directory from the backup paired with this database"};
+                    "' resolves but its check value does not match the registered fingerprint "
+                    "(torn/corrupt key file or foreign key material — NOT row tamper). Restore "
+                    "the keys directory from the backup paired with this database"}};
 
-        refs.emplace(version, *ref);
-        max_live = std::max(max_live, version);
+        refs.emplace(*version, *ref);
+        max_live = std::max(max_live, *version);
     }
 
     if (max_live == 0)
-        return std::unexpected{"kek init: kek_meta has rows but no live (non-retired) KEK version"};
+        return db_err("kek init: kek_meta has rows but no live (non-retired) KEK version");
 
     if (!txn.commit())
-        return std::unexpected{"kek init: COMMIT failed"};
+        return db_err("kek init: COMMIT failed");
 
     {
         std::lock_guard lock{mu_};
@@ -540,12 +596,32 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
 
     const std::uint32_t next = cur + 1;
     const std::string key_id = kek_key_id(next);
-    const auto ref = provider_.generate_kek(key_id);
-    if (!ref)
-        return std::unexpected{"rotate: KEK generation failed for " + key_id};
+    // Adopt-or-generate, mirroring first boot (sec-M3): a crash between a
+    // prior rotation's generate_kek and its fingerprint INSERT leaves an
+    // orphan key file, and generate_kek correctly refuses to overwrite it —
+    // without adoption every subsequent rotation would wedge. Adoption is
+    // safe by the same first-boot argument: nothing can be encrypted under
+    // an unregistered version (encrypt only uses versions in key_refs_,
+    // which only ever holds registered ones).
+    bool adopted = false;
+    std::optional<std::string> ref = provider_.resolve_kek(key_id);
+    if (ref) {
+        spdlog::warn("secret_codec: adopting existing un-registered KEK '{}' "
+                     "(crashed prior rotation?)",
+                     key_id);
+        adopted = true;
+    } else {
+        ref = provider_.generate_kek(key_id);
+        if (!ref)
+            return std::unexpected{"rotate: KEK generation failed for " + key_id};
+    }
     const auto kcv = provider_.kek_check_value(*ref);
     if (!kcv)
-        return std::unexpected{"rotate: check-value computation failed for " + key_id};
+        return std::unexpected{
+            "rotate: check-value computation failed for " + key_id +
+            (adopted ? " (adopted orphan may be torn — deleting it and re-running rotation is "
+                       "safe: nothing is encrypted under an unregistered KEK)"
+                     : "")};
 
     const std::string kcv_hex = to_hex(std::span<const std::uint8_t>{*kcv});
     const std::string version_str = std::to_string(next);
@@ -559,10 +635,13 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
         return std::unexpected{std::string{"rotate: fingerprint INSERT failed: "} +
                                PQerrorMessage(conn)};
     if (std::strcmp(PQcmdTuples(ins.get()), "1") != 0) {
-        // A concurrent rotation registered this version first. Our freshly
-        // minted key file is an orphan with a non-matching fingerprint —
-        // remove it or the next boot verification fails as kek_corrupt.
-        (void)provider_.delete_key(*ref);
+        // A concurrent rotation registered this version first. If WE minted
+        // the key file just now it is an orphan with a non-matching
+        // fingerprint — remove it or the next boot fails as kek_corrupt. If
+        // we ADOPTED the file, it may be the legitimately registered one
+        // (same-host racer) — never delete it; boot verification arbitrates.
+        if (!adopted)
+            (void)provider_.delete_kek(*ref);
         return std::unexpected{"rotate: concurrent rotation detected for " + key_id +
                                " — re-run rotation"};
     }
@@ -745,7 +824,7 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
             key_refs_.erase(it);
         }
     }
-    if (!ref.empty() && !provider_.delete_key(ref))
+    if (!ref.empty() && !provider_.delete_kek(ref))
         spdlog::warn("secret_codec: retired v{} but key deletion failed — remove '{}' manually",
                      version, kek_key_id(version));
 

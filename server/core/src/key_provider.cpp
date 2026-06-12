@@ -16,6 +16,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <cerrno>
@@ -152,6 +155,11 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
 
 #ifndef _WIN32
     {
+        // Manual fd close is deliberate here (documented RAII exception): the
+        // checked close return feeds the durability verdict — a guard that
+        // closes on unwind would swallow it — and there is no throwing
+        // operation between open and close.
+        //
         // Create the temp file mode 0600 from the outset — no umask window where
         // the private key is group/other-readable. O_EXCL refuses to reuse an
         // attacker-planted path.
@@ -166,6 +174,8 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         bool ok = true;
         while (remaining > 0) {
             const ssize_t n = ::write(fd, p, remaining);
+            if (n < 0 && errno == EINTR)
+                continue; // benign signal interruption — retry the write
             if (n <= 0) {
                 ok = false;
                 break;
@@ -175,9 +185,16 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         }
         // fsync before rename (ADR-0010 §2 "Atomic write"): power loss after
         // the rename must never reveal a torn file that "resolves" but fails
-        // every decrypt as pseudo-tamper.
+        // every decrypt as pseudo-tamper. On Darwin fsync only reaches the
+        // drive cache; F_FULLFSYNC is the durable form (fall back where the
+        // volume rejects it).
+#ifdef __APPLE__
+        if (ok && ::fcntl(fd, F_FULLFSYNC) != 0 && ::fsync(fd) != 0)
+            ok = false;
+#else
         if (ok && ::fsync(fd) != 0)
             ok = false;
+#endif
         if (::close(fd) != 0)
             ok = false;
         if (!ok) {
@@ -189,11 +206,16 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
 #else
     {
         // CREATE_NEW = the O_EXCL analogue; FlushFileBuffers = the fsync
-        // analogue. POSIX mode bits are an approximation on Windows — the
-        // data dir carries a restrictive DACL granting only the service
-        // account (docs/agent-privilege-model.md); the native owner-only
-        // DACL remains the tracked follow-up flagged in the PR1 notes.
-        const HANDLE h = ::CreateFileA(tmp.string().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        // analogue. Wide-char API: fs::path is wchar_t on Windows and
+        // path::string() converts through the ANSI code page (garbles
+        // non-ASCII base dirs); path::c_str() is already wchar_t*. POSIX
+        // mode bits are an approximation on Windows — the data dir carries
+        // a restrictive DACL granting only the service account
+        // (docs/agent-privilege-model.md); the native owner-only DACL
+        // remains the tracked follow-up flagged in the PR1 notes. Manual
+        // CloseHandle is the same documented RAII exception as the POSIX
+        // branch (checked close feeds the durability verdict).
+        const HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                        FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             spdlog::error("key_provider: cannot open temp {} (err {})", tmp.string(),
@@ -234,6 +256,31 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         return false;
     }
     set_owner_only_file(dest); // re-assert in case rename reset perms
+
+#ifndef _WIN32
+    // Make the RENAME durable, not just the file contents (governance
+    // sec-M2): without a directory fsync, power loss after the caller
+    // records the key's fingerprint can lose the dirent entirely —
+    // kek_unresolvable at next boot. Windows has no std-expressible
+    // equivalent (it would need MoveFileEx(MOVEFILE_WRITE_THROUGH), which
+    // std::filesystem::rename cannot request); FlushFileBuffers above plus
+    // NTFS metadata journaling is the available posture there.
+    {
+        const int dfd = ::open(base_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+#ifdef __APPLE__
+            if (::fcntl(dfd, F_FULLFSYNC) != 0)
+                (void)::fsync(dfd);
+#else
+            (void)::fsync(dfd);
+#endif
+            (void)::close(dfd);
+        } else {
+            spdlog::warn("key_provider: could not fsync {} after rename: {}", base_dir_.string(),
+                         std::strerror(errno));
+        }
+    }
+#endif
     return true;
 }
 
@@ -272,13 +319,12 @@ bool FileKeyProvider::has_key(std::string_view key_ref) {
 }
 
 bool FileKeyProvider::delete_key(std::string_view key_ref) {
-    {
-        // Evict a cached KEK so a retired version cannot keep wrapping from
-        // memory after its file is destroyed (ADR-0010 §3 retirement).
-        std::lock_guard lock{kek_mutex_};
-        if (auto it = kek_cache_.find(key_ref); it != kek_cache_.end())
-            kek_cache_.erase(it); // SecureBuffer dtor cleanses
-    }
+    // Hold kek_mutex_ across BOTH the file removal and the cache eviction:
+    // evicting first (or unlocked) lets a concurrent wrap_dek cache-miss
+    // re-read the still-present file and resurrect a retired KEK in memory
+    // (governance safety-S1; ADR-0010 §3 retirement). The lock also covers
+    // plain CA-PEM deletes — harmless, they share no cache entries.
+    std::lock_guard lock{kek_mutex_};
     const fs::path p{key_ref};
     if (!within_base(p)) {
         spdlog::error("key_provider: refusing to delete key_ref outside base: {}",
@@ -292,7 +338,16 @@ bool FileKeyProvider::delete_key(std::string_view key_ref) {
         spdlog::error("key_provider: delete {} failed: {}", p.string(), rm_ec.message());
         return false;
     }
-    return !fs::exists(p, ex_ec);
+    if (fs::exists(p, ex_ec))
+        return false;
+    if (auto it = kek_cache_.find(key_ref); it != kek_cache_.end())
+        kek_cache_.erase(it); // SecureBuffer dtor cleanses
+    return true;
+}
+
+bool FileKeyProvider::delete_kek(std::string_view key_ref) {
+    // Same storage and the same eviction-after-remove discipline.
+    return delete_key(key_ref);
 }
 
 // ── KEK wrap/unwrap seam (ADR-0010 §2) ───────────────────────────────────────

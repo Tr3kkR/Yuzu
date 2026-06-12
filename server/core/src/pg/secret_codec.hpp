@@ -58,6 +58,10 @@ public:
     static constexpr std::size_t kDataTagOffset = 77;
     static constexpr std::size_t kCiphertextOffset = 93;
     static constexpr std::size_t kMinBlobSize = kCiphertextOffset;
+    // INVARIANT: the rotation/retirement header scans read kek_version at
+    // its fixed offset WITHOUT checking the version byte — any future blob
+    // v2 must keep kek_version at offset 1 or update those scans in the
+    // same change (sec-I1).
 
     /// Failure-class taxonomy (ADR-0010 §1/§3). Appears in the server-side
     /// audit event and metric ONLY — external surfaces get one generic
@@ -78,6 +82,21 @@ public:
         std::string message;
     };
 
+    /// Boot-verification failure taxonomy (typed so callers and tests gate
+    /// on the discriminant, never on message wording — governance qe-B1).
+    /// The kind name is also the stable startup-log token operators alert
+    /// on; `message` is the human-readable detail.
+    struct InitError {
+        enum class Kind {
+            kek_unresolvable, ///< registered version has no key material (backup skew / wrong dir / second server)
+            kek_corrupt,      ///< key material present but fingerprint mismatch (torn/corrupt/foreign file)
+            provider_failure, ///< generation/check-value failure (CSPRNG, storage)
+            db_error,         ///< migration/query/commit failure
+        } kind;
+        std::string message;
+    };
+    [[nodiscard]] static std::string_view to_string(InitError::Kind kind);
+
     /// The identity tuple AAD binds to. Encrypted values are non-relocatable
     /// across any of these coordinates. Secret-bearing tables must use stable
     /// PKs; identity-changing migrations decrypt-and-re-encrypt, never copy
@@ -91,21 +110,20 @@ public:
     /// Canonical 8-byte-BE encoding for BIGINT primary keys.
     [[nodiscard]] static std::string encode_bigint_pk(std::int64_t pk);
 
-    enum class PkKind { bigint, text };
-
     /// A registered secret-bearing column — the rotation scan,
     /// oldest_kek_version_in_use() and retirement refusal all walk this
     /// registry. Identifiers are validated (lowercase SQL identifier rule)
-    /// at registration.
+    /// at registration. No pk-type discriminator is needed: scans use
+    /// binary libpq results, whose bytes ARE the canonical AAD encoding for
+    /// every supported pk type (BIGINT → 8-byte BE, TEXT → raw bytes).
     struct SecretColumn {
         std::string store; ///< Postgres schema
         std::string table;
         std::string column;
         std::string pk_column;
-        PkKind pk_kind;
     };
 
-    explicit SecretCodec(KeyProvider& provider);
+    explicit SecretCodec(KekProvider& provider);
 
     SecretCodec(const SecretCodec&) = delete;
     SecretCodec& operator=(const SecretCodec&) = delete;
@@ -120,7 +138,7 @@ public:
     /// operators triage separately from "DB down". Any failure is the
     /// startup_failed() class: a loudly-down server over one silently
     /// serving with unreadable secrets.
-    [[nodiscard]] std::expected<void, std::string> init(PGconn* conn);
+    [[nodiscard]] std::expected<void, InitError> init(PGconn* conn);
 
     /// Newest non-retired KEK version (encrypts use this). 0 before init.
     [[nodiscard]] std::uint32_t active_kek_version() const;
@@ -191,6 +209,12 @@ public:
     /// carries identifiers only (AAD tuple coordinates, kek_version, failure
     /// class). Wiring to the AuditStore happens where the codec is
     /// constructed (the per-store migration PRs); unset = no-op.
+    ///
+    /// Lifetime: whatever the hook captures must outlive the codec, or the
+    /// wiring must `set_audit_hook({})` before destroying the target.
+    /// Attribution: codec-level events are system-attributed — operator
+    /// attribution for rotate/retire rides the ROUTE-level audit event of
+    /// the surface that invoked them (decided at design review, arch-7).
     using AuditHook = std::function<void(std::string_view verb, const std::string& detail_json)>;
     void set_audit_hook(AuditHook hook);
 
@@ -203,7 +227,7 @@ public:
     decrypt_failure_counts() const;
 
 private:
-    KeyProvider& provider_;
+    KekProvider& provider_;
 
     mutable std::mutex mu_;
     std::uint32_t active_version_{0};
@@ -212,9 +236,17 @@ private:
     AuditHook audit_hook_;
     std::map<std::pair<std::string, FailureClass>, std::uint64_t> failure_counts_;
 
-    /// Record + audit a decrypt-side failure, then build the Error.
+    /// Record + audit a DECRYPT-side failure (`secret.decrypt_failure`
+    /// verb + metric counter), then build the Error.
     [[nodiscard]] Error fail(const SecretId& id, FailureClass cls, std::uint32_t kek_version,
                              std::string_view what);
+
+    /// Encrypt-side failure: logged and returned, but NOT audited/counted
+    /// under the decrypt-failure taxonomy (the metric is
+    /// secret_decrypt_failures; an encrypt failure aborts the caller's
+    /// transaction instead — ADR §1 encrypt-failure semantics).
+    [[nodiscard]] static Error fail_encrypt(const SecretId& id, FailureClass cls,
+                                            std::string_view what);
 
     void emit_audit(std::string_view verb, const std::string& detail_json);
 };

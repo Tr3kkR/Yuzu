@@ -14,11 +14,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -258,4 +261,42 @@ TEST_CASE("FileKeyProvider: kek_check_value is deterministic and key-distinct",
     REQUIRE(*k1a == *k1b);
 
     REQUIRE_FALSE(provider.kek_check_value((dir.path / "nope.key").string()));
+}
+
+TEST_CASE("FileKeyProvider: concurrent wrap vs delete_kek never resurrects a deleted KEK",
+          "[key_provider][kek][concurrency]") {
+    // Governance safety-S1/TSan coverage: delete_kek removes the file and
+    // evicts the resident copy under one lock, so a racing wrap either
+    // succeeds (pre-delete) or reports unresolvable — it must never re-cache
+    // the deleted key from a stale file read.
+    TempDir dir;
+    FileKeyProvider provider(dir.path);
+    auto ref = provider.generate_kek("secrets-kek-v1");
+    REQUIRE(ref);
+
+    std::array<std::uint8_t, 32> dek{};
+    const auto aad = bytes_of("aad");
+    std::atomic<bool> stop{false};
+    std::atomic<int> wrapped_after_delete{0};
+    std::atomic<bool> deleted{false};
+
+    std::thread wrapper([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const bool was_deleted = deleted.load(std::memory_order_acquire);
+            auto r = provider.wrap_dek(*ref, dek, aad);
+            if (was_deleted && r.has_value())
+                wrapped_after_delete.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(provider.delete_kek(*ref));
+    deleted.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop.store(true, std::memory_order_relaxed);
+    wrapper.join();
+
+    REQUIRE(wrapped_after_delete.load() == 0);
+    auto r = provider.wrap_dek(*ref, dek, aad);
+    REQUIRE_FALSE(r);
+    REQUIRE(r.error() == yuzu::server::KekError::unresolvable);
 }

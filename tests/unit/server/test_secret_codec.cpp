@@ -14,6 +14,8 @@
 
 #include <libpq-fe.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -23,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using yuzu::server::FileKeyProvider;
@@ -124,14 +127,10 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
     TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
-    REQUIRE(codec.register_secret_column(
-        {"tstore", "things", "secret", "id", SecretCodec::PkKind::bigint}));
-    REQUIRE_FALSE(codec.register_secret_column(
-        {"Bad-Schema", "things", "secret", "id", SecretCodec::PkKind::bigint}));
-    REQUIRE_FALSE(codec.register_secret_column(
-        {"tstore", "things; DROP TABLE x", "secret", "id", SecretCodec::PkKind::bigint}));
-    REQUIRE_FALSE(codec.register_secret_column(
-        {"public", "things", "secret", "id", SecretCodec::PkKind::bigint}));
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE_FALSE(codec.register_secret_column({"Bad-Schema", "things", "secret", "id"}));
+    REQUIRE_FALSE(codec.register_secret_column({"tstore", "things; DROP TABLE x", "secret", "id"}));
+    REQUIRE_FALSE(codec.register_secret_column({"public", "things", "secret", "id"}));
 }
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
@@ -147,7 +146,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
 
     REQUIRE(codec.active_kek_version() == 0);
     auto r = codec.init(conn.get());
-    INFO((r ? std::string{} : r.error()));
+    INFO((r ? std::string{} : r.error().message));
     REQUIRE(r.has_value());
     REQUIRE(codec.active_kek_version() == 1);
     REQUIRE(provider.resolve_kek("secrets-kek-v1"));
@@ -162,7 +161,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
     // no second generation.
     SecretCodec codec2(provider);
     auto r2 = codec2.init(conn.get());
-    INFO((r2 ? std::string{} : r2.error()));
+    INFO((r2 ? std::string{} : r2.error().message));
     REQUIRE(r2.has_value());
     REQUIRE(codec2.active_kek_version() == 1);
 }
@@ -183,7 +182,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
         SecretCodec codec(provider);
         auto r = codec.init(conn.get());
         REQUIRE_FALSE(r.has_value());
-        REQUIRE(r.error().find("kek_unresolvable") != std::string::npos);
+        REQUIRE(r.error().kind == SecretCodec::InitError::Kind::kek_unresolvable);
     }
     SECTION("corrupt KEK file -> kek_corrupt") {
         // Overwrite the key file with different 32 bytes; fresh provider so
@@ -199,7 +198,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
         SecretCodec codec(provider);
         auto r = codec.init(conn.get());
         REQUIRE_FALSE(r.has_value());
-        REQUIRE(r.error().find("kek_corrupt") != std::string::npos);
+        REQUIRE(r.error().kind == SecretCodec::InitError::Kind::kek_corrupt);
     }
 }
 
@@ -351,7 +350,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
     REQUIRE(codec.init(conn.get()).has_value());
     create_test_table(conn.get());
     REQUIRE(codec.register_secret_column(
-        {"tstore", "things", "secret", "id", SecretCodec::PkKind::bigint}));
+        {"tstore", "things", "secret", "id"}));
 
     std::vector<std::string> audit_verbs;
     codec.set_audit_hook(
@@ -454,10 +453,205 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
         // boots cleanly with the v1 key file destroyed.
         SecretCodec codec2(provider);
         auto r2 = codec2.init(conn.get());
-        INFO((r2 ? std::string{} : r2.error()));
+        INFO((r2 ? std::string{} : r2.error().message));
         REQUIRE(r2.has_value());
         REQUIRE(codec2.active_kek_version() == 2);
     }
+}
+
+
+TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk path)",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    PgResult schema{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore")};
+    REQUIRE(schema.ok());
+    PgResult table{PQexec(conn.get(), "CREATE TABLE tstore.cfg ("
+                                      "  key    TEXT PRIMARY KEY,"
+                                      "  secret BYTEA"
+                                      ")")};
+    REQUIRE(table.ok());
+    REQUIRE(codec.register_secret_column({"tstore", "cfg", "secret", "key"}));
+
+    // Canonical pk encoding for TEXT is the raw bytes — identical to what
+    // the binary-format rotation scan reads back.
+    const SecretCodec::SecretId id{"tstore", "cfg", "secret", "oidc_client_secret"};
+    const auto plaintext = bytes_of("s3cr3t-client-credential");
+    auto blob = codec.encrypt(id, plaintext);
+    REQUIRE(blob.has_value());
+    {
+        const char* values[] = {id.row_pk.c_str(), reinterpret_cast<const char*>(blob->data())};
+        const int lengths[] = {static_cast<int>(id.row_pk.size()),
+                               static_cast<int>(blob->size())};
+        const int formats[] = {1, 1};
+        PgResult ins{PQexecParams(conn.get(),
+                                  "INSERT INTO tstore.cfg (key, secret) VALUES ($1, $2)", 2,
+                                  nullptr, values, lengths, formats, 0)};
+        REQUIRE(ins.ok());
+    }
+
+    auto rotated = codec.rotate_kek(conn.get());
+    INFO((rotated ? std::string{} : rotated.error()));
+    REQUIRE(rotated.has_value());
+
+    const char* values[] = {id.row_pk.c_str()};
+    const int lengths[] = {static_cast<int>(id.row_pk.size())};
+    const int formats[] = {1};
+    PgResult sel2{PQexecParams(conn.get(), "SELECT secret FROM tstore.cfg WHERE key = $1", 1,
+                               nullptr, values, lengths, formats, 1)};
+    REQUIRE(sel2.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(sel2.get()) == 1);
+    const auto* bp = reinterpret_cast<const std::uint8_t*>(PQgetvalue(sel2.get(), 0, 0));
+    const std::vector<std::uint8_t> v2_blob{bp, bp + PQgetlength(sel2.get(), 0, 0)};
+    REQUIRE(blob_kek_version(v2_blob) == 2);
+
+    auto back = codec.decrypt(id, v2_blob);
+    INFO((back ? std::string{} : back.error().message));
+    REQUIRE(back.has_value());
+    REQUIRE(std::equal(plaintext.begin(), plaintext.end(), back->data()));
+
+    auto oldest = codec.oldest_kek_version_in_use(conn.get());
+    REQUIRE(oldest.has_value());
+    REQUIRE(*oldest == 2);
+}
+
+TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard, zero-row column",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    SECTION("retire of a never-registered version is refused") {
+        REQUIRE_FALSE(codec.retire_kek(conn.get(), 99).has_value());
+        REQUIRE_FALSE(codec.retire_kek(conn.get(), 1).has_value()); // active
+    }
+
+    SECTION("zero-row registered column: oldest is nullopt, rewrap_all is a no-op") {
+        auto oldest = codec.oldest_kek_version_in_use(conn.get());
+        REQUIRE(oldest.has_value());
+        REQUIRE_FALSE(oldest->has_value());
+        auto rewrapped = codec.rewrap_all(conn.get());
+        REQUIRE(rewrapped.has_value());
+        REQUIRE(*rewrapped == 0);
+    }
+
+    SECTION("oldest_kek_version_in_use reflects the laggard across columns; "
+            "late registration is honored") {
+        PgResult table{PQexec(conn.get(), "CREATE TABLE tstore.other ("
+                                          "  id     BIGINT PRIMARY KEY,"
+                                          "  secret BYTEA"
+                                          ")")};
+        REQUIRE(table.ok());
+
+        auto blob_a = codec.encrypt(test_id(1), bytes_of("alpha"));
+        REQUIRE(blob_a.has_value());
+        upsert_secret(conn.get(), 1, *blob_a);
+
+        const SecretCodec::SecretId other_id{"tstore", "other", "secret",
+                                             SecretCodec::encode_bigint_pk(7)};
+        auto blob_b = codec.encrypt(other_id, bytes_of("beta"));
+        REQUIRE(blob_b.has_value());
+        {
+            const char* values[] = {"7", reinterpret_cast<const char*>(blob_b->data())};
+            const int lengths[] = {0, static_cast<int>(blob_b->size())};
+            const int formats[] = {0, 1};
+            PgResult ins{PQexecParams(conn.get(),
+                                      "INSERT INTO tstore.other (id, secret)"
+                                      " VALUES ($1::bigint, $2)",
+                                      2, nullptr, values, lengths, formats, 0)};
+            REQUIRE(ins.ok());
+        }
+
+        // Rotate with only the first column registered: tstore.other is a
+        // laggard the codec cannot see yet.
+        auto rotated = codec.rotate_kek(conn.get());
+        REQUIRE(rotated.has_value());
+        // Register late; the next scans must include it.
+        REQUIRE(codec.register_secret_column({"tstore", "other", "secret", "id"}));
+
+        auto oldest = codec.oldest_kek_version_in_use(conn.get());
+        REQUIRE(oldest.has_value());
+        REQUIRE(**oldest == 1); // the laggard pins the minimum
+
+        REQUIRE_FALSE(codec.retire_kek(conn.get(), 1).has_value()); // still referenced
+
+        auto rewrapped = codec.rewrap_all(conn.get());
+        REQUIRE(rewrapped.has_value());
+        REQUIRE(*rewrapped == 1); // exactly the laggard row
+
+        oldest = codec.oldest_kek_version_in_use(conn.get());
+        REQUIRE(oldest.has_value());
+        REQUIRE(**oldest == 2);
+        REQUIRE(codec.retire_kek(conn.get(), 1).has_value());
+    }
+}
+
+TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+
+    std::vector<std::pair<std::string, std::string>> audit; // verb, detail_json
+    codec.set_audit_hook([&](std::string_view verb, const std::string& detail) {
+        audit.emplace_back(std::string{verb}, detail);
+    });
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    // kek.generated carries the version (structured assert, not substring).
+    REQUIRE(audit.size() == 1);
+    REQUIRE(audit[0].first == "kek.generated");
+    REQUIRE(nlohmann::json::parse(audit[0].second).at("kek_version").get<int>() == 1);
+
+    const auto id = test_id();
+    auto blob = codec.encrypt(id, bytes_of("x"));
+    REQUIRE(blob.has_value());
+
+    // Unknown kek_version: counted under kek_unresolvable, audited with the
+    // identity tuple — and never the ciphertext.
+    auto tampered = *blob;
+    set_blob_kek_version(tampered, 99);
+    REQUIRE_FALSE(codec.decrypt(id, tampered).has_value());
+
+    REQUIRE(audit.size() == 2);
+    REQUIRE(audit[1].first == "secret.decrypt_failure");
+    const auto detail = nlohmann::json::parse(audit[1].second);
+    REQUIRE(detail.at("store").get<std::string>() == "tstore");
+    REQUIRE(detail.at("table").get<std::string>() == "things");
+    REQUIRE(detail.at("column").get<std::string>() == "secret");
+    REQUIRE(detail.at("kek_version").get<int>() == 99);
+    REQUIRE(detail.at("failure_class").get<std::string>() == "kek_unresolvable");
+
+    bool unresolvable_counted = false;
+    for (const auto& [key, n] : codec.decrypt_failure_counts())
+        if (key.first == "tstore" &&
+            key.second == SecretCodec::FailureClass::kek_unresolvable && n == 1)
+            unresolvable_counted = true;
+    REQUIRE(unresolvable_counted);
+
+    // Encrypt-side failures must NOT ride the decrypt-failure taxonomy: an
+    // encrypt with no active KEK (fresh codec, init never run) errors but
+    // emits no audit event and bumps no counter.
+    SecretCodec uninitialized(provider);
+    std::size_t hook_calls = 0;
+    uninitialized.set_audit_hook(
+        [&](std::string_view, const std::string&) { ++hook_calls; });
+    REQUIRE_FALSE(uninitialized.encrypt(id, bytes_of("y")).has_value());
+    REQUIRE(hook_calls == 0);
+    REQUIRE(uninitialized.decrypt_failure_counts().empty());
 }
 
 #endif // YUZU_TEST_ENABLE_PG

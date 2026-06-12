@@ -77,15 +77,20 @@ public:
     /// Best-effort removal (rotation / cleanup). Returns true if the key is
     /// gone afterwards (including the already-absent case).
     virtual bool delete_key(std::string_view key_ref) = 0;
+};
 
-    // ── KEK wrap/unwrap seam (ADR-0010 §2) ───────────────────────────────────
-    //
-    // The codec↔provider contract is wrap/unwrap, NOT key export (#1333
-    // HIGH-2): `SecretCodec` holds opaque `key_ref`s and never sees raw KEK
-    // bytes, so a PKCS#11/KMS provider with a non-exportable KEK implements
-    // this same interface by delegating to the token. The `load_key` raw-PEM
-    // path above is the CA/TLS key contract and is NOT part of the secrets
-    // seam.
+/// KEK wrap/unwrap seam (ADR-0010 §2) — a SEPARATE interface from
+/// `KeyProvider`, deliberately (interface segregation, governance arch-S2):
+/// the two contracts are disjoint. `KeyProvider` is the raw-PEM CA/TLS key
+/// custody contract; `KekProvider` is wrap/unwrap, NOT key export (#1333
+/// HIGH-2) — `SecretCodec` holds opaque `key_ref`s and never sees raw KEK
+/// bytes. A PKCS#11/KMS secrets provider implements ONLY this interface by
+/// delegating to the token (a non-exportable KEK is fully supported, and the
+/// realistic split deployment — KMS for secrets, file for the CA root —
+/// needs the interfaces separable). `FileKeyProvider` implements both.
+class KekProvider {
+public:
+    virtual ~KekProvider() = default;
 
     /// Mint a fresh 256-bit KEK under `key_id` (ADR naming:
     /// "secrets-kek-v<N>") and persist it durably. Returns the opaque
@@ -97,8 +102,9 @@ public:
     /// Resolve an existing KEK by its logical `key_id` (the inverse of
     /// `generate_kek`, for boot verification: the substrate meta table
     /// records versions + check values only — never refs or key material —
-    /// so the codec re-derives each version's ref through the provider).
-    /// std::nullopt when no such key exists.
+    /// so the codec re-derives each version's ref through the provider; for
+    /// a file provider this is a path, for PKCS#11 a CKA_LABEL lookup, for
+    /// KMS an alias). std::nullopt when no such key exists.
     [[nodiscard]] virtual std::optional<std::string> resolve_kek(std::string_view key_id) = 0;
 
     /// Wrap a 32-byte DEK under the KEK at `key_ref`: AES-256-GCM, fresh
@@ -122,11 +128,19 @@ public:
     /// `key_ref` does not resolve.
     [[nodiscard]] virtual std::optional<std::array<std::uint8_t, 32>>
     kek_check_value(std::string_view key_ref) = 0;
+
+    /// Delete a retired KEK from provider storage. Best-effort; true if gone
+    /// afterwards. The ONLY sanctioned caller is `SecretCodec::retire_kek`,
+    /// which enforces the zero-references precondition (ADR-0010 §3) —
+    /// nothing else may destroy KEK material.
+    virtual bool delete_kek(std::string_view key_ref) = 0;
 };
 
 /// File-backed key store. Keys live as `<base_dir>/<key_id>.key` with mode 0600
-/// inside a 0700 directory. `key_ref` is the absolute file path.
-class FileKeyProvider : public KeyProvider {
+/// inside a 0700 directory. `key_ref` is the absolute file path. Implements
+/// BOTH custody contracts: raw-PEM CA/TLS keys (`KeyProvider`) and the
+/// secrets KEK wrap/unwrap seam (`KekProvider`).
+class FileKeyProvider : public KeyProvider, public KekProvider {
 public:
     explicit FileKeyProvider(std::filesystem::path base_dir);
 
@@ -153,6 +167,7 @@ public:
                std::span<const std::uint8_t> wrap_aad) override;
     [[nodiscard]] std::optional<std::array<std::uint8_t, 32>>
     kek_check_value(std::string_view key_ref) override;
+    bool delete_kek(std::string_view key_ref) override;
 
     /// Exposed for callers/tests that need the resolved on-disk location for a
     /// given id without storing anything.

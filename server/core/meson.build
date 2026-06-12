@@ -234,13 +234,17 @@ qrcodegen_dep = declare_dependency(
 
 # KeyProvider leaf target (ADR-0010, #1320 PR 4, governance arch-S3).
 # key_provider.{hpp,cpp} is extracted from yuzu_server_core_lib so the pg/
-# substrate (SecretCodec takes a KeyProvider&) can grow into its own library
+# substrate (SecretCodec takes a KekProvider&) can grow into its own library
 # later without a meson graph cycle: pg → key_provider is a leaf edge, while
 # key_provider → server_core would have been a back edge. OpenSSL is required
 # here unconditionally (AES-256-GCM KEK wrap/unwrap + SHA-256 check values +
-# OPENSSL_cleanse zeroization) — on Windows openssl_dep resolves via the cmake
-# probe above; a disabler fails the configure loudly, which is correct
-# (fail-closed beats a server quietly built without the secrets seam).
+# OPENSSL_cleanse zeroization). A disabler would NOT fail loudly — it would
+# silently disable this target and everything that links it (the whole
+# server), so guard explicitly (governance build-S1).
+if is_disabler(openssl_dep) or not openssl_dep.found()
+  error('OpenSSL is required for yuzu_key_provider (ADR-0010 secrets seam); '
+        + 'vcpkg.json makes it an unconditional dependency on every platform')
+endif
 yuzu_key_provider_lib = static_library(
   'yuzu_key_provider',
   files('src/key_provider.cpp'),
