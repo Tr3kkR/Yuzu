@@ -24,6 +24,7 @@
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_perf.hpp"
+#include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
 #include "tar_aggregator.hpp"
 #include "tar_sql_executor.hpp"
@@ -368,6 +369,7 @@ private:
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
+    yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -452,44 +454,92 @@ private:
     // fleet_snapshot, so a slow/hung disk IOCTL under the lock would stall them
     // and the /viz hot path. Only the prev_perf_ read-modify-write needs the
     // lock; next_snapshot_id is atomic and insert_perf_sample takes its own.
+    //
+    // A2: the per-app top-N sampler (tar_proc_perf) rides the SAME tick under
+    // its OWN `procperf` source toggle — disabling device perf does not kill
+    // per-app sampling or vice versa (both die when the tar.perf trigger is
+    // unregistered via perf_interval_seconds=0).
     int do_collect_perf(yuzu::CommandContext& ctx) {
+        int rc = 0;
         if (!source_enabled(*db_, "perf")) {
             ctx.write_output("tar|collect_perf|0|source_disabled");
-            return 0;
+        } else {
+            const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
+            if (!cur.valid) {
+                ctx.write_output("tar|collect_perf|0|unsupported_platform");
+            } else {
+                yuzu::tar::PerfSample sample;
+                {
+                    std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
+                    sample = yuzu::tar::derive_sample(prev_perf_, cur);
+                    prev_perf_ = cur;
+                }
+                if (!sample.valid) {
+                    ctx.write_output("tar|collect_perf|0|baseline");
+                } else {
+                    yuzu::tar::PerfRow row;
+                    row.ts = cur.ts_epoch;
+                    row.snapshot_id = next_snapshot_id();
+                    row.cpu_pct = sample.cpu_pct;
+                    row.mem_used_pct = sample.mem_used_pct;
+                    row.commit_pct = sample.commit_pct;
+                    row.disk_read_bps = sample.disk_read_bps;
+                    row.disk_write_bps = sample.disk_write_bps;
+                    row.disk_read_lat_us = sample.disk_read_lat_us;
+                    row.disk_write_lat_us = sample.disk_write_lat_us;
+                    row.net_rx_bps = sample.net_rx_bps;
+                    row.net_tx_bps = sample.net_tx_bps;
+                    if (!db_->insert_perf_sample(row)) {
+                        ctx.write_output("error|perf insert failed");
+                        rc = 1;
+                    } else {
+                        ctx.write_output("tar|collect_perf|1|sample_recorded");
+                    }
+                }
+            }
         }
-        const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
-        if (!cur.valid) {
-            ctx.write_output("tar|collect_perf|0|unsupported_platform");
-            return 0;
+
+        // A2 per-app leg (independent of the device leg's outcome).
+        if (!source_enabled(*db_, "procperf")) {
+            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            return rc;
         }
-        yuzu::tar::PerfSample sample;
+        auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
+        if (!proc_cur.valid) {
+            ctx.write_output("tar|collect_procperf|0|unsupported_platform");
+            return rc;
+        }
+        const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
+        const auto redaction = load_redaction_patterns(*db_);
+        std::vector<yuzu::tar::ProcPerfSample> samples;
         {
-            std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
-            sample = yuzu::tar::derive_sample(prev_perf_, cur);
-            prev_perf_ = cur;
+            std::lock_guard lock(collect_mu_); // prev_proc_ read-modify-write only
+            samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
+            prev_proc_ = std::move(proc_cur);
         }
-        if (!sample.valid) {
-            ctx.write_output("tar|collect_perf|0|baseline");
-            return 0;
+        if (samples.empty()) {
+            ctx.write_output("tar|collect_procperf|0|baseline");
+            return rc;
         }
-        yuzu::tar::PerfRow row;
-        row.ts = cur.ts_epoch;
-        row.snapshot_id = next_snapshot_id();
-        row.cpu_pct = sample.cpu_pct;
-        row.mem_used_pct = sample.mem_used_pct;
-        row.commit_pct = sample.commit_pct;
-        row.disk_read_bps = sample.disk_read_bps;
-        row.disk_write_bps = sample.disk_write_bps;
-        row.disk_read_lat_us = sample.disk_read_lat_us;
-        row.disk_write_lat_us = sample.disk_write_lat_us;
-        row.net_rx_bps = sample.net_rx_bps;
-        row.net_tx_bps = sample.net_tx_bps;
-        if (!db_->insert_perf_sample(row)) {
-            ctx.write_output("error|perf insert failed");
+        const auto snap_id = next_snapshot_id();
+        std::vector<yuzu::tar::ProcPerfRow> rows;
+        rows.reserve(samples.size());
+        for (auto& s : samples) {
+            yuzu::tar::ProcPerfRow r;
+            r.ts = ts;
+            r.snapshot_id = snap_id;
+            r.name = std::move(s.name);
+            r.instances = s.instances;
+            r.cpu_pct = s.cpu_pct;
+            r.ws_bytes = s.ws_bytes;
+            rows.push_back(std::move(r));
+        }
+        if (!db_->insert_proc_perf_samples(rows)) {
+            ctx.write_output("error|procperf insert failed");
             return 1;
         }
-        ctx.write_output("tar|collect_perf|1|sample_recorded");
-        return 0;
+        ctx.write_output(std::format("tar|collect_procperf|{}|apps_recorded", rows.size()));
+        return rc;
     }
 
     // ── collect_slow: services + users ────────────────────────────────────────

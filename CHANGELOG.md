@@ -97,6 +97,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
+  Each Windows agent now records, on the same 30 s perf tick, the **top 10
+  applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)
+  into the on-device TAR edge warehouse — `$ProcPerf_Live` (7-day window) and
+  `$ProcPerf_Hourly` (31-day per-app avg/max rollup). One
+  `NtQuerySystemInformation` snapshot per tick: no PDH, no WMI, no per-process
+  handles. Samples are aggregated per image name (12 chrome.exe processes =
+  one row, `instances=12`); `cpu_pct` is the app's share of total machine
+  capacity, matching Task Manager. Privacy: **image names only — never
+  command lines**; TAR redaction patterns apply to the name; the whole source
+  has its own **`procperf_enabled`** toggle (default `true`) independent of
+  the device-level sampler, so per-app visibility can be disabled on its own.
+  Queryable via `tar.sql`.
+- **TAR: warehouse tables are now ensured on every database open.** Fixes an
+  upgrade bug where tables introduced by a newer release (the perf tier, and
+  now procperf) were never created on a pre-existing `tar.db` — the schema DDL
+  only ran on first-time migration, so upgraded agents failed those inserts
+  until the database was deleted. The DDL is idempotent (`IF NOT EXISTS`) and
+  now runs on each open.
 - **DEX: fleet performance rollup + device perf sparklines.** Two new surfaces
   over the device perf telemetry: (1) every Windows agent ships its current
   utilization (CPU busy %, commit-charge % of limit, per-IO disk latency —
