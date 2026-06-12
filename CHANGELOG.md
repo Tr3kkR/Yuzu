@@ -710,15 +710,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Token-store storage failure now surfaces as `503 storage unavailable` on
-  `GET`/`POST`/`DELETE /api/v1/tokens`, never as `404`/empty list (#347 CH-3).**
-  An `ApiTokenStore` whose SQLite database never opened (bad data dir,
-  permissions) previously collapsed into the not-found path: `DELETE
-  /api/v1/tokens/{token_id}` returned `404 token not found` for a storage
-  outage and `GET /api/v1/tokens` masked it as an empty `200` list. The REST
-  guards now check `is_open()`, mirroring the dashboard API-tokens fragment.
-  The identical-404 anti-enumeration response for not-found vs not-owner is
-  unchanged.
+- **Token-store DB-open failure at startup now surfaces as `503 service
+  unavailable` on `GET`/`POST`/`DELETE /api/v1/tokens`, never as `404`/empty
+  list (#347 CH-3).** An `ApiTokenStore` whose SQLite database failed to open
+  at startup (bad data dir, permissions) previously collapsed into the
+  not-found path: `DELETE /api/v1/tokens/{token_id}` returned `404 token not
+  found` for a storage outage and `GET /api/v1/tokens` masked it as an empty
+  `200` list. The REST guards now check `is_open()`, mirroring the dashboard
+  API-tokens fragment, and emit the same `service unavailable` message as
+  every other store-down guard so message-grep alerting stays unified. The
+  identical-404 anti-enumeration response for not-found vs not-owner is
+  unchanged. Mid-request I/O errors on a connection that opened successfully
+  remain a tracked residual on #347.
 - **Agents enrolling *through the gateway* now receive a per-agent client
   certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
   per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the

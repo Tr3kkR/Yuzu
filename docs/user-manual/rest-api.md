@@ -558,7 +558,7 @@ Remove a role assignment from this management group.
 
 API tokens provide non-interactive authentication for scripts and automation. Tokens are scoped to the creating user's permissions. The raw token string is returned exactly once at creation time and cannot be retrieved afterward.
 
-**Storage failure:** if the server's token store is unavailable (its database failed to open — bad data directory, permissions), all three token endpoints return `503` with message `storage unavailable` rather than `404` or an empty list, so automation can distinguish a server-side outage from a missing token.
+**Storage failure:** if the server's token store database failed to open at startup (bad data directory, permissions), all three token endpoints return `503` with message `service unavailable` rather than `404` or an empty list, so automation can distinguish a server-side outage from a missing token. Note that Bearer-token *authentication* against an unavailable token store deliberately fails closed with `401`, not `503` — an automation client seeing unexpected `401`s during an outage should check server health (`/readyz` reports `api_token_store`) before rotating credentials.
 
 #### `GET /api/v1/tokens`
 
