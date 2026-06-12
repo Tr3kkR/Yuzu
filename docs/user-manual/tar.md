@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors four categories of system activity:
+TAR monitors five categories of system activity:
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -14,8 +14,11 @@ TAR monitors four categories of system activity:
 | **Network connections** | 60 seconds (fast) | Connection opened, connection closed |
 | **Services** | 300 seconds (slow) | Service started, stopped, state changed |
 | **User sessions** | 300 seconds (slow) | User login, user logout |
+| **Performance** | 30 seconds (perf) | Device CPU/memory/disk/network sample (a scalar reading, not a diff) |
 
-Each collection cycle takes a snapshot of the current state, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
+The first four categories take a snapshot of the current state each cycle, compare it to the previous snapshot, and record only the differences as events. This keeps the database compact while providing full visibility into system changes.
+
+The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
 ## Querying TAR data
 
@@ -92,6 +95,8 @@ Use the `configure` action to adjust TAR behavior.
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
 | `user_enabled` | `true` / `false` | `true` | Toggle the user-session collector on this host |
+| `perf_enabled` | `true` / `false` | `true` | Toggle the performance sampler on this host |
+| `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples. Set to `0` to disable the perf trigger entirely (equivalent to `perf_enabled=false`). |
 | `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
 | `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
@@ -129,6 +134,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
+| **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
 
 Status values:
 
@@ -248,9 +254,17 @@ TAR is designed for minimal performance overhead:
 
 - **Fast collection** (processes + network): typically completes in under 100ms
 - **Slow collection** (services + users): typically completes in under 200ms
-- **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day
+- **Performance sampling**: a handful of kernel-counter reads every 30s; one row written per sample. The `$Perf_Live` 7-day window holds ~20,000 rows (~1-2 MB) per endpoint at the default cadence.
+- **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window)
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
 - **Automatic purge**: old events are removed hourly based on the retention setting
+
+> **Upgrade note (always-on perf sampling).** On upgrade to this release, every
+> Windows agent begins performance sampling automatically (`perf_enabled`
+> defaults to `true`, 30-second cadence). Expect a small steady-state CPU/IO
+> footprint and ~1-2 MB of additional `tar.db` growth per endpoint. To opt out,
+> set `perf_enabled=false` (or `perf_interval_seconds=0`) via the `configure`
+> action — fleet-wide through a scheduled instruction, or per-device.
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System
@@ -267,12 +281,13 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **TCP** | `$TCP_Live` (5000 rows) | `$TCP_Hourly` (24h) | `$TCP_Daily` (31d) | `$TCP_Monthly` (12mo) |
 | **Service** | `$Service_Live` (5000 rows) | `$Service_Hourly` (24h) | -- | -- |
 | **User** | `$User_Live` (5000 rows) | -- | `$User_Daily` (31d) | -- |
+| **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 
-- **Live** tables hold the most recent raw events with a 5000-row cap (oldest rows are evicted).
-- **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours.
+- **Live** tables hold the most recent raw events with a 5000-row cap (oldest rows are evicted). **Exception: `$Perf_Live` is time-based (7 days), not row-capped** — a fixed-cadence sampler keeps a *time window*, so raising `perf_interval_seconds` must not shrink the history it covers.
+- **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours (perf hourly: 31 days).
 - **Daily** tables aggregate per day, retained for 31 days.
 - **Monthly** tables aggregate per month, retained for 12 months.
-- Service only has live and hourly tiers. User only has live and daily tiers.
+- Service only has live and hourly tiers. User only has live and daily tiers. Perf has live and hourly tiers.
 
 ### Key columns by table type
 
@@ -283,6 +298,8 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 **Service tables:** `ts`, `name`, `status`, `prev_status`, `action` (started/stopped/state_changed). Hourly tier adds `change_count`.
 
 **User tables:** `ts`, `user`, `domain`, `logon_type`, `action` (login/logout). Daily tier adds `login_count`.
+
+**Perf tables:** `ts`, `cpu_pct`, `mem_used_pct`, `commit_pct`, `disk_read_bps`, `disk_write_bps`, `disk_read_lat_us`, `disk_write_lat_us`, `net_rx_bps`, `net_tx_bps` (all numeric; rates are bytes/sec, latencies are µs per I/O). `$Perf_Hourly` carries per-hour `samples`, `cpu_avg`/`cpu_max`, `mem_avg`/`mem_max`, `commit_avg`, and avg/max throughput and latency columns. Collection is trigger-driven (`tar.collect_perf`, every `perf_interval_seconds`), so the audit trail for perf is the `configure` action that enables/paces it, not a per-sample dispatch record.
 
 ### Querying with SQL
 

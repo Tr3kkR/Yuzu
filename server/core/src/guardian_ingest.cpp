@@ -6,6 +6,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "dex_blast_radius.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
 
@@ -33,7 +34,8 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
 } // namespace
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
-                              const pb::CommandResponse& resp) {
+                              const pb::CommandResponse& resp,
+                              BlastRadiusDetector* blast_radius) {
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
@@ -80,6 +82,22 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         if (auto r = store.insert_event(ev_row); !r) {
             spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}", agent_id,
                          ev_row.rule_id, r.error());
+            return;
+        }
+        // Fleet-wide incident detection — RULELESS observations only, and only
+        // AFTER the event committed (a rolled-back duplicate must never count a
+        // device twice). Uses the SHARED kObservationRuleId constant, same one
+        // is_reserved_rule_id keys on, so the feed gate and the projection guard
+        // can't desync (gov architect/consistency). The window uses server
+        // receipt time, not the agent's clock — "blast radius" is about
+        // simultaneity as the FLEET experiences it, and a skewed agent clock
+        // must not smear the window.
+        if (blast_radius && ev_row.rule_id == kObservationRuleId) {
+            const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+            blast_radius->observe(ev_row.event_type,
+                                  blast_subject_from_detail(ev_row.detail_json), agent_id, now);
         }
         return;
     }

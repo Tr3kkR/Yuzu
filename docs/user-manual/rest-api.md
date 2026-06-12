@@ -2199,8 +2199,17 @@ Create a new webhook subscription.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `url` | string | Yes | HTTPS endpoint to receive POST notifications |
-| `event_types` | array | Yes | Events to subscribe to |
+| `event_types` | array | Yes | Events to subscribe to (see the table below) |
 | `secret` | string | No | HMAC-SHA256 secret for payload signing |
+
+**Event types** (the `event_types` filter matches these literal strings):
+
+| Event type | Fired when | Notable payload fields |
+|---|---|---|
+| `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
+| `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
+| `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
+| `dex.blast_radius` | ≥5 distinct devices report the same DEX signal `(obs_type, subject)` within a 15-minute window (see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 

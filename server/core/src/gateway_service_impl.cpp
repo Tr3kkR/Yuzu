@@ -406,7 +406,8 @@ gw_enrolled:
         // no-cert (identical to a nullopt return — the agent stays on bootstrap).
         std::optional<std::pair<std::string, std::string>> issued;
         try {
-            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
+                                        CertIssuanceSource::GatewayProxy);
         } catch (const std::exception& e) {
             spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}",
                           info.agent_id(), e.what());
@@ -626,7 +627,8 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* /*contex
 
     if (guaranteed_state_store_) {
         // Shared one-true-path ingest (same fn the direct Subscribe loop uses).
-        ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
+        ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
+                                 blast_radius_detector_);
     } else {
         spdlog::warn("[gateway] ForwardGuardianMessage: no guaranteed-state store wired — "
                      "dropping event from agent {}",

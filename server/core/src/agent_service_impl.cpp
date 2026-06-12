@@ -543,7 +543,8 @@ enrolled:
         // the gateway ProxyRegister path so both issuance sites are crash-safe.
         std::optional<std::pair<std::string, std::string>> issued;
         try {
-            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
+                                        CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
             spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
         } catch (...) {
@@ -1035,7 +1036,8 @@ grpc::Status AgentServiceImpl::Subscribe(
             // cert-bound from this Subscribe session. Always skip the
             // response-store / executions path.
             if (guaranteed_state_store_)
-                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
+                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
+                                         blast_radius_detector_);
             continue;
         }
         // Solicited __guard__ replies (push_rules / reconcile carry a command_id)

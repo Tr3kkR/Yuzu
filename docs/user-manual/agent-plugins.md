@@ -63,6 +63,7 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `processors` | CPU model, core count, clock speed, and socket information. |
 | `memory` | Total physical memory, speed, and slot details. |
 | `disks` | Physical disk model, size, interface type, and health status. |
+| `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
 ### device_identity
 
@@ -256,6 +257,20 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | `flush_dns` | Flush the local DNS resolver cache. |
 | `ping` | ICMP ping a target host and return round-trip statistics. |
+
+### netprobe
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Active network measurement — RTT, jitter, and packet loss to operator-chosen targets using native system calls (no shell-out). Complements `network_actions.ping` (a one-shot reachability check) with structured, schedulable, trendable measurements that land in the response store for historical queries. **Admin-only** (a network-reconnaissance primitive). Bounded at 4 targets × 10 samples × 3 s per invocation. |
+
+| Action | Description |
+|---|---|
+| `icmp` | ICMP echo RTT, jitter (population stddev), and packet loss to up to 4 comma-separated IPv4 targets. `IcmpSendEcho` on Windows (whole-millisecond granularity — a sub-ms LAN hop reads 0.0 ms; use `tcp` for LAN fidelity); unprivileged ICMP datagram sockets on macOS/Linux. **On Linux, ICMP requires `net.ipv4.ping_group_range` to include the agent's GID** — a restricted kernel returns `status: not-permitted` (never fake loss). Use `tcp` on fleets where the sysctl is not set. |
+| `tcp` | TCP connect-time RTT, jitter, and connection failure rate to up to 4 targets on a chosen port (default 443). Sub-millisecond, unprivileged everywhere — the right probe for targets that drop ICMP (VPN gateways, SaaS edges). |
+| `dns` | Name-resolution wall time (`getaddrinfo`) for up to 4 names — reports `resolve_ms`, status, and address count. |
 
 ### wifi
 

@@ -118,6 +118,7 @@ Before upgrading any component:
 - [ ] Back up all data (see [Server Administration](server-administration.md))
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
+  - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -134,6 +135,14 @@ sudo systemctl stop yuzu-server
 # 2. Back up data
 sudo cp /var/lib/yuzu/*.db /var/lib/yuzu/backup/
 sudo cp /etc/yuzu/*.cfg /var/lib/yuzu/backup/
+# ... and the Postgres database, if provisioned. The DSN lives only in the
+# root-only env file (NOT in interactive shells) — load it, and keep the
+# password off the argv via PGPASSWORD. Full recipe + restore procedure:
+# server-admin.md § PostgreSQL Substrate.
+sudo sh -c '. /etc/yuzu/yuzu-server.env
+  export PGPASSWORD="$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^[a-z]+://[^:/@]*:([^@]*)@.*\$!\1!")"
+  pg_dump --format=custom --file=/var/lib/yuzu/backup/yuzu-pg.dump \
+    "$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^([a-z]+://[^:/@]*):[^@]*@!\1@!")"'
 
 # 3. Replace the binary
 sudo cp yuzu-server /usr/local/bin/yuzu-server
@@ -177,9 +186,16 @@ Schema migrations execute automatically during the first `up` with the new image
 mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
 docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
   tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+
+# PostgreSQL state (the postgres-data volume) — pg_dump is consistent
+# against a LIVE database, no stop required:
+docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+  > "yuzu-pg-$(date +%F).dump"
 ```
 
-> **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap.
+> **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap. The `pg_dump` half has no such caveat — logical dumps are transactionally consistent by construction. **Never** back up Postgres by `tar`-ing the `postgres-data` volume while the database is running; a torn copy of `pg_wal/` is unrecoverable, which is why the procedure above dumps through the database instead.
+
+> **Restore-pairing (ADR-0010 — forward reference):** once envelope-encrypted secrets land, the Postgres dump contains ciphertext + wrapped DEKs only and is unusable without the matching `KeyProvider` keys directory. Back up and restore the two **as a pair** — full procedure in [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate), key-management runbook tracked in #1341.
 
 **Rollback if a migration fails** (Docker):
 
@@ -190,6 +206,10 @@ docker compose -f docker-compose.reference.yml down server
 # 2. Restore the previous backup over the existing volume
 docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
   sh -c 'rm -rf /data/* && tar xzf /backup/yuzu-data-YYYY-MM-DD.tar.gz -C /data'
+
+# 2b. Restore the Postgres dump (postgres container still running)
+docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+  --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 
 # 3. Pin the previous release
 export YUZU_VERSION=0.9.0

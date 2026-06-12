@@ -118,23 +118,64 @@ aggregates and are not audited. Full request/response shapes are in
 ## Platform coverage
 
 The **Windows** collector is the most complete — it covers the full Windows
-signal catalogue. A **macOS** collector ships too, but is deliberately
-*limited*: an unprivileged collector that reuses the same OS-neutral signal
-types and covers roughly ten of the eleven experience headings (crashes and
-hangs, resource pressure, service failures, boot/resume reports, storage
-pressure, battery health, and more). **Linux** endpoints report no DEX signals
-yet — a collector is a planned follow-up. Because the by-OS and cross-OS views
+signal catalogue. Alongside the event-log observer, Windows also runs a
+**state poll** that emits `storage.low` (a fixed volume ≥90% full or under
+5 GiB free) and battery health (`hw.error`, when full-charge capacity drops
+below 80% of design) — the same two signals, and the same thresholds, the
+macOS collector emits, so they render identically across both platforms. A
+**macOS** collector ships too, but is deliberately *limited*: an unprivileged
+collector that reuses the same OS-neutral signal types and covers roughly ten
+of the eleven experience headings (crashes and hangs, resource pressure,
+service failures, boot/resume reports, storage pressure, battery health, and
+more). **Linux** endpoints report no DEX signals yet — a collector is a
+planned follow-up. Because the by-OS and cross-OS views
 label each OS with its live *signal scope*, a fleet running a narrower collector
 reads as **less observed**, never as healthier; the rates are read *within* an
 OS, never across. The exact macOS source mapping — and what additional fidelity
 the Endpoint Security Framework or other entitlements would unlock — is in
 [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 
+## Fleet incident alerts (blast radius)
+
+Beyond the per-signal drill-downs, the server watches for a single failure
+*spreading across the fleet*. When **≥5 distinct devices** report the same DEX
+signal — the same `obs_type` **and** the same subject (e.g. `process.crashed` /
+`chrome.exe`) — within a **15-minute** sliding window, it raises a fleet
+incident. Detection runs at the shared observation ingest point, so both
+directly-connected and gateway-routed agents contribute, and the window uses
+server receipt time (an agent with a skewed clock cannot smear it).
+
+Each incident fires two things:
+
+- an **operator notification** (dashboard bell, severity `warn`), and
+- a **`dex.blast_radius`** webhook / offload event you can subscribe to so an
+  ITSM auto-opens the incident.
+
+`dex.blast_radius` payload:
+
+| Field | Meaning |
+|---|---|
+| `obs_type` | the signal type (e.g. `process.crashed`) |
+| `subject` | the failing entity (e.g. `chrome.exe`; empty for subject-less signals) |
+| `device_count` | distinct devices that reported the pair within the window |
+| `window_seconds` | the detection window (900 for the 15-minute default) |
+
+A standing incident re-alerts at most once per hour (per-pair cooldown), and a
+global per-minute fan-out cap keeps a correlated multi-subject incident (e.g. a
+bad update crashing many apps at once) from flooding your ITSM. The thresholds
+(5 devices / 15 min / 1 h) are fixed in this release; operator-configurable
+thresholds are a planned follow-up. Detector activity is observable via the
+`yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
+[Webhooks](rest-api.md#event-subscriptions-webhooks).
+
 ## Turning it off
 
 DEX collection is a **deploy-time agent setting**. Start the agent with
 **`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
-observer and sends no DEX telemetry of any kind. There is no server-side runtime
+observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
+off the DEX event observer and the Windows state poll, but the TAR performance
+sampler is a separate subsystem — disable it with `perf_enabled=false` (see
+[TAR configuration](tar.md#configuration)). There is no server-side runtime
 toggle today; per-category collection toggles and an individual-view kill switch
 are named roadmap items (see the enterprise-readiness plan).
 

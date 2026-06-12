@@ -97,6 +97,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
+  UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
+  Three deliverables ahead of the substrate's fail-closed flip: (1) the
+  provisioning helper `install-server-postgres.sh` now ships in the server
+  `.deb`/`.rpm` (at `/usr/share/yuzu/scripts/`, invoked **non-fatally** from
+  the package post-install hooks) and in the Linux/macOS release tarballs
+  (`scripts/`); (2) operator backup/restore documentation now covers
+  PostgreSQL state — `pg_dump --format=custom`/`pg_restore` procedures for
+  native and Docker deployments in `docs/user-manual/server-admin.md` (new
+  "PostgreSQL Substrate" section) and `upgrading.md`, including the ADR-0010
+  **restore-pairing invariant** (database and `KeyProvider` keys-dir backups
+  restore *together*; runbook tracked in #1341) and an explicit warning never
+  to `tar` a live `postgres-data` volume; (3) the native UAT rig
+  (`scripts/start-UAT.sh`) now stands up a `yuzu-postgres:local` sidecar
+  container on loopback `:15433` with per-run random, distinct
+  superuser/app-role credentials, exports `YUZU_POSTGRES_DSN` to the server,
+  and tears the container down on `stop` — a missing docker/sidecar is a
+  warning, not a failure, until the #1320 PR 3 fail-closed boot lands
+  (`PG_SOFT_FAIL` flag). The rig's agent-registration poll timeout also
+  rises 30s → 60s (the fleet-health gauge needs a first heartbeat + a
+  recompute window — measured ~37s; the stack was healthy, the poll was
+  just too tight).
+- **DEX: continuous device performance sampling (TAR `perf` warehouse tier).**
+  Every Windows agent now samples CPU busy %, memory used % + commit-charge %,
+  per-IO disk service time (µs) + read/write throughput, and non-loopback
+  network rx/tx throughput every 30 s into the on-device TAR edge warehouse
+  (`$Perf_Live`, 7-day window; `$Perf_Hourly` avg/max rollup, 31-day) — raw
+  samples never cross the wire (ADR-0004 federated model). Raw kernel counters
+  only (`GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`,
+  `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`); no PDH, no WMI, no shell-out. New
+  `tar collect_perf` action and `configure` keys **`perf_enabled`** (default
+  `true`) and **`perf_interval_seconds`** (default 30; `0` disables the trigger
+  entirely). Queryable via `tar.sql`. Linux (`/proc`) and macOS
+  (`host_statistics`) collectors are planned. Threshold-breach alerting (A3) and
+  fleet rollup (A4) are follow-on slices — today's data is collection +
+  raw-SQL query, no dashboard or alert yet.
+- **DEX: fleet blast-radius incident alerting.** When ≥5 distinct devices report
+  the same DEX signal `(obs_type, subject)` within a 15-minute sliding window,
+  the server raises an operator notification (severity `warn`) and fires a new
+  **`dex.blast_radius`** webhook/offload event (payload: `obs_type`, `subject`,
+  `device_count`, `window_seconds`) — subscribe to auto-open ITSM incidents.
+  Detection runs at the shared Guardian ingest chokepoint, so directly-connected
+  and gateway-routed agents both contribute; the window uses server receipt time
+  (clock-skew tolerant). Per-pair 1-hour re-alert cooldown; a global
+  per-minute fan-out cap and a bounded LRU pair map keep it kind to the server
+  and the ITSM sink under a correlated multi-subject incident. Metrics:
+  `yuzu_server_dex_blast_radius_{incidents,fires_dropped,entries_dropped,pairs_evicted}_total`
+  + `yuzu_server_dex_blast_radius_pairs_tracked`. Thresholds are fixed in this
+  release (operator-configurable in a later slice).
+- **DEX: Windows disk-space and battery-health observations.** A Windows
+  state-poll collector (`dex_win_poll`) emits `storage.low` (fixed volume ≥90%
+  full or <5 GiB free, 10-min cadence, via `GetDiskFreeSpaceExW`) and `hw.error`
+  (battery full-charge capacity <80% of design, hourly, via `IOCTL_BATTERY`)
+  on the transition into a bad state (latched; re-arms only on a valid healthy
+  reading). Thresholds match the macOS IOKit poll; zero server change. The DEX
+  display catalogue is now 104 entries, with `storage.low` and battery
+  (`hw.error`) emitted on both Windows and macOS.
+- **Network probes (`netprobe` plugin).** Active RTT, jitter, and packet-loss
+  measurement to operator-chosen targets using native system calls (no
+  shell-out): `network.probe.icmp` (ICMP echo — `IcmpSendEcho` on Windows,
+  unprivileged ICMP datagram sockets on POSIX; on Linux gated by
+  `net.ipv4.ping_group_range`, reporting `not-permitted` rather than fake loss),
+  `network.probe.tcp` (connect-time RTT to a target:port, sub-millisecond,
+  unprivileged everywhere — use where ICMP is dropped), and `network.probe.dns`
+  (`getaddrinfo` resolution timing). Bounded at 4 targets × 10 samples × 3 s,
+  sequential. Recurrence via the scheduler; results trend in the response store.
+  Admin-only execution (network-reconnaissance primitive).
+- **Hardware: installed-driver inventory.** New `hardware drivers` action and
+  `device.hardware.drivers` definition list installed device drivers (name,
+  version, date, provider, class) via `Win32_PnPSignedDriver` on Windows and
+  `/proc/modules` on Linux — supports fleet queries like "devices running driver
+  X older than version Y".
 - **macOS DEX collector — limited, unprivileged.** The DEX observer now ships a
   macOS collector (`dex_macos_collector.cpp` + the pure parsers
   `dex_macos_{signals,oslog,iokit}.{hpp,cpp}`) using four privilege-light

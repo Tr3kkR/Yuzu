@@ -323,6 +323,7 @@ yuzu_server_core_lib = static_library(
     'src/guardian_rule_spec.cpp',
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
+    'src/dex_blast_radius.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',

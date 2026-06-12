@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_blast_radius.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -215,6 +216,26 @@ struct ScopedKeyZero {
     ~ScopedKeyZero() { yuzu::secure_zero(s); }
 };
 
+// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+// detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
+// Register gate — never charset-checked — and is audited verbatim. Without this,
+// an agent_id like `x via=direct` could forge the very `via=` discriminator
+// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
+// every control byte and structural delimiter (space, '=', ',') with '_'; the
+// identity is preserved verbatim in its own audit columns (principal/target_id)
+// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -277,6 +298,21 @@ public:
                           "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
                           "boot reports, …; sum of agent-reported counts since each agent "
                           "started)", "gauge");
+        // D3 blast-radius detector observability (gov SRE OBS-1 / compliance S1).
+        metrics_.describe("yuzu_server_dex_blast_radius_incidents_total",
+                          "Fleet-incident alerts fired (≥min_devices distinct devices, same "
+                          "obs_type+subject, within the window)", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_fires_dropped_total",
+                          "Incident fires suppressed by the global per-minute fan-out rate cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_entries_dropped_total",
+                          "Sightings dropped because the global tracked-entry memory budget was "
+                          "exhausted", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_evicted_total",
+                          "(obs_type,subject) pairs LRU-evicted to admit a new pair at the cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
+                          "Current count of tracked (obs_type,subject) pairs", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -1527,6 +1563,45 @@ public:
                 // shared path. Gateway service exists only in gateway mode.
                 if (gateway_service_)
                     gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
+
+                // D3 fleet-incident alerting (docs/dex-brd-coverage.md): N
+                // distinct devices reporting the same (obs_type, subject)
+                // inside the window → one operator notification + one
+                // webhook/offload event per cooldown. Wired before traffic
+                // (set-before-traffic contract on the detector).
+                blast_radius_detector_.set_on_incident([this](const BlastRadiusIncident& inc) {
+                    const std::string what = inc.subject.empty()
+                                                 ? inc.obs_type
+                                                 : inc.obs_type + " '" + inc.subject + "'";
+                    const std::string title = "Fleet incident: " + what + " on " +
+                                              std::to_string(inc.device_count) + " devices";
+                    const std::string message =
+                        std::to_string(inc.device_count) + " distinct devices reported " +
+                        what + " within the last " + std::to_string(inc.window_seconds / 60) +
+                        " minutes. See /dex for the drill-down.";
+                    spdlog::warn("BlastRadius: {}", title);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Same dual-sink discipline as agent.registered (HP-1/UP-6):
+                    // build the body once, guard each sink separately.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.blast_radius"},
+                                                  {"obs_type", inc.obs_type},
+                                                  {"subject", inc.subject},
+                                                  {"device_count", inc.device_count},
+                                                  {"window_seconds", inc.window_seconds}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.blast_radius", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.blast_radius", body);
+                    }
+                });
+                blast_radius_detector_.set_metrics(&metrics_);
+                agent_service_.set_blast_radius_detector(&blast_radius_detector_);
+                if (gateway_service_)
+                    gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
             }
         }
 
@@ -1838,12 +1913,12 @@ public:
             // exception out of a sync gRPC handler on the exposed one-way-TLS agent
             // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
             std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&)>
-                cert_signer = [this](const std::string& csr_pem,
-                                     const std::string& agent_id)
+                const std::string&, const std::string&, CertIssuanceSource)>
+                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                     CertIssuanceSource src)
                 -> std::optional<std::pair<std::string, std::string>> {
                 try {
-                    return sign_agent_csr(csr_pem, agent_id);
+                    return sign_agent_csr(csr_pem, agent_id, src);
                 } catch (const std::exception& e) {
                     spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
                                   agent_id);
@@ -2382,6 +2457,15 @@ public:
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
 
+        // Same contract for the blast-radius detector: both service impls
+        // borrow it by raw pointer and call observe() from the ingest path the
+        // drain above quiesced. Null before any member teardown (gov
+        // cpp-safety/architect/consistency — the detector destructs early by
+        // member-decl order, so this removes the only reliance on drain timing).
+        agent_service_.set_blast_radius_detector(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_blast_radius_detector(nullptr);
+
         // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
         // drain above guarantees no handler is mid-invocation; null them for the
@@ -2538,7 +2622,13 @@ private:
     /// key is loaded transiently and zeroed before return (incl. exception
     /// unwind) so the crown jewel is not resident for the process lifetime.
     std::optional<std::pair<std::string, std::string>>
-    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id) {
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id,
+                   CertIssuanceSource src) {
+        // #1290: forensic discriminator on the issuance audit — was this minted on a
+        // direct agent connection or relayed by a (potentially compromised) gateway?
+        // The exact population an incident responder scopes when bulk-revoking after
+        // a gateway compromise (the PR5 R-5 confused-deputy compensating control).
+        const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
         auto root = ca_store_->get_root();
@@ -2598,7 +2688,9 @@ private:
                                                  .action = "ca.cert.reissue_blocked",
                                                  .target_type = "AgentCertificate",
                                                  .target_id = rev.serial_hex,
-                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .detail = "reason=revoked_identity cn=" +
+                                                           detail::audit_token(agent_id) +
+                                                           " via=" + via,
                                                  .result = "denied"});
                     }
                     return std::nullopt;
@@ -2691,6 +2783,14 @@ private:
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;
+        // #1296: stamp the STABLE key-based CA identity (and the issuance-time cert
+        // fingerprint, which agent rows previously left blank) so an "issued by this
+        // CA" inventory query survives a subordinate re-key. issuer_key_id hashes the
+        // root's public key (invariant across the re-key); both are best-effort
+        // forensic metadata — a derivation miss does not block issuance.
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
         if (!ca_store_->record_issued(rec)) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
@@ -2706,7 +2806,8 @@ private:
         }
         // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
         // storms / CSR floods (the audit row below is the forensic record).
-        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}}).increment();
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}, {"via", via}})
+            .increment();
 
         if (audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
@@ -2715,7 +2816,9 @@ private:
                                      .action = "ca.cert.issued",
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
-                                     .detail = "purpose=agent cn=" + agent_id,
+                                     .detail =
+                                         "purpose=agent cn=" + detail::audit_token(agent_id) +
+                                         " via=" + via,
                                      // gov consistency: "success" (not "ok") so a
                                      // SIEM filter on ca.% AND result=success
                                      // catches issuance alongside revoke/publish.
@@ -2823,10 +2926,14 @@ private:
         // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
         // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
         // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
-        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint). A
-        // stable key-based CA identity (SubjectKeyIdentifier) is the tracked
-        // follow-up (#1296); nothing in the admission/revocation/CRL paths keys on
-        // the fingerprint, so the two-fingerprints-one-key state is safe today.
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint).
+        //
+        // #1296 resolves the "issued by this CA" query landmine: ca_issued.issuer_key_id
+        // is the STABLE key-based identity (pki::issuer_key_id — a hash of the public
+        // key). Because THIS import keeps the key, that id is unchanged across the
+        // switch, so leaves issued before AND after share one issuer_key_id and
+        // CaStore::list_issued_by_key_id returns the whole population with NO rewrite
+        // here. (issuer_fingerprint stays split two-for-one-key, by design.)
         CaRoot updated = *root;
         updated.cert_pem = intermediate_pem;
         updated.chain_pem = parent_chain_pem;
@@ -2932,6 +3039,12 @@ private:
         rec.next_update =
             std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
                 .count();
+        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+        // cert fingerprint plus the STABLE key id (invariant across a subordinate
+        // re-key) so the CRL history is attributable to the key, not just a cert.
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
         if (!ca_store_->record_crl(rec)) {
             // B-1 (#1240): do NOT report success on a persistence failure. Returning
             // the freshly-built DER here would make the revoke handler audit
@@ -8128,6 +8241,15 @@ private:
     yuzu::MetricsRegistry metrics_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
+    /// direct Subscribe path via agent_service_ and the gateway path via
+    /// gateway_service_). Its on_incident sink fans out to notification +
+    /// webhook + offload. Plain member (no heap): in-memory derived state only.
+    /// DECLARED BEFORE its borrowers (agent_service_ / gateway_service_ /
+    /// agent_server_) so it destructs AFTER them — the detector must outlive any
+    /// ingest thread that holds its raw pointer (gov cpp-safety/architect). stop()
+    /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
+    BlastRadiusDetector blast_radius_detector_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;

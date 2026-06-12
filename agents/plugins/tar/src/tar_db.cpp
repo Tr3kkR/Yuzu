@@ -823,6 +823,46 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
     return true;
 }
 
+bool TarDatabase::insert_perf_sample(const PerfRow& row) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+
+    // Single row per sample interval — no transaction wrapper needed (one
+    // statement is already atomic; one fsync per 30 s is the WAL cost).
+    const char* sql = R"(
+        INSERT INTO perf_live (ts, snapshot_id, cpu_pct, mem_used_pct, commit_pct,
+                               disk_read_bps, disk_write_bps, disk_read_lat_us,
+                               disk_write_lat_us, net_rx_bps, net_tx_bps)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_perf_sample prepare: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_int64(stmt.get(), 1, row.ts);
+    sqlite3_bind_int64(stmt.get(), 2, row.snapshot_id);
+    sqlite3_bind_double(stmt.get(), 3, row.cpu_pct);
+    sqlite3_bind_double(stmt.get(), 4, row.mem_used_pct);
+    sqlite3_bind_double(stmt.get(), 5, row.commit_pct);
+    sqlite3_bind_int64(stmt.get(), 6, row.disk_read_bps);
+    sqlite3_bind_int64(stmt.get(), 7, row.disk_write_bps);
+    sqlite3_bind_int64(stmt.get(), 8, row.disk_read_lat_us);
+    sqlite3_bind_int64(stmt.get(), 9, row.disk_write_lat_us);
+    sqlite3_bind_int64(stmt.get(), 10, row.net_rx_bps);
+    sqlite3_bind_int64(stmt.get(), 11, row.net_tx_bps);
+
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        spdlog::error("insert_perf_sample step: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    return true;
+}
+
 // ── Generic SQL execution ───────────────────────────────────────────────────
 
 std::expected<QueryResult, std::string> TarDatabase::execute_query(const std::string& sql,

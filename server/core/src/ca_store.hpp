@@ -89,10 +89,15 @@ struct IssuedCertRecord {
     /// over the SAME signing key. Those leaves stay fully valid: admission verifies
     /// by the key+DN (`is_yuzu_issued`→`verify_chain`), and revocation matches by
     /// serial — neither consults this column. A future "issued by THIS CA" query
-    /// must therefore key on the stable identity (the key / SubjectKeyIdentifier),
-    /// never on a single fingerprint value. The stable-key-identity follow-up is
-    /// tracked in #1296. Empty until a caller populates it.
+    /// must therefore key on the stable identity (`issuer_key_id` below), never on
+    /// a single fingerprint value. Empty until a caller populates it.
     std::string issuer_fingerprint;
+    /// STABLE key-based CA identity (#1296): SHA-256 of the issuer's subjectPublicKey
+    /// (`pki::issuer_key_id`). Unlike issuer_fingerprint this is invariant across a
+    /// subordinate-CA re-key (same key, new issuer cert), so it — NOT the
+    /// fingerprint — is the correct key for an "issued by THIS CA" inventory query
+    /// (`CaStore::list_issued_by_key_id`). Empty on pre-v5 / unpopulated rows.
+    std::string issuer_key_id;
 };
 
 struct CrlVersionRecord {
@@ -104,6 +109,9 @@ struct CrlVersionRecord {
     /// SHA-256 fingerprint of the root that signed this CRL (see IssuedCertRecord).
     /// Empty until populated; prevents serving an old-root CRL after a re-key.
     std::string issuer_fingerprint;
+    /// STABLE key-based identity of the signing CA (#1296, see IssuedCertRecord).
+    /// Invariant across a subordinate re-key; empty on pre-v5 rows.
+    std::string issuer_key_id;
 };
 
 /// Canonicalise a certificate serial to the engine's stored form — uppercase
@@ -135,6 +143,13 @@ public:
     [[nodiscard]] bool record_issued(const IssuedCertRecord& rec);
     [[nodiscard]] std::optional<IssuedCertRecord> get_issued(const std::string& serial_hex);
     [[nodiscard]] std::vector<IssuedCertRecord> list_issued(int limit = 200, int offset = 0);
+    /// "Certificates issued by THIS CA", keyed on the STABLE pki::issuer_key_id
+    /// (#1296) — NOT issuer_fingerprint, which a subordinate re-key would split into
+    /// two values over one key and silently orphan the older population. An empty
+    /// `issuer_key_id` returns nothing (the unpopulated-row sentinel is not a CA
+    /// identity). Newest-first, same pagination contract as list_issued.
+    [[nodiscard]] std::vector<IssuedCertRecord>
+    list_issued_by_key_id(const std::string& issuer_key_id, int limit = 200, int offset = 0);
     /// Revoke a cert. Returns true iff a row transitioned Active → Revoked; an
     /// already-revoked or unknown serial returns false (idempotent).
     [[nodiscard]] bool revoke(const std::string& serial_hex, const std::string& reason);
@@ -179,7 +194,8 @@ public:
     /// (nothing inserted; the number is not consumed).
     [[nodiscard]] std::optional<CrlVersionRecord>
     publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                     const std::string& issuer_fingerprint = {});
+                     const std::string& issuer_fingerprint = {},
+                     const std::string& issuer_key_id = {});
 
 private:
     /// Set once in the constructor (and only nulled there, on a migration
