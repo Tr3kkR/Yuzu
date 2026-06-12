@@ -7849,7 +7849,16 @@ private:
                 // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
                 forward_gateway_pending();
                 return sent;
-            }));
+            }),
+            // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
+            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled
+            // from AuthDB (same injection pattern as session_revoke_fn).
+            // SOC 2 CC6.3. Empty/null auth_db ⇒ false ⇒ the route 500s and
+            // audits the failure.
+            [this](const std::string& username) -> bool {
+                auto* db = auth_mgr_.auth_db_ptr();
+                return db && db->clear_failed_logins(username).has_value();
+            });
 
         // -- Register MCP server routes ----------------------------------------
 

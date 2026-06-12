@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Account lockout is ON by default (`--auth-lockout-threshold=5`).** Existing
+  deployments gain a new failure mode on upgrade with no config change: 5
+  consecutive failed local-password logins lock an account for 15 minutes
+  (returning the same generic 401 as a bad password — no "you are locked"
+  message). Shared/service accounts that authenticate with a password and any
+  password-rotation automation are the highest-risk targets. Recover with
+  `POST /api/v1/users/{name}/unlock`, wait out the window, or disable the
+  control with `--auth-lockout-threshold=0`. SSO/OIDC and API tokens are
+  unaffected. See `docs/user-manual/upgrading.md` § Account lockout and the
+  full feature entry under **Added** below.
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
@@ -97,6 +107,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Account lockout for failed local-password logins (SOC 2 CC6.3).** After
+  `--auth-lockout-threshold` (default 5) consecutive failed `POST /login`
+  attempts within `--auth-lockout-window-secs` (default 900 s) the account is
+  locked; subsequent attempts return the **same generic 401** as a bad password
+  (no username-enumeration / lock-state oracle, and PBKDF2 is skipped). The lock
+  auto-expires after the window — it is never permanent — and a waited-out user
+  regains a fresh attempt budget. An admin can clear a lock immediately via
+  `POST /api/v1/users/{username}/unlock` (`UserManagement:Write`, MFA step-up;
+  self-target permitted). Set `--auth-lockout-threshold=0` to disable. Env vars:
+  `YUZU_AUTH_LOCKOUT_THRESHOLD` / `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. New audit
+  verbs `auth.lockout.applied` (once, at the threshold crossing) /
+  `auth.lockout.cleared` (successful login or admin unlock); new metrics
+  `yuzu_auth_lockout_applied_total` / `yuzu_auth_lockout_blocked_total`. Scope is
+  local-password login only — OIDC/SSO and API tokens are unaffected.
 - **macOS DEX collector — limited, unprivileged.** The DEX observer now ships a
   macOS collector (`dex_macos_collector.cpp` + the pure parsers
   `dex_macos_{signals,oslog,iokit}.{hpp,cpp}`) using four privilege-light

@@ -129,6 +129,13 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
+    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
+    /// the underlying auth.db write succeeded. Empty/missing callback =
+    /// `POST /api/v1/users/<name>/unlock` returns 503.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -165,7 +172,8 @@ public:
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
-        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {});
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
+        LockoutClearFn lockout_clear_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -191,7 +199,8 @@ public:
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
-        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {});
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
+        LockoutClearFn lockout_clear_fn = {});
 };
 
 } // namespace yuzu::server

@@ -152,6 +152,17 @@ struct Config {
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
 
+    // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
+    // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
+    // attempts the account is locked for `auth_lockout_window_secs`. The
+    // counter resets on a successful login or an admin unlock. Threshold 0
+    // disables the feature. The lock is temporary/auto-expiring so it cannot
+    // be weaponised to permanently DoS a legitimate principal; OIDC and the
+    // MFA code-verification path (which has its own rate-limit) are out of
+    // scope. See docs/auth-architecture.md.
+    int auth_lockout_threshold{5};     // consecutive failures before lock; 0 disables
+    int auth_lockout_window_secs{900}; // lock duration, default 15 min
+
     // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
     // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-
     // service enrollment, no enforcement at login). PR3 wires admin-only /

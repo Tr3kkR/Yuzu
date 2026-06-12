@@ -84,6 +84,11 @@ struct RestSessionsHarness {
     std::vector<RevokeCall> revoke_calls;
     RestApiV1::SessionRevokeResult revoke_returns{};
 
+    // Account-lockout admin-unlock knobs (POST /api/v1/users/<name>/unlock).
+    bool wire_lockout_callback{true};   // false = test the 503 no-callback path
+    bool lockout_clear_returns{true};   // false = simulate auth.db write failure (500)
+    std::vector<std::string> lockout_clear_calls;
+
     RestApiV1 api;
 
     RestSessionsHarness() {
@@ -130,6 +135,14 @@ struct RestSessionsHarness {
             };
         }
 
+        RestApiV1::LockoutClearFn lockout_clear_fn;
+        if (wire_lockout_callback) {
+            lockout_clear_fn = [this](const std::string& username) -> bool {
+                lockout_clear_calls.push_back(username);
+                return lockout_clear_returns;
+            };
+        }
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/nullptr,
@@ -150,7 +163,12 @@ struct RestSessionsHarness {
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
-                            /*metrics_registry=*/nullptr, std::move(session_revoke_fn));
+                            /*metrics_registry=*/nullptr, std::move(session_revoke_fn),
+                            /*execution_event_bus=*/nullptr,
+                            /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{},
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{}, std::move(lockout_clear_fn));
     }
 
     // Helper: parse the `data` payload of the JSON envelope. The server's
@@ -608,4 +626,166 @@ TEST_CASE("REST DELETE /api/v1/sessions: missing username 400 is NOT marked audi
     CHECK(res->status == 400);
     CHECK(!res->has_header("Sec-Audit-Failed"));
     CHECK(h.audit_log.empty());
+}
+
+// ── POST /api/v1/users/<name>/unlock (account lockout, SOC 2 CC6.3) ───────
+//
+// Reuses RestSessionsHarness: the unlock route shares the sibling
+// DELETE /api/v1/sessions handler's contract (UserManagement:Write gate,
+// is_valid_username validation, 503-on-null-callback, and the HIGH-2/#883
+// audit-failure surface — Sec-Audit-Failed header + audit_emitted body).
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: admin unlock succeeds",
+          "[rest][lockout][unlock][admin]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = h.json_body(res);
+    CHECK(body["username"].get<std::string>() == "alice");
+    CHECK(body["unlocked"].get<bool>() == true);
+    CHECK(body["audit_emitted"].get<bool>() == true);
+    CHECK(!res->has_header("Sec-Audit-Failed"));
+
+    REQUIRE(h.lockout_clear_calls.size() == 1);
+    CHECK(h.lockout_clear_calls[0] == "alice");
+
+    // Audit contract — CC6.3 evidence. Same target_type/verb shape as siblings.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "auth.lockout.cleared");
+    CHECK(h.audit_log[0].result == "ok"); // canonical ok|denied|error envelope
+    CHECK(h.audit_log[0].target_type == "User");
+    CHECK(h.audit_log[0].target_id == "alice");
+    CHECK(h.audit_log[0].detail == "admin_unlock");
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: non-admin rejected by perm gate",
+          "[rest][lockout][unlock][rbac]") {
+    RestSessionsHarness h;
+    h.session_user = "bob";
+    h.session_role = auth::Role::user;
+    h.perm_should_grant = false;
+
+    auto res = h.sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // perm_fn is the gate — the callback must NOT have fired, no audit row.
+    CHECK(h.lockout_clear_calls.empty());
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: self-target is permitted (recoverable)",
+          "[rest][lockout][unlock][self]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.sink.Post("/api/v1/users/root/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.lockout_clear_calls.size() == 1);
+    CHECK(h.lockout_clear_calls[0] == "root");
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: malformed username rejected 400",
+          "[rest][lockout][unlock][validation]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    // A ':' is config-injection-reserved → is_valid_username rejects it.
+    auto res = h.sink.Post("/api/v1/users/alice:admin/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    // Validation precedes the callback and the audit — neither fires.
+    CHECK(h.lockout_clear_calls.empty());
+    CHECK(h.audit_log.empty());
+    CHECK(!res->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: null callback returns 503",
+          "[rest][lockout][unlock][503]") {
+    // The harness wires the callback in its constructor, so exercise the
+    // unwired path with a fresh RestApiV1 that never receives a
+    // lockout_clear_fn (the trailing param defaults to an empty
+    // std::function) — mirrors the sessions 503 test above.
+    yuzu::server::test::TestRouteSink sink;
+    RestApiV1 api;
+    auto auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "root";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        /*session_revoke_fn=*/{});
+    // lockout_clear_fn not passed → empty → the unlock route returns 503.
+    auto res = sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: auth.db write failure returns 500",
+          "[rest][lockout][unlock][failure]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.lockout_clear_returns = false; // simulate clear_failed_logins failure
+
+    auto res = h.sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    // The failure is still audited (best-effort) for the CC6.3 chain.
+    REQUIRE(h.lockout_clear_calls.size() == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "auth.lockout.cleared");
+    CHECK(h.audit_log[0].result == "error");
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: lost audit row sets Sec-Audit-Failed (HIGH-2 parity)",
+          "[rest][lockout][unlock][high-2]") {
+    // The S1 governance fix: a silent audit-persist failure on this
+    // CC6.3-evidence action must NOT masquerade as a clean 200 — mirror the
+    // sessions route's Sec-Audit-Failed header + audit_emitted=false body.
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.audit_should_emit = false; // audit_fn returns false (silent persist loss)
+
+    auto res = h.sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200); // unlock still happened (operator intent)
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    // And the unlock itself still fired.
+    REQUIRE(h.lockout_clear_calls.size() == 1);
+}
+
+TEST_CASE("REST POST /api/v1/users/<name>/unlock: throwing audit_fn is caught, not 500",
+          "[rest][lockout][unlock][high-2]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.audit_should_throw = true; // audit pipeline throws
+
+    auto res = h.sink.Post("/api/v1/users/alice/unlock", "", "application/json");
+    REQUIRE(res);
+    // The exception is caught inside try_audit — response is still 200 with
+    // the failure surfaced, not an uncaught-exception 500.
+    CHECK(res->status == 200);
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
 }

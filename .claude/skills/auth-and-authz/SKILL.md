@@ -60,6 +60,7 @@ skill claims anything is "done."
 | `auth.admin_required` denied audit on every 403 | Shipped (gate) | `auth_routes.cpp:150` inside `require_admin` |
 | Private-key permission validation | Shipped | `cert_reloader.cpp:120` `validate_key_file_permissions()` (helper in `file_utils.hpp`); called at startup from `server.cpp` and on hot-reload |
 | Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
+| Account lockout after N failed local-password logins | Shipped (SOC 2 CC6.3) | `auth.db` v3 columns + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins` (`auth_db.cpp`); `POST /login` pre-check + record/clear (`auth_routes.cpp`); admin unlock `POST /api/v1/users/<name>/unlock` (`rest_api_v1.cpp`); `--auth-lockout-threshold`/`--auth-lockout-window-secs` (`main.cpp`). Generic-401 (no enum/oracle), auto-expiring window, audit `auth.lockout.applied`/`.cleared`. Ref: `docs/auth-architecture.md` "Account lockout". |
 | MFA / TOTP — full ladder (enrollment + login challenge + recovery codes; step-up on 11 high-risk surfaces; enforcement modes + OIDC `amr` short-circuit + login-time enrollment bootstrap) | Shipped (v0.12–v0.13, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors; `POST /login` 202-branches + `POST /login/mfa`, `/login/mfa/stepup`, `/login/mfa/enroll` at `auth_routes.cpp`; `require_mfa_step_up` + `amr_asserts_mfa` at `mfa_step_up.{hpp,cpp}`; `--mfa-enforcement` at `main.cpp`; Settings panel + self-target disable guard at `settings_routes.cpp`. Remaining: at-rest TOTP-secret encryption — **mechanism decided by ADR-0010** (SecretCodec envelope encryption at the `auth` store's Postgres migration; the `auth_kv` scaffolding will NOT be used). Full reference: `docs/auth-mfa-design.md`. |
 
 ---
@@ -87,7 +88,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
 | **API token inventory + last-used view** — data layer shipped (`api_tokens.last_used_at` written/read at `api_token_store.cpp:291,325-345`); dashboard inventory view missing. | "token inventory" | CC6.6 | **PARTIAL — UI only** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
-| **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **MISSING** |
+| **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
 | **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **MISSING** |
@@ -136,11 +137,18 @@ matches the customer ask.
    at-rest TOTP-secret encryption follow-up remains — per ADR-0010 it lands
    as SecretCodec envelope encryption with the `auth` store's Postgres
    migration (the `auth_kv` scaffolding will NOT be used).
-2. **Account lockout after N failed logins.** Simple: per-user counter +
-   timestamp in `auth.db`, reset on success, configurable threshold. Audit:
-   `auth.lockout.applied`, `auth.lockout.cleared`. Closes a basic
-   credential-stuffing surface. *Lowest-risk P0 to implement first — good
-   workflow shake-out.*
+2. ~~**Account lockout after N failed logins.**~~ **DONE** — `auth.db` v3
+   columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) +
+   `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`;
+   `--auth-lockout-threshold` (default 5, 0 disables) /
+   `--auth-lockout-window-secs` (default 900). `POST /login` pre-check returns
+   the **same generic 401** as a bad password (no enumeration/oracle, skips
+   PBKDF2 on a locked account); the window auto-expires and a waited-out user
+   gets a fresh budget. Admin unlock `POST /api/v1/users/<name>/unlock`
+   (`UserManagement:Write` + step-up, self-target allowed). Audit
+   `auth.lockout.applied`/`.cleared`; metrics `yuzu_auth_lockout_applied_total`
+   / `yuzu_auth_lockout_blocked_total`. See `docs/auth-architecture.md`
+   "Account lockout".
 3. **Hardened-mode local-password disable.** New CLI flag
    `--auth-mode=sso-only`; `auth_routes.cpp` rejects local-password login
    with a clear message and logs `auth.local_disabled`. Break-glass account

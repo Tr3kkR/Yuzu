@@ -26,6 +26,76 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
 
+## Account lockout (SOC 2 CC6.3)
+
+Brute-force / credential-stuffing protection on the **local-password** login
+path (`POST /login`). OIDC delegates throttling to the IdP; the MFA
+code-verification path has its own per-token failure rate-limit — neither is in
+scope here.
+
+- **State** lives in three columns on the `users` table (`auth.db` migration
+  v3): `failed_login_count`, `last_failed_login_at`, `locked_until`
+  (`NULL` = not locked). A non-existent username has no row, so spraying random
+  usernames neither locks a non-existent account nor grows storage
+  (anti-enumeration). All three accessors (`AuthDB::lockout_status` /
+  `record_failed_login` / `clear_failed_logins`) are parameterised and use
+  `RETURNING`, never `sqlite3_changes()` (#1033).
+- **Policy** is config, not schema, so operators retune without a migration:
+  - `--auth-lockout-threshold` (`YUZU_AUTH_LOCKOUT_THRESHOLD`, default `5`,
+    `0` disables) — consecutive failures before lock.
+  - `--auth-lockout-window-secs` (`YUZU_AUTH_LOCKOUT_WINDOW_SECS`, default
+    `900`) — lock duration. The lock **auto-expires** after the window; it is
+    never permanent, so it cannot be weaponised to permanently DoS a
+    legitimate principal. The posture is logged once at boot for CC6.3
+    evidence.
+- **Flow** in `auth_routes.cpp` `POST /login`:
+  - *Pre-check* (before PBKDF2): if the account is currently locked, reject
+    with the **same generic 401** as a bad password — no `Retry-After`, no
+    "locked" wording, so the response body is not a username-enumeration /
+    lock-state **content** oracle. `verify_password` is skipped entirely, so the
+    ~100 ms PBKDF2 is never burned on a locked account. Fail-open on a read error
+    (lockout protects against *wrong* passwords; `verify_password` is still the
+    real gate). *Accepted residue:* skipping PBKDF2 makes the locked path
+    measurably faster than a known-user wrong-password 401, so response **timing**
+    is a weak lock-*state* oracle (it reveals that an account is locked, never a
+    credential). This is an accepted trade-off — adding a constant-time floor to
+    the locked path would re-introduce the PBKDF2-cost DoS the skip exists to
+    avoid.
+- **Concurrency — per-username serialized (single-node).** The flow is
+  *check-then-act* (`lockout_status` → `verify_password` → `record_failed_login`).
+  Without serialization a **synchronized burst** for one username could all
+  observe `locked=false` and each verify a password before any sibling recorded
+  its failure, so the effective single-burst guess budget would be the in-flight
+  concurrency rather than `auth_lockout_threshold` (the per-IP `login_rate_limit`
+  does **not** bound a distributed botnet firing one request per IP). The whole
+  sequence is therefore held under a **striped per-username login lock**
+  (`AuthRoutes::login_lock_for` / `login_locks_`): concurrent attempts for one
+  account serialize, so at most `threshold` reach password verification before
+  the lock arms (covered by a barrier-style concurrent route test). Different
+  usernames hash to different stripes and log in fully in parallel — only a burst
+  against one account is throttled, which is the intended effect. This is
+  **single-process** scope, adequate for the current single-node SQLite
+  `auth.db`; the HA/multi-replica-correct form is a DB-atomic attempt-reservation
+  that lands with the auth store's Postgres migration (tracked follow-up).
+  `login_rate_limit` remains the companion control for the distributed vector.
+  - *On failure*: `record_failed_login` increments the counter and arms
+    `locked_until` on the threshold-th failure. A window that has **fully
+    expired** starts a fresh attempt budget (the waited-out user gets their
+    attempts back).
+  - *On success*: `clear_failed_logins` resets the counter (covers all three
+    success exits — no-MFA mint, MFA challenge, enforced enrollment).
+- **Admin unlock** — `POST /api/v1/users/<name>/unlock`, gated by
+  `UserManagement:Write` and the MFA step-up gate. Self-target is permitted
+  (recoverable, same reasoning as session self-revoke). The operability path
+  for an operator who can't wait out the window.
+- **Audit** — `auth.lockout.applied` (once, on the threshold crossing),
+  `auth.lockout.cleared` (success reset or admin unlock, actor recorded). A
+  blocked attempt while already locked is counted via the metric, **not**
+  audited per-attempt (flood-amplification, same rationale as the MFA pending
+  load-shed).
+- **Metrics** — `yuzu_auth_lockout_applied_total`,
+  `yuzu_auth_lockout_blocked_total`.
+
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 
 Full design: `docs/auth-mfa-design.md`. Summary:

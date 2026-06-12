@@ -14,7 +14,9 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -217,6 +219,29 @@ private:
     /// `mfa_pending_mu_` from each insert/lookup; constant-time on an
     /// empty map and bounded by the configured rate limit.
     void reap_mfa_pending_locked();
+
+    // ── Per-username login serialization (account-lockout race close) ──────
+    //
+    // Closes the check-then-act lockout race (adversarial C1): without it a
+    // synchronized burst of requests for ONE username could all pass the
+    // stale `lockout_status` pre-check and all reach `verify_password` before
+    // any failure was recorded, so the effective guess budget was the in-flight
+    // concurrency rather than `auth_lockout_threshold`. Holding the per-username
+    // lock across the pre-check → verify_password → record/clear sequence
+    // serializes attempts for that username, so at most `threshold` reach
+    // password verification before the lock arms.
+    //
+    // Striped (fixed array; `hash(username) % N` picks the lock) so there is no
+    // per-username allocation or cleanup and memory is bounded. Distinct
+    // usernames that collide on a stripe serialize harmlessly and rarely
+    // (N=256). Other usernames (different stripes) log in fully in parallel —
+    // only an attacker bursting one account is serialized, which is the intended
+    // throttle. Scope is single-process; the HA-replica-correct form is a
+    // DB-atomic attempt reservation, landing with the auth store's Postgres
+    // migration (see docs/security-reviews/account-lockout-2026-06-12.md).
+    static constexpr std::size_t kLoginLockStripes = 256;
+    std::array<std::mutex, kLoginLockStripes> login_locks_;
+    std::mutex& login_lock_for(const std::string& username);
 };
 
 } // namespace yuzu::server

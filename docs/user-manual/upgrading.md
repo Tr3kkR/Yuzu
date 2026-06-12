@@ -17,6 +17,50 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Breaking: account lockout is ON by default
+
+This release adds account lockout for failed **local-password** logins (SOC 2
+CC6.3) and it is **active by default** (`--auth-lockout-threshold=5`,
+`--auth-lockout-window-secs=900`). No config change is required to opt in — an
+existing deployment gains the behavior the instant you start the new build.
+
+What changes on upgrade:
+
+- After **5 consecutive failed `POST /login` attempts** a local-password account
+  is locked for **15 minutes**. While locked, every login attempt — *including
+  one with the correct password* — returns the **same generic 401 as a bad
+  password** (no `Retry-After`, no "you are locked" message; this is deliberate,
+  to avoid a username-enumeration / lock-state oracle).
+- The lock **auto-expires** after the window — it is never permanent — and a
+  user who waits it out regains a full attempt budget.
+- Scope is **local-password only**. SSO/OIDC logins (throttled by your IdP) and
+  API/automation tokens are **unaffected** — no automation breakage.
+
+**Highest-risk targets** on upgrade: shared or service accounts that log in with
+a password, and any password-rotation / monitoring automation that may submit a
+stale password in a loop — these can now lock themselves out where previously
+nothing happened.
+
+**Before upgrading, do ONE of:**
+
+1. Accept the default (recommended for most) — it closes a real
+   credential-stuffing surface. Make sure operators know the recovery path
+   below.
+2. Raise the threshold if you also rate-limit at the network layer
+   (NIST 800-63B §5.2.2 suggests ≥10): `--auth-lockout-threshold=10`.
+3. Disable it (not recommended; constitutes a deviation from the CC6.3 hardened
+   baseline): `--auth-lockout-threshold=0` (the server logs a startup `WARN`).
+
+**Recovery if an account is locked out:**
+
+- Another admin can clear it immediately:
+  `POST /api/v1/users/{username}/unlock` (`UserManagement:Write`, MFA step-up).
+- Or wait out the window (default 15 min).
+- **Single-admin deployments:** there is no self-service unlock for the *only*
+  admin (the unlock endpoint requires a second privileged principal), so either
+  wait out the window or use the offline recovery procedure in
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and
