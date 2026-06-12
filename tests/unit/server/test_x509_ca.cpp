@@ -294,6 +294,53 @@ TEST_CASE("x509_ca: fingerprint format is stable colon-hex", "[pki][fingerprint]
     REQUIRE(*fp != *fp_other);
 }
 
+TEST_CASE("x509_ca: issuer_key_id is stable across a re-key, distinct per key (#1296)",
+          "[pki][fingerprint][issuer_key_id]") {
+    // The stable key-based CA identity must depend ONLY on the public key, so a
+    // subordinate-CA re-key (same key, NEW issuer cert) keeps it constant while the
+    // whole-cert fingerprint changes — exactly the property that lets an "issued by
+    // this CA" query survive the swap.
+    auto key = generate_private_key(KeyAlgo::EcP384);
+    REQUIRE(key);
+
+    CaParams p1;
+    p1.subject = {"Yuzu Internal CA", "Yuzu"};
+    p1.validity = validity_years_from_now(10);
+    p1.path_len = 0;
+    auto cert1 = self_sign_ca(*key, p1);
+    REQUIRE(cert1);
+
+    // Re-sign a DIFFERENT cert over the SAME key (models the builtin→subordinate
+    // identity swap: new issuer cert, unchanged issuing key).
+    CaParams p2;
+    p2.subject = {"Yuzu Internal CA (subordinate)", "Yuzu"};
+    p2.validity = validity_years_from_now(5);
+    p2.path_len = 0;
+    auto cert2 = self_sign_ca(*key, p2);
+    REQUIRE(cert2);
+
+    auto kid1 = issuer_key_id(*cert1);
+    auto kid2 = issuer_key_id(*cert2);
+    REQUIRE(kid1);
+    REQUIRE(kid2);
+    REQUIRE(kid1->size() == 95); // 32-byte SHA-256 → 64 hex + 31 colons
+    REQUIRE((*kid1)[2] == ':');
+    // Stable across the re-key…
+    REQUIRE(*kid1 == *kid2);
+    // …while the whole-cert fingerprint is NOT (the discriminator #1296 fixes).
+    auto fp1 = fingerprint_sha256(*cert1);
+    auto fp2 = fingerprint_sha256(*cert2);
+    REQUIRE(fp1);
+    REQUIRE(fp2);
+    REQUIRE(*fp1 != *fp2);
+
+    // A genuinely different key yields a different identity.
+    auto other = make_test_ca("Different Key");
+    auto kid_other = issuer_key_id(other.cert);
+    REQUIRE(kid_other);
+    REQUIRE(*kid_other != *kid1);
+}
+
 TEST_CASE("x509_ca: build CRL over revoked serials", "[pki][crl]") {
     auto ca = make_test_ca();
     LeafParams lp;

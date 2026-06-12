@@ -906,12 +906,15 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
 
     int calls = 0;
     std::string seen_csr, seen_id;
+    auto seen_src = yuzu::server::CertIssuanceSource::Direct; // sentinel ≠ expected
     gateway_svc.set_agent_cert_signer(
-        [&](const std::string& csr, const std::string& id)
+        [&](const std::string& csr, const std::string& id,
+            yuzu::server::CertIssuanceSource src)
             -> std::optional<std::pair<std::string, std::string>> {
             ++calls;
             seen_csr = csr;
             seen_id = id;
+            seen_src = src;
             return std::make_pair("LEAF-PEM-for-" + id, "CHAIN-PEM");
         });
 
@@ -925,6 +928,9 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
     CHECK(calls == 1);
     CHECK(seen_csr == "FAKE-CSR");          // the agent's CSR reached the signer
     CHECK(seen_id == "agent-gw-1");          // bound to the registering agent_id
+    // #1290: the gateway path tags issuance gateway_proxy so the ca.cert.issued
+    // audit (minted inside sign_agent_csr) is forensically attributable.
+    CHECK(seen_src == yuzu::server::CertIssuanceSource::GatewayProxy);
     CHECK(resp.issued_certificate() == "LEAF-PEM-for-agent-gw-1");
     CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
 }
@@ -957,7 +963,7 @@ TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert
 
     int calls = 0;
     gateway_svc.set_agent_cert_signer(
-        [&](const std::string&, const std::string&)
+        [&](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> {
             ++calls;
             return std::make_pair("X", "Y");
@@ -981,7 +987,7 @@ TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
                                            &h.metrics};
 
     gateway_svc.set_agent_cert_signer(
-        [&](const std::string&, const std::string&)
+        [&](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> { return std::nullopt; });
 
     auto req = make_gw_register(h.auth_mgr, "agent-gw-4", "FAKE-CSR");
@@ -1002,12 +1008,15 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
     GatewayResponseHarness h;
     int calls = 0;
     std::string seen_csr, seen_id;
+    auto seen_src = yuzu::server::CertIssuanceSource::GatewayProxy; // sentinel ≠ expected
     h.svc.set_agent_cert_signer(
-        [&](const std::string& csr, const std::string& id)
+        [&](const std::string& csr, const std::string& id,
+            yuzu::server::CertIssuanceSource src)
             -> std::optional<std::pair<std::string, std::string>> {
             ++calls;
             seen_csr = csr;
             seen_id = id;
+            seen_src = src;
             return std::make_pair("LEAF-PEM-for-" + id, "CHAIN-PEM");
         });
 
@@ -1027,6 +1036,8 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
     CHECK(calls == 1);
     CHECK(seen_csr == "FAKE-CSR");
     CHECK(seen_id == "agent-direct-1");
+    // #1290: the direct path tags issuance `direct` (vs the gateway's gateway_proxy).
+    CHECK(seen_src == yuzu::server::CertIssuanceSource::Direct);
     CHECK(resp.issued_certificate() == "LEAF-PEM-for-agent-direct-1");
     CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
 }
@@ -1046,7 +1057,7 @@ TEST_CASE("ProxyRegister: the signer is called with the RELAYED agent_id, never 
                                            &h.metrics};
     std::string seen_id;
     gateway_svc.set_agent_cert_signer(
-        [&](const std::string&, const std::string& id)
+        [&](const std::string&, const std::string& id, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> {
             seen_id = id;
             return std::make_pair("LEAF-for-" + id, "CHAIN");
@@ -1075,7 +1086,7 @@ TEST_CASE("ProxyRegister: a THROWING signer cannot crash the gateway handler (#1
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     gateway_svc.set_agent_cert_signer(
-        [&](const std::string&, const std::string&)
+        [&](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> {
             throw std::runtime_error("signer blew up (key load glitch / OpenSSL error)");
         });
@@ -1096,7 +1107,7 @@ TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either 
     // ProxyRegister (both signer sites are now exception-contained).
     GatewayResponseHarness h;
     h.svc.set_agent_cert_signer(
-        [&](const std::string&, const std::string&)
+        [&](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> {
             throw std::runtime_error("signer blew up");
         });
@@ -1595,8 +1606,8 @@ TEST_CASE("Register: approved CSR reaches the signer with the authenticated agen
     std::string seen_csr, seen_agent_id;
     int signer_calls = 0;
     h.svc.set_agent_cert_signer(
-        [&](const std::string& csr,
-            const std::string& agent_id) -> std::optional<std::pair<std::string, std::string>> {
+        [&](const std::string& csr, const std::string& agent_id,
+            yuzu::server::CertIssuanceSource) -> std::optional<std::pair<std::string, std::string>> {
             ++signer_calls;
             seen_csr = csr;
             seen_agent_id = agent_id;
@@ -1626,8 +1637,8 @@ TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert
     install_match_all_auto_approve(h);
     int signer_calls = 0;
     h.svc.set_agent_cert_signer(
-        [&](const std::string&,
-            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+        [&](const std::string&, const std::string&,
+            yuzu::server::CertIssuanceSource) -> std::optional<std::pair<std::string, std::string>> {
             ++signer_calls;
             return std::nullopt; // signing unavailable / failed
         });
@@ -1652,8 +1663,8 @@ TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR sig
     // agent the operator has not approved.
     bool signer_called = false;
     h.svc.set_agent_cert_signer(
-        [&](const std::string&,
-            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+        [&](const std::string&, const std::string&,
+            yuzu::server::CertIssuanceSource) -> std::optional<std::pair<std::string, std::string>> {
             signer_called = true;
             return std::make_pair(std::string("X"), std::string("Y"));
         });
@@ -1676,8 +1687,8 @@ TEST_CASE("Register: no CSR → signer is not invoked even when wired (B-2)",
     install_match_all_auto_approve(h);
     bool signer_called = false;
     h.svc.set_agent_cert_signer(
-        [&](const std::string&,
-            const std::string&) -> std::optional<std::pair<std::string, std::string>> {
+        [&](const std::string&, const std::string&,
+            yuzu::server::CertIssuanceSource) -> std::optional<std::pair<std::string, std::string>> {
             signer_called = true;
             return std::make_pair(std::string("X"), std::string("Y"));
         });
