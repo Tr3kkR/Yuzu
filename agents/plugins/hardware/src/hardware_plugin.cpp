@@ -648,6 +648,73 @@ int do_disks(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── drivers action ────────────────────────────────────────────────────────
+// Installed driver inventory (BRD row 115 — docs/dex-brd-coverage.md D5).
+// Windows: Win32_PnPSignedDriver (name, version, date, provider, class) — the
+// canonical signed-driver registry; the query can take several seconds, which
+// is fine for an on-demand/gathered question. Linux: loaded kernel modules
+// via lsmod (no version/date without a per-module modinfo walk — left empty
+// rather than guessed). Other platforms emit the house unknown row.
+
+#ifdef _WIN32
+// CIM_DATETIME "yyyymmddHHMMSS.mmmmmm±UUU" → "yyyy-mm-dd" ("" when malformed).
+std::string cim_date_to_iso(const std::string& cim) {
+    if (cim.size() < 8)
+        return {};
+    for (int i = 0; i < 8; ++i)
+        if (cim[static_cast<std::size_t>(i)] < '0' || cim[static_cast<std::size_t>(i)] > '9')
+            return {};
+    return cim.substr(0, 4) + "-" + cim.substr(4, 2) + "-" + cim.substr(6, 2);
+}
+#endif
+
+int do_drivers(yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+    WmiQuery wmi;
+    if (wmi.valid()) {
+        int idx = 0;
+        wmi.query(L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, "
+                  L"DeviceClass FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
+                  [&](IWbemClassObject* obj) {
+                      auto name = WmiQuery::get_string(obj, L"DeviceName");
+                      auto version = WmiQuery::get_string(obj, L"DriverVersion");
+                      auto date = cim_date_to_iso(WmiQuery::get_string(obj, L"DriverDate"));
+                      auto provider = WmiQuery::get_string(obj, L"DriverProviderName");
+                      auto dev_class = WmiQuery::get_string(obj, L"DeviceClass");
+                      ctx.write_output(std::format("driver|{}|{}|{}|{}|{}|{}", idx++, name,
+                                                   version, date, provider, dev_class));
+                  });
+        if (idx == 0)
+            ctx.write_output("driver|0|unknown||||");
+    } else {
+        ctx.write_output("driver|0|unknown||||");
+    }
+
+#elif defined(__linux__)
+    auto lsmod = run_command("lsmod 2>/dev/null");
+    int idx = 0;
+    if (!lsmod.empty()) {
+        std::istringstream ss(lsmod);
+        std::string line;
+        std::getline(ss, line); // header: Module Size Used by
+        while (std::getline(ss, line)) {
+            std::istringstream ls(line);
+            std::string module;
+            ls >> module;
+            if (!module.empty())
+                ctx.write_output(
+                    std::format("driver|{}|{}|||kernel|module", idx++, module));
+        }
+    }
+    if (idx == 0)
+        ctx.write_output("driver|0|unknown||||");
+
+#else
+    ctx.write_output("driver|0|unknown||||");
+#endif
+    return 0;
+}
+
 } // namespace
 
 class HardwarePlugin final : public yuzu::Plugin {
@@ -655,12 +722,13 @@ public:
     std::string_view name() const noexcept override { return "hardware"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks";
+        return "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, "
+               "drivers";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"manufacturer", "model", "bios", "processors",
-                                     "memory",       "disks", nullptr};
+        static const char* acts[] = {"manufacturer", "model", "bios",    "processors",
+                                     "memory",       "disks", "drivers", nullptr};
         return acts;
     }
 
@@ -682,6 +750,8 @@ public:
             return do_memory(ctx);
         if (action == "disks")
             return do_disks(ctx);
+        if (action == "drivers")
+            return do_drivers(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

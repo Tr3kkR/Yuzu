@@ -331,3 +331,67 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
+  id: device.hardware.drivers
+  displayName: Installed Driver Inventory
+  version: 1.0.0
+  description: >
+    Lists installed device drivers with name, version, date, provider, and
+    device class. Uses Win32_PnPSignedDriver on Windows (the canonical
+    signed-driver registry; the query can take several seconds) and loaded
+    kernel modules via lsmod on Linux (module names only — version/date are
+    not available without a per-module walk). Supports fleet queries like
+    "devices running driver X older than version Y".
+  tags: [hardware, inventory, drivers]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: hardware
+    action: drivers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: index
+        type: int32
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: date
+        type: string
+      - name: provider
+        type: string
+      - name: device_class
+        type: string
+
+  readablePayload: "List installed device drivers"
+
+  gather:
+    ttlSeconds: 86400
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active

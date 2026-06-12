@@ -221,7 +221,7 @@ The agent runs fine *inside* VDI guests; what's descoped is hypervisor/broker/vR
 | Row | Requirement | Verdict | Basis / plan |
 |---|---|---|---|
 | 114 | Endpoint configuration push | **Covered** | Instruction engine + registry/services/firewall/bitlocker/network_config plugins + Guardian baselines |
-| 115 | Device & driver monitoring (RFP Q) | **Partial** | `hw.device_start_failed`, `boot.degraded_driver`, `display.driver_reset` live; driver *inventory* (versions, outdated) → small planned win, **D5** |
+| 115 | Device & driver monitoring (RFP Q) | **Covered** (D5, 2026-06-12) | Failure events (`hw.device_start_failed`, `boot.degraded_driver`, `display.driver_reset`) + `device.hardware.drivers` inventory (Win32_PnPSignedDriver: name/version/date/provider/class; lsmod on Linux). Outdated-driver detection = fleet query over the inventory; automated threshold alerts → F1 |
 | 116 | Dynamic device groups (RFP Q) | **Covered** | Scope engine (expression trees, tags, props, OS) + scope walking + management groups — re-evaluates as device facts change; stronger than incumbents |
 | 117 | Policy management | **Covered** | Policy engine + Guardian |
 
@@ -354,7 +354,7 @@ at PR-to-dev time.
 | ~~D2~~ | ~~Reboot-nudge content pack~~ | 138 | **Dropped 2026-06-12** — user-facing interaction out for now |
 | D3 | Blast-radius alerting: server-side detector — N distinct devices, same (obs_type, subject), sliding window → NotificationStore + webhook event | 32, 137, 27 | **SHIPPED 2026-06-12** (`dex_blast_radius.{hpp,cpp}` at the shared ingest chokepoint; server suite green, 2278 cases). Thresholds (5 devices / 15 min / 1 h cooldown) hardcoded until F1 |
 | D4 | Failed-logon counts: scheduled Security-log 4625 counts per device (no usernames/IPs) | 67 | **Decided 2026-06-12: build counts-only**; needs agent privilege-model procedure |
-| D5 | Driver inventory action (wmi/hardware plugin): installed driver list w/ versions + date | 115 | Small plugin addition |
+| D5 | Driver inventory action (hardware plugin): installed driver list w/ versions + date | 115 | **SHIPPED 2026-06-12** — `drivers` action + `device.hardware.drivers` definition; WQL live-verified (269 drivers on the dev box); agent suite green |
 
 ### A — Continuous device performance telemetry (the foundation)
 
