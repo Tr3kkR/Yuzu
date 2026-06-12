@@ -23,6 +23,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <optional>
 #include <string>
@@ -450,6 +451,48 @@ TEST_CASE("procperf render: app drill links + escape + the soft empty state",
     auto empty = render_dex_procperf_panel({}, "7d");
     CHECK(empty.find("off by default") != std::string::npos);
     CHECK(empty.find("no hourly rollup has completed yet") != std::string::npos);
+}
+
+// ── PR3: per-cohort Prometheus export ────────────────────────────────────────
+
+TEST_CASE("cohort gauge export: floor, untagged label, clipped visibility, absent on disable",
+          "[dex][perf][export]") {
+    yuzu::MetricsRegistry metrics;
+    auto snap = two_cohorts(12, 4); // "a" exports, "b" is sub-floor
+    for (int i = 0; i < 11; ++i)    // 11 untagged → above floor, exports as "(untagged)"
+        snap.devices.push_back(dev("u-" + std::to_string(i), 5.0, 40.0, 0.5, ""));
+
+    dex_perf_export_cohort_gauges(metrics, dex_perf_cohorts(snap));
+    auto text = metrics.serialize();
+    CHECK(text.find("yuzu_fleet_perf_cohort_cpu_pct{cohort=\"a\",stat=\"p50\"}") !=
+          std::string::npos);
+    CHECK(text.find("yuzu_fleet_perf_cohort_reporting{cohort=\"a\"} 12") != std::string::npos);
+    CHECK(text.find("cohort=\"(untagged)\"") != std::string::npos);
+    CHECK(text.find("cohort=\"b\"") == std::string::npos); // sub-floor — withheld
+    CHECK(text.find("yuzu_fleet_perf_cohort_clipped 0") != std::string::npos); // measured zero
+
+    SECTION("clear → every cohort series goes absent (never stale)") {
+        dex_perf_clear_cohort_gauges(metrics);
+        auto cleared = metrics.serialize();
+        CHECK(cleared.find("cohort=\"a\"") == std::string::npos);
+        CHECK(cleared.find("yuzu_fleet_perf_cohort_clipped 0") == std::string::npos);
+    }
+    SECTION("cap: top-N by population export, the rest are counted, not silent") {
+        DexPerfSnapshot big;
+        big.cohort_key = "model";
+        // 7 cohorts of descending population (16..10), all above the floor.
+        for (int c = 0; c < 7; ++c)
+            for (int i = 0; i < 16 - c; ++i)
+                big.devices.push_back(dev("c" + std::to_string(c) + "-" + std::to_string(i),
+                                          10.0, 50.0, 1.0, "m" + std::to_string(c)));
+        dex_perf_export_cohort_gauges(metrics, dex_perf_cohorts(big), /*cap=*/5);
+        auto capped = metrics.serialize();
+        CHECK(capped.find("cohort=\"m0\"") != std::string::npos); // biggest survives
+        CHECK(capped.find("cohort=\"m4\"") != std::string::npos);
+        CHECK(capped.find("cohort=\"m5\"") == std::string::npos); // clipped
+        CHECK(capped.find("cohort=\"m6\"") == std::string::npos);
+        CHECK(capped.find("yuzu_fleet_perf_cohort_clipped 2") != std::string::npos);
+    }
 }
 
 // ── REST surface (/api/v1/dex/perf/*) ────────────────────────────────────────

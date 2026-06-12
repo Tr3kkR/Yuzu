@@ -24,6 +24,10 @@
 #include <string>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 
 /// One device's current perf sample, joined with its resolved cohort value.
@@ -110,6 +114,24 @@ struct DexPerfDeviceRow {
 enum class DexPerfMetric { kCpu, kCommit, kDiskLat };
 DexPerfMetric dex_perf_metric_from_token(const std::string& token);
 const char* dex_perf_metric_token(DexPerfMetric m);
+
+// ── PR3: per-cohort Prometheus export (Grafana) ──────────────────────────────
+
+/// Cardinality cap for the cohort gauge export: top N cohorts by population.
+/// Clipping is made visible via yuzu_fleet_perf_cohort_clipped, never silent.
+inline constexpr int kDexCohortExportCap = 50;
+
+/// Clear the five yuzu_fleet_perf_cohort_* families — series go ABSENT, never
+/// stale (called every sweep; the disabled path stops here).
+void dex_perf_clear_cohort_gauges(yuzu::MetricsRegistry& metrics);
+
+/// Publish the per-cohort gauge families from cohort rows (clears first).
+/// Suppressed (sub-floor) rows never export; rows beyond `cap` count into the
+/// clipped gauge; the untagged residual exports as cohort="(untagged)".
+/// `clipped` is a measured 0 when the export is active and nothing was cut.
+void dex_perf_export_cohort_gauges(yuzu::MetricsRegistry& metrics,
+                                   const std::vector<DexPerfCohortRow>& rows,
+                                   int cap = kDexCohortExportCap);
 
 /// One metric of a device's now-vs-now comparison (PR2 percentile strips):
 /// the device's current heartbeat value against the CURRENT fleet and cohort

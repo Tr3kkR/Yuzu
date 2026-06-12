@@ -97,6 +97,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
+  Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
+  default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
+  disk_lat_ms}{cohort,stat}` + `yuzu_fleet_perf_cohort_reporting{cohort}` for
+  that key's cohorts, refreshed on the same sweep (and the same validation
+  rules) as the existing fleet gauges. Cardinality is bounded: top 50 cohorts
+  by population, the 10-device statistical floor applies, and
+  `yuzu_fleet_perf_cohort_clipped` makes any capping visible rather than
+  silent. Devices without the key export as `cohort="(untagged)"`. Changes
+  are audit-logged (`settings.dex_alerts.cohort_export`) and persisted in
+  runtime config (`dex_cohort_export_key`).
 - **DEX: device drill-down performance extensions.** The `/dex` per-device
   page gains (1) **vs-fleet / vs-cohort percentile strips** — the device's
   current heartbeat CPU / memory commit / disk latency placed against the

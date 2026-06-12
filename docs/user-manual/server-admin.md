@@ -990,8 +990,9 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration fragment (HTMX). Admin-only. |
 | `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
 | `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+| `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, 10-device floor, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
 
-**New `runtime_config` keys.** All four are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
+**New `runtime_config` keys.** All are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -999,6 +1000,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `dex_blast_min_devices` | integer string | `5` | Blast-radius minimum distinct-device threshold. Clamped `[2, 100000]`. |
 | `dex_blast_window_seconds` | integer string | `900` | Blast-radius detection window (seconds). Clamped `[60, 86400]`. |
 | `dex_blast_cooldown_seconds` | integer string | `3600` | Blast-radius per-incident re-alert cooldown (seconds). Clamped `[0, 604800]`. |
+| `dex_cohort_export_key` | tag-key string | *(empty)* | Tag key whose cohorts export as `yuzu_fleet_perf_cohort_*` Prometheus gauges. Empty = export disabled. Invalid stored values disable the export (fail closed). |
 
 **New audit actions.**
 
@@ -1006,7 +1008,9 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|
 | `settings.dex_alerts.routing` | An admin changes the routed signal-type list. Detail records the full new routed set (the runtime-config store keeps no history, so this row is the change-management evidence). |
 | `settings.dex_alerts.blast` | An admin changes the blast-radius thresholds (detail records the new min/window/cooldown). |
+| `settings.dex_alerts.cohort_export` | An admin sets or clears the cohort metrics export tag key (detail records the new key, or "export disabled"). |
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
+| `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
 ---
 

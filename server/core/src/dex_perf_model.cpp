@@ -2,6 +2,8 @@
 
 #include "dex_perf_rules.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <algorithm>
 #include <map>
 #include <string>
@@ -136,6 +138,48 @@ std::vector<DexPerfCohortRow> dex_perf_cohorts(const DexPerfSnapshot& snap) {
                          return a.devices > b.devices;
                      });
     return rows;
+}
+
+void dex_perf_clear_cohort_gauges(yuzu::MetricsRegistry& metrics) {
+    metrics.clear_gauge_family("yuzu_fleet_perf_cohort_cpu_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_cohort_commit_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_cohort_disk_lat_ms");
+    metrics.clear_gauge_family("yuzu_fleet_perf_cohort_reporting");
+    metrics.clear_gauge_family("yuzu_fleet_perf_cohort_clipped");
+}
+
+void dex_perf_export_cohort_gauges(yuzu::MetricsRegistry& metrics,
+                                   const std::vector<DexPerfCohortRow>& rows, int cap) {
+    dex_perf_clear_cohort_gauges(metrics);
+    int exported = 0;
+    int clipped = 0;
+    auto set_stats = [&](const char* family, const std::string& cohort,
+                         const std::optional<DexPerfStat>& s) {
+        if (!s)
+            return; // metric nobody in the cohort reported — absent, never 0
+        metrics.gauge(family, {{"cohort", cohort}, {"stat", "avg"}}).set(s->avg);
+        metrics.gauge(family, {{"cohort", cohort}, {"stat", "p50"}}).set(s->p50);
+        metrics.gauge(family, {{"cohort", cohort}, {"stat", "p90"}}).set(s->p90);
+        metrics.gauge(family, {{"cohort", cohort}, {"stat", "max"}}).set(s->max);
+    };
+    for (const auto& r : rows) {
+        if (r.suppressed)
+            continue; // below the statistical floor — withheld everywhere
+        if (exported >= cap) {
+            ++clipped;
+            continue;
+        }
+        const std::string label = r.cohort.empty() ? "(untagged)" : r.cohort;
+        set_stats("yuzu_fleet_perf_cohort_cpu_pct", label, r.cpu);
+        set_stats("yuzu_fleet_perf_cohort_commit_pct", label, r.commit);
+        set_stats("yuzu_fleet_perf_cohort_disk_lat_ms", label, r.disk_lat);
+        metrics.gauge("yuzu_fleet_perf_cohort_reporting", {{"cohort", label}})
+            .set(static_cast<double>(r.devices));
+        ++exported;
+    }
+    // A measured zero once the export is active: "nothing was clipped" is a
+    // fact Grafana alerts can rely on.
+    metrics.gauge("yuzu_fleet_perf_cohort_clipped").set(static_cast<double>(clipped));
 }
 
 DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,

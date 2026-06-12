@@ -315,6 +315,23 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
                           "Current count of tracked (obs_type,subject) pairs", "gauge");
+        // F2a PR3: per-cohort fleet perf gauges (exported only when the operator
+        // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
+        metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
+                          "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
+                          "cohorts of the configured export tag key, ≥10 reporting devices)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
+                          "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_disk_lat_ms",
+                          "Per-cohort disk per-IO service time ms (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_reporting",
+                          "Devices contributing perf samples per exported cohort", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_clipped",
+                          "Exportable cohorts dropped by the top-50 cardinality cap this sweep "
+                          "(0 = nothing clipped; absent = export disabled)", "gauge");
         // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
         metrics_.describe("yuzu_server_dex_alert_fired_total",
                           "Operator-routed per-signal alerts fired (notification + dex.signal "
@@ -2157,6 +2174,9 @@ public:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // F2a PR3: per-cohort fleet perf gauges — same cycle, same
+                // staleness window as the fleet families above.
+                publish_cohort_perf_gauges();
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
@@ -3627,6 +3647,39 @@ private:
             get_int("dex_blast_min_devices", defaults.min_devices),
             get_int("dex_blast_window_seconds", defaults.window_seconds),
             get_int("dex_blast_cooldown_seconds", defaults.cooldown_seconds));
+        // F2a PR3: cohort metrics export key — read+validated here, consumed by
+        // the reaper-thread gauge sweep. Invalid stored values disable the
+        // export (fail closed) rather than reaching the snapshot provider.
+        {
+            std::string key = runtime_config_store_->get_value("dex_cohort_export_key");
+            if (!key.empty() && !TagStore::validate_key(key))
+                key.clear();
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_cohort_export_key_ = std::move(key);
+        }
+    }
+
+    /// F2a PR3: publish the per-cohort fleet perf gauges for the configured
+    /// export tag key. Runs on the reaper thread each sweep, right after
+    /// recompute_metrics (same cycle, same staleness window → the cohort
+    /// gauges can never disagree with the fleet families). The export logic
+    /// (clear-first absent-not-stale, floor, top-N cap + visible clipped
+    /// count, "(untagged)" residual label) lives in dex_perf_model so the
+    /// gauges are pinned by unit tests against the same cohort rows the tab
+    /// and REST render.
+    void publish_cohort_perf_gauges() {
+        std::string key;
+        DexPerfFn perf;
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            key = dex_cohort_export_key_;
+            perf = dex_perf_fn_;
+        }
+        if (key.empty() || !perf) {
+            dex_perf_clear_cohort_gauges(metrics_); // export disabled — absent
+            return;
+        }
+        dex_perf_export_cohort_gauges(metrics_, dex_perf_cohorts(perf(key)));
     }
 
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -7689,6 +7742,11 @@ private:
             }
             return snap;
         };
+        // PR3: the reaper-thread cohort gauge sweep uses the same provider.
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_perf_fn_ = dex_perf_fn;
+        }
 
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
@@ -8439,6 +8497,12 @@ private:
     /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
     BlastRadiusDetector blast_radius_detector_;
     DexAlertRouter dex_alert_router_;
+    /// F2a PR3: cohort metrics export — written by apply_dex_alert_config
+    /// (boot + settings POST) and start_web_server (the provider closure),
+    /// read by the reaper-thread gauge sweep. One mutex guards both.
+    std::mutex dex_cohort_export_mu_;
+    std::string dex_cohort_export_key_;
+    DexPerfFn dex_perf_fn_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
