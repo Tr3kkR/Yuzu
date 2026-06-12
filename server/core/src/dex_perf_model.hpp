@@ -61,6 +61,11 @@ using DexPerfFn = std::function<DexPerfSnapshot(const std::string& cohort_key)>;
 /// setting (grill 2026-06-12) — make it tunable only if a real fleet asks.
 inline constexpr int64_t kDexCohortFloor = 10;
 
+/// The conventional default cohort key (the asset-tagging recipe's key) —
+/// the ONE spelling shared by the fragment, REST and MCP defaults so the
+/// three surfaces cannot drift.
+inline constexpr const char* kDexDefaultCohortKey = "model";
+
 /// One metric's fleet stats. Only constructed when n > 0 (absent-not-zero).
 struct DexPerfStat {
     double avg{0.0};

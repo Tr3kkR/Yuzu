@@ -292,6 +292,16 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
         REQUIRE(drill);
         CHECK(drill->status == 200);
         CHECK(drill->body.find("devices") != std::string::npos);
+
+        // Grill pin: a card drill (no cohort params) still resolves the
+        // DEFAULT key so the Cohort column shows real values — and does NOT
+        // filter. Without this, every row read "(untagged)".
+        requested_key.clear();
+        auto card = sink.Get("/fragments/dex/perf/devices?metric=cpu");
+        REQUIRE(card);
+        CHECK(card->status == 200);
+        CHECK(requested_key == "model");
+        CHECK(card->body.find(">a<") != std::string::npos); // real cohort rendered
     }
 
     SECTION("an invalid ?key= falls back to the default, never reaches the provider") {
@@ -599,6 +609,20 @@ TEST_CASE("REST /dex/perf/devices: sort, filters, validation", "[dex][perf][rest
     REQUIRE(j["data"].size() == 2);
     CHECK(j["data"][0]["agent_id"] == "b-2"); // worst first
     CHECK(j["data"][0]["fleet_pctile"] == 100);
+    CHECK(j["data"][0]["cohort"] == "b"); // grill pin: default key resolves cohorts
+
+    SECTION("cohort_key without cohort_value resolves display but does NOT filter") {
+        auto all = h.sink.Get("/api/v1/dex/perf/devices?cohort_key=model");
+        REQUIRE(all);
+        auto ja = nlohmann::json::parse(all->body);
+        CHECK(ja["data"].size() == 6); // both cohorts present — no implicit filter
+    }
+    SECTION("empty cohort_value present = the untagged residual filter") {
+        auto none = h.sink.Get("/api/v1/dex/perf/devices?cohort_key=model&cohort_value=");
+        REQUIRE(none);
+        auto jn = nlohmann::json::parse(none->body);
+        CHECK(jn["data"].empty()); // two_cohorts has no untagged devices
+    }
 
     SECTION("invalid limit → 400") {
         auto bad = h.sink.Get("/api/v1/dex/perf/devices?limit=0");
@@ -616,6 +640,20 @@ TEST_CASE("REST /dex/perf/devices: sort, filters, validation", "[dex][perf][rest
         REQUIRE(denied);
         CHECK(denied->status == 403);
     }
+}
+
+TEST_CASE("OpenAPI spec lists the perf endpoints (A2 discovery) and stays valid JSON",
+          "[dex][perf][rest][discovery][a2]") {
+    RestPerfHarness h({});
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // The spec literal is hand-maintained — parse the WHOLE document so an
+    // edit that breaks JSON validity fails here, not in a client generator.
+    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+    CHECK(res->body.find(R"("/dex/perf/fleet":)") != std::string::npos);
+    CHECK(res->body.find(R"("/dex/perf/cohorts":)") != std::string::npos);
+    CHECK(res->body.find(R"("/dex/perf/devices":)") != std::string::npos);
 }
 
 TEST_CASE("REST /dex/perf/*: no provider wired → 503", "[dex][perf][rest]") {

@@ -7698,10 +7698,13 @@ private:
             DexPerfSnapshot snap;
             snap.cohort_key = cohort_key;
             std::unordered_map<std::string, std::string> cohort_values;
-            if (tag_store_) {
+            if (tag_store_ && !cohort_key.empty()) {
+                // available_keys feed the tab's key picker and the cohorts
+                // REST response — both always pass a key. Key-less callers
+                // (the pollable fleet endpoint, the disabled gauge sweep)
+                // don't pay the extra query (grill NFR fix).
                 snap.available_keys = tag_store_->get_distinct_keys();
-                if (!cohort_key.empty())
-                    cohort_values = tag_store_->get_values_for_key(cohort_key);
+                cohort_values = tag_store_->get_values_for_key(cohort_key);
             }
             // Same staleness the recompute_metrics sweep prunes by — the tab and
             // the yuzu_fleet_perf_* gauges see the same population.

@@ -349,7 +349,10 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
     }
 
     std::string h;
+    // Back link preserves the cohort key, so returning from an image-cohort
+    // drill lands on the image table, not the default (grill fix).
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf?window=" + w +
+         (snap.cohort_key.empty() ? std::string{} : "&amp;key=" + url_encode(snap.cohort_key)) +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
          "style=\"cursor:pointer;\">&larr; Fleet performance</a>";
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
@@ -364,8 +367,9 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
                                      "this cycle."
                                    : "No reporting devices match this view.");
 
-    h += "<table class=\"gp-table\"><thead><tr><th>#</th><th>Device</th><th>Cohort</th>"
-         "<th>CPU</th><th>Commit</th><th>Disk lat</th><th>vs fleet</th></tr></thead><tbody>";
+    h += "<table class=\"gp-table\"><thead><tr><th>#</th><th>Device</th><th>Cohort" +
+         (snap.cohort_key.empty() ? std::string{} : " (" + esc(snap.cohort_key) + ")") +
+         "</th><th>CPU</th><th>Commit</th><th>Disk lat</th><th>vs fleet</th></tr></thead><tbody>";
     int i = 1;
     for (const auto& r : rows) {
         auto cell = [](const std::optional<double>& v, bool lat) {

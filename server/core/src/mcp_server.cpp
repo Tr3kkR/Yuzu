@@ -1902,7 +1902,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("windows_online", now.windows_online)
                                   .str();
                 } else if (tool_name == "get_dex_perf_cohorts") {
-                    const auto key = param_str(args, "key", "model");
+                    const auto key = param_str(args, "key", kDexDefaultCohortKey);
                     if (!TagStore::validate_key(key)) {
                         res.set_content(error_response(id, kInvalidParams, "invalid tag key"),
                                         "application/json");
@@ -1935,17 +1935,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto metric =
                         dex_perf_metric_from_token(param_str(args, "metric", "cpu"));
                     const bool not_reporting = param_str(args, "filter") == "not_reporting";
-                    std::string cohort_key = param_str(args, "cohort_key");
-                    std::optional<std::string> cohort_filter;
-                    if (!cohort_key.empty()) {
-                        if (!TagStore::validate_key(cohort_key)) {
-                            res.set_content(
-                                error_response(id, kInvalidParams, "invalid cohort_key"),
-                                "application/json");
-                            return;
-                        }
-                        cohort_filter = param_str(args, "cohort_value");
+                    // Grill fix (parity with REST/fragment): key always resolves
+                    // (default "model"); filtering only when cohort_value given.
+                    std::string cohort_key = param_str(args, "cohort_key", kDexDefaultCohortKey);
+                    if (!TagStore::validate_key(cohort_key)) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid cohort_key"),
+                                        "application/json");
+                        return;
                     }
+                    std::optional<std::string> cohort_filter;
+                    if (args.contains("cohort_value") && args["cohort_value"].is_string())
+                        cohort_filter = args["cohort_value"].get<std::string>();
                     const int limit =
                         std::clamp(param_int32(args, "limit", 50), 1, 500);
                     JArr arr;

@@ -602,6 +602,15 @@ const std::string& openapi_spec() {
     },
     "/dex/signals/{obs_type}": {
       "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/fleet": {
+      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/cohorts": {
+      "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/devices": {
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
     }
   }
 })json";
@@ -4987,7 +4996,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const std::string key =
-                     req.has_param("key") ? req.get_param_value("key") : "model";
+                     req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(key)) {
                      res.status = 400;
                      res.set_content(error_json("invalid tag key"), "application/json");
@@ -5036,19 +5045,21 @@ void RestApiV1::register_routes(
                      req.has_param("metric") ? req.get_param_value("metric") : "cpu");
                  const bool not_reporting = req.has_param("filter") &&
                                             req.get_param_value("filter") == "not_reporting";
-                 std::string cohort_key;
-                 std::optional<std::string> cohort_filter;
-                 if (req.has_param("cohort_key")) {
-                     cohort_key = req.get_param_value("cohort_key");
-                     if (!TagStore::validate_key(cohort_key)) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid cohort_key"), "application/json");
-                         return;
-                     }
-                     cohort_filter = req.has_param("cohort_value")
-                                         ? req.get_param_value("cohort_value")
-                                         : std::string{};
+                 // Grill fix (parity with the fragment): the cohort KEY always
+                 // resolves (default "model") so rows carry real cohort values;
+                 // FILTERING applies only when cohort_value is present ("" =
+                 // the untagged residual).
+                 std::string cohort_key =
+                     req.has_param("cohort_key") ? req.get_param_value("cohort_key")
+                                                 : kDexDefaultCohortKey;
+                 if (!TagStore::validate_key(cohort_key)) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid cohort_key"), "application/json");
+                     return;
                  }
+                 std::optional<std::string> cohort_filter;
+                 if (req.has_param("cohort_value"))
+                     cohort_filter = req.get_param_value("cohort_value");
                  int limit = 50;
                  if (req.has_param("limit")) {
                      int v = 0;

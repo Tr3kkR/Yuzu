@@ -2042,7 +2042,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // cohort key — the strips compare against the conventional cohort).
         std::optional<DexPerfSnapshot> snap;
         if (perf_fn_)
-            snap = perf_fn_("model");
+            snap = perf_fn_(kDexDefaultCohortKey);
         res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
                         "text/html; charset=utf-8");
     });
@@ -2069,9 +2069,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // Cohort tag key: validated to the TagStore key alphabet so garbage
         // never reaches the provider or markup; invalid/absent falls back to
         // the conventional default ("model" — the asset-tagging recipe's key).
-        std::string key = req.has_param("key") ? req.get_param_value("key") : "model";
+        std::string key =
+            req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
         if (!valid_tag_key(key))
-            key = "model";
+            key = kDexDefaultCohortKey;
         res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
                         "text/html; charset=utf-8");
     });
@@ -2092,17 +2093,19 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             req.has_param("metric") ? req.get_param_value("metric") : "cpu");
         const bool not_reporting = req.has_param("filter") &&
                                    req.get_param_value("filter") == "not_reporting";
-        std::string cohort_key;
+        // Grill fix: the cohort KEY is always resolved (default "model") so
+        // the Cohort column shows real values even when the drill came from a
+        // metric/Reporting card — without this, every device read "(untagged)",
+        // which is a lie. FILTERING is a separate decision: it applies only
+        // when cohort_value is present ("" = the untagged residual).
+        std::string cohort_key =
+            req.has_param("cohort_key") ? req.get_param_value("cohort_key")
+                                        : kDexDefaultCohortKey;
+        if (!valid_tag_key(cohort_key))
+            cohort_key = kDexDefaultCohortKey;
         std::optional<std::string> cohort_filter;
-        if (req.has_param("cohort_key")) {
-            cohort_key = req.get_param_value("cohort_key");
-            if (!valid_tag_key(cohort_key))
-                cohort_key.clear();
-            else
-                cohort_filter = req.has_param("cohort_value")
-                                    ? req.get_param_value("cohort_value")
-                                    : std::string{}; // "" = the untagged residual
-        }
+        if (req.has_param("cohort_value"))
+            cohort_filter = req.get_param_value("cohort_value");
         int limit = 50;
         if (req.has_param("limit")) {
             try {
