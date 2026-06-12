@@ -199,6 +199,18 @@ struct CrlRevocation {
 /// "which CA / cert is this" identifier surfaced in banners, /health, and audit.
 [[nodiscard]] std::optional<std::string> fingerprint_sha256(std::string_view cert_pem);
 
+/// SHA-256 of the certificate's subjectPublicKey (X509_pubkey_digest) — a STABLE,
+/// key-based CA identity, formatted as uppercase colon-separated hex. Unlike
+/// fingerprint_sha256 (a hash of the whole cert), this depends ONLY on the public
+/// key, so it is **invariant across a subordinate-CA re-key** (PR6): importing an
+/// enterprise-signed intermediate swaps the issuer CERT but keeps the issuing KEY,
+/// so the key id is unchanged while the cert fingerprint changes. This is the
+/// identity an "issued by THIS CA" inventory query must key on so it never orphans
+/// leaves minted before the re-key (#1296). Conceptually the SubjectKeyIdentifier,
+/// computed deterministically here rather than read from the (optional) X509v3
+/// extension so it is robust to externally-signed intermediates.
+[[nodiscard]] std::optional<std::string> issuer_key_id(std::string_view cert_pem);
+
 /// True iff `s` is a syntactically valid IPv4 or IPv6 literal, judged by the
 /// exact parser the SAN builder uses for an iPAddress entry (OpenSSL
 /// `a2i_IPADDRESS`). Callers classifying a SAN as IP-vs-DNS should gate on this

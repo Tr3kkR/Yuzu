@@ -406,7 +406,8 @@ gw_enrolled:
         // no-cert (identical to a nullopt return — the agent stays on bootstrap).
         std::optional<std::pair<std::string, std::string>> issued;
         try {
-            issued = agent_cert_signer_(request->csr_pem(), info.agent_id());
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
+                                        CertIssuanceSource::GatewayProxy);
         } catch (const std::exception& e) {
             spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}",
                           info.agent_id(), e.what());
