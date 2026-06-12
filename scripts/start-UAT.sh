@@ -59,7 +59,10 @@ UAT_DIR="/tmp/yuzu-uat"
 # Postgres sidecar (see header). PG_SOFT_FAIL=1 → a missing/failed sidecar
 # warns and continues; becomes a hard failure once #1320 PR 3 makes the
 # server require the DSN at boot.
-PG_CONTAINER="yuzu-uat-postgres"
+# Distinct from the full-uat compose's container_name yuzu-uat-postgres —
+# the native teardown force-removes this container, and a shared name would
+# let one rig destroy the other's database (PR #1381 review, LOW).
+PG_CONTAINER="yuzu-native-uat-postgres"
 PG_IMAGE="yuzu-postgres:local"
 PG_HOST_PORT=15433
 PG_SOFT_FAIL=1
@@ -398,20 +401,30 @@ start_postgres_sidecar() {
     fi
 
     # Readiness mirrors the compose healthcheck: pg_isready liveness AND
-    # SELECT 1 over the app DSN (proves the app credential exists and is
-    # not the superuser's). -h 127.0.0.1 is load-bearing — the temporary
-    # initdb-phase server is unix-socket-only, so a TCP probe cannot
-    # false-positive mid-init.
+    # SELECT 1 over the app credential. The psql leg dials $(hostname), NOT
+    # loopback — initdb leaves 127.0.0.1 on trust auth, so a loopback dial
+    # would greenlight a broken password; the container-hostname dial forces
+    # scram, actually proving the credential (PR #1381 review, item 2 — same
+    # reason the compose healthchecks dial $(hostname)). pg_isready stays on
+    # loopback: pure liveness, and the initdb-phase temp server is
+    # unix-socket-only so TCP can't false-positive mid-init. The password
+    # rides docker-exec env, never the host-visible argv.
     local _i
     for _i in $(seq 1 60); do
-        if docker exec "$PG_CONTAINER" sh -c \
-            "pg_isready -h 127.0.0.1 -U yuzu -d yuzu >/dev/null 2>&1 && \
-             psql 'postgresql://yuzu:${pg_app}@127.0.0.1:5432/yuzu' -tA -c 'SELECT 1' >/dev/null 2>&1" \
+        if docker exec -e PGPASSWORD="$pg_app" "$PG_CONTAINER" sh -c \
+            'pg_isready -h 127.0.0.1 -U yuzu -d yuzu >/dev/null 2>&1 && \
+             psql -h "$(hostname)" -U yuzu -d yuzu -tA -c "SELECT 1" >/dev/null 2>&1' \
             2>/dev/null; then
             PG_DSN="postgresql://yuzu:${pg_app}@127.0.0.1:${PG_HOST_PORT}/yuzu"
             # 0600 — carries the app credential; lets the operator psql in
-            # while the rig is up: psql "$(cat /tmp/yuzu-uat/postgres-dsn)"
-            (umask 077; printf '%s\n' "$PG_DSN" > "$UAT_DIR/postgres-dsn")
+            # while the rig is up: psql "$(cat /tmp/yuzu-uat/postgres-dsn)".
+            # mktemp+mv: the file is created O_EXCL at 0600, closing the
+            # symlink-swap window between create and write (PR #1381 LOW).
+            local _dsn_tmp
+            if _dsn_tmp=$(mktemp "$UAT_DIR/.postgres-dsn.XXXXXX"); then
+                printf '%s\n' "$PG_DSN" > "$_dsn_tmp"
+                mv -f "$_dsn_tmp" "$UAT_DIR/postgres-dsn"
+            fi
             ok "Postgres sidecar up ($PG_CONTAINER → host 127.0.0.1:${PG_HOST_PORT})"
             info "DSN saved to $UAT_DIR/postgres-dsn (0600)"
             return 0

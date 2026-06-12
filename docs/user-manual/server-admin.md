@@ -825,23 +825,33 @@ The helper is **non-fatal when no local cluster is found** (prints install hints
 
 The SQLite backup guidance in [Configuration Files](#configuration-files) continues to apply while stores migrate incrementally — during the transition, a complete backup covers **both** the remaining SQLite stores **and** the Postgres database.
 
-Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies):
+Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies).
+
+**Native installs** — the DSN lives only in the root-only systemd environment file (`/etc/yuzu/yuzu-server.env`), **not** in interactive shells, so load it first. Then split the password out so it rides the `PGPASSWORD` environment variable instead of the process argv (`/proc/<pid>/cmdline` is world-readable, and the command lands in shell history):
 
 ```bash
-# Native install (DSN from /etc/yuzu/yuzu-server.env)
-pg_dump --format=custom --file="yuzu-pg-$(date +%F).dump" "$YUZU_POSTGRES_DSN"
+# Run as root. Assumes the standard helper-written DSN shape
+# scheme://user:password@host:port/db.
+. /etc/yuzu/yuzu-server.env
+export PGPASSWORD="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^[a-z]+://[^:/@]*:([^@]*)@.*$!\1!')"
+DSN_NOPASS="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^([a-z]+://[^:/@]*):[^@]*@!\1@!')"
 
-# Docker Compose (reference template — superuser inside the container)
+pg_dump --format=custom --file="yuzu-pg-$(date +%F).dump" "$DSN_NOPASS"
+```
+
+**Docker Compose** (reference template — superuser peer auth inside the container; no credential on the host command line):
+
+```bash
 docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
   > "yuzu-pg-$(date +%F).dump"
 ```
 
-Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot):
+Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
 
 ```bash
-# Native
+# Native — same env-file + PGPASSWORD/DSN_NOPASS preamble as the backup recipe
 pg_restore --clean --if-exists --no-owner --role=yuzu \
-  --dbname="$YUZU_POSTGRES_DSN" "yuzu-pg-YYYY-MM-DD.dump"
+  --dbname="$DSN_NOPASS" "yuzu-pg-YYYY-MM-DD.dump"
 
 # Docker Compose
 docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \

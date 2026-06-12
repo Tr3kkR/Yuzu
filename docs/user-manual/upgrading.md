@@ -135,8 +135,14 @@ sudo systemctl stop yuzu-server
 # 2. Back up data
 sudo cp /var/lib/yuzu/*.db /var/lib/yuzu/backup/
 sudo cp /etc/yuzu/*.cfg /var/lib/yuzu/backup/
-# ... and the Postgres database, if provisioned (DSN in /etc/yuzu/yuzu-server.env)
-sudo -u yuzu pg_dump --format=custom --file=/var/lib/yuzu/backup/yuzu-pg.dump "$YUZU_POSTGRES_DSN"
+# ... and the Postgres database, if provisioned. The DSN lives only in the
+# root-only env file (NOT in interactive shells) — load it, and keep the
+# password off the argv via PGPASSWORD. Full recipe + restore procedure:
+# server-admin.md § PostgreSQL Substrate.
+sudo sh -c '. /etc/yuzu/yuzu-server.env
+  export PGPASSWORD="$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^[a-z]+://[^:/@]*:([^@]*)@.*\$!\1!")"
+  pg_dump --format=custom --file=/var/lib/yuzu/backup/yuzu-pg.dump \
+    "$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^([a-z]+://[^:/@]*):[^@]*@!\1@!")"'
 
 # 3. Replace the binary
 sudo cp yuzu-server /usr/local/bin/yuzu-server

@@ -42,7 +42,7 @@ fi
 %files
 %{_bindir}/yuzu-server
 %{_unitdir}/yuzu-server.service
-%{_datadir}/yuzu/scripts/install-server-postgres.sh
+%attr(0755,root,root) %{_datadir}/yuzu/scripts/install-server-postgres.sh
 %dir %attr(0750,yuzu,yuzu) /var/lib/yuzu
 %dir %attr(0750,yuzu,yuzu) /var/log/yuzu
 %dir %attr(0750,yuzu,yuzu) /etc/yuzu
