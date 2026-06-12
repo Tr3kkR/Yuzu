@@ -97,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RDP control plugin (`rdp_control`).** New Windows-only agent plugin with
+  two actions: `set_state` (enable|disable — writes `HKLM fDenyTSConnections`,
+  toggles the Remote Desktop firewall rule group locale-independently via
+  `INetFwPolicy2`, and starts `TermService` on enable; per-step status columns
+  with `overall=ok` only when every step succeeds) and `status` (reads back all
+  three gates and derives `rdp=on|off|unknown`, reporting `unknown` rather than
+  `off` when a gate is unreadable). Bundled `windows.rdp.set_state` definition
+  (role-gated, `endpoint-admin`) and `windows.rdp.status` (auto, question).
+  Built for change-gated remote access: an ITSM system can enable RDP at the
+  start of an approved change window and disable it afterward. Disable blocks
+  new connections only (does not terminate active sessions). Non-Windows builds
+  compile to an error-returning stub. Requires the agent service account to be
+  in the local `Administrators` group (not the default install) — see
+  `docs/agent-privilege-model.md`.
 - **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
   UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
   Three deliverables ahead of the substrate's fail-closed flip: (1) the

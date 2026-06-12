@@ -526,6 +526,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"registry.enumerate_keys", "List subkeys under a registry key"},
         {"registry.enumerate_values", "List values in a registry key"},
         {"registry.get_user_value", "Get a registry value for a specific user SID"},
+        // rdp_control
+        {"rdp_control.set_state",
+         "Enable or disable Remote Desktop (registry + firewall group + TermService)"},
+        {"rdp_control.status",
+         "Remote Desktop posture: registry, firewall group, service, derived rdp on/off"},
         // filesystem
         {"filesystem.exists", "Check if a path exists, report type and size"},
         {"filesystem.list_dir", "List directory contents (max 1000 entries)"},
