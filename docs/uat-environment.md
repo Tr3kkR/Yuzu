@@ -15,6 +15,8 @@ bash scripts/start-UAT.sh stop     # kill all
 bash scripts/start-UAT.sh status   # show running processes
 ```
 
+**Server tier = (server + postgres) pair.** Under the Postgres substrate (ADR-0006, #1320) the deployable stack is `(Server + Postgres) → Gateway → Agent` — every rig that boots the server tier also carries a PostgreSQL instance. The native rig runs a **postgres sidecar container** (`yuzu-uat-postgres`, image `yuzu-postgres:local` built from `deploy/docker/Dockerfile.postgres` on first use) on loopback `:15433` with per-run random credentials (superuser ≠ app role, per the #1334 init contract); the DSN is exported to the server as `YUZU_POSTGRES_DSN` and saved to `/tmp/yuzu-uat/postgres-dsn` (0600). The viz-UAT and demo rigs get their postgres as a compose service. Until #1320 PR 3 lands the fail-closed boot, a missing docker/sidecar is a **warning, not a failure** (`PG_SOFT_FAIL=1` in the script — flip with that PR). Host port 15433 deliberately avoids `5432` (local clusters), `5433` (dev pg-canary convention), and `15432` (yuzu-ci-postgres).
+
 ## viz-UAT (container-based, feat/viz-engine ladder)
 
 `scripts/start-viz-uat.sh` stands up a three-container Docker stack (server + gateway + agent) for the visualization feature ladder. **Cannot run alongside `start-UAT.sh`** — both bind host ports 8080 *and* 50051. Auto-detects arm64 vs amd64 and sets `--build-arg TRIPLET` accordingly; default `x64-linux` preserves the `release.yml` path. The launcher exports `VIZ_UAT_CONFIG` (absolute path to a generated `yuzu-server.cfg`); do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly. State dir `/tmp/yuzu-viz-uat/`; scale agents with `VIZ_UAT_AGENTS=N`. Set `VIZ_UAT_AGENT_MODE=vm` to skip the in-container agent and print the enrollment token + host-exposed gateway address for running a native `yuzu-agent` on an OrbStack VM / bare-metal host — needed for PR 8+ visuals that depend on real loopback workloads. `VIZ_UAT_AGENT_MODE=none` skips agent startup entirely. **Note:** `scripts/start-UAT.sh` (the native, non-container UAT) force-wipes `/tmp/yuzu-uat/` on each start to work around a stale-DB session-auth bug (#947); do not remove that wipe without first closing the issue. See `bash scripts/start-viz-uat.sh --help` for full usage.
@@ -37,6 +39,7 @@ Server and gateway defaults do not conflict — all three components can run on 
 | 50063 | Gateway | Management/command forwarding (server sends commands here) |
 | 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
 | 9568 | Gateway | Prometheus metrics |
+| 15433 | Postgres sidecar | Native-rig `yuzu-uat-postgres` container, loopback-published → container 5432 (server tier's substrate pair; ADR-0006/#1320) |
 
 ## Gateway command forwarding
 

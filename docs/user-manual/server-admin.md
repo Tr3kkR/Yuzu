@@ -18,11 +18,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Data Storage and Encryption](#data-storage-and-encryption)
-13. [Retention Settings](#retention-settings)
-14. [Settings API Reference](#settings-api-reference)
-15. [Deployment](#deployment)
-16. [Windows Service Installation](#windows-service-installation)
-17. [Planned Features](#planned-features)
+13. [PostgreSQL Substrate](#postgresql-substrate)
+14. [Retention Settings](#retention-settings)
+15. [Settings API Reference](#settings-api-reference)
+16. [Deployment](#deployment)
+17. [Windows Service Installation](#windows-service-installation)
+18. [Planned Features](#planned-features)
 
 ---
 
@@ -128,7 +129,7 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
@@ -787,6 +788,69 @@ Operators must use full-disk encryption to protect Yuzu data at rest:
 For containerized deployments (Docker Compose), ensure the host volume backing `server-data` is on an encrypted filesystem.
 
 > **Planned:** A future `--encrypt-db` option will add application-level SQLite encryption using SQLCipher, providing defense-in-depth independent of disk encryption. Track progress in the roadmap (Phase 7).
+
+---
+
+## PostgreSQL Substrate
+
+The server's storage substrate is moving from SQLite to **PostgreSQL** (ADR-0006; the agent stays SQLite). Today the database is **inert-but-ready**: the bundled containers, the provisioning helper, and the backup procedure below all exist so that deployments are Postgres-ready *before* the release that makes the server require a DSN at boot (#1320 — a **breaking** change; the CHANGELOG entry for that release will say so explicitly).
+
+### Provisioning a native (non-container) install
+
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+
+| Install method | Helper location | Invocation |
+|---|---|---|
+| `.deb` / `.rpm` | `/usr/share/yuzu/scripts/install-server-postgres.sh` | Run automatically (non-fatally) by the package post-install hook |
+| Release tarball | `scripts/install-server-postgres.sh` inside the archive | Run manually as root after unpacking |
+| Git checkout | `scripts/install-server-postgres.sh` | Run manually as root |
+
+Two modes:
+
+```bash
+# Mode 1 — external/managed Postgres: writes the DSN to
+# /etc/yuzu/yuzu-server.env (0600), which the systemd unit loads
+# via EnvironmentFile=. No local Postgres is touched.
+sudo bash install-server-postgres.sh --dsn 'postgresql://yuzu:...@db.example.com:5432/yuzu'
+
+# Mode 2 (default) — local Postgres: provisions the app role + database
+# on an already-installed local PostgreSQL 16+ and writes the DSN env file.
+# Idempotent — never clobbers an existing role, database, or env file.
+sudo bash install-server-postgres.sh
+```
+
+The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008).
+
+### Backing up PostgreSQL state
+
+The SQLite backup guidance in [Configuration Files](#configuration-files) continues to apply while stores migrate incrementally — during the transition, a complete backup covers **both** the remaining SQLite stores **and** the Postgres database.
+
+Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies):
+
+```bash
+# Native install (DSN from /etc/yuzu/yuzu-server.env)
+pg_dump --format=custom --file="yuzu-pg-$(date +%F).dump" "$YUZU_POSTGRES_DSN"
+
+# Docker Compose (reference template — superuser inside the container)
+docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+  > "yuzu-pg-$(date +%F).dump"
+```
+
+Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot):
+
+```bash
+# Native
+pg_restore --clean --if-exists --no-owner --role=yuzu \
+  --dbname="$YUZU_POSTGRES_DSN" "yuzu-pg-YYYY-MM-DD.dump"
+
+# Docker Compose
+docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+  --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
+```
+
+Schedule the dump alongside the existing SQLite/cert-dir backups; verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
+
+> **The restore-pairing invariant (ADR-0010 — forward reference).** Once envelope-encrypted secrets land (ADR-0010), `pg_dump` output and volume snapshots will contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching `KeyProvider` keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and treat the KEK file like the CA root key (separate, offline copy). The restore-verification drill must restore both halves and confirm a clean fingerprint check at boot. The full key-management runbook (rotation, DR drill) is tracked in #1341. Plan your backup automation for this pairing **now** so the secrets migration doesn't invalidate your procedure.
 
 ---
 
