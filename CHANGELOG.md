@@ -138,7 +138,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `yuzu_fleet_perf_*` Prometheus gauges, computed at render time over
   registry heartbeat state with **zero new storage** — plus **cohort
   benchmarking**: fleet-relative percentiles per cohort of an operator-chosen
-  tag key (e.g. `model`, `image`), the Aternity model. Honesty rules
+  tag key (e.g. `model`, `image`) — fleet-relative percentile
+  benchmarking. Honesty rules
   throughout: a metric nobody reported is absent (never 0), cohorts under 10
   reporting devices withhold percentiles ("n too small"), and devices without
   the chosen key appear as an explicit "(untagged)" residual. Every aggregate
