@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
+  server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
+  Postgres substrate move and generated a server with no database to talk to.
+  It now has a PostgreSQL section on the Data step with two deployment modes:
+  **bundled** (emits a release-pinned `ghcr.io/tr3kkr/yuzu-postgres` service
+  with the reference healthcheck and gates server start on
+  `depends_on: condition: service_healthy`) and **external/managed** (the
+  operator supplies a DSN, no local container). Either way the server gets a
+  `YUZU_POSTGRES_DSN` env entry (consumed as an env var, not a CLI flag). Per
+  ADR-0010 the credentials/DSN live in the generated `.env`; the compose YAML
+  only references `${YUZU_POSTGRES_PASSWORD}` / `${YUZU_DB_PASSWORD}` /
+  `${YUZU_POSTGRES_DSN}` so no secret is baked into it. Bundled mode enforces
+  the image's distinct-credentials invariant (superuser ≠ app role) and offers
+  a Web-Crypto secret generator. The wizard's default version was also bumped
+  `0.10.0` → `0.12.0` so the bundled image tag resolves.
 - **CI server-test legs now require a reachable PostgreSQL 16**
   (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
   provision or authenticate one — except the documented psql-less TCP-probe
