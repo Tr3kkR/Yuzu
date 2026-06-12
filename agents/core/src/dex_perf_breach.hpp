@@ -40,11 +40,14 @@ namespace yuzu::agent::win {
 
 /// One instant's raw counters — the minimal set breach detection needs.
 /// CPU and disk are CUMULATIVE since boot; commit charge is instantaneous.
-/// `valid` covers CPU + commit (the core reads); `disk_valid` is separate
-/// because IOCTL_DISK_PERFORMANCE can be unavailable (some virtual disks)
-/// while everything else works — mirrors the tar_perf contract.
+/// `valid` covers the CPU core read; `commit_valid` and `disk_valid` are
+/// PER-DOMAIN because GetPerformanceInfo (commit) and IOCTL_DISK_PERFORMANCE
+/// (disk) can each fail independently of GetSystemTimes — mirrors the tar_perf
+/// contract. A failed sub-read must NOT feed a healthy 0% into its latch (that
+/// would clear a real breach / reset a building one — gov review MEDIUM #1).
 struct PerfBreachCounters {
     bool valid{false};
+    bool commit_valid{false};
     bool disk_valid{false};
     std::int64_t ts_epoch{0};
 
@@ -54,9 +57,9 @@ struct PerfBreachCounters {
     std::uint64_t cpu_kernel{0};
     std::uint64_t cpu_user{0};
 
-    // Commit charge, instantaneous, bytes. A failed GetPerformanceInfo leaves
-    // both 0 → commit_pct derives 0 → reads healthy, never a breach (a missing
-    // reading must never read as a failure — the D1 contract).
+    // Commit charge, instantaneous, bytes. Valid only when GetPerformanceInfo
+    // succeeded (commit_valid) — an intermittent failure must not masquerade as
+    // a healthy 0% and defeat the memory latch.
     std::uint64_t commit_total_bytes{0};
     std::uint64_t commit_limit_bytes{0};
 
@@ -71,8 +74,9 @@ struct PerfBreachCounters {
 /// service time over the interval; an interval with zero IOs derives 0 — an
 /// idle disk is a healthy disk, not a slow one.
 struct PerfBreachSample {
-    bool valid{false};
-    bool disk_valid{false};
+    bool valid{false};        ///< CPU domain valid (the sample as a whole)
+    bool commit_valid{false}; ///< commit_pct trustworthy (GetPerformanceInfo ok)
+    bool disk_valid{false};   ///< disk_lat_ms trustworthy (IOCTL_DISK_PERFORMANCE ok)
     double cpu_pct{0.0};
     double commit_pct{0.0};
     double disk_lat_ms{0.0};

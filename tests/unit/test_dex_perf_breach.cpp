@@ -25,6 +25,7 @@ constexpr std::uint64_t kSec = 10'000'000ULL;
 win::PerfBreachCounters base() {
     win::PerfBreachCounters c;
     c.valid = true;
+    c.commit_valid = true;
     c.disk_valid = true;
     c.ts_epoch = 1000;
     c.cpu_idle = 100 * kSec;
@@ -82,6 +83,26 @@ TEST_CASE("derive: commit limit 0 (failed read) derives healthy, never a breach"
     const auto s = win::derive_breach_sample(prev, cur);
     REQUIRE(s.valid);
     CHECK(s.commit_pct == 0.0);
+}
+
+TEST_CASE("derive: a failed commit read is NOT valid — never feeds the memory latch (review #1)",
+          "[dex_perf]") {
+    // GetPerformanceInfo failed this tick: commit_valid=false even though CPU
+    // (GetSystemTimes) succeeded. The sample is CPU-valid but the memory domain
+    // must read INVALID, so the caller (poll_perf, gating on s.valid &&
+    // s.commit_valid) does not reset a building breach or clear a reported latch
+    // with a bogus healthy 0%.
+    const auto prev = base();
+    auto cur = advance(prev, 120, 0.1);
+    cur.commit_valid = false;
+    cur.commit_total_bytes = 0; // a failed GetPerformanceInfo leaves these 0
+    cur.commit_limit_bytes = 0;
+    const auto s = win::derive_breach_sample(prev, cur);
+    REQUIRE(s.valid);          // CPU domain still usable
+    CHECK(!s.commit_valid);    // memory domain marked invalid → latch holds
+    CHECK(s.commit_pct == 0.0);
+    // And a genuinely valid commit reading sets the flag.
+    CHECK(win::derive_breach_sample(prev, advance(prev, 120, 0.1)).commit_valid);
 }
 
 TEST_CASE("derive: disk latency = combined per-IO service time in ms", "[dex_perf]") {

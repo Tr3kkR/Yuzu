@@ -47,11 +47,16 @@ PerfBreachSample derive_breach_sample(const PerfBreachCounters& prev,
         s.cpu_pct = clamp_pct(100.0 * static_cast<double>(total_d - idle_d) /
                               static_cast<double>(total_d));
 
-    // Commit charge: instantaneous from the current reading. A failed
-    // GetPerformanceInfo left limit 0 → stays 0.0 → healthy, never a breach.
-    if (cur.commit_limit_bytes > 0)
+    // Commit charge: instantaneous from the current reading. Per-domain valid
+    // (gov review MEDIUM #1) — only when THIS reading's GetPerformanceInfo
+    // succeeded. An intermittent failure must not feed a healthy 0% into the
+    // memory latch (which would reset a building breach or clear a reported
+    // one); the caller gates the memory breach on s.commit_valid.
+    if (cur.commit_valid && cur.commit_limit_bytes > 0) {
+        s.commit_valid = true;
         s.commit_pct = clamp_pct(100.0 * static_cast<double>(cur.commit_total_bytes) /
                                  static_cast<double>(cur.commit_limit_bytes));
+    }
 
     // Disk: per-domain degrade — both readings must have disk data; a
     // regression zeroes the domain for one interval via the saturating delta.
@@ -210,9 +215,10 @@ PerfBreachCounters read_perf_breach_counters() {
     if (::GetPerformanceInfo(&pi, sizeof(pi))) {
         c.commit_total_bytes = static_cast<std::uint64_t>(pi.CommitTotal) * pi.PageSize;
         c.commit_limit_bytes = static_cast<std::uint64_t>(pi.CommitLimit) * pi.PageSize;
+        c.commit_valid = true; // memory latch is fed only when this succeeded
     }
 
-    c.valid = true; // CPU + commit are the core reads; disk degrades separately
+    c.valid = true; // CPU is the core read; commit + disk degrade independently
     read_disks(c);
     return c;
 }

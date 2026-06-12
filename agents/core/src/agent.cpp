@@ -1535,8 +1535,12 @@ public:
                                 if (ps.valid) {
                                     tags["yuzu.perf_cpu_pct"] =
                                         std::format("{:.1f}", ps.cpu_pct);
-                                    tags["yuzu.perf_commit_pct"] =
-                                        std::format("{:.1f}", ps.commit_pct);
+                                    // Per-domain validity (gov review MEDIUM #1):
+                                    // omit a sub-metric whose read failed rather
+                                    // than ship a healthy 0% into the fleet gauge.
+                                    if (ps.commit_valid)
+                                        tags["yuzu.perf_commit_pct"] =
+                                            std::format("{:.1f}", ps.commit_pct);
                                     if (ps.disk_valid)
                                         tags["yuzu.perf_disk_lat_ms"] =
                                             std::format("{:.2f}", ps.disk_lat_ms);

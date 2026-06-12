@@ -14,6 +14,22 @@
 namespace yuzu::server::detail {
 
 namespace {
+// Strip control bytes from an agent-supplied label before it reaches an alert
+// sink (webhook HTTP, notification row) or a server log line (gov review
+// MEDIUM #2). obs_type and agent_id flow to on_alert_/on_incident_ and the
+// spdlog warns; a raw \r\n is a latent CRLF/header-injection and a log-forging
+// vector. subject is already stripped in blast_subject_from_detail; this gives
+// obs_type and agent_id the same treatment at the one chokepoint that feeds
+// both observers. Bounded at 256 bytes (the projection field clamp) so a
+// forged multi-KB label can't bloat a notification/log either.
+std::string sanitize_label(const std::string& s) {
+    std::string out = s.size() > 256 ? s.substr(0, 256) : s;
+    for (char& c : out)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+            c = '?';
+    return out;
+}
+
 // google.protobuf.Timestamp seconds → ISO-8601 UTC; falls back to "now" when
 // unset (an agent that didn't stamp the event, or a 0 default). Mirrors
 // iso_now() in rest_api_v1.cpp. Moved here from agent_service_impl.cpp when the
@@ -97,7 +113,14 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
+            // Sanitize every agent-influenced label that reaches an alert sink
+            // or a log line: subject (via blast_subject_from_detail), plus
+            // obs_type and agent_id here (gov review MEDIUM #2). The stored
+            // projection above keeps the raw values (escaped at render); this is
+            // the alert/log path only.
             const auto subject = blast_subject_from_detail(ev_row.detail_json);
+            const auto obs_type = sanitize_label(ev_row.event_type);
+            const auto safe_agent = sanitize_label(agent_id);
             // Belt-and-braces (gov SRE): this runs on the gRPC ingest thread
             // inside a sync handler with NO catch-all above it — an escape tears
             // down the agent's Subscribe stream. Each observer also guards its
@@ -105,17 +128,17 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // observer regardless of whether each remembers to.
             try {
                 if (blast_radius)
-                    blast_radius->observe(ev_row.event_type, subject, agent_id, now);
+                    blast_radius->observe(obs_type, subject, safe_agent, now);
                 // F1: operator-routed per-signal alerts — same chokepoint, same
-                // both-paths coverage, same clamped subject (sec-M1).
+                // both-paths coverage, same sanitized labels.
                 if (alert_router)
-                    alert_router->observe(ev_row.event_type, subject, agent_id, now);
+                    alert_router->observe(obs_type, subject, safe_agent, now);
             } catch (const std::exception& e) {
-                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}",
-                             ev_row.event_type, agent_id, e.what());
+                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}", obs_type,
+                             safe_agent, e.what());
             } catch (...) {
                 spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
-                             ev_row.event_type, agent_id);
+                             obs_type, safe_agent);
             }
         }
         return;

@@ -298,7 +298,11 @@ private:
         prev_perf_ = cur;
         if (auto avg = breach_update(cpu_breach_, s.cpu_pct, s.valid, kCpuBreach))
             emit(cpu_sustained_observation(*avg));
-        if (auto avg = breach_update(mem_breach_, s.commit_pct, s.valid, kMemoryBreach))
+        // Memory + disk gate on their PER-DOMAIN validity (gov review MEDIUM #1):
+        // a failed GetPerformanceInfo / IOCTL_DISK_PERFORMANCE must read as an
+        // invalid sample (latch holds) — never a healthy 0%.
+        if (auto avg = breach_update(mem_breach_, s.commit_pct, s.valid && s.commit_valid,
+                                     kMemoryBreach))
             emit(memory_pressure_observation(*avg));
         if (auto avg = breach_update(disk_breach_, s.disk_lat_ms, s.valid && s.disk_valid,
                                      kDiskLatBreach))
