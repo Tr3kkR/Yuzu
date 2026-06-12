@@ -1678,6 +1678,8 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
+| `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |
+| `rdp_control.status` | `rdp_control` | Y | - | - | Verified |
 
 ### 14.10 Agent Key-Value Storage
 
