@@ -3,6 +3,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <utility>
@@ -93,7 +94,7 @@ void DexAlertRouter::observe(const std::string& obs_type, const std::string& sub
         const std::string key = obs_type + '\x1f' + agent_id;
         if (auto it = last_fire_.find(key); it != last_fire_.end() &&
                                             now_unix - it->second < cfg_.cooldown_seconds) {
-            inc_metric("yuzu_server_dex_alerts_suppressed_total");
+            inc_metric("yuzu_server_dex_alert_suppressed_total");
             return; // in cooldown
         }
         // Rolling-minute fan-out budget (the blast-radius UP-2 posture).
@@ -102,7 +103,7 @@ void DexAlertRouter::observe(const std::string& obs_type, const std::string& sub
             fire_minute_count_ = 0;
         }
         if (fire_minute_count_ >= cfg_.max_fires_per_minute) {
-            inc_metric("yuzu_server_dex_alerts_dropped_total");
+            inc_metric("yuzu_server_dex_alert_dropped_total");
             return; // budget exhausted — the cooldown is NOT armed, so the
                     // alert fires on a later sighting once the burst passes
         }
@@ -112,12 +113,25 @@ void DexAlertRouter::observe(const std::string& obs_type, const std::string& sub
         fire = true;
     }
     if (fire && on_alert_) {
-        inc_metric("yuzu_server_dex_alerts_fired_total");
+        inc_metric("yuzu_server_dex_alert_fired_total");
         RoutedSignalAlert a;
         a.obs_type = obs_type;
         a.subject = subject;
         a.agent_id = agent_id;
-        on_alert_(a); // outside the lock — SQLite + webhook dispatch
+        try {
+            on_alert_(a); // outside the lock — SQLite + webhook dispatch
+        } catch (...) {
+            // A throwing sink (SQLITE_BUSY → exception, disk full, webhook
+            // store closed mid-fire) MUST NOT escape: observe() runs on the
+            // gRPC ingest thread inside a sync handler with no catch-all, so an
+            // escape tears down the agent's Subscribe stream (gov UP-1 BLOCKING;
+            // mirrors BlastRadiusDetector::observe). The cooldown is already
+            // armed above, so a lost alert stays silent until the next episode
+            // — surfaced via the delivery-failed counter for on-call.
+            inc_metric("yuzu_server_dex_alert_delivery_failed_total");
+            spdlog::warn("DexAlertRouter: on_alert sink threw for {} '{}' — alert lost",
+                         obs_type, subject);
+        }
     }
 }
 

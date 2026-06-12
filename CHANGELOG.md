@@ -108,9 +108,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   posture, not policy). Routing is evaluated at the shared observation-ingest
   chokepoint, so directly-connected and gateway-routed agents are covered
   identically. Changes are audit-logged (`settings.dex_alerts.*`) and
-  persisted in runtime config; router activity is observable via
-  `yuzu_server_dex_alerts_*` metrics. The agent-side A3 breach thresholds
-  (90 % CPU / 10 min etc.) remain fixed in this release.
+  persisted in runtime config; router activity is observable via the
+  `yuzu_server_dex_alert_*` metrics (fired / delivery_failed / suppressed /
+  dropped / cooldowns_evicted / routed_types). The agent-side A3 breach
+  thresholds (90 % CPU / 10 min etc.) remain fixed in this release.
 - **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
   Each Windows agent now records, on the same 30 s perf tick, the **top 10
   applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)
@@ -120,10 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles. Samples are aggregated per image name (12 chrome.exe processes =
   one row, `instances=12`); `cpu_pct` is the app's share of total machine
   capacity, matching Task Manager. Privacy: **image names only — never
-  command lines**; TAR redaction patterns apply to the name; the whole source
-  has its own **`procperf_enabled`** toggle (default `true`) independent of
-  the device-level sampler, so per-app visibility can be disabled on its own.
-  Queryable via `tar.sql`.
+  command lines**; TAR redaction patterns apply to the name. **Off by default**
+  (`procperf_enabled=false`) — per-application data is usage-class telemetry
+  subject to works-council/DPA review, distinct from device-level perf (which
+  carries no per-app identity and stays on); set `procperf_enabled=true` to opt
+  in, independent of the device-level sampler. Queryable via `tar.sql`.
 - **TAR: warehouse tables are now ensured on every database open.** Fixes an
   upgrade bug where tables introduced by a newer release (the perf tier, and
   now procperf) were never created on a pre-existing `tar.db` — the schema DDL
@@ -191,8 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-minute fan-out cap and a bounded LRU pair map keep it kind to the server
   and the ITSM sink under a correlated multi-subject incident. Metrics:
   `yuzu_server_dex_blast_radius_{incidents,fires_dropped,entries_dropped,pairs_evicted}_total`
-  + `yuzu_server_dex_blast_radius_pairs_tracked`. Thresholds are fixed in this
-  release (operator-configurable in a later slice).
+  + `yuzu_server_dex_blast_radius_pairs_tracked`. The 5-devices / 15-min / 1-h
+  defaults are now operator-tunable under Settings → DEX alerts (see the alert
+  routing entry above).
 - **DEX: Windows disk-space and battery-health observations.** A Windows
   state-poll collector (`dex_win_poll`) emits `storage.low` (fixed volume ≥90%
   full or <5 GiB free, 10-min cadence, via `GetDiskFreeSpaceExW`) and `hw.error`

@@ -203,9 +203,12 @@ regardless. Good candidates are the low-volume, high-meaning types — the
 type (e.g. `process.crashed` on a large fleet) is safe for the server but
 noisy for you. Changes apply live and are audit-logged
 (`settings.dex_alerts.routing`); router activity is observable via the
-`yuzu_server_dex_alerts_*` Prometheus metrics. The A3 perf-breach *thresholds*
-themselves (90 % CPU / 10 min etc.) remain fixed agent-side in this release —
-server-to-agent threshold distribution is a planned follow-up.
+`yuzu_server_dex_alert_fired_total`, `yuzu_server_dex_alert_delivery_failed_total`,
+`yuzu_server_dex_alert_suppressed_total`, `yuzu_server_dex_alert_dropped_total`,
+`yuzu_server_dex_alert_cooldowns_evicted_total`, and
+`yuzu_server_dex_alert_routed_types` Prometheus metrics. The A3 perf-breach
+*thresholds* themselves (90 % CPU / 10 min etc.) remain fixed agent-side in
+this release — server-to-agent threshold distribution is a planned follow-up.
 
 ## Fleet performance rollup (Prometheus)
 

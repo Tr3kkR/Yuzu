@@ -19,8 +19,10 @@ std::uint64_t delta(std::uint64_t prev, std::uint64_t cur) {
 
 // (pid, create_time) identity key — PID alone is reused by the OS.
 std::uint64_t proc_key(const ProcCounter& p) {
-    // create_time's low bits are unique enough to disambiguate a reused PID;
-    // a 64-bit mix keeps the map single-keyed.
+    // PID in the high 32 bits XOR'd with the FULL 64-bit create_time; a
+    // collision needs two procs whose create_time high-dword aligns with a
+    // reused PID — astronomically rare, and at worst costs one interval of CPU
+    // mis-attribution for one app row.
     return (static_cast<std::uint64_t>(p.pid) << 32) ^
            static_cast<std::uint64_t>(p.create_time_100ns);
 }
@@ -157,6 +159,14 @@ struct SysProcEntry {
     SIZE_T WorkingSetSize;
     // trailing fields exist; NextEntryOffset walks past them safely
 };
+// These asserts pin only the fields winternl.h PUBLICLY exposes — all of which
+// sit AFTER the `Reserved1[48]` block. CreateTime/UserTime/KernelTime (the CPU
+// fields we read) live INSIDE that reserved region, so they CANNOT be
+// offsetof-checked; their offsets rely on the documented, Vista-stable layout
+// of the reserved bytes (gov cross-platform S1). Pinning ImageName's absolute
+// offset (56 on x64) transitively anchors the tail, and walking by
+// NextEntryOffset insulates against trailing-field growth across Win10/11/Server
+// SKUs — so any layout drift that would matter trips one of these.
 static_assert(offsetof(SysProcEntry, ImageName) ==
               offsetof(SYSTEM_PROCESS_INFORMATION, ImageName));
 static_assert(offsetof(SysProcEntry, UniqueProcessId) ==
@@ -202,7 +212,14 @@ ProcSnapshot read_proc_counters() {
 
     // Buffer-growth loop: the process list changes between the size probe and
     // the fill, so re-ask with headroom until it fits (bounded attempts).
+    // `ok` is load-bearing: only a successful (st==0) fill is walkable. If all
+    // attempts return STATUS_INFO_LENGTH_MISMATCH, the buffer holds partial
+    // kernel writes AND each resize() moved storage, so every kernel-written
+    // ImageName.Buffer (an absolute pointer INTO the pre-resize allocation) now
+    // dangles — walking it would be a use-after-free heap read (gov cpp-safety
+    // BLOCKING). Bail with valid=false instead.
     std::vector<unsigned char> buf(1 << 18); // 256 KiB start
+    bool ok = false;
     for (int attempt = 0; attempt < 6; ++attempt) {
         ULONG needed = 0;
         const NTSTATUS st =
@@ -213,12 +230,17 @@ ProcSnapshot read_proc_counters() {
         }
         if (st != 0)
             return snap; // any other failure: valid stays false
+        ok = true;
         break;
     }
+    if (!ok)
+        return snap; // never successfully filled — buffer contents are undefined
 
+    const unsigned char* base = buf.data();
+    const unsigned char* end = base + buf.size();
     std::size_t off = 0;
     while (off + sizeof(SysProcEntry) <= buf.size()) {
-        const auto* e = reinterpret_cast<const SysProcEntry*>(buf.data() + off);
+        const auto* e = reinterpret_cast<const SysProcEntry*>(base + off);
         const auto pid =
             static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(e->UniqueProcessId));
         if (pid != 0) { // skip Idle — its "CPU" is the absence of work
@@ -228,7 +250,13 @@ ProcSnapshot read_proc_counters() {
             p.cpu_100ns = static_cast<std::uint64_t>(e->KernelTime.QuadPart) +
                           static_cast<std::uint64_t>(e->UserTime.QuadPart);
             p.ws_bytes = static_cast<std::uint64_t>(e->WorkingSetSize);
-            p.name = ucs_to_utf8(e->ImageName);
+            // Defence-in-depth: only read ImageName if its (Buffer, Length)
+            // span lies wholly within the buffer. The kernel writes Buffer as
+            // an absolute pointer into `buf`; a corrupt/forged length must never
+            // make ucs_to_utf8 read out of bounds.
+            const auto* nb = reinterpret_cast<const unsigned char*>(e->ImageName.Buffer);
+            if (nb && e->ImageName.Length > 0 && nb >= base && nb + e->ImageName.Length <= end)
+                p.name = ucs_to_utf8(e->ImageName);
             if (p.name.empty() && pid == 4)
                 p.name = "System"; // the kernel: real working set, no image name
             snap.procs.push_back(std::move(p));

@@ -294,13 +294,17 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
                           "Current count of tracked (obs_type,subject) pairs", "gauge");
-        // F1 alert-router observability.
-        metrics_.describe("yuzu_server_dex_alerts_fired_total",
+        // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
+        metrics_.describe("yuzu_server_dex_alert_fired_total",
                           "Operator-routed per-signal alerts fired (notification + dex.signal "
                           "webhook event)", "counter");
-        metrics_.describe("yuzu_server_dex_alerts_suppressed_total",
+        metrics_.describe("yuzu_server_dex_alert_delivery_failed_total",
+                          "Routed alerts whose sink (notification/webhook) threw — fired but not "
+                          "delivered; the cooldown is already armed so the alert is lost until the "
+                          "next episode", "counter");
+        metrics_.describe("yuzu_server_dex_alert_suppressed_total",
                           "Routed sightings silenced by the per-(type,agent) cooldown", "counter");
-        metrics_.describe("yuzu_server_dex_alerts_dropped_total",
+        metrics_.describe("yuzu_server_dex_alert_dropped_total",
                           "Routed alerts dropped by the global per-minute fan-out cap", "counter");
         metrics_.describe("yuzu_server_dex_alert_cooldowns_evicted_total",
                           "Cooldown entries evicted at the capacity bound", "counter");
@@ -317,8 +321,10 @@ public:
         // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
         // no agent reports — never a fabricated zero).
         metrics_.describe("yuzu_fleet_perf_reporting",
-                          "Agents whose latest heartbeat carried device-utilization perf tags "
-                          "(the population behind the yuzu_fleet_perf_* gauges)", "gauge");
+                          "Agents whose latest heartbeat carried CPU/commit perf tags (the "
+                          "population behind yuzu_fleet_perf_cpu_pct and _commit_pct). The "
+                          "disk-latency gauge may cover a SUBSET — agents on virtual disks that "
+                          "don't answer IOCTL_DISK_PERFORMANCE omit that tag", "gauge");
         metrics_.describe("yuzu_fleet_perf_cpu_pct",
                           "Fleet device CPU busy % over each agent's last heartbeat interval, "
                           "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");

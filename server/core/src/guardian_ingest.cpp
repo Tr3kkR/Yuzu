@@ -98,12 +98,25 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
             const auto subject = blast_subject_from_detail(ev_row.detail_json);
-            if (blast_radius)
-                blast_radius->observe(ev_row.event_type, subject, agent_id, now);
-            // F1: operator-routed per-signal alerts — same chokepoint, same
-            // both-paths coverage, same clamped subject (sec-M1).
-            if (alert_router)
-                alert_router->observe(ev_row.event_type, subject, agent_id, now);
+            // Belt-and-braces (gov SRE): this runs on the gRPC ingest thread
+            // inside a sync handler with NO catch-all above it — an escape tears
+            // down the agent's Subscribe stream. Each observer also guards its
+            // own sink, but this catch-all protects EVERY current and future
+            // observer regardless of whether each remembers to.
+            try {
+                if (blast_radius)
+                    blast_radius->observe(ev_row.event_type, subject, agent_id, now);
+                // F1: operator-routed per-signal alerts — same chokepoint, same
+                // both-paths coverage, same clamped subject (sec-M1).
+                if (alert_router)
+                    alert_router->observe(ev_row.event_type, subject, agent_id, now);
+            } catch (const std::exception& e) {
+                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}",
+                             ev_row.event_type, agent_id, e.what());
+            } catch (...) {
+                spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
+                             ev_row.event_type, agent_id);
+            }
         }
         return;
     }

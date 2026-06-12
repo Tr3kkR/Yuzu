@@ -96,8 +96,8 @@ Use the `configure` action to adjust TAR behavior.
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
 | `user_enabled` | `true` / `false` | `true` | Toggle the user-session collector on this host |
 | `perf_enabled` | `true` / `false` | `true` | Toggle the device performance sampler on this host |
-| `procperf_enabled` | `true` / `false` | `true` | Toggle the per-application top-N sampler on this host — independent of `perf_enabled`, so per-app visibility can be switched off while device-level sampling stays on (works-council posture) |
-| `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app — they share the tick). Set to `0` to disable the perf trigger entirely (equivalent to disabling both). |
+| `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
+| `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). Set to `0` to disable the perf trigger entirely. |
 | `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
 | `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
@@ -136,7 +136,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
 | **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
-| **procperf** | supported (`ntsysinfo`) — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name. | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
+| **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 
 Status values:
 
@@ -261,16 +261,18 @@ TAR is designed for minimal performance overhead:
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
 - **Automatic purge**: old events are removed hourly based on the retention setting
 
-> **Upgrade note (always-on perf sampling).** On upgrade to this release, every
-> Windows agent begins device performance sampling automatically (`perf_enabled`
-> defaults to `true`, 30-second cadence) **and per-application top-N sampling**
-> (`procperf_enabled`, same default and cadence). Expect a small steady-state
-> CPU/IO footprint and a few MB of additional `tar.db` growth per endpoint. To
-> opt out, set `perf_enabled=false` / `procperf_enabled=false` (or
-> `perf_interval_seconds=0` for both) via the `configure` action — fleet-wide
-> through a scheduled instruction, or per-device. Warehouse tables added by a
-> new release are now created on every database open (previously a pre-existing
-> `tar.db` missed tables introduced after it was first created).
+> **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
+> upgrade to this release, every Windows agent continues **device** performance
+> sampling (`perf_enabled` defaults to `true`, 30-second cadence — unchanged
+> from the prior release). **Per-application** sampling (`procperf_enabled`) is
+> a new, distinct telemetry category — per-app CPU/working-set by image name —
+> and ships **off by default**: it is not collected until an operator opts in,
+> because it is usage-class data subject to works-council/DPA review (see
+> `docs/enterprise-readiness-soc2-first-customer.md`). To enable it, set
+> `procperf_enabled=true` via the `configure` action (fleet-wide or per-device).
+> Warehouse tables added by a new release are now created on every database open
+> (previously a pre-existing `tar.db` missed tables introduced after it was
+> first created), so no manual table-creation step is needed on upgrade.
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System

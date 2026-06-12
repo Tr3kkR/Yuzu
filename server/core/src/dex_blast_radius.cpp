@@ -35,6 +35,14 @@ std::string blast_subject_from_detail(const std::string& detail_json) {
     std::string subject = field("subject");
     if (subject.empty())
         subject = field("process"); // slice-1 crash key fallback (PR #1311 transition)
+    // Strip control bytes (gov sec LOW): the subject lands in a server log line
+    // (DexAlertRouter/BlastRadius), a notification title/message, and webhook
+    // JSON. JSON encoding handles the wire today, but a raw \n forges log lines
+    // and is a latent trap for any future HTML notification renderer. Replace
+    // anything < 0x20 (and DEL) with '?'.
+    for (char& c : subject)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+            c = '?';
     return subject;
 }
 

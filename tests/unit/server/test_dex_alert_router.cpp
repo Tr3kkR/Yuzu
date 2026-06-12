@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -132,9 +133,33 @@ TEST_CASE("router: config JSON round-trip + defensive parse", "[dex][f1][router]
     CHECK(parse_routed_types("[1, 2, null, {}]").empty());
     // Oversized entries are skipped; the array is clamped at 512.
     CHECK(parse_routed_types("[\"" + std::string(200, 'x') + "\"]").empty());
+    // Exact length fence: kMaxTypeLen=128 is "max 128 chars" (size() > 128
+    // rejects), so 128 is admitted and 129 rejected (gov QE S2).
+    CHECK(parse_routed_types("[\"" + std::string(128, 'a') + "\"]").size() == 1);
+    CHECK(parse_routed_types("[\"" + std::string(129, 'a') + "\"]").empty());
     std::string big = "[";
     for (int i = 0; i < 600; ++i)
         big += (i ? ",\"" : "\"") + std::to_string(i) + "\"";
     big += "]";
     CHECK(parse_routed_types(big).size() == 512);
+}
+
+TEST_CASE("router: a throwing alert sink never escapes observe() (UP-1)",
+          "[dex][f1][router]") {
+    // observe() runs on the gRPC ingest thread inside a sync handler with no
+    // catch-all — a throwing sink (SQLITE_BUSY, webhook closed mid-fire) must
+    // be swallowed, not propagate and tear down the agent's Subscribe stream.
+    DexAlertRouter router;
+    router.set_routes({"os.bugcheck"});
+    int calls = 0;
+    router.set_on_alert([&](const RoutedSignalAlert&) {
+        ++calls;
+        throw std::runtime_error("sink boom");
+    });
+    CHECK_NOTHROW(router.observe("os.bugcheck", "", "agent-1", 1000));
+    CHECK(calls == 1); // the sink WAS invoked; the throw was contained
+    // The cooldown armed despite the failed delivery — a second sighting within
+    // the cooldown is suppressed (documented lost-alert tradeoff).
+    CHECK_NOTHROW(router.observe("os.bugcheck", "", "agent-1", 1001));
+    CHECK(calls == 1);
 }

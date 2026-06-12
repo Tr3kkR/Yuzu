@@ -598,6 +598,21 @@ TEST_CASE("DEX perf parse: error payload / wrong shape / garbage rows never rend
     CHECK(pts[0].cpu_avg == 100.0); // clamped
 }
 
+TEST_CASE("DEX perf parse: a forged disk latency is clamped, never crushes the sparkline",
+          "[dex][perf][parse]") {
+    // The SVG y-axis auto-scales to the series range, so one absurd-but-finite
+    // disk-latency row (1e9 µs = 1e6 ms) would otherwise flatten every real
+    // point to an invisible line. cell_double accepts it (finite, >=0, <=32
+    // chars); the clamp at 1000 ms is the defence (gov QE B1).
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "3600|10|40|2000|1500\n"      // ~2 ms, real
+                            "7200|10|40|1000000000|0\n";  // 1e9 µs forged
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 2);
+    CHECK(pts[0].disk_lat_ms == 2.0);       // real point intact
+    CHECK(pts[1].disk_lat_ms == 1000.0);    // forged row clamped, not 1e6
+}
+
 TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
           "[dex][perf][render]") {
     CHECK(render_dex_perf_panel({}).find("No performance history") != std::string::npos);
@@ -716,6 +731,23 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(err);
         CHECK(err->body.find("reported an error") != std::string::npos);
         CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+    }
+
+    SECTION("result poll: a valid-but-empty result renders 'no history', stops polling (gov S3)") {
+        // The agent is online and answered, but $Perf_Hourly has no rows yet
+        // (fresh agent, no rollup completed). Distinct from offline/timeout:
+        // schema present, zero data rows. Must show the honest panel, not
+        // re-poll forever — exercised THROUGH the route, not the render fn.
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "total|0\n",
+                      ""}};
+        auto empty =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(empty);
+        CHECK(empty->body.find("No performance history") != std::string::npos);
+        CHECK(empty->body.find("hx-trigger") == std::string::npos); // not re-polled
+        CHECK(empty->body.find("<svg") == std::string::npos);
     }
 
     SECTION("result poll: another agent's rows never render; timeout is honest") {

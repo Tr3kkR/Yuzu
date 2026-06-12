@@ -499,8 +499,17 @@ private:
             }
         }
 
-        // A2 per-app leg (independent of the device leg's outcome).
-        if (!source_enabled(*db_, "procperf")) {
+        // A2 per-app leg (independent of the device leg's outcome). Unlike the
+        // other TAR sources, procperf defaults OFF (opt-in): per-application
+        // CPU/working-set reveals which applications run on a device, which is
+        // usage-class telemetry under the works-council posture (W0 commits
+        // app_usage-class collectors to default-off pending per-category
+        // toggles + DPO concurrence) — distinct from device-level perf, which
+        // carries no per-app identity and stays default-on. So this gate reads
+        // the explicit "true" rather than going through source_enabled (which
+        // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
+        // memory project-telemetry-privacy-works-council.
+        if (db_->get_config("procperf_enabled", "false") != "true") {
             ctx.write_output("tar|collect_procperf|0|source_disabled");
             return rc;
         }

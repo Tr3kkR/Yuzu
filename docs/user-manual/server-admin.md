@@ -167,6 +167,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
+
+This release adds per-application resource sampling (top-N processes by CPU and
+working set, by image name) to the TAR edge warehouse. **It is off by default**
+(`procperf_enabled=false`) and collects nothing until an operator opts in — it
+is a distinct, usage-class telemetry category subject to works-council / DPA
+review, separate from the device-level performance sampling (`perf_enabled`,
+on by default, no per-app identity) that shipped in the prior release. To
+enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
+instruction (fleet-wide or per-device). The data is image names only (no
+command lines), 7-day raw / 31-day hourly retention, and is captured in the
+Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.
+TAR warehouse tables are now also created on every database open, so upgraded
+agents need no manual table-creation step. New webhook egress: the `dex.signal`
+event (operator-routed signals) — see the security questionnaire note in the
+assurance package if you answer data-egress questions.
+
 ### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
 
 Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
@@ -343,6 +360,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
+| DEX Alerts | `/fragments/settings/dex-alerts` | Route individual DEX signal types to operator notifications and the `dex.signal` webhook, and tune the fleet blast-radius thresholds (min devices / window / cooldown). Admin-only; changes apply live (no restart) and are audit-logged (`settings.dex_alerts.routing`, `settings.dex_alerts.blast`). See the user-manual *DEX → Routing signals to alerts* section for guidance on which types to route. |
 
 ### Revoking an agent certificate from the dashboard
 
@@ -890,6 +908,31 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
+
+### DEX Alerts
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration fragment (HTMX). Admin-only. |
+| `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+
+**New `runtime_config` keys.** All four are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dex_alert_routing` | JSON array string | `[]` | DEX `obs_type` strings routed to operator notifications + the `dex.signal` webhook. Empty = nothing routed. |
+| `dex_blast_min_devices` | integer string | `5` | Blast-radius minimum distinct-device threshold. Clamped `[2, 100000]`. |
+| `dex_blast_window_seconds` | integer string | `900` | Blast-radius detection window (seconds). Clamped `[60, 86400]`. |
+| `dex_blast_cooldown_seconds` | integer string | `3600` | Blast-radius per-incident re-alert cooldown (seconds). Clamped `[0, 604800]`. |
+
+**New audit actions.**
+
+| Action | Emitted when |
+|---|---|
+| `settings.dex_alerts.routing` | An admin changes the routed signal-type list. Detail records the full new routed set (the runtime-config store keeps no history, so this row is the change-management evidence). |
+| `settings.dex_alerts.blast` | An admin changes the blast-radius thresholds (detail records the new min/window/cooldown). |
+| `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 
 ---
 

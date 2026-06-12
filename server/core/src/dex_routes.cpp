@@ -1695,8 +1695,12 @@ std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output) {
         p.hour_ts = static_cast<std::int64_t>(*ts);
         p.cpu_avg = std::clamp(*cpu, 0.0, 100.0);
         p.mem_avg = std::clamp(*mem, 0.0, 100.0);
-        // Worse of read/write avg per-IO service time, µs → ms.
-        p.disk_lat_ms = (std::max)(*rl, *wl) / 1000.0;
+        // Worse of read/write avg per-IO service time, µs → ms. Clamped to a
+        // sane ceiling (1000 ms/IO is already pathological): the SVG y-axis
+        // auto-scales to the series range, so a single forged agent row of
+        // 1e9 µs would otherwise crush every real point to an invisible flat
+        // line (gov quality-engineer B1).
+        p.disk_lat_ms = std::clamp((std::max)(*rl, *wl) / 1000.0, 0.0, 1000.0);
         out.push_back(p);
     }
     std::sort(out.begin(), out.end(),

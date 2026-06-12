@@ -588,6 +588,24 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
     CHECK(q->rows[2][1] == "3");
 }
 
+TEST_CASE("TarDatabase: insert_proc_perf_samples returns false (no crash) when the table is gone",
+          "[tar][store][procperf]") {
+    // The prepare-fail ROLLBACK path (gov QE S1): drop procperf_live out from
+    // under an open TarDatabase via the trusted exec path, then insert —
+    // sqlite3_prepare_v2 fails, the function must ROLLBACK and return false
+    // without throwing or wedging the connection.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE procperf_live").has_value());
+    ProcPerfRow r;
+    r.ts = 1;
+    r.snapshot_id = 1;
+    r.name = "x.exe";
+    r.instances = 1;
+    CHECK_FALSE(t.db.insert_proc_perf_samples({r}));
+    // The connection is still usable afterwards (no wedged transaction).
+    REQUIRE(t.db.execute_query("SELECT 1").has_value());
+}
+
 TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgrade path)",
           "[tar][store][lifecycle]") {
     // The A1 regression this pins: create_warehouse_tables used to run only at

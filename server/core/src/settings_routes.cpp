@@ -1748,8 +1748,13 @@ std::string SettingsRoutes::render_data_retention_fragment() {
 std::string SettingsRoutes::render_dex_alerts_fragment() {
     // Current state straight from runtime_config (the single source of truth;
     // the live router/detector were fed the same values via the apply fn).
+    // Defaults derive from BlastRadiusConfig{} so the form can never drift from
+    // the struct defaults the POST clamp + update_alert_shape use (gov N1).
+    const BlastRadiusConfig kBlastDefaults{};
     std::unordered_set<std::string> routed;
-    std::string min_dev = "5", win_s = "900", cool_s = "3600";
+    std::string min_dev = std::to_string(kBlastDefaults.min_devices);
+    std::string win_s = std::to_string(kBlastDefaults.window_seconds);
+    std::string cool_s = std::to_string(kBlastDefaults.cooldown_seconds);
     if (runtime_config_store_ && runtime_config_store_->is_open()) {
         routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
         auto v = runtime_config_store_->get_value("dex_blast_min_devices");
@@ -2459,6 +2464,8 @@ void SettingsRoutes::register_routes(
             return;
         if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
             res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
             return;
         }
         // Collect every checked "types" value from the urlencoded body and
@@ -2516,6 +2523,8 @@ void SettingsRoutes::register_routes(
                                              session ? session->username : "unknown");
         if (!rc) {
             res.status = 500;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Failed to save routing","level":"error"}})");
             res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
                                 "</span>",
                             "text/html; charset=utf-8");
@@ -2523,9 +2532,11 @@ void SettingsRoutes::register_routes(
         }
         if (dex_alert_apply_fn_)
             dex_alert_apply_fn_(); // live — no restart
+        // Record the FULL routed set, not just a count: runtime_config is a
+        // key→value store with no history, so this audit row is the sole
+        // change-management evidence of WHICH types were routed (gov compliance).
         audit_fn_(req, "settings.dex_alerts.routing", "success", "RuntimeConfig",
-                  "dex_alert_routing",
-                  std::to_string(selected.size()) + " obs_type(s) routed");
+                  "dex_alert_routing", "routed=" + json);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"DEX alert routing saved","level":"success"}})");
         res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
@@ -2537,6 +2548,8 @@ void SettingsRoutes::register_routes(
             return;
         if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
             res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
             return;
         }
         // Clamp server-side to the same ranges update_alert_shape enforces, so
@@ -2565,6 +2578,9 @@ void SettingsRoutes::register_routes(
                   .has_value();
         if (!ok) {
             res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
             res.set_content("<span class=\"feedback-error\">Failed to persist thresholds.</span>",
                             "text/html; charset=utf-8");
             return;
