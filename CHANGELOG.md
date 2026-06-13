@@ -1044,6 +1044,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian drift events lost during fleet-wide drift waves (#1307).** The
+  agent drift path minted `event_id = "{rule_id}-{ms}-{seq}"` with no agent
+  component. Because `event_seq_` is a per-agent counter that every agent starts
+  at 0 and `event_id` is a global `PRIMARY KEY` on the server (insert drops on
+  UNIQUE conflict), two agents drifting on the same rule in the same millisecond
+  produced an identical id and the server silently kept one row and discarded the
+  rest — exactly the correlated case during a bad-deploy drift wave. The id now
+  folds in the agent id: `"{rule_id}-{agent_id}-{ms}-{seq}"`, so the agent_id
+  segment alone guarantees cross-agent distinctness. No schema change; `event_id`
+  remains an opaque primary key.
 - **Token-store DB-open failure at startup now surfaces as `503 service
   unavailable` on `GET`/`POST`/`DELETE /api/v1/tokens`, never as `404`/empty
   list (#347 CH-3).** An `ApiTokenStore` whose SQLite database failed to open
