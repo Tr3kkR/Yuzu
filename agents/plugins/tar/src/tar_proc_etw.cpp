@@ -532,11 +532,11 @@ std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path
 }
 
 std::int64_t boot_time_unix() {
-    // boot ≈ now - uptime. GetTickCount64 is ms of uptime; round the result to
-    // the nearest minute so sub-second measurement jitter doesn't change the key
-    // across restarts within a boot, while the prior boot's uptime (>> 60s)
-    // keeps boots distinct. (Sleep is excluded from uptime — see the header note
-    // on the bounded re-backfill edge.)
+    // boot ≈ now - uptime. GetTickCount64 is ms of uptime; floor the result to
+    // the minute so sub-second measurement jitter doesn't change the key across
+    // restarts within a boot, while the prior boot's uptime (>> 60s) keeps boots
+    // distinct. (Sleep is excluded from uptime — see the header note on the
+    // bounded re-backfill edge.)
     const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();

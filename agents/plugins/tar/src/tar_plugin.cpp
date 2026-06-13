@@ -38,6 +38,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <iterator>
@@ -478,7 +479,10 @@ private:
     // stays false and collect_fast falls back to the snapshot-diff poll — so a
     // process source is always present. Drained only under collect_mu_.
     std::unique_ptr<yuzu::tar::ProcEtwCollector> proc_etw_;
-    bool etw_active_{false};
+    // Atomic: written under collect_mu_ (init + self-heal in collect_fast) but
+    // also read WITHOUT the lock by the `status` action (do_status), which runs
+    // on a different command thread — a plain bool there would be a data race.
+    std::atomic<bool> etw_active_{false};
     // Events drained from the ETW ring but not yet persisted because a prior
     // insert failed (DB locked/full); retried on the next collect_fast tick so a
     // transient failure does not lose the batch (UP-2). Guarded by collect_mu_;

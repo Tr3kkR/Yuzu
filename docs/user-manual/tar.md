@@ -293,7 +293,11 @@ TAR is designed for minimal performance overhead:
 >   more rows (cap raised to 100000). If the ETW session cannot start, the agent
 >   logs the reason and falls back to the `toolhelp32` poll automatically; if the
 >   session later dies, it self-heals to the poll. The active path is reported by
->   the `status` action as `process_capture_method` (`etw` or `polling`).
+>   the `status` action as `process_capture_method` (`etw` or `polling`). Once it
+>   has fallen back to the poll, ETW capture is **not** re-established until the
+>   agent restarts (so `process_capture_method=polling` on a Windows host that
+>   should be on ETW indicates a prior session failure — restart the agent to
+>   retry ETW).
 > - **Boot-window backfill requires the boot AutoLogger**, which today is
 >   configured only by the developer install path (`install-agent-user.ps1`),
 >   **not yet by the production MSI/InnoSetup installer** — wiring it there is a

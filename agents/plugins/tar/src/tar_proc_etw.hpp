@@ -140,7 +140,7 @@ private:
 std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path,
                                                      std::int64_t before_ts_unix);
 
-/// This machine's boot instant as unix seconds, rounded to the nearest minute so
+/// This machine's boot instant as unix seconds, floored to the minute so
 /// it is STABLE across agent restarts within the same boot yet distinct between
 /// boots. Used as the per-boot backfill dedup key: keying on the boot instant
 /// (rather than the earliest event in the circular .etl, which shifts as the
