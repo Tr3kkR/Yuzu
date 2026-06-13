@@ -14,9 +14,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 using namespace yuzu::agent;
 using Desired = ServiceGuard::Desired;
@@ -115,3 +120,57 @@ TEST_CASE("make_service_guard returns a non-null guard carrying the rule id",
     // (on Linux) touches the live system bus, which is integration territory, not a
     // unit test. Off Linux start() is a no-op returning false by construction.
 }
+
+#if defined(__linux__)
+// LIVE integration test — exercises the one path the pure cases cannot: the
+// event-driven sd-bus PropertiesChanged transition on a REAL unit. Gated on
+// YUZU_SYSTEMD_LIVE_UNIT so normal CI (incl. bus-less containers) skips it; runs on
+// a real systemd box. Recipe:
+//   sudo systemd-run --unit=yuzu-probe.service /usr/bin/sleep 3600   # active unit
+//   ( sleep 4; sudo systemctl stop yuzu-probe.service ) &           # transition it
+//   YUZU_SYSTEMD_LIVE_UNIT=yuzu-probe.service ./yuzu_agent_tests "[systemd][live]"
+// Arms desired=running: the active unit is compliant (silent) until it stops, when
+// the guard must emit a "stopped" drift via the PropertiesChanged path.
+TEST_CASE("live: SystemdServiceGuard detects a real unit transition",
+          "[guard][systemd][live]") {
+    const char* unit = std::getenv("YUZU_SYSTEMD_LIVE_UNIT");
+    if (!unit || !*unit) {
+        SUCCEED("YUZU_SYSTEMD_LIVE_UNIT unset — skipping live systemd integration test");
+        return;
+    }
+    struct Collector {
+        std::mutex m;
+        std::condition_variable cv;
+        std::vector<GuardDrift> drifts;
+        void push(const GuardDrift& d) {
+            std::lock_guard lk(m);
+            drifts.push_back(d);
+            cv.notify_all();
+        }
+        bool wait_for(const std::string& val, std::chrono::milliseconds to) {
+            std::unique_lock lk(m);
+            return cv.wait_for(lk, to, [&] {
+                for (const auto& d : drifts)
+                    if (d.detected_value == val)
+                        return true;
+                return false;
+            });
+        }
+    } col;
+
+    ServiceGuard::Config cfg;
+    cfg.rule_id = "live-1";
+    cfg.rule_name = "live transition probe";
+    cfg.service_name = unit;
+    cfg.desired = Desired::Running; // active = compliant; a stop must drift
+    cfg.enforce = false;
+    cfg.event_debounce_ms = 0; // observe every transition (no collapse) in the test
+    auto g = make_service_guard(cfg, [&](const GuardDrift& d) { col.push(d); });
+    REQUIRE(g->start());
+    // The unit is active at arm (compliant → silent). The external stop fires the
+    // PropertiesChanged path; we should see a "stopped" drift within the window.
+    const bool drifted = col.wait_for("stopped", std::chrono::seconds(30));
+    g->stop();
+    CHECK(drifted);
+}
+#endif
