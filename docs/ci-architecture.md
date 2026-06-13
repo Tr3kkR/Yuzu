@@ -85,10 +85,10 @@ Resolution order inside the script:
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@16` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
-4. **Native cluster on `127.0.0.1:5432`** — the `yuzu-local-windows`
-   precondition: a PostgreSQL 16 Windows service with role `yuzu` /
-   password `yuzu` / database `yuzu_test`, bootstrapped **once** per
-   runner (installer or `choco install postgresql16`, then
+4. **Native cluster on `127.0.0.1:5432`** — the generic self-hosted
+   Windows precondition: a PostgreSQL 16 Windows service with role
+   `yuzu` / password `yuzu` / database `yuzu_test`, bootstrapped
+   **once** per runner (installer or `choco install postgresql16`, then
    `createuser`/`createdb` as above). When `psql` is on PATH the script
    authenticates the conventional DSN with `SELECT 1` before exporting
    it — a TCP listener with the wrong credentials produces a `::warning`
@@ -96,12 +96,52 @@ Resolution order inside the script:
    to the bare TCP probe with a loud unverified-credential warning.
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
-5. Nothing found → `::warning`, exit 0.
 
-**Non-fatal by design (for now):** no test consumes the DSN until #1320
-lands the server-side Postgres substrate. When the first Postgres-backed
-store test ships, flip `SOFT_EXIT=1` in the script so a missing database
-fails the job instead of silently skipping coverage.
+   **`yuzu-local-windows` (Shulgi) as bootstrapped 2026-06-12 uses
+   path 1, not path 4:** the box already ran a foreign PostgreSQL 15 on
+   5432 (unknown credentials, left untouched), and the EDB GUI installer
+   fails in non-interactive SSH sessions — so PG **16.14 binaries-zip**
+   lives at `C:\yuzu-ci\pg16`, data dir `C:\yuzu-ci\pgdata16`, service
+   `postgresql-x64-16-yuzu-ci` (auto-start, `NT AUTHORITY\NetworkService`),
+   loopback-only on **5433**, superuser `yuzu`/`yuzu` (initdb-time, scram),
+   database `yuzu_test`. The machine-level
+   `YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test`
+   feeds resolution path 1 — which always wins before the docker probe,
+   so the leg stays deterministic whether or not the box's (usually
+   headless-down) Docker Desktop engine happens to be running.
+5. Nothing found → `::error`, exit 1.
+
+**Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
+the pg substrate suites (`[pg]`-tagged cases in the server suite)
+consume the DSN and skip cleanly when it is unset — so a runner without
+a database would silently skip that coverage. `exit "$SOFT_EXIT"`
+(= exit 1) is reached on every failure path: Docker container not ready
+in 60 s (path 2), brew cluster not ready (path 3), native-cluster
+credential failure when `psql` is available (path 4), and nothing found
+(path 5). The one non-fatal exception is path 4 without `psql`: a TCP
+probe alone produces a `::warning` and still exports the conventional
+DSN (credential **unverified** — wrong credentials then surface as
+downstream `[pg]` test failures; install `psql` on the runner's PATH,
+e.g. `C:\Program Files\PostgreSQL\16\bin` on `yuzu-local-windows`, to
+get the authenticated gate instead). Locally the tests still skip when
+`YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
+fail rather than skip.
+
+Local-dev note: to run the non-pg server tests on a machine with no
+Docker and no Postgres, invoke the test binary directly
+(`tests-build-server-*/yuzu_server_tests`) with `YUZU_TEST_POSTGRES_DSN`
+unset — the `[pg]` cases skip cleanly. The `/test` skill and CI
+deliberately hard-fail at the ensure-postgres step instead (that is the
+gate working, not a skill bug).
+
+Two operational notes for shared instances: the `yuzu-ci-postgres`
+container is shared across concurrent jobs on a runner — the migration
+runner's advisory locks are **cluster-wide**, so same-named stores in
+different ephemeral test databases briefly serialize on each other
+(transaction-scoped locks: never deadlock, never cross-database
+corruption). And every test database is created/dropped per case by the
+`PostgresTestDb` fixture; a `yuzu_test_*` pile-up on a shared instance
+means teardown is failing and is logged to stderr by the fixture.
 
 ## Universal vcpkg cache-key contract
 

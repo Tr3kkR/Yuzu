@@ -21,6 +21,7 @@
 #include "gateway.grpc.pb.h"
 #include "management.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 
 // Forward declarations
@@ -32,6 +33,8 @@ class HeartbeatIngestion;
 class AnalyticsEventStore;
 class AuditStore;
 class GuaranteedStateStore;
+class BlastRadiusDetector;
+class DexAlertRouter;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -80,6 +83,18 @@ public:
         guaranteed_state_store_ = store;
     }
 
+    /// Fleet-wide DEX incident detector (blast radius, coverage-map D3) — the
+    /// shared ingest feeds it ruleless observations from gateway-connected
+    /// agents, same as the direct path. nullptr disables detection.
+    void set_blast_radius_detector(BlastRadiusDetector* detector) {
+        blast_radius_detector_ = detector;
+    }
+
+    /// Operator-routed per-signal alerting (coverage-map F1) — fed alongside
+    /// the blast-radius detector at the same ingest chokepoint. nullptr
+    /// disables routing.
+    void set_dex_alert_router(DexAlertRouter* router) { dex_alert_router_ = router; }
+
     /// PR5d: per-agent CSR signer. Same signature as
     /// AgentServiceImpl::AgentCertSigner; server.cpp wires BOTH to the SAME
     /// `sign_agent_csr`, so they cannot semantically drift (a type change breaks
@@ -88,7 +103,7 @@ public:
     /// closing the gap where through-gateway agents never received one. nullptr
     /// (default) = no issuance (tests / CA inactive), identical to direct.
     using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
-        const std::string& csr_pem, const std::string& agent_id)>;
+        const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
     void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
 
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
@@ -126,6 +141,8 @@ private:
     AnalyticsEventStore* analytics_store_{nullptr};
     AuditStore* audit_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    BlastRadiusDetector* blast_radius_detector_{nullptr};
+    DexAlertRouter* dex_alert_router_{nullptr};
     AgentCertSigner agent_cert_signer_;
 
     // Map of gateway session_id -> agent_id for validation.

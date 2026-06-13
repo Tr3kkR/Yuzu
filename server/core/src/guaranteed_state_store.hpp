@@ -14,6 +14,15 @@
 
 namespace yuzu::server {
 
+// Reserved sentinel rule_id marking a RULELESS DEX observation (no live rule).
+// Single server-side source of truth — `is_reserved_rule_id` (the projection +
+// census guard) and `ingest_guardian_response` (the blast-radius feed gate)
+// both reference this, so a rename can't silently desync the two paths
+// (gov architect/consistency). MUST stay equal to the agent's
+// `kObservationRuleSentinel` (agents/core .../dex_event.hpp) — different binary,
+// shared wire convention.
+inline constexpr const char* kObservationRuleId = "__observation__";
+
 // Server-side storage for Yuzu Guardian — the "Guaranteed State" system.
 // See docs/yuzu-guardian-design-v1.1.md §9.1 for the schema design.
 //

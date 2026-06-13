@@ -4,6 +4,9 @@
 
 #include "settings_routes.hpp"
 
+#include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
+#include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
+#include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
@@ -1742,6 +1745,93 @@ std::string SettingsRoutes::render_data_retention_fragment() {
     return html;
 }
 
+std::string SettingsRoutes::render_dex_alerts_fragment() {
+    // Current state straight from runtime_config (the single source of truth;
+    // the live router/detector were fed the same values via the apply fn).
+    // Defaults derive from BlastRadiusConfig{} so the form can never drift from
+    // the struct defaults the POST clamp + update_alert_shape use (gov N1).
+    const BlastRadiusConfig kBlastDefaults{};
+    std::unordered_set<std::string> routed;
+    std::string min_dev = std::to_string(kBlastDefaults.min_devices);
+    std::string win_s = std::to_string(kBlastDefaults.window_seconds);
+    std::string cool_s = std::to_string(kBlastDefaults.cooldown_seconds);
+    if (runtime_config_store_ && runtime_config_store_->is_open()) {
+        routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
+        auto v = runtime_config_store_->get_value("dex_blast_min_devices");
+        if (!v.empty()) min_dev = v;
+        v = runtime_config_store_->get_value("dex_blast_window_seconds");
+        if (!v.empty()) win_s = v;
+        v = runtime_config_store_->get_value("dex_blast_cooldown_seconds");
+        if (!v.empty()) cool_s = v;
+    }
+
+    std::string html;
+
+    // ── Blast-radius alert shape ─────────────────────────────────────────────
+    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+            "margin-bottom:0.4rem\">FLEET BLAST-RADIUS THRESHOLDS</div>";
+    html += "<form hx-post=\"/api/settings/dex-alerts/blast\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
+    auto num_row = [&](const char* label, const char* name, const std::string& value,
+                       const char* hint) {
+        html += "<div class=\"form-row\"><label>" + std::string(label) +
+                "</label><input type=\"number\" name=\"" + name + "\" value=\"" +
+                html_escape(value) +
+                "\" style=\"width:7rem\"> <span style=\"font-size:0.7rem;color:#8b949e\">" +
+                hint + "</span></div>";
+    };
+    num_row("Min devices", "min_devices", min_dev, "distinct devices that make an incident (>= 2)");
+    num_row("Window (s)", "window_seconds", win_s, "sliding window, 60..86400");
+    num_row("Cooldown (s)", "cooldown_seconds", cool_s, "per-incident re-alert suppression");
+    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
+            "style=\"margin-top:0.3rem\">Save thresholds</button></form>";
+
+    // ── Per-signal routing ───────────────────────────────────────────────────
+    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+            "margin:1rem 0 0.4rem\">PER-SIGNAL ALERTS</div>"
+            "<p style=\"font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem\">"
+            "A routed signal raises an operator notification and fires the "
+            "<code>dex.signal</code> webhook event, once per device per hour. "
+            "Nothing is routed by default — blast-radius incidents always alert.</p>";
+    html += "<form hx-post=\"/api/settings/dex-alerts/routing\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
+    std::unordered_set<std::string> known;
+    for (const auto& g : dex_signal_groups()) {
+        // Open families that contain a routed type so current state is visible.
+        bool any_routed = false;
+        for (const char* t : g.types)
+            if (routed.count(t)) any_routed = true;
+        html += std::string("<details") + (any_routed ? " open" : "") +
+                "><summary style=\"cursor:pointer;font-size:0.78rem;padding:0.2rem 0\">" +
+                html_escape(g.name) + "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">";
+        for (const char* t : g.types) {
+            known.insert(t);
+            const bool checked = routed.count(t) > 0;
+            html += std::string("<label style=\"display:block;font-size:0.75rem;"
+                                "padding:0.1rem 0\"><input type=\"checkbox\" name=\"types\" "
+                                "value=\"") +
+                    t + "\"" + (checked ? " checked" : "") + "> " + dex_signal_label(t) +
+                    " <code style=\"font-size:0.65rem;color:#8b949e\">" + t + "</code></label>";
+        }
+        html += "</div></details>";
+    }
+    // Routed types no longer in the catalogue (config drift / newer-agent
+    // types): keep them visible and clearable rather than silently sticky.
+    std::string strays;
+    for (const auto& t : routed)
+        if (!known.count(t))
+            strays += "<label style=\"display:block;font-size:0.75rem\"><input "
+                      "type=\"checkbox\" name=\"types\" value=\"" +
+                      html_escape(t) + "\" checked> <code>" + html_escape(t) + "</code></label>";
+    if (!strays.empty())
+        html += "<details open><summary style=\"font-size:0.78rem\">Other routed types"
+                "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">" +
+                strays + "</div></details>";
+    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
+            "style=\"margin-top:0.5rem\">Save routing</button></form>";
+    return html;
+}
+
 std::string SettingsRoutes::render_mcp_fragment() {
     std::string html;
     bool mcp_enabled = !cfg_->mcp_disable;
@@ -2359,6 +2449,153 @@ void SettingsRoutes::register_routes(
                      return;
                  res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
              });
+
+    // -- F1: DEX alerting (per-signal routing + blast-radius thresholds) ------
+    sink.Get("/fragments/settings/dex-alerts",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!admin_fn_(req, res))
+                     return;
+                 res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+             });
+
+    sink.Post("/api/settings/dex-alerts/routing", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            return;
+        }
+        // Collect every checked "types" value from the urlencoded body and
+        // allowlist it against the catalogue — a hand-crafted POST cannot
+        // inject arbitrary strings into the stored routing set. (Types absent
+        // from the catalogue but ALREADY routed stay re-saveable so the
+        // "Other routed types" rows remain clearable; brand-new unknown
+        // strings are dropped.)
+        std::unordered_set<std::string> catalogue;
+        for (const auto& g : dex_signal_groups())
+            for (const char* t : g.types)
+                catalogue.insert(t);
+        const auto previously =
+            parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
+        std::unordered_set<std::string> selected;
+        std::size_t pos = 0;
+        while (pos < req.body.size() && selected.size() < 512) {
+            const auto amp = req.body.find('&', pos);
+            const auto pair = req.body.substr(
+                pos, (amp == std::string::npos ? req.body.size() : amp) - pos);
+            pos = (amp == std::string::npos) ? req.body.size() : amp + 1;
+            if (!pair.starts_with("types="))
+                continue;
+            std::string v = pair.substr(6);
+            // obs_types are [a-z_.] — percent-decode just %2E defensively and
+            // reject anything else encoded (no legitimate type needs it).
+            std::string decoded;
+            decoded.reserve(v.size());
+            bool bad = false;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                const char c = v[i];
+                if (c == '%') {
+                    if (v.compare(i, 3, "%2E") == 0 || v.compare(i, 3, "%2e") == 0) {
+                        decoded += '.';
+                        i += 2;
+                    } else {
+                        bad = true;
+                        break;
+                    }
+                } else if (c == '+') {
+                    bad = true; // no spaces in obs_types
+                    break;
+                } else {
+                    decoded += c;
+                }
+            }
+            if (bad || decoded.empty() || decoded.size() > 128)
+                continue;
+            if (catalogue.count(decoded) || previously.count(decoded))
+                selected.insert(std::move(decoded));
+        }
+        auto session = auth_fn_(req, res);
+        const auto json = routed_types_to_json(selected);
+        auto rc = runtime_config_store_->set("dex_alert_routing", json,
+                                             session ? session->username : "unknown");
+        if (!rc) {
+            res.status = 500;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Failed to save routing","level":"error"}})");
+            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
+                                "</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (dex_alert_apply_fn_)
+            dex_alert_apply_fn_(); // live — no restart
+        // Record the FULL routed set, not just a count: runtime_config is a
+        // key→value store with no history, so this audit row is the sole
+        // change-management evidence of WHICH types were routed (gov compliance).
+        audit_fn_(req, "settings.dex_alerts.routing", "success", "RuntimeConfig",
+                  "dex_alert_routing", "routed=" + json);
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"DEX alert routing saved","level":"success"}})");
+        res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/dex-alerts/blast", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            return;
+        }
+        // Clamp server-side to the same ranges update_alert_shape enforces, so
+        // the STORED values always match the LIVE values (no silent divergence
+        // between what the UI shows and what the detector runs).
+        auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
+            try {
+                const auto v = extract_form_value(req.body, field);
+                if (!v.empty())
+                    return std::clamp(std::stoi(v), lo, hi);
+            } catch (...) {}
+            return fallback;
+        };
+        const BlastRadiusConfig d{};
+        const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
+        const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
+        const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        auto session = auth_fn_(req, res);
+        const std::string by = session ? session->username : "unknown";
+        bool ok = true;
+        ok &= runtime_config_store_->set("dex_blast_min_devices", std::to_string(min_dev), by)
+                  .has_value();
+        ok &= runtime_config_store_->set("dex_blast_window_seconds", std::to_string(win_s), by)
+                  .has_value();
+        ok &= runtime_config_store_->set("dex_blast_cooldown_seconds", std::to_string(cool_s), by)
+                  .has_value();
+        if (!ok) {
+            res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
+            res.set_content("<span class=\"feedback-error\">Failed to persist thresholds.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (dex_alert_apply_fn_)
+            dex_alert_apply_fn_(); // live — no restart
+        audit_fn_(req, "settings.dex_alerts.blast", "success", "RuntimeConfig",
+                  "dex_blast_thresholds",
+                  "min_devices=" + std::to_string(min_dev) + ", window=" + std::to_string(win_s) +
+                      "s, cooldown=" + std::to_string(cool_s) + "s");
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"Blast-radius thresholds saved","level":"success"}})");
+        res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+    });
 
     sink.Get("/fragments/settings/plugin-signing",
              [this](const httplib::Request& req, httplib::Response& res) {

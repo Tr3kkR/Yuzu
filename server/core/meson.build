@@ -304,6 +304,8 @@ yuzu_server_core_lib = static_library(
     'src/guardian_rule_spec.cpp',
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
+    'src/dex_alert_router.cpp',
+    'src/dex_blast_radius.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
@@ -351,6 +353,11 @@ yuzu_server_core_lib = static_library(
     'src/response_templates_engine.cpp',
     'src/icons_svg.cpp',
     'src/migration_runner.cpp',
+    # Postgres substrate (ADR-0006/0008, #1320 PR 1): RAII owners + shared
+    # pool + migration runner under src/pg/. Header pg_raii.hpp is
+    # header-only; canary_main.cpp is the separate yuzu_pg_canary exe below.
+    'src/pg/pg_pool.cpp',
+    'src/pg/pg_migration_runner.cpp',
     'src/rate_limiter.cpp',
     'src/cert_reloader.cpp',
     'src/x509_ca.cpp',
@@ -363,14 +370,16 @@ yuzu_server_core_lib = static_library(
   include_directories: ['include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
+                 libpq_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
+                 libpq_dep] + auth_crypto_deps + https_deps,
 )
 
 executable(
@@ -380,12 +389,14 @@ executable(
   install: true,
 )
 
-# Postgres F0 link canary (#1317, ADR-0008): proves libpq builds at the pinned
-# vcpkg baseline and links on MSVC with no LNK-class errors, before any
-# substrate code is committed (the #375 lesson). Linkage is static on
-# Linux/macOS, dynamic DLL on Windows (see the libpq_dep comment in the root
-# meson.build and the ADR-0008 Correction). Throwaway — folded into the pg/
-# substrate when F1 (#1320) lands.
+# Postgres link canary (#1317 F0, ADR-0008): proves libpq builds at the pinned
+# vcpkg baseline and links on MSVC with no LNK-class errors (the #375 lesson).
+# Linkage is static on Linux/macOS, dynamic DLL on Windows (see the libpq_dep
+# comment in the root meson.build and the ADR-0008 Correction). The F1
+# substrate (#1320 PR 1) folded its body onto the pg_raii owners, but the
+# TARGET stays: the CI link-provenance assertions on all four Tier-1 legs
+# (ldd/otool/dumpbin in ci.yml) inspect this binary path. Do not remove or
+# rename without updating those workflow steps.
 executable(
   'yuzu_pg_canary',
   files('src/pg/canary_main.cpp'),

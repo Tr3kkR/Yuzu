@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "custom_properties_store.hpp"
 #include "result_set_store.hpp"
@@ -490,6 +491,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.processors", "Installed CPUs with model, cores, threads, clock speed"},
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
+        {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},
@@ -525,6 +527,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"registry.enumerate_keys", "List subkeys under a registry key"},
         {"registry.enumerate_values", "List values in a registry key"},
         {"registry.get_user_value", "Get a registry value for a specific user SID"},
+        // rdp_control
+        {"rdp_control.set_state",
+         "Enable or disable Remote Desktop (registry + firewall group + TermService)"},
+        {"rdp_control.status",
+         "Remote Desktop posture: registry, firewall group, service, derived rdp on/off"},
         // filesystem
         {"filesystem.exists", "Check if a path exists, report type and size"},
         {"filesystem.list_dir", "List directory contents (max 1000 entries)"},
@@ -562,6 +569,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // netstat
         {"netstat.netstat_list",
          "Active TCP/UDP connections and listening sockets with owning PID"},
+        // netprobe
+        {"netprobe.icmp", "ICMP round-trip time, jitter, and loss to targets"},
+        {"netprobe.tcp", "TCP connect-time RTT, jitter, and loss to targets (default port 443)"},
+        {"netprobe.dns", "DNS resolution timing per name"},
         // device_identity
         {"device_identity.device_name", "Machine hostname"},
         {"device_identity.domain", "DNS/AD domain and join status"},
@@ -660,6 +671,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"tar.configure", "Update TAR collection intervals and retention settings"},
         {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
         {"tar.collect_slow", "Run slow collectors (services + users + installed apps)"},
+        {"tar.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
     };
     return m;
 }
@@ -1208,6 +1220,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
+    // A4 perf families cleared too: when no agent reports a metric this cycle
+    // the series go ABSENT, never a fabricated/stale 0 (the no-mock-data rule).
+    metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1217,6 +1234,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int healthy_count = 0;
     int dex_observer_disarmed = 0;
     double total_dex_observed = 0.0;
+    // A4: per-agent device-utilization samples from the heartbeat perf tags.
+    std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1263,6 +1282,28 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         auto dex_val = get("yuzu.dex_observed");
         if (!dex_val.empty())
             add_finite_count(total_dex_observed, dex_val);
+
+        // A4 perf tags. Same forged-value posture as add_finite_count: accept
+        // only finite, non-negative values so one rogue agent cannot poison a
+        // fleet percentile with inf/nan/negatives. Percentages have a semantic
+        // bound, so a >100% claim CLAMPS (a lie, not an outlier); latency has
+        // none, so an absurd-but-finite claim (1e308 ms/IO) is REJECTED above
+        // a sanity ceiling — clamping would still poison avg with the ceiling.
+        auto collect_finite = [&](std::vector<double>& out, const std::string& key,
+                                  double clamp_hi, double reject_above) {
+            const auto s = get(key);
+            if (s.empty())
+                return;
+            try {
+                double v = std::stod(s);
+                if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
+                    out.push_back(clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v);
+            } catch (...) {}
+        };
+        constexpr double kMaxSaneLatMs = 1.0e6; // 1000 s per IO — beyond absurd
+        collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
+        collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
+        collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, kMaxSaneLatMs);
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1282,6 +1323,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             .set(static_cast<double>(count));
     }
     metrics.gauge("yuzu_fleet_commands_executed_total").set(total_commands);
+
+    // A4 fleet perf rollup: avg + nearest-rank p50/p90 + max per metric, with a
+    // {stat} label (the summary-quantile idiom). The families were cleared above,
+    // so a metric nobody reported is ABSENT this cycle — Prometheus consumers see
+    // a gap, not a fake zero. `yuzu_fleet_perf_reporting` carries the population
+    // size so an "avg" over 3 devices is never misread as fleet-wide.
+    auto set_stats = [&](const char* family, std::vector<double>& vals) {
+        if (vals.empty())
+            return;
+        std::sort(vals.begin(), vals.end());
+        const auto n = vals.size();
+        double sum = 0.0;
+        for (double v : vals)
+            sum += v;
+        // True nearest-rank: index ceil(p·n)−1. floor((n−1)·p) looks similar but
+        // under-reports high percentiles in small fleets (n=2 → p90 = the MIN).
+        auto rank = [&](double p) {
+            const auto idx = static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
+            return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
+        };
+        metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
+        metrics.gauge(family, {{"stat", "p50"}}).set(rank(0.50));
+        metrics.gauge(family, {{"stat", "p90"}}).set(rank(0.90));
+        metrics.gauge(family, {{"stat", "max"}}).set(vals.back());
+    };
+    metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_cpu.size()));
+    set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
+    set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
+    set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
 }
 
 } // namespace yuzu::server::detail

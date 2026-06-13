@@ -6,12 +6,30 @@
 
 #include <spdlog/spdlog.h>
 
+#include "dex_alert_router.hpp"
+#include "dex_blast_radius.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
 
 namespace yuzu::server::detail {
 
 namespace {
+// Strip control bytes from an agent-supplied label before it reaches an alert
+// sink (webhook HTTP, notification row) or a server log line (gov review
+// MEDIUM #2). obs_type and agent_id flow to on_alert_/on_incident_ and the
+// spdlog warns; a raw \r\n is a latent CRLF/header-injection and a log-forging
+// vector. subject is already stripped in blast_subject_from_detail; this gives
+// obs_type and agent_id the same treatment at the one chokepoint that feeds
+// both observers. Bounded at 256 bytes (the projection field clamp) so a
+// forged multi-KB label can't bloat a notification/log either.
+std::string sanitize_label(const std::string& s) {
+    std::string out = s.size() > 256 ? s.substr(0, 256) : s;
+    for (char& c : out)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+            c = '?';
+    return out;
+}
+
 // google.protobuf.Timestamp seconds → ISO-8601 UTC; falls back to "now" when
 // unset (an agent that didn't stamp the event, or a 0 default). Mirrors
 // iso_now() in rest_api_v1.cpp. Moved here from agent_service_impl.cpp when the
@@ -33,7 +51,8 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
 } // namespace
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
-                              const pb::CommandResponse& resp) {
+                              const pb::CommandResponse& resp,
+                              BlastRadiusDetector* blast_radius, DexAlertRouter* alert_router) {
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
@@ -80,6 +99,47 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         if (auto r = store.insert_event(ev_row); !r) {
             spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}", agent_id,
                          ev_row.rule_id, r.error());
+            return;
+        }
+        // Fleet-wide incident detection — RULELESS observations only, and only
+        // AFTER the event committed (a rolled-back duplicate must never count a
+        // device twice). Uses the SHARED kObservationRuleId constant, same one
+        // is_reserved_rule_id keys on, so the feed gate and the projection guard
+        // can't desync (gov architect/consistency). The window uses server
+        // receipt time, not the agent's clock — "blast radius" is about
+        // simultaneity as the FLEET experiences it, and a skewed agent clock
+        // must not smear the window.
+        if ((blast_radius || alert_router) && ev_row.rule_id == kObservationRuleId) {
+            const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+            // Sanitize every agent-influenced label that reaches an alert sink
+            // or a log line: subject (via blast_subject_from_detail), plus
+            // obs_type and agent_id here (gov review MEDIUM #2). The stored
+            // projection above keeps the raw values (escaped at render); this is
+            // the alert/log path only.
+            const auto subject = blast_subject_from_detail(ev_row.detail_json);
+            const auto obs_type = sanitize_label(ev_row.event_type);
+            const auto safe_agent = sanitize_label(agent_id);
+            // Belt-and-braces (gov SRE): this runs on the gRPC ingest thread
+            // inside a sync handler with NO catch-all above it — an escape tears
+            // down the agent's Subscribe stream. Each observer also guards its
+            // own sink, but this catch-all protects EVERY current and future
+            // observer regardless of whether each remembers to.
+            try {
+                if (blast_radius)
+                    blast_radius->observe(obs_type, subject, safe_agent, now);
+                // F1: operator-routed per-signal alerts — same chokepoint, same
+                // both-paths coverage, same sanitized labels.
+                if (alert_router)
+                    alert_router->observe(obs_type, subject, safe_agent, now);
+            } catch (const std::exception& e) {
+                spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}", obs_type,
+                             safe_agent, e.what());
+            } catch (...) {
+                spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
+                             obs_type, safe_agent);
+            }
         }
         return;
     }

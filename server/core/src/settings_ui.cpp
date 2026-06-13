@@ -454,6 +454,24 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── DEX Alerts (F1) ────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">DEX Alerts</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Route DEX reliability signals to operator notifications and the
+          <code>dex.signal</code> webhook event, and tune the fleet blast-radius
+          incident thresholds. Changes apply immediately.
+        </p>
+        <div id="dex-alerts-section"
+             hx-get="/fragments/settings/dex-alerts"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── MCP (AI Integration) ────────────────────────── -->
     <div class="section">
       <div class="section-header">MCP (AI Integration)</div>

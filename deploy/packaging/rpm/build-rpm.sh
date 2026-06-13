@@ -40,6 +40,8 @@ for bin in yuzu-server yuzu-agent; do
 done
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$TOPDIR/SOURCES/"
+# Postgres provisioning helper, shipped in the server RPM (ADR-0006, #1320)
+cp "$SCRIPT_DIR/../../../scripts/install-server-postgres.sh" "$TOPDIR/SOURCES/"
 
 # Agent core shared library (plugins link against it)
 find "$BIN_DIR" -name 'libyuzu_agent_core.so*' -exec cp {} "$TOPDIR/SOURCES/" \; 2>/dev/null || true

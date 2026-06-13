@@ -106,6 +106,8 @@ EventSystemFields extract_system_fields(const std::string& xml) {
 
 #include "guard_win_handle.hpp" // ScopedWinHandle + <windows.h>, EventHandle
 
+#include "dex_win_poll.hpp" // IStatePoller (storage.low / battery state poll)
+
 #include <winevt.h>
 
 #include <chrono>
@@ -242,6 +244,11 @@ public:
             spdlog::warn("dex_observer: no channel armed — DEX signal collection disabled");
             return false;
         }
+        // State-poll companion (storage.low / battery): event subscriptions are
+        // blind to bad *states* the OS never logs. Started only on successful
+        // arm so the start()==false ⇒ nothing-running invariant holds.
+        poller_ = win::make_win_state_poller();
+        poller_->start(state_->sink);
         spdlog::info("dex_observer: armed — {} channel(s), {} signal type(s) catalogued", armed,
                      distinct_obs_types());
         return true;
@@ -251,6 +258,12 @@ public:
         {
             std::lock_guard lk(state_->mu);
             state_->stopping = true;
+        }
+        // The poller owns a plain thread + its own sink copy — join it first so
+        // no poll emission can race the teardown below.
+        if (poller_) {
+            poller_->stop();
+            poller_.reset();
         }
         // EvtClose stops further delivery. OUTSIDE mu (it may block on an in-flight
         // callback that needs mu). The leaked ctxs are deliberately NOT freed — a
@@ -384,6 +397,7 @@ private:
 
     std::shared_ptr<State> state_ = std::make_shared<State>();
     std::vector<detail::EvtSubHandle> subs_;
+    std::unique_ptr<win::IStatePoller> poller_; // storage.low / battery state poll
     int armed_{0};
 };
 
