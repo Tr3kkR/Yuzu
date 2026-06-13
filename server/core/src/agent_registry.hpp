@@ -46,6 +46,14 @@ struct PluginMeta {
 };
 
 // -- Agent session (one per connected agent) ----------------------------------
+//
+// IMMUTABILITY CONTRACT: the identity fields (agent_id..scopable_tags,
+// gateway_node) are fully populated BEFORE the session is installed in the
+// registry and are never mutated afterwards — re-registration REPLACES the
+// shared_ptr, it does not edit in place. Lock-free readers (scope evaluation,
+// the DEX perf provider) depend on this. Post-publication writes are confined
+// to stream/server_context/peer_cert_pem (under stream_mu) and the atomic
+// last_activity_epoch_ms. (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
@@ -325,6 +333,15 @@ public:
     void remove(const std::string& agent_id);
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
+
+    /// Per-agent snapshots carrying ONLY the yuzu.perf_* heartbeat tags
+    /// (dex_perf_rules.hpp keys) + agent_id, excluding entries staler than
+    /// `staleness` (the same contract recompute_metrics prunes by — pass the
+    /// same value so the /dex Performance read model and the Prometheus gauges
+    /// see the same population). Deliberately NOT a general-purpose accessor:
+    /// the copy runs under the heartbeat-upsert mutex, so it copies the
+    /// minimum (G3 performance S1). Do NOT call on a hot path.
+    std::vector<AgentHealthSnapshot> perf_snapshot(std::chrono::seconds staleness) const;
 
 private:
     mutable std::mutex mu_;

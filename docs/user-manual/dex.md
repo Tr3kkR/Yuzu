@@ -11,12 +11,12 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The four views
+## The five views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into three deep pages. A shared sub-nav switches between **Overview ·
-Catalogue · Health score · Trends**; the window selector (below) applies to all
-four.
+links* into four deep pages. A shared sub-nav switches between **Overview ·
+Catalogue · Health score · Trends · Performance**; the window selector (below)
+applies to the signal views (Performance is a now-view — see below).
 
 ### Overview (the hub)
 
@@ -77,8 +77,38 @@ Cross-OS comparison cards — each carrying its **live signal scope**, so an OS
 with a narrower collector reads as *less observed*, not healthier — plus
 per-family small-multiple sparklines and a family×day activity heatmap.
 
-**Window selector.** `24h / 7d / 30d / All` rescopes every view. Drill-downs
-opened from a panel inherit the window you were viewing, so the numbers match.
+### Performance
+
+Continuous device telemetry rolled up across the fleet — the *levels*, where
+Trends shows the *events*. A **now-view**: every number is computed at render
+time from the latest heartbeat sample of each reporting device (the same data
+behind the `yuzu_fleet_perf_*` Prometheus gauges), with **no window selector**
+— nothing on this page has retained history yet (trend charts arrive with the
+server-side series store).
+
+- **Fleet now cards** — CPU utilization, memory commit and disk I/O latency,
+  each showing avg / p50 / p90 / max plus the **Reporting** population card
+  (the honest denominator: an average over 12 devices is never silently
+  presented as fleet-wide truth). Perf telemetry is collected by **Windows
+  agents only** today; other platforms are absent from these numbers, not
+  zero.
+- **Cohort benchmarking** — fleet-relative percentiles per **cohort**: the
+  distinct values of an operator-chosen **tag key** (default `model`; pick any
+  key from the selector — e.g. an `image` key compares a vanilla VDI image
+  against a layered one on identical hardware). Cohorts come from tags, not
+  from a central inventory column: tag the fleet via the tag API (see the
+  asset-tagging guide) and the comparison appears. Honesty rules: cohorts
+  under **10 reporting devices** show "n too small" instead of noisy
+  percentiles, and devices without the chosen key always appear as an explicit
+  **(untagged)** residual row.
+- **Everything drills.** Each metric card opens the worst devices by that
+  metric; the Reporting card opens the devices *not* reporting; each cohort
+  row opens that cohort's device list — and every device row opens the
+  per-device drill-down.
+
+**Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
+Drill-downs opened from a panel inherit the window you were viewing, so the
+numbers match.
 
 ## Drill-downs
 
@@ -95,6 +125,25 @@ opened from a panel inherit the window you were viewing, so the numbers match.
   `GuaranteedState:Read`) the **`Execution:Execute`** permission — without it
   the panel shows a note instead. Each query is audit-logged
   (`dex.device.perf.query`).
+
+  Below the panel, **vs fleet & cohort strips** place the device's *current*
+  heartbeat values against the current fleet p50–p90 band (the marker turns
+  red above the fleet p90) and show its percentile position in the fleet and
+  in its cohort — rendered live from registry state, no query dispatched, and
+  the cohort comparison is withheld below the 10-device floor with an honest
+  caption.
+
+  A separate **Top applications** panel queries the device's opt-in per-app
+  tier (`$ProcPerf_Hourly`, process **names only** — never command lines)
+  behind its **own** "Load applications" click. Per-app data is usage-class
+  telemetry — it observes what people run, not just how the machine behaves —
+  so it carries its **own audit action (`dex.device.procperf.query`)**,
+  keeping usage reads separately countable from machine-health reads. An
+  empty result states plainly that per-app sampling is **off by default** on
+  every device (or that no hourly rollup has completed yet) — the device's
+  read-only query surface deliberately hides plugin config, so the server
+  does not guess which. App rows cross-link to the per-application
+  reliability drill.
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 
@@ -117,13 +166,27 @@ does (agentic-first parity):
   cross-OS captions.
 - **`GET /api/v1/dex/signals/{obs_type}`** — one signal's drill-down (subjects,
   OS split, most-affected devices, per-day trend).
+- **`GET /api/v1/dex/perf/fleet`** — the Performance tab's fleet-now stats
+  (avg/p50/p90/max + n per metric, `null` when nobody reported it, plus the
+  reporting/online denominators).
+- **`GET /api/v1/dex/perf/cohorts?key=`** — the cohort benchmarking table
+  (suppression and the untagged residual included in the response shape, plus
+  `available_keys` for picker UIs).
+- **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
+  — the one device list behind every Performance drill (worst-by-metric,
+  not-reporting, cohort members).
 
-All three take a `window` of `24h`/`7d`/`30d`/`all` and are gated on
-`GuaranteedState:Read`. The per-signal drill-down returns a most-affected
-**devices** list (behavioral) and is **audit-logged** (`dex.signal.view`) on
-every call, exactly like the dashboard view; the rollup and scope are fleet
-aggregates and are not audited. Full request/response shapes are in
-[`rest-api.md`](rest-api.md#dex-digital-employee-experience).
+The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all`; the perf
+endpoints are now-views (no window). All are gated on `GuaranteedState:Read`.
+The per-signal drill-down returns a most-affected **devices** list
+(behavioral) and is **audit-logged** (`dex.signal.view`) on every call,
+exactly like the dashboard view; the rollup, scope and perf endpoints are
+aggregates / machine-health telemetry and are not audited. The same six reads
+are exposed as MCP tools (`list_dex_signals`, `get_dex_signal_scope`,
+`get_dex_signal_detail`, `get_dex_perf_fleet`, `get_dex_perf_cohorts`,
+`list_dex_perf_devices`). Full request/response shapes are in
+[`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
+`GET /api/v1/openapi.json`.
 
 ## Platform coverage
 
@@ -228,6 +291,27 @@ When no agent reports a metric the series goes **absent**, never a fabricated
 zero. Values are validated server-side (non-finite and negative readings are
 rejected; percentages clamp at 100) so a single misbehaving agent cannot poison
 a fleet percentile. Agents with `--dex-disable` ship no perf tags at all.
+
+**Per-cohort export (opt-in).** Setting a **cohort export tag key** in
+Settings → DEX alerts additionally publishes the same stats per cohort of that
+key:
+
+| Gauge | Meaning |
+|---|---|
+| `yuzu_fleet_perf_cohort_cpu_pct{cohort,stat}` | per-cohort CPU busy %, same `stat` labels |
+| `yuzu_fleet_perf_cohort_commit_pct{cohort,stat}` | per-cohort memory pressure |
+| `yuzu_fleet_perf_cohort_disk_lat_ms{cohort,stat}` | per-cohort disk latency |
+| `yuzu_fleet_perf_cohort_reporting{cohort}` | reporting devices per exported cohort |
+| `yuzu_fleet_perf_cohort_clipped` | exportable cohorts dropped by the cardinality cap (a measured 0 when nothing was cut; absent when the export is off) |
+
+Cardinality is bounded by design: only cohorts with **≥ 10 reporting devices**
+export, capped at the **top 50 by population**, and clipping is visible via
+the `_clipped` gauge rather than silent. Devices without the key export as
+`cohort="(untagged)"`. The export refreshes on the same sweep — and through
+the same validation — as the fleet gauges, so Grafana, the REST API and the
+Performance tab can never disagree about the same heartbeat sample. The key is
+empty (export disabled) by default; per-device and per-app data are **never**
+exported to Prometheus — reach those via the REST endpoints on demand.
 
 ## Turning it off
 

@@ -313,6 +313,8 @@ yuzu_server_core_lib = static_library(
     'src/compliance_routes.cpp',
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
+    'src/dex_perf_model.cpp',
+    'src/dex_perf_ui.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',

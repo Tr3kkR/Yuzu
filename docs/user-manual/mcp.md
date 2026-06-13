@@ -43,7 +43,9 @@ Key characteristics:
   (checked second). A token must pass both.
 - **Audit**: Every tool invocation is recorded in the audit log with an
   `mcp.<tool_name>` action.
-- **Capabilities**: 23 tools, 3 resources, 4 prompts.
+- **Capabilities**: the authoritative tool/resource/prompt list is the
+  server's own `tools/list` / `resources/list` / `prompts/list` responses
+  (and the startup log line) — counts in this document are illustrative.
 
 The MCP server reuses the same authentication middleware, RBAC engine, and
 audit pipeline as the REST API. No separate ports or processes are required.
@@ -239,7 +241,8 @@ curl -s -b cookies.txt -X DELETE https://localhost:8080/api/v1/tokens/a1b2c3d4
 
 ## Available Tools
 
-The MCP server exposes 23 tools. Each tool maps to a specific RBAC
+The MCP server exposes the tools below (`tools/list` is the authoritative
+catalogue). Each tool maps to a specific RBAC
 securable type and operation. The tier check and RBAC check both must pass
 for the tool to execute.
 
@@ -270,6 +273,12 @@ for the tool to execute.
 | 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
 | 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
 | 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. | `Security:Delete` |
+| 26 | `list_dex_signals` | DEX catalogue rollup: every observation type in the window with count, blast radius, last seen. Mirrors `GET /api/v1/dex/signals`. | `GuaranteedState:Read` |
+| 27 | `get_dex_signal_scope` | DEX per-OS signal coverage (distinct types + total events per platform). Mirrors `GET /api/v1/dex/scope`. | `GuaranteedState:Read` |
+| 28 | `get_dex_signal_detail` | One DEX signal's drill-down (subjects, OS split, most-affected devices, trend). Behavioral — every call emits `dex.signal.view`. Mirrors `GET /api/v1/dex/signals/{obs_type}`. | `GuaranteedState:Read` |
+| 29 | `get_dex_perf_fleet` | Fleet device-performance now-stats (avg/p50/p90/max + reporting population; null = nobody reported). Mirrors `GET /api/v1/dex/perf/fleet`. | `GuaranteedState:Read` |
+| 30 | `get_dex_perf_cohorts` | Fleet-relative perf percentiles per cohort of a tag key (10-device floor, untagged residual, `available_keys`). Mirrors `GET /api/v1/dex/perf/cohorts`. | `GuaranteedState:Read` |
+| 31 | `list_dex_perf_devices` | The device list behind every fleet-performance drill (worst-by-metric / not-reporting / cohort members). Machine-health telemetry. Mirrors `GET /api/v1/dex/perf/devices`. | `GuaranteedState:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
