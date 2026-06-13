@@ -62,6 +62,7 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -313,6 +314,22 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
                           "Current count of tracked (obs_type,subject) pairs", "gauge");
+        // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
+        metrics_.describe("yuzu_server_dex_alert_fired_total",
+                          "Operator-routed per-signal alerts fired (notification + dex.signal "
+                          "webhook event)", "counter");
+        metrics_.describe("yuzu_server_dex_alert_delivery_failed_total",
+                          "Routed alerts whose sink (notification/webhook) threw — fired but not "
+                          "delivered; the cooldown is already armed so the alert is lost until the "
+                          "next episode", "counter");
+        metrics_.describe("yuzu_server_dex_alert_suppressed_total",
+                          "Routed sightings silenced by the per-(type,agent) cooldown", "counter");
+        metrics_.describe("yuzu_server_dex_alert_dropped_total",
+                          "Routed alerts dropped by the global per-minute fan-out cap", "counter");
+        metrics_.describe("yuzu_server_dex_alert_cooldowns_evicted_total",
+                          "Cooldown entries evicted at the capacity bound", "counter");
+        metrics_.describe("yuzu_server_dex_alert_routed_types",
+                          "Number of obs_types currently routed to alerts", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -321,6 +338,22 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
+        // no agent reports — never a fabricated zero).
+        metrics_.describe("yuzu_fleet_perf_reporting",
+                          "Agents whose latest heartbeat carried CPU/commit perf tags (the "
+                          "population behind yuzu_fleet_perf_cpu_pct and _commit_pct). The "
+                          "disk-latency gauge may cover a SUBSET — agents on virtual disks that "
+                          "don't answer IOCTL_DISK_PERFORMANCE omit that tag", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cpu_pct",
+                          "Fleet device CPU busy % over each agent's last heartbeat interval, "
+                          "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_commit_pct",
+                          "Fleet commit-charge % of limit (memory pressure), by {stat}: "
+                          "avg / p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_disk_lat_ms",
+                          "Fleet per-IO disk service time in ms, by {stat}: avg / p50 / p90 / max",
+                          "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -1602,6 +1635,40 @@ public:
                 agent_service_.set_blast_radius_detector(&blast_radius_detector_);
                 if (gateway_service_)
                     gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
+
+                // F1 operator-routed per-signal alerts (Settings → DEX alerts):
+                // a routed obs_type raises one notification + one `dex.signal`
+                // webhook/offload event per (type, agent) cooldown. Routes load
+                // from runtime config after the store opens (apply_dex_alert_
+                // config); default = nothing routed.
+                dex_alert_router_.set_on_alert([this](const RoutedSignalAlert& a) {
+                    const std::string what =
+                        a.subject.empty() ? a.obs_type : a.obs_type + " '" + a.subject + "'";
+                    const std::string title = "DEX alert: " + what;
+                    const std::string message = "Device " + a.agent_id + " reported " + what +
+                                                " (operator-routed signal). See /dex for the "
+                                                "drill-down.";
+                    spdlog::info("DexAlertRouter: {} on {}", what, a.agent_id);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Dual-sink discipline, same as the blast-radius incident.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.signal"},
+                                                  {"obs_type", a.obs_type},
+                                                  {"subject", a.subject},
+                                                  {"agent_id", a.agent_id}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.signal", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.signal", body);
+                    }
+                });
+                dex_alert_router_.set_metrics(&metrics_);
+                agent_service_.set_dex_alert_router(&dex_alert_router_);
+                if (gateway_service_)
+                    gateway_service_->set_dex_alert_router(&dex_alert_router_);
             }
         }
 
@@ -2465,6 +2532,10 @@ public:
         agent_service_.set_blast_radius_detector(nullptr);
         if (gateway_service_)
             gateway_service_->set_blast_radius_detector(nullptr);
+        // F1: the alert router has the identical borrow contract.
+        agent_service_.set_dex_alert_router(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_dex_alert_router(nullptr);
 
         // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
@@ -3528,6 +3599,33 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+        // F1 DEX alerting config — both consumers accept live updates, so the
+        // same call applies at boot and from the settings POST handlers.
+        apply_dex_alert_config();
+    }
+
+    /// F1: push the persisted DEX alerting config into the alert router and
+    /// the blast-radius detector. Safe to call any time (both take their own
+    /// locks); called at boot via apply_runtime_config_overrides and from the
+    /// Settings → DEX alerts POST handlers after a write.
+    void apply_dex_alert_config() {
+        if (!runtime_config_store_ || !runtime_config_store_->is_open())
+            return;
+        dex_alert_router_.set_routes(
+            parse_routed_types(runtime_config_store_->get_value("dex_alert_routing")));
+        const auto get_int = [&](const char* key, int fallback) {
+            try {
+                const auto v = runtime_config_store_->get_value(key);
+                if (!v.empty())
+                    return std::stoi(v);
+            } catch (...) {}
+            return fallback;
+        };
+        const BlastRadiusConfig defaults{};
+        blast_radius_detector_.update_alert_shape(
+            get_int("dex_blast_min_devices", defaults.min_devices),
+            get_int("dex_blast_window_seconds", defaults.window_seconds),
+            get_int("dex_blast_cooldown_seconds", defaults.cooldown_seconds));
     }
 
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -4664,6 +4762,9 @@ private:
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
             /*metrics_registry=*/&metrics_, step_up_fn);
+        // F1: live-apply hook for the DEX alerts settings (wired before the
+        // listener starts, so no request races the set).
+        settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -7556,7 +7657,27 @@ private:
                 }
                 return f;
             },
-            audit_fn);
+            audit_fn,
+            // A4 device perf panel: canned tar.sql dispatch through the shared
+            // chokepoint (untracked path — empty execution_id, same posture as
+            // the dashboard TAR SQL surface).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -8250,6 +8371,7 @@ private:
     /// ingest thread that holds its raw pointer (gov cpp-safety/architect). stop()
     /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
     BlastRadiusDetector blast_radius_detector_;
+    DexAlertRouter dex_alert_router_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;

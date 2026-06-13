@@ -1037,7 +1037,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // response-store / executions path.
             if (guaranteed_state_store_)
                 ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
-                                         blast_radius_detector_);
+                                         blast_radius_detector_, dex_alert_router_);
             continue;
         }
         // Solicited __guard__ replies (push_rules / reconcile carry a command_id)

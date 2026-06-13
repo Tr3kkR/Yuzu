@@ -97,6 +97,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: alert routing + tunable blast-radius thresholds (Settings → DEX
+  alerts).** Operators can now route individual DEX signal types to alerts:
+  each routed observation raises an operator notification and fires a new
+  **`dex.signal`** webhook/offload event (`obs_type`, `subject`, `agent_id`),
+  once per device per hour per type, with a global per-minute fan-out cap.
+  Nothing is routed by default. The same panel makes the fleet blast-radius
+  thresholds (min devices / window / cooldown) **operator-tunable, applied
+  live** — no restart (memory and fan-out bounds remain fixed; they are DoS
+  posture, not policy). Routing is evaluated at the shared observation-ingest
+  chokepoint, so directly-connected and gateway-routed agents are covered
+  identically. Changes are audit-logged (`settings.dex_alerts.*`) and
+  persisted in runtime config; router activity is observable via the
+  `yuzu_server_dex_alert_*` metrics (fired / delivery_failed / suppressed /
+  dropped / cooldowns_evicted / routed_types). The agent-side A3 breach
+  thresholds (90 % CPU / 10 min etc.) remain fixed in this release.
+- **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
+  Each Windows agent now records, on the same 30 s perf tick, the **top 10
+  applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)
+  into the on-device TAR edge warehouse — `$ProcPerf_Live` (7-day window) and
+  `$ProcPerf_Hourly` (31-day per-app avg/max rollup). One
+  `NtQuerySystemInformation` snapshot per tick: no PDH, no WMI, no per-process
+  handles. Samples are aggregated per image name (12 chrome.exe processes =
+  one row, `instances=12`); `cpu_pct` is the app's share of total machine
+  capacity, matching Task Manager. Privacy: **image names only — never
+  command lines**; TAR redaction patterns apply to the name. **Off by default**
+  (`procperf_enabled=false`) — per-application data is usage-class telemetry
+  subject to works-council/DPA review, distinct from device-level perf (which
+  carries no per-app identity and stays on); set `procperf_enabled=true` to opt
+  in, independent of the device-level sampler. Queryable via `tar.sql`.
+- **TAR: warehouse tables are now ensured on every database open.** Fixes an
+  upgrade bug where tables introduced by a newer release (the perf tier, and
+  now procperf) were never created on a pre-existing `tar.db` — the schema DDL
+  only ran on first-time migration, so upgraded agents failed those inserts
+  until the database was deleted. The DDL is idempotent (`IF NOT EXISTS`) and
+  now runs on each open.
+- **DEX: fleet performance rollup + device perf sparklines.** Two new surfaces
+  over the device perf telemetry: (1) every Windows agent ships its current
+  utilization (CPU busy %, commit-charge % of limit, per-IO disk latency —
+  derived over its heartbeat interval) as heartbeat tags, and the server
+  aggregates the fleet into Prometheus gauges
+  **`yuzu_fleet_perf_{cpu_pct,commit_pct,disk_lat_ms}{stat="avg"|"p50"|"p90"|"max"}`**
+  plus **`yuzu_fleet_perf_reporting`** (the contributing population). Series go
+  absent — never a fabricated zero — when nobody reports; non-finite/negative
+  values from a rogue agent are rejected and percentages clamp at 100.
+  (2) The `/dex` per-device drill-down gains a **device performance panel**:
+  CPU / memory / disk-latency sparklines over the device's hourly warehouse
+  rollups, fetched by a live read-only `$Perf_Hourly` TAR query dispatched to
+  the device when you **click Load performance** (click-to-load — viewing a
+  device page alone never dispatches a command; raw samples stay on-device —
+  the federated model). Server-rendered SVG, no JS. Needs the device online
+  and `Execution:Execute` (the panel says so honestly otherwise); each query
+  is audit-logged (`dex.device.perf.query`). Agents with `--dex-disable` ship
+  no perf tags.
+- **DEX: sustained performance-breach alerts (Performance signal family).** The
+  Windows state poller now samples CPU, commit charge, and disk service time
+  every 120 s (raw kernel counters — `GetSystemTimes`, `GetPerformanceInfo`,
+  `IOCTL_DISK_PERFORMANCE`; no PDH, no WMI, no shell-out) and emits a DEX
+  observation when a metric stays bad for a sustained window:
+  **`perf.cpu_sustained`** (≥90% busy for 10 min), **`perf.memory_pressure`**
+  (commit charge ≥90% of limit for 10 min), **`perf.disk_latency_high`**
+  (≥25 ms per IO for 10 min). Each fires once per episode with the window
+  average as its metric and re-arms only after a sustained recovery below a
+  lower exit threshold (hysteresis — a flapping metric cannot spam the feed;
+  worst case ~4 observations/hour/type). The signals ride every existing alert
+  surface (SSE, webhooks, blast-radius detection) and land in a new
+  **"Performance"** family on the `/dex` Catalogue and Health views (display
+  catalogue now 107 entries). Thresholds are fixed in this release
+  (operator-configurable thresholds are the F1 follow-up). The TAR perf
+  warehouse remains the historical record of the same counters; this is the
+  alerting leg.
+- **RDP control plugin (`rdp_control`).** New Windows-only agent plugin with
+  two actions: `set_state` (enable|disable — writes `HKLM fDenyTSConnections`,
+  toggles the Remote Desktop firewall rule group locale-independently via
+  `INetFwPolicy2`, and starts `TermService` on enable; per-step status columns
+  with `overall=ok` only when every step succeeds) and `status` (reads back all
+  three gates and derives `rdp=on|off|unknown`, reporting `unknown` rather than
+  `off` when a gate is unreadable). Bundled `windows.rdp.set_state` definition
+  (role-gated, `endpoint-admin`) and `windows.rdp.status` (auto, question).
+  Built for change-gated remote access: an ITSM system can enable RDP at the
+  start of an approved change window and disable it afterward. Disable blocks
+  new connections only (does not terminate active sessions). Non-Windows builds
+  compile to an error-returning stub. Requires the agent service account to be
+  in the local `Administrators` group (not the default install) — see
+  `docs/agent-privilege-model.md`.
 - **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
   UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
   Three deliverables ahead of the substrate's fail-closed flip: (1) the
@@ -130,9 +214,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tar collect_perf` action and `configure` keys **`perf_enabled`** (default
   `true`) and **`perf_interval_seconds`** (default 30; `0` disables the trigger
   entirely). Queryable via `tar.sql`. Linux (`/proc`) and macOS
-  (`host_statistics`) collectors are planned. Threshold-breach alerting (A3) and
-  fleet rollup (A4) are follow-on slices — today's data is collection +
-  raw-SQL query, no dashboard or alert yet.
+  (`host_statistics`) collectors are planned. Threshold-breach alerting shipped
+  alongside (see "sustained performance-breach alerts" above); fleet rollup
+  (A4) is a follow-on slice — today's data is collection + raw-SQL query +
+  breach alerts, no dashboard chart yet.
 - **DEX: fleet blast-radius incident alerting.** When ≥5 distinct devices report
   the same DEX signal `(obs_type, subject)` within a 15-minute sliding window,
   the server raises an operator notification (severity `warn`) and fires a new
@@ -144,16 +229,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-minute fan-out cap and a bounded LRU pair map keep it kind to the server
   and the ITSM sink under a correlated multi-subject incident. Metrics:
   `yuzu_server_dex_blast_radius_{incidents,fires_dropped,entries_dropped,pairs_evicted}_total`
-  + `yuzu_server_dex_blast_radius_pairs_tracked`. Thresholds are fixed in this
-  release (operator-configurable in a later slice).
+  + `yuzu_server_dex_blast_radius_pairs_tracked`. The 5-devices / 15-min / 1-h
+  defaults are now operator-tunable under Settings → DEX alerts (see the alert
+  routing entry above).
 - **DEX: Windows disk-space and battery-health observations.** A Windows
   state-poll collector (`dex_win_poll`) emits `storage.low` (fixed volume ≥90%
   full or <5 GiB free, 10-min cadence, via `GetDiskFreeSpaceExW`) and `hw.error`
   (battery full-charge capacity <80% of design, hourly, via `IOCTL_BATTERY`)
   on the transition into a bad state (latched; re-arms only on a valid healthy
-  reading). Thresholds match the macOS IOKit poll; zero server change. The DEX
-  display catalogue is now 104 entries, with `storage.low` and battery
-  (`hw.error`) emitted on both Windows and macOS.
+  reading). Thresholds match the macOS IOKit poll; zero server change.
+  `storage.low` and battery (`hw.error`) are now emitted on both Windows and
+  macOS (final display-catalogue count for this release: see the Performance
+  family entry above).
 - **Network probes (`netprobe` plugin).** Active RTT, jitter, and packet-loss
   measurement to operator-chosen targets using native system calls (no
   shell-out): `network.probe.icmp` (ICMP echo — `IcmpSendEcho` on Windows,
