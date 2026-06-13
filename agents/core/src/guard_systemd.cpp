@@ -321,16 +321,19 @@ void SystemdServiceGuard::run() try {
             sink_(drift);
     };
 
-    // Best-effort Subscribe so the Manager emits unit signals to us. Not fatal if it
-    // fails — PropertiesChanged on the unit object still works without it on most
-    // systemd versions; we just lose the Manager-level UnitNew/Removed stream (the
-    // bounded reconcile backstop covers add/remove anyway). Re-run after every reopen.
+    // Subscribe so the Manager emits unit signals to us. systemd only sends change
+    // signals (including a unit's PropertiesChanged) while at least one client has
+    // Subscribed — so this is NOT optional for the event-driven path, despite being
+    // non-fatal: if it fails we silently lose PropertiesChanged and fall back entirely
+    // to the bounded reconcile, i.e. latency degrades from ~ms to kHealthyReconcileMs.
+    // Hence warn (not debug) so a degraded watch is visible. Re-run after every reopen.
     auto subscribe = [&] {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
         if (sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "Subscribe", &err, &reply, "") < 0)
-            spdlog::debug("Guardian SystemdServiceGuard[{}]: Subscribe failed: {}", cfg_.rule_id,
-                          err.message ? err.message : "(none)");
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: Subscribe failed ({}) — losing the "
+                         "PropertiesChanged event stream, falling back to bounded reconcile only",
+                         cfg_.rule_id, err.message ? err.message : "(none)");
         if (reply)
             sd_bus_message_unref(reply);
         sd_bus_error_free(&err);
@@ -371,16 +374,31 @@ void SystemdServiceGuard::run() try {
         return res;
     };
 
-    auto read_state = [&]() -> SystemdState {
+    // Read the unit's live ActiveState. Returns nullopt on a bare TRANSPORT failure
+    // (bus gone) so the caller reopens instead of emitting — the read_state twin of
+    // resolve_path's BusError split. Without it a dbus-restart / daemon-reexec read
+    // fails, falls through to Absent, and fabricates a false "stopped" drift (the same
+    // UP-4 fleet-wide-spurious-drift hazard the resolve_path fix closed, in a sibling
+    // function). A remote D-Bus error (the unit's object was removed) IS a genuine
+    // Absent terminal state; only a no-error-name transport failure yields nullopt.
+    auto read_state = [&]() -> std::optional<SystemdState> {
         if (unit_path.empty())
             return SystemdState::Absent;
         sd_bus_error err = SD_BUS_ERROR_NULL;
         char* s = nullptr;
-        SystemdState st = SystemdState::Absent;
+        std::optional<SystemdState> st;
         int r = sd_bus_get_property_string(bus, kDest, unit_path.c_str(), kUnitIface, "ActiveState",
                                            &err, &s);
-        if (r >= 0 && s)
+        if (r >= 0 && s) {
             st = parse_active_state(s);
+        } else if (sd_bus_error_is_set(&err)) {
+            st = SystemdState::Absent; // remote error: unit object removed — genuinely absent
+        } else {
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: ActiveState read bus error ({}) — "
+                         "reopening, no false drift",
+                         cfg_.rule_id, err_str(r < 0 ? -r : 0));
+            // leave nullopt → caller flips bus_ok and reopens
+        }
         if (s)
             free(s);
         sd_bus_error_free(&err);
@@ -409,11 +427,19 @@ void SystemdServiceGuard::run() try {
         if (r < 0) {
             spdlog::warn("Guardian SystemdServiceGuard[{}]: match arm failed for '{}': {}",
                          cfg_.rule_id, unit, err_str(-r));
-            emit(read_state());
+            if (auto st = read_state())
+                emit(*st);
+            else
+                bus_ok = false; // transport failure — reopen, never a false Absent
             return kAbsentRetryMs;
         }
         match_slot.reset(slot);
-        emit(read_state()); // initial / re-resolved compare
+        if (auto st = read_state()) { // initial / re-resolved compare
+            emit(*st);
+        } else {
+            bus_ok = false; // transport failure between arm and read — reopen
+            return kAbsentRetryMs;
+        }
         return kHealthyReconcileMs;
     };
 
@@ -470,7 +496,12 @@ void SystemdServiceGuard::run() try {
                 break;
             if (bus_ok && dirty) {
                 dirty = false;
-                emit(read_state());
+                if (auto st = read_state()) {
+                    emit(*st);
+                } else {
+                    bus_ok = false; // transport failure — reopen promptly, no false drift
+                    next_backstop = std::chrono::steady_clock::now();
+                }
             }
         }
         if (stop_.load(std::memory_order_acquire))
