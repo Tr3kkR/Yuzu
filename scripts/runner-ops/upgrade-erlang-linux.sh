@@ -3,7 +3,7 @@
 # to a specified Erlang/OTP release globally.
 #
 # Works for any runner installed via the standard /opt/actions-runner layout
-# (yuzu-wsl2-linux, scw-eager-lumiere, …). Detects the runner directory,
+# (e.g. yuzu-wsl2-linux). Detects the runner directory,
 # the systemd User=, and the runner home automatically.
 #
 # What it does:

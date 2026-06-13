@@ -8,14 +8,18 @@
  * battery wearing out produce no Event Log record. This module is the Windows
  * analogue of the macOS IOKit poll (dex_macos_iokit): a slow-cadence poll that
  * emits only on the transition INTO a bad state (latch on, suppress while it
- * persists, re-arm on recovery). BRD rows 20–21 (docs/dex-brd-coverage.md, D1).
+ * persists, re-arm on recovery). BRD rows 20–21 (docs/dex-brd-coverage.md, D1)
+ * + rows 13–15/124 (A3 sustained perf breaches via dex_perf_breach.hpp).
  *
- * Signals (both already in the server display catalogue — zero server change):
+ * Signals:
  *   - `storage.low`          — fixed volume >= 90% full or < 5 GiB free (the
  *                              macOS collector's thresholds, kept identical so
  *                              fleet dashboards read the same on both platforms)
  *   - `hw.error` ("battery") — full-charge capacity below 80% of design via
  *                              IOCTL_BATTERY (mirrors the macOS battery signal)
+ *   - `perf.cpu_sustained` / `perf.memory_pressure` / `perf.disk_latency_high`
+ *                            — sustained threshold breaches over the A3 perf
+ *                              sample (decision logic in dex_perf_breach.hpp)
  *
  * The decision functions are pure and unit-tested on every host; the Win32
  * mechanism (GetDiskFreeSpaceExW, SetupDi + battery IOCTLs, the poll thread)
@@ -72,9 +76,10 @@ YUZU_EXPORT std::optional<SignalObservation> battery_observation(const BatteryHe
 YUZU_EXPORT bool latch_should_emit(bool currently_bad, bool reading_valid, bool& reported);
 
 /// A running state poll. start() launches the poll thread (disk every 10 min,
-/// battery hourly; first poll on the first 60 s tick — timer-driven, never
-/// at-arm, the macOS lesson); stop() joins it. Single-owner; the Windows DEX
-/// observer owns one alongside its event subscriptions.
+/// battery hourly, perf breach sample every 120 s; first poll on the first
+/// 60 s tick — timer-driven, never at-arm, the macOS lesson); stop() joins it.
+/// Single-owner; the Windows DEX observer owns one alongside its event
+/// subscriptions.
 class IStatePoller {
 public:
     virtual ~IStatePoller() = default;

@@ -10,12 +10,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 // ── Standalone reproduction of AgentHealthStore ─────────────────────────────
 
@@ -45,12 +47,16 @@ public:
         metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
         metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
         metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
+        metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
+        metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
+        metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
 
         std::unordered_map<std::string, int> os_counts, arch_counts, version_counts;
         double total_commands = 0.0;
         int healthy_count = 0;
         int dex_observer_disarmed = 0;
         double total_dex_observed = 0.0;
+        std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
 
         for (const auto& [id, snap] : snapshots_) {
             ++healthy_count;
@@ -93,6 +99,23 @@ public:
             auto dex_val = get("yuzu.dex_observed");
             if (!dex_val.empty())
                 add_finite_count(total_dex_observed, dex_val);
+
+            // A4 perf tags — finite, non-negative; percentages clamp at 100,
+            // latency rejects above the sanity ceiling (absurd-but-finite).
+            auto collect_finite = [&](std::vector<double>& out, const std::string& key,
+                                      double clamp_hi, double reject_above) {
+                const auto s = get(key);
+                if (s.empty())
+                    return;
+                try {
+                    double v = std::stod(s);
+                    if (std::isfinite(v) && v >= 0.0 && v <= reject_above)
+                        out.push_back(clamp_hi > 0.0 ? (std::min)(v, clamp_hi) : v);
+                } catch (...) {}
+            };
+            collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
+            collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
+            collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, 1.0e6);
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -112,6 +135,30 @@ public:
                 .set(static_cast<double>(count));
 
         metrics.gauge("yuzu_fleet_commands_executed_total").set(total_commands);
+
+        // A4 fleet perf rollup — mirrors AgentHealthStore::recompute_metrics.
+        auto set_stats = [&](const char* family, std::vector<double>& vals) {
+            if (vals.empty())
+                return;
+            std::sort(vals.begin(), vals.end());
+            const auto n = vals.size();
+            double sum = 0.0;
+            for (double v : vals)
+                sum += v;
+            auto rank = [&](double p) {
+                const auto idx =
+                    static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
+                return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
+            };
+            metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
+            metrics.gauge(family, {{"stat", "p50"}}).set(rank(0.50));
+            metrics.gauge(family, {{"stat", "p90"}}).set(rank(0.90));
+            metrics.gauge(family, {{"stat", "max"}}).set(vals.back());
+        };
+        metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_cpu.size()));
+        set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
+        set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
+        set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
     }
 
 private:
@@ -265,4 +312,88 @@ TEST_CASE("AgentHealthStore: version breakdown", "[health_store]") {
     CHECK(metrics.gauge("yuzu_fleet_agents_by_version", {{"version", "1.0.0"}}).value() == 2.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_version", {{"version", "1.1.0"}}).value() == 1.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_version", {{"version", "2.0.0"}}).value() == 1.0);
+}
+
+// ── A4 fleet perf rollup ─────────────────────────────────────────────────────
+
+TEST_CASE("AgentHealthStore: perf tags aggregate to avg/p50/p90/max + population",
+          "[health_store][perf]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // Ten agents with CPU 10..100 — known percentile answers (nearest-rank,
+    // floor((n-1)*p): p50 -> index 4 = 50, p90 -> index 8 = 90).
+    for (int i = 1; i <= 10; ++i)
+        store.upsert("a" + std::to_string(i),
+                     {{"yuzu.perf_cpu_pct", std::to_string(i * 10) + ".0"},
+                      {"yuzu.perf_commit_pct", "40.0"},
+                      {"yuzu.perf_disk_lat_ms", "2.50"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    CHECK(metrics.gauge("yuzu_fleet_perf_reporting").value() == 10.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "avg"}}).value() == 55.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p50"}}).value() == 50.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p90"}}).value() == 90.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "max"}}).value() == 100.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_commit_pct", {{"stat", "avg"}}).value() == 40.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "max"}}).value() == 2.5);
+}
+
+TEST_CASE("AgentHealthStore: perf gauges go absent (not zero) when nobody reports",
+          "[health_store][perf]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // First cycle: one reporter populates the family.
+    store.upsert("w1", {{"yuzu.perf_cpu_pct", "42.0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    REQUIRE(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "avg"}}).value() == 42.0);
+
+    // Second cycle: the agent stops reporting the tag (e.g. --dex-disable or a
+    // non-Windows fleet). The family must be CLEARED — a stale 42% or a
+    // fabricated 0% would both be lies; only the population gauge reads 0.
+    store.upsert("w1", {{"yuzu.os", "windows"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    CHECK(metrics.gauge("yuzu_fleet_perf_reporting").value() == 0.0);
+    const auto text = metrics.serialize();
+    CHECK(text.find("yuzu_fleet_perf_cpu_pct{") == std::string::npos);
+}
+
+TEST_CASE("AgentHealthStore: rogue perf values cannot poison fleet percentiles",
+          "[health_store][perf]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    store.upsert("good", {{"yuzu.perf_cpu_pct", "50.0"}, {"yuzu.perf_disk_lat_ms", "3.0"}});
+    store.upsert("inf", {{"yuzu.perf_cpu_pct", "inf"}, {"yuzu.perf_disk_lat_ms", "nan"}});
+    store.upsert("neg", {{"yuzu.perf_cpu_pct", "-5"}});
+    store.upsert("junk", {{"yuzu.perf_cpu_pct", "garbage"}});
+    // A >100% CPU claim is a lie, not an outlier — clamped to 100, so it can
+    // shift max to the clamp but never to an absurd magnitude.
+    store.upsert("liar", {{"yuzu.perf_cpu_pct", "9000"}});
+    // Latency has NO semantic bound to clamp to — an absurd-but-finite claim
+    // (1e308 passes the isfinite check!) is REJECTED above the sanity ceiling,
+    // otherwise one agent drags avg/max to nonsense (grill finding 2).
+    store.upsert("lat-liar", {{"yuzu.perf_disk_lat_ms", "1e308"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    CHECK(metrics.gauge("yuzu_fleet_perf_reporting").value() == 2.0); // good + liar
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "max"}}).value() == 100.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "avg"}}).value() == 75.0);
+    CHECK(std::isfinite(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "avg"}}).value()));
+    CHECK(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "avg"}}).value() == 3.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_disk_lat_ms", {{"stat", "max"}}).value() == 3.0);
+}
+
+TEST_CASE("AgentHealthStore: true nearest-rank percentiles in tiny fleets",
+          "[health_store][perf]") {
+    // floor((n-1)·p) would return the MIN as p90 for n=2 — the regression the
+    // grill caught. True nearest-rank (ceil(p·n)−1) returns the max.
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    store.upsert("a", {{"yuzu.perf_cpu_pct", "10.0"}});
+    store.upsert("b", {{"yuzu.perf_cpu_pct", "90.0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p50"}}).value() == 10.0);
+    CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p90"}}).value() == 90.0);
 }

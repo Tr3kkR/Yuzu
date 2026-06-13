@@ -18,6 +18,7 @@ shared_library(
     'src/tar_sql_executor.cpp',
     'src/tar_network_collector.cpp',
     'src/tar_perf.cpp',
+    'src/tar_proc_perf.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
     'src/tar_fleet_snapshot.cpp',

@@ -106,6 +106,18 @@ public:
     /// (gov SRE OBS-1 / compliance S1).
     void set_metrics(yuzu::MetricsRegistry* metrics);
 
+    /// F1: update the ALERT-SHAPE knobs at runtime (Settings → DEX alerts).
+    /// Only the operator-meaningful trio is tunable — the memory/fan-out
+    /// bounds (max_pairs, entry budget, prune throttle, fire budget) stay
+    /// fixed, they are DoS posture, not policy. Values are clamped to sane
+    /// ranges (min_devices >= 2 — single-device alerting is the alert
+    /// router's job; window 60s..24h; cooldown 0..7d). Takes the internal
+    /// mutex — safe against concurrent observe().
+    void update_alert_shape(int min_devices, int window_seconds, int cooldown_seconds);
+
+    /// Snapshot of the current alert-shape trio (settings rendering).
+    BlastRadiusConfig alert_shape() const;
+
     /// Record one observation sighting. Cheap (hash-map ops under one mutex);
     /// fires the incident callback (outside the lock) when this sighting tips
     /// the pair over the threshold and the pair is not in cooldown.
@@ -135,10 +147,10 @@ private:
     // Counter bump helpers (no-op when metrics_ unset).
     void inc_metric(const char* name);
 
-    BlastRadiusConfig cfg_;
+    BlastRadiusConfig cfg_; // alert-shape trio mutable via update_alert_shape (under mu_)
     std::function<void(const BlastRadiusIncident&)> on_incident_;
     yuzu::MetricsRegistry* metrics_{nullptr};
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::unordered_map<std::string, Pair> pairs_; ///< key: obs_type + '\x1f' + subject
     std::size_t total_entries_{0};                ///< tracked (pair, agent) sightings
     bool entry_budget_warned_{false};

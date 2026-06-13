@@ -25,6 +25,11 @@ static const std::vector<std::string> kAllowedKeys = {
     "oidc_admin_group",              // OIDC admin group ID
     "oidc_skip_tls_verify",          // "true" or "false"
     "plugin_signing_required",       // see plugin_signing::kPluginSigningRequiredKey — must match
+    // F1 DEX alerting (Settings → DEX alerts; applied live, no restart)
+    "dex_alert_routing",             // JSON array of routed obs_types
+    "dex_blast_min_devices",         // blast-radius alert shape (clamped on apply)
+    "dex_blast_window_seconds",      //
+    "dex_blast_cooldown_seconds",    //
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {

@@ -35,6 +35,14 @@ std::string blast_subject_from_detail(const std::string& detail_json) {
     std::string subject = field("subject");
     if (subject.empty())
         subject = field("process"); // slice-1 crash key fallback (PR #1311 transition)
+    // Strip control bytes (gov sec LOW): the subject lands in a server log line
+    // (DexAlertRouter/BlastRadius), a notification title/message, and webhook
+    // JSON. JSON encoding handles the wire today, but a raw \n forges log lines
+    // and is a latent trap for any future HTML notification renderer. Replace
+    // anything < 0x20 (and DEL) with '?'.
+    for (char& c : subject)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+            c = '?';
     return subject;
 }
 
@@ -45,6 +53,21 @@ void BlastRadiusDetector::set_on_incident(std::function<void(const BlastRadiusIn
 }
 
 void BlastRadiusDetector::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
+
+void BlastRadiusDetector::update_alert_shape(int min_devices, int window_seconds,
+                                             int cooldown_seconds) {
+    std::lock_guard lock(mu_);
+    cfg_.min_devices = std::clamp(min_devices, 2, 100000);
+    cfg_.window_seconds = std::clamp(window_seconds, 60, 86400);
+    cfg_.cooldown_seconds = std::clamp(cooldown_seconds, 0, 7 * 86400);
+    spdlog::info("BlastRadius: alert shape updated — min_devices={} window={}s cooldown={}s",
+                 cfg_.min_devices, cfg_.window_seconds, cfg_.cooldown_seconds);
+}
+
+BlastRadiusConfig BlastRadiusDetector::alert_shape() const {
+    std::lock_guard lock(mu_);
+    return cfg_;
+}
 
 void BlastRadiusDetector::inc_metric(const char* name) {
     if (metrics_)
