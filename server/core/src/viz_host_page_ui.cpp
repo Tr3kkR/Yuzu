@@ -41,6 +41,7 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
     <a href="/" class="nav-brand">Yuzu</a>
     <a href="/" class="nav-link">Dashboard</a>
     <a href="/guardian" class="nav-link">Guardian</a>
+    <a href="/dex" class="nav-link">DEX</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
   </nav>
 

@@ -108,9 +108,17 @@ services:
       # and doesn't need a proxy.
       NO_PROXY: "*"
       no_proxy: "*"
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags. ⚠ DEV/UAT-ONLY default
+      # password ('yuzu-app') — distinct from the superuser default.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     ports:
       - "8080:8080"   # Web dashboard + REST API (operator-facing)
       - "50055:50055" # Gateway upstream (debugging convenience)
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       # VIZ_UAT_CONFIG must be set explicitly -- the launcher always exports
       # it after generate_config() writes the cfg file. There is no compose
@@ -128,6 +136,36 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+    restart: unless-stopped
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ──────────────────────
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    container_name: yuzu-viz-postgres
+    environment:
+      # ⚠ DEV/UAT-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: first-boot init refuses to run if
+      # they are equal (PR #1334 review, S1).
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-app}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init. psql
+      # SELECT 1 over the app DSN proves the app credential authenticates
+      # ($$ defers expansion to the container's shell). The psql leg
+      # dials the container's own hostname, NOT loopback: initdb leaves
+      # 'trust' auth on 127.0.0.1, so only a non-loopback connection
+      # actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Erlang Gateway ──────────────────────────────────────────────────────
@@ -318,3 +356,4 @@ services:
 
 volumes:
   server-data:
+  postgres-data:

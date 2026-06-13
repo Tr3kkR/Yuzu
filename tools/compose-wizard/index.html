@@ -36,7 +36,7 @@
         <h3>What you'll configure:</h3>
         <ul>
           <li>Yuzu version, admin credentials, and ports</li>
-          <li>Data storage and ClickHouse settings</li>
+          <li>PostgreSQL storage substrate (bundled or external), data dir, and ClickHouse analytics</li>
           <li>Prometheus &amp; Grafana observability stack</li>
           <li>Yuzu Gateway (Erlang/OTP) settings</li>
         </ul>
@@ -57,7 +57,7 @@
 
         <div class="field">
           <label for="yuzu-version">Yuzu Version</label>
-          <input type="text" id="yuzu-version" value="0.10.0" placeholder="0.10.0">
+          <input type="text" id="yuzu-version" value="0.12.0" placeholder="0.12.0">
           <small>The container image tag. Use <code>latest</code> for bleeding edge.</small>
         </div>
 
@@ -121,8 +121,63 @@
       <section id="step-3" class="step-panel">
         <h2>Data &amp; Storage</h2>
 
+        <div class="callout info">
+          <strong>PostgreSQL is the server's storage substrate (ADR-0006/0008).</strong>
+          As of v0.12 the server stores its state in PostgreSQL, not SQLite. The
+          server needs a database to talk to — choose a bundled local container or
+          point at an external/managed instance below.
+        </div>
+
+        <div class="field">
+          <label for="pg-mode">PostgreSQL Deployment</label>
+          <select id="pg-mode">
+            <option value="bundled" selected>Bundled — compose stands up a local Postgres container</option>
+            <option value="external">External / managed — supply a DSN, no local container</option>
+          </select>
+          <small>Bundled uses the release-pinned <code>yuzu-postgres</code> image (PostgreSQL&nbsp;16 + pgvector). External points the server at a managed database.</small>
+        </div>
+
+        <fieldset id="pg-bundled-fields">
+          <legend>Bundled PostgreSQL</legend>
+
+          <div class="callout warning">
+            <strong>⚠️ Two distinct credentials.</strong> The superuser and app-role
+            passwords <em>must differ</em> — the image's first-boot init refuses to
+            run if they are equal. They are written to <code>.env</code>, never baked
+            into the compose file. Generate strong values for any non-local deployment.
+          </div>
+
+          <div class="field">
+            <label for="pg-superuser-pass">Superuser Password (POSTGRES_PASSWORD)</label>
+            <div class="input-row">
+              <input type="text" id="pg-superuser-pass" value="" placeholder="set a strong value">
+              <button type="button" onclick="genSecret('pg-superuser-pass')" class="btn small">🎲 Generate</button>
+            </div>
+            <small>Stays inside the postgres container. Never carried by the server DSN.</small>
+          </div>
+
+          <div class="field">
+            <label for="pg-app-pass">App Role Password (YUZU_DB_PASSWORD)</label>
+            <div class="input-row">
+              <input type="text" id="pg-app-pass" value="" placeholder="set a strong value (distinct from superuser)">
+              <button type="button" onclick="genSecret('pg-app-pass')" class="btn small">🎲 Generate</button>
+            </div>
+            <small>The credential the server's <code>YUZU_POSTGRES_DSN</code> carries. Must differ from the superuser password.</small>
+          </div>
+        </fieldset>
+
+        <fieldset id="pg-external-fields" style="display:none">
+          <legend>External / Managed PostgreSQL</legend>
+
+          <div class="field">
+            <label for="pg-dsn">PostgreSQL DSN</label>
+            <input type="text" id="pg-dsn" value="" placeholder="postgresql://yuzu:password@db.example.com:5432/yuzu">
+            <small>Written to <code>.env</code> as <code>YUZU_POSTGRES_DSN</code>; the server reads it from the environment. Carry the app-role password here, never a superuser credential. No local Postgres container is generated.</small>
+          </div>
+        </fieldset>
+
         <div class="callout warning">
-          <strong>⚠️ Known gotcha:</strong> The <code>--data-dir</code> flag is <em>required</em> in the server command. Without it, SQLite stores fail silently and agents won't persist. This wizard includes it by default.
+          <strong>⚠️ Known gotcha:</strong> The <code>--data-dir</code> flag is <em>required</em> in the server command. Even on the Postgres substrate the server still uses this directory for its config file, OTA binaries, and the not-yet-migrated SQLite stores. This wizard includes it by default.
         </div>
 
         <div class="field">

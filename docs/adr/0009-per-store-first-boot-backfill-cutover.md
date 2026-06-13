@@ -58,3 +58,11 @@ data).
   migrate last and only behind a dedicated secrets-at-rest ADR (envelope encryption / KMS /
   `pgcrypto`) + `security-guardian` review — a plain `migrate_from_sqlite()` copy into Postgres
   columns is forbidden for secret material (the ADR-0004/0006 carve-out).
+
+  **Update (ADR-0010, 2026-06-10):** the dedicated secrets-at-rest ADR landed as ADR-0010,
+  with a scope ruling that differs from the sentence above: `api_token` and `ca` are
+  hash-only / key_ref-only (no plaintext secret columns) and are **unblocked** onto the
+  normal ladder; the stores that actually require the secrets mechanism are `auth`,
+  `webhooks`, `offload_targets`, and `runtime_config`. The decided mechanism is app-side
+  AES-256-GCM envelope encryption (`SecretCodec`); `pgcrypto` was considered and rejected.
+  Backfills that touch secret columns transform (encrypt/hash), never copy — see ADR-0010.

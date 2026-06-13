@@ -339,6 +339,58 @@ TEST_CASE("CaStore: issuer_fingerprint provenance round-trips (issued + CRL)",
     REQUIRE(latest->issuer_fingerprint == "AA:BB:CC:DD");
 }
 
+TEST_CASE("CaStore: issuer_key_id round-trips and list_issued_by_key_id filters (#1296)",
+          "[ca_store][provenance][pki]") {
+    // The stable key-based CA identity (issuer_key_id) is what an "issued by THIS
+    // CA" query keys on — invariant across a subordinate re-key (same key, new
+    // issuer cert). Here we model TWO issuer identities (kid_a, kid_b) and assert
+    // the filtered query returns exactly the rows minted under each, and that the
+    // empty-sentinel returns nothing (an unpopulated row is not a CA identity).
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-"}};
+    CaStore store(db.path);
+    const std::string kid_a = "AA:AA:AA:AA";
+    const std::string kid_b = "BB:BB:BB:BB";
+
+    auto mk = [&](const std::string& serial, const std::string& kid) {
+        auto r = sample_issued(serial);
+        r.issuer_key_id = kid;
+        return r;
+    };
+    REQUIRE(store.record_issued(mk("A1", kid_a)));
+    REQUIRE(store.record_issued(mk("A2", kid_a)));
+    REQUIRE(store.record_issued(mk("B1", kid_b)));
+    REQUIRE(store.record_issued(sample_issued("C1"))); // empty issuer_key_id
+
+    // Field round-trips on the single-row getter.
+    auto got = store.get_issued("A1");
+    REQUIRE(got);
+    REQUIRE(got->issuer_key_id == kid_a);
+
+    // The filter returns exactly the two kid_a rows, not kid_b or the blank one.
+    auto a = store.list_issued_by_key_id(kid_a);
+    REQUIRE(a.size() == 2);
+    for (const auto& r : a)
+        REQUIRE(r.issuer_key_id == kid_a);
+    REQUIRE(store.list_issued_by_key_id(kid_b).size() == 1);
+
+    // The empty key id is the unpopulated-row sentinel, NOT a CA identity — it must
+    // never surface the (single) blank row, or "issued by this CA" would conflate
+    // with "we don't know".
+    REQUIRE(store.list_issued_by_key_id("").empty());
+
+    // CRL row carries the stable id too.
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x00};
+    crl.this_update = now_s();
+    crl.next_update = now_s() + 86400;
+    crl.issuer_key_id = kid_a;
+    REQUIRE(store.record_crl(crl));
+    auto latest = store.latest_crl();
+    REQUIRE(latest);
+    REQUIRE(latest->issuer_key_id == kid_a);
+}
+
 TEST_CASE("CaStore: list_revoked surfaces a revoked agent cert by BARE agent_id (re-issue guard)",
           "[ca_store][revoke][security]") {
     // Pins the PR3 HIGH-2 guard contract (#1239): sign_agent_csr refuses to

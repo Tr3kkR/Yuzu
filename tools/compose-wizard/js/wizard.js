@@ -32,6 +32,12 @@ document.getElementById('enable-tls').addEventListener('change', e => {
   document.querySelectorAll('.tls-field').forEach(f => f.style.display = e.target.checked ? '' : 'none');
 });
 
+document.getElementById('pg-mode').addEventListener('change', e => {
+  const bundled = e.target.value === 'bundled';
+  document.getElementById('pg-bundled-fields').style.display = bundled ? '' : 'none';
+  document.getElementById('pg-external-fields').style.display = bundled ? 'none' : '';
+});
+
 document.getElementById('include-clickhouse').addEventListener('change', e => {
   document.getElementById('clickhouse-fields').style.display = e.target.checked ? '' : 'none';
 });
@@ -53,6 +59,16 @@ document.getElementById('include-gateway').addEventListener('change', e => {
 function val(id) { return document.getElementById(id).value.trim(); }
 function num(id) { return parseInt(document.getElementById(id).value) || 0; }
 function chk(id) { return document.getElementById(id).checked; }
+
+// Fill a field with a cryptographically-random 24-byte hex secret. Used for
+// the Postgres credentials so operators can avoid weak / shared passwords —
+// the secret only ever lands in the generated .env, never in the compose YAML.
+function genSecret(id) {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  document.getElementById(id).value =
+    Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
 
 // ── Admin password hash ──
 // Yuzu uses: username:password:salt in a specific format
@@ -131,12 +147,14 @@ function detectPortConflicts() {
 
 // ── Review Summary ──
 function buildReview() {
+  const pgBundled = val('pg-mode') === 'bundled';
   const items = [
     ['Yuzu Version', val('yuzu-version')],
     ['Admin User', val('admin-user')],
     ['Dashboard Port', num('dashboard-port')],
     ['Agent gRPC Port', num('grpc-port')],
     ['TLS', chk('enable-tls') ? '✅ Enabled' : '❌ Disabled'],
+    ['PostgreSQL', pgBundled ? '✅ Bundled container' : '🔗 External / managed'],
     ['ClickHouse', chk('include-clickhouse') ? '✅ Included' : '❌ Skipped'],
     ['Prometheus', chk('include-prometheus') ? '✅ Included' : '❌ Skipped'],
     ['Grafana', chk('include-grafana') ? '✅ Included' : '❌ Skipped'],
@@ -151,8 +169,19 @@ function buildReview() {
   html += '</div>';
   document.getElementById('review-summary').innerHTML = html;
 
-  // Port warnings
+  // Port warnings + Postgres credential checks
   const warnings = detectPortConflicts();
+  if (pgBundled) {
+    const su = val('pg-superuser-pass');
+    const app = val('pg-app-pass');
+    if (!su || !app) {
+      warnings.push('⚠️ Bundled Postgres: set BOTH the superuser and app-role passwords (🎲 Generate) — the image refuses to boot without them.');
+    } else if (su === app) {
+      warnings.push('⚠️ Bundled Postgres: superuser and app-role passwords are identical — first-boot init refuses to run. Make them distinct.');
+    }
+  } else if (!val('pg-dsn')) {
+    warnings.push('⚠️ External Postgres selected but no DSN supplied — the server will have no database to talk to.');
+  }
   const warnEl = document.getElementById('port-warnings');
   if (warnings.length) {
     warnEl.innerHTML = warnings.join('<br>');

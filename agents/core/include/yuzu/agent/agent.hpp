@@ -44,6 +44,11 @@ struct Config {
     // OTA updates
     bool auto_update{true};                               // --no-auto-update disables
     std::chrono::seconds update_check_interval{6 * 3600}; // --update-check-interval
+
+    // Guardian DEX (Digital Experience) — fleet-wide crash recorder (slice 1)
+    bool dex_disable{false}; // --dex-disable / YUZU_AGENT_DEX_DISABLE: deploy-time opt-out;
+                             // when set, the crash recorder never arms and no crash
+                             // telemetry is collected.
 };
 
 /**
