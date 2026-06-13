@@ -67,7 +67,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quiet ones too",
+TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quiet ones too",
           "[dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -82,11 +82,11 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quie
     std::string html;
     for (const char* family :
          {"App reliability", "Boot, start-up & shutdown", "Service health", "System stability",
-          "Hardware & storage", "File system", "Network", "Identity & logon",
+          "Hardware & storage", "Performance", "File system", "Network", "Identity & logon",
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
         html += render_dex_catalogue_group_fragment(&store, "", 7, family);
 
-    // All 104 labels.
+    // All 107 labels.
     for (const char* label :
          {// wave 1
           "App crash", "App hang", "Service crash", "Service start failure",
@@ -123,11 +123,13 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 104 monitored types, quie
           "Entra ID token error", "Authentication error", "TLS failure",
           "Threat removal failure", "Protection engine error", "BitLocker error",
           "Certificate enrollment failure", "Update check failure", "Update download failure",
-          "Policy extension failure", "MDM/Intune error"})
+          "Policy extension failure", "MDM/Intune error",
+          // A3 sustained perf breaches (Windows state poll, dex_perf_breach)
+          "Sustained high CPU", "Memory pressure", "High disk latency"})
         CHECK(html.find(label) != std::string::npos);
 
     // No fabricated numbers: quiet rows carry a literal zero count. (The "All
-    // 104 monitored signal types" headline is asserted on Catalogue View 1 by
+    // 107 monitored signal types" headline is asserted on Catalogue View 1 by
     // the "lists every family + the sub-nav" test below.)
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
@@ -138,7 +140,7 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
-    CHECK(html.find("All 104 monitored signal types") != std::string::npos);
+    CHECK(html.find("All 107 monitored signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -220,6 +222,10 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
     CHECK(html.find("derived &middot; secondary") != std::string::npos);
     CHECK(html.find("Why this score") != std::string::npos);
     CHECK(html.find("weighting:") != std::string::npos); // server-round-tripped presets
+    // Every display family carries a weight entry (a family missing from
+    // dex_family_weights silently never contributes to the score) — pin the
+    // A3 addition via its per-family sub-score card.
+    CHECK(html.find("Performance") != std::string::npos);
 
     // No reporting agents → suppressed (NEVER a fabricated 100).
     const auto suppressed = render_dex_health_fragment(&store, "", 7, DexFleet{}, "default");
@@ -260,8 +266,8 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
     CHECK(html.find("Signal families over time") != std::string::npos);  // small-multiples
     CHECK(html.find("Activity heatmap") != std::string::npos);           // heatmap
     CHECK(html.find("App reliability") != std::string::npos);            // a family row
-    // DERIVED-LIVE scope caption — "of 104 signal types", not the mockup's stale 6
-    CHECK(html.find("of 104 signal types") != std::string::npos);
+    // DERIVED-LIVE scope caption — "of 107 signal types", not the mockup's stale 6
+    CHECK(html.find("of 107 signal types") != std::string::npos);
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
@@ -540,5 +546,264 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(dev);
         CHECK(dev->body.find("<script>") == std::string::npos);
         CHECK(dev->body.find("alert(1)") == std::string::npos);
+    }
+}
+
+// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+
+TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",
+          "[dex][perf][parse]") {
+    // Rows arrive DESC (the canned query's ORDER BY); parse must sort ASC and
+    // skip the "total|N" trailer + map columns by NAME from the schema line.
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "7200|55.5|60.1|3000|1000\n"
+                            "3600|20.0|40.0|500|2500\n"
+                            "total|2\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 2);
+    CHECK(pts[0].hour_ts == 3600);
+    CHECK(pts[0].cpu_avg == 20.0);
+    CHECK(pts[0].disk_lat_ms == 2.5); // worse of read/write, us -> ms
+    CHECK(pts[1].hour_ts == 7200);
+    CHECK(pts[1].mem_avg == 60.1);
+    CHECK(pts[1].disk_lat_ms == 3.0);
+}
+
+TEST_CASE("DEX perf parse: column order is schema-driven, not positional",
+          "[dex][perf][parse]") {
+    const std::string out = "__schema__|cpu_avg|hour_ts|write_lat_us_avg|mem_avg|read_lat_us_avg\n"
+                            "75.0|3600|0|50.0|0\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 1);
+    CHECK(pts[0].cpu_avg == 75.0);
+    CHECK(pts[0].hour_ts == 3600);
+    CHECK(pts[0].mem_avg == 50.0);
+}
+
+TEST_CASE("DEX perf parse: error payload / wrong shape / garbage rows never render",
+          "[dex][perf][parse]") {
+    CHECK(parse_dex_perf_output("error|no such table").empty());
+    CHECK(parse_dex_perf_output("").empty());
+    // Schema missing a required column -> refuse rather than guess.
+    CHECK(parse_dex_perf_output("__schema__|hour_ts|cpu_avg\n3600|50\n").empty());
+    // Garbage cells: non-finite / negative / non-numeric rows are skipped;
+    // a >100% percentage is clamped (forged data must not distort the chart).
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "3600|inf|50|0|0\n"
+                            "3600|-5|50|0|0\n"
+                            "3600|garbage|50|0|0\n"
+                            "7200|9000|50|0|0\n";
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 1);
+    CHECK(pts[0].cpu_avg == 100.0); // clamped
+}
+
+TEST_CASE("DEX perf parse: a forged disk latency is clamped, never crushes the sparkline",
+          "[dex][perf][parse]") {
+    // The SVG y-axis auto-scales to the series range, so one absurd-but-finite
+    // disk-latency row (1e9 µs = 1e6 ms) would otherwise flatten every real
+    // point to an invisible line. cell_double accepts it (finite, >=0, <=32
+    // chars); the clamp at 1000 ms is the defence (gov QE B1).
+    const std::string out = "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                            "3600|10|40|2000|1500\n"      // ~2 ms, real
+                            "7200|10|40|1000000000|0\n";  // 1e9 µs forged
+    const auto pts = parse_dex_perf_output(out);
+    REQUIRE(pts.size() == 2);
+    CHECK(pts[0].disk_lat_ms == 2.0);       // real point intact
+    CHECK(pts[1].disk_lat_ms == 1000.0);    // forged row clamped, not 1e6
+}
+
+TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
+          "[dex][perf][render]") {
+    CHECK(render_dex_perf_panel({}).find("No performance history") != std::string::npos);
+
+    std::vector<DexPerfPoint> pts;
+    for (int i = 0; i < 5; ++i)
+        pts.push_back({3600 * (i + 1), 10.0 * (i + 1), 42.0, 1.5});
+    const auto html = render_dex_perf_panel(pts);
+    CHECK(html.find("<svg") != std::string::npos); // server-rendered SVG, no JS
+    CHECK(html.find("<polyline") != std::string::npos);
+    CHECK(html.find("CPU busy") != std::string::npos);
+    CHECK(html.find("Memory used") != std::string::npos);
+    CHECK(html.find("Disk latency") != std::string::npos);
+    CHECK(html.find("now 50%") != std::string::npos); // CPU last value
+    CHECK(html.find("min 10%") != std::string::npos);
+    CHECK(html.find("max 50%") != std::string::npos);
+    CHECK(html.find("5 hourly rollups") != std::string::npos);
+    CHECK(html.find("hx-on") == std::string::npos); // CSP rule: never hx-on
+}
+
+TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf][render]") {
+    GuaranteedStateStore store(":memory:");
+    // With signals AND without - a quiet device still has perf history.
+    const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
+    CHECK(quiet.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
+    seed_crash(store, "e1", "WS-9", "app.exe", "m.dll", "windows", "2026-06-09T10:00:00Z");
+    const auto busy = render_dex_device_fragment(&store, "WS-9", "7d");
+    CHECK(busy.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
+    // Click-to-load, NEVER auto-load: the route dispatches a real command and
+    // probes Execute (which audit-logs denials) — auto-loading would fire both
+    // on every page view (grill finding 1). Pin the button + the absence of an
+    // hx-trigger="load" auto-fire anywhere in the fragment.
+    CHECK(busy.find("<button") != std::string::npos);
+    CHECK(busy.find("Load performance") != std::string::npos);
+    CHECK(busy.find("hx-trigger=\"load\"") == std::string::npos);
+}
+
+TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
+          "[dex][perf][routes][rbac]") {
+    GuaranteedStateStore store(":memory:");
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string& tid, const std::string&) {
+        audited = a + "|" + r + "|" + tid;
+    };
+
+    // Fake dispatch + response store.
+    int dispatched = 0;
+    std::string seen_sql;
+    int fake_sent = 1;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ++dispatched;
+        CHECK(plugin == "tar");
+        CHECK(action == "sql");
+        REQUIRE(ids.size() == 1);
+        seen_sql = params.count("sql") ? params.at("sql") : "";
+        return {"tar-deadbeef", fake_sent};
+    };
+    std::vector<DexAgentResponse> fake_rows;
+    auto responses = [&](const std::string& command_id) {
+        CHECK(command_id == "tar-deadbeef");
+        return fake_rows;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, dispatch, responses);
+
+    SECTION("dispatch returns the polling stub + audits the query") {
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(dispatched == 1);
+        CHECK(seen_sql.find("$Perf_Hourly") != std::string::npos);
+        CHECK(r->body.find("/fragments/dex/device/perf/result?command_id=tar-deadbeef") !=
+              std::string::npos);
+        CHECK(audited == "dex.device.perf.query|success|WS-1");
+    }
+
+    SECTION("offline device renders the honest note, no polling") {
+        fake_sent = 0;
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->body.find("Device offline") != std::string::npos);
+        CHECK(r->body.find("hx-trigger") == std::string::npos);
+    }
+
+    SECTION("result poll: pending -> re-poll with n+1; data -> panel; error -> note") {
+        auto pending =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(pending);
+        CHECK(pending->body.find("&amp;n=2") != std::string::npos); // re-poll bumps the attempt
+
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "3600|33|44|0|0\n",
+                      ""}};
+        auto done =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(done);
+        CHECK(done->body.find("<svg") != std::string::npos);
+        CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
+
+        fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
+        auto err =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(err);
+        CHECK(err->body.find("reported an error") != std::string::npos);
+        CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+    }
+
+    SECTION("result poll: a valid-but-empty result renders 'no history', stops polling (gov S3)") {
+        // The agent is online and answered, but $Perf_Hourly has no rows yet
+        // (fresh agent, no rollup completed). Distinct from offline/timeout:
+        // schema present, zero data rows. Must show the honest panel, not
+        // re-poll forever — exercised THROUGH the route, not the render fn.
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "total|0\n",
+                      ""}};
+        auto empty =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(empty);
+        CHECK(empty->body.find("No performance history") != std::string::npos);
+        CHECK(empty->body.find("hx-trigger") == std::string::npos); // not re-polled
+        CHECK(empty->body.find("<svg") == std::string::npos);
+    }
+
+    SECTION("result poll: another agent's rows never render; timeout is honest") {
+        fake_rows = {{"OTHER-AGENT", 0,
+                      "__schema__|hour_ts|cpu_avg|mem_avg|read_lat_us_avg|write_lat_us_avg\n"
+                      "3600|33|44|0|0\n",
+                      ""}};
+        auto r =
+            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<svg") == std::string::npos); // filtered out
+
+        auto timeout = sink.Get(
+            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=20");
+        REQUIRE(timeout);
+        CHECK(timeout->body.find("timed out") != std::string::npos);
+        CHECK(timeout->body.find("hx-trigger") == std::string::npos);
+    }
+
+    SECTION("non-tar command_id is rejected - this route polls only tar dispatches") {
+        auto r = sink.Get(
+            "/fragments/dex/device/perf/result?command_id=script_exec-123&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+
+    SECTION("read-only operator gets the in-panel Execute note, no dispatch") {
+        auto readOnly = [](const httplib::Request&, httplib::Response& res,
+                           const std::string& securable, const std::string& op) {
+            if (securable == "Execution" && op == "Execute") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        yuzu::server::test::TestRouteSink sink2;
+        DexRoutes routes2;
+        routes2.register_routes(sink2, okAuth, readOnly, &store, fleet, audit, dispatch,
+                                responses);
+        auto r = sink2.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200); // in-panel note, NOT a swallowed 403
+        CHECK(r->body.find("Execute") != std::string::npos);
+        CHECK(dispatched == 0);
+        auto poll = sink2.Get(
+            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(poll);
+        CHECK(poll->body.find("Execute") != std::string::npos); // result leg gated too
+    }
+
+    SECTION("no dispatch/responses wiring degrades to the unavailable note") {
+        yuzu::server::test::TestRouteSink sink3;
+        DexRoutes routes3;
+        routes3.register_routes(sink3, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink3.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->body.find("unavailable") != std::string::npos);
     }
 }

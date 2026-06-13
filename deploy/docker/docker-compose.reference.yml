@@ -51,12 +51,24 @@
 ##   mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
 ##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
 ##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+##   # Postgres state: pg_dump through the database — consistent against a
+##   # LIVE instance. Never tar the postgres-data volume while it runs (a
+##   # torn pg_wal/ copy is unrecoverable).
+##   docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+##     > "yuzu-pg-$(date +%F).dump"
 ##
 ## Restore (with server stopped):
 ##   docker compose -f docker-compose.reference.yml down server
 ##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
 ##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data
+##   docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+##     --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ##   docker compose -f docker-compose.reference.yml up -d server
+##
+## Once envelope-encrypted secrets land (ADR-0010), the Postgres dump holds
+## ciphertext + wrapped DEKs only — DB and KeyProvider keys-dir backups are
+## a PAIR and must be restored together. Full procedure + pairing invariant:
+## docs/user-manual/server-admin.md "PostgreSQL Substrate".
 
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────

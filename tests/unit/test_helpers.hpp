@@ -28,10 +28,20 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <string>
 #include <string_view>
+
+#if defined(YUZU_TEST_ENABLE_PG)
+#include <format>
+
+#include <libpq-fe.h>
+
+#include "pg/pg_raii.hpp" // server suite only — include path carries server/core/src
+#endif
 
 namespace yuzu::test {
 
@@ -50,7 +60,7 @@ namespace yuzu::test {
 /// created. Callers are responsible for creating parent directories and
 /// cleaning up (prefer `TempDbFile` RAII below for SQLite stores).
 inline std::filesystem::path unique_temp_path(std::string_view prefix = "yuzu-test-") {
-    static const std::uint64_t salt = []{
+    static const std::uint64_t salt = [] {
         std::mt19937_64 rng{std::random_device{}()};
         return rng();
     }();
@@ -92,10 +102,8 @@ struct TempDbFile {
     ~TempDbFile() noexcept {
         std::error_code ec;
         std::filesystem::remove(path, ec);
-        std::filesystem::remove(
-            std::filesystem::path(path.string() + "-wal"), ec);
-        std::filesystem::remove(
-            std::filesystem::path(path.string() + "-shm"), ec);
+        std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
+        std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
     }
 
     TempDbFile(const TempDbFile&) = delete;
@@ -103,5 +111,179 @@ struct TempDbFile {
     TempDbFile(TempDbFile&&) = delete;
     TempDbFile& operator=(TempDbFile&&) = delete;
 };
+
+#if defined(YUZU_TEST_ENABLE_PG)
+
+/// ── Postgres test support (#1320 PR 1) ──────────────────────────────────
+///
+/// Compiled only into suites that link libpq (the server suite defines
+/// YUZU_TEST_ENABLE_PG in tests/meson.build); the agent/tar suites include
+/// this header without a libpq include path, so everything Postgres-shaped
+/// stays behind the guard.
+///
+/// Skip-vs-fail contract (F1 ledger, #1320): when YUZU_TEST_POSTGRES_DSN is
+/// UNSET the test skips cleanly (local dev without a Postgres). When it is
+/// SET but broken the test FAILS — in CI `scripts/ci/ensure-postgres.sh`
+/// guarantees a reachable database (SOFT_EXIT=1), so an unreachable DSN is
+/// breakage to surface, never to skip past.
+
+/// The operator/CI-provided admin DSN, or nullptr when unset/empty.
+inline const char* pg_admin_dsn_env() {
+    const char* v = std::getenv("YUZU_TEST_POSTGRES_DSN");
+    return (v != nullptr && v[0] != '\0') ? v : nullptr;
+}
+
+/// RAII fixture for an ephemeral, uniquely-named Postgres database.
+///
+/// Connects to YUZU_TEST_POSTGRES_DSN, issues `CREATE DATABASE
+/// yuzu_test_<salt>_<n>`, and exposes a rewritten conninfo (`dsn()`)
+/// pointing at it; the destructor drops the database (`WITH (FORCE)`, so a
+/// leaked test connection cannot keep it alive). Name uniqueness uses the
+/// same process-salt + atomic-counter scheme as `unique_temp_path` — never
+/// thread-id/clock salting (flake #473).
+class PostgresTestDb {
+public:
+    PostgresTestDb() {
+        const char* admin = pg_admin_dsn_env();
+        if (admin == nullptr) {
+            error_ = "YUZU_TEST_POSTGRES_DSN not set";
+            return;
+        }
+        admin_dsn_ = admin;
+        db_name_ = unique_db_name();
+
+        // RAII owners (server/core/src/pg/pg_raii.hpp): an allocation throw
+        // while building error_ must not leak the admin connection/result.
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            error_ = std::string("admin connect failed: ") + PQerrorMessage(conn.get());
+            return;
+        }
+        const std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
+        if (!res.ok()) {
+            error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+            return;
+        }
+        res.reset();
+        conn.reset();
+
+        dsn_ = rewrite_dbname(admin_dsn_, db_name_);
+        if (dsn_.empty()) {
+            error_ = "could not parse YUZU_TEST_POSTGRES_DSN to rewrite dbname";
+            return;
+        }
+        available_ = true;
+    }
+
+    ~PostgresTestDb() {
+        if (db_name_.empty() || admin_dsn_.empty())
+            return;
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            // Can't throw from a dtor — but a silent failure piles leaked
+            // yuzu_test_* databases onto a shared instance; say so.
+            log_leak("teardown admin connect failed", nullptr);
+            return;
+        }
+        // FORCE (PG 13+; every supported leg pins 16): terminate any
+        // connection a test leaked so the drop cannot fail and pile up
+        // databases on the shared instance.
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+        if (!res.ok())
+            log_leak("DROP DATABASE failed", PQerrorMessage(conn.get()));
+    }
+
+    PostgresTestDb(const PostgresTestDb&) = delete;
+    PostgresTestDb& operator=(const PostgresTestDb&) = delete;
+    PostgresTestDb(PostgresTestDb&&) = delete;
+    PostgresTestDb& operator=(PostgresTestDb&&) = delete;
+
+    /// True when the ephemeral database exists and `dsn()` is usable.
+    [[nodiscard]] bool available() const noexcept { return available_; }
+    /// Why `available()` is false.
+    [[nodiscard]] const std::string& error() const noexcept { return error_; }
+    /// Conninfo (keyword/value form) for the ephemeral database.
+    [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
+    [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
+
+private:
+    // std::format + fputs, never printf-family (docs/cpp-conventions.md;
+    // std::print is unavailable on GCC 13 libstdc++ / Apple Clang 15 — same
+    // portable form as canary_main.cpp). Called from the dtor, so formatting
+    // must not throw out: fall back to a static message on bad_alloc.
+    void log_leak(const char* what, const char* detail) const noexcept {
+        try {
+            const std::string msg =
+                detail != nullptr
+                    ? std::format("PostgresTestDb: {} — leaked {}: {}\n", what, db_name_, detail)
+                    : std::format("PostgresTestDb: {} — leaked {}\n", what, db_name_);
+            std::fputs(msg.c_str(), stderr);
+        } catch (...) {
+            std::fputs("PostgresTestDb: teardown failed — leaked a yuzu_test_* database\n", stderr);
+        }
+    }
+
+    static std::string unique_db_name() {
+        static const std::uint64_t salt = [] {
+            std::mt19937_64 rng{std::random_device{}()};
+            return rng();
+        }();
+        static std::atomic<std::uint64_t> counter{0};
+        const auto n = counter.fetch_add(1, std::memory_order_relaxed);
+        return "yuzu_test_" + std::to_string(salt % 1000000000) + "_" + std::to_string(n);
+    }
+
+    /// Re-emit `admin_dsn` as a keyword/value conninfo with dbname replaced.
+    /// Round-trips through PQconninfoParse so both URI and keyword forms
+    /// work. Returns empty on parse failure.
+    static std::string rewrite_dbname(const std::string& admin_dsn, const std::string& new_db) {
+        char* errmsg = nullptr;
+        PQconninfoOption* opts = PQconninfoParse(admin_dsn.c_str(), &errmsg);
+        if (opts == nullptr) {
+            if (errmsg != nullptr)
+                PQfreemem(errmsg);
+            return {};
+        }
+        std::string out;
+        for (PQconninfoOption* o = opts; o->keyword != nullptr; ++o) {
+            if (o->val == nullptr || std::string_view(o->keyword) == "dbname")
+                continue;
+            out += o->keyword;
+            out += "='";
+            for (const char* p = o->val; *p != '\0'; ++p) {
+                if (*p == '\\' || *p == '\'')
+                    out += '\\';
+                out += *p;
+            }
+            out += "' ";
+        }
+        PQconninfoFree(opts);
+        out += "dbname='" + new_db + "'";
+        return out;
+    }
+
+    std::string admin_dsn_;
+    std::string db_name_;
+    std::string dsn_;
+    std::string error_;
+    bool available_{false};
+};
+
+/// Standard prologue for a Postgres-backed TEST_CASE: skip when no DSN is
+/// configured, fail when it is configured but broken, else bind `var` to a
+/// fresh ephemeral database. Requires Catch2 macros at the expansion site.
+/// Expands to an unbraced `if` plus declarations — use only as a direct
+/// statement at block scope (never as the body of an if/loop).
+#define YUZU_REQUIRE_PG_DB(var)                                                                    \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    yuzu::test::PostgresTestDb var;                                                                \
+    INFO("PostgresTestDb: " << var.error());                                                       \
+    REQUIRE(var.available())
+
+#endif // YUZU_TEST_ENABLE_PG
 
 } // namespace yuzu::test

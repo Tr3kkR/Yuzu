@@ -1543,6 +1543,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `system.status` | `status` | Y | Y | Y | Verified |
 | `device.identity` | `device_identity` | Y | Y | Y | Verified |
 | `hardware.inventory` | `hardware` | Y | Y | Y | Verified |
+| `device.hardware.drivers` | `hardware` | Y | Y | - | Verified |
 | `device.tags.get` | `tags` | Y | Y | Y | Verified |
 | `device.tags.set` | `tags` | Y | Y | Y | Verified |
 | `device.asset_tags.sync` | `asset_tags` | Y | Y | Y | Verified |
@@ -1603,6 +1604,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.socket.owner` | `sockwho` | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified |
+| `network.probe.icmp` | `netprobe` | Y | Y | Y | Verified |
+| `network.probe.tcp` | `netprobe` | Y | Y | Y | Verified |
+| `network.probe.dns` | `netprobe` | Y | Y | Y | Verified |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified |
 | `network.adapter.disable` | `network_actions` | Y | Y | Y | Verified |
 | `network.wifi.list` | `wifi` | Y | Y | Y | Verified |
@@ -1674,6 +1678,8 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
+| `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |
+| `rdp_control.status` | `rdp_control` | Y | - | - | Verified |
 
 ### 14.10 Agent Key-Value Storage
 
@@ -1745,12 +1751,15 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.configure` | `tar` | Y | Y | Y | Verified |
 | `tar.collect_fast` | `tar` | Y | Y | Y | Verified |
 | `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
+| `tar.collect_perf` | `tar` | Y | - | - | Verified |
 | `tar.sql` | `tar` | Y | Y | Y | Verified |
 | `tar.rollup` | `tar` | Y | Y | Y | Verified |
 | `tar.compatibility` | `tar` | Y | Y | Y | Verified |
 | `tar.fleet_snapshot` | `tar` | Y | Y | Y | Active |
 
-**`tar.compatibility`** -- Emit the live OS compatibility matrix for all four capture sources (process, tcp, service, user). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`.
+**`tar.compatibility`** -- Emit the live OS compatibility matrix for all five capture sources (process, tcp, service, user, perf). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`.
+
+**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (opt-in, off by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows only today); a manual invocation forces one immediate sample. The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
 
 **`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 

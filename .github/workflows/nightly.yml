@@ -143,7 +143,8 @@ jobs:
       # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
       # Idempotent persistent `yuzu-ci-postgres` docker container on
       # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
-      # runner. Non-fatal until #1320 ships the first consumer.
+      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
+      # fails the job here, before the test step.
       - name: Ensure Postgres 16 (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
