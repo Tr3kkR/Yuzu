@@ -1,8 +1,8 @@
 name: Runner ops — upgrade Erlang/OTP
 #
 # Operational workflow that upgrades the Erlang/OTP toolchain on a
-# specified self-hosted Linux runner (yuzu-wsl2-linux, scw-eager-lumiere,
-# or any future runner with the right matching label).
+# specified self-hosted Linux runner (e.g. yuzu-wsl2-linux, or any
+# future runner with the right matching label).
 #
 # Manual dispatch only — `workflow_dispatch` requires the workflow file
 # to live on the default branch (main), so this workflow is permanent and
@@ -22,14 +22,13 @@ on:
     inputs:
       target_runner_label:
         description: |
-          Custom runner label to target (e.g. yuzu-shulgi or yuzu-cloud-builder).
+          Custom runner label to target (e.g. yuzu-shulgi).
           The job runs-on `[self-hosted, Linux, X64, <this-label>]`, so this
           must be a label unique to the intended runner.
         required: true
         type: choice
         options:
           - yuzu-shulgi
-          - yuzu-cloud-builder
       otp_version:
         description: "Erlang/OTP release to install (e.g. 28.4.2)."
         required: true
