@@ -458,11 +458,11 @@ const std::string& openapi_spec() {
         // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
         R"json(,
     "/tokens": {
-      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}}},
-      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}}}
+      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
+      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
-      "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}}}
+      "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -1263,7 +1263,10 @@ void RestApiV1::register_routes(
              [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ApiToken", "Read"))
                      return;
-                 if (!token_store) {
+                 // #347 CH-3: a failed DB open must read as 503, never as an
+                 // empty list or 404 — is_open() distinguishes "no rows" from
+                 // "no database".
+                 if (!token_store || !token_store->is_open()) {
                      res.status = 503;
                      res.set_content(error_json("service unavailable", 503), "application/json");
                      return;
@@ -1297,7 +1300,7 @@ void RestApiV1::register_routes(
                                     const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
             return;
@@ -1450,7 +1453,7 @@ void RestApiV1::register_routes(
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
             return;
