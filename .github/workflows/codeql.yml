@@ -5,15 +5,15 @@ name: "CodeQL"
 #   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64/yuzu-shulgi) — gcc-13 build
 #   - yuzu-local-windows (labels: self-hosted/Windows/X64) — MSVC build
 #
-# The Linux leg pins `yuzu-shulgi` explicitly so it can't drift to
-# `scw-eager-lumiere` (cloud builder, labels self-hosted/Linux/X64/
-# yuzu-cloud-builder). The cloud builder is sized for nightly Coverage
-# and routinely sits below the 40 GB disk threshold this workflow
-# requires; matching `[self-hosted, Linux, X64]` alone gives GH free
-# reign to assign whichever runner is idle, which produces non-
-# deterministic failures (run 25986790721 hit Scaleway at 23 GB free
-# and died at the disk check before any CodeQL work). Same selector
-# pattern nightly.yml uses for the equivalent meson workload.
+# The Linux leg pins `yuzu-shulgi` explicitly rather than matching the
+# bare `[self-hosted, Linux, X64]` label set. Today Shulgi is the only
+# Linux runner, but the pin is deliberate: any future overflow runner
+# sharing the bare label set must NOT receive this workload unless it
+# meets the 40 GB disk threshold CodeQL needs. (A retired Scaleway cloud
+# builder sized for nightly Coverage routinely sat below it — run
+# 25986790721 died at the disk check at 23 GB free before any CodeQL
+# work — which is why the pin exists.) Same selector pattern nightly.yml
+# uses for the equivalent meson workload.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -102,9 +102,8 @@ jobs:
       matrix:
         include:
           - os: linux
-            # yuzu-shulgi pin — see header comment. The cloud builder
-            # (scw-eager-lumiere) carries `yuzu-cloud-builder` instead;
-            # this list intentionally excludes it.
+            # yuzu-shulgi pin — see header comment (guards the 40 GB disk
+            # threshold against any future overflow Linux runner).
             runner: [self-hosted, Linux, X64, yuzu-shulgi]
             triplet: x64-linux
             vcpkg_bin: vcpkg
