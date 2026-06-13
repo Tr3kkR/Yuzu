@@ -1065,7 +1065,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other store-down guard so message-grep alerting stays unified. The
   identical-404 anti-enumeration response for not-found vs not-owner is
   unchanged. Mid-request I/O errors on a connection that opened successfully
-  are tracked as #1383.
+  are tracked as #1383. *Integration note:* automation that treated `404` from
+  these endpoints as "token not found" must now also handle `503` as a distinct
+  storage-failure signal. (The same store-availability gate is still missing on
+  the device-token routes and dashboard token create/revoke — tracked as #1382.)
 - **SSE channel GC no longer aborts the server (#1198).** `gc_terminal_channels()`
   destroyed each collected execution channel — and the `std::mutex` inside it —
   while a `lock_guard` still owned that mutex: the channel map held the only
@@ -1077,6 +1080,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention window triggered the bad path on the next publish-driven GC sweep.
   Fixed by pinning each victim with an extra `shared_ptr` and deferring
   destruction until all per-channel locks are released.
+- **MCP prompt arguments are now framed as untrusted data (security, #656).**
+  `prompts/get` previously interpolated caller-supplied string arguments
+  (`agent_id`, `policy_id`, `principal`) directly into the generated prompt
+  text, so a hostile agent hostname, policy id, or principal name could inject
+  instructions the AI assistant would act on. Each string argument is now
+  JSON-escaped and wrapped in `BEGIN_UNTRUSTED_MCP_ARGUMENT` /
+  `END_UNTRUSTED_MCP_ARGUMENT` sentinels with an explicit data-only directive;
+  the escaping keeps the value on one line so the end sentinel cannot be forged.
+  These markers are part of the `prompts/get` response shape — clients that
+  display prompt text will see them (see `docs/user-manual/mcp.md` →
+  Prompt-injection hardening).
 - **Agents enrolling *through the gateway* now receive a per-agent client
   certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
   per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the

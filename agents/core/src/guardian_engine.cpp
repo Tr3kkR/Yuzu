@@ -446,10 +446,13 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     // agent_id, two agents drifting on the same rule in the same millisecond mint
     // an identical id (rule_id-{ms}-{seq}, seq being a per-agent counter that both
     // start at 0) → the server silently keeps one and loses the rest during a
-    // fleet-wide drift wave. The agent_id segment alone guarantees cross-agent
-    // distinctness regardless of clock skew. (The crash/observation path landing
-    // with the DEX slice uses the same {discriminator}-{agent_id}-{ms}-{seq}
-    // layout — keep them aligned when that branch merges.)
+    // fleet-wide drift wave. For any non-empty agent_id the agent_id segment
+    // guarantees cross-agent distinctness regardless of clock skew; a degenerate
+    // empty agent_id (pre-Register, before sync_with_server populates it) folds
+    // in nothing and reverts to the old per-(rule,ms,seq) collision class — the
+    // durable fix for that residual is the server-side composite key #1360. (The
+    // crash/observation path landing with the DEX slice uses the same
+    // {discriminator}-{agent_id}-{ms}-{seq} layout — keep them aligned.)
     ev.set_event_id(d.rule_id + "-" + agent_id_ + "-" + std::to_string(now_ms) + "-" +
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
