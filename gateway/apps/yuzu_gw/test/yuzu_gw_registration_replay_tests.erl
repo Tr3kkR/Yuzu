@@ -46,12 +46,8 @@ replay_test_() ->
      ]}.
 
 setup() ->
-    %% pg is needed by the registry.
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _         -> ok
-    end,
-    ensure_registry(),
+    %% pg + a real registry, race-safe across modules (#1403 / #336).
+    yuzu_gw_test_registry:ensure(),
 
     %% Clean up stale mocks from prior modules.
     catch meck:unload(grpcbox_client),
@@ -301,82 +297,6 @@ proxy_register_count() ->
 %% Poll until exactly Expected ProxyRegister RPCs have been recorded.
 wait_for_proxy_register_count(Expected, Timeout) ->
     wait_until(fun() -> proxy_register_count() =:= Expected end, Timeout).
-
-%%%===================================================================
-%%% Helpers — registry lifecycle
-%%%===================================================================
-
-%% Ensure a real yuzu_gw_registry gen_server is available under its
-%% registered name.
-%%
-%% Two hazards have to be navigated, both rooted in #336:
-%%   1. A prior module (health_nf_tests) can leave a mock_loop process
-%%      registered as yuzu_gw_registry. That mock silently discards
-%%      gen_server:call, so register_agent/6 would hang. Detect a
-%%      non-gen_server via proc_lib:initial_call and evict it.
-%%   2. The registry is start_link-ed in every test module's setup, so
-%%      it dies with that module's transient EUnit group process. When
-%%      the next module's setup runs, the old registry may be dead but
-%%      *not yet reaped* — it still owns the named ETS tables, so a
-%%      fresh start_link's init/1 crashes on ets:new "table already
-%%      exists". Wait for those orphaned tables to clear before
-%%      (re)starting, and retry start_link a bounded number of times.
-ensure_registry() ->
-    case whereis(yuzu_gw_registry) of
-        undefined ->
-            start_fresh_registry(20);
-        Existing ->
-            case proc_lib:initial_call(Existing) of
-                {gen_server, init_it, _} ->
-                    %% Real registry from an earlier module — reuse it.
-                    ok;
-                _NotAGenServer ->
-                    catch unregister(yuzu_gw_registry),
-                    catch exit(Existing, kill),
-                    start_fresh_registry(20)
-            end
-    end.
-
-start_fresh_registry(Retries) ->
-    %% Trap exits for the duration of the start attempt(s). A
-    %% yuzu_gw_registry whose init/1 crashes on ets:new "table already
-    %% exists" is start_link-ed, so its EXIT signal would otherwise kill
-    %% this (the EUnit group) process before we ever see start_link's
-    %% {error, _} return. Trapping turns that EXIT into a drainable
-    %% message; we restore the flag once a registry is up.
-    Prev = process_flag(trap_exit, true),
-    Result = do_start_fresh_registry(Retries),
-    %% Drain any {'EXIT', _, _} left by failed start_link attempts so
-    %% the flag restore doesn't strand a signal in the mailbox.
-    drain_exits(),
-    process_flag(trap_exit, Prev),
-    Result.
-
-do_start_fresh_registry(Retries) when Retries =< 0 ->
-    %% Out of retries — surface the real failure rather than loop.
-    {ok, _} = yuzu_gw_registry:start_link(),
-    ok;
-do_start_fresh_registry(Retries) ->
-    %% Wait out any orphaned-but-not-yet-reaped registry that still owns
-    %% the named tables — once the tables are gone, start_link is clean.
-    _ = wait_until(fun() ->
-        ets:info(yuzu_gw_agents, size) =:= undefined andalso
-        ets:info(yuzu_gw_pending, size) =:= undefined
-    end, 1000),
-    case yuzu_gw_registry:start_link() of
-        {ok, _Pid} ->
-            ok;
-        {error, _Reason} ->
-            %% Orphan still alive — drain its EXIT, back off, retry.
-            drain_exits(),
-            timer:sleep(25),
-            do_start_fresh_registry(Retries - 1)
-    end.
-
-drain_exits() ->
-    receive {'EXIT', _, _} -> drain_exits()
-    after 0 -> ok
-    end.
 
 %%%===================================================================
 %%% Helpers — generic

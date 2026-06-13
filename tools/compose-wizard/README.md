@@ -15,7 +15,10 @@ This wizard walks you through a step-by-step configuration and generates a produ
 
 | Issue | Fix |
 |-------|-----|
-| Missing `--data-dir` flag | Always included — SQLite stores fail silently without it |
+| Missing PostgreSQL substrate | Wizard provisions a bundled `yuzu-postgres` service (or wires an external DSN) — the server has a substrate to talk to (ADR-0006/0008) |
+| Postgres superuser == app password | Bundled mode enforces two distinct credentials; the image's first-boot init refuses equal passwords |
+| Secrets baked into compose | Postgres credentials/DSN live in `.env`; the compose YAML only references `${...}` |
+| Missing `--data-dir` flag | Always included — still needed for config, OTA binaries, and not-yet-migrated SQLite stores |
 | RBAC config doesn't enforce | Comment added noting this is a known issue |
 | Port conflicts detected | Wizard warns about common conflicts |
 | Hardcoded passwords | All credentials configurable, with production warnings |

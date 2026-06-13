@@ -27,11 +27,28 @@
 set -euo pipefail
 
 ENV_FILE="/etc/yuzu/yuzu-server.env"
+DEFER_SENTINEL="/etc/yuzu/postgres-provisioning-deferred"
 DB_USER="${YUZU_DB_USER:-yuzu}"
 DB_NAME="${YUZU_DB_NAME:-yuzu}"
 SVC_USER="yuzu"
 SOFT_EXIT=0   # see header — becomes a hard failure once #1320 lands
 EXTERNAL_DSN=""
+
+# Root-baseline privilege drop to the postgres OS user. We already run as
+# root (enforced below; postinst/%post call us as root), so do NOT depend on
+# sudo — minimal hosts may not ship it (PR #1381 review, item 3). Prefer
+# util-linux runuser, fall back to su; sudo is the last resort (macOS has no
+# runuser, and Homebrew clusters usually run under the operator's own user —
+# those fail soft at the detection step regardless).
+run_as_postgres() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u postgres -- "$@"
+  elif command -v su >/dev/null 2>&1; then
+    su -s /bin/sh postgres -c "$(printf '%q ' "$@")"
+  else
+    sudo -u postgres "$@"
+  fi
+}
 
 usage() {
   echo "usage: $0 [--dsn <postgresql://...>]" >&2
@@ -75,6 +92,7 @@ write_env_file() {
 # ── Mode 1: external DSN — write and done ────────────────────────────────
 if [[ -n "$EXTERNAL_DSN" ]]; then
   write_env_file "$EXTERNAL_DSN"
+  rm -f "$DEFER_SENTINEL"
   exit 0
 fi
 
@@ -82,7 +100,7 @@ fi
 # Soft-detect a running local cluster: psql present + the postgres
 # superuser can connect over the local socket.
 if ! command -v psql >/dev/null 2>&1 \
-   || ! sudo -u postgres psql -At -c 'SELECT 1' >/dev/null 2>&1; then
+   || ! run_as_postgres psql -At -c 'SELECT 1' >/dev/null 2>&1; then
   echo "warn: no running local PostgreSQL found — skipping provisioning (non-fatal until #1320)." >&2
   echo "      Install one first, e.g.:" >&2
   echo "        Debian/Ubuntu:  apt-get install postgresql-16   (or distro default)" >&2
@@ -90,6 +108,13 @@ if ! command -v psql >/dev/null 2>&1 \
   echo "        macOS:          brew install postgresql@16 && brew services start postgresql@16" >&2
   echo "      then re-run this script, or point at a managed database with:" >&2
   echo "        $0 --dsn 'postgresql://...'" >&2
+  # Durable breadcrumb: the soft-skip is silent in package-install logs, and
+  # the server starts REQUIRING a DSN at the #1320 fail-closed flip. The
+  # sentinel gives that failure a findable cause (PR #1381 review, item 3).
+  install -d -m 0750 /etc/yuzu
+  printf 'deferred at %s: no running local PostgreSQL found.\nRe-run install-server-postgres.sh (or --dsn for a managed database); this file is removed on success.\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DEFER_SENTINEL"
+  echo "      (recorded in ${DEFER_SENTINEL})" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -103,7 +128,7 @@ fi
 # under `set -e` a failed query (cluster down, bad identifier) aborts the
 # script instead of masquerading as "role does not exist". psql variables
 # do not interpolate in -c strings, so the query comes via stdin.
-role_exists=$(sudo -u postgres psql -At -v ON_ERROR_STOP=1 \
+role_exists=$(run_as_postgres psql -At -v ON_ERROR_STOP=1 \
   -v yuzu_user="$DB_USER" <<'EOSQL'
 SELECT 1 FROM pg_roles WHERE rolname = :'yuzu_user'
 EOSQL
@@ -112,7 +137,7 @@ EOSQL
 DB_PASSWORD=""
 if [[ "$role_exists" != "1" ]]; then
   DB_PASSWORD="$(openssl rand -hex 24)"
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
+  run_as_postgres psql -v ON_ERROR_STOP=1 \
     -v yuzu_user="$DB_USER" -v yuzu_pass="$DB_PASSWORD" <<'EOSQL'
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'yuzu_user', :'yuzu_pass')
 \gexec
@@ -122,13 +147,13 @@ else
   echo "ok: role '${DB_USER}' already exists — password left unchanged"
 fi
 
-db_exists=$(sudo -u postgres psql -At -v ON_ERROR_STOP=1 \
+db_exists=$(run_as_postgres psql -At -v ON_ERROR_STOP=1 \
   -v yuzu_db="$DB_NAME" <<'EOSQL'
 SELECT 1 FROM pg_database WHERE datname = :'yuzu_db'
 EOSQL
 )
 if [[ "$db_exists" != "1" ]]; then
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
+  run_as_postgres psql -v ON_ERROR_STOP=1 \
     -v yuzu_db="$DB_NAME" -v yuzu_user="$DB_USER" <<'EOSQL'
 SELECT format('CREATE DATABASE %I OWNER %I', :'yuzu_db', :'yuzu_user')
 \gexec
@@ -141,7 +166,7 @@ fi
 # pgvector if available (the yuzu-postgres image always has it; a distro
 # cluster needs the postgresql-16-pgvector package). Non-fatal — only the
 # vuln-graph store (ADR-0004) needs it, and that lands later.
-if ! sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME" \
+if ! run_as_postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME" \
      -c 'CREATE EXTENSION IF NOT EXISTS vector' >/dev/null 2>&1; then
   echo "warn: pgvector extension unavailable — install postgresql-16-pgvector (or distro equivalent) before the vuln-graph store migrates" >&2
 fi
@@ -160,4 +185,5 @@ else
   fi
 fi
 
+rm -f "$DEFER_SENTINEL"
 echo "done. The systemd unit picks the DSN up via EnvironmentFile=${ENV_FILE} (server-side consumer: #1320)."

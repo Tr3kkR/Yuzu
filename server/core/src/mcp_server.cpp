@@ -3,6 +3,7 @@
 #include "mcp_policy.hpp"
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 
 #include <spdlog/spdlog.h>
 
@@ -158,7 +159,7 @@ struct ToolDef {
     const char* input_schema_json; // Pre-serialized JSON Schema
 };
 
-// All 23 Phase 1 read-only tools.
+// All 26 Phase 1 read-only tools.
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})"},
@@ -235,6 +236,59 @@ static const ToolDef kTools[] = {
      "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
      "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas catalog.",
      R"({"type":"object","properties":{}})"},
+
+    // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
+    {"list_dex_signals",
+     "List the DEX signal catalogue rollup: every observation type seen in the window with its "
+     "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate. Mirrors "
+     "GET /api/v1/dex/signals. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"}}})j"},
+
+    {"get_dex_signal_scope",
+     "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
+     "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
+     "GuaranteedState:Read.",
+     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
+
+    {"get_dex_signal_detail",
+     "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
+     "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
+     "audit-logged (dex.signal.view). Mirrors GET /api/v1/dex/signals/{obs_type}. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("obs_type":{"type":"string","description":"Catalogue key, e.g. process.crashed, os.boot (pattern [A-Za-z0-9._-]{1,64})"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
+     R"j(},"required":["obs_type"]})j"},
+
+    // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
+    {"get_dex_perf_fleet",
+     "Fleet device-performance now-stats: avg/p50/p90/max + reporting population for CPU "
+     "utilization %, memory commit %, and disk I/O latency (current heartbeat cycle — the same "
+     "numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab). A null "
+     "metric means no device reported it (absent, never zero). Mirrors GET /api/v1/dex/perf/fleet. "
+     "Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
+
+    {"get_dex_perf_cohorts",
+     "Fleet-relative performance percentiles per cohort of an operator-chosen tag key (e.g. "
+     "model, image). Cohorts under the statistical floor are suppressed=true with population "
+     "only; devices without the key form the explicit cohort=\"\" (untagged) residual. Mirrors "
+     "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
+
+    {"list_dex_perf_devices",
+     "The device list behind every fleet-performance drill: worst devices by a metric (default), "
+     "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
+     "cohort_value; empty value = untagged). Machine-health telemetry (device state, not "
+     "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
+     R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
+     R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500})j"
+     R"j(}})j"},
 
     // Phase 2 write tool
     {"execute_instruction",
@@ -318,6 +372,12 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
+    {"list_dex_signals", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
+    {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
+    {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
+    {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     // Implemented write tools
     {"set_tag", {"Tag", "Write"}},
     {"delete_tag", {"Tag", "Delete"}},
@@ -389,7 +449,8 @@ McpServer::HandlerFn McpServer::build_handler(
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
-    PublishCrlFn publish_crl_fn) {
+    PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
+    DexPerfFn dex_perf_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1634,6 +1695,294 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ─────────
+            // Window token resolved via the shared dex_window_to_days /
+            // dex_iso_since helpers so MCP, REST and the dashboard cannot drift
+            // on the window vocabulary. The rollup + scope are fleet aggregates
+            // (only the generic mcp.<tool> audit). The per-signal detail returns
+            // a most-affected DEVICES list (agent_ids — behavioral) and ALSO
+            // emits dex.signal.view (ObsType) so one SIEM filter catches the
+            // dashboard, REST and MCP behavioral-access surfaces alike.
+            if (tool_name == "list_dex_signals") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                JArr arr;
+                for (const auto& r : guaranteed_state_store->dex_signal_summary(since)) {
+                    arr.add(JObj()
+                                .add("obs_type", r.obs_type)
+                                .add("count", r.count)
+                                .add("distinct_devices", r.distinct_devices)
+                                .add("last_seen", r.last_seen));
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_signal_scope") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                JArr arr;
+                for (const auto& r : guaranteed_state_store->dex_os_signal_scope(since)) {
+                    arr.add(JObj()
+                                .add("platform", r.platform)
+                                .add("distinct_types", r.distinct_types)
+                                .add("total_events", r.total_events));
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_signal_detail") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string obs_type = param_str(args, "obs_type");
+                // Same catalogue-key validation as the REST sibling: [A-Za-z0-9._-]
+                // up to 64 chars. Reject before the audit so a malformed request
+                // leaves no trace of a behavioral view that never happened.
+                const bool ok =
+                    !obs_type.empty() && obs_type.size() <= 64 &&
+                    obs_type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                               "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                        std::string::npos;
+                if (!ok) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "obs_type must match [A-Za-z0-9._-]{1,64}"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                const int limit = std::clamp(param_int32(args, "limit", 50), 0, 500);
+                // Behavioral-PII access audit — the devices[] list below names the
+                // agent_ids exhibiting this signal. Same verb/target as the REST
+                // and dashboard per-signal views (cross-surface SIEM parity).
+                audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
+                         "DEX per-signal drill-down via MCP get_dex_signal_detail");
+
+                JArr subjects;
+                for (const auto& s :
+                     guaranteed_state_store->dex_signal_subjects(obs_type, since, limit)) {
+                    subjects.add(JObj()
+                                     .add("subject", s.subject)
+                                     .add("count", s.count)
+                                     .add("distinct_devices", s.distinct_devices)
+                                     .add("last_seen", s.last_seen));
+                }
+                JArr by_os;
+                for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                    // DexOsCrashCount.crashes carries the generic event count here.
+                    by_os.add(JObj()
+                                  .add("platform", o.platform)
+                                  .add("count", o.crashes)
+                                  .add("distinct_devices", o.distinct_devices));
+                }
+                JArr devices;
+                for (const auto& d :
+                     guaranteed_state_store->dex_signal_devices(obs_type, since, limit)) {
+                    devices.add(JObj()
+                                    .add("agent_id", d.agent_id)
+                                    .add("count", d.crashes)
+                                    .add("last_seen", d.last_seen));
+                }
+                JArr by_day;
+                for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
+                    by_day.add(JObj().add("day", d.day).add("count", d.crashes));
+                }
+                auto payload = JObj()
+                                   .add("obs_type", obs_type)
+                                   .raw("subjects", subjects.str())
+                                   .raw("by_os", by_os.str())
+                                   .raw("devices", devices.str())
+                                   .raw("by_day", by_day.str())
+                                   .str();
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── F2a: DEX fleet performance tools (parity with /api/v1/dex/perf/*) ──
+            // Same DexPerfFn provider the REST endpoints and the /dex
+            // Performance fragments use — three surfaces, one read model.
+            // Aggregates + machine-health telemetry: only the generic
+            // mcp.<tool> audit (the behavioral DEX surfaces keep their
+            // dedicated audit verbs).
+            if (tool_name == "get_dex_perf_fleet" || tool_name == "get_dex_perf_cohorts" ||
+                tool_name == "list_dex_perf_devices") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!dex_perf_fn) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Fleet perf provider unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto stat_json = [](const std::optional<DexPerfStat>& s) -> std::string {
+                    if (!s)
+                        return "null"; // absent-not-zero
+                    return JObj()
+                        .add("avg", s->avg)
+                        .add("p50", s->p50)
+                        .add("p90", s->p90)
+                        .add("max", s->max)
+                        .add("n", s->n)
+                        .str();
+                };
+                std::string payload;
+                if (tool_name == "get_dex_perf_fleet") {
+                    const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                    payload = JObj()
+                                  .raw("cpu_pct", stat_json(now.cpu))
+                                  .raw("commit_pct", stat_json(now.commit))
+                                  .raw("disk_lat_ms", stat_json(now.disk_lat))
+                                  .add("reporting", now.reporting)
+                                  .add("windows_online", now.windows_online)
+                                  .str();
+                } else if (tool_name == "get_dex_perf_cohorts") {
+                    const auto key = param_str(args, "key", kDexDefaultCohortKey);
+                    if (!TagStore::validate_key(key)) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid tag key"),
+                                        "application/json");
+                        return;
+                    }
+                    const auto snap = dex_perf_fn(key);
+                    JArr rows;
+                    for (const auto& c : dex_perf_cohorts(snap)) {
+                        JObj o;
+                        o.add("cohort", c.cohort)
+                            .add("devices", c.devices)
+                            .add("suppressed", c.suppressed);
+                        if (!c.suppressed) {
+                            o.raw("cpu_pct", stat_json(c.cpu))
+                                .raw("commit_pct", stat_json(c.commit))
+                                .raw("disk_lat_ms", stat_json(c.disk_lat));
+                        }
+                        rows.add(o);
+                    }
+                    JArr keys;
+                    for (const auto& k : snap.available_keys)
+                        keys.add(k);
+                    payload = JObj()
+                                  .add("key", key)
+                                  .add("floor", kDexCohortFloor)
+                                  .raw("cohorts", rows.str())
+                                  .raw("available_keys", keys.str())
+                                  .str();
+                } else { // list_dex_perf_devices
+                    const auto metric =
+                        dex_perf_metric_from_token(param_str(args, "metric", "cpu"));
+                    const bool not_reporting = param_str(args, "filter") == "not_reporting";
+                    // Grill fix (parity with REST/fragment): key always resolves
+                    // (default "model"); filtering only when cohort_value given.
+                    std::string cohort_key = param_str(args, "cohort_key", kDexDefaultCohortKey);
+                    if (!TagStore::validate_key(cohort_key)) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid cohort_key"),
+                                        "application/json");
+                        return;
+                    }
+                    std::optional<std::string> cohort_filter;
+                    if (args.contains("cohort_value") && args["cohort_value"].is_string())
+                        cohort_filter = args["cohort_value"].get<std::string>();
+                    // C-S4: the REST sibling 400s on limit <= 0 — a tool that
+                    // claims to "mirror" it must not silently clamp to 1.
+                    const int raw_limit = param_int32(args, "limit", 50);
+                    if (raw_limit <= 0) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid limit"),
+                                        "application/json");
+                        return;
+                    }
+                    const int limit = (std::min)(raw_limit, 500);
+                    JArr arr;
+                    for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
+                                                              not_reporting, cohort_filter,
+                                                              limit)) {
+                        JObj o;
+                        o.add("agent_id", r.agent_id).add("cohort", r.cohort);
+                        if (r.cpu_pct)
+                            o.add("cpu_pct", *r.cpu_pct);
+                        if (r.commit_pct)
+                            o.add("commit_pct", *r.commit_pct);
+                        if (r.disk_lat_ms)
+                            o.add("disk_lat_ms", *r.disk_lat_ms);
+                        if (r.fleet_pctile >= 0)
+                            o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                        arr.add(o);
+                    }
+                    payload = arr.str();
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── execute_instruction ───────────────────────────────────────
             // Tier check handled by generic C8 block above (kToolSecurity).
             if (tool_name == "execute_instruction") {
@@ -1870,7 +2219,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                      {"issued_at", r.issued_at},
                                      {"revoked_at", r.revoked_at},
                                      {"revocation_reason", r.revocation_reason},
-                                     {"issued_by", r.issued_by}});
+                                     {"issued_by", r.issued_by},
+                                     // #1296: stable key-based CA identity (see
+                                     // ca_routes /ca/issued). Empty on pre-v5 rows.
+                                     {"issuer_key_id", r.issuer_key_id}});
                 }
                 nlohmann::json payload = {{"items", std::move(items)},
                                           {"count", records.size()},
@@ -1996,14 +2348,17 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine, const bool& read_only_mode,
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
-                                PublishCrlFn publish_crl_fn) {
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store,
+                                DexPerfFn dex_perf_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
                            response_store, audit_store, tag_store, inventory_store, policy_store,
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
                            mcp_disabled, std::move(dispatch_fn), ca_store,
-                           std::move(publish_crl_fn)));
+                           std::move(publish_crl_fn), guaranteed_state_store,
+                           std::move(dex_perf_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

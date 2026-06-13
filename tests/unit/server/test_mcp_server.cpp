@@ -552,6 +552,17 @@ struct McpTestServer {
     bool crl_publish_succeeds_{true};
     int crl_publish_calls_{0};
 
+    /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
+    /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
+    /// exercised. Default nullptr keeps every existing test on the no-store path
+    /// (tools report "Guaranteed State store unavailable").
+    yuzu::server::GuaranteedStateStore* guaranteed_state_store_for_test{nullptr};
+
+    /// F2a: optionally wire a fleet-perf snapshot provider so the perf tools
+    /// (get_dex_perf_fleet / get_dex_perf_cohorts / list_dex_perf_devices) can
+    /// be exercised. Default empty keeps existing tests on the unavailable path.
+    yuzu::server::DexPerfFn dex_perf_fn_for_test{};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
@@ -656,7 +667,9 @@ private:
                 if (!crl_publish_succeeds_)
                     return std::nullopt;
                 return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
-            });
+            },
+            /*guaranteed_state_store=*/guaranteed_state_store_for_test,
+            /*dex_perf_fn=*/dex_perf_fn_for_test);
     }
 };
 
@@ -704,7 +717,7 @@ TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
     CHECK(body["result"].empty()); // {}
 }
 
-// ── 3. tools/list — verify 23 tools ─────────────────────────────────────────
+// ── 3. tools/list — verify the advertised tool set ──────────────────────────
 
 TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integration]") {
     McpTestServer ts;
@@ -741,9 +754,10 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
 
     // Spot-check specific tool names are present
     std::vector<std::string> expected_names = {
-        "list_agents",      "get_agent_details",     "query_audit_log",
-        "list_definitions", "get_definition",        "query_responses",
-        "validate_scope",   "preview_scope_targets", "list_pending_approvals"};
+        "list_agents",       "get_agent_details",     "query_audit_log",
+        "list_definitions",  "get_definition",        "query_responses",
+        "validate_scope",    "preview_scope_targets", "list_pending_approvals",
+        "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail"};
     for (const auto& name : expected_names) {
         bool found = false;
         for (const auto& tool : tools) {
@@ -834,6 +848,263 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
+// The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
+// per-OS scope are fleet aggregates (only the generic mcp.<tool> tool-call audit
+// fires); the per-signal detail returns a most-affected DEVICES list (agent_ids
+// — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
+// catches the dashboard, REST and MCP behavioral-access surfaces alike.
+
+// Seed one ruleless DEX observation (the __observation__ projection the DEX
+// aggregations read) — subject + platform land in detail_json.
+static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
+                         const std::string& agent, const std::string& obs_type,
+                         const std::string& subject, const std::string& platform,
+                         const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = obs_type;
+    e.severity = "info";
+    e.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + platform + "\"}";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":40,"params":{"name":"list_dex_signals","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    bool found = false;
+    for (const auto& r : rows) {
+        if (r["obs_type"] == "process.crashed") {
+            CHECK(r["count"].get<int>() == 2);
+            CHECK(r["distinct_devices"].get<int>() == 2);
+            found = true;
+        }
+    }
+    CHECK(found);
+    // Fleet aggregate — only the generic tool-call audit, never dex.signal.view.
+    CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "o3", "MB-1", "storage.low", "disk", "macos", "2026-06-10T12:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":41,"params":{"name":"get_dex_signal_scope","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    int macos_types = -1;
+    for (const auto& r : rows)
+        if (r["platform"] == "macos")
+            macos_types = r["distinct_types"].get<int>();
+    CHECK(macos_types == 2); // process.crashed + storage.low
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":42,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["obs_type"] == "process.crashed");
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2); // WS-1 + WS-2
+    REQUIRE(payload["subjects"].is_array());
+    CHECK(payload["subjects"][0]["subject"] == "chrome.exe");
+
+    // Behavioral access → dex.signal.view fired, THEN the generic tool-call audit
+    // (same dual-audit convention as revoke_certificate).
+    REQUIRE(ts.audit_log.size() >= 2);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.signal.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":43,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"foo!bar"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // Validation precedes the audit — no dex.signal.view for a view that never ran.
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":44,"params":{"name":"list_dex_signals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+// ── F2a: DEX fleet-perf tools ────────────────────────────────────────────────
+
+namespace {
+/// Two cohorts: "a" above the 10-device floor (12 devices), "b" below (4).
+yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
+    yuzu::server::DexPerfSnapshot snap;
+    snap.cohort_key = key;
+    snap.available_keys = {"model"};
+    auto dev = [](std::string id, double cpu, const char* cohort) {
+        yuzu::server::DexPerfDevice d;
+        d.agent_id = std::move(id);
+        d.is_windows = true;
+        d.cpu_pct = cpu;
+        d.commit_pct = 50.0;
+        d.disk_lat_ms = 1.0;
+        d.cohort = cohort;
+        return d;
+    };
+    for (int i = 0; i < 12; ++i)
+        snap.devices.push_back(dev("a-" + std::to_string(i), 10.0 + i, "a"));
+    for (int i = 0; i < 4; ++i)
+        snap.devices.push_back(dev("b-" + std::to_string(i), 40.0 + i, "b"));
+    return snap;
+}
+/// The MCP result rides as JSON text inside result.content[0].text.
+nlohmann::json mcp_tool_payload(const std::string& body) {
+    auto j = nlohmann::json::parse(body);
+    REQUIRE(j.contains("result"));
+    return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+}
+} // namespace
+
+TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":50,"params":{"name":"get_dex_perf_fleet","arguments":{}}})")
+            ->body);
+    CHECK(fleet["cpu_pct"]["n"] == 16);
+    CHECK(fleet["reporting"] == 16);
+    CHECK(fleet["windows_online"] == 16);
+
+    auto cohorts = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})")
+            ->body);
+    CHECK(cohorts["floor"] == 10);
+    REQUIRE(cohorts["cohorts"].size() == 2);
+    CHECK(cohorts["cohorts"][0]["cohort"] == "a");
+    CHECK(cohorts["cohorts"][0]["suppressed"] == false);
+    CHECK(cohorts["cohorts"][1]["suppressed"] == true); // sub-floor: population only
+    CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
+}
+
+TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    // cohort_key alone resolves display, never filters (the grill fix).
+    auto all = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
+            ->body);
+    CHECK(all.size() == 16);
+
+    // cohort_value present-but-empty = the untagged residual (none here).
+    auto untagged = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":53,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model","cohort_value":""}}})")
+            ->body);
+    CHECK(untagged.empty());
+
+    // C-S4 parity: the REST sibling 400s on limit<=0 — MCP must not clamp to 1.
+    auto bad = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":54,"params":{"name":"list_dex_perf_devices","arguments":{"limit":0}}})")
+            ->body);
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // Invalid cohort key → kInvalidParams (REST 400 parity).
+    auto badkey = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":55,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"not a key!"}}})")
+            ->body);
+    REQUIRE(badkey.contains("error"));
+    CHECK(badkey["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts; // dex_perf_fn_for_test stays empty
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":56,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 // ── 5. tools/call with unknown tool — kMethodNotFound ───────────────────────

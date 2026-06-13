@@ -139,7 +139,8 @@ header .subtitle {
 }
 
 .field input[type="text"],
-.field input[type="number"] {
+.field input[type="number"],
+.field select {
   width: 100%;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);
@@ -150,10 +151,26 @@ header .subtitle {
   transition: border 0.2s;
 }
 
-.field input:focus {
+.field input:focus,
+.field select:focus {
   outline: none;
   border-color: var(--yuzu-orange);
   box-shadow: 0 0 0 3px var(--yuzu-orange-light);
+}
+
+/* Input + inline action button (e.g. the secret generators) */
+.input-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.input-row input[type="text"] {
+  flex: 1;
+}
+
+.input-row .btn {
+  white-space: nowrap;
 }
 
 .field label input[type="checkbox"] {

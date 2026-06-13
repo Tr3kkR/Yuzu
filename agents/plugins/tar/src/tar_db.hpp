@@ -86,6 +86,32 @@ struct UserEvent {
     std::string session_id;
 };
 
+/// One perf_live row (BRD A1 — continuous device performance sampling).
+struct PerfRow {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    double cpu_pct{0.0};
+    double mem_used_pct{0.0};
+    double commit_pct{0.0};
+    int64_t disk_read_bps{0};
+    int64_t disk_write_bps{0};
+    int64_t disk_read_lat_us{0};
+    int64_t disk_write_lat_us{0};
+    int64_t net_rx_bps{0};
+    int64_t net_tx_bps{0};
+};
+
+/// One procperf_live row (BRD A2 — top-N per-application samples). One row
+/// per (tick, app); `name` is the image name only (never a command line).
+struct ProcPerfRow {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string name;
+    int instances{0};
+    double cpu_pct{0.0};
+    int64_t ws_bytes{0};
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -164,6 +190,8 @@ public:
     bool insert_network_events(const std::vector<NetworkEvent>& events);
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
+    bool insert_perf_sample(const PerfRow& row);
+    bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
 
     /**
      * Return one row per unique (proto, local_addr, local_port, remote_addr,

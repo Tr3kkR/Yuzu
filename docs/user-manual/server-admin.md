@@ -18,11 +18,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Data Storage and Encryption](#data-storage-and-encryption)
-13. [Retention Settings](#retention-settings)
-14. [Settings API Reference](#settings-api-reference)
-15. [Deployment](#deployment)
-16. [Windows Service Installation](#windows-service-installation)
-17. [Planned Features](#planned-features)
+13. [PostgreSQL Substrate](#postgresql-substrate)
+14. [Retention Settings](#retention-settings)
+15. [Settings API Reference](#settings-api-reference)
+16. [Deployment](#deployment)
+17. [Windows Service Installation](#windows-service-installation)
+18. [Planned Features](#planned-features)
 
 ---
 
@@ -57,7 +58,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
-| `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
+| `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
 | `--csp-extra-sources` | *(none)* | Extra Content-Security-Policy source-list entries appended to `script-src`, `style-src`, `connect-src`, and `img-src`. Space-separated string of host/scheme expressions or whitelisted CSP keywords (`'self'`, `'none'`, `'sha256-...'`, `'sha384-...'`, `'sha512-...'`, `'nonce-...'`). The server **refuses to start** if the value contains control bytes, semicolons, commas, or unsafe CSP keywords like `'unsafe-eval'`. Use to whitelist customer CDNs, monitoring beacons, or analytics endpoints. See [HTTP Security Response Headers](security-hardening.md#http-security-response-headers). Env: `YUZU_CSP_EXTRA_SOURCES`. |
 | `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. |
@@ -128,7 +129,7 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
@@ -166,6 +167,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
+
+This release adds per-application resource sampling (top-N processes by CPU and
+working set, by image name) to the TAR edge warehouse. **It is off by default**
+(`procperf_enabled=false`) and collects nothing until an operator opts in — it
+is a distinct, usage-class telemetry category subject to works-council / DPA
+review, separate from the device-level performance sampling (`perf_enabled`,
+on by default, no per-app identity) that shipped in the prior release. To
+enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
+instruction (fleet-wide or per-device). The data is image names only (no
+command lines), 7-day raw / 31-day hourly retention, and is captured in the
+Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.
+TAR warehouse tables are now also created on every database open, so upgraded
+agents need no manual table-creation step. New webhook egress: the `dex.signal`
+event (operator-routed signals) — see the security questionnaire note in the
+assurance package if you answer data-egress questions.
 
 ### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
 
@@ -343,6 +361,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
+| DEX Alerts | `/fragments/settings/dex-alerts` | Route individual DEX signal types to operator notifications and the `dex.signal` webhook, tune the fleet blast-radius thresholds (min devices / window / cooldown), and set the per-cohort Prometheus gauge **export tag key**. Admin-only; changes apply live (no restart) and are audit-logged (`settings.dex_alerts.routing`, `settings.dex_alerts.blast`, `settings.dex_alerts.cohort_export`). See the user-manual *DEX → Routing signals to alerts* and *DEX → Fleet performance rollup* sections. |
 
 ### Revoking an agent certificate from the dashboard
 
@@ -790,6 +809,79 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 
 ---
 
+## PostgreSQL Substrate
+
+The server's storage substrate is moving from SQLite to **PostgreSQL** (ADR-0006; the agent stays SQLite). Today the database is **inert-but-ready**: the bundled containers, the provisioning helper, and the backup procedure below all exist so that deployments are Postgres-ready *before* the release that makes the server require a DSN at boot (#1320 — a **breaking** change; the CHANGELOG entry for that release will say so explicitly).
+
+### Provisioning a native (non-container) install
+
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+
+| Install method | Helper location | Invocation |
+|---|---|---|
+| `.deb` / `.rpm` | `/usr/share/yuzu/scripts/install-server-postgres.sh` | Run automatically (non-fatally) by the package post-install hook |
+| Release tarball | `scripts/install-server-postgres.sh` inside the archive | Run manually as root after unpacking |
+| Git checkout | `scripts/install-server-postgres.sh` | Run manually as root |
+
+Two modes:
+
+```bash
+# Mode 1 — external/managed Postgres: writes the DSN to
+# /etc/yuzu/yuzu-server.env (0600), which the systemd unit loads
+# via EnvironmentFile=. No local Postgres is touched.
+sudo bash install-server-postgres.sh --dsn 'postgresql://yuzu:...@db.example.com:5432/yuzu'
+
+# Mode 2 (default) — local Postgres: provisions the app role + database
+# on an already-installed local PostgreSQL 16+ and writes the DSN env file.
+# Idempotent — never clobbers an existing role, database, or env file.
+sudo bash install-server-postgres.sh
+```
+
+The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008).
+
+### Backing up PostgreSQL state
+
+The SQLite backup guidance in [Configuration Files](#configuration-files) continues to apply while stores migrate incrementally — during the transition, a complete backup covers **both** the remaining SQLite stores **and** the Postgres database.
+
+Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies).
+
+**Native installs** — the DSN lives only in the root-only systemd environment file (`/etc/yuzu/yuzu-server.env`), **not** in interactive shells, so load it first. Then split the password out so it rides the `PGPASSWORD` environment variable instead of the process argv (`/proc/<pid>/cmdline` is world-readable, and the command lands in shell history):
+
+```bash
+# Run as root. Assumes the standard helper-written DSN shape
+# scheme://user:password@host:port/db.
+. /etc/yuzu/yuzu-server.env
+export PGPASSWORD="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^[a-z]+://[^:/@]*:([^@]*)@.*$!\1!')"
+DSN_NOPASS="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^([a-z]+://[^:/@]*):[^@]*@!\1@!')"
+
+pg_dump --format=custom --file="yuzu-pg-$(date +%F).dump" "$DSN_NOPASS"
+```
+
+**Docker Compose** (reference template — superuser peer auth inside the container; no credential on the host command line):
+
+```bash
+docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+  > "yuzu-pg-$(date +%F).dump"
+```
+
+Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
+
+```bash
+# Native — same env-file + PGPASSWORD/DSN_NOPASS preamble as the backup recipe
+pg_restore --clean --if-exists --no-owner --role=yuzu \
+  --dbname="$DSN_NOPASS" "yuzu-pg-YYYY-MM-DD.dump"
+
+# Docker Compose
+docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+  --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
+```
+
+Schedule the dump alongside the existing SQLite/cert-dir backups; verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
+
+> **The restore-pairing invariant (ADR-0010 — forward reference).** Once envelope-encrypted secrets land (ADR-0010), `pg_dump` output and volume snapshots will contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching `KeyProvider` keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and treat the KEK file like the CA root key (separate, offline copy). The restore-verification drill must restore both halves and confirm a clean fingerprint check at boot. The full key-management runbook (rotation, DR drill) is tracked in #1341. Plan your backup automation for this pairing **now** so the secrets migration doesn't invalidate your procedure.
+
+---
+
 ## Retention Settings
 
 The server applies retention policies to stored data to manage disk usage. Retention values are set via CLI flags at startup.
@@ -890,6 +982,35 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
+
+### DEX Alerts
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration fragment (HTMX). Admin-only. |
+| `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+| `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, 10-device floor, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
+
+**New `runtime_config` keys.** All are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dex_alert_routing` | JSON array string | `[]` | DEX `obs_type` strings routed to operator notifications + the `dex.signal` webhook. Empty = nothing routed. |
+| `dex_blast_min_devices` | integer string | `5` | Blast-radius minimum distinct-device threshold. Clamped `[2, 100000]`. |
+| `dex_blast_window_seconds` | integer string | `900` | Blast-radius detection window (seconds). Clamped `[60, 86400]`. |
+| `dex_blast_cooldown_seconds` | integer string | `3600` | Blast-radius per-incident re-alert cooldown (seconds). Clamped `[0, 604800]`. |
+| `dex_cohort_export_key` | tag-key string | *(empty)* | Tag key whose cohorts export as `yuzu_fleet_perf_cohort_*` Prometheus gauges. Empty = export disabled. Invalid stored values disable the export (fail closed). |
+
+**New audit actions.**
+
+| Action | Emitted when |
+|---|---|
+| `settings.dex_alerts.routing` | An admin changes the routed signal-type list. Detail records the full new routed set (the runtime-config store keeps no history, so this row is the change-management evidence). |
+| `settings.dex_alerts.blast` | An admin changes the blast-radius thresholds (detail records the new min/window/cooldown). |
+| `settings.dex_alerts.cohort_export` | An admin sets or clears the cohort metrics export tag key (detail records the new key, or "export disabled"). |
+| `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
+| `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
 ---
 

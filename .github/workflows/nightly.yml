@@ -40,9 +40,10 @@ jobs:
     # is a forced cold-cache rebuild every run because per-instrumentation
     # vcpkg packages can't be safely shared with the standard triplet — so
     # the ASan job rebuilds the full dep tree from source on every nightly.
-    # On the small cloud runner (scw-eager-lumiere) that step alone runs
-    # 60+ minutes and routinely blows the 60-min job timeout. Shulgi
-    # (16-core 5950X) clears the same workload in ~15 min. TSan and
+    # On a small cloud runner that step alone runs 60+ minutes and
+    # routinely blows the 60-min job timeout; this is why the Linux legs
+    # pin Shulgi (16-core 5950X), which clears the same workload in
+    # ~15 min. TSan and
     # Coverage share the warm x64-linux triplet cache so they don't need
     # pinning and keep the runner pool flexible.
     runs-on: [self-hosted, Linux, X64, yuzu-shulgi]
@@ -67,7 +68,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -143,7 +144,8 @@ jobs:
       # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
       # Idempotent persistent `yuzu-ci-postgres` docker container on
       # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
-      # runner. Non-fatal until #1320 ships the first consumer.
+      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
+      # fails the job here, before the test step.
       - name: Ensure Postgres 16 (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
@@ -172,9 +174,9 @@ jobs:
     # ASan job: the TSan triplet (x64-linux-tsan, issue #917) is a forced
     # cold-cache rebuild every run because per-instrumentation vcpkg
     # packages can't be safely shared with the standard or ASan triplets.
-    # On scw-eager-lumiere (small Scaleway VM) the from-source dep-tree
-    # rebuild blows the 60-min job timeout; Shulgi (16-core 5950X) clears
-    # the same workload in ~15 min.
+    # On a small cloud VM the from-source dep-tree rebuild blows the
+    # 60-min job timeout; Shulgi (16-core 5950X) clears the same workload
+    # in ~15 min, which is why this leg pins yuzu-shulgi.
     runs-on: [self-hosted, Linux, X64, yuzu-shulgi]
     timeout-minutes: 60
     env:
@@ -192,7 +194,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -425,7 +427,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false

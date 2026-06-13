@@ -95,7 +95,7 @@ jobs:
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: Probe runner health
@@ -115,7 +115,7 @@ jobs:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+  #     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -135,7 +135,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
@@ -200,7 +200,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
@@ -340,7 +340,8 @@ jobs:
       # self-hosted runner the script idempotently (re)uses a persistent
       # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
       # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
-      # no per-run install. Non-fatal until #1320 ships the first consumer.
+      # no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1): a missing
+      # Postgres fails the job here, before the test step.
       - name: Ensure Postgres 16 (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
@@ -442,7 +443,7 @@ jobs:
             rm -rf "$GITHUB_WORKSPACE/build-windows"
           fi
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
@@ -584,8 +585,8 @@ jobs:
       # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
       # see docs/ci-architecture.md "Postgres for server tests"), or a
       # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
-      # 127.0.0.1:5432 and exports the DSN; warns (non-fatal until #1320)
-      # when nothing is listening.
+      # 127.0.0.1:5432 and exports the DSN; required since #1320 PR 1
+      # (SOFT_EXIT=1) — nothing listening fails the job at this step.
       #
       # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
       # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
@@ -642,7 +643,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -752,8 +753,8 @@ jobs:
       # macOS runners have no docker; the script brew-installs
       # postgresql@16 (bottle, ~1 min), boots a throwaway trust-auth
       # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports
-      # YUZU_TEST_POSTGRES_DSN. Non-fatal until #1320 ships the first
-      # consumer.
+      # YUZU_TEST_POSTGRES_DSN. Required since #1320 PR 1 (SOFT_EXIT=1) — a
+      # missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres 16 (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
@@ -820,7 +821,7 @@ jobs:
     outputs:
       workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -860,7 +861,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false

@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "custom_properties_store.hpp"
+#include "dex_perf_rules.hpp"
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
 #include "tag_store.hpp"
@@ -488,6 +492,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.processors", "Installed CPUs with model, cores, threads, clock speed"},
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
+        {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},
@@ -523,6 +528,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"registry.enumerate_keys", "List subkeys under a registry key"},
         {"registry.enumerate_values", "List values in a registry key"},
         {"registry.get_user_value", "Get a registry value for a specific user SID"},
+        // rdp_control
+        {"rdp_control.set_state",
+         "Enable or disable Remote Desktop (registry + firewall group + TermService)"},
+        {"rdp_control.status",
+         "Remote Desktop posture: registry, firewall group, service, derived rdp on/off"},
         // filesystem
         {"filesystem.exists", "Check if a path exists, report type and size"},
         {"filesystem.list_dir", "List directory contents (max 1000 entries)"},
@@ -560,6 +570,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // netstat
         {"netstat.netstat_list",
          "Active TCP/UDP connections and listening sockets with owning PID"},
+        // netprobe
+        {"netprobe.icmp", "ICMP round-trip time, jitter, and loss to targets"},
+        {"netprobe.tcp", "TCP connect-time RTT, jitter, and loss to targets (default port 443)"},
+        {"netprobe.dns", "DNS resolution timing per name"},
         // device_identity
         {"device_identity.device_name", "Machine hostname"},
         {"device_identity.domain", "DNS/AD domain and join status"},
@@ -658,6 +672,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"tar.configure", "Update TAR collection intervals and retention settings"},
         {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
         {"tar.collect_slow", "Run slow collectors (services + users + installed apps)"},
+        {"tar.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
     };
     return m;
 }
@@ -1193,6 +1208,31 @@ void AgentHealthStore::remove(const std::string& agent_id) {
     snapshots_.erase(agent_id);
 }
 
+std::vector<AgentHealthSnapshot>
+AgentHealthStore::perf_snapshot(std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<AgentHealthSnapshot> out;
+    out.reserve(snapshots_.size());
+    for (const auto& [id, snap] : snapshots_) {
+        if ((now - snap.last_seen) > staleness)
+            continue; // same staleness contract recompute_metrics prunes by
+        // Copy ONLY the perf tags (G3 performance S1): the full status_tags
+        // map is ~12 entries × 2 strings per agent, and this copy runs under
+        // the SAME mutex every heartbeat upsert needs — at 10k agents a full
+        // deep copy stalls the heartbeat path for tens of milliseconds.
+        AgentHealthSnapshot s;
+        s.agent_id = snap.agent_id;
+        s.last_seen = snap.last_seen;
+        for (const char* k : {kPerfTagCpuPct, kPerfTagCommitPct, kPerfTagDiskLatMs}) {
+            if (auto it = snap.status_tags.find(k); it != snap.status_tags.end())
+                s.status_tags.emplace(it->first, it->second);
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);
@@ -1206,6 +1246,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
+    // A4 perf families cleared too: when no agent reports a metric this cycle
+    // the series go ABSENT, never a fabricated/stale 0 (the no-mock-data rule).
+    metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1213,6 +1258,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, int> version_counts;
     double total_commands = 0.0;
     int healthy_count = 0;
+    int dex_observer_disarmed = 0;
+    double total_dex_observed = 0.0;
+    // A4: per-agent device-utilization samples from the heartbeat perf tags.
+    std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
+    // C-S2: the reporting population counts agents contributing ANY of the
+    // three metrics — the same reports_any definition DexPerfFleetNow uses,
+    // so the gauge and the Performance tab's Reporting card agree.
+    int perf_reporting = 0;
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1234,15 +1287,56 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!ver_val.empty())
             version_counts[ver_val]++;
 
-        auto cmd_val = get("yuzu.commands_executed");
-        if (!cmd_val.empty()) {
+        // std::stod does NOT throw on "inf"/"nan" — it returns the non-finite value,
+        // which a single (rogue/buggy) agent could use to poison a fleet-wide gauge for
+        // every operator until it ages out. Accept only finite, non-negative counts.
+        auto add_finite_count = [](double& acc, const std::string& s) {
             try {
-                total_commands += std::stod(cmd_val);
+                double v = std::stod(s);
+                if (std::isfinite(v) && v >= 0.0)
+                    acc += v;
             } catch (...) {}
+        };
+
+        auto cmd_val = get("yuzu.commands_executed");
+        if (!cmd_val.empty())
+            add_finite_count(total_commands, cmd_val);
+
+        // DEX signal observer: a Windows agent (DEX enabled) reporting "0" failed to
+        // arm (or a channel went deaf at runtime). The tag is only emitted by such
+        // agents (see agent heartbeat), so absent / other values are correctly not
+        // counted as a fault.
+        if (get("yuzu.dex_observer_armed") == "0")
+            ++dex_observer_disarmed;
+
+        auto dex_val = get("yuzu.dex_observed");
+        if (!dex_val.empty())
+            add_finite_count(total_dex_observed, dex_val);
+
+        // A4 perf tags — validation rules live in dex_perf_rules.hpp, SHARED
+        // with the F2a /dex Performance read model so the Prometheus gauges
+        // and the in-product view can never disagree on the same sample.
+        bool perf_reported_any = false;
+        if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct))) {
+            perf_cpu.push_back(*v);
+            perf_reported_any = true;
         }
+        if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct))) {
+            perf_commit.push_back(*v);
+            perf_reported_any = true;
+        }
+        if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs))) {
+            perf_disk_lat.push_back(*v);
+            perf_reported_any = true;
+        }
+        if (perf_reported_any)
+            ++perf_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
+    metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
+        .set(static_cast<double>(dex_observer_disarmed));
+    metrics.gauge("yuzu_fleet_dex_observed_total").set(total_dex_observed);
 
     for (const auto& [os, count] : os_counts) {
         metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));
@@ -1256,6 +1350,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             .set(static_cast<double>(count));
     }
     metrics.gauge("yuzu_fleet_commands_executed_total").set(total_commands);
+
+    // A4 fleet perf rollup: avg + nearest-rank p50/p90 + max per metric, with a
+    // {stat} label (the summary-quantile idiom). The families were cleared above,
+    // so a metric nobody reported is ABSENT this cycle — Prometheus consumers see
+    // a gap, not a fake zero. `yuzu_fleet_perf_reporting` carries the population
+    // size so an "avg" over 3 devices is never misread as fleet-wide.
+    auto set_stats = [&](const char* family, std::vector<double>& vals) {
+        if (vals.empty())
+            return;
+        std::sort(vals.begin(), vals.end());
+        const auto n = vals.size();
+        double sum = 0.0;
+        for (double v : vals)
+            sum += v;
+        metrics.gauge(family, {{"stat", "avg"}}).set(sum / static_cast<double>(n));
+        metrics.gauge(family, {{"stat", "p50"}}).set(nearest_rank(vals, 0.50));
+        metrics.gauge(family, {{"stat", "p90"}}).set(nearest_rank(vals, 0.90));
+        metrics.gauge(family, {{"stat", "max"}}).set(vals.back());
+    };
+    metrics.gauge("yuzu_fleet_perf_reporting").set(static_cast<double>(perf_reporting));
+    set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
+    set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
+    set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
 }
 
 } // namespace yuzu::server::detail

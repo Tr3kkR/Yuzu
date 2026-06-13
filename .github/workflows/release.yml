@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -159,6 +159,11 @@ jobs:
 
           # Plugin shared libraries
           find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
+
+          # Postgres provisioning helper (ADR-0006, #1320) — tarball installs
+          # run it manually; .deb/.rpm invoke it from their post-install hooks.
+          mkdir -p "${STAGING}/scripts"
+          cp scripts/install-server-postgres.sh "${STAGING}/scripts/"
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
@@ -274,7 +279,7 @@ jobs:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
@@ -447,7 +452,7 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -740,7 +745,7 @@ jobs:
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -956,6 +961,11 @@ jobs:
           # Plugin dylibs
           find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
 
+          # Postgres provisioning helper (ADR-0006, #1320) — tarball installs
+          # run it manually (script's local mode covers Homebrew postgresql@16).
+          mkdir -p "${STAGING}/scripts"
+          cp scripts/install-server-postgres.sh "${STAGING}/scripts/"
+
           tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
 
       - name: Build macOS installer (.pkg)
@@ -1081,7 +1091,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1263,7 +1273,7 @@ jobs:
       attestations: write    # actions/attest-build-provenance
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1469,7 +1479,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.agent.chisel
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1662,7 +1672,7 @@ jobs:
       id-token: write        # cosign keyless + Sigstore OIDC
       attestations: write    # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -1794,7 +1804,7 @@ jobs:
       id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
