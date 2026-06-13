@@ -148,9 +148,12 @@ std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path
 /// restarted agent computes the same key and skips re-inserting the boot window.
 /// Returns 0 off-Windows (where the backfill is a no-op anyway).
 ///
-/// Known limitation: derived from GetTickCount64 (uptime), which excludes sleep,
-/// so a sleep/resume of more than a minute between two agent restarts in the same
-/// boot can shift the key and cause one extra (bounded, user-empty) backfill. A
+/// Known limitations (each causes at most ONE extra bounded, user-empty
+/// backfill — far better than the old min-ts key): derived from GetTickCount64
+/// (uptime), which excludes sleep, so a sleep/resume of more than a minute
+/// between two agent restarts in the same boot can shift the key; and two
+/// restarts whose computed boot instants straddle a minute boundary (sub-2s
+/// measurement jitter near a :00 second) can floor to different minutes. A
 /// precise sleep-immune boot id is a tracked follow-up.
 std::int64_t boot_time_unix();
 

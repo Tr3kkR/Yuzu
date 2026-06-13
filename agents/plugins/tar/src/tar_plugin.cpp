@@ -577,13 +577,27 @@ private:
                 // another tool stopped it, buffer loss, quota), running() is
                 // false. The batch above is already persisted; fall back to the
                 // snapshot-diff poll so the process source does not go silently
-                // blind (UP-1). The next tick re-establishes the poll baseline;
-                // `status` then reports process_capture_method=polling.
+                // blind (UP-1). `status` then reports process_capture_method=polling.
                 if (!proc_etw_->running()) {
                     spdlog::warn("TAR: ETW process session ended — falling back to "
                                  "snapshot-diff poll");
                     proc_etw_->stop();
                     etw_active_ = false;
+                    // Prime the poll's process baseline with the CURRENT process
+                    // set, WITHOUT emitting events. Otherwise the first poll tick
+                    // would diff every running process against an empty snapshot
+                    // and emit a spurious 'started' for each — double-counting the
+                    // processes ETW already recorded as started. Seeding the
+                    // baseline here makes the first real diff capture only changes
+                    // since the fallback. (Mirrors the poll branch's enumerate +
+                    // stabilization-exclusion filter, minus the diff/insert.)
+                    auto current = yuzu::agent::enumerate_processes();
+                    if (!stab_excl.empty()) {
+                        std::erase_if(current, [&](const auto& p) {
+                            return yuzu::tar::should_redact(p.name, stab_excl);
+                        });
+                    }
+                    db_->set_state("process", processes_to_json(current).dump());
                 }
             } else {
                 // Non-Windows (or ETW unavailable): snapshot-diff poll.
