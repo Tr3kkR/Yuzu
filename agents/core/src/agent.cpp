@@ -10,9 +10,11 @@ __declspec(allocate(".CRT$XCB"))
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/dex_observer.hpp>
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -28,10 +30,13 @@ __declspec(allocate(".CRT$XCB"))
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
+#include "guaranteed_state.pb.h"
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
+#include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
+#include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -64,6 +69,7 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 #if defined(_WIN32)
@@ -530,6 +536,21 @@ public:
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
+        metrics_.describe("yuzu_agent_dex_observer_armed",
+                          "1 if the Guardian DEX signal observer is armed AND all its channel "
+                          "subscriptions are live, else 0. Tracks runtime health: a runtime "
+                          "EvtSubscribe error on any channel (EventLog restart / channel ACL "
+                          "change) flips it to 0 via the observer error callback. NOT whether the "
+                          "underlying reporters are enabled (a WER-disabled host stays armed=1 yet "
+                          "emits no crash events). Surfaced fleet-wide via the heartbeat rollup "
+                          "yuzu_fleet_agents_dex_observer_disarmed (the agent has no /metrics "
+                          "endpoint).",
+                          "gauge");
+        // PKI PR3 (gov UP-9 / enterprise): make a stuck/failed per-agent mTLS
+        // provisioning observable to fleet alerting, not just the agent log.
+        metrics_.describe("yuzu_agent_cert_provision_failed_total",
+                          "Per-agent mTLS provisioning failures, labeled by reason "
+                          "(persist_failed|no_cert_issued)", "counter");
     }
 
     void run() override {
@@ -606,6 +627,62 @@ public:
             spdlog::warn("Guardian engine start_local failed: {} — continuing without Guardian",
                          r.error());
         }
+
+        // 1c-bis. Fleet-wide DEX signal observer (Guardian DEX, multi-signal).
+        // RULELESS observations — records every catalogued reliability signal
+        // (crash, hang, service failure, bugcheck, boot duration, …; see
+        // dex_signal_catalog.cpp), independent of any rule. No-op off Windows.
+        // Armed pre-network; emit_guardian_event() self-guards on the Subscribe
+        // stream being up, so signals before first connect are dropped (like
+        // guard events pre-sink; durable buffering is A3).
+        // --dex-disable / YUZU_AGENT_DEX_DISABLE is a deploy-time opt-out: when set,
+        // the observer never arms and NO DEX signal telemetry is collected.
+        dex_observer_ = make_dex_observer();
+        // Runtime health flag — the single source of truth for the heartbeat arm tag.
+        // A shared_ptr<atomic> (NOT `this`) so the observer's error callback, which fires
+        // on an OS threadpool thread and may outlive this agent, can flip it to false
+        // without a use-after-free. A runtime EvtSubscribeActionError on ANY channel
+        // (EventLog restart / channel ACL change → that channel goes deaf after a
+        // successful start) flips it, so the next heartbeat reports armed=0 and the
+        // fleet `disarmed` gauge rises — the arm signal tracks runtime health, not just
+        // the initial arm (UP-1).
+        // Seeded OPTIMISTICALLY true: the error callback may fire DURING start() (once
+        // EvtSubscribe arms, before start() returns), so we must NOT blind-store the
+        // start() result afterwards — that would clobber a false the callback wrote in
+        // that window. The disable / not-armed branches clear it explicitly instead.
+        dex_health_ = std::make_shared<std::atomic<bool>>(true);
+        if (cfg_.dex_disable) {
+            dex_health_->store(false, std::memory_order_relaxed);
+            spdlog::info(
+                "dex_observer: disabled by --dex-disable — no DEX signal telemetry collected");
+        } else if (dex_observer_->start([this](const SignalObservation& obs) {
+                       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                       const auto seq = dex_seq_.fetch_add(1, std::memory_order_relaxed);
+                       // Include agent_id: the at-least-once event_id is a GLOBAL primary key
+                       // server-side, so two agents observing in the same ms (e.g. a bad
+                       // fleet-wide deploy) would otherwise mint identical ids and all but one
+                       // would be dropped at ingest — losing signals exactly when they matter.
+                       const std::string event_id = std::string(kObservationRuleSentinel) + "-" +
+                                                     cfg_.agent_id + "-" + std::to_string(now_ms) +
+                                                     "-" + std::to_string(seq);
+                       // dex_seq_ (incremented above) doubles as the per-agent observed-signal
+                       // total surfaced in the heartbeat → fleet rollup; no separate counter.
+                       emit_guardian_event(signal_observation_to_event(obs, event_id));
+                   },
+                   [h = dex_health_] { h->store(false, std::memory_order_relaxed); })) {
+            // Armed — leave dex_health_ as-is: true, or false if the error callback
+            // already fired during start(). Do NOT blind-store — see the seed comment.
+        } else {
+            dex_health_->store(false, std::memory_order_relaxed);
+            spdlog::debug("dex_observer: not armed on this platform — DEX signals disabled");
+        }
+        // Arm gauge: seeded from dex_health_ (so a during-start error is reflected) and
+        // re-synced from it at each heartbeat, so it tracks runtime subscription health,
+        // not just the initial arm (UP-1).
+        metrics_.gauge("yuzu_agent_dex_observer_armed")
+            .set(dex_health_->load(std::memory_order_relaxed) ? 1.0 : 0.0);
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -803,63 +880,124 @@ public:
             }
         }
 
-        CloudIdentity cloud_id; // Populated before registration (step 2b)
-        std::shared_ptr<grpc::ChannelCredentials> creds;
-        std::shared_ptr<grpc::Channel> channel;
-        std::unique_ptr<pb::AgentService::Stub> stub;
-        if (cfg_.tls_enabled) {
-            grpc::SslCredentialsOptions ssl_opts;
-            if (!cfg_.tls_ca_cert.empty()) {
-                ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
-                if (ssl_opts.pem_root_certs.empty()) {
-                    spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
-                    return;
+        // PKI PR3: per-agent mTLS provisioning. When TLS is on with a CA but the
+        // operator supplied no explicit client cert / OS-store cert, the agent
+        // obtains its OWN client leaf from the server — it generates a keypair +
+        // CSR, sends the CSR in Register, persists the issued leaf (key 0600), and
+        // reconnects presenting it. `pending_csr_pem` rides the next Register; a
+        // non-empty `pending_key_pem` is the key awaiting its issued leaf.
+        //
+        // Renewal is evaluated here at startup (NeedsRenew at 2/3 life). A
+        // continuously-running agent that never restarts renews on its next
+        // process start / re-provision; a mid-run renewal thread is a follow-up.
+        std::string pending_csr_pem;
+        std::string pending_key_pem;
+        // cpp-safety (#1239): the agent private key lives in `pending_key_pem`
+        // from generation until it is persisted (then explicitly zeroed below).
+        // A stop/return BETWEEN those points — e.g. shutdown mid-enrollment, or
+        // any early return on the connect path — would otherwise leave the key
+        // resident in process memory. This guard scrubs it on EVERY exit from
+        // run() (the explicit zeroes below clear() too, so the guard then no-ops).
+        struct KeyScrub {
+            std::string& k;
+            ~KeyScrub() { yuzu::secure_zero(k); }
+        } pending_key_scrub{pending_key_pem};
+        int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
+        const std::filesystem::path cert_dir =
+            cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
+        const bool provisioning_eligible =
+            cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
+            cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();
+        if (provisioning_eligible) {
+            const auto state = inspect_provisioned_cert(cert_dir);
+            const auto paths = provisioned_cert_paths(cert_dir);
+            if (state == CertState::Valid || state == CertState::NeedsRenew) {
+                // A usable leaf exists — present it (mTLS from the first connect).
+                cfg_.tls_client_cert = paths.cert_path;
+                cfg_.tls_client_key = paths.key_path;
+                spdlog::info("PKI: using provisioned client cert {} ({})", paths.cert_path.string(),
+                             state == CertState::NeedsRenew ? "past 2/3 life — will renew"
+                                                            : "valid");
+            }
+            if (state != CertState::Valid) {
+                // Missing / Expired → enroll; NeedsRenew → renew. Either way mint a
+                // fresh keypair + CSR to present in Register.
+                if (auto kc = generate_key_and_csr(cfg_.agent_id)) {
+                    pending_key_pem = std::move(kc->private_key_pem);
+                    pending_csr_pem = std::move(kc->csr_pem);
+                    spdlog::info("PKI: generated EC P-256 keypair + CSR ({})",
+                                 state == CertState::NeedsRenew ? "renewal" : "first enrollment");
+                } else {
+                    spdlog::error("PKI: failed to generate agent keypair/CSR — continuing without "
+                                  "per-agent mTLS");
                 }
             }
-
-            // Client certificate: prefer cert store, fall back to PEM files
-            if (!cfg_.cert_store.empty()) {
-                // Read client cert + key from OS certificate store
-                spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
-                auto store_result =
-                    read_cert_from_store(cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
-
-                if (!store_result.ok()) {
-                    spdlog::error("Certificate store error: {}", store_result.error);
-                    return;
-                }
-
-                ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
-                ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
-                spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
-            } else {
-                const bool has_client_cert = !cfg_.tls_client_cert.empty();
-                const bool has_client_key = !cfg_.tls_client_key.empty();
-                if (has_client_cert != has_client_key) {
-                    spdlog::error("mTLS requires both --client-cert and --client-key");
-                    return;
-                }
-
-                if (has_client_cert && has_client_key) {
-                    ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
-                    ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
-                    if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
-                        spdlog::error("Failed to read client cert/key for mTLS");
-                        return;
-                    } else {
-                        spdlog::info("mTLS enabled: using client certificate files");
-                    }
-                }
-            }
-            creds = grpc::SslCredentials(ssl_opts);
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-        } else {
-            creds = grpc::InsecureChannelCredentials();
         }
 
-        channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
+        CloudIdentity cloud_id; // Populated before registration (step 2b)
+        std::shared_ptr<grpc::Channel> channel;
+        std::unique_ptr<pb::AgentService::Stub> stub;
+        // Build (or rebuild, post-issuance) the credentials + channel + stub from
+        // the current cfg_ cert paths. Returns false on an unreadable cert/key.
+        auto build_channel = [&]() -> bool {
+            std::shared_ptr<grpc::ChannelCredentials> creds;
+            if (cfg_.tls_enabled) {
+                grpc::SslCredentialsOptions ssl_opts;
+                if (!cfg_.tls_ca_cert.empty()) {
+                    ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
+                    if (ssl_opts.pem_root_certs.empty()) {
+                        spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
+                        return false;
+                    }
+                }
 
-        stub = pb::AgentService::NewStub(channel);
+                // Client certificate: prefer cert store, fall back to PEM files
+                if (!cfg_.cert_store.empty()) {
+                    // Read client cert + key from OS certificate store
+                    spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
+                    auto store_result = read_cert_from_store(cfg_.cert_store, cfg_.cert_subject,
+                                                             cfg_.cert_thumbprint);
+
+                    if (!store_result.ok()) {
+                        spdlog::error("Certificate store error: {}", store_result.error);
+                        return false;
+                    }
+
+                    ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
+                    ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
+                    spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
+                } else {
+                    const bool has_client_cert = !cfg_.tls_client_cert.empty();
+                    const bool has_client_key = !cfg_.tls_client_key.empty();
+                    if (has_client_cert != has_client_key) {
+                        spdlog::error("mTLS requires both --client-cert and --client-key");
+                        return false;
+                    }
+
+                    if (has_client_cert && has_client_key) {
+                        ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
+                        ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
+                        if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                            spdlog::error("Failed to read client cert/key for mTLS");
+                            return false;
+                        } else {
+                            spdlog::info("mTLS enabled: using client certificate files");
+                        }
+                    }
+                }
+                creds = grpc::SslCredentials(ssl_opts);
+                yuzu::secure_zero(ssl_opts.pem_private_key);
+            } else {
+                creds = grpc::InsecureChannelCredentials();
+            }
+
+            channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
+            stub = pb::AgentService::NewStub(channel);
+            return true;
+        };
+
+        if (!build_channel())
+            return;
 
         // 2b. Detect cloud instance identity (for auto-approve)
         {
@@ -936,6 +1074,7 @@ public:
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
@@ -1051,6 +1190,15 @@ public:
                                  cloud_id.provider);
                 }
 
+                // PKI PR3: present the CSR so the server signs a per-agent client
+                // leaf (CN=<agent_id>). Only set when enrolling/renewing — once a
+                // leaf is issued and the channel rebuilt, pending_csr_pem is cleared
+                // so a steady-state re-Register never triggers a re-issue.
+                if (!pending_csr_pem.empty()) {
+                    req.set_csr_pem(pending_csr_pem);
+                    spdlog::info("Including CSR for per-agent mTLS enrollment");
+                }
+
                 pb::RegisterResponse resp;
                 auto register_start = std::chrono::steady_clock::now();
                 auto status = stub->Register(&ctx, req, &resp);
@@ -1078,6 +1226,86 @@ public:
                 }
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
+
+                // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
+                // + issuing chain, point the config at it, and rebuild the channel
+                // so the next connection is mutual TLS. We then `continue` to
+                // re-Register over mTLS — the FIRST (server-auth) session bound an
+                // empty client identity, so the data plane (Subscribe) would reject
+                // it; re-registering binds the leaf's CN=<agent_id> to a fresh
+                // session. The CSR is cleared first so the re-Register doesn't
+                // request a second cert.
+                if (!pending_csr_pem.empty()) {
+                    if (!resp.issued_certificate().empty()) {
+                        const bool persisted = persist_provisioned_cert(
+                            cert_dir, pending_key_pem, resp.issued_certificate(),
+                            resp.issued_ca_chain());
+                        // Zero the in-memory key on every path; clear the CSR once we
+                        // no longer need to act on it.
+                        yuzu::secure_zero(pending_key_pem);
+                        pending_key_pem.clear();
+                        pending_csr_pem.clear();
+                        if (persisted) {
+                            // Pairs with yuzu_agent_cert_provision_failed_total so an
+                            // operator can distinguish a provisioned (mutual-TLS) agent
+                            // from one that gave up and is running unauthenticated —
+                            // the observability half of the silent-downgrade concern
+                            // (#1239 should-fix; the enforcement half is the planned
+                            // --require-agent-identity flag, see auth-architecture.md).
+                            metrics_.counter("yuzu_agent_cert_provisioned_total").increment();
+                            const auto paths = provisioned_cert_paths(cert_dir);
+                            cfg_.tls_client_cert = paths.cert_path;
+                            cfg_.tls_client_key = paths.key_path;
+                            spdlog::info("PKI: received per-agent client cert — reconnecting with "
+                                         "mutual TLS");
+                            if (!build_channel()) {
+                                spdlog::error("PKI: failed to rebuild channel with issued cert");
+                                return;
+                            }
+                            continue; // re-Register over mTLS (binds the cert identity)
+                        }
+                        // Persist failed (disk full / perms). The server recorded the
+                        // leaf but we can't use it; falling through would Subscribe
+                        // with no client identity and be rejected, then reconnect with
+                        // an empty CSR and never recover. Exit so the service manager
+                        // restarts us — on restart the pre-step mints a fresh CSR.
+                        metrics_.counter("yuzu_agent_cert_provision_failed_total",
+                                         {{"reason", "persist_failed"}})
+                            .increment();
+                        spdlog::error("PKI: failed to persist the issued client cert under {} — "
+                                      "exiting for a clean restart-driven retry",
+                                      cert_dir.string());
+                        return;
+                    }
+                    // Hermes HIGH-2: enrolled but NO cert returned (server signer
+                    // unavailable/rate-limited, or an active MITM stripped the field).
+                    // reconnect_count was reset to 0 above, so without a bound the
+                    // agent would tight-loop re-minting/dropping certs. Back off and
+                    // retry the SAME CSR a bounded number of times; then give up
+                    // provisioning (clear the pending CSR) and proceed — if the server
+                    // requires client identity Subscribe will be rejected and the
+                    // normal reconnect backoff applies (no more cert churn), and if it
+                    // does not (one-way TLS) the agent runs without a client cert.
+                    if (++csr_attempts >= kMaxCsrAttempts) {
+                        metrics_.counter("yuzu_agent_cert_provision_failed_total",
+                                         {{"reason", "no_cert_issued"}})
+                            .increment();
+                        spdlog::error("PKI: enrolled but the server issued no client certificate "
+                                      "after {} attempts — giving up auto-provisioning for this "
+                                      "run (check the server CA / signer)",
+                                      csr_attempts);
+                        yuzu::secure_zero(pending_key_pem);
+                        pending_key_pem.clear();
+                        pending_csr_pem.clear();
+                        // fall through unauthenticated
+                    } else {
+                        spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
+                                     "backing off and retrying",
+                                     csr_attempts, kMaxCsrAttempts);
+                        reconnect_count = csr_attempts; // drive exponential backoff
+                        continue;                       // retry Register with the same CSR
+                    }
+                }
 
                 session_id_ = resp.session_id();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1158,6 +1386,25 @@ public:
                 }
                 spdlog::info("Subscribe stream opened - waiting for commands");
 
+                // Step 4: publish this stream as the Guardian sink target and wire
+                // the event-sink now the stream is up and BEFORE any push arrives, so
+                // a guard started by a push has a live sink. Drift events ship as a
+                // self-describing CommandResponse{plugin:"__guard__", action:"event",
+                // payload}. The sink captures only `this` and writes through
+                // guardian_sink_stream_ (H4 / #1209): a guard worker fires
+                // asynchronously and outlives any single stream, so capturing a
+                // specific `stream` would let it write to a cancelled stream across a
+                // reconnect. The holder is reset on read-loop exit, under the same
+                // mutex, before the stream is torn down.
+                if (guardian_) {
+                    {
+                        std::lock_guard lock(stream_write_mu_);
+                        guardian_sink_stream_ = stream;
+                    }
+                    guardian_->set_event_sink(
+                        [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
+                }
+
                 // 4b. Spawn OTA update check thread
                 if (cfg_.auto_update && updater_) {
                     auto* raw_stub = static_cast<void*>(stub.get());
@@ -1203,6 +1450,11 @@ public:
                         // last produced — important so a flapping link
                         // doesn't leave the server reading a stale slot.
                         uint64_t last_attached_seq = 0;
+                        // A4: previous perf-counter reading for the heartbeat's
+                        // device-utilization tags (deriving a rate needs two
+                        // readings; lambda-local so a reconnect re-baselines and
+                        // the first heartbeat of a session ships no stale rate).
+                        win::PerfBreachCounters hb_prev_perf;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1236,6 +1488,64 @@ public:
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
                             tags["yuzu.healthy"] = "1";
+                            // Guardian policy generation (M5 / #1209): lets the
+                            // server detect an agent that missed a push (offline at
+                            // push time, or reconnected) and re-push it without a
+                            // manual operator action. Always emitted — including
+                            // generation 0 — so an agent that has never received a
+                            // push still converges once rules exist server-side.
+                            if (guardian_)
+                                tags["yuzu.guardian_generation"] =
+                                    std::to_string(guardian_->policy_generation());
+#if defined(_WIN32)
+                            // DEX signal observer (Windows only — no-op elsewhere). Both tags
+                            // are omitted when --dex-disable opted the agent out, so the server
+                            // rollups reflect genuine state, not opt-outs or non-Windows agents.
+                            // The agent has no /metrics endpoint; these heartbeat tags are the
+                            // ONLY path that makes a silently-deaf observer and the fleet signal
+                            // count observable (see AgentHealthStore::recompute_metrics).
+                            if (!cfg_.dex_disable) {
+                                const bool healthy =
+                                    dex_health_ &&
+                                    dex_health_->load(std::memory_order_relaxed);
+                                tags["yuzu.dex_observer_armed"] = healthy ? "1" : "0";
+                                tags["yuzu.dex_observed"] =
+                                    std::to_string(dex_seq_.load(std::memory_order_relaxed));
+                                metrics_.gauge("yuzu_agent_dex_observer_armed")
+                                    .set(healthy ? 1.0 : 0.0);
+                            }
+#endif
+                            // A4 fleet perf rollup: ship the device's current
+                            // utilization as heartbeat tags — the agent has no
+                            // /metrics endpoint, so this is the ONLY channel by
+                            // which fleet perf gauges exist (see
+                            // AgentHealthStore::recompute_metrics). Derived over
+                            // the heartbeat interval from the same raw counter
+                            // reads as the A3 breach detector. The first
+                            // heartbeat of a session only baselines (invalid
+                            // sample -> tags omitted; the server simply doesn't
+                            // count this agent that cycle). Gated like the DEX
+                            // observer: --dex-disable means no DEX telemetry of
+                            // any kind. Off-Windows the read is valid=false
+                            // until those collectors land, so no tags ship.
+                            if (!cfg_.dex_disable) {
+                                const auto cur = win::read_perf_breach_counters();
+                                const auto ps = win::derive_breach_sample(hb_prev_perf, cur);
+                                hb_prev_perf = cur;
+                                if (ps.valid) {
+                                    tags["yuzu.perf_cpu_pct"] =
+                                        std::format("{:.1f}", ps.cpu_pct);
+                                    // Per-domain validity (gov review MEDIUM #1):
+                                    // omit a sub-metric whose read failed rather
+                                    // than ship a healthy 0% into the fleet gauge.
+                                    if (ps.commit_valid)
+                                        tags["yuzu.perf_commit_pct"] =
+                                            std::format("{:.1f}", ps.commit_pct);
+                                    if (ps.disk_valid)
+                                        tags["yuzu.perf_disk_lat_ms"] =
+                                            std::format("{:.2f}", ps.disk_lat_ms);
+                                }
+                            }
 
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
@@ -1342,6 +1652,11 @@ public:
                             resp.set_exit_code(dr.exit_code);
                             resp.set_output(std::move(dr.output));
                         }
+                        // Stamp the response so the server routes it via the Guardian
+                        // ingest branch (plugin=="__guard__") and skips the response
+                        // store / executions drawer. action mirrors the request.
+                        resp.set_plugin("__guard__");
+                        resp.set_action(cmd.action());
                         metrics_
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
@@ -1533,6 +1848,18 @@ public:
 
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
 
+                // Detach the Guardian event-sink from this (now broken) stream BEFORE
+                // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
+                // in-flight sink Write to finish, then nulls the holder so a guard
+                // worker firing during teardown drops the event instead of writing to
+                // a cancelled stream. Guards keep running across the reconnect; the
+                // next iteration republishes the new stream and the heartbeat reconcile
+                // (M5) catches up any generation missed while the link was down.
+                {
+                    std::lock_guard lock(stream_write_mu_);
+                    guardian_sink_stream_.reset();
+                }
+
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
                 // ensuring no task holds a dangling stream pointer.
@@ -1604,14 +1931,25 @@ public:
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
-        if (guardian_)
-            guardian_->stop();
-        if (updater_)
-            updater_->stop();
-        // Cancel the Subscribe stream to unblock the Read() call
+        // Cancel the Subscribe stream FIRST. The Guardian drift workers and the DEX
+        // observer both emit through emit_guardian_event(), whose synchronous gRPC
+        // Write() BLOCKS on a stalled-but-not-dead stream (gateway up, not draining).
+        // guardian_->stop() / dex_observer_->stop() below DRAIN those emitters with an
+        // unbounded wait, so cancelling only after the drain lets an in-flight signal
+        // Write during shutdown wedge stop() forever (cpp-safety BLOCKING). TryCancel
+        // aborts the blocked Write; it does NOT tear the stream down — the stream holder
+        // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
+        // they stay live through both drains and emit_guardian_event's null-check under
+        // the lock remains UAF-safe.
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
         }
+        if (guardian_)
+            guardian_->stop();
+        if (dex_observer_)
+            dex_observer_->stop();
+        if (updater_)
+            updater_->stop();
         // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
         if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
             hctx->TryCancel();
@@ -1623,6 +1961,21 @@ public:
     std::vector<std::string> loaded_plugins() const override { return plugin_names_; }
 
 private:
+    // Serialize a Guardian event into the __guard__/event CommandResponse and write
+    // it through the current Subscribe stream. Shared by the GuardianEngine drift
+    // sink and the (ruleless) DEX signal observer. Drops the event if the link is
+    // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
+    void emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        pb::CommandResponse resp;
+        resp.set_plugin("__guard__");
+        resp.set_action("event");
+        resp.set_status(pb::CommandResponse::SUCCESS);
+        resp.set_payload(ev.SerializeAsString());
+        std::lock_guard lock(stream_write_mu_);
+        if (guardian_sink_stream_)
+            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+    }
+
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -1630,7 +1983,6 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
-    std::unique_ptr<GuardianEngine> guardian_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.
@@ -1647,6 +1999,35 @@ private:
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
+    // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
+    // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
+    // and fire asynchronously, so the sink must NOT capture a specific stream: it
+    // reads this holder under the lock and drops the event if it is null (link down
+    // between reconnects). Set on stream open, reset on read-loop exit BEFORE the
+    // stream is torn down, so a guard firing mid-teardown can never write to a
+    // cancelled stream.
+    std::shared_ptr<SubscribeStream> guardian_sink_stream_;
+    // Declared AFTER stream_write_mu_ + guardian_sink_stream_ so it is DESTROYED
+    // FIRST (reverse declaration order): ~GuardianEngine joins the guard worker
+    // threads, which must happen while the mutex + sink-stream holder those
+    // workers write through are still alive (H4 / #1209). Body-initialized in the
+    // ctor (after kv_store_), so the later declaration does not affect construction.
+    std::unique_ptr<GuardianEngine> guardian_;
+    // Fleet-wide DEX signal observer (multi-signal). Declared AFTER stream_write_mu_
+    // + guardian_sink_stream_ (same reasoning as guardian_): its OS-callbacks emit
+    // through emit_guardian_event(), so its dtor (which stop()s the subscriptions +
+    // drains in-flight callbacks) must run while the mutex + sink-stream holder are
+    // still alive. dex_seq_ disambiguates the at-least-once event_id for same-agent
+    // bursts within one millisecond; agent_id (folded into the id) disambiguates
+    // ACROSS agents so a fleet-wide signal wave doesn't collide on the global PK.
+    std::atomic<std::uint64_t> dex_seq_{0};
+    // Runtime arm/health of the DEX observer — flipped to false by the observer's
+    // error callback on a runtime subscription failure on any channel (UP-1). A
+    // shared_ptr<atomic> (not `this`) so a late OS-threadpool error callback stays
+    // UAF-safe. Read by the heartbeat thread to drive the `yuzu.dex_observer_armed`
+    // tag.
+    std::shared_ptr<std::atomic<bool>> dex_health_;
+    std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;

@@ -191,40 +191,16 @@ streaming(cast, {dispatch, CommandReq, {ReplyTo, FanoutRef}}, Data) ->
     Pending2 = Pending#{CmdId => {ReplyTo, FanoutRef, erlang:monotonic_time(millisecond)}},
     {keep_state, Data#data{pending = Pending2}};
 
-streaming(info, {stream_data, ResponseFrame}, Data) ->
-    #data{agent_id = AgentId, pending = Pending} = Data,
-    CmdId = maps:get(<<"command_id">>, ResponseFrame,
-                     maps:get(command_id, ResponseFrame, undefined)),
-    Status = maps:get(<<"status">>, ResponseFrame,
-                      maps:get(status, ResponseFrame, undefined)),
-
-    case maps:find(CmdId, Pending) of
-        {ok, {ReplyTo, FanoutRef, DispatchedAt}} ->
-            ReplyTo ! {command_response, FanoutRef, AgentId, ResponseFrame},
-
-            Pending2 = case Status of
-                'RUNNING'          -> Pending;
-                <<"RUNNING">>      -> Pending;
-                0                  -> Pending;  %% proto enum value
-                _FinalStatus       ->
-                    Duration = erlang:monotonic_time(millisecond) - DispatchedAt,
-                    Plugin = maps:get(<<"plugin">>, ResponseFrame,
-                                      maps:get(plugin, ResponseFrame, <<"unknown">>)),
-                    telemetry:execute([yuzu, gw, command, completed],
-                                      #{duration_ms => Duration},
-                                      #{agent_id => AgentId, plugin => Plugin, status => Status}),
-                    %% Notify router so it can complete the fanout.
-                    case whereis(yuzu_gw_router) of
-                        undefined  -> ok;
-                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-                    end,
-                    maps:remove(CmdId, Pending)
-            end,
-            {keep_state, Data#data{pending = Pending2}};
-
-        error ->
-            logger:debug("Orphaned response from ~s for cmd ~s", [AgentId, CmdId]),
-            keep_state_and_data
+streaming(info, {stream_data, ResponseFrame}, #data{agent_id = AgentId} = Data) ->
+    %% Guardian side-channel ("__guard__") frames are unsolicited (no
+    %% command_id in `pending`) and carry a drift event for the control plane,
+    %% not a reply to a dispatched command. Intercept and forward them upstream
+    %% BEFORE the command-correlation path — otherwise they would hit the
+    %% orphan-drop in handle_stream_response/2. AgentId is the gateway-asserted
+    %% bound identity (never read from the frame).
+    case yuzu_gw_guardian:intercept(AgentId, ResponseFrame) of
+        forwarded   -> keep_state_and_data;
+        passthrough -> handle_stream_response(ResponseFrame, Data)
     end;
 
 streaming(info, stream_closed, Data) ->
@@ -282,6 +258,44 @@ code_change(_OldVsn, State, Data, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% Correlate a non-Guardian response frame to a pending command and forward it
+%% to the waiting caller, or drop it as orphaned. Guardian side-channel frames
+%% ("__guard__") are intercepted in streaming/3 before reaching here.
+handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pending} = Data) ->
+    CmdId = maps:get(<<"command_id">>, ResponseFrame,
+                     maps:get(command_id, ResponseFrame, undefined)),
+    Status = maps:get(<<"status">>, ResponseFrame,
+                      maps:get(status, ResponseFrame, undefined)),
+
+    case maps:find(CmdId, Pending) of
+        {ok, {ReplyTo, FanoutRef, DispatchedAt}} ->
+            ReplyTo ! {command_response, FanoutRef, AgentId, ResponseFrame},
+
+            Pending2 = case Status of
+                'RUNNING'          -> Pending;
+                <<"RUNNING">>      -> Pending;
+                0                  -> Pending;  %% proto enum value
+                _FinalStatus       ->
+                    Duration = erlang:monotonic_time(millisecond) - DispatchedAt,
+                    Plugin = maps:get(<<"plugin">>, ResponseFrame,
+                                      maps:get(plugin, ResponseFrame, <<"unknown">>)),
+                    telemetry:execute([yuzu, gw, command, completed],
+                                      #{duration_ms => Duration},
+                                      #{agent_id => AgentId, plugin => Plugin, status => Status}),
+                    %% Notify router so it can complete the fanout.
+                    case whereis(yuzu_gw_router) of
+                        undefined  -> ok;
+                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
+                    end,
+                    maps:remove(CmdId, Pending)
+            end,
+            {keep_state, Data#data{pending = Pending2}};
+
+        error ->
+            logger:debug("Orphaned response from ~s for cmd ~s", [AgentId, CmdId]),
+            keep_state_and_data
+    end.
 
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,

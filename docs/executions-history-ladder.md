@@ -123,6 +123,30 @@ terminal are GC'd by `gc_terminal_channels` once
 runs opportunistically from `publish` so no separate timer thread is
 required.
 
+### GC lock-ordering invariant (#1198)
+
+`channels_` holds the only `shared_ptr` to each idle channel, and each
+`Channel` carries its own `std::mutex`. **A `Channel` must never be
+destroyed — via `erase` or any other `channels_` mutation — while any lock
+on that channel's mutex is alive.** The required pattern, used by
+`gc_terminal_channels`:
+
+1. Pin the victim with a local `shared_ptr` copy *before* locking its mutex.
+2. Erase the map entry — the local copy keeps the `Channel` alive.
+3. Park the copy in a container declared *outside* the lock scopes (the
+   `dead` vector), so `~Channel` runs only after the per-channel guard and
+   the `map_mu_` write lock are both released.
+
+Violating this is UB on every toolchain and a hard server-wide abort on
+MSVC ("unlock of unowned mutex"). The Linux sanitizers cannot see a
+regression here (the bad unlock executes inside uninstrumented libpthread,
+and libstdc++/libc++ `~mutex` is trivial, so TSan gets no destroy hook) —
+the MSVC test legs are the enforcement point, via the `set_clock_fn`
+regression test in `test_execution_event_bus.cpp` (`[gc]` tag). Any
+successor PR that restructures `gc_terminal_channels` or adds a new path
+that erases from `channels_` while holding a channel mutex must preserve
+this ordering. Lock hierarchy is `map_mu_` → `ch->mu`, never reversed.
+
 ### Client-side bootstrap is data-attribute-driven
 
 The list-row markup carries `data-execution-id` and

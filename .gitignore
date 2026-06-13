@@ -176,6 +176,5 @@ __pycache__/
 enrollment-tokens.cfg
 pending-agents.cfg
 
-# Generated CVE rules from scripts/generate-cve-rules.py
-content/cve_rules.json
-content/cve_rules.json.sha256
+# Commercially sensitive planning docs — local-only, never commit
+docs/dex-brd-coverage.md

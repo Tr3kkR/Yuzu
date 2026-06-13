@@ -3,6 +3,7 @@
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
+#include <ctime>
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
@@ -11,6 +12,9 @@
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
+#include "guaranteed_state.pb.h"
+#include "guaranteed_state_store.hpp"
+#include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -31,6 +35,7 @@ namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
+
 
 // -- Constructor --------------------------------------------------------------
 
@@ -73,11 +78,37 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                             "agent_id length exceeds 256 chars or empty");
     }
 
-    if (require_client_identity_) {
-        if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
-            spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
-            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
-                                "agent_id must match client certificate identity (CN/SAN)");
+    // PR3: Register is bootstrap-exempt. A first-enrollment agent presents NO
+    // client cert (it obtains one via this very call), so a no-cert Register is
+    // permitted even when mTLS identity is required. But a PRESENTED cert (re-auth
+    // after enrollment) MUST match the claimed agent_id and must not be revoked.
+    if (require_client_identity_ && context) {
+        const auto idents = extract_peer_identities(*context);
+        if (!idents.empty()) {
+            // Hermes CRITICAL-1: only treat a presented cert as a Yuzu agent
+            // identity if it was issued by OUR CA. In a multi-CA trust bundle a
+            // foreign cert (e.g. corporate-CA) carrying a spoofed CN=<agent_id>
+            // would otherwise pass the CN match below and be trusted as
+            // re-authentication. When a recognizer is wired (our CA is active) and
+            // says the cert is not ours, fall through to bootstrap rather than
+            // trusting it. When no recognizer is wired (operator-supplied single
+            // trust root) every authenticated cert is an agent — legacy behaviour.
+            const std::string peer_pem = extract_peer_cert_pem(*context);
+            const bool treat_as_identity =
+                !peer_cert_recognizer_ || peer_cert_recognizer_(peer_pem);
+            if (treat_as_identity) {
+                if (!peer_identity_matches_agent_id(*context, info.agent_id())) {
+                    spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
+                    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                        "agent_id must match client certificate identity (CN/SAN)");
+                }
+                if (revocation_checker_ && !peer_pem.empty() && revocation_checker_(peer_pem)) {
+                    spdlog::warn("Register rejected: revoked client cert for agent {}",
+                                 info.agent_id());
+                    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                        "client certificate is revoked");
+                }
+            }
         }
     }
 
@@ -501,6 +532,34 @@ enrolled:
     response->set_accepted(true);
     response->set_enrollment_status("enrolled");
 
+    // PR3: if the agent sent a CSR and a signer is wired (the CA is active), sign
+    // a per-agent client leaf bound to agent_id and return it; the agent persists
+    // it and reconnects with mutual TLS. Signing failure is non-fatal — the agent
+    // stays on the bootstrap (request-but-don't-require) posture and can retry.
+    if (!request->csr_pem().empty() && agent_cert_signer_) {
+        // #1273 B-2: contain any exception out of the signer — it runs in this sync
+        // handler; a throw would terminate the server. Degrade to no-cert (the
+        // agent stays on the bootstrap posture), same as a nullopt return. Mirrors
+        // the gateway ProxyRegister path so both issuance sites are crash-safe.
+        std::optional<std::pair<std::string, std::string>> issued;
+        try {
+            issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
+                                        CertIssuanceSource::Direct);
+        } catch (const std::exception& e) {
+            spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
+        } catch (...) {
+            spdlog::error("Register: signer threw a non-std exception for agent {}",
+                          info.agent_id());
+        }
+        if (issued) {
+            response->set_issued_certificate(issued->first);
+            response->set_issued_ca_chain(issued->second);
+            spdlog::info("Issued per-agent client cert for {}", info.agent_id());
+        } else {
+            spdlog::warn("Register: client-cert signing failed for agent {}", info.agent_id());
+        }
+    }
+
     PendingRegistration pending;
     pending.agent_id = info.agent_id();
     pending.register_peer = context ? context->peer() : std::string{};
@@ -518,11 +577,17 @@ enrolled:
 
 // -- Heartbeat ----------------------------------------------------------------
 
-grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
+grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* context,
                                          const pb::HeartbeatRequest* request,
                                          pb::HeartbeatResponse* response) {
     metrics_.counter("yuzu_grpc_requests_total", {{"method", "Heartbeat"}, {"status", "received"}})
         .increment();
+
+    // PR3: lock a revoked agent out of liveness too — otherwise a revoked cert,
+    // rejected at Subscribe, could keep heart-beating and mask the revocation by
+    // staying "online" in the fleet view.
+    if (auto s = reject_revoked_peer(context, "heartbeat"); !s.ok())
+        return s;
 
     // Validate session
     const auto& session_id = request->session_id();
@@ -593,6 +658,45 @@ grpc::Status AgentServiceImpl::Subscribe(
     if (session_id.empty()) {
         spdlog::warn("Subscribe rejected: missing {} metadata", kSessionMetadataKey);
         return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "missing session metadata");
+    }
+
+    // PR3: revoked-cert gate. The presented client leaf IS the agent's mTLS
+    // identity (issued bound to agent_id at enrollment). If its serial is on the
+    // CRL the whole data plane is closed to it — reject before any registry work.
+    // Independent of pending_mu_: reads only the gRPC auth context + ca.db, so it
+    // runs BEFORE the plane lock is taken (no cross-store query under the lock,
+    // gov #1117). No-op when no cert is presented or no checker is wired.
+    if (revocation_checker_) {
+        const std::string peer_pem = extract_peer_cert_pem(*context);
+        if (!peer_pem.empty() && revocation_checker_(peer_pem)) {
+            metrics_
+                .counter("yuzu_grpc_revoked_cert_total",
+                         {{"event", "security"}, {"rpc", "subscribe"}})
+                .increment();
+            const auto ids = extract_peer_identities(*context);
+            const std::string cert_id = ids.empty() ? std::string{} : ids.front();
+            spdlog::warn("Subscribe rejected: revoked client cert (session={}, cert_id={})",
+                         session_id, cert_id);
+            if (audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + cert_id;
+                ev.principal_role = "agent";
+                ev.action = "session.cert_revoked";
+                ev.target_type = "Session";
+                ev.target_id = session_id;
+                ev.detail = "reason=revoked_client_cert cert_id=" + cert_id;
+                ev.source_ip = extract_peer_ip(context->peer());
+                ev.session_id = session_id;
+                ev.result = "denied";
+                if (!audit_store_->log(ev))
+                    signal_grpc_audit_failed(context);
+            }
+            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                "client certificate is revoked");
+        }
     }
 
     std::string agent_id;
@@ -781,7 +885,19 @@ grpc::Status AgentServiceImpl::Subscribe(
             return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
         }
 
-        if (require_client_identity_) {
+        // PR3 gov (enterprise-readiness BLOCKING): GRADUAL identity enforcement.
+        // Enforce the #1118 overlap only when this session actually bound a client
+        // identity at Register (peer_identities non-empty). A session that
+        // registered WITHOUT a client cert — a not-yet-provisioned or a legacy
+        // pre-PR3 agent — has no cryptographic identity to match, and is left on
+        // the pre-PR3 posture (session + #826 peer-IP binding) rather than being
+        // hard-rejected. This makes per-agent mTLS a non-breaking, gradual rollout:
+        // a provisioned agent (bound non-empty) MUST present its leaf (strict — a
+        // no-cert Subscribe yields has_identity_overlap(non-empty, {})==false →
+        // reject, so the stolen-session guard holds), while an unprovisioned agent
+        // keeps working. A future --require-agent-identity flag can harden this to
+        // require a bound identity for ALL agents once a fleet is fully enrolled.
+        if (require_client_identity_ && !it->second.peer_identities.empty()) {
             const auto subscribe_ids = extract_peer_identities(*context);
             if (!has_identity_overlap(it->second.peer_identities, subscribe_ids)) {
                 // event=security is the SIEM-routing tag (see
@@ -878,7 +994,12 @@ grpc::Status AgentServiceImpl::Subscribe(
     }
 
     spdlog::info("Agent subscribe stream opened for {}", agent_id);
-    registry_.set_stream(agent_id, stream, context);
+    // PR3 H-1: stash the presented client leaf so the background revocation sweep
+    // can tear this long-lived stream down if the cert is later revoked (the gate
+    // above only runs once, at establishment). Only captured when a revocation
+    // checker is wired (CA active) so a non-PKI deployment stores nothing.
+    registry_.set_stream(agent_id, stream, context,
+                         revocation_checker_ ? extract_peer_cert_pem(*context) : std::string{});
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
@@ -895,6 +1016,40 @@ grpc::Status AgentServiceImpl::Subscribe(
     pb::CommandResponse resp;
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
+
+        // Guardian side-channel (contract G2 / step 5): UNSOLICITED agent→server
+        // messages over the reserved "__guard__" plugin (drift events). Routed at
+        // the TOP of the loop body — BEFORE the RUNNING/terminal status split — so
+        // they never enter the response store / executions drawer. Status-agnostic:
+        // Guardian events arrive as SUCCESS, so mirroring the in-RUNNING __timing__
+        // intercept would miss them. agent_id is server-stamped from the cert-bound
+        // session, never self-reported.
+        //
+        // The empty-command_id guard is load-bearing (H2 / #1209): only a
+        // command_id-LESS __guard__ message is an unsolicited drift event to
+        // ingest. A __guard__ message that DOES carry a command_id is a SOLICITED
+        // reply (push_rules / get_status) and must NOT be ingested as an event.
+        if (resp.plugin() == "__guard__" && resp.command_id().empty()) {
+            // Guardian side-channel — route through the shared ingest so the
+            // direct and gateway-proxied (GatewayUpstreamServiceImpl::
+            // ForwardGuardianMessage) paths cannot diverge. agent_id is
+            // cert-bound from this Subscribe session. Always skip the
+            // response-store / executions path.
+            if (guaranteed_state_store_)
+                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
+                                         blast_radius_detector_, dex_alert_router_);
+            continue;
+        }
+        // Solicited __guard__ replies (push_rules / reconcile carry a command_id)
+        // are fire-and-forget on this DIRECT Subscribe loop — no server caller
+        // blocks on a __guard__ command_id, so drop them rather than persist a
+        // row-per-agent-per-push in the response store / executions drawer (hp-F1 /
+        // #1209). (For gateway-connected agents the reply is correlated and its
+        // pending entry cleared on the gateway by yuzu_gw_guardian's passthrough,
+        // not here.)
+        if (resp.plugin() == "__guard__")
+            continue;
+
         if (resp.status() == pb::CommandResponse::RUNNING) {
             // Intercept __timing__ metadata
             if (resp.output().starts_with("__timing__|")) {
@@ -1560,12 +1715,20 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
 
 // -- OTA Update RPCs ----------------------------------------------------------
 
-grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
+grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
                                               const pb::CheckForUpdateRequest* request,
                                               pb::CheckForUpdateResponse* response) {
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "CheckForUpdate"}, {"status", "received"}})
         .increment();
+
+    // B-1 (#1239): a revoked agent must not learn the latest version / sha256 /
+    // mandatory flag / rollout eligibility for its agent_id. This is the OTA
+    // sibling of DownloadUpdate's gate above — both agent-initiated update RPCs
+    // now reject a revoked peer. (No-op when no cert is presented or no checker
+    // is wired, matching Heartbeat/DownloadUpdate.)
+    if (auto s = reject_revoked_peer(context, "check_for_update"); !s.ok())
+        return s;
 
     if (!update_registry_) {
         response->set_update_available(false);
@@ -1601,12 +1764,18 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;
 }
 
-grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* /*context*/,
+grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
                                               const pb::DownloadUpdateRequest* request,
                                               grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) {
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "DownloadUpdate"}, {"status", "received"}})
         .increment();
+
+    // PR3: a revoked agent must not be able to pull the agent binary over the OTA
+    // path. (Requiring a *positive* identity here — not just non-revocation — is a
+    // tracked follow-up that pairs with the centralised identity interceptor.)
+    if (auto s = reject_revoked_peer(context, "download_update"); !s.ok())
+        return s;
 
     if (!update_registry_) {
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
@@ -1679,6 +1848,59 @@ AgentServiceImpl::extract_peer_identities(const grpc::ServerContext& context) {
     }
 
     return out;
+}
+
+std::string AgentServiceImpl::extract_peer_cert_pem(const grpc::ServerContext& context) {
+    auto auth_ctx = context.auth_context();
+    if (!auth_ctx || !auth_ctx->IsPeerAuthenticated())
+        return {};
+    const auto vals = auth_ctx->FindPropertyValues(GRPC_X509_PEM_CERT_PROPERTY_NAME);
+    if (vals.empty())
+        return {};
+    return std::string(vals.front().data(), vals.front().size());
+}
+
+grpc::Status AgentServiceImpl::reject_revoked_peer(grpc::ServerContext* context,
+                                                   std::string_view rpc) {
+    if (!context || !revocation_checker_)
+        return grpc::Status::OK;
+    const std::string peer_pem = extract_peer_cert_pem(*context);
+    if (peer_pem.empty() || !revocation_checker_(peer_pem))
+        return grpc::Status::OK; // no cert, foreign cert, or not revoked → allow
+    // event=security is the SIEM-routing tag; rpc distinguishes the surface. A
+    // revoked agent that keeps calling is a decommissioned/compromised-credential
+    // signal. Metric-only (no per-call audit) — Heartbeat is high-frequency and a
+    // flood must not hammer the WAL; the command-channel reject (Subscribe) keeps
+    // the audited row. SOC 2 CC7.2 signal via the counter.
+    metrics_
+        .counter("yuzu_grpc_revoked_cert_total",
+                 {{"event", "security"}, {"rpc", std::string(rpc)}})
+        .increment();
+    spdlog::warn("{} rejected: revoked client certificate", rpc);
+    // gov (compliance CC7.1): emit a forensic audit row for the lower-frequency,
+    // supply-chain-relevant surfaces (download_update) — a revoked agent attempting
+    // an OTA pull is worth a durable record. Heartbeat stays metric-only (high
+    // frequency; a flood must not hammer the WAL). Subscribe keeps its own richer
+    // audited gate, so it does not route through here.
+    if (rpc != "heartbeat" && audit_store_ && audit_store_->is_open()) {
+        const auto ids = extract_peer_identities(*context);
+        const std::string cert_id = ids.empty() ? std::string{} : ids.front();
+        AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "agent:" + cert_id;
+        ev.principal_role = "agent";
+        ev.action = "session.cert_revoked";
+        ev.target_type = "AgentCertificate";
+        ev.target_id = cert_id;
+        ev.detail = std::string("reason=revoked_client_cert rpc=").append(rpc);
+        ev.source_ip = extract_peer_ip(context->peer());
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            signal_grpc_audit_failed(context);
+    }
+    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "client certificate is revoked");
 }
 
 bool AgentServiceImpl::peer_identity_matches_agent_id(const grpc::ServerContext& context,

@@ -9,12 +9,18 @@ option cc_enable_arenas = true;
 // Guaranteed State wire protocol for the Yuzu Guardian engine.
 // See docs/yuzu-guardian-design-v1.1.md § 7.
 //
-// Transport reuses the existing CommandRequest/CommandResponse bidi stream
-// via the reserved plugin name "__guard__" with these actions:
-//   Server -> Agent:  plugin="__guard__" action="push_rules" params=GuaranteedStatePush
-//   Agent  -> Server: plugin="__guard__" action="event"      output=GuaranteedStateEvent
+// Transport reuses the existing CommandRequest/CommandResponse bidi stream via
+// the reserved plugin name "__guard__" with these actions. Each message body is a
+// serialized proto carried in the binary-safe `payload` (bytes) field of the
+// CommandRequest / CommandResponse — NOT the `parameters` map or the `output`
+// string. proto3 string values must be valid UTF-8 and serialized proto bytes are
+// not; `payload` is binary-safe and survives the gateway re-encode. See
+// agent.proto CommandRequest.payload / CommandResponse.payload and
+// docs/guardian-mvp-contract.md G2.
+//   Server -> Agent:  plugin="__guard__" action="push_rules"  payload=GuaranteedStatePush
+//   Agent  -> Server: plugin="__guard__" action="event"       payload=GuaranteedStateEvent
 //   Server -> Agent:  plugin="__guard__" action="get_status"
-//   Agent  -> Server: plugin="__guard__" action="status"     output=GuaranteedStateStatus
+//   Agent  -> Server: plugin="__guard__" action="status"      payload=GuaranteedStateStatus
 
 message GuaranteedStateRule {
   string rule_id = 1;
@@ -22,8 +28,27 @@ message GuaranteedStateRule {
   string yaml_source = 3;       // Verbatim source, authoritative form
   uint64 version = 4;
   bool enabled = 5;
-  string enforcement_mode = 6;  // "enforce" | "audit" | "disabled"
-  bytes signature = 7;          // HMAC-SHA256 over yaml_source (see design §11.2)
+  string enforcement_mode = 6;  // "enforce" | "audit" — disable is enabled=false (field 5),
+                                // NOT a third mode value (M3 / #1209). Store + REST validate
+                                // mode in {enforce, audit}; `enabled` is the on/off gate.
+  bytes signature = 7;          // HMAC-SHA256 over the canonical JSON (contract G3, deferred)
+
+  // Structured, typed enforcement content — the agent's source of truth (it never
+  // parses yaml_source). Each block is {type, map<string,string> params}; the param
+  // shape is defined by the server-side JSON-Schema registry, not the proto.
+  // See docs/guardian-mvp-contract.md decisions 1 & 3.
+  GuardianSpecBlock spark       = 8;   // trigger / detection mechanism
+  GuardianSpecBlock assertion   = 9;   // desired-state check
+  GuardianSpecBlock remediation = 10;  // alert|remediate (action + method in params)
+}
+
+// A typed {type, params} block — the unit of a Guard's spark/assertion/remediation.
+// `type` is the discriminator the agent dispatches on; `params` carries typed values
+// by key (e.g. hive/key/value_name/value_type/expected). The param schema lives in the
+// server-side JSON-Schema registry (the agent never sees it). See contract decision 3.
+message GuardianSpecBlock {
+  string type = 1;
+  map<string, string> params = 2;
 }
 
 message GuaranteedStatePush {
@@ -33,6 +58,13 @@ message GuaranteedStatePush {
 }
 
 message GuaranteedStateEvent {
+  // Normally the id of the Guardian rule that produced this event. The reserved
+  // sentinel "__observation__" marks a RULELESS DEX observation (e.g. a process
+  // crash) not tied to any rule: such an event is distinguished from rule-bound
+  // drift by this sentinel + `event_type` (the DEX discriminator — there is
+  // deliberately no separate category field). Server ingest finds no rule for the
+  // sentinel, so its severity-enrich is a no-op and the per-(agent,rule) census is
+  // untouched (the event_type is not a compliance state). See agent crash_event.hpp.
   string rule_id = 1;
   string rule_name = 2;
   string event_type = 3;        // e.g. "drift.detected" | "drift.remediated"
@@ -52,6 +84,25 @@ message GuaranteedStateEvent {
   double drift_rate = 16;
   string competing_process = 17;
   string platform = 18;         // "windows" | "linux" | "macos"
+
+  // Agent-generated, stable across retries — the dedup key for the at-least-once
+  // event journal (contract G6/N1). The server dedups inserts by event_id.
+  string event_id = 19;
+
+  // Structured, machine-readable detail for this event — JSON, keyed by
+  // event_type (route a'). For "process.crashed" (a DEX observation) the object
+  // carries process / pid / kind / exception_code / symbolic / faulting_module
+  // (NO image_path — data-minimisation, mirrors the parsed-not-sent rule). The
+  // human-readable `detected_value` (field 7) is UNCHANGED and kept alongside.
+  // Deliberately ONE generic field, not per-type typed fields, so the wire
+  // contract stays frozen as new observation types arrive (each defines its own
+  // JSON shape); the DEX read model projects this into indexed columns
+  // server-side. Empty for events with no structured detail (e.g. plain drift).
+  //
+  // Gateway-safe: the event travels as opaque bytes in CommandRequest.payload, so
+  // the gateway forwards this field without decoding it — no gpb regen needed
+  // (there is no guaranteed_state_pb module on the Erlang side).
+  string detail_json = 20;
 }
 
 message GuaranteedStateStatus {

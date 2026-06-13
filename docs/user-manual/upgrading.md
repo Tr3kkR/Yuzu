@@ -10,12 +10,96 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
+
+## ⚠️ Breaking: `--mfa-enforcement` now enforces
+
+Releases before this one accepted `--mfa-enforcement=admin-only` and
+`--mfa-enforcement=required` but treated them as **no-ops** (the parser
+accepted the value for forward-compat and the server emitted a startup
+`WARN`). **This release makes them enforce.** If you staged the flag based
+on that prior documentation, enforcement goes live the instant you start
+the new build.
+
+What changes on upgrade if the flag is set to `admin-only` or `required`:
+
+- An **un-enrolled** user covered by the mode can no longer log in directly.
+  `POST /login` returns a 202 `mfa_enrollment_required` challenge and the
+  user must complete TOTP enrollment (scan QR → enter first code at
+  `POST /login/mfa/enroll`) before a session is minted. This is a no-lockout
+  bootstrap, **but** it requires the user to enroll at their next login.
+- The startup log line for non-default modes changes from `WARN` (no-op) to
+  `INFO` (enforcement active).
+- An operator can no longer disable their own MFA while the mode protects
+  their role.
+
+**Before upgrading with the flag set, do ONE of:**
+
+1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
+   users enroll (Settings → Multi-Factor Authentication), *then* set
+   `admin-only`/`required` and restart. or
+2. Upgrade with the flag set and accept that affected un-enrolled users will
+   be walked through enrollment on their next login.
+
+**SSO / OIDC pre-flight (required reading if you use SSO):** under
+`required` (and `admin-only` for admin SSO users), OIDC sessions are
+MFA-gated by the IdP's `amr` claim — an SSO login the IdP did **not** MFA
+is blocked from high-risk endpoints (it must re-authenticate via SSO),
+symmetric with a local user being forced to enrol. Yuzu cannot mint a
+second factor for an external identity, so **before enabling
+`required`/`admin-only` with SSO you MUST verify your IdP asserts an `amr`
+claim containing a recognized MFA method** (Entra: `mfa`; others:
+`otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
+unable to reach high-risk endpoints — recoverable by restarting in
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md`). Under `optional`,
+no IdP `amr` configuration is required (SSO sessions pass the gate).
+
+**Single-admin deployments:** do not first-boot a fresh single-admin
+deployment straight into `required`. Enroll the admin under `optional` first,
+then switch. If you do start with `required`, the admin must complete
+login-time enrollment within `--mfa-login-pending-secs` (default 120s); if
+the token expires, restart with `optional`, log in, enroll, then re-enable.
+
+**Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
+admin can't enroll): restart the server with `--mfa-enforcement=optional`
+(this re-seeds the in-memory config), log in, resolve enrollment, then
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
+
+## ⚠️ Breaking: server generates default TLS certificates on first boot (v0.13.0)
+
+Before v0.13.0 the server **refused to start** without operator-provided certs
+(or `--no-tls`/`--no-https`). From v0.13.0, when a TLS surface has no certs the
+server **auto-generates a per-install ECDSA CA + leaf certs** on first boot and
+serves encrypted with no operator action.
+
+Impact by prior configuration:
+
+| Prior startup flags | After upgrade |
+|---|---|
+| `--cert`/`--key` (+ `--https-cert`/`--https-key`) supplied | No change — operator certs always win; defaults are never generated for a supplied surface. |
+| `--no-tls --no-https` (plaintext dev) | No change — both surfaces disabled; no certs generated. |
+| `--no-tls` only (HTTPS previously errored without certs) | **HTTPS now serves an auto-generated default cert** instead of failing. The agent surface stays plaintext. |
+| No cert flags (previously refused to start) | **Now starts, encrypted, on default certs**, with a loud banner. |
+
+What to expect / do:
+
+- **Browsers show an untrusted-issuer warning** for the dashboard until you trust
+  the per-install CA (`<ca-dir>/default-ca.pem`, default `/etc/yuzu/certs`) or
+  replace the cert with `--https-cert`/`--https-key`. The connection is encrypted;
+  only issuer verification is missing.
+- **Agents:** while on default certs the agent listener is encrypted but does
+  **not require** client certs (per-agent mTLS arrives in a later release).
+  Agents that previously connected over plaintext must switch to TLS — point them
+  at the CA with `--ca-cert <ca-dir>/default-ca.pem`.
+- **To keep the legacy refuse-to-start behaviour**, pass `--no-default-certs`.
+- **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
+  — losing the CA key forces a full fleet re-enrollment.
+- Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
 
 ## Upgrade Order
 
@@ -34,10 +118,17 @@ Before upgrading any component:
 - [ ] Back up all data (see [Server Administration](server-administration.md))
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
+  - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
 - [ ] Plan a maintenance window (upgrades take < 5 minutes per component)
+- [ ] **Review new opt-in telemetry:** this release adds DEX per-application
+  performance sampling (`procperf`), a new usage-class data category. It is
+  **off by default** (no action needed to keep it off) — but if you intend to
+  enable it for an EU workforce, treat it as a works-council co-determination
+  trigger. See the *DEX per-application sampling* upgrade note in
+  [Server Administration](server-admin.md#upgrade-notes).
 
 ## Upgrading the Server
 
@@ -50,6 +141,14 @@ sudo systemctl stop yuzu-server
 # 2. Back up data
 sudo cp /var/lib/yuzu/*.db /var/lib/yuzu/backup/
 sudo cp /etc/yuzu/*.cfg /var/lib/yuzu/backup/
+# ... and the Postgres database, if provisioned. The DSN lives only in the
+# root-only env file (NOT in interactive shells) — load it, and keep the
+# password off the argv via PGPASSWORD. Full recipe + restore procedure:
+# server-admin.md § PostgreSQL Substrate.
+sudo sh -c '. /etc/yuzu/yuzu-server.env
+  export PGPASSWORD="$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^[a-z]+://[^:/@]*:([^@]*)@.*\$!\1!")"
+  pg_dump --format=custom --file=/var/lib/yuzu/backup/yuzu-pg.dump \
+    "$(printf "%s\n" "$YUZU_POSTGRES_DSN" | sed -E "s!^([a-z]+://[^:/@]*):[^@]*@!\1@!")"'
 
 # 3. Replace the binary
 sudo cp yuzu-server /usr/local/bin/yuzu-server
@@ -93,9 +192,16 @@ Schema migrations execute automatically during the first `up` with the new image
 mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
 docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
   tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+
+# PostgreSQL state (the postgres-data volume) — pg_dump is consistent
+# against a LIVE database, no stop required:
+docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+  > "yuzu-pg-$(date +%F).dump"
 ```
 
-> **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap.
+> **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap. The `pg_dump` half has no such caveat — logical dumps are transactionally consistent by construction. **Never** back up Postgres by `tar`-ing the `postgres-data` volume while the database is running; a torn copy of `pg_wal/` is unrecoverable, which is why the procedure above dumps through the database instead.
+
+> **Restore-pairing (ADR-0010 — forward reference):** once envelope-encrypted secrets land, the Postgres dump contains ciphertext + wrapped DEKs only and is unusable without the matching `KeyProvider` keys directory. Back up and restore the two **as a pair** — full procedure in [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate), key-management runbook tracked in #1341.
 
 **Rollback if a migration fails** (Docker):
 
@@ -106,6 +212,10 @@ docker compose -f docker-compose.reference.yml down server
 # 2. Restore the previous backup over the existing volume
 docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
   sh -c 'rm -rf /data/* && tar xzf /backup/yuzu-data-YYYY-MM-DD.tar.gz -C /data'
+
+# 2b. Restore the Postgres dump (postgres container still running)
+docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+  --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 
 # 3. Pin the previous release
 export YUZU_VERSION=0.9.0

@@ -43,13 +43,21 @@
          proxy_register/1,
          proxy_inventory/1,
          notify_stream_status/4,
+         forward_guardian_message/2,
          circuit_state/0]).
+-export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(MAX_NOTIFY_INFLIGHT, 10).
+%% Dedicated in-flight cap for Guardian drift-event forwards, separate from
+%% MAX_NOTIFY_INFLIGHT so a drift storm can't starve stream-status notifies
+%% and vice-versa. Larger than notify because drift events carry enforcement
+%% evidence; still bounded (NFR — no unbounded process spawn under a slow
+%% upstream). Overflow is dropped best-effort; durable buffering is Guardian A3.
+-define(MAX_GUARDIAN_INFLIGHT, 50).
 -define(DEFAULT_CB_THRESHOLD, 5).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
@@ -67,7 +75,9 @@
     cb_timer        :: reference() | undefined,
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
-    replay_queue    :: [{binary(), map()}]  %% agents still to re-proxy ([] = idle)
+    replay_queue    :: [{binary(), map()}],  %% agents still to re-proxy ([] = idle)
+    %% Guardian drift-event forwards in flight (bounded by MAX_GUARDIAN_INFLIGHT)
+    guardian_pids   :: #{pid() => true}
 }).
 
 %%%===================================================================
@@ -91,6 +101,20 @@ proxy_inventory(InventoryReport) ->
 -spec notify_stream_status(binary(), binary() | undefined, connected | disconnected, binary()) -> ok.
 notify_stream_status(AgentId, SessionId, Event, PeerAddr) ->
     gen_server:cast(?SERVER, {notify_stream_status, AgentId, SessionId, Event, PeerAddr}).
+
+%% @doc Forward an unsolicited Guardian side-channel CommandResponse
+%% (plugin="__guard__") upstream to the C++ control plane via the
+%% GatewayUpstream.ForwardGuardianMessage RPC.
+%%
+%% Fire-and-forget (cast): this is invoked from the agent gen_statem's
+%% stream_data handler and MUST NOT block it. Best-effort delivery — the
+%% message is dropped (with a counter) if the circuit is open or the dedicated
+%% in-flight budget is exhausted; durable buffering is Guardian A3. AgentId is
+%% gateway-asserted by the caller (the agent's bound stream identity) and is
+%% NEVER taken from the forwarded frame.
+-spec forward_guardian_message(binary(), map()) -> ok.
+forward_guardian_message(AgentId, ResponseFrame) ->
+    gen_server:cast(?SERVER, {forward_guardian_message, AgentId, ResponseFrame}).
 
 %% @doc Query the current circuit breaker state (for health checks).
 -spec circuit_state() -> closed | open | half_open.
@@ -121,7 +145,8 @@ init([]) ->
         cb_cur_timeout  = BaseTimeout,
         cb_timer        = undefined,
         replay_spacing  = ReplaySpacing,
-        replay_queue    = []
+        replay_queue    = [],
+        guardian_pids   = #{}
     }}.
 
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->
@@ -179,6 +204,43 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
                         end
                     end),
                     {noreply, State#state{notify_pids = Pids#{Pid => true}}}
+            end
+    end;
+
+handle_cast({forward_guardian_message, AgentId, ResponseFrame},
+            #state{guardian_pids = GPids, cb_state = CbState} = State) ->
+    %% Best-effort, like notify_stream_status: skip if the circuit is open
+    %% (upstream known-down) or the dedicated in-flight budget is full. Each
+    %% accepted message is sent on its own monitored process so a slow upstream
+    %% can't block the gen_server, and the count is bounded.
+    case CbState of
+        open ->
+            logger:debug("Dropping guardian message for ~s (circuit open)", [AgentId]),
+            telemetry:execute([yuzu, gw, guardian, forward_dropped],
+                              #{count => 1}, #{reason => <<"circuit_open">>}),
+            {noreply, State};
+        _ ->
+            case map_size(GPids) >= ?MAX_GUARDIAN_INFLIGHT of
+                true ->
+                    logger:debug("Dropping guardian message for ~s (at capacity)", [AgentId]),
+                    telemetry:execute([yuzu, gw, guardian, forward_dropped],
+                                      #{count => 1}, #{reason => <<"at_capacity">>}),
+                    {noreply, State};
+                false ->
+                    %% Accepted for delivery — count it so the drop counters
+                    %% have a denominator (drop-rate SLO). See yuzu_gw_telemetry.
+                    telemetry:execute([yuzu, gw, guardian, forward_accepted],
+                                      #{count => 1}, #{}),
+                    Request = #{agent_id => AgentId, response => ResponseFrame},
+                    {Pid, _MonRef} = spawn_monitor(fun() ->
+                        case do_rpc('ForwardGuardianMessage', Request, guardian) of
+                            {ok, _} -> ok;
+                            {error, Reason} ->
+                                logger:warning("Failed to forward guardian message for ~s: ~p",
+                                               [AgentId, Reason])
+                        end
+                    end),
+                    {noreply, State#state{guardian_pids = GPids#{Pid => true}}}
             end
     end;
 
@@ -279,8 +341,11 @@ handle_info(circuit_half_open, State) ->
     {noreply, State#state{cb_state = half_open, cb_timer = undefined}};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
-            #state{notify_pids = Pids} = State) ->
-    {noreply, State#state{notify_pids = maps:remove(Pid, Pids)}};
+            #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
+    %% A finished notify OR guardian-forward worker. Remove from whichever set
+    %% holds it (maps:remove on an absent key is a no-op, so both are safe).
+    {noreply, State#state{notify_pids = maps:remove(Pid, Pids),
+                          guardian_pids = maps:remove(Pid, GPids)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -421,7 +486,9 @@ rpc_types('ProxyRegister')      -> {'yuzu.agent.v1.RegisterRequest',
 rpc_types('ProxyInventory')     -> {'yuzu.agent.v1.InventoryReport',
                                     'yuzu.agent.v1.InventoryAck'};
 rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',
-                                    'yuzu.gateway.v1.StreamStatusAck'}.
+                                    'yuzu.gateway.v1.StreamStatusAck'};
+rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest',
+                                        'yuzu.gateway.v1.ForwardGuardianAck'}.
 
 do_rpc(Method, Request, Tag) ->
     {InputType, OutputType} = rpc_types(Method),
@@ -450,11 +517,57 @@ do_rpc(Method, Request, Tag) ->
             logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, Message]),
             {error, {Status, Message}};
         {error, Reason} ->
+            %% R-3 (#1243): emit a DISTINCT metric for a TLS handshake failure
+            %% (cert expiry / CA rotation / wrong-SAN / unreadable cert) so it is
+            %% not lost in the generic rpc_error → circuit-open noise. The generic
+            %% rpc_error still fires too (the circuit breaker keys off it).
+            case classify_tls_error(Reason) of
+                {true, Kind} ->
+                    telemetry:execute([yuzu, gw, upstream, tls_handshake_failure],
+                                      #{count => 1},
+                                      #{rpc_name => atom_to_binary(Tag, utf8), kind => Kind}),
+                    logger:warning("Upstream RPC ~s TLS handshake failure (~s): ~p",
+                                   [Method, Kind, Reason]);
+                {false, _} ->
+                    ok
+            end,
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Reason}),
             {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
+    end.
+
+%% @private Classify whether an upstream transport error is a TLS handshake
+%% failure, returning {true, KindBin} (the alert/cause, for the metric label) or
+%% {false, _}. gun/ssl surface these as nested {tls_alert, {Alert,_}} or
+%% {options,_} terms (e.g. {shutdown,{tls_alert,{unknown_ca,_}}}); search a
+%% bounded depth so an arbitrary error term can't loop. R-3 (#1243).
+-spec classify_tls_error(term()) -> {boolean(), binary()}.
+classify_tls_error(Term) ->
+    classify_tls_error(Term, 4).
+
+classify_tls_error(_Term, 0) ->
+    {false, <<>>};
+classify_tls_error({tls_alert, {Alert, _}}, _D) when is_atom(Alert) ->
+    {true, atom_to_binary(Alert, utf8)};
+classify_tls_error({tls_alert, Alert}, _D) when is_atom(Alert) ->
+    {true, atom_to_binary(Alert, utf8)};
+classify_tls_error({options, _}, _D) ->
+    {true, <<"bad_tls_options">>};
+classify_tls_error(T, D) when is_tuple(T) ->
+    classify_tls_error_list(tuple_to_list(T), D);
+classify_tls_error(L, D) when is_list(L) ->
+    classify_tls_error_list(L, D);
+classify_tls_error(_Other, _D) ->
+    {false, <<>>}.
+
+classify_tls_error_list([], _D) ->
+    {false, <<>>};
+classify_tls_error_list([H | Rest], D) ->
+    case classify_tls_error(H, D - 1) of
+        {true, _} = R -> R;
+        {false, _}    -> classify_tls_error_list(Rest, D)
     end.
 
 ensure_binary(undefined) -> <<>>;

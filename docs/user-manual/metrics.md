@@ -22,32 +22,32 @@ curl -s 'http://localhost:8080/metrics'
 **Example response (excerpt):**
 
 ```
-# HELP yuzu_server_http_requests_total Total HTTP requests handled
-# TYPE yuzu_server_http_requests_total counter
-yuzu_server_http_requests_total{method="GET",status="200"} 1542
-yuzu_server_http_requests_total{method="POST",status="200"} 87
-yuzu_server_http_requests_total{method="GET",status="404"} 12
+# HELP yuzu_http_requests_total Total HTTP requests handled
+# TYPE yuzu_http_requests_total counter
+yuzu_http_requests_total{method="GET",status="200"} 1542
+yuzu_http_requests_total{method="POST",status="200"} 87
+yuzu_http_requests_total{method="GET",status="404"} 12
 
-# HELP yuzu_server_http_request_duration_seconds HTTP request latency
-# TYPE yuzu_server_http_request_duration_seconds histogram
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.005"} 920
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.01"} 1100
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.025"} 1350
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.05"} 1450
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.1"} 1500
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.25"} 1530
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.5"} 1540
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="1.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="2.5"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="5.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="10.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="+Inf"} 1542
-yuzu_server_http_request_duration_seconds_sum{method="GET"} 12.345
-yuzu_server_http_request_duration_seconds_count{method="GET"} 1542
+# HELP yuzu_command_duration_seconds Command execution latency in seconds
+# TYPE yuzu_command_duration_seconds histogram
+yuzu_command_duration_seconds_bucket{le="0.005"} 12
+yuzu_command_duration_seconds_bucket{le="0.01"} 47
+yuzu_command_duration_seconds_bucket{le="0.025"} 180
+yuzu_command_duration_seconds_bucket{le="0.05"} 540
+yuzu_command_duration_seconds_bucket{le="0.1"} 980
+yuzu_command_duration_seconds_bucket{le="0.25"} 1320
+yuzu_command_duration_seconds_bucket{le="0.5"} 1480
+yuzu_command_duration_seconds_bucket{le="1.0"} 1530
+yuzu_command_duration_seconds_bucket{le="2.5"} 1541
+yuzu_command_duration_seconds_bucket{le="5.0"} 1542
+yuzu_command_duration_seconds_bucket{le="10.0"} 1542
+yuzu_command_duration_seconds_bucket{le="+Inf"} 1542
+yuzu_command_duration_seconds_sum 198.74
+yuzu_command_duration_seconds_count 1542
 
-# HELP yuzu_server_connected_agents Number of currently connected agents
-# TYPE yuzu_server_connected_agents gauge
-yuzu_server_connected_agents 47
+# HELP yuzu_agents_connected Number of currently connected agents
+# TYPE yuzu_agents_connected gauge
+yuzu_agents_connected 47
 ```
 
 ## Naming conventions
@@ -56,10 +56,17 @@ All Yuzu metrics follow a consistent naming scheme.
 
 | Prefix | Source | Examples |
 |---|---|---|
-| `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
+| `yuzu_server_` | Server process | `yuzu_server_uptime_seconds`, `yuzu_server_open_connections` |
 | `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
-| `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
+| `yuzu_agent_` | Agent process | `yuzu_agent_commands_executed_total`, `yuzu_agent_uptime_seconds` |
 | `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
+
+## Internal-CA / default-certificate metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
 ## Fleet visualization metrics
 
@@ -241,7 +248,7 @@ successfully:
 curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.labels.job == "yuzu-server")'
 
 # Query a metric
-curl -s 'http://localhost:9090/api/v1/query?query=yuzu_server_connected_agents' | jq .
+curl -s 'http://localhost:9090/api/v1/query?query=yuzu_agents_connected' | jq .
 ```
 
 ## Real-time event stream
@@ -293,6 +300,51 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+## Fleet performance gauges (DEX)
+
+Published on every fleet-health sweep (~15 s). A metric nobody reported is
+**absent**, never zero; values are validated server-side (forged non-finite /
+out-of-range readings are rejected).
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
+| `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
+| `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |
+| `yuzu_fleet_perf_disk_lat_ms{stat}` | gauge | Fleet per-IO disk service time (ms), same `stat` labels |
+
+**Per-cohort export (opt-in)** — published only when a cohort export tag key
+is configured (Settings → DEX alerts; `runtime_config` key
+`dex_cohort_export_key`):
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_perf_cohort_cpu_pct{cohort,stat}` | gauge | Per-cohort CPU busy % |
+| `yuzu_fleet_perf_cohort_commit_pct{cohort,stat}` | gauge | Per-cohort memory commit % |
+| `yuzu_fleet_perf_cohort_disk_lat_ms{cohort,stat}` | gauge | Per-cohort disk latency (ms) |
+| `yuzu_fleet_perf_cohort_reporting{cohort}` | gauge | Reporting devices per exported cohort |
+| `yuzu_fleet_perf_cohort_clipped` | gauge | Exportable cohorts dropped by the top-50 cardinality cap (a measured 0 when nothing was cut; **absent when the export is off** — use this gauge, not `absent()` on the cohort families, as the export-liveness probe) |
+
+Cohorts under 10 reporting devices and cohorts beyond the top-50-by-population
+cap never export; devices without the key export as `cohort="(untagged)"`.
+Families clear on every sweep — series go absent, never stale. Alerting
+recipe: `max_over_time(yuzu_fleet_perf_cohort_clipped[1m])` for liveness,
+`yuzu_fleet_perf_cohort_clipped > 0 for 5m` for cap pressure; with the ~15 s
+sweep cadence, scrape at ≤10 s intervals when the export is enabled. See the
+label-exposure note under Security considerations before choosing a key.
+
+## Guardian metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_guardian_baselines_total` | gauge | Number of persisted Guardian Baselines. Refreshed on every `/metrics` scrape. |
+| `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
+| `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
+| `yuzu_server_guardian_proj_failures_total` | gauge | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
+| `yuzu_server_guardian_observations_reaped_total` | gauge | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). |
+
+Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
+
 ## Management group metrics
 
 The server exposes two gauges for management group telemetry. These are
@@ -334,38 +386,42 @@ yuzu_server_management_groups_total == 0
 
 ```promql
 # Total connected agents
-yuzu_server_connected_agents
+yuzu_agents_connected
 
 # Connected agents by OS
-count by (os) (yuzu_agent_info)
+sum by (os) (yuzu_fleet_agents_by_os)
 
 # Connected agents by architecture
-count by (arch) (yuzu_agent_info)
+sum by (arch) (yuzu_fleet_agents_by_arch)
 ```
 
 ### Request performance
 
 ```promql
 # Request rate (per second, 5-minute window)
-rate(yuzu_server_http_requests_total[5m])
+rate(yuzu_http_requests_total[5m])
 
-# 95th percentile latency
-histogram_quantile(0.95, rate(yuzu_server_http_request_duration_seconds_bucket[5m]))
+# 95th percentile command-execution latency
+# (the server emits no general HTTP request-duration histogram; command duration
+#  is its primary latency SLI — see also auth-login and viz-topology histograms)
+histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))
 
 # Error rate (percentage of 5xx responses)
-sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-/ sum(rate(yuzu_server_http_requests_total[5m])) * 100
+sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+/ sum(rate(yuzu_http_requests_total[5m])) * 100
 ```
 
 ### Agent health
 
 ```promql
-# Agents with heartbeat latency over 5 seconds
-yuzu_agent_heartbeat_latency_seconds > 5
+# Healthy agents reported via heartbeat status_tags.
+# (Agents have no Prometheus endpoint, so there is no per-agent heartbeat-latency
+#  series; the server re-exports fleet health as this gauge.)
+yuzu_fleet_agents_healthy
 
 # Plugin execution failure rate by plugin
-sum by (plugin) (rate(yuzu_agent_plugin_executions_total{status="failure"}[5m]))
-/ sum by (plugin) (rate(yuzu_agent_plugin_executions_total[5m])) * 100
+sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
+/ sum by (plugin) (rate(yuzu_agent_commands_executed_total[5m])) * 100
 ```
 
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
@@ -406,26 +462,34 @@ increase(yuzu_agent_plugin_rejected_total{reason="reserved_name"}[5m]) > 0
 
 ```promql
 # Instructions completed per minute
-rate(yuzu_server_instructions_completed_total[5m]) * 60
+rate(yuzu_commands_completed_total[5m]) * 60
 
 # Average instruction duration
-rate(yuzu_server_instruction_duration_seconds_sum[5m])
-/ rate(yuzu_server_instruction_duration_seconds_count[5m])
+rate(yuzu_command_duration_seconds_sum[5m])
+/ rate(yuzu_command_duration_seconds_count[5m])
 ```
 
 ## Grafana integration
 
-Import the Prometheus data source into Grafana and use the PromQL queries
-above to build dashboards. A typical Yuzu dashboard includes:
+Yuzu ships pre-built Grafana dashboards. The operational set lives in
+`deploy/grafana/` (`yuzu-dashboard`, `yuzu-fleet-dashboard`, and
+`yuzu-gateway-dashboard` over Prometheus, plus `yuzu-analytics-dashboard` over
+ClickHouse) and is auto-provisioned by the UAT / full-UAT rigs; a standalone
+Prometheus import template is at `docs/grafana/yuzu-overview.json`. See
+[`docs/grafana/README.md`](../grafana/README.md) for the full list and import
+instructions.
+
+To build your own, import the Prometheus data source into Grafana and use the
+PromQL queries above. A typical Yuzu dashboard includes:
 
 | Panel | Visualization | Query |
 |---|---|---|
-| Connected agents | Stat / single value | `yuzu_server_connected_agents` |
-| Agents by OS | Pie chart | `count by (os) (yuzu_agent_info)` |
-| Request rate | Time series | `rate(yuzu_server_http_requests_total[5m])` |
-| Request latency (p95) | Time series | `histogram_quantile(0.95, ...)` |
+| Connected agents | Stat / single value | `yuzu_agents_connected` |
+| Agents by OS | Pie chart | `sum by (os) (yuzu_fleet_agents_by_os)` |
+| Request rate | Time series | `rate(yuzu_http_requests_total[5m])` |
+| Command latency (p95) | Time series | `histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))` |
 | Error rate | Time series | `5xx / total * 100` |
-| Instruction throughput | Time series | `rate(yuzu_server_instructions_completed_total[5m])` |
+| Instruction throughput | Time series | `rate(yuzu_commands_completed_total[5m])` |
 
 ### Alerting rules
 
@@ -436,7 +500,7 @@ groups:
   - name: yuzu
     rules:
       - alert: YuzuNoAgentsConnected
-        expr: yuzu_server_connected_agents == 0
+        expr: yuzu_agents_connected == 0
         for: 5m
         labels:
           severity: critical
@@ -445,24 +509,22 @@ groups:
 
       - alert: YuzuHighErrorRate
         expr: >
-          sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-          / sum(rate(yuzu_server_http_requests_total[5m])) > 0.05
+          sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(yuzu_http_requests_total[5m])) > 0.05
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Yuzu server error rate above 5%"
 
-      - alert: YuzuHighLatency
-        expr: >
-          histogram_quantile(0.95,
-            rate(yuzu_server_http_request_duration_seconds_bucket[5m])
-          ) > 2.0
-        for: 10m
+      - alert: YuzuHighCommandLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server p95 latency above 2 seconds"
+          summary: "Command p99 latency exceeds 10 seconds"
 ```
 
 ## Security considerations
@@ -476,6 +538,7 @@ The `/metrics` endpoint exposes aggregated fleet composition data through gauge 
 | `yuzu_fleet_agents_by_os` | `os` | OS distribution (windows, linux, darwin counts) |
 | `yuzu_fleet_agents_by_arch` | `arch` | CPU architecture distribution (x64, arm64 counts) |
 | `yuzu_fleet_agents_by_version` | `version` | Agent version inventory |
+| `yuzu_fleet_perf_cohort_*` | `cohort` | **Operator tag values** (only when the opt-in cohort export key is set — Settings → DEX alerts). Cohort labels carry the raw tag values of the exported key; if those values encode personnel-relevant or confidential groupings (`department`, `cost-center`, owner names…), they flow to whatever scrapes `/metrics`, including third-party monitoring stacks. **Choose export keys whose values are non-sensitive organizational identifiers** (hardware model, image name). |
 
 This data reveals your fleet's attack surface to anyone who can reach the metrics endpoint. An attacker who learns that 80% of your fleet runs Windows x64 with agent v0.4.2 can target known vulnerabilities for that specific combination.
 
@@ -494,4 +557,3 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 |---|---|---|
 | System health dashboard | Phase 7, Issue 7.2 | Server CPU, memory, connection counts, queue depths |
 | Topology map | Phase 7 | Visual map of server nodes, gateways, and agent counts |
-| Grafana dashboard templates | Planned | Pre-built JSON dashboard files in `docs/grafana/` |

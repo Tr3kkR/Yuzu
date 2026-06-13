@@ -22,6 +22,11 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "ca_routes.hpp"
+#include "ca_store.hpp"
+#include "default_certs.hpp"
+#include "key_provider.hpp"
+#include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
@@ -40,15 +45,27 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "baseline_store.hpp"
+#include "guardian_push_builder.hpp"
+#include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_matcher.hpp"
+#include "result_set_store.hpp"
+#include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "guardian_routes.hpp"
+#include "dex_alert_router.hpp"
+#include "dex_blast_radius.hpp"
+#include "dex_perf_rules.hpp"
+#include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -134,10 +151,12 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <ranges>
 #include <set>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -190,6 +209,35 @@ namespace yuzu::server {
 
 namespace detail {
 
+// RAII guard that zeroes a std::string's bytes on scope exit (incl. exception
+// unwind). Used wherever a private key is transiently materialised — the CA
+// signing + CRL paths — so the crown jewel is not left in freed heap. (DRYs the
+// formerly-duplicated local KeyZero structs — gov cpp-expert SHOULD.)
+struct ScopedKeyZero {
+    std::string& s;
+    ~ScopedKeyZero() { yuzu::secure_zero(s); }
+};
+
+// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+// detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
+// Register gate — never charset-checked — and is audited verbatim. Without this,
+// an agent_id like `x via=direct` could forge the very `via=` discriminator
+// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
+// every control byte and structural delimiter (space, '=', ',') with '_'; the
+// identity is preserved verbatim in its own audit columns (principal/target_id)
+// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -218,6 +266,13 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_default_certs_active",
+                          "1 when running with built-in per-install default certificates, else 0",
+                          "gauge");
+        metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
+                          "Unix timestamp (seconds) at which a server certificate expires, by "
+                          "cert label. The yuzu-tls alert rules fire on (value - time()) < window.",
+                          "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
         metrics_.describe("yuzu_commands_dispatched_total",
@@ -234,6 +289,65 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
+                          "Windows agents (DEX enabled) reporting their DEX signal observer is not "
+                          "fully healthy (no channel armed, or a channel subscription dropped at "
+                          "runtime) — >0 means reliability telemetry is off or degraded on that "
+                          "many endpoints. (Per-channel partial-arm granularity is a follow-up; "
+                          "today this is the agent's own health flag.)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_dex_observed_total",
+                          "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
+                          "boot reports, …; sum of agent-reported counts since each agent "
+                          "started)", "gauge");
+        // D3 blast-radius detector observability (gov SRE OBS-1 / compliance S1).
+        metrics_.describe("yuzu_server_dex_blast_radius_incidents_total",
+                          "Fleet-incident alerts fired (≥min_devices distinct devices, same "
+                          "obs_type+subject, within the window)", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_fires_dropped_total",
+                          "Incident fires suppressed by the global per-minute fan-out rate cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_entries_dropped_total",
+                          "Sightings dropped because the global tracked-entry memory budget was "
+                          "exhausted", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_evicted_total",
+                          "(obs_type,subject) pairs LRU-evicted to admit a new pair at the cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
+                          "Current count of tracked (obs_type,subject) pairs", "gauge");
+        // F2a PR3: per-cohort fleet perf gauges (exported only when the operator
+        // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
+        metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
+                          "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
+                          "cohorts of the configured export tag key, ≥10 reporting devices)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
+                          "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_disk_lat_ms",
+                          "Per-cohort disk per-IO service time ms (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_reporting",
+                          "Devices contributing perf samples per exported cohort", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_clipped",
+                          "Exportable cohorts dropped by the top-50 cardinality cap this sweep "
+                          "(0 = nothing clipped; absent = export disabled)", "gauge");
+        // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
+        metrics_.describe("yuzu_server_dex_alert_fired_total",
+                          "Operator-routed per-signal alerts fired (notification + dex.signal "
+                          "webhook event)", "counter");
+        metrics_.describe("yuzu_server_dex_alert_delivery_failed_total",
+                          "Routed alerts whose sink (notification/webhook) threw — fired but not "
+                          "delivered; the cooldown is already armed so the alert is lost until the "
+                          "next episode", "counter");
+        metrics_.describe("yuzu_server_dex_alert_suppressed_total",
+                          "Routed sightings silenced by the per-(type,agent) cooldown", "counter");
+        metrics_.describe("yuzu_server_dex_alert_dropped_total",
+                          "Routed alerts dropped by the global per-minute fan-out cap", "counter");
+        metrics_.describe("yuzu_server_dex_alert_cooldowns_evicted_total",
+                          "Cooldown entries evicted at the capacity bound", "counter");
+        metrics_.describe("yuzu_server_dex_alert_routed_types",
+                          "Number of obs_types currently routed to alerts", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -242,6 +356,24 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
+        // no agent reports — never a fabricated zero).
+        metrics_.describe("yuzu_fleet_perf_reporting",
+                          "Agents whose latest heartbeat carried at least ONE perf tag — the "
+                          "same any-of-three definition the /dex Performance tab's Reporting "
+                          "card uses, so the two always agree. Each per-metric gauge may cover "
+                          "a SUBSET of this population (its {stat} series carry their own n via "
+                          "the tab/REST; e.g. agents on virtual disks that don't answer "
+                          "IOCTL_DISK_PERFORMANCE omit the disk-latency tag)", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cpu_pct",
+                          "Fleet device CPU busy % over each agent's last heartbeat interval, "
+                          "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_commit_pct",
+                          "Fleet commit-charge % of limit (memory pressure), by {stat}: "
+                          "avg / p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_disk_lat_ms",
+                          "Fleet per-IO disk service time in ms, by {stat}: avg / p50 / p90 / max",
+                          "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -261,6 +393,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
+        // absent/expired/not-owned set at dispatch. Audit rows are not
+        // Prometheus-alertable; this counter makes the failure mode (silent
+        // under-scope to zero targets) visible to an on-call SRE.
+        metrics_.describe("yuzu_scope_resolution_failed_total",
+                          "from_result_set: scope references that failed owner-checked "
+                          "resolution at dispatch (set absent, expired, or not owned)",
+                          "counter");
         // Audit-pipeline observability (governance PR4 OBS-4). Increments when
         // audit_store->add_event()'s SQLite step does not return DONE — pages
         // operators that the audit chain itself is degraded.
@@ -341,6 +481,32 @@ public:
                           "match the identity bound at Register time (stolen-session signal, "
                           "#1118). Labelled event=security (SIEM-routing tag)",
                           "counter");
+        // PKI PR3: an agent-initiated RPC rejected because the presented client
+        // leaf's serial is on the internal CA's revocation list (ca.db). A revoked
+        // agent that keeps calling is a decommissioned/compromised-credential
+        // signal. Labelled by rpc (subscribe|heartbeat|download_update) so an
+        // operator can see a revoked agent trying every surface, not just the
+        // command channel.
+        metrics_.describe("yuzu_grpc_revoked_cert_total",
+                          "Agent RPC rejected because the presented client certificate has been "
+                          "revoked against the internal CA (PKI PR3). Labelled event=security "
+                          "(SIEM-routing tag) and rpc (subscribe|heartbeat|download_update)",
+                          "counter");
+        // PKI PR3: per-agent client certificates signed at enrollment. A spike is
+        // an enrollment storm (mass deploy) or, if sustained, a CSR-flood signal.
+        metrics_.describe("yuzu_server_ca_cert_issued_total",
+                          "Per-agent client certificates issued by the internal CA at agent "
+                          "enrollment (PKI PR3). Labelled purpose (agent)",
+                          "counter");
+        // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
+        // the public CRL is stale relative to ca.db. Alert on >0 since a revocation,
+        // since server-side enforcement is live but external consumers are not
+        // seeing the revocation. The audit row (ca.crl.published failure) is the
+        // forensic pair; this counter is the real-time alert source.
+        metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
+                          "Internal-CA CRL (re)publish failures (key load / build / record). A "
+                          "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
+                          "counter");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
         // (rejects): a spike here without a matching reject spike is benign
@@ -384,6 +550,17 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_proj_failures_total",
+                          "DEX observation projection failures. The source event is preserved "
+                          "(degrade-don't-destroy); only the derived guardian_observations read "
+                          "model row is lost. >0 means /dex is under-counting — investigate "
+                          "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_observations_reaped_total",
+                          "Cumulative DEX observation rows deleted by the retention reaper "
+                          "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
+        metrics_.describe("yuzu_server_guardian_baselines_total",
+                          "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -921,6 +1098,9 @@ public:
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
             }
+            // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
+            // root key itself is a 0600 file via default_certs, never in this DB.
+            ca_store_ = std::make_unique<CaStore>(cfg_.db_dir() / "ca.db");
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
             // so push success (first-per-agent) and rejections emit
             // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
@@ -1025,6 +1205,127 @@ public:
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    if (!guaranteed_state_store_)
+                        return;
+                    const std::uint64_t current =
+                        guaranteed_state_store_->current_policy_generation();
+                    if (agent_gen >= current)
+                        return;  // agent already at or ahead of current policy
+                    const std::string agent_id(agent_id_sv);
+
+                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
+                    // Claim the slot under the lock BEFORE any work so concurrent
+                    // heartbeats from the same agent can't both reconcile, and a
+                    // stuck/hostile agent can't turn every heartbeat into a registry
+                    // scan. Wall-clock based so it self-heals a re-registered/wiped
+                    // agent after the interval (no generation-keyed dedupe hole).
+                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
+                    const auto reconcile_now = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard lk(guardian_reconcile_mu_);
+                        auto last = guardian_last_reconcile_.find(agent_id);
+                        if (last != guardian_last_reconcile_.end() &&
+                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
+                            metrics_
+                                .counter("yuzu_server_guardian_reconciles_total",
+                                         {{"result", "rate_limited"}})
+                                .increment();
+                            return;
+                        }
+                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
+                    }
+
+                    auto sess = registry_.get_session(agent_id);
+                    if (!sess) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "no_session"}})
+                            .increment();
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
+                    // Baseline gate (docs/guardian-baseline-model.md): the rule source
+                    // is the union of member Guards of *deployed* Baselines, so an
+                    // enabled-but-undeployed Guard is never reconciled onto an agent.
+                    const auto rules = guardian::filter_deployed_members(
+                        guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+                    std::unordered_map<std::string, bool> scope_member;
+                    auto push = guardian::build_agent_push(
+                        rules, sess->os,
+                        [&](const std::string& expr) {
+                            auto cached = scope_member.find(expr);
+                            if (cached != scope_member.end())
+                                return cached->second;
+                            bool member = false;
+                            if (auto parsed = yuzu::scope::parse(expr)) {
+                                for (const auto& id : registry_.evaluate_scope(
+                                         *parsed, tag_store_.get(),
+                                         custom_properties_store_.get()))
+                                    if (id == agent_id) {
+                                        member = true;
+                                        break;
+                                    }
+                            }
+                            scope_member.emplace(expr, member);
+                            return member;
+                        },
+                        /*full_sync=*/true, current);
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per re-push (random suffix) so a same-generation reconcile
+                    // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-reconcile-" + std::to_string(current) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(agent_id, cmd)) {
+                        forward_gateway_pending();
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "sent"}})
+                            .increment();
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "reconcile"}})
+                            .increment();
+                        metrics_.gauge("yuzu_server_guardian_policy_generation")
+                            .set(static_cast<double>(current));
+                        // Durable audit of a system-initiated enforcement re-deploy
+                        // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
+                        // row per agent per interval, not per heartbeat.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile re-push (generation " +
+                                        std::to_string(agent_gen) + " -> " +
+                                        std::to_string(current) + ")";
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
+                                     agent_id, agent_gen, current);
+                    }
+                });
         }
 
         // Initialize tag store
@@ -1277,6 +1578,13 @@ public:
             auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
+        {
+            // Scope-walking result sets (capability §30).
+            auto rs_db = cfg_.db_dir() / "result_sets.db";
+            result_set_store_ = std::make_unique<ResultSetStore>(rs_db);
+            if (result_set_store_ && result_set_store_->is_open())
+                spdlog::info("ResultSetStore initialized at {}", rs_db.string());
+        }
 
         // Phase 5: Policy Engine
         {
@@ -1299,7 +1607,99 @@ public:
                 guaranteed_state_store_->start_cleanup();
                 spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
                              gs_db.string(), cfg_.guardian_event_retention_days);
+                // Step 5: ingest agent `__guard__` events arriving on the Subscribe
+                // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
+                agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
+                // Guardian Half B: gateway-connected agents' drift events arrive
+                // via GatewayUpstream.ForwardGuardianMessage, not the direct
+                // Subscribe loop — wire the same store so they ingest through the
+                // shared path. Gateway service exists only in gateway mode.
+                if (gateway_service_)
+                    gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
+
+                // D3 fleet-incident alerting (docs/dex-brd-coverage.md): N
+                // distinct devices reporting the same (obs_type, subject)
+                // inside the window → one operator notification + one
+                // webhook/offload event per cooldown. Wired before traffic
+                // (set-before-traffic contract on the detector).
+                blast_radius_detector_.set_on_incident([this](const BlastRadiusIncident& inc) {
+                    const std::string what = inc.subject.empty()
+                                                 ? inc.obs_type
+                                                 : inc.obs_type + " '" + inc.subject + "'";
+                    const std::string title = "Fleet incident: " + what + " on " +
+                                              std::to_string(inc.device_count) + " devices";
+                    const std::string message =
+                        std::to_string(inc.device_count) + " distinct devices reported " +
+                        what + " within the last " + std::to_string(inc.window_seconds / 60) +
+                        " minutes. See /dex for the drill-down.";
+                    spdlog::warn("BlastRadius: {}", title);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Same dual-sink discipline as agent.registered (HP-1/UP-6):
+                    // build the body once, guard each sink separately.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.blast_radius"},
+                                                  {"obs_type", inc.obs_type},
+                                                  {"subject", inc.subject},
+                                                  {"device_count", inc.device_count},
+                                                  {"window_seconds", inc.window_seconds}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.blast_radius", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.blast_radius", body);
+                    }
+                });
+                blast_radius_detector_.set_metrics(&metrics_);
+                agent_service_.set_blast_radius_detector(&blast_radius_detector_);
+                if (gateway_service_)
+                    gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
+
+                // F1 operator-routed per-signal alerts (Settings → DEX alerts):
+                // a routed obs_type raises one notification + one `dex.signal`
+                // webhook/offload event per (type, agent) cooldown. Routes load
+                // from runtime config after the store opens (apply_dex_alert_
+                // config); default = nothing routed.
+                dex_alert_router_.set_on_alert([this](const RoutedSignalAlert& a) {
+                    const std::string what =
+                        a.subject.empty() ? a.obs_type : a.obs_type + " '" + a.subject + "'";
+                    const std::string title = "DEX alert: " + what;
+                    const std::string message = "Device " + a.agent_id + " reported " + what +
+                                                " (operator-routed signal). See /dex for the "
+                                                "drill-down.";
+                    spdlog::info("DexAlertRouter: {} on {}", what, a.agent_id);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Dual-sink discipline, same as the blast-radius incident.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.signal"},
+                                                  {"obs_type", a.obs_type},
+                                                  {"subject", a.subject},
+                                                  {"agent_id", a.agent_id}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.signal", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.signal", body);
+                    }
+                });
+                dex_alert_router_.set_metrics(&metrics_);
+                agent_service_.set_dex_alert_router(&dex_alert_router_);
+                if (gateway_service_)
+                    gateway_service_->set_dex_alert_router(&dex_alert_router_);
             }
+        }
+
+        // Guardian Baselines — the deployable collection of Guards (M:N members +
+        // included/excluded management-group assignment). Control-plane only; the
+        // agent never hears the word "Baseline". See docs/guardian-baseline-model.md.
+        {
+            auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
+            baseline_store_ = std::make_unique<BaselineStore>(bl_db);
+            if (baseline_store_ && baseline_store_->is_open())
+                spdlog::info("BaselineStore initialized at {}", bl_db.string());
         }
 
         // Phase 7: Runtime Configuration + Custom Properties
@@ -1419,22 +1819,240 @@ public:
     // policy-eval / health threads were spawned, or an exception during late
     // construction — would destroy a still-joinable std::thread and call
     // std::terminate, or free borrowed stores out from under a live thread.
+    // PKI: generate + wire per-install default certs on first boot when the
+    // operator supplied no certs (and --no-default-certs is unset). Fills the
+    // per-surface cfg_ paths, flips cfg_.using_default_certs, and emits the
+    // one-shot audit + startup banner + Prometheus gauge. Sets
+    // default_certs_failed_ when generation was required but failed, so run()
+    // can refuse to start rather than serve without the certs it expected.
+    void bootstrap_default_certs() {
+        // Always publish the gauge (0) so dashboards can alert on ==1 and clear
+        // on ==0 within one process lifetime; flipped to 1 below if defaults are
+        // actually active.
+        metrics_.gauge("yuzu_server_default_certs_active").set(0);
+        if (cfg_.no_default_certs)
+            return;
+        // A surface is "operator-supplied" only when BOTH its cert and key are
+        // present. Exactly one present is a misconfiguration — refuse rather than
+        // silently mix operator + generated material (otherwise a half-supplied
+        // --cert would be clobbered, or — worse — a strict operator agent
+        // listener would be downgraded to don't-require).
+        auto half_supplied = [](const std::filesystem::path& cert,
+                                const std::filesystem::path& key) {
+            return cert.empty() != key.empty();
+        };
+        if ((cfg_.https_enabled && half_supplied(cfg_.https_cert_path, cfg_.https_key_path)) ||
+            (cfg_.tls_enabled && half_supplied(cfg_.tls_server_cert, cfg_.tls_server_key))) {
+            spdlog::error("A TLS surface has a certificate without its key (or vice versa). "
+                          "Supply both, or neither (to use default certs). Refusing to start.");
+            default_certs_failed_ = true;
+            return;
+        }
+        const bool https_needs =
+            cfg_.https_enabled && cfg_.https_cert_path.empty() && cfg_.https_key_path.empty();
+        const bool agent_needs =
+            cfg_.tls_enabled && cfg_.tls_server_cert.empty() && cfg_.tls_server_key.empty();
+        if (!https_needs && !agent_needs)
+            return; // operator supplied certs for every active surface (or TLS/HTTPS off)
+
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        if (!ca_store_ || !ca_store_->is_open())
+            spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
+                         "generation will refuse (surfacing the DB-open failure)");
+        if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
+                                  cfg_.cert_sans)) {
+            spdlog::error("default certificates were required but generation failed");
+            default_certs_failed_ = true;
+            return;
+        }
+        cfg_.using_default_certs = true; // any surface on defaults — drives the notifications
+        // Per-surface fill — only where the operator left BOTH paths empty, so an
+        // explicit operator surface is never clobbered or downgraded.
+        if (https_needs) {
+            cfg_.https_cert_path = default_cert_set_.https_cert;
+            cfg_.https_key_path = default_cert_set_.https_key;
+        }
+        if (agent_needs) {
+            cfg_.tls_server_cert = default_cert_set_.server_cert;
+            cfg_.tls_server_key = default_cert_set_.server_key;
+            if (cfg_.tls_ca_cert.empty())
+                cfg_.tls_ca_cert = default_cert_set_.ca_cert;
+            // This flag relaxes ONLY the agent listener to request-but-don't-
+            // require on default certs, so an unenrolled agent can bootstrap before
+            // PR3 mints per-agent client certs. It does NOT relax the higher-
+            // privilege management or gateway-upstream planes — those stay STRICT
+            // even in default mode (see run() #1238 H-1). An operator-supplied
+            // agent surface keeps the strict REQUIRE posture.
+            // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
+            // inside this `if (https_needs/agent_needs)` block, only after
+            // using_default_certs is set above). The /healthz ca-store check keys on
+            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // surface is active); the listener relaxation keys on the agent-specific
+            // flag. Keep them in sync if a future mixed-mode is introduced.
+            cfg_.using_default_agent_certs = true;
+        }
+        metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
+        // so their eventual expiry is otherwise a silent outage. Publish the
+        // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
+        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
+        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
+            const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
+                                    default_cert_set_.ca_expires_at.time_since_epoch())
+                                    .count();
+            metrics_.gauge("yuzu_server_cert_expiry_timestamp_seconds", {{"cert", "default-ca"}})
+                .set(static_cast<double>(exp_ts));
+        }
+        if (default_cert_set_.freshly_generated && audit_store_ && audit_store_->is_open()) {
+            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                     .principal = "system",
+                                     .principal_role = "system",
+                                     .action = "server.default_certs_generated",
+                                     .target_type = "server",
+                                     // #1238 should-fix: startup-posture rows key
+                                     // target_id on the feature, not a value, to
+                                     // match sibling rows; fingerprint goes in detail.
+                                     .target_id = "default-certs",
+                                     .detail = "Generated per-install default CA + server leaves; "
+                                               "ca_fingerprint=" +
+                                               default_cert_set_.ca_fingerprint_sha256,
+                                     .result = "warning"});
+        }
+        const std::time_t exp =
+            std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
+        // std::ctime returns nullptr on an out-of-range time_t (reachable with a
+        // 10-year expiry on a 32-bit time_t build) — constructing a std::string
+        // from nullptr is UB and would crash AFTER certs are generated. Guard it.
+        // (The banner runs once at startup, single-threaded, so ctime's shared
+        // static buffer is not a reentrancy concern here.)
+        const char* exp_c = std::ctime(&exp);
+        std::string exp_str = exp_c ? exp_c : "unknown";
+        if (!exp_str.empty() && exp_str.back() == '\n')
+            exp_str.pop_back();
+        spdlog::error("**********************************************************************");
+        spdlog::error("*** Yuzu is running with BUILT-IN DEFAULT CERTIFICATES.");
+        spdlog::error("*** CA SHA-256 : {}", default_cert_set_.ca_fingerprint_sha256);
+        spdlog::error("*** CA key     : {} — anyone who reads it can MITM agent traffic",
+                      (dir / "default-ca.key").string());
+        spdlog::error("*** Expires    : {}", exp_str);
+        spdlog::error("*** Replace with --cert/--key/--https-cert (or via Settings) ASAP.");
+        spdlog::error("**********************************************************************");
+    }
+
     ~ServerImpl() override { stop(); }
+
+    [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
 
     void run() override {
         spdlog::info("run(): entering");
+
+        // PKI: generate + wire per-install default certs before building TLS
+        // credentials (fills cfg_ cert paths + cfg_.using_default_certs).
+        bootstrap_default_certs();
+        if (default_certs_failed_) {
+            spdlog::error("Refusing to start: default certificates were required but could not be "
+                          "generated. Provide --cert/--key/--https-cert, or pass "
+                          "--no-default-certs to opt out.");
+            startup_failed_ = true;
+            return;
+        }
+
+        // PKI PR3: per-agent mTLS issuance + enforcement, wired AFTER the
+        // bootstrap so it sees the live CA. require_client_identity_ was baked at
+        // ctor from cfg_.tls_ca_cert (empty pre-bootstrap when relying on
+        // defaults) — recompute it now from the post-bootstrap config so the app
+        // layer enforces mTLS identity whenever a CA bundle is in play (default
+        // OR operator-supplied). Register stays bootstrap-exempt (it issues the
+        // first cert); every other RPC requires a verified, non-revoked identity.
+        agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
+        // Only an install with our OWN issuing CA (built-in defaults today,
+        // subordinate in PR6) signs agent CSRs. When the operator brought their
+        // own certs there is no root in ca.db → no signer, and agents must carry
+        // operator-minted client certs (the pre-PKI contract). The revocation
+        // checker is wired whenever a CA root exists so a revoked leaf is refused
+        // even on an operator-supplied-cert install that still uses our CA.
+        if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
+            // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
+            // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
+            // is safe only because stop() (run from ~ServerImpl) calls
+            // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
+            // RPCs — BEFORE any member is destroyed, even though ca_store_ is
+            // declared after agent_service_/agent_server_ (destructs first). Same
+            // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
+            // is written ONCE here, before BuildAndStart accepts traffic (publish-
+            // before-start), so the worker-thread reads are race-free; do not re-wire
+            // the CA at runtime without adding synchronisation.
+            // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
+            // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
+            // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
+            // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
+            if (auto r = ca_store_->get_root())
+                agent_ca_cert_pem_ = r->cert_pem;
+            // ONE guarded signer, shared by the direct (AgentServiceImpl) and
+            // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
+            // Register paths — so an agent enrolling through the gateway receives a
+            // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
+            // recording / CSR-size cap (one chokepoint, cannot drift). The
+            // try/catch enforces sign_agent_csr's documented "nullopt on any
+            // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
+            // exception out of a sync gRPC handler on the exposed one-way-TLS agent
+            // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
+            std::function<std::optional<std::pair<std::string, std::string>>(
+                const std::string&, const std::string&, CertIssuanceSource)>
+                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                     CertIssuanceSource src)
+                -> std::optional<std::pair<std::string, std::string>> {
+                try {
+                    return sign_agent_csr(csr_pem, agent_id, src);
+                } catch (const std::exception& e) {
+                    spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
+                                  agent_id);
+                    return std::nullopt;
+                } catch (...) {
+                    spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
+                                  agent_id);
+                    return std::nullopt;
+                }
+            };
+            agent_service_.set_agent_cert_signer(cert_signer);
+            if (gateway_service_)
+                gateway_service_->set_agent_cert_signer(cert_signer);
+            agent_service_.set_revocation_checker(
+                [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
+            // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
+            // certs as agent identities (foreign certs fall through to bootstrap).
+            agent_service_.set_peer_cert_recognizer(
+                [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+            spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
+                         default_cert_set_.ca_fingerprint_sha256.empty()
+                             ? std::string("operator-supplied")
+                             : default_cert_set_.ca_fingerprint_sha256);
+            // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
+            // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
+            // the CA key for an anonymous caller (the public handler is
+            // serve-or-503, it does NOT build). Best-effort: a failure just means
+            // /ca/crl returns 503 until the next revoke republishes.
+            if (!publish_crl())
+                spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
+                             "the next revocation republishes");
+        }
+
         grpc::EnableDefaultHealthCheckService(true);
 
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
-            auto tls =
-                build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
-                                      cfg_.allow_one_way_tls, "agent listener");
+            auto tls = build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key,
+                                             cfg_.tls_ca_cert, cfg_.allow_one_way_tls,
+                                             /*require_client_cert=*/!cfg_.using_default_agent_certs,
+                                             "agent listener");
             if (tls) {
                 agent_creds = std::move(tls);
             } else {
                 spdlog::error("TLS is enabled but credentials are invalid; refusing to start");
+                startup_failed_ = true;
                 return;
             }
 
@@ -1449,13 +2067,38 @@ public:
                 // unauthenticated peer on the management plane.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
-                    cfg_.allow_one_way_tls, "management listener");
+                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
+                    startup_failed_ = true;
+                    return;
+                }
+                mgmt_creds = std::move(mgmt_tls);
+            } else if (cfg_.using_default_agent_certs) {
+                // H-1 (#1238 review): on default certs the AGENT listener relaxes
+                // to request-but-don't-require so an unenrolled agent can bootstrap
+                // before PR3 mints per-agent client certs. The management and
+                // gateway-upstream planes are higher-privilege — do NOT inherit
+                // that relaxation. Build a STRICT (require-client-cert) credential
+                // from the same default server cert/key/CA. In M1 the gRPC mgmt
+                // service is a placeholder so this locks out no real workflow; it
+                // stops the privileged plane silently accepting unauthenticated
+                // peers. A gateway (PR5) presents the default-gateway client leaf,
+                // so the gateway-upstream listener still connects.
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
+                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                if (!mgmt_tls) {
+                    spdlog::error("Management TLS credentials (strict, default certs) are invalid; "
+                                  "refusing to start");
+                    startup_failed_ = true;
                     return;
                 }
                 mgmt_creds = std::move(mgmt_tls);
             } else {
+                // Operator-supplied agent certs: agent_creds is already strict
+                // (require_client_cert = !using_default_agent_certs = true), so the
+                // management plane safely reuses it.
                 mgmt_creds = agent_creds;
             }
         }
@@ -1484,6 +2127,7 @@ public:
         if (!agent_server_) {
             spdlog::error("Failed to start gRPC server -- check that ports {} and {} are available",
                           cfg_.listen_address, cfg_.management_address);
+            startup_failed_ = true;
             return;
         }
 
@@ -1531,9 +2175,78 @@ public:
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                // G6 SRE: the sweep body is a serial budget shared with the
+                // SECURITY-relevant revocation sweep below — a stall here (e.g.
+                // a locked tags.db inside the cohort gauge publish) delays
+                // revoked-agent teardown by the same amount. Make it visible.
+                const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // F2a PR3: per-cohort fleet perf gauges — same cycle, same
+                // staleness window as the fleet families above.
+                publish_cohort_perf_gauges();
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
+                // PR3 H-1: tear down any live Subscribe stream whose agent leaf
+                // has since been revoked. The Subscribe establishment gate runs
+                // once; without this sweep a revoked/compromised agent keeps
+                // receiving dispatched commands until it voluntarily reconnects.
+                // ~15s cadence (this thread) is well inside CRL validity windows;
+                // PR4's operator-revoke handler calls the same sweep immediately
+                // for prompt teardown. No-op unless the internal CA is active.
+                // PR4 (architect S1 / UP-3): keep the published CRL fresh. A fleet
+                // with no revocations would otherwise never re-publish, so /ca/crl
+                // eventually serves a CRL past its nextUpdate (external validators
+                // reject an expired CRL), and a failed startup pre-publish would
+                // leave /ca/crl 503 with no self-heal. Re-publish when the latest
+                // CRL is missing or within 24h of nextUpdate. publish_crl()
+                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
+                // 7 days out so this fires at most ~once/6 days in steady state.
+                if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
+                    // Backoff (steady_clock — immune to NTP jumps): after a failed
+                    // freshness publish, don't retry every tick — wait 5 min so a
+                    // persistent failure (bad CA key) doesn't spam logs + the
+                    // failure counter (gov L1/L5).
+                    const auto now_steady = std::chrono::steady_clock::now();
+                    if (now_steady >= crl_freshness_retry_after_) {
+                        // nextUpdate is a wall-clock epoch → compare with wall time.
+                        const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
+                        auto latest = ca_store_->latest_crl();
+                        const bool stale =
+                            !latest || (latest->next_update - now_epoch) < 24 * 3600;
+                        if (stale) {
+                            if (publish_crl())
+                                spdlog::info(
+                                    "PKI: CRL re-published for freshness (nextUpdate window)");
+                            else
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
+                        }
+                    }
+                }
+                if (ca_store_ && ca_store_->is_open()) {
+                    const auto swept = registry_.sweep_revoked(
+                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
+                    if (!swept.empty()) {
+                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                     swept.size());
+                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                        // The sweep is low-frequency (fires only on actual revocations),
+                        // so a WAL row per cancelled stream is not a flood risk.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            for (const auto& aid : swept) {
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "agent:" + aid,
+                                     .principal_role = "agent",
+                                     .action = "session.cert_revoked",
+                                     .target_type = "Session",
+                                     .target_id = aid,
+                                     .detail = "reason=revoked_client_cert source=stream_sweep",
+                                     .result = "denied"});
+                            }
+                        }
+                    }
+                }
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {
                     metrics_.gauge("yuzu_server_cert_reloads_total")
@@ -1618,6 +2331,16 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                    metrics_.gauge("yuzu_server_guardian_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_reaped_total()));
+                }
+                if (baseline_store_) {
+                    metrics_.gauge("yuzu_server_guardian_baselines_total")
+                        .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
                 // Process health sampling (22.1)
                 {
@@ -1641,6 +2364,15 @@ public:
                                         .count();
                     metrics_.gauge("yuzu_server_uptime_seconds").set(static_cast<double>(uptime_s));
                 }
+                // G6 SRE: sweep-body duration (excludes the sleep) — the
+                // revocation sweep above shares this serial budget, so a stall
+                // (locked tags.db, slow fleet walk) is a security-relevant
+                // delay, not just stale metrics.
+                metrics_
+                    .histogram("yuzu_server_reaper_sweep_duration_seconds")
+                    .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           sweep_start)
+                                 .count());
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
@@ -1652,9 +2384,20 @@ public:
         // log rotation or land in audit.db).
         const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
         const bool no_tls_active = !cfg_.tls_enabled;
-        if (insecure_skip_verify_active || no_tls_active) {
-            insecure_tls_reminder_thread_ =
-                std::thread([this, insecure_skip_verify_active, no_tls_active]() {
+        const bool default_certs_active = cfg_.using_default_certs;
+        if (insecure_skip_verify_active || no_tls_active || default_certs_active) {
+            // Compose the default-certs detail once (carries the CA fingerprint).
+            const std::string default_certs_detail =
+                default_certs_active
+                    ? "Running with built-in per-install default certificates (CA " +
+                          default_cert_set_.ca_fingerprint_sha256 +
+                          "). Anyone who can read the local CA key can MITM agent traffic. "
+                          "Replace with operator-provided certs (--cert/--https-cert) or via "
+                          "Settings as soon as possible."
+                    : std::string();
+            insecure_tls_reminder_thread_ = std::thread(
+                [this, insecure_skip_verify_active, no_tls_active, default_certs_active,
+                 default_certs_detail]() {
                     using namespace std::chrono_literals;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
                         // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
@@ -1664,28 +2407,36 @@ public:
                         }
                         if (stop_requested_.load(std::memory_order_acquire))
                             break;
-                        const char* posture =
-                            no_tls_active ? "--no-tls" : "--insecure-skip-client-verify";
-                        const char* detail =
-                            no_tls_active
-                                ? "TLS is fully disabled; both agent and management gRPC "
-                                  "listeners accept plaintext from any peer with no encryption "
-                                  "and no peer authentication. Restart with TLS certificates "
-                                  "to leave this posture."
-                                : "Agent / management listener still running without client "
-                                  "certificate verification. Re-enable mTLS by supplying "
-                                  "--ca-cert (and --management-ca-cert if applicable).";
-                        spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
-                        if (audit_store_ && audit_store_->is_open()) {
-                            (void)audit_store_->log({.timestamp = std::time(nullptr),
-                                                     .principal = "system",
-                                                     .principal_role = "system",
-                                                     .action = "server.tls_degraded",
-                                                     .target_type = "server",
-                                                     .target_id = posture,
-                                                     .detail = detail,
-                                                     .result = "warning"});
-                        }
+                        auto emit = [this](const char* posture, const std::string& detail,
+                                           const char* action) {
+                            spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
+                            if (audit_store_ && audit_store_->is_open()) {
+                                (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                         .principal = "system",
+                                                         .principal_role = "system",
+                                                         .action = action,
+                                                         .target_type = "server",
+                                                         .target_id = posture,
+                                                         .detail = detail,
+                                                         .result = "warning"});
+                            }
+                        };
+                        if (no_tls_active)
+                            emit("--no-tls",
+                                 "TLS is fully disabled; both agent and management gRPC listeners "
+                                 "accept plaintext from any peer with no encryption and no peer "
+                                 "authentication. Restart with TLS certificates to leave this "
+                                 "posture.",
+                                 "server.tls_degraded");
+                        if (insecure_skip_verify_active)
+                            emit("--insecure-skip-client-verify",
+                                 "Agent / management listener still running without client "
+                                 "certificate verification. Re-enable mTLS by supplying --ca-cert "
+                                 "(and --management-ca-cert if applicable).",
+                                 "server.tls_degraded");
+                        if (default_certs_active)
+                            emit("default-certs", default_certs_detail,
+                                 "server.default_certs_in_use");
                     }
                 });
         }
@@ -1728,6 +2479,12 @@ public:
         // so it must stop before any of them are torn down)
         if (policy_eval_thread_.joinable()) {
             policy_eval_thread_.join();
+        }
+
+        // Join the result-set maintenance thread (borrows result_set_store_,
+        // execution_tracker_, response_store_ — must stop before teardown)
+        if (result_set_maint_thread_.joinable()) {
+            result_set_maint_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -1804,6 +2561,28 @@ public:
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
 
+        // Same contract for the blast-radius detector: both service impls
+        // borrow it by raw pointer and call observe() from the ingest path the
+        // drain above quiesced. Null before any member teardown (gov
+        // cpp-safety/architect/consistency — the detector destructs early by
+        // member-decl order, so this removes the only reliance on drain timing).
+        agent_service_.set_blast_radius_detector(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_blast_radius_detector(nullptr);
+        // F1: the alert router has the identical borrow contract.
+        agent_service_.set_dex_alert_router(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_dex_alert_router(nullptr);
+
+        // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
+        // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
+        // drain above guarantees no handler is mid-invocation; null them for the
+        // same belt-and-braces reason as the tracker so a stray late call cannot
+        // touch released CA state.
+        agent_service_.set_agent_cert_signer(nullptr);
+        agent_service_.set_revocation_checker(nullptr);
+        agent_service_.set_peer_cert_recognizer(nullptr);
+
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -1822,7 +2601,7 @@ private:
     build_tls_credentials(const std::filesystem::path& cert_path,
                           const std::filesystem::path& key_path,
                           const std::filesystem::path& ca_path, bool allow_one_way_tls,
-                          std::string_view listener_name) const {
+                          bool require_client_cert, std::string_view listener_name) const {
         if (cert_path.empty() || key_path.empty()) {
             spdlog::error("{} TLS requires certificate and key", listener_name);
             return nullptr;
@@ -1853,8 +2632,13 @@ private:
             }
 
             ssl_opts.pem_root_certs = std::move(ca);
+            // Under built-in default certs the agent has no client cert yet
+            // (per-agent issuance is PR3): REQUEST + VERIFY if presented, but do
+            // NOT REQUIRE — otherwise no agent could connect. Operator-provided
+            // certs keep the strict REQUIRE posture.
             ssl_opts.client_certificate_request =
-                GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+                require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
+                                    : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
             if (!allow_one_way_tls) {
                 spdlog::error("{} TLS requires --ca-cert (or enable "
@@ -1872,6 +2656,515 @@ private:
             yuzu::secure_zero(kc.private_key);
         }
         return creds;
+    }
+
+    // -- PKI PR3: per-agent client-cert issuance + revocation ------------------
+
+    /// Percent-encode a single URI path segment per RFC 3986 (Hermes LOW-6).
+    /// agent_id arrives from protobuf with only length validation, so it may carry
+    /// characters that are invalid raw in a URI (spaces, `/`, `%`, control bytes);
+    /// the issued leaf's URI SAN must stay well-formed for downstream parsers.
+    static std::string uri_encode_segment(std::string_view s) {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size());
+        for (unsigned char c : s) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '.' || c == '_' || c == '~') {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out.push_back('%');
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 0x0F]);
+            }
+        }
+        return out;
+    }
+
+    /// True iff `peer_cert_pem` chains to OUR issuing CA (signature-verified, not a
+    /// mere issuer-DN string match). In a multi-CA trust bundle this is what
+    /// distinguishes a Yuzu-issued agent leaf from a foreign (e.g. corporate-CA)
+    /// client cert that merely carries a matching CN — so a foreign cert is never
+    /// conflated with a Yuzu agent identity (Hermes CRITICAL-1) nor with a revoked
+    /// Yuzu serial (Hermes LOW-5). `agent_ca_cert_pem_` is cached at wiring time.
+    /// NOTE: verify_chain is validity-sensitive — a genuine-but-EXPIRED Yuzu leaf
+    /// returns false here. Benign on the call paths today (gRPC rejects an expired
+    /// client cert at the TLS handshake, so it never reaches these gates, and
+    /// Register then falls through to a clean re-enrollment). A future caller that
+    /// inspects a cert OFF the handshake-validated path must not read false as
+    /// "not ours".
+    bool is_yuzu_issued(const std::string& peer_cert_pem) {
+        if (peer_cert_pem.empty() || agent_ca_cert_pem_.empty())
+            return false;
+        // gov UP-7 / sre: cache the verify_chain result so the per-heartbeat
+        // revocation gate doesn't pay an ECDSA chain verify on every call
+        // fleet-wide. The result is immutable for a given (cert, CA) pair — a cert
+        // either chains to our CA or never will — and agent_ca_cert_pem_ is set
+        // once before traffic, so no TTL is needed (re-wiring the CA at runtime,
+        // a PR6 concern, must clear this cache). Keyed by the full PEM so there is
+        // no hash-collision trust risk.
+        {
+            std::lock_guard<std::mutex> lk(yuzu_issued_cache_mu_);
+            auto it = yuzu_issued_cache_.find(peer_cert_pem);
+            if (it != yuzu_issued_cache_.end())
+                return it->second;
+        }
+        const bool ok = pki::verify_chain(peer_cert_pem, agent_ca_cert_pem_);
+        {
+            std::lock_guard<std::mutex> lk(yuzu_issued_cache_mu_);
+            if (yuzu_issued_cache_.size() > 16384)
+                yuzu_issued_cache_.clear(); // crude bound; certs are stable → low churn
+            yuzu_issued_cache_[peer_cert_pem] = ok;
+        }
+        return ok;
+    }
+
+    /// Sign a per-agent client leaf from the agent's CSR, bound to agent_id.
+    /// Returns {leaf_pem, ca_chain_pem} or nullopt on any failure (the Register
+    /// handler treats nullopt as "stay on the bootstrap posture, retry later").
+    ///
+    /// SECURITY: the CSR contributes ONLY its public key (proof-of-possession is
+    /// verified inside pki::sign_csr). Identity is set HERE from the authenticated
+    /// agent_id — CN=agent_id (matched by the #1118 peer-identity gate) plus an
+    /// install-scoped URI SAN — never from CSR-controlled fields. The CA private
+    /// key is loaded transiently and zeroed before return (incl. exception
+    /// unwind) so the crown jewel is not resident for the process lifetime.
+    std::optional<std::pair<std::string, std::string>>
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id,
+                   CertIssuanceSource src) {
+        // #1290: forensic discriminator on the issuance audit — was this minted on a
+        // direct agent connection or relayed by a (potentially compromised) gateway?
+        // The exact population an incident responder scopes when bulk-revoking after
+        // a gateway compromise (the PR5 R-5 confused-deputy compensating control).
+        const char* const via = to_audit_via(src);
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root) {
+            spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            return std::nullopt;
+        }
+        // PR5d / Hermes LOW: bound the attacker-supplied CSR before any parse or
+        // sign. A PEM CSR is well under 2 KiB (EC P-256 ~0.6 KiB, RSA-4096
+        // ~1.7 KiB); 16 KiB is generous slack. This is the SINGLE chokepoint for
+        // BOTH the direct Register and the gateway ProxyRegister signing paths, so
+        // the now-gateway-reachable signer cannot be fed a multi-MB blob (gRPC's
+        // 4 MiB message cap is the outer bound — this is defence-in-depth on the
+        // exposed one-way-TLS agent edge).
+        constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
+        if (csr_pem.size() > kMaxCsrPemBytes) {
+            spdlog::warn("PKI: rejecting oversize CSR ({} bytes > {}) for agent {}",
+                         csr_pem.size(), kMaxCsrPemBytes, agent_id);
+            return std::nullopt;
+        }
+
+        // HIGH-2 (#1239 Hermes): block revocation bypass via re-enrollment. A
+        // compromised endpoint whose leaf was revoked could otherwise delete its
+        // local key, reconnect, and trigger this CSR flow to obtain a FRESH leaf
+        // with a new serial — silently resurrecting a revoked identity. If this
+        // agent_id has a revoked, non-expired cert on record, refuse to auto-issue:
+        // clearing a revocation must be a deliberate operator action, not an
+        // automatic side effect of the agent dropping its key. A non-revoked
+        // orphan (benign key loss) is unaffected — only an ACTIVE revocation
+        // blocks re-provisioning. (sign_agent_csr is rate-limited and only runs at
+        // enrollment/renewal, so the list_revoked scan is off the hot path.)
+        //
+        // CONTRACT: ca_issued.subject for an agent cert is the BARE agent_id (set
+        // below at `rec.subject = agent_id`), NOT a "CN=..." DN — so the bare-vs-bare
+        // compare below is correct. Do NOT "fix" this into a DN parse without also
+        // changing the issuance site. Residuals (tracked, narrow): a revoke landing
+        // between this scan and signing still issues (TOCTOU — operator re-revokes;
+        // the sweep then tears it down), and list_revoked() is an O(revoked) scan
+        // (fine at realistic revocation counts; a subject-indexed query is the
+        // follow-up if it ever grows).
+        {
+            const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
+            for (const auto& rev : ca_store_->list_revoked()) {
+                if (rev.subject == agent_id && rev.not_after > now_epoch) {
+                    spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
+                                 "non-expired cert (serial {}) exists; an operator must clear "
+                                 "the revocation before this agent can re-provision",
+                                 agent_id, rev.serial_hex);
+                    metrics_
+                        .counter("yuzu_server_ca_reissue_blocked_total",
+                                 {{"reason", "revoked_identity"}})
+                        .increment();
+                    if (audit_store_ && audit_store_->is_open()) {
+                        (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                 .principal = "agent:" + agent_id,
+                                                 .principal_role = "agent",
+                                                 .action = "ca.cert.reissue_blocked",
+                                                 .target_type = "AgentCertificate",
+                                                 .target_id = rev.serial_hex,
+                                                 .detail = "reason=revoked_identity cn=" +
+                                                           detail::audit_token(agent_id) +
+                                                           " via=" + via,
+                                                 .result = "denied"});
+                    }
+                    return std::nullopt;
+                }
+            }
+        }
+        // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
+        // enrollment credential could otherwise spam Register-with-CSR, each call
+        // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
+        // provisioning (it then re-Registers WITHOUT a CSR) and again only at the
+        // ~8-month renewal, so this floor never affects the happy path; it also
+        // bounds the ca.db rows a bounded agent retry (Hermes HIGH-2) can create.
+        {
+            // gov UP-1: CHECK only here; the timestamp is recorded AFTER a
+            // successful issuance (below), so a transient server-side failure
+            // (key-load glitch, record_issued contention) does NOT throttle the
+            // agent's legitimate retry for 30s. A successful issuance still blocks
+            // a re-issue for the window.
+            constexpr auto kCsrIssueMinInterval = std::chrono::seconds(30);
+            std::lock_guard<std::mutex> rl(csr_issue_mu_);
+            const auto now_s = std::chrono::steady_clock::now();
+            // Opportunistic prune so the map can't grow unbounded over uptime.
+            if (csr_issue_last_.size() > 4096) {
+                for (auto it = csr_issue_last_.begin(); it != csr_issue_last_.end();) {
+                    if (now_s - it->second > kCsrIssueMinInterval)
+                        it = csr_issue_last_.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            auto it = csr_issue_last_.find(agent_id);
+            if (it != csr_issue_last_.end() && now_s - it->second < kCsrIssueMinInterval) {
+                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id,
+                             kCsrIssueMinInterval.count());
+                return std::nullopt;
+            }
+        }
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — agent cert not issued");
+            return std::nullopt;
+        }
+        // Zero the CA key on every exit path, including exception unwind.
+        detail::ScopedKeyZero ca_key_zero{*ca_key};
+
+        // Leaf validity: ~1y (the agent auto-renews at 2/3 life), clamped so it
+        // can never outlive the issuing CA (x509_ca rejects a leaf beyond the CA).
+        const auto now = std::chrono::system_clock::now();
+        auto not_after = now + std::chrono::hours(24 * 365);
+        const auto ca_not_after =
+            std::chrono::system_clock::time_point{std::chrono::seconds{root->not_after}};
+        if (not_after > ca_not_after)
+            not_after = ca_not_after;
+
+        pki::LeafParams lp;
+        lp.subject = {agent_id, "Yuzu"}; // CN=agent_id → #1118 identity match
+        // H-2: backdate not_before by the clock-skew allowance so an agent whose
+        // clock lags the server can still present this leaf on its immediate
+        // reconnect (a not-yet-valid leaf fails the handshake and the agent does
+        // not recover from clock skew). Mirrors the validity_* helpers.
+        lp.validity = {now - pki::kClockSkewBackdate, not_after};
+        lp.usage = pki::LeafUsage{.client_auth = true};
+        // Install-scoped URI SAN (defence in depth + forensic identity). The CA
+        // fingerprint (colon-stripped → a valid URI authority) is the per-install
+        // id; fall back to the ca.db root fingerprint on an operator-supplied set.
+        std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
+                                  ? root->fingerprint_sha256
+                                  : default_cert_set_.ca_fingerprint_sha256;
+        std::erase(install, ':');
+        if (!install.empty())
+            lp.san.uris.push_back("yuzu://" + install + "/agent/" + uri_encode_segment(agent_id));
+
+        auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
+        if (!issued) {
+            spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);
+            return std::nullopt;
+        }
+
+        // Record the issued leaf so it can be revoked / inventoried (ca.db).
+        IssuedCertRecord rec;
+        rec.serial_hex = issued->serial_hex;
+        rec.subject = agent_id;
+        rec.san = lp.san.uris.empty() ? std::string{} : lp.san.uris.front();
+        rec.purpose = "agent";
+        rec.not_after =
+            std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
+        rec.cert_pem = issued->cert_pem;
+        rec.issued_by = "agent:" + agent_id;
+        rec.enrollment_request_id = agent_id;
+        // #1296: stamp the STABLE key-based CA identity (and the issuance-time cert
+        // fingerprint, which agent rows previously left blank) so an "issued by this
+        // CA" inventory query survives a subordinate re-key. issuer_key_id hashes the
+        // root's public key (invariant across the re-key); both are best-effort
+        // forensic metadata — a derivation miss does not block issuance.
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (!ca_store_->record_issued(rec)) {
+            // Fail closed: an unrecorded cert can't be revoked, so don't hand it
+            // out — the agent stays on the bootstrap posture and retries.
+            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing", agent_id);
+            return std::nullopt;
+        }
+
+        // gov UP-1: record the rate-limit timestamp only now (issuance succeeded),
+        // so a failed attempt above never throttles a legitimate retry.
+        {
+            std::lock_guard<std::mutex> rl(csr_issue_mu_);
+            csr_issue_last_[agent_id] = std::chrono::steady_clock::now();
+        }
+        // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
+        // storms / CSR floods (the audit row below is the forensic record).
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}, {"via", via}})
+            .increment();
+
+        if (audit_store_ && audit_store_->is_open()) {
+            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                     .principal = "agent:" + agent_id,
+                                     .principal_role = "agent",
+                                     .action = "ca.cert.issued",
+                                     .target_type = "AgentCertificate",
+                                     .target_id = issued->serial_hex,
+                                     .detail =
+                                         "purpose=agent cn=" + detail::audit_token(agent_id) +
+                                         " via=" + via,
+                                     // gov consistency: "success" (not "ok") so a
+                                     // SIEM filter on ca.% AND result=success
+                                     // catches issuance alongside revoke/publish.
+                                     .result = "success"});
+        }
+        // The issued chain is our issuing cert PLUS, in subordinate mode (PR6),
+        // the parent chain above it — so the agent receives a full path to the
+        // corporate trust anchor. chain_pem is empty in Builtin mode, leaving the
+        // M1 single-cert behaviour unchanged.
+        return std::make_pair(issued->cert_pem, root->cert_pem + root->chain_pem);
+    }
+
+    /// PR6 subordinate-CA: export the install CA's CSR (PKCS#10 PEM) over its
+    /// EXISTING key, with the CA's own subject, for an enterprise root to sign
+    /// into a subordinate-CA intermediate. Returns nullopt on no-CA / key-load /
+    /// CSR-build failure. The CA key is loaded transiently and zeroed on every
+    /// exit path (same custody discipline as sign_agent_csr).
+    std::optional<std::string> export_ca_csr() {
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root) {
+            spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
+            return std::nullopt;
+        }
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — CSR not exported");
+            return std::nullopt;
+        }
+        struct KeyZero {
+            std::string& s;
+            ~KeyZero() { yuzu::secure_zero(s); }
+        } ca_key_zero{*ca_key};
+
+        // Subject = our CA's existing subject so the signed intermediate keeps the
+        // same DN (authorityKeyIdentifier on previously-issued leaves is derived
+        // from the issuer KEY, which is unchanged, so they keep validating; the
+        // matching DN keeps the human-facing identity stable too).
+        auto details = pki::parse_certificate(root->cert_pem);
+        pki::CsrParams cp;
+        cp.subject = details ? details->subject
+                             : pki::DistinguishedName{"Yuzu Internal CA", "Yuzu"};
+        return pki::make_csr(*ca_key, cp);
+    }
+
+    /// PR6 subordinate-CA: validate an enterprise-signed intermediate and, on
+    /// success, switch the issuing identity to subordinate mode. The validation is
+    /// the security crux — an operator could otherwise re-root the install at an
+    /// attacker-chosen hierarchy or an issuing cert whose key we don't hold:
+    ///   1. parseable cert,
+    ///   2. is a CA (basicConstraints CA:TRUE) — else it cannot sign leaves,
+    ///   3. carries OUR CA public key — proof the enterprise signed the CSR we
+    ///      exported, and that we still hold the matching private key, and
+    ///   4. verifies up to the uploaded parent chain.
+    /// Only then does it set_root (cert=intermediate, chain=parent, mode=
+    /// Subordinate); the issuing KEY (key_ref) is unchanged.
+    CaRoutes::ImportOutcome import_subordinate_chain(const std::string& intermediate_pem,
+                                                     const std::string& parent_chain_pem) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return CaRoutes::ImportOutcome::StoreError;
+        auto root = ca_store_->get_root();
+        if (!root)
+            return CaRoutes::ImportOutcome::NoRoot;
+
+        auto details = pki::parse_certificate(intermediate_pem);
+        if (!details)
+            return CaRoutes::ImportOutcome::BadIntermediate;
+        if (!pki::cert_is_ca(intermediate_pem))
+            return CaRoutes::ImportOutcome::NotCa;
+
+        // Load the CA key transiently (zeroed on exit) to prove the intermediate
+        // carries our public key.
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — subordinate import refused");
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        struct KeyZero {
+            std::string& s;
+            ~KeyZero() { yuzu::secure_zero(s); }
+        } ca_key_zero{*ca_key};
+
+        if (!pki::cert_matches_key(intermediate_pem, *ca_key))
+            return CaRoutes::ImportOutcome::KeyMismatch;
+        if (!pki::verify_chain_to_bundle(intermediate_pem, parent_chain_pem))
+            return CaRoutes::ImportOutcome::ChainInvalid;
+
+        auto fp = pki::fingerprint_sha256(intermediate_pem);
+        if (!fp)
+            return CaRoutes::ImportOutcome::BadIntermediate;
+
+        // Switch the issuing identity. Keep key_ref + algo (the key is unchanged);
+        // adopt the intermediate's validity window and our new parent chain.
+        //
+        // H1 (PR6 Hermes): the issuing KEY is unchanged, only the issuer cert (and
+        // the current root fingerprint) changes. Leaves issued BEFORE this switch
+        // keep validating — admission verifies by key+DN, not by fingerprint — and
+        // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
+        // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
+        // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint).
+        //
+        // #1296 resolves the "issued by this CA" query landmine: ca_issued.issuer_key_id
+        // is the STABLE key-based identity (pki::issuer_key_id — a hash of the public
+        // key). Because THIS import keeps the key, that id is unchanged across the
+        // switch, so leaves issued before AND after share one issuer_key_id and
+        // CaStore::list_issued_by_key_id returns the whole population with NO rewrite
+        // here. (issuer_fingerprint stays split two-for-one-key, by design.)
+        CaRoot updated = *root;
+        updated.cert_pem = intermediate_pem;
+        updated.chain_pem = parent_chain_pem;
+        updated.mode = CaMode::Subordinate;
+        updated.fingerprint_sha256 = *fp;
+        updated.not_before = std::chrono::duration_cast<std::chrono::seconds>(
+                                 details->not_before.time_since_epoch())
+                                 .count();
+        updated.not_after = std::chrono::duration_cast<std::chrono::seconds>(
+                                details->not_after.time_since_epoch())
+                                .count();
+        if (!ca_store_->set_root(updated)) {
+            spdlog::error("PKI: subordinate import validated but set_root failed");
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
+                     "to an enterprise root",
+                     *fp);
+        metrics_.counter("yuzu_server_ca_subordinate_imported_total", {}).increment();
+        return CaRoutes::ImportOutcome::Ok;
+    }
+
+    /// True iff the presented client leaf is one of OURS and its serial is revoked
+    /// in ca.db. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// happens to collide with a revoked Yuzu serial is not falsely rejected
+    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
+    /// agent-plane lock.
+    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
+            return false;
+        // gov/sre: the serial is IMMUTABLE for a given leaf PEM, so cache the
+        // PEM→serial parse (mirrors yuzu_issued_cache_) — the per-heartbeat
+        // revocation gate would otherwise pay an X509 PEM parse on every call,
+        // fleet-wide. CRITICAL: the is_revoked() lookup below stays LIVE — caching
+        // the revocation *result* would let a revoked agent keep talking until the
+        // cache expired (a security bug). Only the parse is memoised.
+        std::string serial;
+        {
+            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+            if (auto it = peer_serial_cache_.find(peer_cert_pem);
+                it != peer_serial_cache_.end())
+                serial = it->second;
+        }
+        if (serial.empty()) {
+            auto details = pki::parse_certificate(peer_cert_pem);
+            if (!details || details->serial_hex.empty())
+                return false; // unparseable → not our cert; the identity gate handles it
+            serial = details->serial_hex;
+            std::lock_guard<std::mutex> lk(peer_serial_cache_mu_);
+            if (peer_serial_cache_.size() > 16384)
+                peer_serial_cache_.clear(); // crude bound; certs are stable → low churn
+            peer_serial_cache_[peer_cert_pem] = serial;
+        }
+        return ca_store_->is_revoked(serial);
+    }
+
+    /// PKI PR4: build + record a new CRL version over the current revoked set,
+    /// signed by the CA, and return its DER. Backs GET /api/v1/ca/crl (served from
+    /// the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
+    /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
+    /// CA / load / sign failure.
+    std::optional<std::vector<std::uint8_t>> publish_crl() {
+        // Serialise number-allocation + record so the crlNumber stays monotonic
+        // under concurrent publishers (gov architect SHOULD).
+        std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root)
+            return std::nullopt;
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        detail::ScopedKeyZero ca_key_zero{*ca_key};
+
+        std::vector<pki::CrlRevocation> revoked;
+        for (const auto& r : ca_store_->list_revoked()) {
+            revoked.push_back(
+                {r.serial_hex,
+                 std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
+        }
+        const auto now = std::chrono::system_clock::now();
+        const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
+        const std::uint64_t number = ca_store_->next_crl_number();
+        auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
+        if (!der) {
+            spdlog::error("PKI: build_crl failed");
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        CrlVersionRecord rec;
+        rec.version = static_cast<int64_t>(number);
+        rec.der = *der;
+        rec.this_update =
+            std::chrono::duration_cast<std::chrono::seconds>(validity.not_before.time_since_epoch())
+                .count();
+        rec.next_update =
+            std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
+                .count();
+        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+        // cert fingerprint plus the STABLE key id (invariant across a subordinate
+        // re-key) so the CRL history is attributable to the key, not just a cert.
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        if (!ca_store_->record_crl(rec)) {
+            // B-1 (#1240): do NOT report success on a persistence failure. Returning
+            // the freshly-built DER here would make the revoke handler audit
+            // ca.crl.published/success and set crl_republished:true while /ca/crl
+            // keeps serving the PREVIOUS CRL (missing the just-revoked serial) — a
+            // false success that also evades the stale-CRL alert. Fail honestly so
+            // the caller reports crl_republished:false and the failure audit fires.
+            spdlog::error("PKI: failed to record CRL v{} — reporting publish failure", number);
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        return der;
     }
 
     // -- Web server -----------------------------------------------------------
@@ -2268,6 +3561,40 @@ private:
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly. Carries the dispatch/instruction correlation id (command_id),
+    // the result-set ref, principal + role, and reason — the forensic chain the
+    // design §10 walkthrough requires (gov C-B1/F1). Also increments a
+    // Prometheus counter so the failure is alertable rather than buried in
+    // audit.db (gov OBS-2), and logs at warn so a signal survives even when the
+    // audit write itself fails (gov OBS-3 / F3 / UP-2).
+    void audit_scope_resolution_failed(const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& ref) {
+        metrics_.counter("yuzu_scope_resolution_failed_total").increment();
+        spdlog::warn("scope resolution failed: command={} principal={} ref={} "
+                     "(result set absent, expired, or not owned)",
+                     command_id, principal.empty() ? "unknown" : principal, ref);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED command=" + command_id + " ref=" + ref +
+                    " reason=result set not found, expired, or not owned by principal";
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: instruction.scope_resolution_failed "
+                          "(command={} ref={})",
+                          command_id, ref);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -2309,6 +3636,66 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+        // F1 DEX alerting config — both consumers accept live updates, so the
+        // same call applies at boot and from the settings POST handlers.
+        apply_dex_alert_config();
+    }
+
+    /// F1: push the persisted DEX alerting config into the alert router and
+    /// the blast-radius detector. Safe to call any time (both take their own
+    /// locks); called at boot via apply_runtime_config_overrides and from the
+    /// Settings → DEX alerts POST handlers after a write.
+    void apply_dex_alert_config() {
+        if (!runtime_config_store_ || !runtime_config_store_->is_open())
+            return;
+        dex_alert_router_.set_routes(
+            parse_routed_types(runtime_config_store_->get_value("dex_alert_routing")));
+        const auto get_int = [&](const char* key, int fallback) {
+            try {
+                const auto v = runtime_config_store_->get_value(key);
+                if (!v.empty())
+                    return std::stoi(v);
+            } catch (...) {}
+            return fallback;
+        };
+        const BlastRadiusConfig defaults{};
+        blast_radius_detector_.update_alert_shape(
+            get_int("dex_blast_min_devices", defaults.min_devices),
+            get_int("dex_blast_window_seconds", defaults.window_seconds),
+            get_int("dex_blast_cooldown_seconds", defaults.cooldown_seconds));
+        // F2a PR3: cohort metrics export key — read+validated here, consumed by
+        // the reaper-thread gauge sweep. Invalid stored values disable the
+        // export (fail closed) rather than reaching the snapshot provider.
+        {
+            std::string key = runtime_config_store_->get_value("dex_cohort_export_key");
+            if (!key.empty() && !TagStore::validate_key(key))
+                key.clear();
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_cohort_export_key_ = std::move(key);
+        }
+    }
+
+    /// F2a PR3: publish the per-cohort fleet perf gauges for the configured
+    /// export tag key. Runs on the reaper thread each sweep, right after
+    /// recompute_metrics (same cycle, same staleness window → the cohort
+    /// gauges can never disagree with the fleet families). The export logic
+    /// (clear-first absent-not-stale, floor, top-N cap + visible clipped
+    /// count, "(untagged)" residual label) lives in dex_perf_model so the
+    /// gauges are pinned by unit tests against the same cohort rows the tab
+    /// and REST render.
+    void publish_cohort_perf_gauges() {
+        std::string key;
+        DexPerfFn perf;
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            key = dex_cohort_export_key_;
+            perf = dex_perf_fn_;
+        }
+        if (key.empty() || !perf) {
+            dex_perf_clear_cohort_gauges(metrics_); // export disabled — absent
+            return;
+        }
+        dex_perf_export_cohort_gauges(metrics_, dex_perf_cohorts(perf(key)));
     }
 
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -2387,8 +3774,27 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // Rate limiting — check before auth to protect against brute force
-            bool is_login = (req.path == "/login" && req.method == "POST");
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            // `/login/mfa/stepup` joins this bucket (PR2): the endpoint
+            // accepts the same TOTP / recovery code space as `/login/mfa`
+            // so a malicious operator with a stolen valid session could
+            // pound the space to brute-force the secret. Step-up has no
+            // per-pending-token attempts cap (the session IS the
+            // credential), so the per-IP rate limit is the only brake.
+            // `/login/mfa/enroll` joins it too (PR3): it confirms the first
+            // code against a provisional TOTP secret during enforced
+            // enrollment, so it is the same online-guessing surface and
+            // must not fall through to the looser bucket.
+            bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
+                             req.path == "/login/mfa/stepup" ||
+                             req.path == "/login/mfa/enroll") &&
+                            req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -2399,7 +3805,7 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
             // rate limiting). They are kept in this list as defense-in-depth
@@ -2407,9 +3813,28 @@ private:
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
             // re-review LOW. Do not remove either site without updating both.
-            if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
-                req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                req.path == "/api/v1/openapi.json" || req.path.starts_with("/static/")) {
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            // `/login/mfa/enroll` (PR3) is also pre-session: it completes
+            // an enforced login for an un-enrolled user who has only the
+            // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
+            // is deliberately NOT here — it requires an existing session.)
+            if (req.path == "/login" || req.path == "/login/mfa" ||
+                req.path == "/login/mfa/enroll" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                // PKI PR4: the CA root cert + CRL are public by design — clients
+                // and browsers need them to establish trust / check revocation
+                // before they have any session. Exact-match only; /api/v1/ca/issued
+                // and /api/v1/ca/revoke remain Security-gated below.
+                req.path == "/api/v1/ca/root" || req.path == "/api/v1/ca/crl" ||
+                req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -2547,15 +3972,24 @@ private:
             // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+            // Guardian Baselines store — load-bearing for the Baseline dashboard +
+            // deploy surface; same rationale as the Guard store row above.
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
             // Phase 8.3 #255 — same pattern as Guardian above. Without
             // this row /healthz would report "healthy" while every
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // (issuance / revocation / CRL). It was wired into /readyz but missing
+            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // the /readyz conjunction; trivially true when not on default certs
+            // (the operator brought their own, so ca.db isn't required).
+            bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && offload_target_ok;
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -2568,11 +4002,24 @@ private:
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
-                  {"offload_target", offload_target_ok ? "ok" : "error"}}},
+                  {"baselines", baseline_ok ? "ok" : "error"},
+                  {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"ca", ca_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
                 {"version", std::string(yuzu::kVersionString)}};
+
+            // TLS posture — intentionally UNAUTHENTICATED: operators and
+            // monitoring MUST be able to see when the install is on built-in
+            // default certs. The CA fingerprint is public.
+            health["tls"] = {
+                {"default_certs_active", cfg_.using_default_certs},
+                {"ca_fingerprint", default_cert_set_.ca_fingerprint_sha256},
+                {"ca_expires_at",
+                 cfg_.using_default_certs ? static_cast<int64_t>(std::chrono::system_clock::to_time_t(
+                                                default_cert_set_.ca_expires_at))
+                                          : int64_t{0}}};
 
             // Authenticated extension — heavier work, only run when the caller
             // has a session. Adds: agents.pending (SQLite scan), executions.*
@@ -2665,6 +4112,7 @@ private:
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
                  guaranteed_state_store_ && guaranteed_state_store_->is_open()},
+                {"baseline_store", baseline_store_ && baseline_store_->is_open()},
                 // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
                 // legacy config-file-only deployments (auth_db_ == nullptr
                 // in AuthManager) and false only when an opted-in AuthDB
@@ -2703,6 +4151,19 @@ private:
                 // dashboard would not detect the half-state. Pairs with the
                 // workflow_routes.cpp install handler's `is_open()` guard.
                 {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
+                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
+                // scoped command dispatch and the /api/scope/estimate preview
+                // resolve from_result_set: aliases and owner-check membership
+                // against it. A failed migration / corrupt result_sets.db would
+                // silently degrade every scoped dispatch to zero targets while
+                // /readyz reported "ready".
+                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
+                // PKI PR2: ca.db is load-bearing only when the install is on
+                // built-in default certs (PR3+ make it load-bearing for mTLS
+                // issuance/revocation). When the operator brought their own certs
+                // it is not on the request path, so report ok.
+                {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
+                {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
             };
 
             std::string failed_list;
@@ -2744,8 +4205,9 @@ private:
             bool policy_ok = policy_store_ && policy_store_->is_open();
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
-            bool all_ok =
-                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
+            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
+            bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+                          guaranteed_state_ok && baseline_ok;
 
             // Execution stats
             int in_flight = 0;
@@ -3319,6 +4781,29 @@ private:
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // both surfaces atomically). Hoisted to the top of start_web_server
+        // because SettingsRoutes::register_routes (called just below) and
+        // RestApiV1::register_routes (called later in this same function)
+        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement);
+        };
+
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
         settings_routes_->register_routes(
@@ -3346,7 +4831,10 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_);
+            /*metrics_registry=*/&metrics_, step_up_fn);
+        // F1: live-apply hook for the DEX alerts settings (wired before the
+        // listener starts, so no request races the set).
+        settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -3603,8 +5091,25 @@ private:
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal, principal_role;
+                if (auto s = require_auth(req, res)) {
+                    principal = s->username;
+                    principal_role = auth::role_to_string(s->role);
+                }
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -3613,7 +5118,8 @@ private:
                     return;
                 }
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -4144,6 +5650,225 @@ private:
             }
             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
         });
+
+        // ── Result Sets (scope walking — capability §30) ─────────────────
+        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
+        // fragment authenticates and filters/loads by the session principal.
+        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
+        web_server_->Get("/result-sets",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session) {
+                                 res.set_redirect("/login");
+                                 return;
+                             }
+                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
+                         });
+
+        // Owner-scoped sidebar list.
+        web_server_->Get(
+            "/fragments/result-sets/sidebar",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                if (!result_set_store_) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+                std::string next;
+                std::string selected =
+                    req.has_param("selected") ? req.get_param_value("selected") : "";
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, selected),
+                                "text/html; charset=utf-8");
+            });
+
+        // Detail pane for one set (owner-checked).
+        web_server_->Get(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_ ? result_set_store_->get(id) : std::nullopt;
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                auto chain = result_set_store_->lineage(id, session->username);
+                res.set_content(render_result_set_detail(*row, chain),
+                                "text/html; charset=utf-8");
+            });
+
+        // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
+        auto rs_detail_after = [this](const std::string& id, const std::string& owner,
+                                      httplib::Response& res) {
+            auto row = result_set_store_->get(id);
+            if (!row || row->owner_principal != owner) {
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                return;
+            }
+            auto chain = result_set_store_->lineage(id, owner);
+            res.set_header("HX-Trigger", "resultSetsChanged");
+            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+        };
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto pinned = result_set_store_->pin(id);
+                if (!pinned) {
+                    // Don't audit a success that didn't happen, and tell the
+                    // operator why (review merged_bug_009). PinLimit is the
+                    // 50-pin cap; otherwise a transient store error.
+                    audit_log(req, "result_set.pin",
+                              pinned.error() == ResultSetError::PinLimit ? "denied" : "failure",
+                              "ResultSet", id, to_string(pinned.error()));
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{{"showToast",
+                                        {{"level", "error"}, {"message", to_string(pinned.error())}}}}
+                            .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto unpinned = result_set_store_->unpin(id);
+                if (!unpinned) {
+                    audit_log(req, "result_set.unpin", "failure", "ResultSet", id,
+                              to_string(unpinned.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(unpinned.error())}}}}
+                                       .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto del = result_set_store_->delete_set(id);
+                if (!del) {
+                    // Pinned sets must be unpinned first — re-render the detail
+                    // so the operator sees why nothing was deleted.
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.delete", "success", "ResultSet", id, "");
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+            });
+
+        // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
+        web_server_->Post(
+            "/fragments/result-sets/create",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = req.has_param("name") ? req.get_param_value("name") : "";
+                cr.source_kind = std::string(source_kind::kManualCurate);
+                cr.source_payload = R"({"note":"dashboard CSV import"})";
+
+                std::vector<std::string> members;
+                if (req.has_param("device_ids")) {
+                    std::string raw = req.get_param_value("device_ids");
+                    std::string cur;
+                    auto flush = [&]() {
+                        // trim whitespace
+                        std::size_t a = cur.find_first_not_of(" \t\r\n");
+                        std::size_t b = cur.find_last_not_of(" \t\r\n");
+                        if (a != std::string::npos)
+                            members.push_back(cur.substr(a, b - a + 1));
+                        cur.clear();
+                    };
+                    for (char c : raw) {
+                        if (c == '\n' || c == ',')
+                            flush();
+                        else
+                            cur += c;
+                    }
+                    flush();
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    // Surface quota / too-many-members / store errors instead of
+                    // silently re-rendering as if the create succeeded (review
+                    // merged_bug_009). The store enforces kMaxMembersPerSet, so an
+                    // oversized pasted CSV lands here as TooManyMembers (B4).
+                    if (created.error() == ResultSetError::QuotaExceeded ||
+                        created.error() == ResultSetError::TooManyMembers)
+                        metrics_.counter("yuzu_result_set_quota_rejected").increment();
+                    audit_log(req, "result_set.create", "denied", "ResultSet", "",
+                              to_string(created.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(created.error())}}}}
+                                       .dump());
+                    std::string next;
+                    auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.create", "success", "ResultSet", created->id,
+                          cr.source_kind);
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_sets_sidebar(sets, created->id),
+                                "text/html; charset=utf-8");
+            });
 
         // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
         // (same posture as /tar) but the per-request RBAC check happens
@@ -5764,10 +7489,32 @@ private:
                             ++sent;
                 }
             } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Role is not available on the tracked path (principal recovered
+                // from the execution row, no live session); principal + command
+                // id still identify the actor for the forensic chain.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
                     for (const auto& aid : matched)
                         if (registry_.send_to(aid, cmd))
                             ++sent;
@@ -5823,6 +7570,103 @@ private:
             }
         });
 
+        // Result-set maintenance thread (capability §30) — materialises pending
+        // result sets once their producing execution reaches a terminal state,
+        // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
+        // gauges. Borrows result_set_store_, execution_tracker_, response_store_
+        // and metrics_, so it MUST be joined before any of them are torn down
+        // (join sits next to the policy-eval join in stop()).
+        if (result_set_store_ && result_set_store_->is_open()) {
+            result_set_maint_thread_ = std::thread([this]() {
+                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
+                constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                int tick = 0;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    try {
+                        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+
+                        // 1) Materialise terminal pending sets.
+                        for (const auto& p : result_set_store_->list_pending()) {
+                            if (p.source_execution_id.empty())
+                                continue;
+                            bool terminal = false;
+                            if (execution_tracker_) {
+                                auto sum = execution_tracker_->get_summary(p.source_execution_id);
+                                terminal = sum.agents_targeted > 0 &&
+                                           sum.agents_responded >= sum.agents_targeted;
+                            }
+                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
+                            if (!terminal && !timed_out)
+                                continue;
+
+                            // Membership: every responder whose (status,
+                            // output) satisfies the pending row's matcher.
+                            // rs_matcher centralises the per-producer rule —
+                            // empty matcher = SUCCESS responders; tar_rows_ge
+                            // = SUCCESS with ≥N rows; column/op/value = a
+                            // matching output row (PR-D, design §3.3).
+                            std::vector<std::string> members;
+                            std::unordered_set<std::string> seen;
+                            if (response_store_) {
+                                for (const auto& r :
+                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
+                                        continue;
+                                    if (seen.insert(r.agent_id).second)
+                                        members.push_back(r.agent_id);
+                                }
+                            }
+                            if (result_set_store_->materialize(p.id, members)) {
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialized"}})
+                                    .increment();
+                            } else {
+                                // Don't count a materialization that didn't happen
+                                // (review finding bug_008); surface the failure so
+                                // SRE can alert on a stuck pending row.
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialize_failed"}})
+                                    .increment();
+                            }
+                        }
+
+                        // 2) GC sweep on the slow cadence.
+                        if (++tick % kGcEveryNTicks == 0) {
+                            int swept = result_set_store_->gc_sweep();
+                            if (swept > 0) {
+                                metrics_.counter("yuzu_result_set_gc_total")
+                                    .increment(static_cast<double>(swept));
+                                spdlog::info("result-set GC swept {} expired set(s)", swept);
+                            }
+                        }
+
+                        // 3) Refresh alive gauges.
+                        auto c = result_set_store_->counts();
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                            .set(static_cast<double>(c.pinned));
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                            .set(static_cast<double>(c.total - c.pinned));
+                    } catch (const std::exception& e) {
+                        spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("result_set_maint: tick threw unknown — thread continuing");
+                    }
+                }
+            });
+        }
+
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
         // /api/compliance/*
         compliance_routes_ = std::make_unique<ComplianceRoutes>();
@@ -5834,6 +7678,232 @@ private:
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
             policy_evaluator_.get());
+
+        // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
+        // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
+        // mock-backed (contract-shaped) until the parallel backend on
+        // feat/guardian-mvp lands; live data is used where it already exists
+        // (rule CRUD + event query on GuaranteedStateStore).
+        guardian_routes_ = std::make_unique<GuardianRoutes>();
+        guardian_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            [this](const std::string& event_type, const httplib::Request& req,
+                   const nlohmann::json& attrs, const nlohmann::json& payload_data) {
+                emit_event(event_type, req, attrs, payload_data);
+            },
+            guaranteed_state_store_.get(),
+            baseline_store_.get(),
+            [this]() -> std::string { return registry_.to_json(); },
+            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // REST endpoint uses. guardian_push_fn_ is assigned just below during
+            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // registration time, so the ordering is fine.
+            [this](const std::string& scope, bool full_sync) -> int {
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+            });
+
+        // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
+        // perf tags (validated through the SAME dex_perf_rules the Prometheus
+        // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
+        // TagStore (operator tags, ONE bulk query per render — not N point
+        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
+        // first, then the tag store. Shared by the /dex Performance fragments,
+        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
+        // three can never disagree.
+        auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
+            DexPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            std::unordered_map<std::string, std::string> cohort_values;
+            if (tag_store_ && !cohort_key.empty()) {
+                // available_keys feed the tab's key picker and the cohorts
+                // REST response — both always pass a key. Key-less callers
+                // (the pollable fleet endpoint, the disabled gauge sweep)
+                // don't pay the extra query (grill NFR fix).
+                snap.available_keys = tag_store_->get_distinct_keys();
+                cohort_values = tag_store_->get_values_for_key(cohort_key);
+            }
+            // Same staleness the recompute_metrics sweep prunes by — the tab and
+            // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
+            // copies ONLY the perf tags (G3 performance S1 — the copy runs under
+            // the heartbeat-upsert mutex).
+            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
+            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
+            by_id.reserve(health.size());
+            for (const auto& h : health)
+                by_id[h.agent_id] = &h;
+            for (const auto& id : registry_.all_ids()) {
+                auto s = registry_.get_session(id);
+                if (!s)
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = id;
+                std::string os = s->os;
+                for (auto& c : os)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
+                // match classifies every macOS agent as Windows (G4 UP-1
+                // BLOCKING). Agents report "windows" / "darwin" / "linux"
+                // (agents/core/src/agent.cpp kAgentOs).
+                d.is_windows = os.starts_with("win");
+                if (auto it = by_id.find(id); it != by_id.end()) {
+                    const auto& tags = it->second->status_tags;
+                    auto get = [&](const char* k) -> std::string {
+                        auto t = tags.find(k);
+                        return t != tags.end() ? t->second : std::string{};
+                    };
+                    d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                    d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                    d.disk_lat_ms =
+                        detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                }
+                if (!cohort_key.empty()) {
+                    // STORE-FIRST precedence — deliberately the OPPOSITE of
+                    // evaluate_scope's agent-first order: a benchmark cohort is
+                    // an operator-declared comparison population, so a rogue
+                    // agent must not self-assign into "executive-laptops" and
+                    // drag its p90 (G4 UP-5). The store already carries honest
+                    // agents' tags via sync_agent_tags, so store-first loses
+                    // nothing; the in-memory fallback only covers a tag not yet
+                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
+                    // are unvalidated at session ingest) so oversized/garbage
+                    // bytes never become a cohort label.
+                    if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
+                        d.cohort = cv->second;
+                    } else if (auto it = s->scopable_tags.find(cohort_key);
+                               it != s->scopable_tags.end() &&
+                               TagStore::validate_value(it->second)) {
+                        d.cohort = it->second;
+                    }
+                }
+                snap.devices.push_back(std::move(d));
+            }
+            // C-S1 (consistency): the fleet yuzu_fleet_perf_* gauges aggregate
+            // EVERY fresh health snapshot; an agent whose Subscribe session was
+            // reaped while its heartbeat is still <90s old must therefore also
+            // appear here, or the tab and the gauges disagree about the same
+            // sweep. Session-less devices carry values but no OS/cohort context
+            // (is_windows=false keeps them out of the Windows denominator;
+            // store-side cohort still resolves).
+            std::unordered_set<std::string> seen;
+            seen.reserve(snap.devices.size());
+            for (const auto& d : snap.devices)
+                seen.insert(d.agent_id);
+            for (const auto& h : health) {
+                if (seen.contains(h.agent_id))
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = h.agent_id;
+                auto get = [&](const char* k) -> std::string {
+                    auto t = h.status_tags.find(k);
+                    return t != h.status_tags.end() ? t->second : std::string{};
+                };
+                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                if (!cohort_key.empty())
+                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+        // G3 performance S2: a 5s TTL memo keyed by cohort key. Heartbeat data
+        // changes on a ~30s cadence, so every consumer (operator clicks, agentic
+        // pollers, per-device drills, the 15s gauge sweep) can share one build
+        // per key per 5s — bounding the fleet-walk + tag-query cost no matter
+        // how hard the REST surface is polled. Consumers may therefore see a
+        // snapshot up to 5s stale; that is well inside the heartbeat cadence.
+        struct DexPerfMemo {
+            std::mutex mu;
+            struct Entry {
+                std::chrono::steady_clock::time_point at;
+                DexPerfSnapshot snap;
+            };
+            std::unordered_map<std::string, Entry> by_key;
+        };
+        auto dex_perf_memo = std::make_shared<DexPerfMemo>();
+        auto dex_perf_fn = [memo = dex_perf_memo,
+                            dex_perf_uncached](const std::string& cohort_key) -> DexPerfSnapshot {
+            constexpr auto kTtl = std::chrono::seconds{5};
+            constexpr std::size_t kMaxMemoEntries = 8; // "", default key, export key, picker keys
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lk(memo->mu);
+                if (auto it = memo->by_key.find(cohort_key);
+                    it != memo->by_key.end() && now - it->second.at < kTtl)
+                    return it->second.snap;
+            }
+            auto snap = dex_perf_uncached(cohort_key);
+            {
+                std::lock_guard lk(memo->mu);
+                if (memo->by_key.size() >= kMaxMemoEntries &&
+                    !memo->by_key.contains(cohort_key)) {
+                    auto oldest = memo->by_key.begin();
+                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
+                        if (it->second.at < oldest->second.at)
+                            oldest = it;
+                    memo->by_key.erase(oldest);
+                }
+                memo->by_key[cohort_key] = {now, snap};
+            }
+            return snap;
+        };
+        // PR3: the reaper-thread cohort gauge sweep uses the same provider.
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_perf_fn_ = dex_perf_fn;
+        }
+
+        // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
+        // over the crash-observation projection). Read-only; NO mock data — real
+        // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
+        dex_routes_ = std::make_unique<DexRoutes>();
+        dex_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(),
+            // Cross-store fleet denominator for the DEX rates: count online agents,
+            // and of those the Windows ones (the only OS with a crash collector
+            // today — the coverage-honest crash-free denominator). Real data; an
+            // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            [this]() -> DexFleet {
+                DexFleet f;
+                const auto ids = registry_.all_ids();
+                f.total_online = static_cast<int64_t>(ids.size());
+                for (const auto& id : ids) {
+                    if (auto s = registry_.get_session(id)) {
+                        std::string os = s->os;
+                        for (auto& c : os)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        // starts_with, NOT find — "darwin" contains "win"
+                        // (G4 UP-1; pre-existing here, fixed with the sibling).
+                        if (os.starts_with("win"))
+                            ++f.windows_online;
+                    }
+                }
+                return f;
+            },
+            audit_fn,
+            // A4 device perf panel: canned tar.sql dispatch through the shared
+            // chokepoint (untracked path — empty execution_id, same posture as
+            // the dashboard TAR SQL surface).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            // F2a: the shared fleet perf snapshot provider (defined above).
+            dex_perf_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -5887,7 +7957,8 @@ private:
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                                custom_properties_store_.get());
+                                                                custom_properties_store_.get(),
+                                                                result_set_store_.get());
                         for (const auto& aid : matched) {
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
@@ -5972,12 +8043,16 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.scope_fn =
-            [this](const std::string& expression) -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
+            [this](const std::string& expression,
+                   const std::string& principal) -> std::pair<std::size_t, std::size_t> {
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
-                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
+                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
+                                         result_set_store_.get(), principal);
             return {matched.size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
@@ -6019,6 +8094,21 @@ private:
         discovery_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                            directory_sync_.get(), patch_manager_.get(),
                                            deployment_store_.get(), discovery_store_.get());
+
+        // -- PKI PR4: internal-CA REST surface (/api/v1/ca/*) ---------------------
+        // The publish-CRL callback captures `this`; like the agent-cert signer it
+        // relies on the gRPC/web drain in stop() running before members destruct.
+        ca_routes_ = std::make_unique<CaRoutes>();
+        ca_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
+            [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
+            // PR6 subordinate-CA: export our CA CSR / import an enterprise-signed
+            // intermediate. Both need the CA key + dir, so they live in ServerImpl.
+            [this]() -> std::optional<std::string> { return export_ca_csr(); },
+            [this](const std::string& intermediate_pem,
+                   const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
+                return import_subordinate_chain(intermediate_pem, parent_chain_pem);
+            });
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -6098,7 +8188,132 @@ private:
             // workers to live execution transitions. Same bus the
             // dashboard SSE handler uses; nullptr leaves the new
             // route registered but returning 503.
-            execution_event_bus_.get());
+            execution_event_bus_.get(),
+            // Scope-walking result-set store (capability §30). nullptr leaves
+            // the /api/v1/result-sets routes unregistered.
+            result_set_store_.get(),
+            // Same hoisted dispatch closure the workflow + policy engines use,
+            // so the async result-set producers (from-tar-query /
+            // from-instruction-result / re-eval) drive the exact dispatch path
+            // (PR-D). Empty closure would 503 those routes.
+            command_dispatch_fn,
+            // PR2 MFA step-up gate for the high-risk REST handlers; empty
+            // closure disables the gate (preserves pre-PR2 behaviour).
+            step_up_fn,
+            // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
+            // GuaranteedStatePush from the store's enabled rules (typed
+            // spark/assertion/remediation from spec_json) and deliver as a
+            // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
+            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
+            // toggle deploys via this exact fan-out. The parenthesised assignment yields
+            // the assigned std::function, which is what gets passed here by value.
+            (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
+                if (!guaranteed_state_store_)
+                    return 0;
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                // Read (never bump) the monotonic generation: a reconcile re-push
+                // (M5) must carry the SAME generation as the policy-change push that
+                // minted it, otherwise catching one lagging agent up would make the
+                // rest of the fleet look stale and trigger a reconcile storm. The
+                // store bumps the counter on rule mutations; we only read it here.
+                // Replaces wall-clock seconds, which could repeat or step backwards
+                // and wedge the heartbeat reconcile. (M6 / #1209.)
+                const std::uint64_t generation =
+                    guaranteed_state_store_->current_policy_generation();
+                // Baseline gate: push only Guards that are members of a *deployed*
+                // Baseline (docs/guardian-baseline-model.md). With nothing deployed
+                // the set is empty and a full_sync converges agents to zero guards.
+                const auto rules = guardian::filter_deployed_members(
+                    guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+
+                // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
+                // toggle to the affected rule's scope_expr (was the whole fleet); an
+                // empty scope still means fleet-wide.
+                std::vector<std::string> targets;
+                if (scope.empty()) {
+                    targets = registry_.all_ids();
+                } else if (scope.starts_with("group:") && mgmt_group_store_) {
+                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                        targets.push_back(m.agent_id);
+                } else {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                       custom_properties_store_.get());
+                }
+
+                // Per-rule scope membership, evaluated once per distinct scope_expr
+                // and cached, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents × rules).
+                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                auto agent_in_scope = [&](const std::string& aid,
+                                          const std::string& expr) -> bool {
+                    auto it = scope_cache.find(expr);
+                    if (it == scope_cache.end()) {
+                        std::unordered_set<std::string> ids;
+                        if (auto parsed = yuzu::scope::parse(expr)) {
+                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                            ids.insert(v.begin(), v.end());
+                        }
+                        it = scope_cache.emplace(expr, std::move(ids)).first;
+                    }
+                    return it->second.contains(aid);
+                };
+
+                // Build and send a per-agent FILTERED push (M4 / #1209): each agent
+                // receives only the enabled rules that target its OS and name it in
+                // scope, so a Linux box is no longer handed Windows registry guards.
+                int sent = 0;
+                for (const auto& aid : targets) {
+                    auto sess = registry_.get_session(aid);
+                    const std::string agent_os = sess ? sess->os : std::string{};
+                    auto push = guardian::build_agent_push(
+                        rules, agent_os,
+                        [&](const std::string& expr) { return agent_in_scope(aid, expr); },
+                        full_sync, generation);
+
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per push (random suffix) so two pushes in the same second
+                    // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-push-" + std::to_string(now_s) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    // Binary serialized proto rides in the `payload` bytes field, not the
+                    // `parameters` string map: proto3 string values must be valid UTF-8, and
+                    // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(aid, cmd)) {
+                        ++sent;
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "policy_change"}})
+                            .increment();
+                    }
+                }
+                metrics_.gauge("yuzu_server_guardian_policy_generation")
+                    .set(static_cast<double>(generation));
+                // Drain gw_pending_ so the push reaches gateway-connected agents.
+                // send_to only QUEUES for a gateway agent (it has no local Subscribe
+                // stream — the gateway holds it); direct agents already got the inline
+                // write. Every other dispatch site drains here; the Guardian push
+                // omitted it, so over a gateway the push silently never arrived and no
+                // guard armed (works in direct mode, breaks via gateway). See
+                // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
+                forward_gateway_pending();
+                return sent;
+            }),
+            // F2a: the shared fleet perf snapshot provider — the same closure
+            // the /dex Performance fragments and the MCP perf tools use, so
+            // REST, dashboard and MCP can never disagree.
+            dex_perf_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -6122,8 +8337,8 @@ private:
                 },
                 [this](const httplib::Request& req, const std::string& action,
                        const std::string& result, const std::string& target_type,
-                       const std::string& target_id, const std::string& detail) {
-                    (void)audit_log(req, action, result, target_type, target_id, detail);
+                       const std::string& target_id, const std::string& detail) -> bool {
+                    return audit_log(req, action, result, target_type, target_id, detail);
                 },
                 [this]() { return registry_.to_json_obj(); }, rbac_store_.get(),
                 instruction_store_.get(), execution_tracker_.get(), response_store_.get(),
@@ -6165,10 +8380,28 @@ private:
                                     ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        // Role unavailable on the MCP path (principal recovered
+                        // from the MCP-created execution row); principal + command
+                        // id identify the actor for the forensic chain.
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
                             for (const auto& aid : registry_.evaluate_scope(
-                                     *parsed, tag_store_.get(), custom_properties_store_.get()))
+                                     *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                     result_set_store_.get(), principal))
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
@@ -6186,7 +8419,14 @@ private:
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
                                  sent);
                     return {command_id, sent};
-                });
+                },
+                // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
+                ca_store_.get(), [this]() { return publish_crl(); },
+                // ar-S1: DEX read tools (parity with /api/v1/dex/*).
+                guaranteed_state_store_.get(),
+                // F2a: the shared fleet perf snapshot provider (one closure,
+                // three surfaces — fragments, REST, MCP).
+                dex_perf_fn);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -6284,6 +8524,11 @@ private:
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
 
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
+
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
     static std::string extract_json_string(const std::string& body, const std::string& key) {
@@ -6350,6 +8595,22 @@ private:
     yuzu::MetricsRegistry metrics_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
+    /// direct Subscribe path via agent_service_ and the gateway path via
+    /// gateway_service_). Its on_incident sink fans out to notification +
+    /// webhook + offload. Plain member (no heap): in-memory derived state only.
+    /// DECLARED BEFORE its borrowers (agent_service_ / gateway_service_ /
+    /// agent_server_) so it destructs AFTER them — the detector must outlive any
+    /// ingest thread that holds its raw pointer (gov cpp-safety/architect). stop()
+    /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
+    BlastRadiusDetector blast_radius_detector_;
+    DexAlertRouter dex_alert_router_;
+    /// F2a PR3: cohort metrics export — written by apply_dex_alert_config
+    /// (boot + settings POST) and start_web_server (the provider closure),
+    /// read by the reaper-thread gauge sweep. One mutex guards both.
+    std::mutex dex_cohort_export_mu_;
+    std::string dex_cohort_export_key_;
+    DexPerfFn dex_perf_fn_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
@@ -6420,20 +8681,89 @@ private:
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    std::unique_ptr<BaselineStore> baseline_store_;
+    std::unique_ptr<CaStore> ca_store_;
+    DefaultCertSet default_cert_set_;
+    bool default_certs_failed_{false};
+    // PR4: backoff for the reaper's CRL freshness re-publish — on a persistent
+    // publish failure (e.g. unreadable CA key) skip retries until this point so
+    // the ~15s reaper doesn't spam logs/metrics. steady_clock (NTP-jump-safe,
+    // gov L5). ACCESSED ONLY by the single reaper thread (health_recompute_thread_)
+    // — not atomic by design; do NOT read/write it from another thread without
+    // converting to std::atomic first (gov L1).
+    std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
+    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
+    // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
+    std::string agent_ca_cert_pem_;
+    std::mutex csr_issue_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
+    // Serialises publish_crl() so next_crl_number()+record_crl() are atomic across
+    // concurrent publishers (startup pre-publish vs a revoke, or two revokes) —
+    // otherwise both could read the same number and last-writer-wins overwrites,
+    // breaking RFC 5280 monotonic crlNumber (gov architect SHOULD).
+    std::mutex crl_publish_mu_;
+    // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
+    // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
+    std::mutex yuzu_issued_cache_mu_;
+    std::unordered_map<std::string, bool> yuzu_issued_cache_;
+    // Cache of the immutable PEM→serial parse for the per-heartbeat revocation
+    // gate (is_peer_cert_revoked) — avoids an X509 parse per call fleet-wide. The
+    // revocation status itself is deliberately NOT cached (it is mutable). Keyed
+    // by full leaf PEM; same crude size bound as yuzu_issued_cache_.
+    std::mutex peer_serial_cache_mu_;
+    std::unordered_map<std::string, std::string> peer_serial_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<GuardianRoutes> guardian_routes_;
+    std::unique_ptr<DexRoutes> dex_routes_;
+    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
+    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
+    // which point it is set.
+    std::function<int(const std::string&, bool)> guardian_push_fn_;
+
+    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
+    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
+    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
+    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
+    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
+    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
+    // is agent_id -> last reconcile time, guarded by its own mutex.
+    std::mutex guardian_reconcile_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        guardian_last_reconcile_;
+
+    // The Baseline gate's input: the union of member-Guard rule_ids across all
+    // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
+    // was deployed) — NOT its live member set. A Guard reaches an agent only as a
+    // member of a deployed Baseline (docs/guardian-baseline-model.md), so the push
+    // fan-out and the heartbeat reconcile filter their rule source through this via
+    // guardian::filter_deployed_members. Empty when nothing is deployed — a
+    // full_sync push then converges agents to zero guards (correct by model).
+    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // format) so an edit to a deployed Baseline's members does not change what the
+    // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
+    std::unordered_set<std::string> deployed_member_rule_ids() const {
+        if (!baseline_store_)
+            return {};
+        return baseline_store_->deployed_member_rule_ids();
+    }
+
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+    std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
@@ -6475,6 +8805,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

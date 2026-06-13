@@ -63,6 +63,11 @@ struct RestGsHarness {
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
 
+    // When false, perm_fn denies (403) — lets a test prove the permission gate
+    // runs BEFORE any audit emission on the DEX read surface (default grants,
+    // preserving every other test's behaviour).
+    bool grant_perms{true};
+
     std::vector<AuditRecord> audit_log;
 
     RestApiV1 api;
@@ -84,10 +89,14 @@ struct RestGsHarness {
             return s;
         };
 
-        // perm_fn always grants — RBAC is exercised in test_rbac_store.cpp.
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool {
-            return true;
+        // perm_fn grants unless grant_perms is flipped off (then 403, mirroring
+        // the production perm_fn) — RBAC proper is exercised in test_rbac_store.cpp.
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            if (grant_perms)
+                return true;
+            res.status = 403;
+            return false;
         };
 
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
@@ -125,6 +134,23 @@ struct RestGsHarness {
         // sqlite WAL/SHM siblings
         fs::remove(db_path.string() + "-wal");
         fs::remove(db_path.string() + "-shm");
+    }
+
+    // Seed one ruleless DEX observation (the __observation__ projection the DEX
+    // aggregations read — matches seed_signal in test_dex_routes.cpp). subject +
+    // platform land in detail_json so dex_signal_subjects / _by_os pick them up.
+    void seed_obs(const std::string& id, const std::string& agent, const std::string& obs_type,
+                  const std::string& subject, const std::string& platform, const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = obs_type;
+        e.severity = "info";
+        e.detail_json =
+            "{\"subject\":\"" + subject + "\",\"platform\":\"" + platform + "\"}";
+        e.timestamp = ts;
+        REQUIRE(store->insert_event(e).has_value());
     }
 
     static std::string make_rule_body(const std::string& rule_id, const std::string& name,
@@ -301,24 +327,29 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     REQUIRE(res);
     CHECK(res->status == 202);
     CHECK(res->body.find("\"queued\":true") != std::string::npos);
-    // Response body uses a stable operational phrase, not an engineer-facing
-    // roadmap reference (BL-6 / ER-Dep2).
-    CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
+    // Real fan-out landed: the body reports the rule count and the number of
+    // in-scope agents the push was dispatched to (direct + gateway transports).
+    // The old "agent delivery is asynchronous / deferred" phrasing is gone —
+    // see docs/user-manual/guaranteed-state.md.
+    CHECK(res->body.find("\"rules\":1") != std::string::npos);
+    CHECK(res->body.find("\"agents\":") != std::string::npos);
 
     REQUIRE(h.audit_log.size() == 2); // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
     // Vocabulary matches sibling handlers: "success" (not the prior novel
     // "accepted"), target_id is empty because a push is fleet-level rather
-    // than per-entity, and the scope expression lives in detail alongside
-    // the fan-out-deferred marker so SIEM correlation rules can filter on it.
+    // than per-entity, and the scope expression lives in detail alongside the
+    // agents=<count> fan-out result so SIEM correlation rules can filter on it.
     CHECK(push_audit.result == "success");
     CHECK(push_audit.target_id == "");
     CHECK(push_audit.target_type == "GuaranteedState");
     CHECK(push_audit.detail.find("rules=1") != std::string::npos);
     CHECK(push_audit.detail.find("full_sync=true") != std::string::npos);
     CHECK(push_audit.detail.find("scope=\"tag:env=prod\"") != std::string::npos);
-    CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
+    // Audit detail records the dispatched agent count, not the retired
+    // fan_out_deferred_pr3 marker (push now actually delivers).
+    CHECK(push_audit.detail.find("agents=") != std::string::npos);
 }
 
 TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
@@ -369,7 +400,7 @@ TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
     // The structural frame of the detail is intact.
     CHECK(d.find("rules=0") != std::string::npos);
     CHECK(d.find("full_sync=false") != std::string::npos);
-    CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
+    CHECK(d.find("agents=") != std::string::npos);
 }
 
 TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state][events]") {
@@ -434,4 +465,285 @@ TEST_CASE("REST gs.alerts: empty list placeholder", "[rest][guaranteed_state][al
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"].is_array());
     CHECK(j["data"].empty());
+}
+
+// ── C3b: structured authoring + resilience validation + schema discovery ─────
+
+namespace {
+// A full structured Guard body (spark + assertion + remediation). `resilience`
+// is the remediation.params object carrying the C3b resilience policy.
+std::string make_structured_body(const std::string& rule_id, const std::string& name,
+                                 const std::string& remediation_type, nlohmann::json resilience) {
+    nlohmann::json j;
+    j["rule_id"] = rule_id;
+    j["name"] = name;
+    j["enforcement_mode"] = "enforce";
+    j["severity"] = "high";
+    j["spark"] = {{"type", "registry-change"}, {"params", nlohmann::json::object()}};
+    j["assertion"] = {{"type", "registry-value-equals"},
+                      {"params",
+                       {{"hive", "HKLM"},
+                        {"key", "SOFTWARE\\YuzuTest"},
+                        {"value_name", "Flag"},
+                        {"value_type", "REG_DWORD"},
+                        {"expected", "1"}}}};
+    j["remediation"] = {{"type", remediation_type}, {"params", std::move(resilience)}};
+    return j.dump();
+}
+} // namespace
+
+TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience params",
+          "[rest][guaranteed_state][create][resilience]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-res", "bounded-guard", "enforce",
+                             {{"mode", "BOUNDED"}, {"max_attempts", 3}}));
+    REQUIRE(res);
+    CHECK(res->status == 201);
+
+    auto stored = h.store->get_rule("r-res");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    const auto& params = spec["remediation"]["params"];
+    // Canonical-out: mode lowercased, numeric stored as a decimal string.
+    CHECK(params["mode"].get<std::string>() == "bounded");
+    CHECK(params["max_attempts"].get<std::string>() == "3");
+}
+
+TEST_CASE("REST gs.rules: invalid resilience params → 400 A4 envelope + denied audit",
+          "[rest][guaranteed_state][create][resilience][validation]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-bad", "bad-guard", "enforce",
+                             {{"mode", "bounded"}, {"max_attempts", 0}})); // 0 invalid
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    // A4 envelope shape (contract decision 3).
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"].get<int>() == 400);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"].contains("remediation"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    // Rule not persisted; reject audited.
+    CHECK_FALSE(h.store->get_rule("r-bad").has_value());
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.rules: PUT re-authors structured spec (no silent drop)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-edit", "edit-guard", "enforce",
+                                           {{"mode", "persist"}}))
+                ->status == 201);
+
+    // Tune the resilience policy via PUT — the pre-C3b PUT returned 200 but
+    // silently dropped structured blocks. Now it must re-derive the spec.
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-edit",
+                          make_structured_body("r-edit", "edit-guard", "enforce",
+                                               {{"mode", "bounded"}, {"max_attempts", 2}}));
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+
+    auto stored = h.store->get_rule("r-edit");
+    REQUIRE(stored.has_value());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "bounded");
+    CHECK(spec["remediation"]["params"]["max_attempts"].get<std::string>() == "2");
+    CHECK(stored->version == 2);
+}
+
+TEST_CASE("REST gs.rules: PUT with an incomplete structured body → 400 (not silently dropped)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-meta", "meta-guard"))
+                ->status == 201);
+    // A remediation block with no spark/assertion is an incomplete structured
+    // edit — rejected explicitly rather than 200-and-drop.
+    nlohmann::json partial;
+    partial["remediation"] = {{"type", "enforce"}, {"params", {{"mode", "bounded"}}}};
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-meta", partial.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+    auto j = nlohmann::json::parse(upd->body);
+    CHECK(j["error"]["message"].get<std::string>().find("spark") != std::string::npos);
+}
+
+TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured spec",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-keep", "keep-guard", "enforce",
+                                           {{"mode", "backoff"}, {"backoff_initial_ms", 500}}))
+                ->status == 201);
+    // Toggle enabled only — must not wipe spec_json.
+    nlohmann::json meta;
+    meta["enabled"] = false;
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-keep", meta.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+    auto stored = h.store->get_rule("r-keep");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "backoff");
+}
+
+TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_state][schemas]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/schemas");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("schemas"));
+    CHECK(j["schemas"].is_array());
+
+    // Conditional GET with the matching ETag → 304 Not Modified.
+    auto cached = h.sink.Get("/api/v1/guaranteed-state/schemas",
+                             {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+}
+
+// ── DEX read-model aggregation surface (/api/v1/dex/*) — ar-S1 agentic parity ─
+//
+// The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
+// per-OS scope are fleet aggregates and must NOT audit; the per-signal drill-down
+// returns a most-affected DEVICES list (agent_ids — behavioral) and MUST emit the
+// same dex.signal.view verb the dashboard fragment does. Both halves are asserted.
+
+TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audited",
+          "[rest][dex][signals]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "WS-1", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/signals?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+
+    int64_t crashed_count = -1, crashed_devices = -1;
+    bool saw_boot = false;
+    for (const auto& row : j["data"]) {
+        if (row["obs_type"].get<std::string>() == "process.crashed") {
+            crashed_count = row["count"].get<int64_t>();
+            crashed_devices = row["distinct_devices"].get<int64_t>();
+        }
+        if (row["obs_type"].get<std::string>() == "os.boot")
+            saw_boot = true;
+    }
+    CHECK(crashed_count == 2);
+    CHECK(crashed_devices == 2);
+    CHECK(saw_boot);
+    // Fleet aggregate — no individual-identifying access, so no audit.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "MB-1", "storage.low", "disk", "macos", "2026-06-10T12:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/scope?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+
+    int64_t macos_types = -1;
+    for (const auto& row : j["data"]) {
+        if (row["platform"].get<std::string>() == "macos")
+            macos_types = row["distinct_types"].get<int64_t>();
+    }
+    CHECK(macos_types == 2); // process.crashed + storage.low
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + returns the shape",
+          "[rest][dex][signals][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["obs_type"].get<std::string>() == "process.crashed");
+    REQUIRE(j["data"]["subjects"].is_array());
+    REQUIRE(j["data"]["by_os"].is_array());
+    REQUIRE(j["data"]["devices"].is_array());
+    REQUIRE(j["data"]["by_day"].is_array());
+    CHECK(j["data"]["devices"].size() == 2); // WS-1 + WS-2
+    CHECK(j["data"]["subjects"][0]["subject"].get<std::string>() == "chrome.exe");
+
+    // Behavioral-PII access → exactly one dex.signal.view, same target shape as
+    // the /fragments/dex/catalogue/signal route (governance B4).
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& a = h.audit_log[0];
+    CHECK(a.action == "dex.signal.view");
+    CHECK(a.result == "success");
+    CHECK(a.target_type == "ObsType");
+    CHECK(a.target_id == "process.crashed");
+}
+
+TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",
+          "[rest][dex][signals]") {
+    RestGsHarness h; // empty store
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["subjects"].empty());
+    CHECK(j["data"]["devices"].empty());
+    // The operator requested an individual-identifying view; audit the access
+    // regardless of whether the read-model happened to hold matching rows.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.signal.view");
+}
+
+TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[rest][dex][signals]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    // Validation precedes audit — a rejected malformed request leaves no trace
+    // of a behavioral-view access that never happened.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[rest][dex][signals]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
+          "[rest][dex][rbac]") {
+    RestGsHarness h;
+    h.grant_perms = false; // perm_fn denies → 403
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // No audit emission on a denied request — the permission check is the first
+    // statement in the handler, before the dex.signal.view audit.
+    CHECK(h.audit_log.empty());
 }

@@ -18,12 +18,18 @@
 
 #include <yuzu/plugin.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
+
+#include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
 
 namespace yuzu::agent {
 class KvStore;
@@ -33,6 +39,7 @@ namespace yuzu::guardian::v1 {
 class GuaranteedStatePush;
 class GuaranteedStateRule;
 class GuaranteedStateStatus;
+class GuaranteedStateEvent;
 } // namespace yuzu::guardian::v1
 
 namespace yuzu::agent::v1 {
@@ -75,6 +82,14 @@ public:
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();
+
+    /// Sink for outbound Guardian events (drift, etc.). Wired by agent.cpp once
+    /// the Subscribe stream is open and BEFORE any push arrives, so a guard started
+    /// by apply_rules captures a live sink. The sink writes a
+    /// CommandResponse{plugin:"__guard__", action:"event", payload:<event>} on the
+    /// stream. Guards capture a copy at start, so this is set-once-then-read.
+    using EventSink = std::function<void(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
+    void set_event_sink(EventSink sink);
 
     /// Replace (full_sync=true) or merge (full_sync=false) the active
     /// rule set with the contents of `push`. Persists each rule as a
@@ -120,6 +135,39 @@ private:
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     void persist_generation_locked();
+
+    /// Step 4: start (or restart) the on-box guard for a rule. Reads the rule's
+    /// spark/assertion to decide the guard. MVP supports only the Windows Registry
+    /// Spark (`spark.type=="registry-change"` + `assertion.type=="registry-value-equals"`);
+    /// no-op otherwise / off-Windows. Called under mtx_.
+    /// Arm (or re-arm) the on-box guard for a rule. Returns true iff a guard was
+    /// actually started (false for non-registry sparks, off-Windows, or a failed
+    /// start) so callers can count armed guards accurately.
+    bool start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
+    void stop_all_guards_locked();
+
+    /// Build a GuaranteedStateEvent from a guard's drift report and ship it to
+    /// the current event sink. Called from guard worker threads, so it takes
+    /// ONLY sink_mtx_ (never mtx_): guards may fire during apply_rules / stop
+    /// which hold mtx_, and taking mtx_ here would deadlock the stop-join.
+    void emit_guard_event(const GuardDrift& drift);
+
+    // Test seam: drift emission is otherwise reachable only through an armed
+    // guard, and guards are Windows-only / no-op elsewhere — so the event_id
+    // shape (the #1307 agent_id fold) has no cross-platform test path without
+    // this. The helper drives emit_guard_event() with a synthetic GuardDrift;
+    // a sink installed via set_event_sink() captures the resulting event.
+    friend YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
+                                                         const GuardDrift& drift);
+
+    // event_sink_ is guarded by its own mutex (not mtx_) so a guard worker can
+    // deliver an event without contending with — or deadlocking against — the
+    // engine's rule-management path. The dedicated lock makes the A2 pre-network
+    // arm (guards started by start_local before the sink is wired) race-free.
+    mutable std::mutex sink_mtx_;
+    EventSink event_sink_;
+    std::atomic<std::uint64_t> event_seq_{0};
+    std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the
@@ -162,5 +210,13 @@ private:
 YUZU_EXPORT GuardianDispatchResult
 guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
                                       std::string_view push_param_bytes);
+
+/// Test-support helper: emit a synthetic GuardDrift through the engine's
+/// private emit_guard_event() so the resulting GuaranteedStateEvent can be
+/// captured by a sink installed via set_event_sink(). Intended ONLY for unit
+/// tests — production drift originates inside Windows-only guard workers. Used
+/// by the #1307 regression test to assert the event_id embeds the agent_id.
+YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
+                                              const GuardDrift& drift);
 
 } // namespace yuzu::agent

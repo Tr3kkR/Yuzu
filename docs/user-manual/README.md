@@ -15,7 +15,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [RBAC](rbac.md) | Role-based access control -- principals, roles, securable types, per-operation permissions |
 | [Asset Tagging](../asset-tagging-guide.md) | Structured tags (role, environment, location, service), categories, and tag compliance |
 | [Management Groups](management-groups.md) | Hierarchical device grouping for access scoping and policy inheritance |
-| [Instruction Engine](instruction-engine.md) | Instruction definitions, sets, parameter/result schemas, scheduling, and approval workflows |
+| [Instruction Engine](instructions.md) | Instruction definitions, sets, parameter/result schemas, scheduling, and approval workflows |
 | [Scope Engine](scope-engine.md) | Expression-tree device targeting with AND/OR/NOT, tags, OS filters, and wildcards |
 | [Audit Log](audit-log.md) | Structured audit events -- who did what, when, on which devices |
 | [Response Store](response-store.md) | Persistent, filterable, aggregatable instruction response data |
@@ -23,9 +23,10 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
 | [Guaranteed State (Guardian)](guaranteed-state.md) | Real-time policy enforcement with agent-side guards, events, and remediation (control plane + agent skeleton shipped in v0.12; Windows enforcement lands in Guardian PR 3) |
+| [DEX (Digital Employee Experience)](dex.md) | Read-only fleet-reliability dashboard over the Guardian event store — crash-free rates, 103-signal catalogue, per-app/per-device drill-downs (Windows collectors today) |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
-| [Server Administration](server-administration.md) | Configuration, TLS, user management, first-run setup, and backup |
-| [REST API Reference](rest-api-reference.md) | Complete REST API v1 endpoint reference with request/response examples |
+| [Server Administration](server-admin.md) | Configuration, TLS, user management, first-run setup, and backup |
+| [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
@@ -46,9 +47,9 @@ The following features are documented within the files listed above:
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
 | WiFi & WoL | [Agent Plugins](agent-plugins.md#wifi) | WiFi network scanning and Wake-on-LAN magic packets |
-| Patch Management | [REST API](rest-api-reference.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
-| Webhooks | [REST API](rest-api-reference.md) | Event-driven HTTP notifications to external systems |
-| Product Packs | [REST API](rest-api-reference.md) | Signed YAML bundles containing definitions, policies, and templates |
+| Patch Management | [REST API](rest-api.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
+| Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
+| Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
 
 ### Operations Guides
 

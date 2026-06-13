@@ -254,14 +254,68 @@ The full set of agent command-line flags:
 |---|---|---|
 | `--server` | Server address (`host:port`) | `localhost:50051` |
 | `--enrollment-token` | Pre-shared token for Tier 2 enrollment | (none) |
-| `--tls-ca` | Path to CA certificate PEM file | (auto-discover) |
-| `--tls-cert` | Path to client certificate PEM file | (auto-discover) |
-| `--tls-key` | Path to client private key PEM file | (auto-discover) |
+| `--ca-cert` | Path to CA certificate PEM file (verifies the server) | (auto-discover) |
+| `--client-cert` | Path to client certificate PEM file (mTLS) | (auto-discover) |
+| `--client-key` | Path to client private key PEM file (mTLS) | (auto-discover) |
 | `--cert-store` | Windows certificate store name (e.g. `MY`) | (none) |
 | `--cert-subject` | Subject CN match for cert store lookup | (none) |
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
+| `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
+| `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
 | `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+
+### Per-agent mTLS auto-provisioning (PKI)
+
+When the server runs with its built-in CA and the agent has no operator-supplied
+client certificate (`--client-cert`/`--cert-store`) but does have the server CA
+(`--ca-cert`), the agent automatically obtains its own client certificate at
+enrollment: it generates an EC P-256 keypair + CSR, the server signs a per-agent
+leaf (`CN=<agent-id>`) and returns it, and the agent persists the leaf + key
+(mode `0600`) + issuing chain under `--cert-dir`, then reconnects with mutual TLS.
+The leaf auto-renews once two-thirds of its lifetime has elapsed (checked at agent
+start). Pass `--no-auto-provision-cert` to opt out (e.g. when you supply your own
+client certificate). See `docs/auth-architecture.md` "Per-agent mTLS".
+
+This applies equally to agents enrolling **through the Erlang gateway** — the
+gateway relays the `RegisterResponse` verbatim **and signs the forwarded CSR**
+(`ProxyRegister`, PKI PR5d), so the per-agent leaf reaches the agent on both the
+direct and gateway paths.
+
+**Files written under `--cert-dir`** (default `<data-dir>/certs`):
+
+| File | Contents | Mode |
+|---|---|---|
+| `agent-client.key` | The agent's EC P-256 private key — never leaves the host, never sent to the server | `0600` |
+| `agent-client.pem` | The per-agent client leaf the server issued (`CN=<agent-id>`) | `0644` |
+| `agent-ca.pem` | The issuing CA chain the agent pins the server against | `0644` |
+
+**Key loss → automatic re-provisioning.** If `agent-client.key` is deleted or
+corrupted, the agent transparently re-provisions on its next enrollment: it
+generates a fresh keypair + CSR and the server issues a **new** leaf with a
+**new serial**. The previous serial remains in the server's issued-cert inventory
+(`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
+harmless, but if you reconcile the inventory you should expect one orphan per
+key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
+
+> **Revocation is not bypassable by key deletion.** Auto-re-provisioning applies
+> only when the agent's prior cert was *not* revoked. If you **revoke** an
+> agent's certificate (`POST /api/v1/ca/revoke`) and that agent then deletes its
+> key and reconnects, the server **refuses** to issue a fresh leaf (audit
+> `ca.cert.reissue_blocked`, metric `yuzu_server_ca_reissue_blocked_total`) — the
+> agent cannot silently resurrect a revoked identity. To bring a revoked agent
+> back, an operator must deliberately re-approve it (clearing the revocation),
+> not merely let it re-enroll.
+
+> **Gateway-proxied agents:** per-agent mTLS revocation is enforced on
+> **direct-connect** agents only. An agent that reaches the server *through a
+> gateway* presents its leaf to the gateway, not the server, so revoking that
+> agent's certificate (`POST /api/v1/ca/revoke`) does **not** by itself cut it
+> off the data plane — the server never sees the agent's leaf on the
+> gateway→server hop. To decommission a gateway-proxied agent promptly, also
+> disconnect it at the gateway/management layer. Through-gateway cryptographic
+> revocation is planned with the QUIC transport migration. See
+> `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration
 

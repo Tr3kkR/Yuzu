@@ -1,6 +1,8 @@
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+
+#include "audit_store.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
@@ -24,7 +26,9 @@
 // clang-format on
 #include <crtdbg.h>
 #include <io.h>
+#include <lmcons.h>  // UNLEN for GetUserNameA
 #else
+#include <pwd.h>     // getpwuid for the real OS principal
 #include <unistd.h>
 #endif
 #include <sqlite3.h>
@@ -49,6 +53,54 @@ static void on_signal(int sig) {
     (void)sig;
     if (auto* s = g_server.load(std::memory_order_acquire))
         s->stop();
+}
+
+// Resolve the real OS account running this process for break-glass audit
+// attribution. Reads the kernel-authoritative identity (getpwuid(geteuid) /
+// GetUserNameA) rather than getenv("USER"), which is inherited from the parent
+// and trivially forgeable — a forged principal would poison the very evidence
+// the break-glass audit row exists to provide (#1226 H-2).
+static std::string resolve_os_principal() {
+#ifdef _WIN32
+    char name[UNLEN + 1];
+    DWORD len = static_cast<DWORD>(sizeof(name));
+    if (GetUserNameA(name, &len) && len > 1) {
+        return std::string(name, len - 1); // len counts the trailing NUL
+    }
+    return "unknown";
+#else
+    if (struct passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_name && pw->pw_name[0] != '\0') {
+        return std::string(pw->pw_name);
+    }
+    return "unknown";
+#endif
+}
+
+// Minimal RFC 8259 string-content escaper for emitting a username inside a JSON
+// status line. is_valid_username already restricts the charset so no escaping is
+// strictly needed today, but output-encoding (not input validation) is the
+// correct defence: this stays correct if the validator is ever relaxed (#1226 M-2).
+static std::string json_escape(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
 }
 
 int main(int argc, char* argv[]) {
@@ -105,6 +157,27 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")->envname("YUZU_CERT");
     app.add_option("--key", cfg.tls_server_key, "PEM server private key")->envname("YUZU_KEY");
+    app.add_flag("--no-default-certs",
+                 "Do not auto-generate built-in default certificates on first boot; require "
+                 "operator-provided certs instead (legacy refuse-to-start behaviour)")
+        ->each([&cfg](const std::string&) { cfg.no_default_certs = true; })
+        ->envname("YUZU_NO_DEFAULT_CERTS");
+    app.add_option("--ca-dir", cfg.ca_dir,
+                   "Directory for the built-in CA + default certs (default: platform cert dir)")
+        ->envname("YUZU_CA_DIR");
+    app.add_option("--cert-san", cfg.cert_sans,
+                   "Extra Subject Alternative Name for the auto-generated default certs "
+                   "(repeatable). Forms: 'dns:<name>', 'ip:<addr>', or a bare value "
+                   "(auto-classified); a single value may be comma-separated. Added to the "
+                   "https/agent/gateway default leaves so they validate for a deployment "
+                   "hostname or IP (e.g. 'dns:gateway'). Ignored when operator certs are "
+                   "supplied or --no-default-certs is set.")
+        // #1271 cpp-expert: comma-splitting is done ONCE, in parse_extra_sans
+        // (default_certs.cpp), NOT here — do NOT add CLI11 `->delimiter(',')`, or a
+        // comma-separated value would be split twice (CLI11 tokens × the parser's
+        // own comma loop) and mangle entries. Each CLI/env token reaches the parser
+        // whole; the parser owns the comma semantics.
+        ->envname("YUZU_CERT_SAN");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;
@@ -168,6 +241,27 @@ int main(int argc, char* argv[]) {
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
 
+    // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
+    app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
+                   "MFA enforcement (default: optional). \"optional\" = self-service "
+                   "enrollment, login never requires it. \"admin-only\" = admins must "
+                   "enrol before login completes. \"required\" = every role must enrol. "
+                   "Under admin-only/required an un-enrolled login is redirected through "
+                   "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
+        ->default_val("optional")
+        ->check(CLI::IsMember({"optional", "admin-only", "required"}))
+        ->envname("YUZU_MFA_ENFORCEMENT");
+    app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
+                   "Seconds after a TOTP proof that high-risk endpoints accept the session as "
+                   "stepped-up (default: 300)")
+        ->default_val(300)
+        ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
+    app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
+                   "Seconds the intermediate mfa-pending token is valid between password "
+                   "success and TOTP submission (default: 120)")
+        ->default_val(120)
+        ->envname("YUZU_MFA_LOGIN_PENDING_SECS");
+
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
@@ -224,6 +318,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
     app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
     app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+
+    // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
+    // user's MFA enrollment out-of-band so an operator locked out by MFA
+    // enforcement (lost device, IdP not asserting amr, sole admin who could not
+    // enroll) can recover. Run on the server host as the service account. The
+    // reset is audited (unlike the manual SQL break-glass it replaces). #1226.
+    std::string mfa_reset_user;
+    app.add_option("--mfa-reset", mfa_reset_user,
+                   "Break-glass: clear MFA enrollment for the named user, then exit "
+                   "(audited recovery from MFA lockout)");
 
     // NVD CVE feed options
     int nvd_sync_hours = 4;
@@ -336,6 +440,33 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // ── MFA enforcement mode advisory ──
+    // Surface the active enforcement mode once at startup so an auditor
+    // reading the boot log can confirm the deployment's posture (SOC 2
+    // CC6.6 evidence). `admin-only` and `required` redirect an un-enrolled
+    // login through TOTP enrollment before a session is minted; `optional`
+    // (default) leaves enrollment self-service.
+    if (cfg.mfa_enforcement != "optional") {
+        spdlog::info("MFA enforcement active: mode={} — un-enrolled {} must complete TOTP "
+                     "enrollment at login before a session is issued.",
+                     cfg.mfa_enforcement,
+                     cfg.mfa_enforcement == "required" ? "users" : "admins");
+    }
+    // PR2 governance Gate 2 sec-M6: the step-up gate honours
+    // window_secs <= 0 as an "escape hatch" that lets every request
+    // through without re-prompting. The helper itself doesn't log on
+    // every skip (too noisy), so we surface it once at startup so the
+    // operator sees the disabled state in journald and an auditor
+    // reading the boot log can spot a misconfigured deployment.
+    if (cfg.mfa_step_up_window_secs <= 0) {
+        spdlog::warn(
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
+            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
+            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
+            "(default 300) to re-enable.",
+            cfg.mfa_step_up_window_secs);
+    }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
     // Done immediately after CLI parse so operators see a clear startup
@@ -609,6 +740,100 @@ int main(int argc, char* argv[]) {
         spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
+    // -- Break-glass MFA reset mode (exits without starting server) -----------
+    // Out-of-band recovery for an operator locked out by MFA enforcement.
+    // Runs on the server host as the service account; clears the user's MFA
+    // and writes an audit row (the manual SQL break-glass it replaces bypassed
+    // the audit chain — #1226). Under enforcement the user is walked through
+    // re-enrollment at their next login.
+    if (!mfa_reset_user.empty()) {
+        if (!auth_db) {
+            spdlog::error("--mfa-reset requires the persistent auth store (auth.db); none is "
+                          "configured for data dir '{}'",
+                          cfg.data_dir.string());
+            return EXIT_FAILURE;
+        }
+        // Defence-in-depth: validate the CLI arg before it touches the store
+        // (governance sec-LOW-1). The SQL is parameterised and user_exists
+        // would reject a non-conforming value anyway, but validating up front
+        // keeps the charset guarantee local to the entry point.
+        if (!yuzu::server::is_valid_username(mfa_reset_user)) {
+            spdlog::error("--mfa-reset: '{}' is not a valid username", mfa_reset_user);
+            std::cerr << "error: invalid username\n";
+            return EXIT_FAILURE;
+        }
+        auto exists = auth_db->user_exists(mfa_reset_user);
+        if (!exists) {
+            // Distinguish a store error from a genuinely-absent user so an
+            // operator mid-lockout isn't misled (governance cpp-safety SHOULD).
+            spdlog::error("--mfa-reset: auth store error checking '{}': {}", mfa_reset_user,
+                          static_cast<int>(exists.error()));
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        if (!*exists) {
+            spdlog::error("--mfa-reset: user '{}' not found", mfa_reset_user);
+            std::cerr << "error: user '" << mfa_reset_user << "' not found\n";
+            return EXIT_FAILURE;
+        }
+        // Audit is MANDATORY for break-glass: the whole point of #1226 is to
+        // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). So
+        // open + verify the audit store is WRITABLE *before* mutating MFA — if
+        // it isn't, refuse to proceed rather than silently clear a second factor
+        // with no record (H-1). This also gives the operator an actionable error
+        // instead of a buried warning during a stressful recovery.
+        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
+        if (!audit.is_open()) {
+            spdlog::error("--mfa-reset: audit store (audit.db in '{}') is not writable; refusing "
+                          "to clear MFA without an audit record. Fix audit.db permissions/disk and "
+                          "retry, or perform the reset via your documented break-glass SQL path "
+                          "(which you must then record in change management).",
+                          cfg.data_dir.string());
+            std::cerr << "error: audit store unavailable; refusing to clear MFA without an audit "
+                         "record\n";
+            return EXIT_FAILURE;
+        }
+        if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
+            spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
+            return EXIT_FAILURE;
+        }
+        // Attribute the break-glass to the KERNEL-AUTHORITATIVE OS identity, not
+        // getenv("USER") — the env var is inherited from the parent and trivially
+        // forgeable (USER=root ./yuzu-server --mfa-reset ...), which would let the
+        // actor poison the very evidence this audit exists to provide (H-2).
+        const std::string os_user = resolve_os_principal();
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = os_user;
+        ev.principal_role = "break-glass";
+        ev.action = "mfa.reset.breakglass";
+        ev.target_type = "User";
+        ev.target_id = mfa_reset_user;
+        ev.result = "success";
+        ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
+                                os_user);
+        if (!audit.log(ev)) {
+            // The pre-check passed but the write failed (e.g. disk filled mid-op).
+            // MFA is already cleared; fail loudly and non-zero so automation and
+            // the operator know the evidence row is missing and must be recorded.
+            spdlog::error("--mfa-reset: MFA cleared for '{}' but the audit row failed to persist — "
+                          "record this reset manually in your change-management system NOW",
+                          mfa_reset_user);
+            std::cerr << "error: MFA cleared but audit row failed to persist; record this reset "
+                         "manually\n";
+            return EXIT_FAILURE;
+        }
+        spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
+                     "password alone; under MFA enforcement they will be walked through "
+                     "enrollment at next login.",
+                     mfa_reset_user);
+        std::cout << std::format("{{\"status\":\"ok\",\"user\":\"{}\",\"action\":\"{}\"}}\n",
+                                 json_escape(mfa_reset_user), "mfa.reset.breakglass");
+        return EXIT_SUCCESS;
+    }
+
     // -- Batch token generation mode (exits without starting server) ----------
 
     if (generate_tokens > 0) {
@@ -640,6 +865,12 @@ int main(int argc, char* argv[]) {
         auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
         g_server.store(server.get(), std::memory_order_release);
         server->run();
+        if (server->startup_failed()) {
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_FAILURE;
+        }
     } catch (const std::exception& ex) {
         spdlog::error("Fatal exception: {}", ex.what());
 #ifdef _WIN32

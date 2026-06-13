@@ -9,7 +9,7 @@ Management groups organize devices into a hierarchy for scoped access control an
 | **Management group** | A named container for devices, with optional parent/child relationships. |
 | **Root group** | The built-in "All Devices" group (ID `000000000000`) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group. |
 | **Static membership** | Agents are explicitly added to or removed from the group by an operator. |
-| **Dynamic membership** | A scope expression (e.g., `os = "Windows" AND tag:department = "Finance"`) determines membership. Matching agents are included automatically. |
+| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) determines membership. Matching agents are included automatically. |
 | **Hierarchy** | Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children. |
 | **Service groups** | When a `service` tag is set on an agent, Yuzu auto-creates a `Service: {name}` management group containing all agents with that tag. |
 | **Visibility filtering** | Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership. |
@@ -128,7 +128,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
     "description": "Auto-populated with all Windows agents",
     "parent_id": "mg_all_devices",
     "membership_type": "dynamic",
-    "scope_expression": "os = \"Windows\""
+    "scope_expression": "ostype == \"Windows\""
   }'
 ```
 
@@ -136,10 +136,10 @@ The `scope_expression` uses the same syntax as the scope engine. Common operator
 
 | Expression | Matches |
 |---|---|
-| `os = "Windows"` | All Windows agents |
-| `os = "Linux" AND tag:environment = "production"` | Linux agents tagged as production |
-| `tag:department = "Finance" OR tag:department = "Legal"` | Agents in Finance or Legal |
-| `NOT tag:decommissioned EXISTS` | Agents without a decommissioned tag |
+| `ostype == "Windows"` | All Windows agents |
+| `ostype == "Linux" AND tag:environment == "production"` | Linux agents tagged as production |
+| `tag:department == "Finance" OR tag:department == "Legal"` | Agents in Finance or Legal |
+| `NOT EXISTS tag:decommissioned` | Agents without a decommissioned tag |
 
 ### Get Group Details
 
@@ -224,7 +224,7 @@ curl -s -b cookies.txt -X PUT \
   -H "Content-Type: application/json" \
   -d '{
     "membership_type": "dynamic",
-    "scope_expression": "os = \"Linux\" AND tag:environment = \"production\""
+    "scope_expression": "ostype == \"Linux\" AND tag:environment == \"production\""
   }'
 ```
 

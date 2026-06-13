@@ -7,6 +7,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "dex_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -17,8 +18,10 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_store.hpp"
 #include "schedule_engine.hpp"
 #include "software_deployment_store.hpp"
+#include "mfa_step_up.hpp"
 #include "tag_store.hpp"
 
 // W5.1 — `/api/v1/events` JSON SSE consumes the per-execution event bus.
@@ -52,6 +55,9 @@ class ExecutionEventBus;
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -79,6 +85,11 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
     using ServiceGroupFn = std::function<void(const std::string& service_value)>;
     using TagPushFn = std::function<void(const std::string& agent_id, const std::string& key)>;
+    /// Guardian rule push fan-out (contract step 3 / G12): resolve the scope →
+    /// in-scope agents, build the GuaranteedStatePush from the store, and deliver via
+    /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
+    /// invalid scope expression. Injected from server.cpp where the registry/scope live.
+    using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -119,6 +130,21 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Command dispatch callback — sends a CommandRequest to agents via gRPC
+    /// and returns (command_id, agents_reached). Identical signature to
+    /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
+    /// `command_dispatch_fn` closure into both so the result-set async
+    /// producers (`from-tar-query`, `from-instruction-result`, `re-eval`) drive
+    /// the exact dispatch path the workflow + policy engines use. The trailing
+    /// `execution_id` is registered command_id→execution_id BEFORE any RPC so
+    /// FAST loopback agents can't reply before the mapping lands (UP2-4). Empty
+    /// callback leaves the async producer routes returning 503.
+    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
+
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
     ///
@@ -138,11 +164,21 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
+        DexPerfFn dex_perf_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
+    ///
+    /// `step_up_fn` (PR2, optional) — when present, the 9 high-risk REST
+    /// handlers (token create/revoke, session revoke, Guardian rule
+    /// create/update/push, software package create, software deploy
+    /// start, file retrieval upload) gate behind it after permissions
+    /// pass. Empty functor disables the gate entirely (default — preserves
+    /// pre-PR2 behaviour for any caller that hasn't wired it).
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
         RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
@@ -155,7 +191,10 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
+        DexPerfFn dex_perf_fn = {});
 };
 
 } // namespace yuzu::server

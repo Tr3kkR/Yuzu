@@ -33,8 +33,13 @@
     %% Upstream (C++ server)
     [yuzu, gw, upstream, rpc_latency],
     [yuzu, gw, upstream, rpc_error],
+    [yuzu, gw, upstream, tls_handshake_failure],
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
+
+    %% Guardian side-channel forwarding (agent drift events -> control plane)
+    [yuzu, gw, guardian, forward_accepted],
+    [yuzu, gw, guardian, forward_dropped],
 
     %% Cluster
     [yuzu, gw, cluster, node_up],
@@ -116,6 +121,15 @@ handle_event([yuzu, gw, upstream, rpc_error], #{count := N}, Meta, _Config) ->
     Code = maps:get(code, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_upstream_rpc_errors_total, [RpcName, Code], N);
 
+%% R-3 (#1243): a DISTINCT counter for upstream TLS handshake failures so an
+%% operator can tell "the gateway cert/CA broke" (expiry, rotation, wrong-SAN,
+%% missing volume) from a generic circuit-open / "server down" — the two were
+%% previously indistinguishable in telemetry.
+handle_event([yuzu, gw, upstream, tls_handshake_failure], #{count := N}, Meta, _Config) ->
+    RpcName = maps:get(rpc_name, Meta, <<"unknown">>),
+    Kind = maps:get(kind, Meta, <<"unknown">>),
+    prometheus_counter:inc(yuzu_gw_upstream_tls_handshake_failures_total, [RpcName, Kind], N);
+
 handle_event([yuzu, gw, upstream, circuit_state], #{count := N}, Meta, _Config) ->
     State = maps:get(state, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [State], N);
@@ -127,6 +141,18 @@ handle_event([yuzu, gw, upstream, registration_replay],
              #{replayed := N, queue_depth := Q}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_registration_replay_total, [], N),
     prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
+
+%% Guardian side-channel forwarding. `forward_accepted` is the denominator for a
+%% drop-rate SLO; `forward_dropped` is split by reason (circuit_open | at_capacity).
+%% yuzu_gw_upstream:forward_guardian_message/2 emits both — without these clauses
+%% the drop counters fire into an unregistered telemetry event and never reach
+%% Prometheus, leaving guardian drift loss invisible.
+handle_event([yuzu, gw, guardian, forward_accepted], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_guardian_forward_accepted_total, [], N);
+
+handle_event([yuzu, gw, guardian, forward_dropped], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, <<"unknown">>),
+    prometheus_counter:inc(yuzu_gw_guardian_forward_dropped_total, [Reason], N);
 
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
@@ -189,6 +215,12 @@ declare_metrics() ->
         {labels, [rpc_name, code]},
         {help, "Upstream RPC errors by method and status code"}]),
     prometheus_counter:declare([
+        {name, yuzu_gw_upstream_tls_handshake_failures_total},
+        {labels, [rpc_name, kind]},
+        {help, "Upstream TLS handshake failures (cert expiry / CA rotation / "
+               "wrong-SAN / unreadable cert) - distinct from a generic RPC error "
+               "so a broken gateway cert is not mistaken for 'server down'"}]),
+    prometheus_counter:declare([
         {name, yuzu_gw_upstream_circuit_transitions_total},
         {labels, [state]},
         {help, "Circuit breaker state transitions (closed, open, half_open)"}]),
@@ -204,6 +236,17 @@ declare_metrics() ->
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
         {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_guardian_forward_accepted_total},
+        {labels, []},
+        {help, "Guardian drift-event forwards accepted for upstream delivery "
+               "(denominator for the forward drop-rate)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_guardian_forward_dropped_total},
+        {labels, [reason]},
+        {help, "Guardian drift-event forwards dropped before delivery "
+               "(reason: circuit_open | at_capacity). Best-effort; durable "
+               "buffering is Guardian A3."}]),
 
     %% Histograms
     Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],

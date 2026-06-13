@@ -50,6 +50,13 @@ else
 fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$PKG/usr/lib/systemd/system/"
 
+# Postgres provisioning helper (ADR-0006, #1320). Shipped in the package and
+# invoked non-fatally from postinst so a native install is Postgres-ready
+# before the server starts requiring a DSN (#1320 PR 3 fail-closed flip).
+mkdir -p "$PKG/usr/share/yuzu/scripts"
+cp "$SCRIPT_DIR/../../../scripts/install-server-postgres.sh" "$PKG/usr/share/yuzu/scripts/"
+chmod 0755 "$PKG/usr/share/yuzu/scripts/install-server-postgres.sh"
+
 cat > "$PKG/DEBIAN/control" <<EOF
 Package: yuzu-server
 Version: $VERSION

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ranges>
@@ -27,6 +28,7 @@
 namespace yuzu::server {
 class TagStore;
 class CustomPropertiesStore;
+class ResultSetStore;
 class DeviceTokenStore;
 } // namespace yuzu::server
 
@@ -44,6 +46,14 @@ struct PluginMeta {
 };
 
 // -- Agent session (one per connected agent) ----------------------------------
+//
+// IMMUTABILITY CONTRACT: the identity fields (agent_id..scopable_tags,
+// gateway_node) are fully populated BEFORE the session is installed in the
+// registry and are never mutated afterwards — re-registration REPLACES the
+// shared_ptr, it does not edit in place. Lock-free readers (scope evaluation,
+// the DEX perf provider) depend on this. Post-publication writes are confined
+// to stream/server_context/peer_cert_pem (under stream_mu) and the atomic
+// last_activity_epoch_ms. (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
@@ -60,6 +70,12 @@ struct AgentSession {
     // Stream pointer -- valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
     grpc::ServerContext* server_context = nullptr; // for timeout cancellation
+    // PR3 H-1: the client leaf PEM presented when this Subscribe stream was
+    // established, captured so a background sweep can re-evaluate revocation on
+    // the long-lived stream (the establishment gate only runs once). Empty when
+    // the agent presented no client cert. Guarded by stream_mu alongside stream/
+    // server_context.
+    std::string peer_cert_pem;
     std::mutex stream_mu;
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
@@ -80,9 +96,26 @@ public:
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
-                    grpc::ServerContext* context = nullptr);
+                    grpc::ServerContext* context = nullptr,
+                    const std::string& peer_cert_pem = {});
 
     void clear_stream(const std::string& agent_id);
+
+    /// PR3 H-1: re-evaluate revocation on every live Subscribe stream and tear
+    /// down (TryCancel) any whose presented client leaf is now revoked. The
+    /// establishment gate (`Subscribe`) only checks once; a long-lived stream
+    /// would otherwise keep dispatching to a revoked/compromised agent until it
+    /// voluntarily reconnects (which a hostile agent never does). Driven
+    /// periodically from the reaper thread and callable immediately after an
+    /// operator revoke (PR4) for prompt teardown. `is_revoked(peer_pem)` returns
+    /// true iff that leaf is on the CRL; sessions with no presented cert are
+    /// skipped. The predicate is evaluated OFF stream_mu (it reads ca.db);
+    /// teardown re-acquires the lock and re-checks the cert is unchanged.
+    /// Returns the `agent_id`s whose streams were cancelled (so the caller can
+    /// emit a per-teardown audit row — the registry holds no AuditStore). Null
+    /// predicate → no-op (empty).
+    std::vector<std::string>
+    sweep_revoked(const std::function<bool(const std::string& peer_cert_pem)>& is_revoked);
 
     /// Update last_activity timestamp for an agent (called on heartbeat + subscribe reads).
     void touch_activity(const std::string& agent_id);
@@ -230,9 +263,19 @@ public:
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
     // Evaluate a scope expression against all agents, return matching agent IDs.
+    // `rs_store` resolves the `from_result_set:<id>` scope kind (capability §30)
+    // to per-device membership, scoped to `principal`: a referenced set that
+    // `principal` does not own resolves to an empty membership and never matches
+    // (no cross-operator targeting — review finding B1). Pass the dispatching
+    // operator as `principal` on every command path; leave it empty (and/or
+    // rs_store null) only where from_result_set is intentionally unsupported
+    // (e.g. server-authored policy scopes). Aliases must be pre-resolved to
+    // canonical ids by the caller. Stale members (offline / decommissioned
+    // agents not in the live registry) drop silently.
     std::vector<std::string>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                   const CustomPropertiesStore* props_store = nullptr) const;
+                   const CustomPropertiesStore* props_store = nullptr,
+                   ResultSetStore* rs_store = nullptr, std::string_view principal = {}) const;
 
 private:
     mutable std::mutex mu_;
@@ -290,6 +333,15 @@ public:
     void remove(const std::string& agent_id);
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
+
+    /// Per-agent snapshots carrying ONLY the yuzu.perf_* heartbeat tags
+    /// (dex_perf_rules.hpp keys) + agent_id, excluding entries staler than
+    /// `staleness` (the same contract recompute_metrics prunes by — pass the
+    /// same value so the /dex Performance read model and the Prometheus gauges
+    /// see the same population). Deliberately NOT a general-purpose accessor:
+    /// the copy runs under the heartbeat-upsert mutex, so it copies the
+    /// minimum (G3 performance S1). Do NOT call on a hot path.
+    std::vector<AgentHealthSnapshot> perf_snapshot(std::chrono::seconds staleness) const;
 
 private:
     mutable std::mutex mu_;

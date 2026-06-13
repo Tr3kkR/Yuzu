@@ -29,6 +29,16 @@ case "$1" in
 
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
+
+            # Postgres provisioning (ADR-0006, #1320). NON-FATAL by design:
+            # the helper exits 0 with install hints when no local cluster is
+            # found, and any other failure must not break package configure
+            # while the server still boots without Postgres (until the #1320
+            # PR 3 fail-closed flip; re-evaluate this guard then).
+            if [[ -x /usr/share/yuzu/scripts/install-server-postgres.sh ]]; then
+                bash /usr/share/yuzu/scripts/install-server-postgres.sh || \
+                    echo "warn: Postgres provisioning incomplete — re-run /usr/share/yuzu/scripts/install-server-postgres.sh (see docs/user-manual/server-admin.md)" >&2
+            fi
         fi
 
         # Update shared library cache (agent ships libyuzu_agent_core.so)
