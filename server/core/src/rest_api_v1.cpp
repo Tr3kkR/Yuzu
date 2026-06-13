@@ -1,6 +1,9 @@
 #include "rest_api_v1.hpp"
+#include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "guardian_rule_spec.hpp"
+#include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
@@ -22,6 +25,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <format>
@@ -29,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 
 namespace yuzu::server {
 namespace {
@@ -352,6 +357,7 @@ const std::string& openapi_spec() {
           "guard_category": {"type": "string", "enum": ["event", "condition"]},
           "detected_value": {"type": "string"},
           "expected_value": {"type": "string"},
+          "detail_json": {"type": "string", "description": "Structured machine-readable detail, JSON keyed by event_type (route a'); empty for plain drift. For process.crashed: process/pid/kind/exception_code/symbolic/faulting_module/platform."},
           "remediation_action": {"type": "string"},
           "remediation_success": {"type": "boolean"},
           "detection_latency_us": {"type": "integer"},
@@ -458,6 +464,24 @@ const std::string& openapi_spec() {
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}}}
     },
+    "/ca/root": {
+      "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
+    },
+    "/ca/crl": {
+      "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
+    },
+    "/ca/issued": {
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "403": {"description": "Requires Security:Read"}}}
+    },
+    "/ca/revoke": {
+      "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
+    },
+    "/ca/root-csr": {
+      "get": {"summary": "Export the install CA's CSR for enterprise (subordinate-CA) signing", "tags": ["Security"], "responses": {"200": {"description": "PKCS#10 CSR (application/pkcs10), over the existing CA key"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "CSR generation failed"}, "503": {"description": "CA unavailable"}}}
+    },
+    "/ca/import-chain": {
+      "post": {"summary": "Import an enterprise-signed intermediate + parent chain (switch to subordinate mode)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["intermediate_pem", "chain_pem"], "properties": {"intermediate_pem": {"type": "string", "description": "This CA's key signed by the enterprise root (must be CA:TRUE)"}, "chain_pem": {"type": "string", "description": "Parent chain: enterprise root [+ intermediates]"}}}}}}, "responses": {"200": {"description": "Validated; issuing identity switched to subordinate, CRL republished"}, "400": {"description": "Bad JSON / missing field / unparseable intermediate"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "No existing CA to subordinate"}, "422": {"description": "Intermediate is not a CA / does not carry this CA's key / does not verify to the chain"}, "413": {"description": "Body too large"}, "503": {"description": "CA unavailable"}}}
+    },
     "/quarantine": {
       "get": {"summary": "List quarantined devices", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices"}}},
       "post": {"summary": "Quarantine a device", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}}}
@@ -504,7 +528,10 @@ const std::string& openapi_spec() {
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
-    },
+    },)json"
+        // Split: keep each raw-string literal under MSVC's 16,380-byte C2026 cap
+        // (adjacent literals concatenate; emitted OpenAPI JSON is byte-identical).
+        R"json(
     "/offload-targets": {
       "get": {"summary": "List configured offload targets", "tags": ["Offload"], "description": "Requires Infrastructure:Read. Returns every registered offload target. The auth_credential is never returned in any response (issue #255, Phase 8.3).", "responses": {"200": {"description": "List of offload targets"}, "503": {"description": "Offload store unavailable"}}},
       "post": {"summary": "Create an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Validation: URL must be http(s)://, name must be non-empty and unique, batch_size must be >= 1, auth_credential must not contain control bytes (defends against Authorization header CRLF injection).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["name", "url"], "properties": {"name": {"type": "string", "description": "Unique stable identifier referenced from spec.offload.targets"}, "url": {"type": "string", "description": "http:// or https:// POST endpoint"}, "auth_type": {"type": "string", "enum": ["none", "bearer", "basic", "hmac"], "default": "none"}, "auth_credential": {"type": "string", "description": "Bearer token, user:pass, or shared HMAC secret. Never returned by any read endpoint."}, "event_types": {"type": "string", "default": "*", "description": "Comma-separated event names or *"}, "batch_size": {"type": "integer", "minimum": 1, "default": 1}, "enabled": {"type": "boolean", "default": true}}}}}}, "responses": {"201": {"description": "Target created"}, "400": {"description": "Invalid JSON, missing name/url, bad URL scheme, control bytes in credential, batch_size < 1, or duplicate name"}, "503": {"description": "Offload store unavailable"}}}
@@ -534,7 +561,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+    },
+    "/guaranteed-state/schemas": {
+      "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
     },
     "/guaranteed-state/rules/{rule_id}": {
       "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
@@ -542,7 +572,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "404": {"description": "Rule not found"}}}
     },
     "/guaranteed-state/push": {
-      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/events": {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
@@ -561,6 +591,17 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}": {
       "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
+        R"json(,
+    "/dex/signals": {
+      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d; any other value resolves to 7d).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/scope": {
+      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/signals/{obs_type}": {
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
     }
   }
 })json";
@@ -742,7 +783,9 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
+    GuardianPushFn guardian_push_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -750,7 +793,8 @@ void RestApiV1::register_routes(
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
-                    execution_event_bus);
+                    execution_event_bus, result_set_store, std::move(command_dispatch_fn),
+                    std::move(step_up_fn), std::move(guardian_push_fn));
 }
 
 void RestApiV1::register_routes(
@@ -763,7 +807,9 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
+    GuardianPushFn guardian_push_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1237,9 +1283,9 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
-                                 tag_store, metrics_registry](const httplib::Request& req,
-                                                              httplib::Response& res) {
+    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store, rbac_store,
+                                 mgmt_store, tag_store, metrics_registry](
+                                    const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -1250,6 +1296,11 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token issuance is high-risk
+        // (creates a long-lived bearer credential); require fresh MFA
+        // proof so a hijacked session cannot mint replacement creds.
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens"))
             return;
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1386,7 +1437,7 @@ void RestApiV1::register_routes(
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
+    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store](
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -1398,6 +1449,10 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token revocation can kill an
+        // operator's automation; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/tokens/{id}"))
             return;
 
         auto token_id = req.matches[1].str();
@@ -1560,13 +1615,17 @@ void RestApiV1::register_routes(
     // parameter is required AND validated with `is_valid_username` so a
     // NUL byte in the input cannot truncate the SQL bind in a way that
     // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
-    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, step_up_fn, session_revoke_fn](
                                         const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "UserManagement", "Write"))
             return;
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        // PR2 Gate 2 sec-M2: empty-username defensive check runs FIRST
+        // (sec-M1 invariant) — never emit an audit row carrying an
+        // empty principal, even from the step-up gate. Step-up runs
+        // immediately after, before any state mutation.
         if (session->username.empty()) {
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
@@ -1574,6 +1633,10 @@ void RestApiV1::register_routes(
             res.set_content(error_json("session has empty username", 500), "application/json");
             return;
         }
+        // PR2 — MFA step-up gate. Admin force-logout of another user
+        // is high-risk; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/sessions"))
+            return;
         if (!session_revoke_fn) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
@@ -2845,6 +2908,693 @@ void RestApiV1::register_routes(
                   });
     }
 
+    // ── Result Sets / Scope Walking (capability 30.1/30.2) ────────────────
+    // Per-operator, owner-scoped result sets. Authz is the owner check
+    // (design §4.1 — phase 1 is owner-only; no RBAC securable type yet, a
+    // ResultSet securable is a follow-up once cross-operator sharing lands).
+    // Errors use the A4 envelope + the result-set error taxonomy. The two
+    // async producers (from-tar-query / from-instruction-result) and re-eval
+    // dispatch a command (create-execution-before-dispatch, UP2-4) and land a
+    // `pending` row that the server maintenance thread materialises once the
+    // producing execution reaches a terminal state (PR-D). They require the
+    // command-dispatch callback + ExecutionTracker; without them they 503.
+    if (result_set_store) {
+        // Serialise a ResultSet row to a JSON object string.
+        auto rs_to_json = [](const ResultSet& r) {
+            JObj o;
+            o.add("id", r.id);
+            o.add("name", r.name);
+            o.add("owner_principal", r.owner_principal);
+            o.add("created_at", r.created_at);
+            o.add("ttl_at", r.ttl_at);
+            o.add("last_used_at", r.last_used_at);
+            o.add("pinned", r.pinned);
+            o.add("parent_id", r.parent_id.value_or(""));
+            o.add("source_kind", r.source_kind);
+            o.add("status", to_string(r.status));
+            o.add("source_execution_id", r.source_execution_id);
+            o.add("device_count", r.device_count);
+            return o.str();
+        };
+
+        // Emit an A4 error with a fresh correlation id.
+        auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
+            auto cid = detail::make_correlation_id();
+            res.status = status;
+            res.set_content(detail::error_json_a4(status, msg, cid), "application/json");
+        };
+
+        // Load a row and enforce the owner check. Returns nullopt and writes a
+        // 404 (existence-oracle-safe: non-owner is indistinguishable from
+        // missing) when the row is absent or not owned by the session.
+        auto load_owned = [result_set_store, rs_err, audit_fn](
+                              const httplib::Request& req, const std::string& id,
+                              const std::string& owner,
+                              httplib::Response& res) -> std::optional<ResultSet> {
+            auto row = result_set_store->get(id);
+            if (!row || row->owner_principal != owner) {
+                // Audit the failed access so probing the existence oracle leaves
+                // a trail (review finding G). The 404 stays oracle-safe (a
+                // non-owner is indistinguishable from missing); the audit row is
+                // server-side only.
+                audit_fn(req, "result_set.access", "denied", "ResultSet", id,
+                         "not found or not owned");
+                rs_err(res, 404, "RESULT_SET_NOT_FOUND: result set not found");
+                return std::nullopt;
+            }
+            return row;
+        };
+
+        // Resolve a parent reference (canonical `rs_` id OR a per-operator
+        // alias — design §2 "Source query" / §4.1) to a canonical owned id.
+        // Alias pre-resolution at the dispatch layer is the right place: the
+        // owner is known here, whereas `evaluate_scope` (which resolves
+        // `from_result_set:` deep in the dispatch lambda) has no principal to
+        // scope the alias lookup. Writes a 404 and returns nullopt when the
+        // ref doesn't resolve to a row this session owns.
+        auto resolve_owned_parent =
+            [result_set_store, load_owned](const httplib::Request& req, const std::string& raw,
+                                           const std::string& owner,
+                                           httplib::Response& res) -> std::optional<std::string> {
+            std::string id = raw;
+            if (!raw.starts_with("rs_")) {
+                if (auto canon = result_set_store->resolve_alias(owner, raw))
+                    id = *canon;
+                // else: id stays = raw; load_owned() below 404s on the miss.
+            }
+            auto row = load_owned(req, id, owner, res);
+            if (!row)
+                return std::nullopt;
+            return id;
+        };
+
+        // Shared async-producer engine for `from-tar-query` /
+        // `from-instruction-result` / `re-eval`. Implements the
+        // create-execution-BEFORE-dispatch ordering (UP2-4) then lands a
+        // `pending` row the maintenance thread materialises once the
+        // execution reaches a terminal state (design §3.1). `body` is read
+        // only for `parent_id`; everything else is passed explicitly so
+        // re-eval can synthesise a body. Writes the 202 (or an error) on res.
+        auto run_async = [result_set_store, execution_tracker, command_dispatch_fn, audit_fn,
+                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent](
+                             const httplib::Request& req, httplib::Response& res,
+                             const std::string& owner, const std::string& plugin,
+                             const std::string& action,
+                             const std::unordered_map<std::string, std::string>& params,
+                             std::string_view src_kind, const std::string& source_payload,
+                             const std::string& matcher, const nlohmann::json& body,
+                             const std::string& name) {
+            if (!command_dispatch_fn || !execution_tracker) {
+                rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
+                return;
+            }
+            // Resolve the parent scope. parent_id present → dispatch is scoped
+            // to that set's CURRENT members via the `from_result_set:` scope
+            // kind; absent → broadcast to all connected agents (__all__).
+            std::optional<std::string> parent_id;
+            std::string scope_expr;
+            if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                !body["parent_id"].get<std::string>().empty()) {
+                auto canon =
+                    resolve_owned_parent(req, body["parent_id"].get<std::string>(), owner, res);
+                if (!canon)
+                    return; // resolve_owned_parent wrote 404
+                parent_id = *canon;
+                scope_expr = "from_result_set:" + *canon;
+            }
+
+            // Create-before-dispatch: the execution_id must be registered
+            // command_id→execution_id before any RPC so a FAST loopback agent
+            // can't reply ahead of the mapping (UP2-4).
+            Execution exec;
+            exec.definition_id = std::string(src_kind);
+            exec.status = "running";
+            exec.scope_expression = scope_expr;
+            exec.parameter_values = nlohmann::json(params).dump();
+            exec.dispatched_by = owner;
+            std::string exec_id;
+            if (auto created = execution_tracker->create_execution(exec); created.has_value())
+                exec_id = *created;
+            if (exec_id.empty()) {
+                rs_err(res, 500, "RESULT_SET_INTERNAL: failed to create execution row");
+                return;
+            }
+
+            // Pre-dispatch quota check: never send a (possibly destructive)
+            // command we can't record. create_pending re-checks atomically
+            // below, but rejecting here means the common at-quota case fails
+            // BEFORE any agent executes (review finding B5).
+            if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
+                                     " execution_id=" + exec_id);
+                return;
+            }
+
+            std::string command_id;
+            int sent = 0;
+            try {
+                std::tie(command_id, sent) =
+                    command_dispatch_fn(plugin, action, {}, scope_expr, params, exec_id);
+            } catch (const std::exception& e) {
+                spdlog::error("result-set async producer dispatch failed: {}", e.what());
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 500, "RESULT_SET_DISPATCH_FAILED: dispatch raised");
+                return;
+            }
+            if (sent == 0) {
+                // No agents in scope — record the attempt (forensic) and tell
+                // the operator rather than leaking a pending row that idles to
+                // the 300s timeout and then materialises empty.
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
+                return;
+            }
+            execution_tracker->set_agents_targeted(exec_id, sent);
+
+            CreateRequest cr;
+            cr.owner_principal = owner;
+            cr.name = name;
+            cr.parent_id = parent_id;
+            cr.source_kind = std::string(src_kind);
+            cr.source_payload = source_payload;
+            cr.matcher = matcher;
+            auto created = result_set_store->create_pending(cr, exec_id);
+            if (!created) {
+                if (metrics_registry && created.error() == ResultSetError::QuotaExceeded)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                // The command already dispatched but there is no row to
+                // materialise into — cancel the execution so it doesn't idle in
+                // 'running', and surface exec_id so the operator can trace what
+                // was sent (review B5; mirrors the throw / no-agents paths).
+                execution_tracker->mark_cancelled(exec_id, owner);
+                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                rs_err(res, status,
+                       std::string(to_string(created.error())) + " execution_id=" + exec_id);
+                return;
+            }
+            if (metrics_registry)
+                metrics_registry
+                    ->counter("yuzu_result_sets_total",
+                              {{"source_kind", std::string(src_kind)}, {"result", "pending"}})
+                    .increment();
+            audit_fn(req, "result_set.create", "success", "ResultSet", created->id,
+                     std::string(src_kind) + " execution_id=" + exec_id +
+                         " agents=" + std::to_string(sent));
+            // 202 Accepted: membership is not known yet; the client polls
+            // GET /{id} (status flips pending→materialized) or subscribes to
+            // /api/v1/events on source_execution_id.
+            res.status = 202;
+            res.set_content(ok_json(rs_to_json(*created)), "application/json");
+        };
+
+        // GET /api/v1/result-sets — owner-scoped list.
+        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json](
+                                            const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "";
+            int limit = 50;
+            if (req.has_param("limit")) {
+                const auto lv = req.get_param_value("limit");
+                int v = 0;
+                std::from_chars(lv.data(), lv.data() + lv.size(), v);
+                if (v > 0 && v <= 500)
+                    limit = v;
+            }
+            std::string next;
+            auto sets = result_set_store->list_by_owner(session->username, cursor, limit, next);
+            JArr arr;
+            for (const auto& s : sets)
+                arr.add_raw(rs_to_json(s));
+            auto data =
+                JObj().raw("result_sets", arr.str()).add("next_cursor", next).str();
+            res.set_content(ok_json(data), "application/json");
+        });
+
+        // POST /api/v1/result-sets — direct create from pre-computed device ids
+        // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
+        sink.Post("/api/v1/result-sets",
+                  [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                rs_err(res, 400, "invalid JSON");
+                return;
+            }
+            CreateRequest cr;
+            cr.owner_principal = session->username;
+            cr.name = body.value("name", "");
+            cr.source_kind = body.value("source_kind", std::string(source_kind::kManualCurate));
+            cr.source_payload = body.contains("source_payload") ? body["source_payload"].dump()
+                                                                : std::string("{}");
+            if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                !body["parent_id"].get<std::string>().empty()) {
+                auto pid = body["parent_id"].get<std::string>();
+                // Owner-check the parent before persisting the lineage edge,
+                // else an operator can parent onto a victim's id and read its
+                // name/source_kind/device_count back via /lineage (review B2).
+                if (!load_owned(req, pid, session->username, res))
+                    return; // load_owned wrote 404
+                cr.parent_id = pid;
+            }
+
+            std::vector<std::string> members;
+            if (body.contains("device_ids") && body["device_ids"].is_array()) {
+                for (const auto& d : body["device_ids"])
+                    if (d.is_string())
+                        members.push_back(d.get<std::string>());
+            }
+            // Reject an oversized array before the store dedups it under its
+            // write lock — bounds the DoS from a giant device_ids body (B4).
+            if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                rs_err(res, 400, to_string(ResultSetError::TooManyMembers));
+                return;
+            }
+
+            auto created = result_set_store->create_materialized(cr, members);
+            if (!created) {
+                if (metrics_registry && created.error() == ResultSetError::QuotaExceeded)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                rs_err(res, status, to_string(created.error()));
+                return;
+            }
+            if (metrics_registry)
+                metrics_registry
+                    ->counter("yuzu_result_sets_total",
+                              {{"source_kind", cr.source_kind}, {"result", "created"}})
+                    .increment();
+            audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+            res.status = 201;
+            res.set_content(ok_json(rs_to_json(*created)), "application/json");
+        });
+
+        // POST /api/v1/result-sets/from-inventory-query — synchronous producer.
+        // Runs the inventory evaluation server-side; the member set is every
+        // agent that matched. When parent_id is given, the candidate set is
+        // narrowed to that set's current members.
+        sink.Post("/api/v1/result-sets/from-inventory-query",
+                  [auth_fn, audit_fn, result_set_store, inventory_store, metrics_registry,
+                   rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!inventory_store || !inventory_store->is_open()) {
+                          rs_err(res, 503, "inventory store not available");
+                          return;
+                      }
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+
+                      InventoryEvalRequest eval_req;
+                      eval_req.combine = body.value("combine", "all");
+                      if (body.contains("conditions") && body["conditions"].is_array()) {
+                          for (const auto& c : body["conditions"]) {
+                              InventoryCondition cond;
+                              cond.plugin = c.value("plugin", "");
+                              cond.field = c.value("field", "");
+                              cond.op = c.value("op", "");
+                              cond.value = c.value("value", "");
+                              eval_req.conditions.push_back(std::move(cond));
+                          }
+                      }
+
+                      // Optional parent-scope narrowing.
+                      std::optional<std::unordered_set<std::string>> parent_members;
+                      CreateRequest cr;
+                      cr.owner_principal = session->username;
+                      cr.name = body.value("name", "");
+                      cr.source_kind = std::string(source_kind::kInventoryQuery);
+                      cr.source_payload = body.dump();
+                      if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                          !body["parent_id"].get<std::string>().empty()) {
+                          auto pid = body["parent_id"].get<std::string>();
+                          auto parent = load_owned(req, pid, session->username, res);
+                          if (!parent)
+                              return; // load_owned already wrote 404
+                          cr.parent_id = pid;
+                          std::unordered_set<std::string> ms;
+                          std::string cur;
+                          while (true) {
+                              // Separate in/out cursor: members() clears its
+                              // out-cursor first, so aliasing one variable as
+                              // both rereads page 1 forever once the parent
+                              // exceeds the page size (review finding B3).
+                              std::string next;
+                              auto page = result_set_store->members(pid, cur, 5000, next);
+                              ms.insert(page.begin(), page.end());
+                              if (next.empty())
+                                  break;
+                              cur = std::move(next);
+                          }
+                          parent_members = std::move(ms);
+                      }
+
+                      InventoryQuery iq;
+                      iq.limit = 5000;
+                      auto records_raw = inventory_store->query(iq);
+                      std::vector<std::pair<std::string, std::string>> records;
+                      records.reserve(records_raw.size());
+                      for (const auto& r : records_raw)
+                          records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+
+                      auto results = evaluate_inventory(eval_req, records);
+                      std::unordered_set<std::string> seen;
+                      std::vector<std::string> members;
+                      for (const auto& r : results) {
+                          if (!r.match)
+                              continue;
+                          if (parent_members && !parent_members->count(r.agent_id))
+                              continue;
+                          if (seen.insert(r.agent_id).second)
+                              members.push_back(r.agent_id);
+                      }
+
+                      auto created = result_set_store->create_materialized(cr, members);
+                      if (!created) {
+                          if (metrics_registry &&
+                              created.error() == ResultSetError::QuotaExceeded)
+                              metrics_registry->counter("yuzu_result_set_quota_rejected")
+                                  .increment();
+                          int status =
+                              created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                          rs_err(res, status, to_string(created.error()));
+                          return;
+                      }
+                      if (metrics_registry)
+                          metrics_registry
+                              ->counter("yuzu_result_sets_total",
+                                        {{"source_kind", cr.source_kind}, {"result", "created"}})
+                              .increment();
+                      audit_fn(req, "result_set.create", "success", "ResultSet", created->id,
+                               cr.source_kind);
+                      res.status = 201;
+                      res.set_content(ok_json(rs_to_json(*created)), "application/json");
+                  });
+
+        // POST /api/v1/result-sets/from-tar-query — async producer (design §6).
+        // Dispatches operator SQL to the tar plugin in parent_id's scope (or
+        // __all__); the membership set is every agent that returned ≥1 row
+        // (default) or every SUCCESS responder (`include_empty=true`). The
+        // SQL is sandboxed AGENT-side by TarDatabase::execute_user_query
+        // (read-only authorizer, #760/#631) — the server only length-checks.
+        sink.Post("/api/v1/result-sets/from-tar-query",
+                  [auth_fn, rs_err, run_async](const httplib::Request& req,
+                                               httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+                      std::string sql = body.value("sql", "");
+                      if (sql.empty()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
+                          return;
+                      }
+                      if (sql.size() > 100000) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
+                          return;
+                      }
+                      const bool include_empty = body.value("include_empty", false);
+                      nlohmann::json matcher =
+                          include_empty ? nlohmann::json{{"kind", "any_response"}}
+                                        : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
+                      // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                      nlohmann::json payload;
+                      payload["sql"] = sql;
+                      payload["include_empty"] = include_empty;
+                      if (body.contains("parent_id") && body["parent_id"].is_string())
+                          payload["scope_input_id"] = body["parent_id"];
+                      std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                      run_async(req, res, session->username, "tar", "sql", params,
+                                source_kind::kTarQuery, payload.dump(), matcher.dump(), body,
+                                body.value("name", ""));
+                  });
+
+        // POST /api/v1/result-sets/from-instruction-result — async producer.
+        // Runs an InstructionDefinition in parent_id's scope; membership is the
+        // responders whose output row satisfies the operator-supplied `matcher`
+        // (column/op/value — design §3.2, applied by the maintenance thread via
+        // rs_matcher). Mirrors the Chrome-IR hash-check step (design §10).
+        sink.Post("/api/v1/result-sets/from-instruction-result",
+                  [auth_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!instruction_store || !instruction_store->is_open()) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+                      std::string instruction_id = body.value("instruction_id", "");
+                      if (instruction_id.empty()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
+                          return;
+                      }
+                      auto def = instruction_store->get_definition(instruction_id);
+                      if (!def) {
+                          rs_err(res, 404, "INSTRUCTION_NOT_FOUND: unknown instruction_id");
+                          return;
+                      }
+                      std::unordered_map<std::string, std::string> params;
+                      if (body.contains("params") && body["params"].is_object())
+                          for (auto& [k, v] : body["params"].items())
+                              params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                      std::string matcher = (body.contains("matcher") && body["matcher"].is_object())
+                                                ? body["matcher"].dump()
+                                                : std::string();
+                      // source_payload — design §3.2 instruction_result shape.
+                      nlohmann::json payload;
+                      payload["instruction_id"] = instruction_id;
+                      payload["params"] =
+                          body.contains("params") ? body["params"] : nlohmann::json::object();
+                      if (body.contains("matcher"))
+                          payload["matcher"] = body["matcher"];
+                      if (body.contains("parent_id") && body["parent_id"].is_string())
+                          payload["scope_input_id"] = body["parent_id"];
+                      run_async(req, res, session->username, def->plugin, def->action, params,
+                                source_kind::kInstructionResult, payload.dump(), matcher, body,
+                                body.value("name", ""));
+                  });
+
+        // POST /api/v1/result-sets/{id}/re-eval — re-run the source query and
+        // create a SIBLING set (parent_id = original.parent_id, NOT a child —
+        // design §6/§11). Async sources (tar_query/instruction_result) re-
+        // dispatch and land a new pending row; sync sources are deferred to
+        // PR-G (their re-eval needs the inventory evaluator on this path).
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
+                  [auth_fn, rs_err, load_owned, run_async, instruction_store](
+                      const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto orig = load_owned(req, id, session->username, res);
+                      if (!orig)
+                          return;
+                      auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                      // Synthesise the parent so the sibling shares the
+                      // original's parent (re-eval re-asks the same question
+                      // against the same candidate scope, today's estate).
+                      nlohmann::json synth;
+                      if (orig->parent_id && !orig->parent_id->empty())
+                          synth["parent_id"] = *orig->parent_id;
+                      // Skip the suffix if it's already there, else repeated
+                      // re-evals of a sibling grow "foo (re-eval) (re-eval) …"
+                      // unboundedly (review finding bug_014).
+                      const std::string reeval_name =
+                          orig->name.empty()                  ? std::string()
+                          : orig->name.ends_with(" (re-eval)") ? orig->name
+                                                               : (orig->name + " (re-eval)");
+                      if (orig->source_kind == source_kind::kTarQuery) {
+                          std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                          if (sql.empty()) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
+                              return;
+                          }
+                          std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                          run_async(req, res, session->username, "tar", "sql", params,
+                                    source_kind::kTarQuery, orig->source_payload, orig->matcher,
+                                    synth, reeval_name);
+                      } else if (orig->source_kind == source_kind::kInstructionResult) {
+                          std::string instruction_id =
+                              sp.is_object() ? sp.value("instruction_id", "") : "";
+                          auto def = instruction_store && instruction_store->is_open()
+                                         ? instruction_store->get_definition(instruction_id)
+                                         : std::nullopt;
+                          if (instruction_id.empty() || !def) {
+                              rs_err(res, 400,
+                                     "RESULT_SET_BAD_REQUEST: original instruction unavailable");
+                              return;
+                          }
+                          std::unordered_map<std::string, std::string> params;
+                          if (sp.contains("params") && sp["params"].is_object())
+                              for (auto& [k, v] : sp["params"].items())
+                                  params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                          run_async(req, res, session->username, def->plugin, def->action, params,
+                                    source_kind::kInstructionResult, orig->source_payload,
+                                    orig->matcher, synth, reeval_name);
+                      } else {
+                          rs_err(res, 400,
+                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                 "lands in PR-G");
+                      }
+                  });
+
+        // GET /api/v1/result-sets/{id}
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
+                 [auth_fn, rs_to_json, load_owned](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto row = load_owned(req, req.matches[1].str(), session->username, res);
+                     if (!row)
+                         return;
+                     res.set_content(ok_json(rs_to_json(*row)), "application/json");
+                 });
+
+        // GET /api/v1/result-sets/{id}/members
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
+                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto id = req.matches[1].str();
+                     auto row = load_owned(req, id, session->username, res);
+                     if (!row)
+                         return;
+                     std::string cursor =
+                         req.has_param("cursor") ? req.get_param_value("cursor") : "";
+                     int limit = 1000;
+                     if (req.has_param("limit")) {
+                         const auto lv = req.get_param_value("limit");
+                         int v = 0;
+                         std::from_chars(lv.data(), lv.data() + lv.size(), v);
+                         if (v > 0 && v <= 10000)
+                             limit = v;
+                     }
+                     std::string next;
+                     auto devs = result_set_store->members(id, cursor, limit, next);
+                     JArr arr;
+                     for (const auto& d : devs)
+                         arr.add(d);
+                     auto data =
+                         JObj().raw("device_ids", arr.str()).add("next_cursor", next).str();
+                     res.set_content(ok_json(data), "application/json");
+                 });
+
+        // GET /api/v1/result-sets/{id}/lineage
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
+                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto id = req.matches[1].str();
+                     auto row = load_owned(req, id, session->username, res);
+                     if (!row)
+                         return;
+                     auto chain = result_set_store->lineage(id, session->username);
+                     JArr arr;
+                     for (const auto& n : chain)
+                         arr.add(JObj()
+                                     .add("id", n.id)
+                                     .add("name", n.name)
+                                     .add("source_kind", n.source_kind)
+                                     .add("device_count", n.device_count));
+                     res.set_content(ok_json(JObj().raw("chain", arr.str()).str()),
+                                     "application/json");
+                 });
+
+        // POST /api/v1/result-sets/{id}/pin
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto row = load_owned(req, id, session->username, res);
+                      if (!row)
+                          return;
+                      auto pinned = result_set_store->pin(id);
+                      if (!pinned) {
+                          int status = pinned.error() == ResultSetError::PinLimit ? 409 : 404;
+                          rs_err(res, status, to_string(pinned.error()));
+                          return;
+                      }
+                      audit_fn(req, "result_set.pin", "success", "ResultSet", id, "");
+                      res.set_content(ok_json(rs_to_json(*pinned)), "application/json");
+                  });
+
+        // POST /api/v1/result-sets/{id}/unpin
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto row = load_owned(req, id, session->username, res);
+                      if (!row)
+                          return;
+                      auto unpinned = result_set_store->unpin(id);
+                      if (!unpinned) {
+                          rs_err(res, 404, to_string(unpinned.error()));
+                          return;
+                      }
+                      audit_fn(req, "result_set.unpin", "success", "ResultSet", id, "");
+                      res.set_content(ok_json(rs_to_json(*unpinned)), "application/json");
+                  });
+
+        // DELETE /api/v1/result-sets/{id}
+        sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
+                    [auth_fn, audit_fn, result_set_store, rs_err,
+                     load_owned](const httplib::Request& req, httplib::Response& res) {
+                        auto session = auth_fn(req, res);
+                        if (!session)
+                            return;
+                        auto id = req.matches[1].str();
+                        auto row = load_owned(req, id, session->username, res);
+                        if (!row)
+                            return;
+                        auto del = result_set_store->delete_set(id);
+                        if (!del) {
+                            // Pinned sets must be unpinned first (design §6).
+                            int status = del.error() == ResultSetError::Pinned ? 409 : 404;
+                            rs_err(res, status, to_string(del.error()));
+                            return;
+                        }
+                        audit_fn(req, "result_set.delete", "success", "ResultSet", id, "");
+                        res.status = 200;
+                        res.set_content(ok_json(JObj().add("deleted", true).str()),
+                                        "application/json");
+                    });
+    }
+
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 
     if (device_token_store) {
@@ -3020,13 +3770,18 @@ void RestApiV1::register_routes(
                                      "application/json");
                  });
 
-        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn,
+        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 sw_deploy_store](const httplib::Request& req,
                                                                  httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
             if (!perm_fn(req, res, "SoftwareDeployment", "Write"))
+                return;
+            // PR2 — MFA step-up gate. Uploading a software package
+            // introduces executable content into the fleet; require
+            // fresh MFA proof.
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/software-packages"))
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
@@ -3189,12 +3944,17 @@ void RestApiV1::register_routes(
 
         sink.Post(
             R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
-            [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
-                                                          httplib::Response& res) {
+            [auth_fn, perm_fn, audit_fn, step_up_fn, sw_deploy_store](
+                const httplib::Request& req, httplib::Response& res) {
                 auto session = auth_fn(req, res);
                 if (!session)
                     return;
                 if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                // PR2 — MFA step-up gate. Starting a deployment pushes
+                // packages onto live endpoints; require fresh MFA proof.
+                if (step_up_fn &&
+                    !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
                 if (sw_deploy_store->start_deployment(id)) {
@@ -3445,6 +4205,7 @@ void RestApiV1::register_routes(
         o.add("rule_id", r.rule_id)
             .add("name", r.name)
             .add("yaml_source", r.yaml_source)
+            .add("spec_json", r.spec_json)
             .add("version", static_cast<int64_t>(r.version))
             .add("enabled", r.enabled)
             .add("enforcement_mode", r.enforcement_mode)
@@ -3476,43 +4237,128 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+    // Schema-registry discovery surface (contract G9 / decision 3): the static
+    // catalog of Guard spark/assertion/remediation types + per-type JSON Schemas
+    // (discriminated subschemas for value-dependent formats). Agentic-first
+    // (A1/A2) — drives the dashboard's create/edit form (C3c) and any agentic
+    // author. Cacheable: a content-derived ETag lets a client fetch-once and
+    // revalidate cheaply (NFR-kind). Does NOT require the store — the catalog is
+    // compiled-in, so it answers even when the rules DB is unavailable.
+    sink.Get("/api/v1/guaranteed-state/schemas",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto& catalog = guardian::guardian_schema_catalog();
+                 res.set_header("ETag", catalog.etag);
+                 res.set_header("Cache-Control", "public, max-age=300");
+                 if (req.get_header_value("If-None-Match") == catalog.etag) {
+                     res.status = 304; // not modified — client's cached copy is current
+                     return;
+                 }
+                 res.set_content(catalog.json, "application/json");
+             });
+
+    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, step_up_fn,
+                                                 guaranteed_state_store,
                                                  iso_now](const httplib::Request& req,
                                                           httplib::Response& res) {
+        // PR2 governance Gate 4 consistency-B2: order is
+        // auth_fn → perm_fn → step_up_fn → store-null guard. Resolving
+        // the session up front means a single map lookup and avoids the
+        // re-resolve race that the prior order opened up. (The
+        // token/session handlers run perm_fn before auth_fn; both
+        // orderings are safe because step_up_fn always runs last, after
+        // auth_fn has populated `session` — PR #1199 review LOW.)
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Write"))
             return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/rules"))
+            return;
+        // Authoring errors return the A4 structured envelope (contract decision 3)
+        // so an agentic author self-corrects; the whole create handler speaks A4
+        // uniformly (not a mix of A4 + plain error_json across sibling branches).
+        const auto cid = detail::make_correlation_id();
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                  "send a JSON object request body"),
+                            "application/json");
             return;
         }
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
-        row.yaml_source = body.value("yaml_source", "");
         row.version = body.value("version", int64_t{1});
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
         row.severity = body.value("severity", std::string{"medium"});
         row.os_target = body.value("os_target", std::string{""});
-        row.scope_expr = body.value("scope_expr", std::string{""});
-        if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+        row.scope_expr = body.value("scope_expr", body.value("scope", std::string{""}));
+
+        // enforcement_mode decides whether the agent WRITES to the endpoint, so
+        // reject anything but enforce|audit. An empty/garbage value would render
+        // as ENFORCING in the dashboard while the agent silently arms audit
+        // (governance C1/B2). Disabling a guard is the `enabled` flag, not a mode.
+        if (row.enforcement_mode != "enforce" && row.enforcement_mode != "audit") {
             res.status = 400;
-            res.set_content(error_json("rule_id, name, and yaml_source are required"),
+            res.set_content(detail::error_json_a4(400, "enforcement_mode must be 'enforce' or 'audit'",
+                                                  cid, "set enforcement_mode to 'enforce' or 'audit'"),
                             "application/json");
+            // Audit the reject (sibling-parity with the update handler + the
+            // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     "invalid enforcement_mode");
             return;
         }
-        auto session = auth_fn(req, res);
-        if (session) {
-            row.created_by = session->username;
-            row.updated_by = session->username;
+
+        // Guardian Guards are authored STRUCTURED (contract decisions 1-3): typed
+        // spark/assertion/remediation blocks, each {type, map params}. derive_rule_spec
+        // builds the authoritative canonical spec_json + a human-readable yaml_source
+        // rendering and validates the remediation.params resilience policy (C3b). A
+        // legacy yaml_source-only body is still accepted (structured=false; stored but
+        // not agent-enforceable) so pre-structured callers and tests keep working.
+        auto spec = guardian::derive_rule_spec(body, row.name, row.version, row.enabled,
+                                               row.enforcement_mode);
+        if (spec.error) {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     spec.error->message);
+            return;
         }
+        if (spec.structured) {
+            row.spec_json = std::move(spec.spec_json);
+            row.yaml_source = std::move(spec.yaml_source);
+        } else {
+            // Legacy path: yaml_source supplied directly, no structured spec.
+            row.yaml_source = body.value("yaml_source", std::string{});
+        }
+
+        if (row.rule_id.empty() || row.name.empty() ||
+            (!spec.structured && row.yaml_source.empty())) {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(
+                    400,
+                    "rule_id and name are required, plus either a structured "
+                    "spark+assertion or a yaml_source",
+                    cid, "provide rule_id, name and a spark+assertion (or yaml_source)"),
+                "application/json");
+            return;
+        }
+        row.created_by = session->username;
+        row.updated_by = session->username;
         row.created_at = iso_now();
         row.updated_at = row.created_at;
 
@@ -3520,11 +4366,12 @@ void RestApiV1::register_routes(
         if (!result) {
             if (is_conflict_error(result.error())) {
                 res.status = 409;
-                res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()), cid,
+                                                      "choose a unique rule_id and name"),
                                 "application/json");
             } else {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::error_json_a4(400, result.error(), cid), "application/json");
             }
             audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
                      result.error());
@@ -3557,26 +4404,40 @@ void RestApiV1::register_routes(
              });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-             [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+             [auth_fn, perm_fn, audit_fn, step_up_fn, guaranteed_state_store,
               iso_now](const httplib::Request& req, httplib::Response& res) {
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
                  if (!perm_fn(req, res, "GuaranteedState", "Write"))
                      return;
+                 if (step_up_fn &&
+                     !step_up_fn(req, res, *session,
+                                 "PUT /api/v1/guaranteed-state/rules/{id}"))
+                     return;
+                 // A4 envelope across the whole update handler (contract decision 3),
+                 // uniform with the create handler.
+                 const auto cid = detail::make_correlation_id();
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
                      return;
                  }
                  auto id = req.matches[1].str();
                  auto existing = guaranteed_state_store->get_rule(id);
                  if (!existing) {
                      res.status = 404;
-                     res.set_content(error_json("rule not found"), "application/json");
+                     res.set_content(detail::error_json_a4(404, "rule not found", cid),
+                                     "application/json");
                      return;
                  }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                           "send a JSON object request body"),
+                                     "application/json");
                      // Mirror the /push handler's invalid-body audit (BL-6): a
                      // mutating REST path that rejects a malformed body should
                      // leave a denied audit trail so SIEM sees the probe/fuzz
@@ -3597,28 +4458,93 @@ void RestApiV1::register_routes(
                  // request-shape mistake into a server-error alertable event.
                  // Mirrors the POST handler's body.value(...) pattern.
                  updated.name = body.value("name", updated.name);
-                 updated.yaml_source = body.value("yaml_source", updated.yaml_source);
                  updated.enabled = body.value("enabled", updated.enabled);
-                 updated.enforcement_mode =
-                     body.value("enforcement_mode", updated.enforcement_mode);
+                 // Mode (Watch/Enforce) is IMMUTABLE after creation — a different
+                 // posture is a different Guard (docs/guardian-baseline-model.md). A
+                 // full-object PUT may echo the current mode, but changing it is a
+                 // 400, not a silent flip: the operator must author a new Guard.
+                 if (body.contains("enforcement_mode") &&
+                     body.value("enforcement_mode", existing->enforcement_mode) !=
+                         existing->enforcement_mode) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(
+                             400, "enforcement_mode is immutable — create a new Guard for a "
+                                  "different posture (Watch vs Enforce)",
+                             cid, "create a new Guard instead of changing its mode"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "attempt to change immutable enforcement_mode");
+                     return;
+                 }
+                 updated.enforcement_mode = existing->enforcement_mode;  // unchanged
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
                  updated.version = existing->version + 1;
+
+                 // A structured body re-authors the Guard (contract §8): re-derive the
+                 // canonical spec + yaml_source and re-validate the resilience policy
+                 // (C3b) rather than the pre-C3b behaviour of silently dropping the
+                 // blocks on a 200. A metadata-only body (no spark/assertion/remediation)
+                 // keeps the existing spec_json and just applies any yaml_source
+                 // override. derive_rule_spec sees the bumped version so the embedded
+                 // spec.version matches the row.
+                 auto spec = guardian::derive_rule_spec(body, updated.name, updated.version,
+                                                        updated.enabled, updated.enforcement_mode);
+                 if (spec.error) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              spec.error->message);
+                     return;
+                 }
+                 if (spec.structured) {
+                     updated.spec_json = std::move(spec.spec_json);
+                     updated.yaml_source = std::move(spec.yaml_source);
+                 } else {
+                     updated.yaml_source = body.value("yaml_source", updated.yaml_source);
+                     // Metadata-only update keeps the existing spec_json, so
+                     // derive_rule_spec's assertion validator did NOT run. If this
+                     // update flips the rule into enforce mode, re-check the STORED
+                     // assertion against the dangerous-key denylist — otherwise an
+                     // audit guard on a protected key can be promoted to a
+                     // SYSTEM-write past the H1 gate (contract §6).
+                     if (updated.enforcement_mode == "enforce") {
+                         if (std::string why =
+                                 guardian::dangerous_enforce_in_spec(updated.spec_json);
+                             !why.empty()) {
+                             res.status = 400;
+                             res.set_content(
+                                 detail::error_json_a4(
+                                     400, "enforce mode not permitted: this guard targets " + why,
+                                     cid,
+                                     "keep this guard in audit mode, or re-author it against a "
+                                     "non-protected target"),
+                                 "application/json");
+                             audit_fn(req, "guaranteed_state.rule.update", "denied",
+                                      "GuaranteedState", id, "enforce on denylisted target");
+                             return;
+                         }
+                     }
+                 }
+
                  updated.updated_at = iso_now();
-                 auto session = auth_fn(req, res);
-                 if (session)
-                     updated.updated_by = session->username;
+                 updated.updated_by = session->username;
 
                  auto result = guaranteed_state_store->update_rule(updated);
                  if (!result) {
                      if (is_conflict_error(result.error())) {
                          res.status = 409;
-                         res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                         res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()),
+                                                               cid, "choose a unique name"),
                                          "application/json");
                      } else {
                          res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
+                         res.set_content(detail::error_json_a4(400, result.error(), cid),
+                                         "application/json");
                      }
                      audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
                               result.error());
@@ -3634,9 +4560,21 @@ void RestApiV1::register_routes(
              });
 
     sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-                [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
-                                                            httplib::Response& res) {
+                [auth_fn, perm_fn, audit_fn, step_up_fn,
+                 guaranteed_state_store](const httplib::Request& req,
+                                         httplib::Response& res) {
+                    // PR2 Gate 4 consistency-B1: Guardian rule DELETE is
+                    // equally destructive to UPDATE — gating both keeps
+                    // a hijacked session from removing auto-remediation
+                    // policy.
+                    auto session = auth_fn(req, res);
+                    if (!session)
+                        return;
                     if (!perm_fn(req, res, "GuaranteedState", "Delete"))
+                        return;
+                    if (step_up_fn &&
+                        !step_up_fn(req, res, *session,
+                                    "DELETE /api/v1/guaranteed-state/rules/{id}"))
                         return;
                     if (!guaranteed_state_store) {
                         res.status = 503;
@@ -3660,10 +4598,16 @@ void RestApiV1::register_routes(
     // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
     // expansion). PR 2 acks the request and audits the operator action so
     // dashboards and audit-trail tooling can be exercised end-to-end now.
-    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn,
-                                                guaranteed_state_store](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+    sink.Post("/api/v1/guaranteed-state/push", [auth_fn, perm_fn, audit_fn, step_up_fn,
+                                                guaranteed_state_store,
+                                                guardian_push_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
+            return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/push"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
@@ -3713,22 +4657,33 @@ void RestApiV1::register_routes(
             }
             return out;
         };
-        // target_id is reserved for a concrete entity id across every other
-        // audit emission in this file (rule_id, agent_id, group_id, token_id).
-        // The push scope expression is a fleet-level selector, not an entity
-        // id, so emit it in `detail` and leave target_id empty to preserve
-        // the SIEM join semantics. Result vocabulary stays "success" (202 is
-        // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+        // Step 3 fan-out: resolve scope → in-scope agents, build the GuaranteedStatePush
+        // from the store, deliver via the agent dispatch path. The callback is injected
+        // from server.cpp (registry + scope engine live there). A null callback means
+        // dispatch isn't wired (tests) — degrade to ack-only with agents=0. target_id is
+        // left empty: the scope is a fleet-level selector, not an entity id, so it goes
+        // in `detail` to preserve the SIEM join semantics.
+        int pushed = 0;
+        if (guardian_push_fn) {
+            pushed = guardian_push_fn(scope, full_sync);
+            if (pushed < 0) {
+                res.status = 400;
+                res.set_content(error_json("invalid scope expression"), "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
+                return;
+            }
+        }
         audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
-                 "rules=" + std::to_string(rule_count) +
-                     " full_sync=" + (full_sync ? "true" : "false") + " scope=\"" +
-                     sanitize_audit_string(scope) + "\"" + " fan_out_deferred_pr3=true");
+                 "rules=" + std::to_string(rule_count) + " full_sync=" +
+                     (full_sync ? "true" : "false") + " scope=\"" + sanitize_audit_string(scope) +
+                     "\" agents=" + std::to_string(pushed));
         res.status = 202;
         res.set_content(ok_json(JObj()
                                     .add("queued", true)
                                     .add("rules", static_cast<int64_t>(rule_count))
+                                    .add("agents", static_cast<int64_t>(pushed))
                                     .add("scope", scope)
-                                    .add("note", "push accepted; agent delivery is asynchronous")
                                     .str()),
                         "application/json");
     });
@@ -3736,7 +4691,7 @@ void RestApiV1::register_routes(
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
     // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
-    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, guaranteed_state_store](
+    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, audit_fn, guaranteed_state_store](
                                                     const httplib::Request& req,
                                                     httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -3750,6 +4705,15 @@ void RestApiV1::register_routes(
         q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
         q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+        // Behavioral-PII access audit (governance compliance-F1): an agent-scoped
+        // query returns that device's signal history incl. detail_json (which apps
+        // a person runs) — the same behavioral data the dashboard per-device view
+        // audits as dex.device.view. Emit the SAME verb so a SIEM filter catches
+        // both surfaces. A query with NO agent_id filter is a bulk operational
+        // query (not individual-identifying) and is deliberately not audited here.
+        if (!q.agent_id.empty())
+            audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
+                     "DEX per-device events via REST /api/v1/guaranteed-state/events");
         if (req.has_param("limit")) {
             int v = 0;
             auto s = req.get_param_value("limit");
@@ -3786,6 +4750,7 @@ void RestApiV1::register_routes(
                     .add("guard_category", e.guard_category)
                     .add("detected_value", e.detected_value)
                     .add("expected_value", e.expected_value)
+                    .add("detail_json", e.detail_json)
                     .add("remediation_action", e.remediation_action)
                     .add("remediation_success", e.remediation_success)
                     .add("detection_latency_us", static_cast<int64_t>(e.detection_latency_us))
@@ -3796,6 +4761,168 @@ void RestApiV1::register_routes(
             list_json(arr.str(), static_cast<int64_t>(rows.size()), static_cast<int64_t>(q.offset)),
             "application/json");
     });
+
+    // ── DEX read-model aggregation surface (/api/v1/dex/*) ────────────────────
+    //
+    // Agentic-first parity (governance ar-S1): the DEX dashboard's catalogue
+    // rollup, per-signal drill-down and per-OS coverage were dashboard-only
+    // HTMX fragments — an agentic worker had no machine-readable equivalent.
+    // These three GETs expose the SAME store aggregations the fragments render,
+    // JSON-shaped, gated on the same GuaranteedState:Read securable, and resolve
+    // the `window` token through the shared dex_window_to_days/dex_iso_since
+    // helpers so REST and the dashboard can never drift on the window vocabulary.
+    //
+    // Audit boundary mirrors GET /guaranteed-state/events exactly: the catalogue
+    // rollup and per-OS scope are fleet aggregates (not individual-identifying)
+    // and are NOT audited; the per-signal drill-down returns a most-affected
+    // DEVICES list (agent_ids — behavioral, individual-identifying) and emits the
+    // same dex.signal.view verb the /fragments/dex/catalogue/signal route does.
+
+    // GET /dex/signals — whole-catalogue rollup (every obs_type in the window,
+    // with event count + blast radius). Aggregate; not audited.
+    sink.Get("/api/v1/dex/signals", [perm_fn, guaranteed_state_store](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        auto rows = guaranteed_state_store->dex_signal_summary(since);
+        JArr arr;
+        for (const auto& r : rows) {
+            arr.add(JObj()
+                        .add("obs_type", r.obs_type)
+                        .add("count", r.count)
+                        .add("distinct_devices", r.distinct_devices)
+                        .add("last_seen", r.last_seen));
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
+                        "application/json");
+    });
+
+    // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
+    // platform reports, and total events). Aggregate; not audited.
+    sink.Get("/api/v1/dex/scope", [perm_fn, guaranteed_state_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        auto rows = guaranteed_state_store->dex_os_signal_scope(since);
+        JArr arr;
+        for (const auto& r : rows) {
+            arr.add(JObj()
+                        .add("platform", r.platform)
+                        .add("distinct_types", r.distinct_types)
+                        .add("total_events", r.total_events));
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
+                        "application/json");
+    });
+
+    // GET /dex/signals/{obs_type} — one signal type's drill-down: top subjects,
+    // per-OS split, most-affected devices, and the per-day trend. The devices[]
+    // array names agent_ids exhibiting this signal (behavioral, individual-
+    // identifying) so this endpoint emits dex.signal.view — parity with the
+    // /fragments/dex/catalogue/signal route (governance B4) and the agent_id-
+    // filtered /guaranteed-state/events audit. obs_type is validated here (not by
+    // the route regex) so malformed input yields a clear 400 rather than a silent
+    // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
+    // read-model has no such observations — it is not an entity-not-found).
+    sink.Get(R"(/api/v1/dex/signals/([^/]+))",
+             [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const std::string obs_type = req.matches[1].str();
+                 // obs_type is the catalogue's machine key: lowercase dotted
+                 // segments (process.crashed, os.boot, app.sxs_error, ...). Accept
+                 // [A-Za-z0-9._-] up to 64 chars; reject anything else as 400.
+                 const bool ok =
+                     !obs_type.empty() && obs_type.size() <= 64 &&
+                     obs_type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                                "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                         std::string::npos;
+                 if (!ok) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid obs_type"), "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                 int limit = 50;
+                 if (req.has_param("limit")) {
+                     int v = 0;
+                     auto s = req.get_param_value("limit");
+                     [[maybe_unused]] auto [_, ec] =
+                         std::from_chars(s.data(), s.data() + s.size(), v);
+                     if (ec != std::errc{} || v < 0) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid limit"), "application/json");
+                         return;
+                     }
+                     limit = std::min(v, 500);
+                 }
+                 // Behavioral-PII access audit: the devices[] list below names the
+                 // agent_ids exhibiting this signal. Emit the same verb the
+                 // dashboard per-signal view does so a SIEM filter catches both.
+                 audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
+                          "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}");
+
+                 JArr subjects;
+                 for (const auto& s : guaranteed_state_store->dex_signal_subjects(obs_type, since,
+                                                                                  limit)) {
+                     subjects.add(JObj()
+                                      .add("subject", s.subject)
+                                      .add("count", s.count)
+                                      .add("distinct_devices", s.distinct_devices)
+                                      .add("last_seen", s.last_seen));
+                 }
+                 JArr by_os;
+                 for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                     // DexOsCrashCount.crashes carries the generic event count for
+                     // the generalised per-obs_type read (see the store header).
+                     by_os.add(JObj()
+                                   .add("platform", o.platform)
+                                   .add("count", o.crashes)
+                                   .add("distinct_devices", o.distinct_devices));
+                 }
+                 JArr devices;
+                 for (const auto& d : guaranteed_state_store->dex_signal_devices(obs_type, since,
+                                                                                 limit)) {
+                     devices.add(JObj()
+                                     .add("agent_id", d.agent_id)
+                                     .add("count", d.crashes)
+                                     .add("last_seen", d.last_seen));
+                 }
+                 JArr by_day;
+                 for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
+                     by_day.add(JObj().add("day", d.day).add("count", d.crashes));
+                 }
+                 res.set_content(ok_json(JObj()
+                                             .add("obs_type", obs_type)
+                                             .raw("subjects", subjects.str())
+                                             .raw("by_os", by_os.str())
+                                             .raw("devices", devices.str())
+                                             .raw("by_day", by_day.str())
+                                             .str()),
+                                 "application/json");
+             });
 
     // GET /status, /status/:agent_id, /alerts — placeholders that respond
     // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4

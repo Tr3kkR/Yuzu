@@ -53,6 +53,17 @@ reserved_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: plugin with a malformed name (#822) ────────────────────────
+# Declares a name outside the [A-Za-z0-9_] identifier set; test_plugin_loader.cpp
+# scans against it to verify the invalid-name rejection path.
+invalid_name_fixture_plugin = shared_library(
+  'invalid_name_fixture_plugin',
+  files('unit/fixtures/invalid_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -101,26 +112,41 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guard_registry.cpp',
+    'unit/test_guard_file.cpp',
+    'unit/test_dex_signals.cpp',
+    'unit/test_dex_macos.cpp',
+    'unit/test_dex_win_poll.cpp',
+    'unit/test_dex_perf_breach.cpp',
+    'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
+    'unit/test_netprobe_stats.cpp',
+    'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
-  # Ensure the fixture plugin is built before the test runs so the lookup
-  # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
-  link_depends: reserved_name_fixture_plugin,
+  # Ensure the fixture plugins are built before the test runs so the lookups
+  # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 test(
   'agent unit tests',
   agent_test_exe,
   suite: 'agent',
   timeout: 240,
-  depends: reserved_name_fixture_plugin,
+  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
+if host_machine.system() == 'windows'
+  # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
+  tar_test_deps += cxx.find_library('iphlpapi')
+endif
 
 tar_test_exe = executable(
   'yuzu_tar_tests',
@@ -130,12 +156,16 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_tar_perf.cpp',
+    'unit/test_tar_proc_perf.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_perf.cpp',
+    '../agents/plugins/tar/src/tar_proc_perf.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
@@ -152,7 +182,14 @@ if build_server
     files(
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
+      'unit/server/test_auth_routes_mfa.cpp',
+      'unit/server/test_settings_routes_mfa.cpp',
+      'unit/server/test_totp.cpp',
+      'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_mfa_qr.cpp',
+      'unit/server/test_mfa_store.cpp',
       'unit/server/test_auto_approve.cpp',
+      'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
@@ -181,8 +218,25 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_result_set_store.cpp',
+      'unit/server/test_result_set_matcher.cpp',
+      'unit/server/test_rest_result_sets_async.cpp',
+      'unit/server/test_result_sets_ui.cpp',
+      'unit/server/test_scope_walking_authz.cpp',
+      'unit/server/test_scope_yaml.cpp',
+      'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
+      'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_baseline_store.cpp',
+      'unit/server/test_guardian_push_builder.cpp',
+      'unit/server/test_guardian_resilience_schema.cpp',
+      'unit/server/test_guardian_routes.cpp',
+      'unit/server/test_dex_routes.cpp',
+      'unit/server/test_dex_alert_router.cpp',
+      'unit/server/test_dex_blast_radius.cpp',
+      'unit/server/test_guardian_form_render.cpp',
+      'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
@@ -191,6 +245,11 @@ if build_server
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
+      'unit/server/test_x509_ca.cpp',
+      'unit/server/test_ca_store.cpp',
+      'unit/server/test_ca_routes.cpp',
+      'unit/server/test_key_provider.cpp',
+      'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
@@ -222,9 +281,17 @@ if build_server
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',
+      'unit/server/test_pg_raii.cpp',
+      'unit/server/test_pg_pool.cpp',
+      'unit/server/test_pg_migration_runner.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
+      # C3b cross-check: test_guardian_resilience_schema.cpp includes the agent's
+      # resilience_strategy.hpp for resilience_keys to assert the server param-spec
+      # table matches the agent parser (contract G9 drift guard). Header-only
+      # constexpr — no link to yuzu_agent_core, just the include path.
+      include_directories('../agents/core/include'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -233,7 +300,11 @@ if build_server
     # C4743 (vtable size mismatch) and the linked binary crashes with
     # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
     # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
-    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
+    #
+    # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
+    # test_helpers.hpp — only the server suite links libpq, so the guard
+    # keeps the agent/tar suites (which share the header) libpq-free.
+    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

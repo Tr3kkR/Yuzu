@@ -2,6 +2,9 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -181,7 +184,7 @@ struct ToolDef {
     const char* input_schema_json; // Pre-serialized JSON Schema
 };
 
-// All 22 Phase 1 read-only tools.
+// All 26 Phase 1 read-only tools.
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})"},
@@ -253,6 +256,36 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
 
+    {"get_guardian_schemas",
+     "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
+     "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
+     "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas catalog.",
+     R"({"type":"object","properties":{}})"},
+
+    // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
+    {"list_dex_signals",
+     "List the DEX signal catalogue rollup: every observation type seen in the window with its "
+     "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate. Mirrors "
+     "GET /api/v1/dex/signals. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"}}})j"},
+
+    {"get_dex_signal_scope",
+     "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
+     "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
+     "GuaranteedState:Read.",
+     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
+
+    {"get_dex_signal_detail",
+     "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
+     "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
+     "audit-logged (dex.signal.view). Mirrors GET /api/v1/dex/signals/{obs_type}. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("obs_type":{"type":"string","description":"Catalogue key, e.g. process.crashed, os.boot (pattern [A-Za-z0-9._-]{1,64})"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
+     R"j(},"required":["obs_type"]})j"},
+
     // Phase 2 write tool
     {"execute_instruction",
      "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
@@ -267,6 +300,24 @@ static const ToolDef kTools[] = {
      R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
      R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
+
+    // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
+    {"list_issued_certs",
+     "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
+     "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
+     R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
+     R"j(}})j"},
+
+    {"revoke_certificate",
+     "Revoke an issued certificate by serial and republish the CRL. Mirrors "
+     "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
+     "approval-gated like every other destructive MCP op).",
+     R"j({"type":"object","properties":{)j"
+     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
+     R"j(},"required":["serial_hex"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -281,6 +332,7 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
+    "revoke_certificate",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -315,6 +367,10 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    {"get_guardian_schemas", {"GuaranteedState", "Read"}},
+    {"list_dex_signals", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
     // Implemented write tools
     {"set_tag", {"Tag", "Write"}},
     {"delete_tag", {"Tag", "Delete"}},
@@ -323,6 +379,9 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
     {"quarantine_device", {"Security", "Write"}},
+    // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
+    {"list_issued_certs", {"Security", "Read"}},
+    {"revoke_certificate", {"Security", "Delete"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -339,6 +398,8 @@ static const ResourceDef kResources[] = {
     {"yuzu://compliance/fleet", "Fleet Compliance", "Fleet-wide compliance overview",
      "application/json"},
     {"yuzu://audit/recent", "Recent Audit", "Last 50 audit events", "application/json"},
+    {"yuzu://guardian/schemas", "Guardian Schemas",
+     "Guardian (Guaranteed State) Guard authoring schema catalog", "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
@@ -380,7 +441,8 @@ McpServer::HandlerFn McpServer::build_handler(
     ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
-    const bool& mcp_disabled, DispatchFn dispatch_fn) {
+    const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+    PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -609,6 +671,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add("uri", uri)
                                  .add("mimeType", "application/json")
                                  .add("text", arr.str()));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://guardian/schemas") {
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                // Same compiled-in catalog the REST GET /api/v1/guaranteed-state/schemas
+                // serves — one source (guardian_schema_catalog), so a Guardian author on
+                // the MCP plane discovers the identical Guard schemas as on REST (contract
+                // §4 decision 3 / §9 G9: discovery surface on every plane).
+                const auto& catalog = ::yuzu::server::guardian::guardian_schema_catalog();
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", catalog.json));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
@@ -1589,6 +1668,194 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── get_guardian_schemas ──────────────────────────────────────
+            if (tool_name == "get_guardian_schemas") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                // Same compiled-in catalog the REST GET /api/v1/guaranteed-state/schemas
+                // endpoint serves — single source (guardian_schema_catalog), so an MCP
+                // client and a REST client discover the IDENTICAL Guard authoring schemas
+                // (contract §4 decision 3 / §9 G9: discovery on every plane, not REST-only).
+                const auto& catalog = ::yuzu::server::guardian::guardian_schema_catalog();
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", catalog.json)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ─────────
+            // Window token resolved via the shared dex_window_to_days /
+            // dex_iso_since helpers so MCP, REST and the dashboard cannot drift
+            // on the window vocabulary. The rollup + scope are fleet aggregates
+            // (only the generic mcp.<tool> audit). The per-signal detail returns
+            // a most-affected DEVICES list (agent_ids — behavioral) and ALSO
+            // emits dex.signal.view (ObsType) so one SIEM filter catches the
+            // dashboard, REST and MCP behavioral-access surfaces alike.
+            if (tool_name == "list_dex_signals") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                JArr arr;
+                for (const auto& r : guaranteed_state_store->dex_signal_summary(since)) {
+                    arr.add(JObj()
+                                .add("obs_type", r.obs_type)
+                                .add("count", r.count)
+                                .add("distinct_devices", r.distinct_devices)
+                                .add("last_seen", r.last_seen));
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_signal_scope") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                JArr arr;
+                for (const auto& r : guaranteed_state_store->dex_os_signal_scope(since)) {
+                    arr.add(JObj()
+                                .add("platform", r.platform)
+                                .add("distinct_types", r.distinct_types)
+                                .add("total_events", r.total_events));
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_signal_detail") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string obs_type = param_str(args, "obs_type");
+                // Same catalogue-key validation as the REST sibling: [A-Za-z0-9._-]
+                // up to 64 chars. Reject before the audit so a malformed request
+                // leaves no trace of a behavioral view that never happened.
+                const bool ok =
+                    !obs_type.empty() && obs_type.size() <= 64 &&
+                    obs_type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                               "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                        std::string::npos;
+                if (!ok) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "obs_type must match [A-Za-z0-9._-]{1,64}"),
+                        "application/json");
+                    return;
+                }
+                const std::string since =
+                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                const int limit = std::clamp(param_int32(args, "limit", 50), 0, 500);
+                // Behavioral-PII access audit — the devices[] list below names the
+                // agent_ids exhibiting this signal. Same verb/target as the REST
+                // and dashboard per-signal views (cross-surface SIEM parity).
+                audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
+                         "DEX per-signal drill-down via MCP get_dex_signal_detail");
+
+                JArr subjects;
+                for (const auto& s :
+                     guaranteed_state_store->dex_signal_subjects(obs_type, since, limit)) {
+                    subjects.add(JObj()
+                                     .add("subject", s.subject)
+                                     .add("count", s.count)
+                                     .add("distinct_devices", s.distinct_devices)
+                                     .add("last_seen", s.last_seen));
+                }
+                JArr by_os;
+                for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                    // DexOsCrashCount.crashes carries the generic event count here.
+                    by_os.add(JObj()
+                                  .add("platform", o.platform)
+                                  .add("count", o.crashes)
+                                  .add("distinct_devices", o.distinct_devices));
+                }
+                JArr devices;
+                for (const auto& d :
+                     guaranteed_state_store->dex_signal_devices(obs_type, since, limit)) {
+                    devices.add(JObj()
+                                    .add("agent_id", d.agent_id)
+                                    .add("count", d.crashes)
+                                    .add("last_seen", d.last_seen));
+                }
+                JArr by_day;
+                for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
+                    by_day.add(JObj().add("day", d.day).add("count", d.crashes));
+                }
+                auto payload = JObj()
+                                   .add("obs_type", obs_type)
+                                   .raw("subjects", subjects.str())
+                                   .raw("by_os", by_os.str())
+                                   .raw("devices", devices.str())
+                                   .raw("by_day", by_day.str())
+                                   .str();
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── execute_instruction ───────────────────────────────────────
             // Tier check handled by generic C8 block above (kToolSecurity).
             if (tool_name == "execute_instruction") {
@@ -1786,6 +2053,150 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── list_issued_certs ─────────────────────────────────────────
+            // MCP/REST parity for GET /api/v1/ca/issued (PR4 B-2). Same field
+            // set the REST handler returns (cert_pem deliberately omitted —
+            // forensic-only, large). Security:Read.
+            if (tool_name == "list_issued_certs") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!ca_store || !ca_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                int limit = args.value("limit", 200);
+                int offset = args.value("offset", 0);
+                limit = std::clamp(limit, 1, 1000);
+                offset = std::clamp(offset, 0, 1000000);
+                // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
+                // precise has_more so an agentic client can paginate deterministically.
+                auto records = ca_store->list_issued(limit + 1, offset);
+                const bool has_more = static_cast<int>(records.size()) > limit;
+                if (has_more)
+                    records.resize(static_cast<std::size_t>(limit));
+                nlohmann::json items = nlohmann::json::array();
+                for (const auto& r : records) {
+                    items.push_back({{"serial_hex", r.serial_hex},
+                                     {"subject", r.subject},
+                                     {"san", r.san},
+                                     {"purpose", r.purpose},
+                                     {"status", cert_status_to_string(r.status)},
+                                     {"not_after", r.not_after},
+                                     {"issued_at", r.issued_at},
+                                     {"revoked_at", r.revoked_at},
+                                     {"revocation_reason", r.revocation_reason},
+                                     {"issued_by", r.issued_by},
+                                     // #1296: stable key-based CA identity (see
+                                     // ca_routes /ca/issued). Empty on pre-v5 rows.
+                                     {"issuer_key_id", r.issuer_key_id}});
+                }
+                nlohmann::json payload = {{"items", std::move(items)},
+                                          {"count", records.size()},
+                                          {"limit", limit},
+                                          {"offset", offset},
+                                          {"has_more", has_more}};
+                if (has_more)
+                    payload["next_offset"] = offset + limit;
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── revoke_certificate ────────────────────────────────────────
+            // MCP/REST parity for POST /api/v1/ca/revoke (PR4 B-2). Destructive:
+            // Security:Delete, which the generic gate above already tier-checks +
+            // approval-gates (supervised tier → approval, which is the same
+            // platform-wide not-yet-implemented path as every other destructive
+            // MCP op; lower tiers are tier-denied). When reached, it mirrors the
+            // REST handler exactly: validate+canonicalize serial, revoke, republish
+            // the CRL, and emit the SAME ca.* audit actions so the audit trail is
+            // surface-agnostic.
+            if (tool_name == "revoke_certificate") {
+                if (!tier_allows(tier, "Security", "Delete")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Delete"))
+                    return;
+                if (!ca_store || !ca_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                auto serial = param_str(args, "serial_hex");
+                const std::string reason = param_str(args, "reason");
+                const bool serial_ok =
+                    !serial.empty() && serial.size() <= 64 &&
+                    serial.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+                if (!serial_ok) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "serial_hex must be 1-64 hex digits"),
+                        "application/json");
+                    return;
+                }
+                for (auto& c : serial)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (!ca_store->revoke(serial, reason)) {
+                    // Idempotent reject-without-state-change → "denied" (matches REST).
+                    // M1 (#1240): surface a dropped denied-row via the error data.
+                    const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",
+                                                          "AgentCertificate", serial,
+                                                          "serial not found or already revoked");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "serial not found or already revoked",
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                // Observe the audit return (AuditFn is bool): a dropped row on a
+                // privileged revoke is an evidence-chain gap, surfaced to the agentic
+                // caller via audit_persisted:false (the REST sibling uses the
+                // Sec-Audit-Failed header; JSON-RPC has no header channel).
+                bool audit_ok =
+                    audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial, reason);
+                bool crl_ok = false;
+                if (publish_crl_fn)
+                    crl_ok = publish_crl_fn().has_value();
+                audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                    "Security", serial,
+                                    crl_ok ? ""
+                                           : "CRL build/record failed after revocation; CRL may "
+                                             "be stale") &&
+                           audit_ok;
+                nlohmann::json payload = {{"revoked", true},
+                                          {"serial_hex", serial},
+                                          {"crl_republished", crl_ok}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
+                // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
+                // MCP usage correlates with the ca.* domain events in the audit store.
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── Unknown tool ──────────────────────────────────────────────
             mcp_audit("failure", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
@@ -1809,13 +2220,16 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 InventoryStore* inventory_store, PolicyStore* policy_store,
                                 ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine, const bool& read_only_mode,
-                                const bool& mcp_disabled, DispatchFn dispatch_fn) {
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
                            response_store, audit_store, tag_store, inventory_store, policy_store,
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
-                           mcp_disabled, std::move(dispatch_fn)));
+                           mcp_disabled, std::move(dispatch_fn), ca_store,
+                           std::move(publish_crl_fn), guaranteed_state_store));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

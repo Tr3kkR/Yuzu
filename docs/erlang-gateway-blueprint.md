@@ -114,7 +114,7 @@ yuzu_gateway/
 %% rebar.config
 {deps, [
     {grpcbox,   "0.17.1"},     % gRPC server + client (HTTP/2, protobuf)
-    {gpb,       "4.21.2"},     % Protobuf compiler/runtime (grpcbox dep)
+    {gpb,       "4.21.7"},     % Protobuf compiler/runtime (grpcbox dep)
     {telemetry,  "1.3.0"},     % Metrics event API
     {prometheus, "4.11.0"},    % Prometheus exposition (telemetry handler)
     {recon,      "2.5.5"}      % Production introspection

@@ -5,7 +5,9 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "ca_store.hpp"
 #include "execution_tracker.hpp"
+#include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -34,7 +36,11 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    // Returns false if the audit row could not be persisted. Most MCP call sites
+    // discard the result (the generic mcp_audit helper), but destructive tools
+    // (e.g. revoke_certificate) observe it to surface an evidence-chain gap in the
+    // JSON-RPC result — matching the canonical bool-returning audit contract.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using AgentsJsonFn = std::function<nlohmann::json()>;
@@ -60,6 +66,12 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id)>;
 
+    /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
+    /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
+    /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
+    /// nullopt if the CRL could not be (re)built/persisted.
+    using PublishCrlFn = std::function<std::optional<std::vector<std::uint8_t>>()>;
+
     /// Type of the POST /mcp/v1/ handler — same shape as httplib::Server's Post handler
     /// but exposed independently so tests can dispatch in-process without spinning
     /// up an httplib::Server (see #438 for the TSan-vs-httplib-thread-acceptor bug
@@ -82,7 +94,9 @@ public:
                             InventoryStore* inventory_store, PolicyStore* policy_store,
                             ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
                             ScheduleEngine* schedule_engine, const bool& read_only_mode,
-                            const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr);
+                            const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
+                            CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
+                            GuaranteedStateStore* guaranteed_state_store = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -94,7 +108,9 @@ public:
                          PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
                          ApprovalManager* approval_manager, ScheduleEngine* schedule_engine,
                          const bool& read_only_mode, const bool& mcp_disabled,
-                         DispatchFn dispatch_fn = nullptr);
+                         DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
+                         PublishCrlFn publish_crl_fn = nullptr,
+                         GuaranteedStateStore* guaranteed_state_store = nullptr);
 };
 
 } // namespace yuzu::server::mcp

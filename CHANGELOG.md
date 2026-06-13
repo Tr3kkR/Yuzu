@@ -7,6 +7,1420 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI server-test legs now require a reachable PostgreSQL 16**
+  (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
+  provision or authenticate one — except the documented psql-less TCP-probe
+  fallback on a native cluster) — the new `[pg]`-tagged server tests for the
+  Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
+  development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
+  tests skip cleanly; when it is set but unreachable they fail. See
+  `docs/ci-architecture.md` "Postgres for server tests" for the local
+  one-liner.
+
+### Breaking Changes
+
+- **The server now generates per-install default TLS certificates on first
+  boot instead of refusing to start without operator-provided certs.** A fresh
+  install is encrypted and serves the HTTPS dashboard + agent/management gRPC
+  with an auto-generated per-install ECDSA CA (no `--no-tls`/`--no-https`
+  needed). Because the dashboard cert is signed by a per-install CA, browsers
+  show an untrusted-issuer warning until the operator trusts the CA
+  (`<cert-dir>/default-ca.pem`) or replaces the certs. The server warns loudly
+  on six surfaces (startup banner; one-shot audit `server.default_certs_generated`;
+  periodic audit `server.default_certs_in_use`; Prometheus
+  `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
+  `ca_fingerprint` + `ca_expires_at`; `/readyz` `ca_store`/`ca_root`). While on default certs the agent
+  listener runs encrypted but **requests-but-does-not-require** client certs so
+  a first-boot agent can bootstrap; agents then auto-enroll for a per-agent
+  client certificate and upgrade to full mutual TLS (see "Per-agent mutual TLS"
+  under Added). An operator-supplied agent surface keeps strict mTLS, and the
+  management plane is unaffected. **Opt out with
+  `--no-default-certs`** to restore the legacy refuse-to-start. New `--ca-dir`
+  relocates the CA/cert directory. A surface given a cert without its key (or
+  vice-versa) is now a hard startup error. See `docs/auth-architecture.md`
+  "Default certificates".
+- **`--mfa-enforcement=admin-only` and `--mfa-enforcement=required` now
+  ENFORCE (previously a logged no-op).** PR 1/PR 2 accepted these values
+  for forward-compatibility and documented them as no-ops (the server
+  emitted a startup `WARN`). PR 3 wires real enforcement: an un-enrolled
+  login subject to enforcement is redirected through TOTP enrollment
+  (`POST /login/mfa/enroll`) before any session is minted. **An operator
+  who staged `--mfa-enforcement=admin-only|required` based on the prior
+  no-op documentation will hit live enforcement immediately on upgrade.**
+  Before upgrading: ensure all affected accounts are enrolled, or set the
+  flag back to `optional`, upgrade, then re-enable after verifying
+  enrollment. The startup line for non-default modes changes from `WARN`
+  (no-op) to `INFO` (enforcement active). See
+  `docs/user-manual/upgrading.md` for the full pre-flight checklist,
+  including the SSO `amr` requirement and single-admin guidance.
+- **OIDC/SSO sessions are now MFA-gated via the IdP `amr` claim instead of
+  being blanket-exempt from step-up.** An SSO session whose IdP attests a
+  multi-factor login (RFC 8176 `amr` containing `mfa`/`otp`/`hwk`/`fpt`/
+  `face`/`iris`/`sms`/`swk`/`tel`) clears high-risk endpoints without a
+  redundant prompt and re-prompts (via re-SSO) once the assertion ages
+  past `--mfa-step-up-window-secs`. An SSO session whose IdP did **not**
+  attest MFA is handled symmetrically with local users: under `optional`
+  (or `admin-only` for a non-admin) it passes the gate (Yuzu cannot mint a
+  factor for an external identity); under `required` (or `admin-only` for
+  an admin) it is gated and must re-authenticate through SSO. **If you
+  enable `required`/`admin-only` with SSO, configure your IdP to assert
+  `amr` and verify it pre-flight** — otherwise affected SSO users cannot
+  reach high-risk endpoints (recoverable by restarting in `optional`).
+
+- **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
+  Programmatic clients (CI pipelines, automation scripts, health checks)
+  that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
+  fail silently the first time the authenticating user enrolls in TOTP MFA.
+  Handle the 202 branch: read `mfa_pending_token` from the JSON body and
+  POST it along with the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX`
+  recovery code) to `POST /login/mfa` to obtain a session cookie. Clients
+  using API tokens or OIDC are unaffected.
+- **Audit verb taxonomy on every new MFA emission site uses the
+  `target_type="User"` (PascalCase) and `result ∈ {ok, error}` vocabulary
+  from `docs/observability-conventions.md`.** SIEM and Grafana rules that
+  filter on the historical lowercase `target_type="user"` + `success/failure`
+  strings used by `auth.login` / `auth.oidc_login` will not match the new
+  `mfa.*` rows. Existing auth.* sites remain on the historical vocabulary
+  for backwards compatibility (separate tracking issue).
+- **Recovery code format changed from `XXXXX-XXXXX` (50 bits) to
+  `XXXX-XXXX-XXXX-XXXX` (80 bits, four base32 groups).** Codes issued by
+  prior PR1 commits are no longer the canonical shape but remain valid
+  until consumed or regenerated.
+- **`AuthDB::remove_user` now also clears MFA enrollment state.** Soft-
+  deleting a user nulls their `mfa_totp_secret`, clears `mfa_enrolled_at`,
+  and DELETEs every `mfa_recovery_codes` row owned by the user — SOC 2 CC6.8
+  requires credentials be revoked on termination. Any external code or
+  ops tooling that relied on the prior "soft delete leaves MFA intact"
+  behavior must update.
+
+### Added
+
+- **DEX: alert routing + tunable blast-radius thresholds (Settings → DEX
+  alerts).** Operators can now route individual DEX signal types to alerts:
+  each routed observation raises an operator notification and fires a new
+  **`dex.signal`** webhook/offload event (`obs_type`, `subject`, `agent_id`),
+  once per device per hour per type, with a global per-minute fan-out cap.
+  Nothing is routed by default. The same panel makes the fleet blast-radius
+  thresholds (min devices / window / cooldown) **operator-tunable, applied
+  live** — no restart (memory and fan-out bounds remain fixed; they are DoS
+  posture, not policy). Routing is evaluated at the shared observation-ingest
+  chokepoint, so directly-connected and gateway-routed agents are covered
+  identically. Changes are audit-logged (`settings.dex_alerts.*`) and
+  persisted in runtime config; router activity is observable via the
+  `yuzu_server_dex_alert_*` metrics (fired / delivery_failed / suppressed /
+  dropped / cooldowns_evicted / routed_types). The agent-side A3 breach
+  thresholds (90 % CPU / 10 min etc.) remain fixed in this release.
+- **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
+  Each Windows agent now records, on the same 30 s perf tick, the **top 10
+  applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)
+  into the on-device TAR edge warehouse — `$ProcPerf_Live` (7-day window) and
+  `$ProcPerf_Hourly` (31-day per-app avg/max rollup). One
+  `NtQuerySystemInformation` snapshot per tick: no PDH, no WMI, no per-process
+  handles. Samples are aggregated per image name (12 chrome.exe processes =
+  one row, `instances=12`); `cpu_pct` is the app's share of total machine
+  capacity, matching Task Manager. Privacy: **image names only — never
+  command lines**; TAR redaction patterns apply to the name. **Off by default**
+  (`procperf_enabled=false`) — per-application data is usage-class telemetry
+  subject to works-council/DPA review, distinct from device-level perf (which
+  carries no per-app identity and stays on); set `procperf_enabled=true` to opt
+  in, independent of the device-level sampler. Queryable via `tar.sql`.
+- **TAR: warehouse tables are now ensured on every database open.** Fixes an
+  upgrade bug where tables introduced by a newer release (the perf tier, and
+  now procperf) were never created on a pre-existing `tar.db` — the schema DDL
+  only ran on first-time migration, so upgraded agents failed those inserts
+  until the database was deleted. The DDL is idempotent (`IF NOT EXISTS`) and
+  now runs on each open.
+- **DEX: fleet performance rollup + device perf sparklines.** Two new surfaces
+  over the device perf telemetry: (1) every Windows agent ships its current
+  utilization (CPU busy %, commit-charge % of limit, per-IO disk latency —
+  derived over its heartbeat interval) as heartbeat tags, and the server
+  aggregates the fleet into Prometheus gauges
+  **`yuzu_fleet_perf_{cpu_pct,commit_pct,disk_lat_ms}{stat="avg"|"p50"|"p90"|"max"}`**
+  plus **`yuzu_fleet_perf_reporting`** (the contributing population). Series go
+  absent — never a fabricated zero — when nobody reports; non-finite/negative
+  values from a rogue agent are rejected and percentages clamp at 100.
+  (2) The `/dex` per-device drill-down gains a **device performance panel**:
+  CPU / memory / disk-latency sparklines over the device's hourly warehouse
+  rollups, fetched by a live read-only `$Perf_Hourly` TAR query dispatched to
+  the device when you **click Load performance** (click-to-load — viewing a
+  device page alone never dispatches a command; raw samples stay on-device —
+  the federated model). Server-rendered SVG, no JS. Needs the device online
+  and `Execution:Execute` (the panel says so honestly otherwise); each query
+  is audit-logged (`dex.device.perf.query`). Agents with `--dex-disable` ship
+  no perf tags.
+- **DEX: sustained performance-breach alerts (Performance signal family).** The
+  Windows state poller now samples CPU, commit charge, and disk service time
+  every 120 s (raw kernel counters — `GetSystemTimes`, `GetPerformanceInfo`,
+  `IOCTL_DISK_PERFORMANCE`; no PDH, no WMI, no shell-out) and emits a DEX
+  observation when a metric stays bad for a sustained window:
+  **`perf.cpu_sustained`** (≥90% busy for 10 min), **`perf.memory_pressure`**
+  (commit charge ≥90% of limit for 10 min), **`perf.disk_latency_high`**
+  (≥25 ms per IO for 10 min). Each fires once per episode with the window
+  average as its metric and re-arms only after a sustained recovery below a
+  lower exit threshold (hysteresis — a flapping metric cannot spam the feed;
+  worst case ~4 observations/hour/type). The signals ride every existing alert
+  surface (SSE, webhooks, blast-radius detection) and land in a new
+  **"Performance"** family on the `/dex` Catalogue and Health views (display
+  catalogue now 107 entries). Thresholds are fixed in this release
+  (operator-configurable thresholds are the F1 follow-up). The TAR perf
+  warehouse remains the historical record of the same counters; this is the
+  alerting leg.
+- **RDP control plugin (`rdp_control`).** New Windows-only agent plugin with
+  two actions: `set_state` (enable|disable — writes `HKLM fDenyTSConnections`,
+  toggles the Remote Desktop firewall rule group locale-independently via
+  `INetFwPolicy2`, and starts `TermService` on enable; per-step status columns
+  with `overall=ok` only when every step succeeds) and `status` (reads back all
+  three gates and derives `rdp=on|off|unknown`, reporting `unknown` rather than
+  `off` when a gate is unreadable). Bundled `windows.rdp.set_state` definition
+  (role-gated, `endpoint-admin`) and `windows.rdp.status` (auto, question).
+  Built for change-gated remote access: an ITSM system can enable RDP at the
+  start of an approved change window and disable it afterward. Disable blocks
+  new connections only (does not terminate active sessions). Non-Windows builds
+  compile to an error-returning stub. Requires the agent service account to be
+  in the local `Administrators` group (not the default install) — see
+  `docs/agent-privilege-model.md`.
+- **PostgreSQL deploy prerequisites — native packaging, backup/restore docs,
+  UAT sidecar (#1320 PR 2; inert-but-ready, no server behavior change).**
+  Three deliverables ahead of the substrate's fail-closed flip: (1) the
+  provisioning helper `install-server-postgres.sh` now ships in the server
+  `.deb`/`.rpm` (at `/usr/share/yuzu/scripts/`, invoked **non-fatally** from
+  the package post-install hooks) and in the Linux/macOS release tarballs
+  (`scripts/`); (2) operator backup/restore documentation now covers
+  PostgreSQL state — `pg_dump --format=custom`/`pg_restore` procedures for
+  native and Docker deployments in `docs/user-manual/server-admin.md` (new
+  "PostgreSQL Substrate" section) and `upgrading.md`, including the ADR-0010
+  **restore-pairing invariant** (database and `KeyProvider` keys-dir backups
+  restore *together*; runbook tracked in #1341) and an explicit warning never
+  to `tar` a live `postgres-data` volume; (3) the native UAT rig
+  (`scripts/start-UAT.sh`) now stands up a `yuzu-postgres:local` sidecar
+  container on loopback `:15433` with per-run random, distinct
+  superuser/app-role credentials, exports `YUZU_POSTGRES_DSN` to the server,
+  and tears the container down on `stop` — a missing docker/sidecar is a
+  warning, not a failure, until the #1320 PR 3 fail-closed boot lands
+  (`PG_SOFT_FAIL` flag). The rig's agent-registration poll timeout also
+  rises 30s → 60s (the fleet-health gauge needs a first heartbeat + a
+  recompute window — measured ~37s; the stack was healthy, the poll was
+  just too tight).
+- **DEX: continuous device performance sampling (TAR `perf` warehouse tier).**
+  Every Windows agent now samples CPU busy %, memory used % + commit-charge %,
+  per-IO disk service time (µs) + read/write throughput, and non-loopback
+  network rx/tx throughput every 30 s into the on-device TAR edge warehouse
+  (`$Perf_Live`, 7-day window; `$Perf_Hourly` avg/max rollup, 31-day) — raw
+  samples never cross the wire (ADR-0004 federated model). Raw kernel counters
+  only (`GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`,
+  `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`); no PDH, no WMI, no shell-out. New
+  `tar collect_perf` action and `configure` keys **`perf_enabled`** (default
+  `true`) and **`perf_interval_seconds`** (default 30; `0` disables the trigger
+  entirely). Queryable via `tar.sql`. Linux (`/proc`) and macOS
+  (`host_statistics`) collectors are planned. Threshold-breach alerting shipped
+  alongside (see "sustained performance-breach alerts" above); fleet rollup
+  (A4) is a follow-on slice — today's data is collection + raw-SQL query +
+  breach alerts, no dashboard chart yet.
+- **DEX: fleet blast-radius incident alerting.** When ≥5 distinct devices report
+  the same DEX signal `(obs_type, subject)` within a 15-minute sliding window,
+  the server raises an operator notification (severity `warn`) and fires a new
+  **`dex.blast_radius`** webhook/offload event (payload: `obs_type`, `subject`,
+  `device_count`, `window_seconds`) — subscribe to auto-open ITSM incidents.
+  Detection runs at the shared Guardian ingest chokepoint, so directly-connected
+  and gateway-routed agents both contribute; the window uses server receipt time
+  (clock-skew tolerant). Per-pair 1-hour re-alert cooldown; a global
+  per-minute fan-out cap and a bounded LRU pair map keep it kind to the server
+  and the ITSM sink under a correlated multi-subject incident. Metrics:
+  `yuzu_server_dex_blast_radius_{incidents,fires_dropped,entries_dropped,pairs_evicted}_total`
+  + `yuzu_server_dex_blast_radius_pairs_tracked`. The 5-devices / 15-min / 1-h
+  defaults are now operator-tunable under Settings → DEX alerts (see the alert
+  routing entry above).
+- **DEX: Windows disk-space and battery-health observations.** A Windows
+  state-poll collector (`dex_win_poll`) emits `storage.low` (fixed volume ≥90%
+  full or <5 GiB free, 10-min cadence, via `GetDiskFreeSpaceExW`) and `hw.error`
+  (battery full-charge capacity <80% of design, hourly, via `IOCTL_BATTERY`)
+  on the transition into a bad state (latched; re-arms only on a valid healthy
+  reading). Thresholds match the macOS IOKit poll; zero server change.
+  `storage.low` and battery (`hw.error`) are now emitted on both Windows and
+  macOS (final display-catalogue count for this release: see the Performance
+  family entry above).
+- **Network probes (`netprobe` plugin).** Active RTT, jitter, and packet-loss
+  measurement to operator-chosen targets using native system calls (no
+  shell-out): `network.probe.icmp` (ICMP echo — `IcmpSendEcho` on Windows,
+  unprivileged ICMP datagram sockets on POSIX; on Linux gated by
+  `net.ipv4.ping_group_range`, reporting `not-permitted` rather than fake loss),
+  `network.probe.tcp` (connect-time RTT to a target:port, sub-millisecond,
+  unprivileged everywhere — use where ICMP is dropped), and `network.probe.dns`
+  (`getaddrinfo` resolution timing). Bounded at 4 targets × 10 samples × 3 s,
+  sequential. Recurrence via the scheduler; results trend in the response store.
+  Admin-only execution (network-reconnaissance primitive).
+- **Hardware: installed-driver inventory.** New `hardware drivers` action and
+  `device.hardware.drivers` definition list installed device drivers (name,
+  version, date, provider, class) via `Win32_PnPSignedDriver` on Windows and
+  `/proc/modules` on Linux — supports fleet queries like "devices running driver
+  X older than version Y".
+- **macOS DEX collector — limited, unprivileged.** The DEX observer now ships a
+  macOS collector (`dex_macos_collector.cpp` + the pure parsers
+  `dex_macos_{signals,oslog,iokit}.{hpp,cpp}`) using four privilege-light
+  mechanisms — a kqueue `DiagnosticReports` folder-watch (`.ips`/`.diag`
+  crashes/hangs/panics/jetsam), a `sysctl(KERN_BOOTTIME)` uptime scalar, an
+  incremental `log show` unified-log poll, and an IOKit/system-tool poll
+  (SMART/battery/disk/thermal/memory). It reuses the OS-neutral obs_types, so no
+  server or dashboard change is needed beyond one macOS-only type — `storage.low`
+  (disk nearly full) — bringing the catalogue to **104**. Covers ~10 of 11 DEX
+  experience headings unprivileged; the Security heading (XProtect/Gatekeeper) is
+  not yet shipped. Privacy is minimised at the edge (faulting-image basenames
+  only, never raw log message bodies; per-type rate caps; non-finite metric
+  guards). Obeys the same `--dex-disable` kill switch as Windows. Linux endpoints
+  still report no DEX signals. Source mapping + the Endpoint-Security entitlement
+  roadmap: `docs/dex-signal-catalog.md`.
+- **DEX dashboard (`/dex`) — a hub plus three deep pages.** The read-only fleet-
+  reliability lens over the Guardian observation catalogue is structured as a
+  **hub** (measured crash-free-device % and crashes/1k-device-days, honest "—"
+  when no agents report) that summarises and links into three deep pages:
+  **Catalogue** (all 104 monitored signal types across 12 families — App
+  reliability, Boot/start-up & shutdown, Service health, System stability,
+  Hardware & storage, File system, Network, Identity & logon, Security &
+  protection, Updates & installs, Policy & management, Printing — quiet types as
+  real-zero rows, with per-type drill-down and an "Other" bucket for uncatalogued
+  types a newer agent emits), **Health score** (a transparent, *secondary* 0–100
+  composite — `100 − Σ weighted deductions` — suppressed, never fabricated, when
+  no agents report), and **Trends** (cross-OS comparison cards carrying each OS's
+  live signal scope, per-family sparklines, and a guard×day activity heatmap). A
+  24h/7d/30d/All window selector applies to every view; per-app and per-device
+  drill-downs (and the per-signal device list) are permission-gated
+  (`GuaranteedState:Read`) and audit-logged on open (behavioral data). A "DEX"
+  nav link is in the dashboard chrome. NO mock data anywhere: real aggregations
+  or explicit "no data" placeholders.
+- **DEX REST + MCP aggregation surface (`/api/v1/dex/*`, MCP `*_dex_signal*`
+  tools) — agentic parity.** The DEX dashboard rollups now have machine-readable
+  equivalents on both agentic planes so a worker sees the same read-model the
+  dashboard does. REST: `GET /api/v1/dex/signals` (the catalogue rollup), `GET
+  /api/v1/dex/scope` (per-OS signal coverage), and `GET
+  /api/v1/dex/signals/{obs_type}` (one signal's subjects / OS split /
+  most-affected devices / per-day trend). MCP: the matching `list_dex_signals`,
+  `get_dex_signal_scope`, and `get_dex_signal_detail` read tools. All gated on
+  `GuaranteedState:Read` with a `24h/7d/30d/all` `window` and a shared resolver
+  so REST, MCP and the dashboard can never drift on the window vocabulary. Audit
+  boundary mirrors the events endpoint across all three surfaces: the rollup and
+  scope are fleet aggregates (not audited as a view); the per-signal drill-down
+  returns a behavioral devices list and emits `dex.signal.view` on every call.
+- **Guardian DEX — 103-signal observation catalogue (waves 1–3).** The
+  slice-1 crash recorder generalized into one catalogue-driven multi-channel
+  observer (`dex_signal_catalog.{hpp,cpp}` + `dex_observer.{hpp,cpp}`,
+  renamed from `crash_observer`): 103 obs_types / 22 event-log channels —
+  crashes (native + .NET), hangs, service failures (7 kinds), bugcheck/
+  power-loss/dirty-shutdown, boot/shutdown/resume durations + per-cause
+  degradation, disk SMART/controller/port-reset, NTFS + ESE corruption,
+  memory exhaustion, device/TPM/CPU-throttle, Wi-Fi/DHCP/VPN/SMB/DNS/port-
+  exhaustion, Entra ID token errors, Windows Hello/biometric errors, RDP
+  disconnects, machine-trust/Kerberos/LSA/TLS failures, Defender health,
+  BitLocker, certificate auto-enrollment, update check/download/install
+  failures, MDM/Intune errors, Group Policy failures, print failures, and
+  more (`docs/dex-signal-catalog.md`). Uniform `detail_json` keys mean a new
+  signal needs ZERO server change. Per-type rate caps (12–120/h) bound the
+  wire. **Privacy minimisation at the edge** ([privacy]-pinned tests): DNS
+  query names, print document names/owners, usernames (profile/VPN/RDP/
+  service-logon/restart-initiator/Defender), client addresses, user-profile
+  paths, AAD message texts, and .NET stack frames are never extracted.
+  Verified via real-record fixtures harvested from a live Win11 box plus a
+  synthetic event-stream injection sweep (34 classic-source events through
+  the real `EvtSubscribe` path; the sweep caught and fixed a case-
+  sensitivity bug in provider matching). Heartbeat tags/metrics renamed:
+  `yuzu_agent_dex_observer_armed`, `yuzu_fleet_agents_dex_observer_disarmed`,
+  `yuzu_fleet_dex_observed_total`.
+- **Guardian DEX — fleet-wide process-crash recorder (slice 1).** The agent now
+  records Windows process crashes (Application event log, Event ID 1000,
+  "Application Error") on managed endpoints as **ruleless** Digital Experience (DEX)
+  observations, independent of any Guardian rule. It is an idle-until-crash
+  `EvtSubscribe` to the Application channel — no polling, no streaming. Scope is
+  Windows-only and Event-1000-only this slice (pure-.NET crashes that emit only a
+  `.NET Runtime` 1026, and hosts with Windows Error Reporting disabled, are not yet
+  captured). A crash is emitted through the existing Guardian event pipeline and
+  distinguished by `rule_id=__observation__` (a reserved sentinel) plus
+  `event_type=process.crashed` — not a category field; query it via
+  `GET /api/v1/guaranteed-state/events?rule_id=__observation__`. The recorder is a
+  no-op off Windows. Agents report crash-recorder arm-state and observed-crash count
+  in their heartbeat; the server rolls these up into
+  `yuzu_fleet_agents_dex_observer_disarmed` (Windows agents whose observer is not
+  armed — failed to arm at startup or lost its subscription at runtime; `> 0` means
+  reliability telemetry is silently off there) and `yuzu_fleet_dex_observed_total` (a
+  resetting gauge, not a monotonic counter). [Metric names generalised from the
+  earlier `*_crash_observer_disarmed` / `*_crashes_observed_total` when the crash
+  recorder became the 103-signal observer — both pre-release.] A deploy-time opt-out,
+  `--dex-disable` / `YUZU_AGENT_DEX_DISABLE`, collects no crash telemetry. The full executable path is
+  parsed but deliberately not sent (data minimisation). See
+  `docs/user-manual/guaranteed-state.md#dex-signal-observations` and the
+  [DEX dashboard](docs/user-manual/dex.md) (the slice-1 recorder is now one of
+  the 103 catalogued signals).
+- **libpq (PostgreSQL client library) added as a build dependency on all
+  platforms (#1317, ADR-0006/ADR-0008).** This is the F0 link-proof canary for
+  the server's storage-substrate migration to PostgreSQL — **no product
+  behavior changes and no server-side Postgres usage in this release**; the
+  migration lands incrementally over future releases (advance notice:
+  ADR-0006). Building from source on Linux now requires `bison` and `flex`;
+  on macOS, `autoconf`/`automake`/`libtool` (Windows: none — vcpkg
+  auto-acquires winflexbison). The Windows release zip gains `libpq.dll` via
+  the existing vcpkg-DLL bundling.
+- **Subordinate-CA — root Yuzu's internal CA in your enterprise PKI (PKI PR6,
+  M2).** Export the install CA's signing request (`GET /api/v1/ca/root-csr`,
+  `Security:Read`), have your enterprise root sign it as a subordinate CA, then
+  import the signed intermediate + parent chain (`POST /api/v1/ca/import-chain`,
+  `Security:Write`, or **Settings → Internal CA → "Subordinate this CA…"**). Once
+  imported, every Yuzu-issued certificate chains to the corporate trust anchor.
+  The issuing **key is unchanged** (the enterprise signs Yuzu's existing public
+  key), so certificates already issued keep validating across the switch. The
+  import is validated — the intermediate must be a CA, must carry **this
+  install's** CA public key, and must verify to the uploaded parent chain —
+  before the issuing identity is switched; the CRL is then re-published under the
+  new issuer. Audited (`ca.root_csr.exported`, `ca.subordinate.imported`).
+  Bring-your-own-leaf (`--cert`/`--key`/`--ca-cert` per surface) is unchanged and
+  orthogonal. See `docs/pki-architecture.md` "Subordinate-CA".
+- **`--cert-san` — extra Subject Alternative Names for the built-in default
+  certs (PKI PR5b).** New repeatable server flag (env `YUZU_CERT_SAN`) that
+  injects additional SANs into **every** auto-generated default leaf
+  (`default-https` / `default-server` / `default-gateway`) on top of the base
+  `localhost` / `127.0.0.1` / `::1` / `<hostname>` set. Each value is
+  `dns:<name>`, `ip:<addr>`, or a bare value auto-classified by IP-literal shape;
+  a single value may be comma-separated (so one `YUZU_CERT_SAN=dns:gateway,dns:server`
+  works as well as repeated flags). An `ip:`-tagged value that is not an IP literal
+  is dropped with a warning rather than failing the boot. This is the supported way
+  to make the built-in certs valid for a deployment name a client actually dials —
+  e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service
+  name passes SNI hostname verification (the `default-gateway` leaf does not
+  otherwise carry `DNS:gateway`). Ignored when operator certs are supplied or
+  `--no-default-certs` is set; changing it does not rotate an existing cert set
+  (clear the cert dir or replace the certs). See `docs/pki-architecture.md`.
+
+- **Gateway agent-edge one-way TLS — closes the plaintext command-fan-out hop
+  (PKI PR5c).** The Erlang gateway's agent listener (`:50051`) can now run
+  **server-authenticated (one-way) TLS** — encrypted + gateway-authenticated, with
+  **no client cert required**, so an unenrolled agent still bootstraps (CSR
+  enrollment then upgrades identity at the app layer). This closes the
+  fleet-RCE-risk plaintext agent↔gateway edge that PR5 had to leave open. It needed
+  a 2-line patch to grpcbox v0.17.1 (which hardcodes `fail_if_no_peer_cert=true` /
+  `verify=verify_peer` on every TLS listener), carried as a **vendored copy in
+  `gateway/_checkouts/grpcbox`** that makes both options read from `transport_opts`
+  (defaults preserve stock strict mTLS — fully backward-compatible). Enabled on the
+  agent listener in `gateway/config/sys.config.prod`; the privileged mgmt listener
+  deliberately does **not** use one-way TLS (it would be unauthenticated). Covered
+  by a real EC one-way-TLS handshake test (certless client accepted) alongside the
+  existing mTLS test (certless client rejected). 200 eunit pass; dialyzer clean.
+  *(The deployed composes + the agent `--ca-cert` / CA-distribution wiring that
+  turns this on live land in PR5b; see `docs/pki-architecture.md` "Gateway TLS".)*
+
+- **Gateway TLS — upstream mutual TLS + per-agent enrollment through the gateway
+  (PKI PR5).** The Erlang gateway can now speak mutual TLS to the server's
+  `GatewayUpstream` listener using the CA-issued `default-gateway` leaf
+  (`gateway/config/sys.config.prod` carries the canonical `{https,...}` upstream
+  channel; fixes a latent bug where the old config omitted grpcbox's required
+  `ssl => true` on the listener `transport_opts` and silently ran plaintext). The
+  gateway's vendored proto modules — `gateway_pb` (the `ProxyRegister` marshaller),
+  `management_pb`, and the agent-listener `agent_pb` — were all regenerated to
+  include `csr_pem`/`issued_certificate`/`issued_ca_chain`, so the gateway-proxied
+  `Register` path now **forwards** the agent CSR + issued cert verbatim — the fields
+  **survive transit** through the gateway (previously gpb's self-contained modules
+  silently dropped the unknown fields; `agent.proto:96` documents the trap). **This
+  is plumbing only: the gateway path does not yet *sign* the forwarded CSR** —
+  `ProxyRegister` has no signer wired, so a gateway-connected agent still receives an
+  empty `issued_certificate` and stays on the bootstrap posture (fails closed).
+  Gateway-path issuance lands in **PR5d**, which must first add agent-identity
+  attestation on the unauthenticated agent↔gateway hop (the R-6 confused-deputy gate
+  — a malicious gateway could otherwise swap the CSR and have the server issue a cert
+  for the victim's `agent_id`, or strip `csr_pem` to downgrade the agent). Until then,
+  a gateway-forwarded agent is also **not reachable by per-agent revocation** (it
+  presents the shared `default-gateway` leaf upstream, not its own) — see
+  `docs/pki-architecture.md`. Startup now
+  logs the *actual* grpcbox TLS posture (`yuzu_gw_app:log_tls_state/0`), replacing
+  a dead/`case_clause`-prone check on the advisory `tls` env, and **fails closed**
+  if the upstream is TLS-but-unverified (`https` without `verify_peer` — encrypted
+  yet MITM-able; override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` for dev/CI).
+  **Note: the upstream mTLS lives in the `sys.config.prod` *reference* config — it
+  is not yet the build default, so the shipped images/compose rigs still run
+  plaintext upstream until PR5b wires the prod profile + cert volumes.** The
+  **agent↔gateway
+  edge stays plaintext in M1** — grpcbox forces `fail_if_no_peer_cert` on any TLS
+  listener, which breaks unenrolled-agent bootstrap. **Do not expose the gateway
+  agent port (`:50051`) to an untrusted network** — it is the command fan-out
+  plane, so a MITM there is a fleet-RCE risk; front it with TLS termination or keep
+  it on a trusted segment (see the SECURITY callout in `docs/pki-architecture.md`).
+  Encrypting that hop natively is **resolved in PKI PR5c above** (one-way TLS on the
+  agent listener). Covered by a new EUnit suite
+  including a real EC mutual-TLS handshake. See `docs/pki-architecture.md`
+  "Gateway TLS". (The compose/Dockerfile distribution flip — encrypted-by-default
+  containers — is staged as PR5b; the server is already encrypted-by-default when
+  run without `--no-tls`/`--no-https`.)
+
+- **Settings → Internal CA dashboard panel (PKI PR4b).** The operator dashboard
+  now has a Certificate Authority panel (Settings page, HTMX, dark-theme): the CA
+  algorithm/fingerprint/expiry, one-click **Download CA certificate** + **Download
+  CRL**, the issued-certificate inventory (serial, subject, purpose, expiry,
+  status), and a per-certificate **Revoke** button (with an optional reason
+  field) that revokes + republishes the CRL and refreshes the table in place. All
+  agent-controlled fields are HTML-escaped; the panel and its revoke action are
+  gated by the `Security` securable (`Read` / `Delete`), matching the REST
+  surface. The cookie-authenticated dashboard revoke is **CSRF-protected**
+  (Origin/Referer same-site check via a shared `origin_is_same_site` helper, also
+  used by the MFA POSTs; a cross-origin attempt is refused + audited
+  `csrf.denied`) — a forged revoke would otherwise be a fleet-wide-lockout DoS.
+  Error responses re-render the full panel with an inline banner (no blank-panel
+  swap), and the inventory shows a truncation notice past 500 certs. See
+  `docs/user-manual/server-admin.md` and `docs/pki-architecture.md`.
+
+- **Internal-CA REST surface — `/api/v1/ca/*` (PKI PR4).** Operators and
+  automation can now manage the built-in CA over REST:
+  `GET /api/v1/ca/root` (CA certificate PEM, **public** — trust it in a browser
+  or hand it to agents), `GET /api/v1/ca/crl` (certificate revocation list, DER,
+  **public**), `GET /api/v1/ca/issued` (issued-cert inventory — serial, subject,
+  purpose, status, expiry; `Security:Read`), and `POST /api/v1/ca/revoke`
+  (`{"serial_hex","reason"}`; `Security:Delete` — revocation takes effect
+  server-side immediately and republishes the CRL). The same inventory + revoke
+  operations are also exposed as **MCP tools** (`list_issued_certs` /
+  `revoke_certificate`) so an agentic worker reaches the CA surface at parity with
+  the dashboard/REST (governed by the standard MCP tier ladder — `revoke` is
+  destructive and approval-gated like every other destructive MCP op). A revoke
+  of a nonexistent/already-revoked serial is audited `result=denied` (idempotent,
+  retry-safe); a CRL republish that fails to persist now honestly reports
+  `crl_republished:false` (it no longer serves a freshly-built-but-unstored CRL),
+  and a background freshness check re-publishes the CRL before `nextUpdate` lapses
+  (and self-heals a failed startup pre-publish — no permanent `/ca/crl` 503). New
+  metrics `yuzu_server_ca_cert_issued_total{purpose}`,
+  `yuzu_server_ca_crl_publish_failures_total`; audit actions `ca.cert.revoked`
+  (`success`/`denied`) + `ca.crl.published`. Issued-cert inventory is now indexed
+  on `issued_at`. The routed reference doc `docs/pki-architecture.md` lands with
+  this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN signing is
+  intentionally deferred — it needs a non-agent namespace so an operator-issued
+  cert can't impersonate an agent; the dashboard CA panel ships in PR4b above.)
+  See `docs/pki-architecture.md` "CA REST surface".
+
+- **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
+  server runs with its built-in CA (the default-cert bootstrap above) and an
+  agent connects without an operator-supplied client cert, the agent now
+  generates its own EC P-256 keypair + PKCS#10 CSR, sends the CSR in
+  `Register` (new `RegisterRequest.csr_pem`), and the server signs a per-agent
+  client leaf — `CN=<agent_id>` plus an install-scoped URI SAN
+  (`yuzu://<ca-fingerprint>/agent/<agent_id>`) — returning it in
+  `RegisterResponse.issued_certificate` + `issued_ca_chain`. The agent
+  persists the leaf + key (key `0600`) under `--cert-dir` (default
+  `<data-dir>/certs`) and reconnects presenting it, so the data plane runs as
+  full mutual TLS with a cryptographic identity bound to `agent_id`. The CSR's
+  own subject/SAN are ignored — identity is set by the server from the
+  authenticated enrollment, never from CSR fields. The server's agent listener
+  stays *request-but-don't-require* on default certs so a first-boot agent can
+  bootstrap. Enforcement is **gradual** (non-breaking rollout): a provisioned
+  agent must present its leaf on the data plane, while a not-yet-provisioned or
+  pre-PR3 agent keeps connecting on the prior session + peer-IP binding rather
+  than being rejected. Revoked agent leaves are refused at `Subscribe`,
+  `Heartbeat`, `DownloadUpdate`, **and `CheckForUpdate`** (new
+  `yuzu_grpc_revoked_cert_total{rpc}`), and a periodic server-side **revocation
+  sweep** tears down any *already-open* `Subscribe` stream whose leaf is revoked
+  after it connected (`rpc=stream_sweep`, audited `session.cert_revoked`
+  `source=stream_sweep`) so revocation stops an active agent without waiting for a
+  voluntary reconnect. A revoked agent also cannot silently resurrect its identity:
+  `sign_agent_csr` refuses to re-issue to an `agent_id` that has a revoked,
+  non-expired cert (audit `ca.cert.reissue_blocked`, metric
+  `yuzu_server_ca_reissue_blocked_total`), so deleting the local key and
+  re-enrolling does not bypass revocation. Every issued leaf's `notBefore` is
+  backdated 5 min so a freshly-provisioned agent with a slightly-behind clock can
+  still present its cert on the immediate reconnect. Issuance is counted
+  (`yuzu_server_ca_cert_issued_total`) and audited (`ca.cert.issued`). New agent
+  flags **`--cert-dir`** and **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`);
+  leaves auto-renew at 2/3 of their lifetime (evaluated at agent start). Built
+  entirely on OpenSSL 3.x — no new cryptographic primitives. **Known limitation:**
+  per-agent revocation is enforced on direct-connect agents only; a
+  gateway-proxied agent presents its leaf to the gateway, not the server, so
+  revoking it does not by itself cut it off the data plane until the QUIC
+  through-gateway-identity migration (#376) — disconnect at the gateway too. See
+  `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
+  **Upgrade:** no special order is required thanks to gradual enforcement; once a
+  fleet is fully provisioned, a future `--require-agent-identity` flag will be
+  able to harden the data plane to reject any agent without a per-agent cert. See
+  `docs/auth-architecture.md` "Per-agent mTLS".
+
+- **Internal CA engine + `ca.db` issuance store (PKI PR1).** New pure-OpenSSL
+  PKI engine (`x509_ca`: EC keygen, self-signed root, CSR signing with
+  proof-of-possession, leaf issuance, CRL build, chain verify, SHA-256
+  fingerprint), a `KeyProvider` seam (`FileKeyProvider`: `0600`/`O_EXCL` key
+  custody, HSM/PKCS#11-ready), and the `ca.db` metadata store (`CaStore`: root,
+  issued-cert inventory, CRL versions). The root **private key never enters the
+  database** — only an opaque `key_ref`. Serials are normalised (uppercase,
+  colon-free) at the store boundary so a later operator-supplied serial cannot
+  miss `revoke()`/`is_revoked()`; CRL-number allocation is atomic
+  (`publish_next_crl`, monotonic per RFC 5280 §5.2.3); the inventory carries an
+  `issuer_fingerprint` provenance link to the signing root. Engine only — the
+  first-boot wiring lands in PR2.
+- **Guardian service guards — real-time Windows service run-state enforcement
+  (PR5).** A new `service-status-change` spark with `service-running` /
+  `service-stopped` assertions watches one Windows service via
+  `NotifyServiceStatusChange` (kernel-notified by the SCM, ~0 ms, no polling)
+  and, in `enforce` mode, drives it back to the desired state via the
+  service-control API (`StartService` / `ControlService` — never `sc.exe`),
+  gated by the same per-rule resilience policy as registry guards. Pending
+  service states are held as transitional (no spurious drift / control loop
+  during start-up); the watch is resilient to the service being deleted and
+  recreated. Off-Windows the guard is a no-op (never reads as armed). The
+  schema catalog (`GET /api/v1/guaranteed-state/schemas`) and the
+  `derive_rule_spec` authoring validator publish the new types, bound to the
+  agent's `service_support::kStates` by a schema↔handler cross-check (H2/G9).
+  Enforce-*stop* is denied (and downgraded at push) for security services
+  (Defender/Firewall/Security Center/Event Log), critical infrastructure
+  (`RpcSs`/`DcomLaunch`), and the agent's own service, so Guardian cannot be
+  turned into a security-control disabler or strand itself; enforce-*run* is
+  always allowed.
+  `service-disabled` (start-type config, which fires no SCM notification) is
+  deliberately **not** published yet — express it as a registry guard on
+  `…\Services\<name>\Start` = `4` meanwhile. Service guards are authored via
+  REST / the seed rig today (like file guards); a dashboard form follows.
+- **Break-glass MFA reset CLI (#1226).** `yuzu-server --mfa-reset <username>`
+  clears a user's MFA enrollment and exits without starting the server —
+  the documented recovery from MFA-enforcement lockout (lost device, IdP
+  not asserting `amr`, sole admin who could not enroll). Unlike the manual
+  SQL break-glass it replaces, it **writes an audit row**
+  (`mfa.reset.breakglass`), closing the SOC 2 CC6.6 evidence gap. Requires
+  no TLS/HTTPS flags. Security hardening (adversarial + cybersecurity
+  review): the audit row is **mandatory and fail-closed** — `audit.db` is
+  opened and verified writable *before* any MFA is cleared, and the command
+  exits non-zero rather than silently clearing a second factor with no
+  evidence; the audit principal is the **real OS identity**
+  (`getpwuid`/`GetUserNameA`), not the forgeable `$USER`/`$USERNAME` env
+  var; and the JSON status line is output-escaped. See
+  `docs/ops-runbooks/auth-db-recovery.md` for the threat model and the
+  `mfa.reset.breakglass` alerting hook.
+
+- **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
+  Settings panel and the login-time enrollment-bootstrap form — now render
+  a scannable QR code (server-side inline SVG via the vendored Nayuki
+  `qrcodegen`, MIT) in addition to the manual base32 secret. The `/login`
+  202 `mfa_enrollment_required` response gains a `qr_svg` field (inline SVG,
+  or empty string on encode failure → fall back to the text secret).
+  Previously only manual key entry was possible.
+
+- **MFA enforcement modes + login-time enrollment bootstrap + OIDC `amr`
+  gating (PR 3 of the MFA ladder — ladder complete; SOC 2 CC6.6).**
+  - **Enforcement.** `--mfa-enforcement=admin-only|required` (env
+    `YUZU_MFA_ENFORCEMENT`) now enforces. An un-enrolled login subject to
+    enforcement gets a new `POST /login` 202 variant
+    `{"status":"mfa_enrollment_required","mfa_pending_token","otpauth_uri",
+    "secret_base32","expires_in"}` (distinguished from the existing
+    `mfa_required` challenge by `status`) and completes via the new
+    **`POST /login/mfa/enroll`** (confirms the first TOTP code against a
+    provisional secret, mints an MFA-verified session, returns one-time
+    recovery codes). No session is minted until enrollment completes; if
+    `auth_db` is unavailable under enforcement, `/login` fails **closed**
+    (503) rather than minting an unprotected session. The endpoint shares
+    the `is_login` per-IP rate-limit bucket + the 5-attempt-per-pending
+    cap. New audit verb `mfa.enroll.required`; `mfa.enroll.verified` /
+    `mfa.enroll.failed` now also fire from the login bootstrap. New
+    metric label `yuzu_auth_mfa_logins_total{method="enroll"}`.
+  - **Self-target guard.** `POST /api/settings/mfa/disable` refuses to
+    disable an operator's own MFA while enforcement protects their role
+    (`required` → all roles, `admin-only` → admins); audited as
+    `mfa.disabled`/`error`, detail `blocked: mfa_enforcement=<mode>`.
+  - **OIDC `amr` short-circuit.** OIDC sessions are no longer blanket-
+    exempt from step-up. `/auth/callback` parses the RFC 8176 `amr` claim
+    and, when it attests MFA (`amr_asserts_mfa()` allowlist: `mfa`, `otp`,
+    `hwk`, `fpt`, `face`, `iris`, `sms`, `swk`, `tel` — single-factor
+    `pin`/`user`/`pwd` excluded), seeds `Session::mfa_verified_at`
+    anchored to the IdP `iat` in the `steady_clock` domain (NTP-step
+    resistant). An OIDC session with an attested-but-stale proof is
+    re-prompted via re-SSO (`challenge_url=/auth/oidc/start`); one without
+    any attested MFA is treated **symmetrically with a local user** under
+    the active enforcement mode — passes under `optional` (or `admin-only`
+    for a non-admin), gated (re-SSO) under `required` (or `admin-only` for
+    an admin). See the Breaking Changes entry above and
+    `docs/user-manual/upgrading.md` for the SSO `amr` pre-flight.
+    `/login/mfa/stepup` now rejects OIDC callers with a precise 400
+    pointing back to SSO.
+  - Tests: `test_mfa_step_up.cpp` (OIDC gating, window boundary,
+    `amr_asserts_mfa` allowlist incl. single-factor exclusions),
+    `test_auth_routes_mfa.cpp` (enforcement bootstrap, `/login/mfa/enroll`
+    success/exhaustion/malformed/concurrent/503, cross-token replay),
+    `test_settings_routes_mfa.cpp` (self-target disable guard),
+    `test_oidc_provider.cpp` (`amr` parse + malformed/float `iat`
+    type-guard). Docs: `docs/auth-mfa-design.md`,
+    `docs/user-manual/{authentication,rest-api,server-admin,upgrading}.md`,
+    `docs/ops-runbooks/auth-db-recovery.md`.
+
+- **Guardian Baselines — the deployable unit, with baseline-gated deploy.**
+  A **Baseline** is a named collection of Guards and is now the *only* deployable
+  unit: a Guard reaches an agent exclusively as a member of a **deployed**
+  Baseline. New `BaselineStore` (`guardian-baselines.db`): M:N member Guards, an
+  included/excluded management-group assignment (reserved — targeting is deferred,
+  so deploy is fleet-wide for now), and a draft → deployed lifecycle. Dashboard
+  surface only (no REST API yet): create / edit / deploy / re-deploy / delete. The
+  push fan-out and heartbeat reconcile source their rule set from the union of
+  member Guards of deployed Baselines, taken from each Baseline's **deployed
+  snapshot** (what was deployed) — so editing a deployed Baseline's members is a
+  staged change that reaches agents only on a Push-gated re-deploy. New `baselines`
+  row in `/healthz` + `/readyz` and a `yuzu_server_guardian_baselines_total`
+  metric. Audited under `guaranteed_state.baseline.{create,update,deploy,delete}`.
+- **Guardian compliance overview + per-(agent, rule) census.** A new
+  `guard.compliant` event (emitted once on the transition into compliant, then
+  silent) drives a pruning-immune per-(agent, rule) status table
+  (`guardian_agent_rule_status`). The dashboard overview reports live fleet
+  compliance — Fleet / By Guard / By Baseline coverage, a compliant/drifted/error/
+  unknown proportion, a 7-day enforcement-effectiveness trend, and per-device
+  drill-down — from one liveness-folded rollup (offline agents fold to unknown).
+  **Platform honesty:** Guardian arms guards on Windows only today (the registry /
+  file guards are agent-side no-ops on macOS and Linux), but deploy is fleet-wide,
+  so connected macOS/Linux agents are reported as a distinct **"not implemented"**
+  class — a fleet banner with per-platform counts, a separate census segment (in the
+  compliant-share denominator, so the headline % drops when targeted Macs can't be
+  enforced), and explicit per-device rows — never folded into compliant or into the
+  offline "unknown" bucket. An operator can never mistake a no-op platform for an
+  armed one. The REST `/status` endpoint still returns placeholder zeros; the census
+  is dashboard-only for now.
+- Per-Guard `prerequisites` column reserved on the Guard store (stored, not yet
+  evaluated — engine-side evaluation is deferred).
+- **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
+  A new agent guard watches a target file via `ReadDirectoryChangesW` on its
+  parent directory — kernel-notified, no polling, so detection is realtime — and
+  is resilient like the registry guard (survives the parent directory and its
+  whole ancestor chain being deleted and recreated; reconciles from scratch).
+  Two assertions: **`file-exists`** drifts when the file's presence differs from
+  `expected` (`present` → fires on delete; `absent` → tripwire, fires on create),
+  and **`file-hash-equals`** drifts when content (size pre-filter + bounded
+  SHA-256) differs from a baseline (`expected_hash` supplied, or captured on arm)
+  — with a settle window before hashing (writes are not atomic), so a no-op
+  identical rewrite is not reported as drift, and absent/oversize/unreadable are
+  reported rather than silently treated as compliant. Detection-only (file-content
+  remediation deferred); Windows-only (Linux/macOS later). Internally: a new
+  `IGuard` interface lets the engine hold registry and file guards
+  polymorphically; `sha256_file()` gained a backward-compatible bounded-read
+  (`max_bytes`) to defend a hashing-DoS / TOCTOU-grow on an attacker-controlled
+  path. The `/api/v1/guaranteed-state/schemas` catalog now lists `file-change` /
+  `file-exists` / `file-hash-equals` (with an `expected_hash` hex-format check),
+  so the discovery surface and dashboard form know them.
+- **Guardian dashboard guard-create form is now functional (C3c).** The
+  `/guardian` "New Guard" form was a static stub that audited every submission
+  as `denied`. It now renders a structured create form for the Windows registry
+  types — name, severity, enforcement mode, the `registry-value-equals`
+  assertion fields, the remediation action, and a resilience-policy fieldset
+  (mode + tuning params) — and actually persists the Guard. The handler builds
+  the structured spec from the form fields and runs it through the **same
+  `derive_rule_spec` path the REST create uses** (single source: identical
+  validation + canonicalisation), so an invalid resilience policy is rejected
+  with an inline banner rather than silently accepted. Success returns a
+  confirmation panel plus an out-of-band guards-list refresh and a toast; the
+  Guard is created unscoped (draft — device targeting is set at the Baseline).
+  Audited under `guaranteed_state.rule.create`.
+- **Guardian resilience-policy validation + schema discovery (C3b).** The
+  structured Guard create/update path now validates and canonicalises the
+  per-rule resilience policy carried in `remediation.params` (`mode`
+  persist|backoff|bounded, `max_attempts`, `quiet_reset_s`, `resume_after_s`,
+  `backoff_initial_ms`, `backoff_max_ms`, `event_debounce_ms`). Validation is
+  lenient-in / canonical-out — only the chosen mode's load-bearing params are
+  range-checked (a `persist` rule carrying stray `backoff_*` is accepted),
+  values are stored canonical, and failures (e.g. Bounded `max_attempts: 0`,
+  `backoff_initial_ms` > `backoff_max_ms`, overflow-prone seconds) return the A4
+  error envelope. One param-spec table
+  (`server/core/src/guardian_resilience_schema.{hpp,cpp}`) drives both the
+  validator and the published JSON Schema, so the discovery surface and the
+  validator cannot disagree; a cross-check unit test binds the table's keys to
+  the agent's `resilience_keys`. New `GET /api/v1/guaranteed-state/schemas`
+  returns the static type catalog (spark/assertion/remediation + resilience
+  subschema + discriminated `registry-value-equals` encoding), cacheable via a
+  content-derived `ETag` / `If-None-Match` (`304`). A structured `PUT` now
+  re-authors the Guard (re-validating the policy) instead of silently dropping
+  the blocks; the guardian create/update handlers emit the A4 envelope uniformly.
+- **MFA step-up on 11 high-risk REST + Settings surfaces (PR 2 of the MFA
+  ladder; SOC 2 CC6.6).** Closes the privileged-access control gap by
+  re-prompting for fresh TOTP / recovery proof on session-cookie callers
+  before any high-risk mutation lands. New helper `require_mfa_step_up()`
+  in `server/core/src/mfa_step_up.{hpp,cpp}` evaluates the gate: api/mcp
+  tokens bypass (the bearer credential is itself the step-up moment),
+  OIDC/SSO sessions bypass (the identity lives in the IdP — no local
+  `users` row or TOTP to step up against; **superseded in PR 3 by `amr`-claim
+  gating — see the PR 3 entry above**), non-enrolled users bypass (consistent with PR1's `optional`
+  enforcement model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
+  window_secs`, default 300 s) receive a 401 A4 envelope `{"error":
+  {"code":401,"message":"MFA step-up required",...},"meta":{"api_version":
+  "v1","mfa_step_up_required":true,"challenge_url":"/login/mfa/stepup"}}`
+  plus a `mfa.step_up.required` audit row. A new route `POST
+  /login/mfa/stepup` accepts an authenticated session cookie + a TOTP
+  code (6 digits) or recovery code; strict-shape gate (same as PR1's
+  `/login/mfa`) defeats the CPU-DoS shape oracle. Success refreshes
+  `Session::mfa_verified_at` via `AuthManager::mark_session_mfa_verified`
+  and emits `mfa.step_up.passed`; failure emits `mfa.step_up.failed`.
+  The dashboard auto-intercepts the envelope (`htmx:responseError`) and
+  prompts inline so HTMX-driven UI flows complete without operator
+  context-switch. The 11 sites wired in this PR:
+  - `POST /api/v1/tokens` (token mint — high-impact bearer credential)
+  - `DELETE /api/v1/tokens/{id}` (token revoke)
+  - `DELETE /api/v1/sessions` (admin force-logout of another principal)
+  - `POST /api/v1/software-packages` (introduces executable content)
+  - `POST /api/v1/software-deployments/{id}/start` (push to live agents)
+  - `POST /api/v1/guaranteed-state/rules` (Guardian rule create — drives
+    auto-remediation policy)
+  - `PUT /api/v1/guaranteed-state/rules/{id}` (Guardian rule update)
+  - `DELETE /api/v1/guaranteed-state/rules/{id}` (Guardian rule delete —
+    added in Gate 4 consistency-B1 closure; removing a rule is as
+    destructive as updating one)
+  - `POST /api/v1/guaranteed-state/push` (Guardian rule fan-out)
+  - `DELETE /api/settings/users/{username}` (destroys a principal)
+  - `POST /api/settings/users/{username}/role` (promotes / demotes
+    authority)
+  New CLI flag `--mfa-step-up-window-secs` (default 300; 0 disables the
+  gate — emit a startup `WARN`). New Prometheus metric
+  `yuzu_auth_mfa_step_up_total{method,result}` (counter). Tests:
+  `tests/unit/server/test_mfa_step_up.cpp` (9 cases / 108 assertions —
+  every branch of the gate decision tree) + extensions to
+  `tests/unit/server/test_auth_routes_mfa.cpp` (5 new cases for
+  `/login/mfa/stepup`: TOTP / recovery success, no-session, missing
+  code, wrong code). Docs: `docs/auth-mfa-design.md` step-up section
+  marked implemented; `docs/user-manual/{authentication,rest-api}.md`
+  document the new endpoint + the 401 envelope on each gated site.
+  Plan note: the original plan called for 11 sites including `POST
+  /api/v1/file-retrieval`; that endpoint turned out to be the
+  agent-side push-back (authenticated via mTLS / device token, not a
+  session cookie) so step-up does not apply. Guardian rule DELETE was
+  added during governance Gate 4 to keep the destructive-Guardian
+  surface uniform — final scope is 11 sites.
+
+  The helper fails CLOSED on auth_db errors (governance Gate 4 UP-4 /
+  qe Gate 3 BLOCKING fix): a `mfa_status()` failure or a row-not-found
+  on the user emits a 401 with `reason=mfa_status_unavailable
+  (fail-closed)` rather than silently bypassing the gate. Test:
+  `test_mfa_step_up.cpp` "store error fails CLOSED" case.
+
+- **Scope walking — composable scope from previous query results (capability §30).**
+  A new per-operator **result set** primitive: a named, TTL-bounded, lineage-tracked
+  set of device IDs that becomes the input scope for the next query or action.
+  `server/core/src/result_set_store.{hpp,cpp}` (new `result_sets.db`, schema v1 via
+  `MigrationRunner`, time-prefixed lexically-sortable `rs_<ts><rand>` ids,
+  RETURNING-idiom writes per #1033, sync + async `pending → materialized` lifecycle,
+  root-first lineage walk, pin/unpin, per-operator 10k quota + 50-pin caps, 5-minute
+  GC sweep). REST surface under `/api/v1/result-sets` (list, direct create,
+  from-inventory-query, members, lineage, pin/unpin, delete) — owner-scoped authz,
+  A4 error envelope, audit on every state transition. The Scope Engine gains a third
+  short-circuit kind, `from_result_set:<id>` (`scope_engine.cpp`), composable with
+  attribute predicates via AND/OR/NOT and resolved per-device by
+  `AgentRegistry::evaluate_scope` (threaded through all command-dispatch sites); stale
+  (offline) members drop silently. A background maintenance thread materialises async
+  result sets from terminal executions and runs the GC sweep; new
+  `yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` /
+  `yuzu_result_set_quota_rejected` metrics. New `/result-sets` dashboard page
+  (`result_sets_ui.{hpp,cpp}`): sidebar of active sets, lineage breadcrumb, copyable
+  `from_result_set:` scope token, CSV-import create, pin/unpin/delete — HTMX,
+  server-rendered, dark-theme; nav link added across all dashboard pages. The two async
+  producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
+  surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
+
+- **Scope walking — async result-set producers + TAR SQL frame (PR-D).** The two
+  asynchronous producers now create result sets by dispatching a command and
+  materialising membership once the producing execution reaches a terminal state:
+  `POST /api/v1/result-sets/from-tar-query` (dispatches operator SQL to the tar
+  plugin in the parent set's scope — or `__all__` — and includes every agent that
+  returned ≥1 row, or all responders with `include_empty=true`) and
+  `POST /api/v1/result-sets/from-instruction-result` (runs an InstructionDefinition
+  and filters responders by an operator-supplied `{column,op,value|value_set}`
+  matcher — the Chrome-IR hash-check step). Both follow the
+  create-execution-**before**-dispatch ordering (UP2-4) and return `202` with a
+  `pending` row carrying `source_execution_id`; the server maintenance thread applies
+  the matcher (new `result_set_matcher.{hpp,cpp}` — `tar_rows_ge` / `any_response` /
+  column-op over both the tar pipe shape and JSON array-of-objects) and flips the row
+  to `materialized`. `POST /api/v1/result-sets/{id}/re-eval` re-runs an async set's
+  source query as a **sibling** (shares the original's parent). Parent references
+  accept a per-operator **alias** as well as the canonical `rs_` id (resolved at the
+  dispatch layer where the owner is known). New `yuzu_result_sets_total{result="pending"}`
+  metric path. The TAR dashboard's "Ad-hoc TAR SQL" frame (`tar_page_ui.cpp`) is now
+  live: a reusable **scope chip** (your result sets + `__all__`), a SQL editor, and a
+  one-click "Run & create result set" that dispatches, polls the pending set, and
+  surfaces the materialised device count + copyable `from_result_set:` token — HTMX,
+  server-rendered, dark-theme. The async producer routes require the command-dispatch
+  callback + ExecutionTracker (threaded into `RestApiV1::register_routes`); without
+  them they return `503`. Design: `docs/scope-walking-design.md` §3.1/§3.3/§6/§8.3/§10.
+
+- **Scope walking — YAML `fromResultSet:` DSL surface (PR-E).** A `spec.scope:`
+  block may now carry `fromResultSet:` (a canonical `rs_` id or a per-operator
+  alias), optionally refined by a `selector:` composed with `AND`. New
+  `scope_yaml.{hpp,cpp}` (with the YAML line-scanners factored out of
+  `policy_store.cpp` into shared `yaml_scan.{hpp,cpp}`) parses, validates, and
+  lowers the block to the existing scope-engine grammar:
+  `selector.platform` → `ostype == "<value>"`, each `selector.tags` entry →
+  `EXISTS tag:<name>` (presence; Yuzu tags are key=value), AND-composed with the
+  `from_result_set:<ref>` atom. Validation (design §7): `fromResultSet` may not
+  be combined with `assignment.managementGroups`, and requires
+  `assignment.mode: static` — enforced at definition import
+  (`InstructionStore::create_definition`) and policy create. `from_result_set:`
+  **aliases now resolve at the dispatch layer** against the operator's owned sets
+  (`resolve_scope_aliases` at the generic REST, tracked, MCP, and
+  `/api/scope/estimate` paths) — previously only producer `parent_id` resolved
+  aliases, so an alias in a scope silently matched nothing. An invocation-time
+  resolution failure (the referenced set is absent, expired, or not owned) now
+  emits an `instruction.scope_resolution_failed` audit row
+  (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`). Resolution stays lazy: a definition
+  carrying a since-expired `fromResultSet:` is still valid YAML. Policy
+  `fromResultSet:` is **rejected for now** (a result set's 1h TTL clashes with a
+  continuously-evaluated policy; deferred to a follow-up with a policy owner +
+  pinned-set semantics). Design: `docs/scope-walking-design.md` §7;
+  `docs/yaml-dsl-spec.md` §9.3. Validation runs on **both** the create and
+  update definition paths; `selector`/`fromResultSet` values are restricted to
+  the scope-ident charset (no injection / unparseable output) and inline
+  flow-mapping scope is rejected. The dispatch resolution-failure path emits a
+  new `yuzu_scope_resolution_failed_total` metric and `result_set_store` is now
+  covered by `/readyz`.
+
+- **Compliance policies now actually evaluate (check → verdict pipeline).**
+  Authored policies + fragments could be created, but nothing evaluated them —
+  `PolicyStore::update_agent_status` had no caller and no trigger fired, so
+  `get_fleet_compliance` / `get_compliance_summary` always read 0%. A new
+  background `PolicyEvaluator` (`server/core/src/policy_evaluator.{hpp,cpp}`)
+  closes the gap: on a cadence it finds enabled policies whose interval has
+  elapsed, resolves scope/management-groups to agents, dispatches the fragment's
+  `check` instruction (via the shared command-dispatch path), then collects each
+  agent's response, evaluates the CEL `check_compliance`, and writes
+  `compliant` / `non_compliant` / `unknown` / `error` per agent. Two new
+  operator-gated endpoints: `POST /api/policies/{id}/evaluate` (force an
+  immediate check) and `POST /api/policies/{id}/remediate` (manual, opt-in
+  remediation — dispatches the fragment's `fix`, then verifies via `postCheck`;
+  only available when the fragment defines a `fix` instruction, surfaced as
+  `remediation_available` on the policy detail). Remediation is never automatic.
+  Audit actions `policy.evaluate` / `policy.remediate`. Hardening from the
+  governance pass: an empty `check_compliance` is scored `error` (never a false
+  `compliant`); a fresh verdict invalidates the 60s fleet-compliance cache so it
+  surfaces promptly; the evaluator's `polchk-*` correlation ids are skipped by
+  the execution-tracker notifier (no phantom executions / SSE — compliance is
+  not in the executions drawer); stranded `fixing` rows are reset to `unknown`
+  on restart; the background dispatch never holds the evaluator lock across the
+  (blocking) command dispatch; the interval is clamped to a ≥60s floor; the
+  evaluation thread is exception-isolated and joined before stores tear down
+  (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
+  intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
+  / `yuzu_server_policy_eval_errors_total` metrics.
+- **MFA / TOTP — PR 1 of the `/auth-and-authz` skill P0 #1 ladder (SOC 2
+  CC6.6).** First shippable slice of MFA: RFC 6238 TOTP self-service
+  enrollment via Settings → Multi-Factor Authentication, login challenge
+  after password verify, recovery codes. Step-up on high-risk endpoints
+  and OIDC `amr` interop ship in subsequent PRs of the same ladder.
+  - `auth.db` schema v2 migration: `users.mfa_totp_secret` (BLOB, raw 20-byte
+    HMAC-SHA1 key per RFC 4226 §4 R6, at-rest protected by the existing
+    0600 file mode), `users.mfa_enrolled_at`, `users.mfa_disabled_at`,
+    `users.mfa_last_counter` (replay floor), `sessions.mfa_verified_at`,
+    new tables `mfa_recovery_codes` (PBKDF2-SHA256 hashed, single-use)
+    and `auth_kv` (provisioned empty for future encryption-at-rest).
+  - New `server/core/src/totp.{hpp,cpp}` — RFC 6238 TOTP generator/verifier
+    (30 s step, 6 digits, ±1 step skew with replay protection), RFC 4648
+    base32 enc/dec, otpauth URI builder, CSPRNG secret and recovery-code
+    generation. Tested against RFC 6238 Appendix B SHA-1 vectors.
+  - `AuthDB::mfa_init_enrollment` / `mfa_verify_enrollment` /
+    `mfa_verify_login_code` / `mfa_consume_recovery_code` /
+    `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` /
+    `mfa_mark_session_stepup` — new MFA accessor surface on the existing
+    AuthDB instance.
+  - `AuthManager` additions: `verify_password` (creds-only check, no
+    session), `create_local_session(user, role, mfa_verified)`,
+    `mark_session_mfa_verified(token)`, `auth_db_ptr()` accessor.
+  - `Session::mfa_verified_at` field (step-up window comparison).
+  - `Config::mfa_enforcement` (`optional` | `admin-only` | `required`,
+    default `optional`), `Config::mfa_step_up_window_secs` (default 300),
+    `Config::mfa_login_pending_secs` (default 120). CLI flags
+    `--mfa-enforcement`, `--mfa-step-up-window-secs`,
+    `--mfa-login-pending-secs` (envs `YUZU_MFA_*`). PR1 honours
+    `optional` semantics only; non-default values emit a startup `WARN`.
+  - `POST /login` now returns HTTP 202 + `{"status":"mfa_required",
+    "mfa_pending_token":"…","expires_in":N}` if the user is MFA-enrolled;
+    the login page swaps to a TOTP form and posts to `POST /login/mfa`
+    (TOTP code or recovery code; same endpoint). Each pending token is
+    capped at 5 attempts before invalidation.
+  - Settings page gains a Multi-Factor Authentication section with
+    enroll / verify / regenerate / disable HTMX handlers under
+    `/fragments/settings/mfa` and `/api/settings/mfa/*` (admin-only in
+    PR1; per-user surface is a follow-up). All 4 mutating POSTs carry
+    `Origin`/`Referer` CSRF protection via an `origin_safe` helper
+    (default-port normalised, userinfo rejected, audit detail
+    sanitised + 128 B capped).
+  - New audit verbs: `mfa.enroll.initiated`, `mfa.enroll.verified`,
+    `mfa.enroll.failed`, `mfa.disabled`, `mfa.login.required`,
+    `mfa.login.verified`, `mfa.login.failed`, `mfa.recovery_codes.generated`,
+    `mfa.recovery_code.used`, `csrf.denied`. Step-up verbs
+    (`mfa.step_up.required`, `mfa.step_up.passed`, `mfa.step_up.failed`)
+    added in PR 2.
+  - Prometheus metrics: `yuzu_auth_mfa_logins_total{method,result}`,
+    `yuzu_auth_mfa_pending_tokens` gauge,
+    `yuzu_auth_mfa_challenges_issued_total`.
+  - Docs: `docs/auth-mfa-design.md` (architecture), updated
+    `docs/auth-architecture.md`, user-manual updates
+    (`authentication.md`, `rest-api.md`, `server-admin.md`),
+    `docs/ops-runbooks/auth-db-recovery.md` Emergency MFA disable
+    break-glass procedure.
+  - Tests: `tests/unit/server/test_totp.cpp` (RFC 6238 vectors, base32,
+    drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
+    AuthDB enroll → verify → login → recovery → disable).
+
+### Changed
+
+- **Guardian dashboard redesign — full-page detail, card views, and a Guard
+  filter (UI only; no REST `/api/v1` change).** The Guard and Baseline detail
+  views are now **full pages** (`/guardian/guard/<id>`, `/guardian/baseline/<id>`)
+  replacing the detail modal. The By-Guard and By-Baseline compliance views are
+  stats-forward **card lists** (not tables); By-Guard gained a **filter bar**
+  (free-text search + state / severity / mode). The Fleet stat cards are now
+  **clickable** (jump to the matching sub-view, pre-filtered). The Guard detail
+  page's per-device rows link to the host page; the Baseline page shows its member
+  Guards and recent events; the Recent Events panel has a free-text search box.
+  Baseline **Edit** moved to the Baselines-section card. A CSP fix removed htmx
+  `hx-on` handlers from the product UI (operators see no functional change).
+- **Breaking — Guardian `enforcement_mode` is immutable after creation.**
+  `PUT /api/v1/guaranteed-state/rules/{id}` with an `enforcement_mode` that
+  differs from the stored value now returns `400` (`enforcement_mode is immutable
+  — create a new Guard for a different mode`); a different posture (enforce vs
+  audit) is a different Guard. The dashboard's per-Guard **Switch to Audit /
+  Switch to Enforce** toggle is **removed**; the remaining enable/disable toggle
+  is state-only (`Write`, no auto-push) and propagates on the next
+  deploy/reconcile.
+- **Breaking — Guards reach agents only via a deployed Baseline.** After
+  upgrading from a pre-Baseline Guardian build, a Guard not in a deployed Baseline
+  is silently omitted from every agent push and stops enforcing. Create a Baseline
+  containing your active Guards and deploy it — see the upgrade note in
+  `docs/user-manual/guaranteed-state.md`.
+
+### Fixed
+
+- **Agents enrolling *through the gateway* now receive a per-agent client
+  certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
+  per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the
+  agent but never signed its CSR, so a gateway-routed agent retried then ran on
+  the bootstrap (one-way TLS) posture without an identity cert. `ProxyRegister`
+  now signs the CSR through the same `sign_agent_csr` chokepoint as the direct
+  path (same CA, per-agent rate-limit, `ca_issued` inventory, and a new shared
+  16 KiB CSR-size cap), and the gateway relays the issued cert to the agent
+  unchanged. Note: revoking a certificate is serial-scoped (it invalidates a
+  presented leaf) — to stop an agent re-enrolling/re-issuing, **deny** the agent.
+
+- **Server container can generate its default certs on first boot (PKI PR5b).**
+  `deploy/docker/Dockerfile.server` now pre-creates `/etc/yuzu/certs` and
+  `chown -R`s `/etc/yuzu` to the unprivileged `yuzu` runtime user. Previously
+  `/etc/yuzu` was root-owned, so the secure-by-default first-boot CA + default
+  cert generation (which runs as `yuzu`) failed with a permission error in the
+  container. Surfaced by the live two-host gateway boot-test.
+- **MFA enrollment no longer rotates the provisional secret on re-init
+  (#1227).** `mfa_init_enrollment` on a not-yet-confirmed (provisional)
+  row now **reuses** the existing secret instead of minting a fresh one,
+  so a second browser tab, a retried `/login` enrollment bootstrap, or a
+  re-opened Settings panel no longer invalidates the QR the operator
+  already scanned. The provisional secret is still reaped if abandoned;
+  once enrollment is confirmed, the secret is never re-revealed. The reuse
+  path carries a TOCTOU guard (adversarial + cybersecurity review): it
+  re-checks the freshly-loaded row's `enrolled` flag — read in the same
+  SELECT as the secret, so it is a consistent snapshot — and refuses to
+  re-reveal (`MfaAlreadyEnrolled`) if a concurrent `mfa_verify_enrollment`
+  confirmed the secret between the status-check and the reuse-load on the
+  shared FULLMUTEX connection.
+
+- **Login inputs no longer auto-capitalise on iOS (#1233).** The username,
+  MFA-code, and enrollment-code fields on the login page — and the MFA
+  verify-code field in Settings — now carry `autocapitalize="none"`,
+  `autocorrect="off"`, and `spellcheck="false"`, so iOS Safari/WebKit no
+  longer turns `admin` into `Admin` (usernames are case-sensitive).
+
+- **Guardian (#1209): H1–H4 + M1–M8 backend hardening.** Dashboard toggle pushes
+  only the rule's own `scope_expr` (no whole-fleet toggle storm — H1). The
+  `__guard__` side-channel is classified by `plugin=__guard__` **and** empty
+  `command_id`, so solicited `push_rules` replies complete their gateway
+  round-trip instead of being dropped (H2). Per-guard event-sink collapse-with-
+  count debounce caps event-store flooding from a competing writer (H3). The
+  agent event-sink writes through a current-stream holder reset under lock, so a
+  guard firing during a reconnect teardown can't write to a cancelled stream
+  (H4). Dashboard data panels gated on `GuaranteedState:Read` (M1); honest
+  empty-state and an unmistakable DEMO banner — no fabricated "148/148 compliant"
+  rollup on a live console (M2). `enforcement_mode` reconciled to `enforce|audit`
+  + the `enabled` boolean (M3). Per-agent push filtering by `os_target` +
+  `scope_expr` (M4). Heartbeat-carried `policy_generation` drives a per-agent
+  rate-limited server reconcile so offline-at-push agents converge on reconnect
+  (M5), backed by a monotonic persisted generation counter (M6). The reconcile
+  re-push is metered (`yuzu_server_guardian_reconciles_total`,
+  `..._pushes_dispatched_total`, `..._policy_generation`) and audited
+  (`guaranteed_state.reconcile`).
+- **Guardian MVP pre-merge review hardening (PR #1220).** Three blocking review
+  findings fixed before merge: (H1) **enforce-mode registry writes are gated by a
+  dangerous-key denylist** — `derive_rule_spec` now refuses an
+  `enforcement_mode:"enforce"` rule whose key targets a high-blast-radius
+  persistence / privilege location (autorun `CurrentVersion\Run*`, Image File
+  Execution Options, Winlogon, `…\Services\…`, `…\Policies\…`, SafeBoot,
+  BootExecute), returning the A4 envelope (contract §6 gate; the SYSTEM-privileged
+  fleet-wide write path no longer ships ungated). (H2) **the published
+  `/schemas` enum, the dashboard form, and the validator now offer only the
+  registry hives/value-types the agent actually decodes** — `HKCC`, `REG_BINARY`
+  and `REG_MULTI_SZ` are removed (they produced perpetual false drift /
+  remediation-failed); a single server-side source drives the schema enum and the
+  validator, cross-checked against the agent's `registry_support` constants by a
+  unit test. (#3) **the schema catalog is now discoverable on the MCP plane** —
+  `get_guardian_schemas` tool + `yuzu://guardian/schemas` resource, gated
+  `GuaranteedState:Read`, returning the byte-identical REST catalog (contract §4
+  decision 3 / §9 G9; supersedes the #1210 deferral). Plus: server-side validation
+  of spark/assertion params (rejects `max_bytes:"0"`, non-numeric numerics, bad
+  hive/value_type/expected_hash); whole-string numeric parsing on the agent
+  (`"123abc"` no longer parses as `123`); overflow-safe backoff doubling and
+  seconds→ms conversion; and a corrected `guaranteed_state.proto` transport
+  comment (`payload` bytes, not `params`/`output`).
+- **Scope-walking PR-E follow-ups — policy `fromResultSet:` bypass + YAML scanner
+  hardening (#1221).** Two robustness gaps from the #1215 review, both fail-closed
+  before this change: (1) a **scalar** policy scope (`scope: from_result_set:rs_x`)
+  slipped past the policy `fromResultSet` rejection — `extract_yaml_value` returned
+  it non-empty, skipping the mapping-form check — and was stored verbatim;
+  `PolicyStore::create_policy` now rejects the `from_result_set:` atom in either the
+  scalar or mapping form. (2) `yaml_scan::extract_yaml_value` is now comment-aware
+  (it skips keys inside whole-line and inline `#` comments, matching `yaml_has_key`),
+  so a commented `# fromResultSet:` decoy can no longer be picked up; and
+  `extract_yaml_section` now anchors on line-leading keys instead of an unanchored
+  `find()`, so a `scope:` substring inside a description/value no longer mis-anchors
+  the section walk and silently drops the whole block (which, for a policy, would
+  fail **open** to a fleet-wide match). `yaml_scan.hpp` gains an
+  isolate-via-`extract_yaml_section`-first security contract for the
+  now-authorization-load-bearing scanners. No behaviour change for valid content.
+
+- **`scope.selector:` policies now lower to a real scope (PR-E).** A Policy whose
+  `spec.scope:` opened a `selector:` mapping was previously read by the scalar
+  extractor as empty and silently stored no scope. It now lowers via the `scope_yaml`
+  path (`selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`). Scalar
+  `scope:` expressions are unchanged. No shipped content used the mapping form.
+  **Upgrade note:** existing policy rows are not migrated, but **re-creating or
+  re-importing** an operator-authored policy that used the `scope: { selector: ... }`
+  mapping form will now apply the selector as a real predicate — where it previously
+  matched all devices (the selector was silently ignored), it will now narrow. Review
+  such policies' intended scope before re-importing. See `docs/user-manual/upgrading.md`.
+
+- **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
+  responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
+  agent/device selector panel (`.scope`) on any browser window 1280px wide or
+  narrower — a common laptop resolution — making connected agents invisible
+  until the operator widened the window past ~1400px. The rule was inherited
+  from an unrelated `.main-grid` layout. Now only the optional history rail is
+  hidden at that breakpoint; the scope panel reflows to a two-column layout and
+  stays fully accessible. The 1281–1440px band also received grid hardening
+  (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
+  minimum content size can no longer push the panel off-screen.
+
+- **Scope walking — `from_result_set:` is owner-scoped end-to-end (the merge-blocking
+  IDOR, review B1).** `AgentRegistry::evaluate_scope` resolved `from_result_set:<id>`
+  with no owner check, so any operator with `Execution:Execute` could embed another
+  operator's `rs_` id in a scope and dispatch commands to that operator's curated
+  devices. The dispatching principal is now threaded into `evaluate_scope`;
+  referenced sets are preloaded once via the new owner-checked
+  `ResultSetStore::member_set_owned` (a set the caller does not own resolves to an
+  empty membership and never matches), which also removes the per-agent under-lock
+  store query (review F). Tracked dispatch paths (REST async producers, workflows,
+  scheduled, MCP) recover the principal from the execution's `dispatched_by`;
+  `/api/command` reads the session; server-authored policy scopes intentionally do
+  not resolve `from_result_set:`. A used set is `touch`-ed so it does not GC
+  mid-investigation (review I).
+- **Cross-operator result-set metadata leak via `/lineage` closed (review B2).**
+  Direct `POST /api/v1/result-sets` owner-checks `parent_id` before persisting the
+  lineage edge, and `ResultSetStore::lineage` is owner-filtered (the walk stops at
+  the first cross-owner ancestor) — a child can no longer parent onto a victim's id
+  and read its name / source_kind / device_count back.
+- **Result-set DoS vectors bounded (review B3, B4, K).** Fixed an infinite loop in
+  `from-inventory-query` parent pagination (an aliased in/out cursor re-read page one
+  forever once a parent exceeded the 5000 page size); added a `kMaxMembersPerSet` cap
+  (100k) on the JSON-array and CSV-import create paths; bounded the
+  `from_result_set:` scope token to 128 chars in the parser.
+- **Async producers no longer orphan a destructive dispatch (review B5).** `run_async`
+  does a pre-dispatch quota check and, on any post-dispatch `create_pending` failure,
+  calls `mark_cancelled` and surfaces `execution_id` — matching the throw / no-agents
+  paths so the execution cannot idle in `running` after agents already executed.
+- **Dashboard result-set fragments stop faking success (review merged_bug_009).**
+  Pin / unpin / CSV-create honour the store's `std::expected`: they audit the real
+  outcome (no false `success` rows) and surface failures via a `showToast` HX-Trigger
+  instead of silently re-rendering as if the action succeeded.
+- **Failed result-set access is audited (review G) + observability/correctness nits.**
+  Non-owner / not-found 404s emit a `result_set.access` `denied` audit row with the
+  attempted id (existence-oracle trail); the maintenance thread only increments
+  `yuzu_result_sets_total{result="materialized"}` on success (`materialize_failed`
+  otherwise — bug_008); `gc_sweep` returns the real deleted count and logs on failure
+  (D); `device_count` reflects distinct members after `INSERT OR IGNORE` dedup (L);
+  `lineage` has a visited-set cycle guard (J); re-eval no longer appends ` (re-eval)`
+  unboundedly (bug_014); result-set `limit` params parse via `std::from_chars` (M).
+  `rs_` ids stay non-CSPRNG display identifiers per the #801 convention now that B1
+  removes the bearer-reference property (review E, by design).
+
+### Tests
+
+- **Scope walking — YAML `fromResultSet:` DSL (PR-E).** New
+  `tests/unit/server/test_scope_yaml.cpp` (`[scope][dsl]`, 15 cases): the lowering
+  table (`fromResultSet`, `selector.platform` → `ostype`, `selector.tags` →
+  `EXISTS tag:`, full composition), the design §7 validation rules
+  (managementGroups exclusion, static-mode requirement, empty/over-long ref),
+  scalar-scope backward compatibility, rule-3 load-time validity, and the
+  lowered-string round-trip through `yuzu::scope::parse`.
+  `test_scope_walking_authz.cpp` gains `resolve_scope_aliases` (owner alias
+  rewrite, composition, `rs_` passthrough, non-owner / empty-owner no-op,
+  quoted-literal skip) and `scope_refs_failing_owner_check` (absent/unowned
+  flagged; owned-but-empty not flagged) coverage. `test_policy_store.cpp` pins
+  `scope.selector` lowering + the policy `fromResultSet` rejection;
+  `test_instruction_store.cpp` pins import validation (static accepted +
+  round-trips, dynamic rejected, managementGroups rejected, scope-less
+  unaffected). Governance hardening adds: the `update_definition` bypass guard,
+  charset rejection (selector/ref), inline flow-mapping rejection, multi-ref
+  alias rewrite + owner-check, the fail-closed unknown-id case, and a new
+  `test_yaml_scan.cpp` covering the moved line-scanners (incl. adversarial
+  commented-key / quoted-value-leak / prefix-collision inputs).
+- **Route-level MFA test harness (closes PR1 deferred quality-engineer
+  SHOULD-FIX).** Hermes Agent's red-team round on PR1 caught the
+  CRITICAL `/login/mfa` pre-routing exemption bug within 30 s of live
+  curl probing because the internal governance pipeline reviewed
+  handlers statically without exercising the wire path. This change
+  closes that gap with two new test files that drive every MFA-touching
+  handler through an in-process `TestRouteSink` (TSan-clean per #438).
+  - **`AuthRoutes::register_routes` dual overload**: mirrors the
+    `SettingsRoutes` pattern. Existing `httplib::Server&` overload becomes
+    a 2-line shim that constructs `HttplibRouteSink` and delegates to a
+    new `HttpRouteSink&` overload that owns every lambda. Production
+    behaviour is unchanged; tests get a TSan-safe in-process dispatch
+    seam.
+  - **`tests/unit/server/test_auth_routes_mfa.cpp`** — 10 cases covering
+    `POST /login` (no-MFA fast-path + MFA-enrolled 202 branch + bad
+    password), `POST /login/mfa` (valid TOTP, valid recovery code,
+    invalid pending token, 5-attempts-cap, strict-shape gate routing
+    non-6-digit to recovery, pending-token TTL expiry, atomic erase
+    under concurrent submit with same valid token), and the dual audit
+    emission contract (`mfa.login.verified` + `auth.login`,
+    `mfa.recovery_code.used` + `auth.login`).
+  - **`tests/unit/server/test_settings_routes_mfa.cpp`** — 12 cases
+    covering the 5 `/api/settings/mfa/*` routes (init reveal +
+    Cache-Control: no-store contract, double-init → MfaAlreadyEnrolled
+    message, recovery-codes regenerate, disable atomicity, non-admin
+    403), and the `origin_safe` CSRF gate (same-origin pass,
+    cross-origin 403 with `csrf.denied` audit, default-port :443
+    normalisation, userinfo / RFC-6454 rejection, no-Origin
+    non-browser pass-through, Referer fallback).
+
+- **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
+  `ResultSetStore`: synchronous create/get/members, root-first lineage,
+  owner-scoped alias resolution, pin/unpin + pinned-delete rejection, async
+  create → materialize, touch TTL extension, GC sweep, and the per-owner quota
+  counter. `tests/unit/server/test_result_sets_ui.cpp` — 7 render cases for the
+  result-sets dashboard surface including an explicit XSS test (operator-supplied
+  names are HTML-escaped). `tests/unit/server/test_scope_engine.cpp` — 3 added
+  cases for the `from_result_set:` scope kind: bare-atom parse, composition with
+  attribute predicates (AND), and per-device membership evaluation
+  (member+predicate match, non-member drop). All on `TempDbFile` helpers.
+
+- **Scope walking PR-D.** `tests/unit/server/test_result_set_matcher.cpp` — 11 cases
+  for the async membership matcher (pure `(matcher, status, output)` function):
+  non-success never qualifies, empty/blank → SUCCESS default, `any_response`,
+  `tar_rows_ge` thresholds + tar `error|` → 0 rows, `tar_row_count` trailer +
+  line-count fallback, unknown-kind conservative exclude, column ops
+  (`eq`/`in`/`contains`/`exists`) over both the tar pipe shape and the JSON
+  array-of-objects fallback, and the malformed-matcher fallbacks.
+  `tests/unit/server/test_rest_result_sets_async.cpp` — 14 HTTP-level cases (real
+  `ResultSetStore` + `ExecutionTracker`, fake recording dispatch closure):
+  from-tar-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
+  `from_result_set:<parent>` scope, **alias pre-resolution** to canonical id,
+  unknown-alias 404, `include_empty` → `any_response` matcher, missing-sql 400,
+  zero-agents 503 (execution cancelled, no pending row), dispatch-throw 500,
+  unwired-dispatch 503, from-instruction-result plugin/action/matcher persistence +
+  unknown-instruction 404, and re-eval sibling parent / unsupported-kind 400 /
+  not-found 404.
+
+- **Scope walking — review remediation.** `tests/unit/server/test_scope_walking_authz.cpp`
+  — cross-operator `evaluate_scope` authorization: the set owner resolves exactly the
+  set's members, while a non-owner and an empty principal resolve nothing (the B1
+  IDOR is blocked). `tests/unit/server/test_result_set_store.cpp` gains 7 cases: GC
+  actually deletes expired unpinned rows and returns the count (D), per-set member cap
+  (B4), `device_count` distinct-dedup (L), owner-scoped `member_set_owned` (B1),
+  lineage stops at a cross-owner ancestor (B2) and terminates on a `parent_id` cycle
+  (J), and >5000-member pagination terminates (B3); its lineage assertions move to
+  the owner-arg `lineage`. `test_workflow_routes.cpp` updated for the principal-arg
+  scope-estimate callback. (`test_scope_engine.cpp` is unchanged — its existing
+  `from_result_set:` cases pass under the relaxed length-bound token validation.)
+
+- `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
+  `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
+  → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
+  eval-error → `error`, empty-CEL → `error` (no false compliant), interval
+  throttling, remediation fix→verify→compliant, remediation rejected without a
+  `fix`, the 3-attempt remediation cap → `error`, and verify-dispatch-failure →
+  `error`. Real stores on `TempDbFile`, a static management group for targets, a
+  fake dispatch that seeds canned responses, and an injectable clock.
+  visualization.** `VIZ_UAT_AGENT_MODE=cedar-vale-app bash
+  scripts/start-viz-uat.sh` stands up the fictional "Cedar & Vale" company as
+  three named tiers — **Envoy** (frontend) → **node.js** (app) → **Postgres**
+  (db) — each co-hosting a `yuzu-agent`, so the stack renders in `/viz/fleet`
+  with the presentation tier on top, app in the middle, and db at the bottom,
+  joined by two persistent blue connection tubes. The node tier serves an
+  8-slide impress.js (Prezi-style) deck on *"Agentic Colleagues: IT's force
+  multiplier & thinking partner"*; the slide content lives in Postgres
+  (`slides` table, seeded via initdb) and is read live on each request, and
+  the deck is reachable at `http://localhost:8088`. The deck is styled in the
+  Barony of Alyth livery (French Blue base, polished Metallic Gold + Metallic
+  Silver, black depth): metallic-gold headlines with a travelling specular
+  sheen, over an enigmatic dark background that is itself a *machine* — a fixed
+  Victorian analytical-engine backdrop: a deterministic train of ~17
+  interlocking brass/steel gears (constant tooth module so they mesh; centres at
+  the pitch distance; meshing neighbours turn opposite directions with
+  gear-ratio speeds — `omega·N` constant), murky/dark/blurred behind the slides,
+  spread across three clusters to fill the field. Motion is a pure function of a
+  single master drive angle (`public/machine.js` generates the train and drives
+  it), accelerating briefly on each slide transition ("thinking harder"), atop a
+  drifting French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
+  recolored to an engraved aged-brass medallion mounted in a riveted cog bezel
+  (the ancient arms set in the machine), is fixed in the lower-left so the deck
+  is seen flying beneath it during transitions. Each slide is its own steampunk
+  brass plate: a distinct background texture per slide (8 ornate brass/clockwork
+  panels under a dark scrim, framed in brass with gold/shadow insets) so the
+  changing backdrop makes slide-to-slide movement obvious during transitions;
+  body text carries a dark halo for legibility over the machinery. Each slide
+  also supports an optional **moving** background: drop a `bg<N>.webm` into
+  `app/public/` and the server adds a `<video class="slide-video">` for that
+  slide (the JPG stays as poster + fallback), with only the active slide's clip
+  playing at a time (driven off impress step events in `machine.js`) and no
+  autoplay under reduced-motion — so animated steampunk backdrops can be added
+  one at a time without code changes. Slides fly in dramatically via a
+  big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale` is
+  `REAL` so mid-deck zooms can be fractional, and all background/entrance motion
+  is `prefers-reduced-motion`-guarded. Tiers stack by their
+  listener ports (Envoy :8080 → frontend, node :3000 → app, Postgres :5432 →
+  db) and the tubes stay lit at idle via Envoy upstream health checks
+  (frontend→app) and a pg connection-pool keepalive (app→db). All three tiers
+  build on Debian trixie bases so the trixie-built agent's glibc matches.
+  Artifacts under `deploy/docker/cedar-vale/`. Complements the lightweight
+  `cedar-vale-local` (plain named agents) and macOS-only `cedar-vale`
+  (OrbStack VM) modes. DEV/UAT ONLY — `--no-tls`, baked demo credentials.
+- **viz-UAT `cedar-vale-local` mode: three named plain agents.**
+  `VIZ_UAT_AGENT_MODE=cedar-vale-local` runs three `yuzu-agent` containers with
+  hostnames `yuzu-frontend` / `yuzu-app` / `yuzu-db` (no real services), so
+  `/viz/fleet` labels three tiers by name without needing OrbStack VMs — the
+  Linux/WSL2-friendly cousin of the macOS `cedar-vale` mode.
+
+### Fixed
+
+- **viz-UAT: server config bind-mount must be world-readable (0644, not
+  0600).** `start-viz-uat.sh` generated `yuzu-server.cfg` at mode 0600 owned by
+  the operator's uid, then bind-mounted it into the server container which runs
+  as uid 999 (`yuzu`) — unreadable, so the server fell through to interactive
+  first-run setup, read empty stdin, and died on the password floor. The file
+  is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
+  containerized launcher.
+- **CRITICAL — `POST /login/mfa` was unreachable behind the pre-routing
+  auth gate** (Hermes Agent red-team review, 2026-05-29). The exemption
+  list at `server.cpp:2393` covered `/login` but not `/login/mfa`, so
+  every unauthenticated POST to the MFA challenge was redirected to
+  `/login` before the route handler ran — the MFA login flow was
+  completely deadlocked in any deployment with the gate enabled. The
+  internal governance review missed this because PR1 deferred route-
+  level integration tests. Added `/login/mfa` to the exemption list
+  with a comment crediting the Hermes finding.
+- **HIGH — `/login/mfa` was bypassing the login-specific rate limiter**
+  (Hermes Agent LOW #6 escalated by the credential-brute compounding
+  effect). `is_login = req.path == "/login"` at `server.cpp:2374` did
+  not match `/login/mfa`, so MFA submissions fell through to the looser
+  `api_rate_limiter_` bucket. Expanded the predicate to cover both
+  paths so per-IP rate-limit defence applies to both legs of credential
+  auth. The per-pending-token 5-attempt cap remains as the second layer.
+- **MEDIUM — CSRF protection on the five `/api/settings/mfa/*` POST
+  routes** (Hermes Agent MEDIUM #2). The mutating MFA settings routes
+  (`init`, `verify`, `recovery-codes`, `disable`) relied on session-
+  cookie auth (`SameSite=Lax`) without `Origin` / `Referer` checks; a
+  stolen cookie could be replayed cross-site to strip a victim's MFA.
+  Added an `origin_safe` helper that requires `Origin` (or `Referer`
+  fallback) host to match the request `Host` header on browser POSTs;
+  non-browser clients (curl, automation) that omit both headers pass
+  through. Mismatched host returns 403 with audit verb `csrf.denied`
+  (`target_type="Endpoint"`) for SIEM correlation. Audit detail strings
+  are sanitised (control + high-bit bytes stripped, each field capped at
+  128 B), default ports `:443`/`:80` are normalised so a TLS-terminating
+  reverse proxy that rewrites `Host` to the port-less form does not
+  false-deny, and userinfo (`@`) plus fragment / query (`?`, `#`) in the
+  Origin URL are rejected per RFC 6454.
+
+  **Deferred scope (Gate 4 SHOULD S2 — known follow-up):** `origin_safe`
+  is wired into the 4 mutating MFA POSTs only. 11 sibling state-changing
+  Settings POSTs remain CSRF-unprotected:
+  `/api/settings/users` (and `/role`), `/api/settings/api-tokens`,
+  `/api/settings/plugin-signing/{upload,clear,require}`,
+  `/api/settings/oidc` (and `/test`), `/api/settings/{cert-upload,
+  cert-paste}`, `/api/settings/enrollment-tokens`, `/api/settings/tls`.
+  These were unprotected before PR1 too — the asymmetry is documented
+  here so it isn't mistaken for a regression. A follow-up PR wraps every
+  admin HTMX mutation with the same helper.
+
+### Tests
+
+- **Integration / synthetic-UAT scripts: replace fragile log-grep assertions
+  with Prometheus-metric assertions.** Phase 5 of `/test --full` run
+  `1779859754-13864` surfaced a single Integration FAIL whose root cause was
+  a `cat agent.log | grep -qi "register|session|connect|heartbeat"` assertion
+  that silently swallowed an empty-read race (WSL2 drvfs / spdlog flush
+  timing) and false-failed even though the agent had registered cleanly. An
+  audit found five more sites in the same script — and two siblings in
+  `scripts/start-UAT.sh` and `scripts/test/synthetic-uat-tests.sh` — using
+  the same anti-pattern (generic-English substring match on volatile log
+  content with no retry and no diagnostic for empty reads).
+  - `scripts/integration-test.sh`: agent-registration wait loop (line 609),
+    "Agent registration in logs" test (was the failing one), "Gateway sees
+    agent connections", and "Server gateway-mode operation" now poll
+    `yuzu_fleet_agents_healthy` / `yuzu_gw_agents_current` via a new
+    `poll_metric_at_least` helper. The gateway error-pattern fallback at the
+    one site with no metric substitute is hardened: empty-file → loud FAIL,
+    and the grep pattern is tightened to `\\[error\\]|CRASH REPORT|=ERROR REPORT|
+    badarg|Supervisor: .* terminating` so the bare word "error" inside an
+    info line no longer false-positives. The latent "both branches call
+    `pass`" bug in "Server gateway-mode operation" is fixed at the same
+    time. Test count grew 21 → 22 because the previously-merged "gateway
+    sees agent connections" + "gateway has errors" split into two clean
+    assertions.
+  - `scripts/start-UAT.sh`: the agent-registration wait switched from
+    `grep "Registered with server"` to the same metric poll; the `/readyz`
+    JSON check switched from a `grep '"ready"'` substring to a real
+    `python3 -c 'json.load(...)'` parse (the old grep would have
+    false-positived on responses like `{"status":"degraded",
+    "note":"ready_for_disposal"}`). Session-id extraction at line 495 is
+    intentionally left alone — it uses a structural regex on a stable line
+    format, not generic English, and no metric or REST surface exposes
+    `session_id`.
+  - `scripts/test/synthetic-uat-tests.sh`: same `/readyz` JSON parse fix.
+  - `poll_metric_at_least` is duplicated between `integration-test.sh` and
+    `start-UAT.sh` rather than extracted to a shared lib — `start-UAT.sh`
+    is operator-runnable in isolation and the helper is ~10 lines; coupling
+    the two scripts to a shared file has higher carrying cost than the
+    duplication.
+  - Out of scope for this commit, filed as follow-up F19 (governance
+    Tier-C from the prior round): the MCP / e2e-api / e2e-security
+    `assert_contains` cluster and the `grep -c result-row` HTML row count
+    in `start-UAT.sh` / `synthetic-uat-tests.sh` — different domain
+    (JSON-vs-log), different risk model, separate PR.
+  - Verified: all three scripts pass `bash -n`; `bash
+    scripts/integration-test.sh` against the live UAT stack reports
+    22/22 PASS; the helper passes a four-case behavioural sanity test
+    (live PASS, impossible-threshold FAIL, missing-metric FAIL,
+    labelled-metric PASS).
+
+### Security
+
+- **NAT-aware per-session peer-IP binding (#1128).** The W1.3 stolen-session
+  guard (Subscribe source IP must match Register source IP) false-rejected
+  legitimate direct-connect agents behind multi-egress NAT / proxy pools /
+  CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
+  accommodations now downgrade a mismatch to *advisory* (audited
+  `result="ok" outcome=advisory`, counted on
+  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason,gateway_mode}`)
+  instead of rejecting: (1) both IPs falling inside an operator-declared
+  `--trusted-nat-cidr` range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS
+  client identity, which is **opt-in** via `--nat-trust-mtls-identity`
+  (`YUZU_NAT_TRUST_MTLS_IDENTITY`, default off) and SAFE ONLY WITH PER-AGENT
+  CLIENT CERTS — a shared fleet-wide cert would make it a session-replay
+  bypass; enabling the flag now emits a `warn`-level startup banner so it is
+  not silently lost in a tail-only boot log. Mismatches outside both
+  accommodations still hard-reject; an empty extracted IP always rejects.
+  Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
+  When both accommodations are configured, mTLS-identity match takes
+  precedence (the audit row + metric `reason` label record which fired). The
+  advisory audit row and metric now carry a `gateway_mode` field/label
+  matching the existing reject path, so SIEM rules can correlate advisory and
+  reject volumes by operator-mode dimension.
+- **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
+  gateway `ProxyRegister` path previously recorded the gateway's IP as the
+  source, not the agent's (SOC 2 IR-2 mis-attribution). A new
+  transport-agnostic `RegisterRequest.gateway_observed_peer` field (survives the
+  planned gRPC→QUIC move) carries the agent origin IP; the server now records
+  `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
+  `origin_observed=false` when absent). The direct Register path ignores the
+  field (a direct agent cannot forge a source IP; it is not a defence against a
+  compromised gateway). **Note for gateway deployments:** until the gateway-side
+  population follow-up ships, audit rows on the `ProxyRegister` path still record
+  the gateway node's IP as `source_ip` (the field is not yet populated by
+  today's grpcbox transport, which cannot observe the direct agent peer; the
+  durable source arrives with the QUIC transport, #376). Operators relying on
+  `source_ip` for IR-2 attribution on the gateway path should note this.
+
 ## [0.12.0] - 2026-05-25
 
 ### Breaking Changes

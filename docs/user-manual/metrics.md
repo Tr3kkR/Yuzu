@@ -22,32 +22,32 @@ curl -s 'http://localhost:8080/metrics'
 **Example response (excerpt):**
 
 ```
-# HELP yuzu_server_http_requests_total Total HTTP requests handled
-# TYPE yuzu_server_http_requests_total counter
-yuzu_server_http_requests_total{method="GET",status="200"} 1542
-yuzu_server_http_requests_total{method="POST",status="200"} 87
-yuzu_server_http_requests_total{method="GET",status="404"} 12
+# HELP yuzu_http_requests_total Total HTTP requests handled
+# TYPE yuzu_http_requests_total counter
+yuzu_http_requests_total{method="GET",status="200"} 1542
+yuzu_http_requests_total{method="POST",status="200"} 87
+yuzu_http_requests_total{method="GET",status="404"} 12
 
-# HELP yuzu_server_http_request_duration_seconds HTTP request latency
-# TYPE yuzu_server_http_request_duration_seconds histogram
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.005"} 920
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.01"} 1100
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.025"} 1350
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.05"} 1450
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.1"} 1500
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.25"} 1530
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.5"} 1540
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="1.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="2.5"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="5.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="10.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="+Inf"} 1542
-yuzu_server_http_request_duration_seconds_sum{method="GET"} 12.345
-yuzu_server_http_request_duration_seconds_count{method="GET"} 1542
+# HELP yuzu_command_duration_seconds Command execution latency in seconds
+# TYPE yuzu_command_duration_seconds histogram
+yuzu_command_duration_seconds_bucket{le="0.005"} 12
+yuzu_command_duration_seconds_bucket{le="0.01"} 47
+yuzu_command_duration_seconds_bucket{le="0.025"} 180
+yuzu_command_duration_seconds_bucket{le="0.05"} 540
+yuzu_command_duration_seconds_bucket{le="0.1"} 980
+yuzu_command_duration_seconds_bucket{le="0.25"} 1320
+yuzu_command_duration_seconds_bucket{le="0.5"} 1480
+yuzu_command_duration_seconds_bucket{le="1.0"} 1530
+yuzu_command_duration_seconds_bucket{le="2.5"} 1541
+yuzu_command_duration_seconds_bucket{le="5.0"} 1542
+yuzu_command_duration_seconds_bucket{le="10.0"} 1542
+yuzu_command_duration_seconds_bucket{le="+Inf"} 1542
+yuzu_command_duration_seconds_sum 198.74
+yuzu_command_duration_seconds_count 1542
 
-# HELP yuzu_server_connected_agents Number of currently connected agents
-# TYPE yuzu_server_connected_agents gauge
-yuzu_server_connected_agents 47
+# HELP yuzu_agents_connected Number of currently connected agents
+# TYPE yuzu_agents_connected gauge
+yuzu_agents_connected 47
 ```
 
 ## Naming conventions
@@ -56,10 +56,17 @@ All Yuzu metrics follow a consistent naming scheme.
 
 | Prefix | Source | Examples |
 |---|---|---|
-| `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
+| `yuzu_server_` | Server process | `yuzu_server_uptime_seconds`, `yuzu_server_open_connections` |
 | `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
-| `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
+| `yuzu_agent_` | Agent process | `yuzu_agent_commands_executed_total`, `yuzu_agent_uptime_seconds` |
 | `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
+
+## Internal-CA / default-certificate metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
 ## Fleet visualization metrics
 
@@ -82,6 +89,17 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
 | `yuzu_viz_topology_push_rejected_total` | gauge | Pushes rejected by the IP-spoof guard because a claimed `local_ip` is owned by a live agent. A non-zero rate signals a spoofing campaign or a NAT/DHCP misconfiguration. |
 | `yuzu_viz_pushed_cap_evictions_total` | gauge | `pushed_` map entries evicted because the map was at `kPushedMapHardCap` (100000) when a new agent pushed. Non-zero means the fleet outgrew the cap or a cap-flood attack is evicting legitimate agents — cross-check with the `topology.push.evicted_for_cap` audit events. |
 | `yuzu_viz_pushed_map_size` | gauge | Current occupancy of the `pushed_` map. Primary memory-pressure signal — alert before it approaches the 100000 hard cap. |
+
+## Subscribe peer-binding security counters
+
+The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059, NAT-aware relaxation #1128) emits two paired counters. Both carry the `event="security"` SIEM-routing label and should be read together — a spike in one alone vs both together carries very different meaning.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_grpc_subscribe_peer_mismatch_total` | counter | `event="security"`, `gateway_mode=true\|false` | A Subscribe attempt was **rejected** because its source IP did not match the IP recorded at `Register` time and no accommodation applied. `gateway_mode` reflects whether the server is running with `--gateway-mode`. The audit row `session.peer_mismatch result=denied` (see [audit-log.md](audit-log.md)) carries the forensic detail. |
+| `yuzu_grpc_subscribe_peer_advisory_total` | counter | `event="security"`, `reason="mtls_identity_match"\|"trusted_nat_cidr"`, `gateway_mode=true\|false` | A Subscribe peer-IP mismatch was **tolerated** (stream established) under a NAT-aware accommodation (#1128). `reason` distinguishes the two opt-in accommodations: `mtls_identity_match` (via `--nat-trust-mtls-identity`), `trusted_nat_cidr` (both IPs in one `--trusted-nat-cidr` range). The audit row is `session.peer_mismatch result=ok outcome=advisory`. |
+
+**Read-together interpretation.** Both counters share the `event` and `gateway_mode` labels so an analyst can join them by operator-mode dimension. A spike in `_peer_advisory_total` alone is expected multi-egress churn in NAT-relaxed deployments and is not actionable. A spike in BOTH simultaneously is the actionable signal: it can indicate a stolen-session replay landing inside a trusted range, where the legitimate agent triggers the reject and the attacker (also in-range) is admitted via advisory. The `AgentSubscribePeerAdvisoryCorrelatedSpike` alert below encodes exactly that pattern.
 
 ### Recommended alerts
 
@@ -135,6 +153,31 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   expr: increase(yuzu_grpc_subscribe_identity_mismatch_total{event="security"}[5m]) > 0
   annotations:
     summary: "Subscribe mTLS identity mismatch (#1118) — possible stolen session_id replayed with a non-matching client cert"
+
+# NAT-aware tolerated mismatch (#1128). yuzu_grpc_subscribe_peer_advisory_total
+# {event="security",reason="mtls_identity_match|trusted_nat_cidr"} counts peer-IP
+# mismatches that were DOWNGRADED to advisory (not rejected) under a NAT
+# accommodation. A spike here ALONE is expected churn in multi-egress NAT
+# deployments — do NOT alert on it bare. The actionable signal is the
+# correlated form: advisory AND rejected mismatches rising together can mean a
+# stolen-session replay landing inside a trusted range.
+- alert: AgentSubscribePeerAdvisoryCorrelatedSpike
+  expr: >
+    increase(yuzu_grpc_subscribe_peer_advisory_total{event="security"}[5m]) > 0
+    and increase(yuzu_grpc_subscribe_peer_mismatch_total{event="security"}[5m]) > 0
+  annotations:
+    summary: "Tolerated NAT peer-mismatches (#1128) coincide with rejected mismatches — investigate the reject events for a possible stolen-session replay inside a trusted range"
+
+# Operator-visibility guard for --nat-trust-mtls-identity. Sustained
+# mtls_identity_match advisories mean the (opt-in, off-by-default) mTLS-identity
+# NAT accommodation is active — confirm it was enabled intentionally AND that
+# client certs are PER-AGENT (a shared fleet cert makes this a replay bypass,
+# gov UP-2). Long window: this should be rare; a steady stream is worth a look.
+- alert: AgentSubscribeMtlsIdentityAdvisoryActive
+  expr: increase(yuzu_grpc_subscribe_peer_advisory_total{event="security",reason="mtls_identity_match"}[30m]) > 0
+  for: 30m
+  annotations:
+    summary: "--nat-trust-mtls-identity is relaxing peer-IP binding via mTLS-identity match — verify it was enabled deliberately and that client certs are per-agent (shared cert = session-replay bypass)"
 
 - alert: AgentRegisterDeniedFlood
   expr: rate(yuzu_register_denied_total{event="security"}[5m]) > 1
@@ -205,7 +248,7 @@ successfully:
 curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.labels.job == "yuzu-server")'
 
 # Query a metric
-curl -s 'http://localhost:9090/api/v1/query?query=yuzu_server_connected_agents' | jq .
+curl -s 'http://localhost:9090/api/v1/query?query=yuzu_agents_connected' | jq .
 ```
 
 ## Real-time event stream
@@ -257,6 +300,18 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+## Guardian metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_guardian_baselines_total` | gauge | Number of persisted Guardian Baselines. Refreshed on every `/metrics` scrape. |
+| `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
+| `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
+| `yuzu_server_guardian_proj_failures_total` | gauge | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
+| `yuzu_server_guardian_observations_reaped_total` | gauge | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). |
+
+Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
+
 ## Management group metrics
 
 The server exposes two gauges for management group telemetry. These are
@@ -298,38 +353,42 @@ yuzu_server_management_groups_total == 0
 
 ```promql
 # Total connected agents
-yuzu_server_connected_agents
+yuzu_agents_connected
 
 # Connected agents by OS
-count by (os) (yuzu_agent_info)
+sum by (os) (yuzu_fleet_agents_by_os)
 
 # Connected agents by architecture
-count by (arch) (yuzu_agent_info)
+sum by (arch) (yuzu_fleet_agents_by_arch)
 ```
 
 ### Request performance
 
 ```promql
 # Request rate (per second, 5-minute window)
-rate(yuzu_server_http_requests_total[5m])
+rate(yuzu_http_requests_total[5m])
 
-# 95th percentile latency
-histogram_quantile(0.95, rate(yuzu_server_http_request_duration_seconds_bucket[5m]))
+# 95th percentile command-execution latency
+# (the server emits no general HTTP request-duration histogram; command duration
+#  is its primary latency SLI — see also auth-login and viz-topology histograms)
+histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))
 
 # Error rate (percentage of 5xx responses)
-sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-/ sum(rate(yuzu_server_http_requests_total[5m])) * 100
+sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+/ sum(rate(yuzu_http_requests_total[5m])) * 100
 ```
 
 ### Agent health
 
 ```promql
-# Agents with heartbeat latency over 5 seconds
-yuzu_agent_heartbeat_latency_seconds > 5
+# Healthy agents reported via heartbeat status_tags.
+# (Agents have no Prometheus endpoint, so there is no per-agent heartbeat-latency
+#  series; the server re-exports fleet health as this gauge.)
+yuzu_fleet_agents_healthy
 
 # Plugin execution failure rate by plugin
-sum by (plugin) (rate(yuzu_agent_plugin_executions_total{status="failure"}[5m]))
-/ sum by (plugin) (rate(yuzu_agent_plugin_executions_total[5m])) * 100
+sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
+/ sum by (plugin) (rate(yuzu_agent_commands_executed_total[5m])) * 100
 ```
 
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
@@ -370,26 +429,34 @@ increase(yuzu_agent_plugin_rejected_total{reason="reserved_name"}[5m]) > 0
 
 ```promql
 # Instructions completed per minute
-rate(yuzu_server_instructions_completed_total[5m]) * 60
+rate(yuzu_commands_completed_total[5m]) * 60
 
 # Average instruction duration
-rate(yuzu_server_instruction_duration_seconds_sum[5m])
-/ rate(yuzu_server_instruction_duration_seconds_count[5m])
+rate(yuzu_command_duration_seconds_sum[5m])
+/ rate(yuzu_command_duration_seconds_count[5m])
 ```
 
 ## Grafana integration
 
-Import the Prometheus data source into Grafana and use the PromQL queries
-above to build dashboards. A typical Yuzu dashboard includes:
+Yuzu ships pre-built Grafana dashboards. The operational set lives in
+`deploy/grafana/` (`yuzu-dashboard`, `yuzu-fleet-dashboard`, and
+`yuzu-gateway-dashboard` over Prometheus, plus `yuzu-analytics-dashboard` over
+ClickHouse) and is auto-provisioned by the UAT / full-UAT rigs; a standalone
+Prometheus import template is at `docs/grafana/yuzu-overview.json`. See
+[`docs/grafana/README.md`](../grafana/README.md) for the full list and import
+instructions.
+
+To build your own, import the Prometheus data source into Grafana and use the
+PromQL queries above. A typical Yuzu dashboard includes:
 
 | Panel | Visualization | Query |
 |---|---|---|
-| Connected agents | Stat / single value | `yuzu_server_connected_agents` |
-| Agents by OS | Pie chart | `count by (os) (yuzu_agent_info)` |
-| Request rate | Time series | `rate(yuzu_server_http_requests_total[5m])` |
-| Request latency (p95) | Time series | `histogram_quantile(0.95, ...)` |
+| Connected agents | Stat / single value | `yuzu_agents_connected` |
+| Agents by OS | Pie chart | `sum by (os) (yuzu_fleet_agents_by_os)` |
+| Request rate | Time series | `rate(yuzu_http_requests_total[5m])` |
+| Command latency (p95) | Time series | `histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))` |
 | Error rate | Time series | `5xx / total * 100` |
-| Instruction throughput | Time series | `rate(yuzu_server_instructions_completed_total[5m])` |
+| Instruction throughput | Time series | `rate(yuzu_commands_completed_total[5m])` |
 
 ### Alerting rules
 
@@ -400,7 +467,7 @@ groups:
   - name: yuzu
     rules:
       - alert: YuzuNoAgentsConnected
-        expr: yuzu_server_connected_agents == 0
+        expr: yuzu_agents_connected == 0
         for: 5m
         labels:
           severity: critical
@@ -409,24 +476,22 @@ groups:
 
       - alert: YuzuHighErrorRate
         expr: >
-          sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-          / sum(rate(yuzu_server_http_requests_total[5m])) > 0.05
+          sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(yuzu_http_requests_total[5m])) > 0.05
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Yuzu server error rate above 5%"
 
-      - alert: YuzuHighLatency
-        expr: >
-          histogram_quantile(0.95,
-            rate(yuzu_server_http_request_duration_seconds_bucket[5m])
-          ) > 2.0
-        for: 10m
+      - alert: YuzuHighCommandLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server p95 latency above 2 seconds"
+          summary: "Command p99 latency exceeds 10 seconds"
 ```
 
 ## Security considerations
@@ -458,4 +523,3 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 |---|---|---|
 | System health dashboard | Phase 7, Issue 7.2 | Server CPU, memory, connection counts, queue depths |
 | Topology map | Phase 7 | Visual map of server nodes, gateways, and agent counts |
-| Grafana dashboard templates | Planned | Pre-built JSON dashboard files in `docs/grafana/` |

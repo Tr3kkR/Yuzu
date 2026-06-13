@@ -22,6 +22,17 @@
 #             :50052 mgmt gRPC     :8080  web dashboard
 #   Gateway:  :50051 agent-facing  :50063 mgmt (command forwarding)
 #             :9568  metrics       :8081  health
+#   Postgres: :15433 (host) → 5432 (container sidecar; see below)
+#
+# Postgres sidecar (ADR-0006, #1320): the server tier is a (server +
+# postgres) pair. A `yuzu-postgres:local` container (built from
+# deploy/docker/Dockerfile.postgres on first use) runs alongside the
+# native processes with per-run random credentials; the DSN is exported
+# to the server as YUZU_POSTGRES_DSN (inert until #1320 PR 3 wires the
+# consumer). Host port 15433 — deliberately NOT 5432 (local clusters),
+# 5433 (dev pg-canary convention), or 15432 (yuzu-ci-postgres).
+# NON-FATAL while the server boots without Postgres: no docker → warn and
+# continue. Flip PG_SOFT_FAIL to 0 when #1320 PR 3 lands fail-closed boot.
 #
 # Usage:
 #   bash scripts/start-UAT.sh          # start + verify
@@ -44,6 +55,18 @@ else
 fi
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="/tmp/yuzu-uat"
+
+# Postgres sidecar (see header). PG_SOFT_FAIL=1 → a missing/failed sidecar
+# warns and continues; becomes a hard failure once #1320 PR 3 makes the
+# server require the DSN at boot.
+# Distinct from the full-uat compose's container_name yuzu-uat-postgres —
+# the native teardown force-removes this container, and a shared name would
+# let one rig destroy the other's database (PR #1381 review, LOW).
+PG_CONTAINER="yuzu-native-uat-postgres"
+PG_IMAGE="yuzu-postgres:local"
+PG_HOST_PORT=15433
+PG_SOFT_FAIL=1
+PG_DSN=""
 
 # Cross-platform helpers: port_listening, host_os.
 # shellcheck source=scripts/test/_portable.sh
@@ -85,6 +108,31 @@ fail() { echo -e "  ${RED}✗${NC} $*"; }
 warn() { echo -e "  ${YELLOW}⚠${NC} $*"; }
 info() { echo -e "  ${CYAN}→${NC} $*"; }
 
+# poll_metric_at_least <metrics-url> <metric-name> <min-value> [timeout-s]
+#
+# Poll a Prometheus /metrics endpoint until <metric-name> reaches <min-value>.
+# Handles both bare metrics (`name VALUE`) and labelled metrics
+# (`name{labels} VALUE`) by matching the line on `^name` followed by space,
+# `{`, or end-of-line, and reading the last whitespace-separated field as the
+# value. Uses the awk-no-exit pattern from #988 so the parser plays nicely
+# with `set -o pipefail`. Returns 0 if the threshold is met within timeout, 1
+# otherwise. Mirrored in scripts/integration-test.sh — keep the two copies in
+# sync. (See plan/audit comment in CHANGELOG for the no-shared-lib rationale.)
+poll_metric_at_least() {
+    local url="$1" name="$2" min="$3" timeout="${4:-30}"
+    local i resp value
+    for i in $(seq 1 "$timeout"); do
+        resp=$(curl -sf --max-time 2 "$url" 2>/dev/null || echo "")
+        value=$(echo "$resp" | awk -v n="$name" \
+            '$0 ~ "^"n"([ {]|$)" { val=$NF } END { print val }')
+        if [[ -n "$value" ]] && [[ "${value%.*}" -ge "$min" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # ── Kill helpers ────────────────────────────────────────────────────────
 
 kill_stale() {
@@ -112,6 +160,15 @@ kill_stale() {
         killed=$((killed + 1))
     fi
 
+    # Postgres sidecar container (no volume — state is per-run, matching
+    # the rig's wipe-state semantics).
+    if command -v docker >/dev/null 2>&1; then
+        if docker rm -f "$PG_CONTAINER" >/dev/null 2>&1; then
+            ok "Removed postgres sidecar container ($PG_CONTAINER)"
+            killed=$((killed + 1))
+        fi
+    fi
+
     if [ "$killed" -eq 0 ]; then
         ok "No stale processes found"
     fi
@@ -131,13 +188,19 @@ show_status() {
             fail "$proc not running"
         fi
     done
+    if command -v docker >/dev/null 2>&1 && \
+       docker ps --filter "name=^${PG_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        ok "$PG_CONTAINER running (postgres sidecar, host :$PG_HOST_PORT)"
+    else
+        fail "$PG_CONTAINER not running (postgres sidecar)"
+    fi
     echo ""
     echo "=== Listening Ports ==="
     # lsof is portable across BSD/Linux; ss is iproute2-only. Iterate the
     # ports we care about and print one row per listener so the output is
     # the same shape on both OSes.
     local _any=0 _p _line
-    for _p in 50051 50052 50054 50055 50063 8080 8081 9568; do
+    for _p in 50051 50052 50054 50055 50063 8080 8081 9568 "$PG_HOST_PORT"; do
         _line=$(lsof -iTCP:"$_p" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2)
         if [ -n "$_line" ]; then
             echo "$_line"
@@ -293,6 +356,85 @@ print(f'${ADMIN_USER}:admin:{salt.hex()}:{dk.hex()}')
     chmod 600 "$UAT_DIR/yuzu-server.cfg"
 }
 
+# ── Postgres sidecar (ADR-0006, #1320) ──────────────────────────────────
+#
+# The server tier is a (server + postgres) pair. Stand up a yuzu-postgres
+# container with per-run random credentials — superuser and app-role
+# passwords are DISTINCT by construction (the image's first-boot init
+# refuses equal/unset, PR #1334 S1) — published on loopback :15433. No
+# volume: state is per-run, matching the rig's wipe-state semantics (#947).
+#
+# Sets PG_DSN and returns 0 on success; returns 1 on any failure and lets
+# the caller decide fatality via PG_SOFT_FAIL.
+
+start_postgres_sidecar() {
+    if ! command -v docker >/dev/null 2>&1; then
+        warn "docker not found — cannot start the postgres sidecar"
+        return 1
+    fi
+
+    # Build the image on first use (cached afterwards). Same image the
+    # container rigs use (docker-compose.{uat,viz-uat,full-uat}.yml all
+    # declare image: yuzu-postgres:local).
+    if ! docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then
+        info "Building $PG_IMAGE from deploy/docker/Dockerfile.postgres (first use; a few minutes)..."
+        if ! docker build -t "$PG_IMAGE" \
+                -f "$YUZU_ROOT/deploy/docker/Dockerfile.postgres" \
+                "$YUZU_ROOT" > "$UAT_DIR/postgres-build.log" 2>&1; then
+            warn "image build failed — see $UAT_DIR/postgres-build.log"
+            return 1
+        fi
+    fi
+
+    local pg_super pg_app
+    pg_super=$(openssl rand -hex 24)
+    pg_app=$(openssl rand -hex 24)
+
+    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+    if ! docker run -d --name "$PG_CONTAINER" \
+            -e POSTGRES_PASSWORD="$pg_super" \
+            -e YUZU_DB_PASSWORD="$pg_app" \
+            -p "127.0.0.1:${PG_HOST_PORT}:5432" \
+            "$PG_IMAGE" > /dev/null 2> "$UAT_DIR/postgres-run.err"; then
+        warn "docker run failed: $(cat "$UAT_DIR/postgres-run.err" 2>/dev/null)"
+        return 1
+    fi
+
+    # Readiness mirrors the compose healthcheck: pg_isready liveness AND
+    # SELECT 1 over the app credential. The psql leg dials $(hostname), NOT
+    # loopback — initdb leaves 127.0.0.1 on trust auth, so a loopback dial
+    # would greenlight a broken password; the container-hostname dial forces
+    # scram, actually proving the credential (PR #1381 review, item 2 — same
+    # reason the compose healthchecks dial $(hostname)). pg_isready stays on
+    # loopback: pure liveness, and the initdb-phase temp server is
+    # unix-socket-only so TCP can't false-positive mid-init. The password
+    # rides docker-exec env, never the host-visible argv.
+    local _i
+    for _i in $(seq 1 60); do
+        if docker exec -e PGPASSWORD="$pg_app" "$PG_CONTAINER" sh -c \
+            'pg_isready -h 127.0.0.1 -U yuzu -d yuzu >/dev/null 2>&1 && \
+             psql -h "$(hostname)" -U yuzu -d yuzu -tA -c "SELECT 1" >/dev/null 2>&1' \
+            2>/dev/null; then
+            PG_DSN="postgresql://yuzu:${pg_app}@127.0.0.1:${PG_HOST_PORT}/yuzu"
+            # 0600 — carries the app credential; lets the operator psql in
+            # while the rig is up: psql "$(cat /tmp/yuzu-uat/postgres-dsn)".
+            # mktemp+mv: the file is created O_EXCL at 0600, closing the
+            # symlink-swap window between create and write (PR #1381 LOW).
+            local _dsn_tmp
+            if _dsn_tmp=$(mktemp "$UAT_DIR/.postgres-dsn.XXXXXX"); then
+                printf '%s\n' "$PG_DSN" > "$_dsn_tmp"
+                mv -f "$_dsn_tmp" "$UAT_DIR/postgres-dsn"
+            fi
+            ok "Postgres sidecar up ($PG_CONTAINER → host 127.0.0.1:${PG_HOST_PORT})"
+            info "DSN saved to $UAT_DIR/postgres-dsn (0600)"
+            return 0
+        fi
+        sleep 1
+    done
+    warn "postgres sidecar did not become ready in 60s — check: docker logs $PG_CONTAINER"
+    return 1
+}
+
 # ── Start stack ─────────────────────────────────────────────────────────
 
 start_all() {
@@ -348,7 +490,19 @@ start_all() {
     generate_config
     ok "Generated server config ($ADMIN_USER / $ADMIN_PASS)"
 
-    # ── 1. Server ───────────────────────────────────────────────────────
+    # ── 1. Postgres sidecar ─────────────────────────────────────────────
+    echo ""
+    echo "[1/4] Starting postgres sidecar..."
+    if ! start_postgres_sidecar; then
+        if [ "$PG_SOFT_FAIL" -eq 1 ]; then
+            warn "Continuing without Postgres — the server does not require a DSN until #1320 PR 3"
+        else
+            fail "Postgres sidecar is required (fail-closed server boot). See messages above."
+            exit 1
+        fi
+    fi
+
+    # ── 2. Server ───────────────────────────────────────────────────────
     # NOTE: --listen is moved off the default :50051 to :50054 because the
     # gateway will bind :50051 for agent-facing gRPC on this same host. In
     # multi-host production deployments the server can keep :50051 because
@@ -357,7 +511,13 @@ start_all() {
     # server's :50054 listener stays open for any direct agent connections
     # but in this UAT topology agents connect through the gateway only.
     echo ""
-    echo "[1/3] Starting yuzu-server..."
+    echo "[2/4] Starting yuzu-server..."
+    # Hand the sidecar DSN to the server. Inert today — the consumer lands
+    # with #1320 PR 3 (fail-closed boot); exporting it now means this rig
+    # needs zero further changes at the flip.
+    if [ -n "$PG_DSN" ]; then
+        export YUZU_POSTGRES_DSN="$PG_DSN"
+    fi
     # Rate limits are bumped well above production defaults so the /test
     # Phase 5 fan-out (instructions runner with parallelism=4, parallel
     # security E2E logins, etc.) doesn't trip 429s/401s. (#1006, #1007)
@@ -385,9 +545,9 @@ start_all() {
     info "Dashboard http://localhost:8080"
     info "Direct agent gRPC :50054  |  Gateway upstream :50055  |  Mgmt :50052"
 
-    # ── 2. Gateway ──────────────────────────────────────────────────────
+    # ── 3. Gateway ──────────────────────────────────────────────────────
     echo ""
-    echo "[2/3] Starting Erlang gateway..."
+    echo "[3/4] Starting Erlang gateway..."
     local gw_rel="$GATEWAY_DIR/_build/prod/rel/yuzu_gw"
     if [ -x "$gw_rel/bin/yuzu_gw" ]; then
         # #659: the release refuses to boot with the default Erlang cookie.
@@ -435,10 +595,10 @@ start_all() {
     echo "$enroll_token" > "$UAT_DIR/enrollment-token"
     ok "Enrollment token created (saved to $UAT_DIR/enrollment-token)"
 
-    # ── 3. Agent (via gateway) ──────────────────────────────────────────
+    # ── 4. Agent (via gateway) ──────────────────────────────────────────
     echo ""
     if [ -n "$AGENT_AS_USER" ]; then
-        echo "[3/3] Starting yuzu-agent (→ gateway :50051) as user '$AGENT_AS_USER'..."
+        echo "[4/4] Starting yuzu-agent (→ gateway :50051) as user '$AGENT_AS_USER'..."
         verify_as_user_prereqs "$AGENT_AS_USER" || exit 1
         # Make agent-data writable by the runtime user; install-agent-user.sh
         # creates the canonical state dirs under /Library/Application Support/Yuzu
@@ -467,7 +627,7 @@ start_all() {
             --enrollment-token "$enroll_token" \
             > "$UAT_DIR/agent.log" 2>&1 &
     else
-        echo "[3/3] Starting yuzu-agent (→ gateway :50051)..."
+        echo "[4/4] Starting yuzu-agent (→ gateway :50051)..."
         "$BUILDDIR/agents/core/yuzu-agent" \
             --server localhost:50051 \
             --no-tls \
@@ -479,18 +639,28 @@ start_all() {
     fi
     local agent_pid=$!
 
-    # Wait for registration. PR 10 push-pump agents have a first-delay before
-    # the initial heartbeat, so the worst case is ~10-20s. 30s gives headroom
-    # on a moderately busy dev box. (#1003)
-    local waited=0
-    while ! grep -q "Registered with server" "$UAT_DIR/agent.log" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-        if [ "$waited" -ge 30 ]; then
-            fail "Agent did not register within 30s. Check $UAT_DIR/agent.log"
-            exit 1
-        fi
-    done
+    # Wait for registration. Authoritative signal is the server's
+    # yuzu_fleet_agents_healthy gauge — when it crosses 1 the server has
+    # actually counted this agent as healthy. Previously we greped the
+    # agent log for "Registered with server"; the metric is more reliable
+    # because it depends on the SERVER seeing the agent, not on a string
+    # in the AGENT log that downstream tooling may then re-parse and lose.
+    #
+    # Tradeoff (#1003 + recompute window): the fleet-health gauge updates
+    # on the server's 15 s recompute interval. Timeout is 60 s: measured on
+    # dev HEAD (2026-06-12, macOS) the gauge flips ~37 s after the agent's
+    # "Registered with server" line — registration alone isn't enough, the
+    # recompute also wants a first heartbeat (30 s interval), so the old
+    # 30 s timeout failed consistently while the stack was genuinely
+    # healthy. 60 s covers heartbeat + recompute + launch jitter.
+    # The session_id extraction below STILL reads the log; that
+    # is a STRUCTURAL regex on a stable line format (not a generic-English
+    # grep), and there is no metric/REST surface that exposes session_id.
+    if ! poll_metric_at_least "http://localhost:8080/metrics" \
+            yuzu_fleet_agents_healthy 1 60; then
+        fail "Agent did not register within 60s (yuzu_fleet_agents_healthy stayed < 1). Check $UAT_DIR/agent.log"
+        exit 1
+    fi
     local session_id
     session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | grep -oE 'session=[^ ,)]+' | tail -1)
     ok "Agent up (PID $agent_pid) — $session_id"
@@ -520,10 +690,22 @@ start_all() {
     fi
 
     # Test 2: Gateway health (all subsystem checks)
+    # Parse /readyz JSON properly instead of greping for the literal `"ready"`
+    # substring — the old grep would have false-positived on a response like
+    # `{"status":"degraded","note":"ready_for_disposal"}`. python3 is a hard
+    # build dependency project-wide (CLAUDE.md "PyYAML is a hard build
+    # dependency"), so we can rely on it being on PATH.
     tests_total=$((tests_total + 1))
     local gw_health
     gw_health=$(curl -s http://localhost:8081/readyz 2>/dev/null || echo '{"status":"error"}')
-    if echo "$gw_health" | grep -q '"ready"'; then
+    if echo "$gw_health" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("status") == "ready" else 1)
+' 2>/dev/null; then
         ok "Gateway healthy (all checks pass)"
         tests_passed=$((tests_passed + 1))
     else
@@ -668,6 +850,9 @@ for r in d.get('responses',[]):
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Agent → GW(:50051) → Server(:50055)  [data]    ║"
     echo "║  Server → GW(:50063) → Agent          [commands]║"
+    if [ -n "$PG_DSN" ]; then
+        echo "║  Server + Postgres(:15433)            [substrate]║"
+    fi
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Logs:  $UAT_DIR/{server,gateway,agent}.log     ║"
     echo "║  Stop:  bash scripts/start-UAT.sh stop          ║"

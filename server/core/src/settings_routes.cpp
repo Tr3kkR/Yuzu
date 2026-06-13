@@ -4,8 +4,12 @@
 
 #include "settings_routes.hpp"
 
+#include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
+#include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
+#include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
@@ -775,6 +779,160 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
                 "</div>";
     }
 
+    return html;
+}
+
+std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
+                                                const std::string& new_otpauth_uri,
+                                                const std::string& new_secret_b32,
+                                                const std::vector<std::string>& new_recovery_codes,
+                                                const std::string& enrollment_pending_for_verify,
+                                                const std::string& error_msg) {
+    // The fragment renders one of three lifecycle states:
+    //   1. Not enrolled — "Enable MFA" button
+    //   2. Provisional (enrollment initiated, code not yet verified) —
+    //      secret/URI shown, "Enter code to verify" form
+    //   3. Enrolled — status + "Regenerate recovery codes" + "Disable" buttons
+    auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+    if (!auth_db) {
+        return "<span style=\"color:#484f58\">MFA store unavailable (no AuthDB configured).</span>";
+    }
+
+    std::string html;
+    if (!error_msg.empty()) {
+        html += "<div class=\"error-msg\" role=\"alert\" style=\"color: var(--red); "
+                "font-size: 0.8rem; margin-bottom: 0.75rem;\">" +
+                html_escape(error_msg) + "</div>";
+    }
+
+    // Provisional verification panel. Two shapes:
+    //   (a) First reveal post-init — `new_otpauth_uri` and
+    //       `new_secret_b32` are non-empty, render the QR/URI + verify
+    //       form (one-time reveal).
+    //   (b) Retry after a failed verify — empty new_otpauth_uri /
+    //       new_secret_b32 but `enrollment_pending_for_verify` is set:
+    //       render only the verify form with a hint to wait for the
+    //       next 30s window. We DO NOT re-reveal the secret here —
+    //       repeatedly re-emitting it on every failed verify would
+    //       defeat the one-time-reveal property (Gate 4 happy-path B3
+    //       + security defence-in-depth: an attacker triggering verify
+    //       failures should not fish the secret back).
+    if (!enrollment_pending_for_verify.empty()) {
+        if (!new_otpauth_uri.empty()) {
+            // Server-rendered QR (issue #1232). The SVG is from the trusted
+            // qrcodegen encoder over our own otpauth URI — not operator input —
+            // so it is injected raw (it must not be html_escaped or it won't
+            // render). Empty on encode failure → text fallback still shows.
+            const std::string qr_svg = otpauth_qr_svg(new_otpauth_uri);
+            html += "<div class=\"token-reveal\">"
+                    "  <div class=\"token-reveal-header\">"
+                    "    SCAN THIS WITH YOUR AUTHENTICATOR APP — secret shown only once"
+                    "  </div>";
+            if (!qr_svg.empty()) {
+                html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
+                        "    <div style=\"background:#fff;padding:8px;border-radius:6px;"
+                        "line-height:0\">" +
+                        qr_svg +
+                        "</div>"
+                        "  </div>"
+                        "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                        "text-align:center\">Can't scan? Enter the secret below manually.</div>";
+            }
+            html += "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.5rem\">Base32 secret (manual entry):</div>"
+                    "  <code>" +
+                    html_escape(new_secret_b32) +
+                    "</code>"
+                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.5rem\">otpauth URI:</div>"
+                    "  <code style=\"display:block;word-break:break-all\">" +
+                    html_escape(new_otpauth_uri) +
+                    "</code>"
+                    "</div>";
+        } else {
+            html += "<div style=\"font-size:0.8rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-bottom:0.75rem\">"
+                    "Codes refresh every 30 seconds — wait for the next code shown by your "
+                    "authenticator and try again. If you have lost the original QR code, "
+                    "press <strong>Disable MFA</strong> below and restart enrollment."
+                    "</div>";
+        }
+        html += "<form hx-post=\"/api/settings/mfa/verify\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      style=\"margin-top:1rem\">"
+                "  <div class=\"mini-field\">"
+                "    <label>Verification code from your app</label>"
+                "    <input type=\"text\" name=\"code\" inputmode=\"numeric\" "
+                "autocomplete=\"one-time-code\" autocapitalize=\"none\" autocorrect=\"off\" "
+                "spellcheck=\"false\" required style=\"width:120px\">"
+                "  </div>"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Confirm</button>"
+                "  <button class=\"btn btn-secondary\" type=\"submit\""
+                "          hx-post=\"/api/settings/mfa/disable\""
+                "          hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "          formnovalidate"
+                "          style=\"margin-left:0.5rem\">Disable MFA</button>"
+                "</form>";
+        return html;
+    }
+
+    auto status_res = auth_db->mfa_status(username);
+    if (!status_res) {
+        return html + "<span style=\"color:#484f58\">User not found for MFA status.</span>";
+    }
+    const auto& status = *status_res;
+
+    if (!new_recovery_codes.empty()) {
+        html += "<div class=\"token-reveal\">"
+                "  <div class=\"token-reveal-header\">"
+                "    STORE THESE RECOVERY CODES NOW — each can be used once to bypass MFA"
+                "  </div>"
+                "  <ul style=\"font-family:var(--mono);margin:0.5rem 0;padding-left:1.25rem\">";
+        for (const auto& code : new_recovery_codes) {
+            html += "<li><code>" + html_escape(code) + "</code></li>";
+        }
+        html += "</ul></div>";
+    }
+
+    html += "<div style=\"display:flex;align-items:center;gap:1rem;margin-bottom:1rem\">";
+    if (status.enrolled) {
+        html += "<span class=\"yb\">Enabled</span>"
+                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Enrolled " +
+                html_escape(status.enrolled_at) + " UTC</span>";
+    } else if (!status.disabled_at.empty()) {
+        html += "<span class=\"yn\">Disabled</span>"
+                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Last disabled " +
+                html_escape(status.disabled_at) + " UTC</span>";
+    } else {
+        html += "<span class=\"yn\">Not enrolled</span>";
+    }
+    html += "</div>";
+
+    if (status.enrolled) {
+        html += "<div style=\"font-size:0.8rem;margin-bottom:0.75rem\">"
+                "Recovery codes remaining: <strong>" +
+                std::to_string(status.recovery_codes_remaining) +
+                "</strong></div>"
+                "<form hx-post=\"/api/settings/mfa/recovery-codes\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      style=\"display:inline-block;margin-right:0.5rem\">"
+                "  <button class=\"btn btn-secondary\" type=\"submit\">Regenerate recovery codes</button>"
+                "</form>"
+                "<form hx-post=\"/api/settings/mfa/disable\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      hx-confirm=\"Disable MFA for your account? Step-up authentication will no "
+                "longer be required.\""
+                "      style=\"display:inline-block\">"
+                "  <button class=\"btn btn-danger\" type=\"submit\">Disable MFA</button>"
+                "</form>";
+    } else {
+        html += "<form hx-post=\"/api/settings/mfa/init\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\">"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Enable MFA</button>"
+                "</form>";
+    }
     return html;
 }
 
@@ -1587,6 +1745,93 @@ std::string SettingsRoutes::render_data_retention_fragment() {
     return html;
 }
 
+std::string SettingsRoutes::render_dex_alerts_fragment() {
+    // Current state straight from runtime_config (the single source of truth;
+    // the live router/detector were fed the same values via the apply fn).
+    // Defaults derive from BlastRadiusConfig{} so the form can never drift from
+    // the struct defaults the POST clamp + update_alert_shape use (gov N1).
+    const BlastRadiusConfig kBlastDefaults{};
+    std::unordered_set<std::string> routed;
+    std::string min_dev = std::to_string(kBlastDefaults.min_devices);
+    std::string win_s = std::to_string(kBlastDefaults.window_seconds);
+    std::string cool_s = std::to_string(kBlastDefaults.cooldown_seconds);
+    if (runtime_config_store_ && runtime_config_store_->is_open()) {
+        routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
+        auto v = runtime_config_store_->get_value("dex_blast_min_devices");
+        if (!v.empty()) min_dev = v;
+        v = runtime_config_store_->get_value("dex_blast_window_seconds");
+        if (!v.empty()) win_s = v;
+        v = runtime_config_store_->get_value("dex_blast_cooldown_seconds");
+        if (!v.empty()) cool_s = v;
+    }
+
+    std::string html;
+
+    // ── Blast-radius alert shape ─────────────────────────────────────────────
+    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+            "margin-bottom:0.4rem\">FLEET BLAST-RADIUS THRESHOLDS</div>";
+    html += "<form hx-post=\"/api/settings/dex-alerts/blast\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
+    auto num_row = [&](const char* label, const char* name, const std::string& value,
+                       const char* hint) {
+        html += "<div class=\"form-row\"><label>" + std::string(label) +
+                "</label><input type=\"number\" name=\"" + name + "\" value=\"" +
+                html_escape(value) +
+                "\" style=\"width:7rem\"> <span style=\"font-size:0.7rem;color:#8b949e\">" +
+                hint + "</span></div>";
+    };
+    num_row("Min devices", "min_devices", min_dev, "distinct devices that make an incident (>= 2)");
+    num_row("Window (s)", "window_seconds", win_s, "sliding window, 60..86400");
+    num_row("Cooldown (s)", "cooldown_seconds", cool_s, "per-incident re-alert suppression");
+    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
+            "style=\"margin-top:0.3rem\">Save thresholds</button></form>";
+
+    // ── Per-signal routing ───────────────────────────────────────────────────
+    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+            "margin:1rem 0 0.4rem\">PER-SIGNAL ALERTS</div>"
+            "<p style=\"font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem\">"
+            "A routed signal raises an operator notification and fires the "
+            "<code>dex.signal</code> webhook event, once per device per hour. "
+            "Nothing is routed by default — blast-radius incidents always alert.</p>";
+    html += "<form hx-post=\"/api/settings/dex-alerts/routing\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
+    std::unordered_set<std::string> known;
+    for (const auto& g : dex_signal_groups()) {
+        // Open families that contain a routed type so current state is visible.
+        bool any_routed = false;
+        for (const char* t : g.types)
+            if (routed.count(t)) any_routed = true;
+        html += std::string("<details") + (any_routed ? " open" : "") +
+                "><summary style=\"cursor:pointer;font-size:0.78rem;padding:0.2rem 0\">" +
+                html_escape(g.name) + "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">";
+        for (const char* t : g.types) {
+            known.insert(t);
+            const bool checked = routed.count(t) > 0;
+            html += std::string("<label style=\"display:block;font-size:0.75rem;"
+                                "padding:0.1rem 0\"><input type=\"checkbox\" name=\"types\" "
+                                "value=\"") +
+                    t + "\"" + (checked ? " checked" : "") + "> " + dex_signal_label(t) +
+                    " <code style=\"font-size:0.65rem;color:#8b949e\">" + t + "</code></label>";
+        }
+        html += "</div></details>";
+    }
+    // Routed types no longer in the catalogue (config drift / newer-agent
+    // types): keep them visible and clearable rather than silently sticky.
+    std::string strays;
+    for (const auto& t : routed)
+        if (!known.count(t))
+            strays += "<label style=\"display:block;font-size:0.75rem\"><input "
+                      "type=\"checkbox\" name=\"types\" value=\"" +
+                      html_escape(t) + "\" checked> <code>" + html_escape(t) + "</code></label>";
+    if (!strays.empty())
+        html += "<details open><summary style=\"font-size:0.78rem\">Other routed types"
+                "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">" +
+                strays + "</div></details>";
+    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
+            "style=\"margin-top:0.5rem\">Save routing</button></form>";
+    return html;
+}
+
 std::string SettingsRoutes::render_mcp_fragment() {
     std::string html;
     bool mcp_enabled = !cfg_->mcp_disable;
@@ -2012,13 +2257,14 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider, metrics_registry);
+                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn));
 }
 
 void SettingsRoutes::register_routes(
@@ -2028,7 +2274,8 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
@@ -2049,6 +2296,7 @@ void SettingsRoutes::register_routes(
     oidc_mu_ = &oidc_mu;
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
+    step_up_fn_ = std::move(step_up_fn);
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2060,6 +2308,11 @@ void SettingsRoutes::register_routes(
     });
 
     // -- Settings HTMX fragment endpoints -------------------------------------
+    //
+    // NOTE: the Settings → Internal CA panel — `GET /fragments/settings/ca` and
+    // `POST /api/settings/ca/revoke` — is NOT here; it lives in `ca_routes.cpp`
+    // (PKI PR4b), which already owns the CaStore + CRL-publish callback. Look
+    // there for those two `/...settings/ca...` handlers.
 
     sink.Get("/fragments/settings/tls",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -2196,6 +2449,153 @@ void SettingsRoutes::register_routes(
                      return;
                  res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
              });
+
+    // -- F1: DEX alerting (per-signal routing + blast-radius thresholds) ------
+    sink.Get("/fragments/settings/dex-alerts",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!admin_fn_(req, res))
+                     return;
+                 res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+             });
+
+    sink.Post("/api/settings/dex-alerts/routing", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            return;
+        }
+        // Collect every checked "types" value from the urlencoded body and
+        // allowlist it against the catalogue — a hand-crafted POST cannot
+        // inject arbitrary strings into the stored routing set. (Types absent
+        // from the catalogue but ALREADY routed stay re-saveable so the
+        // "Other routed types" rows remain clearable; brand-new unknown
+        // strings are dropped.)
+        std::unordered_set<std::string> catalogue;
+        for (const auto& g : dex_signal_groups())
+            for (const char* t : g.types)
+                catalogue.insert(t);
+        const auto previously =
+            parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
+        std::unordered_set<std::string> selected;
+        std::size_t pos = 0;
+        while (pos < req.body.size() && selected.size() < 512) {
+            const auto amp = req.body.find('&', pos);
+            const auto pair = req.body.substr(
+                pos, (amp == std::string::npos ? req.body.size() : amp) - pos);
+            pos = (amp == std::string::npos) ? req.body.size() : amp + 1;
+            if (!pair.starts_with("types="))
+                continue;
+            std::string v = pair.substr(6);
+            // obs_types are [a-z_.] — percent-decode just %2E defensively and
+            // reject anything else encoded (no legitimate type needs it).
+            std::string decoded;
+            decoded.reserve(v.size());
+            bool bad = false;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                const char c = v[i];
+                if (c == '%') {
+                    if (v.compare(i, 3, "%2E") == 0 || v.compare(i, 3, "%2e") == 0) {
+                        decoded += '.';
+                        i += 2;
+                    } else {
+                        bad = true;
+                        break;
+                    }
+                } else if (c == '+') {
+                    bad = true; // no spaces in obs_types
+                    break;
+                } else {
+                    decoded += c;
+                }
+            }
+            if (bad || decoded.empty() || decoded.size() > 128)
+                continue;
+            if (catalogue.count(decoded) || previously.count(decoded))
+                selected.insert(std::move(decoded));
+        }
+        auto session = auth_fn_(req, res);
+        const auto json = routed_types_to_json(selected);
+        auto rc = runtime_config_store_->set("dex_alert_routing", json,
+                                             session ? session->username : "unknown");
+        if (!rc) {
+            res.status = 500;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Failed to save routing","level":"error"}})");
+            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
+                                "</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (dex_alert_apply_fn_)
+            dex_alert_apply_fn_(); // live — no restart
+        // Record the FULL routed set, not just a count: runtime_config is a
+        // key→value store with no history, so this audit row is the sole
+        // change-management evidence of WHICH types were routed (gov compliance).
+        audit_fn_(req, "settings.dex_alerts.routing", "success", "RuntimeConfig",
+                  "dex_alert_routing", "routed=" + json);
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"DEX alert routing saved","level":"success"}})");
+        res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/dex-alerts/blast", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            return;
+        }
+        // Clamp server-side to the same ranges update_alert_shape enforces, so
+        // the STORED values always match the LIVE values (no silent divergence
+        // between what the UI shows and what the detector runs).
+        auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
+            try {
+                const auto v = extract_form_value(req.body, field);
+                if (!v.empty())
+                    return std::clamp(std::stoi(v), lo, hi);
+            } catch (...) {}
+            return fallback;
+        };
+        const BlastRadiusConfig d{};
+        const int min_dev = clamp_int("min_devices", 2, 100000, d.min_devices);
+        const int win_s = clamp_int("window_seconds", 60, 86400, d.window_seconds);
+        const int cool_s = clamp_int("cooldown_seconds", 0, 7 * 86400, d.cooldown_seconds);
+        auto session = auth_fn_(req, res);
+        const std::string by = session ? session->username : "unknown";
+        bool ok = true;
+        ok &= runtime_config_store_->set("dex_blast_min_devices", std::to_string(min_dev), by)
+                  .has_value();
+        ok &= runtime_config_store_->set("dex_blast_window_seconds", std::to_string(win_s), by)
+                  .has_value();
+        ok &= runtime_config_store_->set("dex_blast_cooldown_seconds", std::to_string(cool_s), by)
+                  .has_value();
+        if (!ok) {
+            res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
+            res.set_content("<span class=\"feedback-error\">Failed to persist thresholds.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (dex_alert_apply_fn_)
+            dex_alert_apply_fn_(); // live — no restart
+        audit_fn_(req, "settings.dex_alerts.blast", "success", "RuntimeConfig",
+                  "dex_blast_thresholds",
+                  "min_devices=" + std::to_string(min_dev) + ", window=" + std::to_string(win_s) +
+                      "s, cooldown=" + std::to_string(cool_s) + "s");
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"Blast-radius thresholds saved","level":"success"}})");
+        res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+    });
 
     sink.Get("/fragments/settings/plugin-signing",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -2967,6 +3367,12 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Deleting a user destroys a principal;
+        // require fresh MFA proof. Sits after admin_fn (no point step-
+        // upping a non-admin) but before any state mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/users/{username}"))
+            return;
         if (session->username.empty()) {
             // Defense-in-depth: an empty session->username would let
             // a hand-crafted DELETE against an empty-username row
@@ -3050,6 +3456,11 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Role changes promote/demote a
+        // principal's authority; require fresh MFA proof.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "POST /api/settings/users/{username}/role"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users/:username/role: session has empty username");
             res.status = 500;
@@ -3857,6 +4268,284 @@ void SettingsRoutes::register_routes(
                   }
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+              });
+
+    // ── MFA / TOTP self-service (`/auth-and-authz` P0 #1, SOC 2 CC6.6) ──────
+    //
+    // Admin-only for PR1 — non-admin operator UX is a follow-up. Each
+    // mutation re-renders the panel via the same `#mfa-section` target so
+    // the new state (or one-time reveal) lands without a full page reload.
+    //
+    // Audit verbs use `target_type="User"` (PascalCase per
+    // observability-conventions.md spec) and `result ∈ {ok, error}`
+    // (spec vocabulary), distinct from the historical lowercase
+    // `target_type="user"` + `success/failure` used elsewhere in
+    // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
+    //
+    // `Cache-Control: no-store, private` is set on every response that
+    // contains a one-time secret (init's otpauth URI / base32 secret,
+    // verify's recovery codes, recovery-codes regenerate) so the
+    // browser/proxy/CDN cannot retain the material past the response
+    // lifetime (Gate 4 unhappy-path UP-9).
+    auto set_no_store = [](httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store, private");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Referrer-Policy", "no-referrer");
+    };
+
+    // Origin/Referer CSRF gate — Hermes Agent red-team finding MEDIUM #2
+    // (2026-05-29). Every Settings MFA POST mutates per-user MFA state
+    // using session-cookie auth alone; SameSite=Lax is not strict enough
+    // to stop a cross-site form POST from disabling MFA on a victim
+    // session. We require Origin (or Referer as fallback) to carry the
+    // same host as the request's Host header; absence means a non-
+    // browser caller (curl, automation) which is explicitly allowed
+    // because programmatic admin clients post without an Origin header.
+    // Mismatched host → 403, audited as csrf.denied for SIEM correlation.
+    //
+    // Hardenings from the re-review round of the Hermes fixes:
+    //  - audit detail is sanitised (Gate 2 MEDIUM) — operator-controlled
+    //    header bytes go through a control-char-stripping helper capped
+    //    at 128 bytes per field so they cannot poison the audit row;
+    //  - default ports are normalised (Gate 2 LOW) so a reverse proxy
+    //    that strips `:443` / `:80` from `Host` does not false-deny
+    //    legitimate same-origin POSTs;
+    //  - userinfo / fragment / query chars are rejected (Gate 2 LOW) —
+    //    RFC 6454 forbids userinfo in `Origin` and httplib does not
+    //    validate URL shape, so anything containing `@`, `?`, or `#`
+    //    is treated as a fail-closed mismatch.
+    //
+    // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
+    // wired into the 4 mutating MFA POSTs only. 11 sibling state-
+    // changing Settings POSTs (/api/settings/users/*, plugin-signing,
+    // OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
+    // pending a follow-up PR that wraps every admin HTMX mutation. The
+    // asymmetric defence is documented in CHANGELOG and is NOT a
+    // regression introduced by this PR — those sites were unprotected
+    // before PR1 too.
+    auto sanitise = [](std::string_view in, std::size_t max_len = 128) -> std::string {
+        std::string out;
+        out.reserve(std::min(in.size(), max_len));
+        for (char c : in) {
+            if (out.size() >= max_len)
+                break;
+            unsigned char u = static_cast<unsigned char>(c);
+            // Strip C0 controls, DEL, and high-bit bytes — exact policy
+            // from fleet_topology_store.cpp::sanitise_for_audit.
+            if (u < 0x20 || u == 0x7f || u >= 0x80) {
+                out.push_back(' ');
+            } else {
+                out.push_back(static_cast<char>(u));
+            }
+        }
+        return out;
+    };
+    auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
+                                        const std::string& action_for_audit) -> bool {
+        auto host = req.get_header_value("Host");
+        auto origin = req.get_header_value("Origin");
+        auto referer = req.get_header_value("Referer");
+
+        // Shared same-site comparison (web_utils) — one implementation across
+        // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
+        // audit; ca_routes' dashboard revoke calls the same helper.
+        if (origin_is_same_site(host, origin, referer)) {
+            return true;
+        }
+        res.status = 403;
+        res.set_content(
+            R"({"error":{"code":403,"message":"cross-origin POST refused"},"meta":{"api_version":"v1"}})",
+            "application/json");
+        audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
+                  "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
+                      " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
+        return false;
+    };
+
+    sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session || session->username.empty()) {
+            res.status = 401;
+            return;
+        }
+        res.set_content(render_mfa_fragment(session->username), "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/mfa/init", [this, set_no_store, origin_safe](
+                                            const httplib::Request& req, httplib::Response& res) {
+        if (!origin_safe(req, res, "/api/settings/mfa/init"))
+            return;
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session || session->username.empty()) {
+            res.status = 401;
+            return;
+        }
+        auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+        if (!db) {
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
+                      "auth_db unavailable");
+            res.set_content(
+                render_mfa_fragment(session->username, {}, {}, {}, {}, "MFA backend unavailable"),
+                "text/html; charset=utf-8");
+            return;
+        }
+        auto init = db->mfa_init_enrollment(session->username, "Yuzu");
+        if (!init) {
+            const char* msg = "Enrollment failed";
+            if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
+                msg = "MFA is already enabled — disable it first to re-enroll";
+            }
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
+            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        audit_fn_(req, "mfa.enroll.initiated", "ok", "User", session->username, "");
+        set_no_store(res);
+        res.set_content(render_mfa_fragment(session->username, init->otpauth_uri,
+                                            init->secret_base32, {}, session->username),
+                        "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/mfa/verify",
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/verify"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto code = extract_form_value(req.body, "code");
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto codes_res = db->mfa_verify_enrollment(session->username, code);
+                  if (!codes_res) {
+                      // Re-render the verify form (no QR re-reveal — the
+                      // provisional row survives so the operator's
+                      // authenticator app still works at the next 30s
+                      // step). Setting `enrollment_pending_for_verify`
+                      // routes the renderer to the retry shape; leaving
+                      // `new_otpauth_uri` empty suppresses the
+                      // one-time secret reveal (Gate 4 happy-path B3).
+                      audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                                "code rejected");
+                      const char* msg = "Code rejected. Try the next code shown by your "
+                                        "authenticator (codes refresh every 30 seconds).";
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {},
+                                                          session->username, msg),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
+                            session->username, "10 codes issued");
+                  set_no_store(res);
+                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes_res),
+                                  "text/html; charset=utf-8");
+              });
+
+    sink.Post("/api/settings/mfa/recovery-codes",
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/recovery-codes"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  if (!codes) {
+                      audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
+                                session->username, "regeneration failed");
+                      res.set_content(
+                          render_mfa_fragment(session->username, {}, {}, {}, {},
+                                              "Could not regenerate codes"),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
+                            session->username, "10 codes issued (rotation)");
+                  set_no_store(res);
+                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes),
+                                  "text/html; charset=utf-8");
+              });
+
+    sink.Post("/api/settings/mfa/disable",
+              [this, origin_safe](const httplib::Request& req, httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/disable"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  // Self-target guard (PR3 / docs-mfa invariant #7). Under an
+                  // active enforcement mode an operator may not strip MFA
+                  // from their own account: it would force re-enrollment at
+                  // their next login and leave the current privileged
+                  // session unable to clear the step-up gate. `required`
+                  // protects every role; `admin-only` protects admins. The
+                  // block is audited and surfaced inline (matching the
+                  // handler's other error paths — fragment + message, no
+                  // status override, so the HTMX swap still renders).
+                  const std::string mfa_mode = cfg_ ? cfg_->mfa_enforcement : "optional";
+                  const bool enforcement_protects_self =
+                      mfa_enforcement_protects(mfa_mode, session->role);
+                  if (enforcement_protects_self) {
+                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
+                                "blocked: mfa_enforcement=" + mfa_mode);
+                      res.set_content(
+                          render_mfa_fragment(
+                              session->username, {}, {}, {}, {},
+                              "MFA is required by policy (enforcement=" + mfa_mode +
+                                  ") and cannot be disabled for your account."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto r = db->mfa_disable(session->username);
+                  if (!r) {
+                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
+                                "disable failed");
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "Could not disable MFA"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
+                  res.set_content(render_mfa_fragment(session->username),
+                                  "text/html; charset=utf-8");
               });
 }
 

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace yuzu::server::auth {
 class AuthManager;
@@ -22,6 +23,25 @@ struct Config {
     std::filesystem::path tls_server_key;  // PEM server private key
     std::filesystem::path tls_ca_cert;     // For mTLS agent verification
     bool allow_one_way_tls{false};         // Permit TLS without client cert verification
+
+    // PKI default certs (PR2). With no operator cert flags and without
+    // --no-default-certs, the server generates a per-install CA + server-side
+    // leaves on first boot (default_certs.hpp). `ca_dir` defaults to
+    // auth::default_cert_dir() when empty; `using_default_certs` is runtime state
+    // the bootstrap sets to drive the notification surfaces + the
+    // request-but-don't-require agent-listener posture (per-agent mTLS is PR3).
+    bool no_default_certs{false};
+    bool using_default_certs{false};       // any surface on default certs — drives notifications
+    bool using_default_agent_certs{false}; // agent listener on default certs (don't-require posture)
+    std::filesystem::path ca_dir;
+    // Extra Subject Alternative Names to inject into the auto-generated default
+    // leaves (--cert-san, repeatable). Each value is "dns:<name>", "ip:<addr>",
+    // or a bare value auto-classified by IP-literal shape; a single value may be
+    // comma-separated. Applied to every default leaf (https/server/gateway) so an
+    // operator can make the built-in certs valid for a deployment hostname or IP
+    // (e.g. "dns:gateway" so an agent verifying a gateway reached by that name
+    // succeeds). Ignored when operator certs are supplied or --no-default-certs.
+    std::vector<std::string> cert_sans;
 
     // Optional management listener TLS override.
     // If left empty, management reuses the agent listener credentials.
@@ -50,6 +70,22 @@ struct Config {
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
+
+    // #1128: operator-declared multi-egress NAT/proxy ranges. When a direct-
+    // connect agent's Register and Subscribe present different source IPs that
+    // BOTH fall inside one of these CIDRs, the per-session peer-IP mismatch is
+    // downgraded to advisory (audit + metric) instead of rejected. Empty = the
+    // strict exact-match binding (default, no relaxation).
+    std::vector<std::string> trusted_nat_cidrs;
+
+    // #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. When
+    // true, a peer-IP mismatch is also downgraded to advisory if the Subscribe
+    // mTLS identity matches the one bound at Register. SAFE ONLY WITH PER-AGENT
+    // CLIENT CERTS — a shared/fleet-wide cert makes every identity "match",
+    // which would let an insider replay another agent's session from its own IP
+    // (the IP guard is waived). Default false: identity-match never relaxes the
+    // IP binding unless the operator affirms per-agent certs via this flag.
+    bool nat_trust_mtls_identity{false};
 
     // NVD CVE feed
     std::string nvd_api_key; // Optional NVD API key for higher rate limits
@@ -116,6 +152,21 @@ struct Config {
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
 
+    // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
+    // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-
+    // service enrollment, no enforcement at login). PR3 wires admin-only /
+    // required by gating /login against users.mfa_enrolled_at.
+    std::string mfa_enforcement{"optional"}; // "optional" | "admin-only" | "required"
+    /// How long after a successful MFA proof (login or step-up) high-risk
+    /// endpoints accept the session as "stepped up" without re-prompting.
+    /// Default 300 s mirrors common bank/SaaS UX. Lowering to <60 s pushes
+    /// every privileged click through TOTP; raising to >900 s weakens
+    /// the CC6.6 evidence chain.
+    int mfa_step_up_window_secs{300};
+    /// How long the intermediate "mfa_pending" token is valid (window
+    /// between password success and TOTP submission). Default 120 s.
+    int mfa_login_pending_secs{120};
+
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
@@ -163,6 +214,11 @@ public:
 
     /** Graceful shutdown. Thread-safe. */
     virtual void stop() noexcept = 0;
+
+    /** True when run() returned because startup failed (refuse-to-start), so the
+     *  caller can exit non-zero — systemd Restart=on-failure / k8s crashloop
+     *  detection need a non-zero code, not a silent clean exit. Default false. */
+    [[nodiscard]] virtual bool startup_failed() const { return false; }
 };
 
 } // namespace yuzu::server

@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cerrno>
+#include <cstdint> // std::uintmax_t (sha256_file bounded-read counter, used before the #ifdef)
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -45,7 +46,7 @@ namespace yuzu::agent {
 
 // ── SHA-256 file hashing ─────────────────────────────────────────────────────
 
-std::string sha256_file(const std::filesystem::path& path) {
+std::string sha256_file(const std::filesystem::path& path, std::size_t max_bytes) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         spdlog::error("sha256_file: cannot open {}", path.string());
@@ -56,6 +57,7 @@ std::string sha256_file(const std::filesystem::path& path) {
     char buf[kBufSize];
     constexpr size_t kDigestLen = 32;
     unsigned char digest[kDigestLen]{};
+    std::uintmax_t hashed_total = 0; // bounded-read guard against max_bytes
 
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE alg = nullptr;
@@ -74,6 +76,12 @@ std::string sha256_file(const std::filesystem::path& path) {
     }
 
     while (f.read(buf, kBufSize) || f.gcount() > 0) {
+        hashed_total += static_cast<std::uintmax_t>(f.gcount());
+        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
         if (!BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf),
                                            static_cast<ULONG>(f.gcount()), 0))) {
             BCryptDestroyHash(hash);
@@ -98,6 +106,11 @@ std::string sha256_file(const std::filesystem::path& path) {
     }
 
     while (f.read(buf, kBufSize) || f.gcount() > 0) {
+        hashed_total += static_cast<std::uintmax_t>(f.gcount());
+        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+            EVP_MD_CTX_free(ctx);
+            return {};
+        }
         EVP_DigestUpdate(ctx, buf, static_cast<size_t>(f.gcount()));
         if (f.eof())
             break;
@@ -778,7 +791,27 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         auto loaded = PluginHandle::load(entry.path());
 #endif
         if (loaded) {
-            const std::string_view plugin_name{loaded->descriptor()->name};
+            // The descriptor name is plugin-self-declared and crosses the C ABI
+            // as a bare `const char*`. Validate it before constructing a
+            // std::string_view from it — the string_view(const char*) ctor calls
+            // strlen, which is UB on a null pointer that a malformed C plugin
+            // could set — and before any reserved-name / dispatch comparison, so
+            // a crafted name cannot diverge between this security check and a
+            // downstream C-string consumer of descriptor->name (#822).
+            const char* raw_name = loaded->descriptor()->name;
+            if (raw_name == nullptr || !is_valid_plugin_name(raw_name)) {
+                // Do NOT echo raw_name: it may carry NUL/control/newline bytes
+                // that would forge log lines or corrupt the error channel. The
+                // on-disk entry path is operator-controlled and safe to log.
+                spdlog::error("Plugin {} declares an invalid name — rejecting (a "
+                              "plugin name must be a non-empty [A-Za-z0-9_] "
+                              "identifier of at most {} bytes)",
+                              entry.path().string(), kMaxPluginNameLen);
+                result.errors.push_back(
+                    LoadError{entry.path().string(), std::string{kInvalidNameReason}});
+                continue;
+            }
+            const std::string_view plugin_name{raw_name};
             if (is_reserved_plugin_name(plugin_name)) {
                 // #453: prevent a compromised plugin author from shadowing
                 // the Guardian (__guard__) or other reserved dispatch names.

@@ -465,6 +465,100 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     return token;
 }
 
+std::optional<Role> AuthManager::verify_password(const std::string& username,
+                                                 const std::string& password) {
+    // Mirrors authenticate() up to the credential check but stops short of
+    // session creation. Histogram labels match authenticate() so dashboards
+    // continue to roll up "password verify" cost across both call sites.
+    const auto t_start = std::chrono::steady_clock::now();
+    std::shared_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end()) {
+        spdlog::warn("verify_password failed: unknown user '{}'", username);
+        if (metrics_) {
+            const auto elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            metrics_
+                ->histogram("yuzu_auth_login_duration_seconds",
+                            {{"method", "password"}, {"result", "unknown_user"}})
+                .observe(elapsed);
+        }
+        return std::nullopt;
+    }
+    auto salt = hex_to_bytes(it->second.salt_hex);
+    auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
+    if (!constant_time_compare(hash, it->second.hash_hex)) {
+        spdlog::warn("verify_password failed: bad password for '{}'", username);
+        if (metrics_) {
+            const auto elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            metrics_
+                ->histogram("yuzu_auth_login_duration_seconds",
+                            {{"method", "password"}, {"result", "bad_password"}})
+                .observe(elapsed);
+        }
+        return std::nullopt;
+    }
+    auto role = it->second.role;
+    lock.unlock();
+    if (auth_db_) {
+        auto db_user = auth_db_->get_user(username);
+        if (!db_user) {
+            spdlog::warn("verify_password failed: user '{}' not active in AuthDB", username);
+            return std::nullopt;
+        }
+    }
+    if (metrics_) {
+        const auto elapsed =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        metrics_
+            ->histogram("yuzu_auth_login_duration_seconds",
+                        {{"method", "password"}, {"result", "success"}})
+            .observe(elapsed);
+    }
+    return role;
+}
+
+std::string AuthManager::create_local_session(const std::string& username, Role role,
+                                              bool mfa_verified) {
+    auto token = generate_session_token();
+    Session s;
+    s.username = username;
+    s.role = role;
+    s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source = "local";
+    if (mfa_verified) {
+        s.mfa_verified_at = std::chrono::steady_clock::now();
+    }
+    {
+        std::unique_lock lock(mu_);
+        sessions_[token] = std::move(s);
+    }
+    // Stamp last_login_at on every successful login, not just the
+    // MFA-verified TOTP path. The MFA-verified TOTP path already does
+    // this as part of its counter UPDATE so calling here is harmless
+    // duplicated work for that branch; for the no-MFA, recovery-code,
+    // and OIDC paths it is the only place the column gets written.
+    // Best-effort — touch_last_login is fail-silent (Gate 4
+    // happy-path B1).
+    if (auth_db_) {
+        auth_db_->touch_last_login(username);
+    }
+    spdlog::info("Local session created for '{}' (mfa_verified={})", username, mfa_verified);
+    return token;
+}
+
+bool AuthManager::mark_session_mfa_verified(const std::string& token) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return false;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return false;
+    it->second.mfa_verified_at = std::chrono::steady_clock::now();
+    return true;
+}
+
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
     // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
     // This check intentionally fires BEFORE the mutex acquire below — rejecting
@@ -681,7 +775,8 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& email, const std::string& oidc_sub,
                                              const std::vector<std::string>& groups,
-                                             const std::string& admin_group_id) {
+                                             const std::string& admin_group_id,
+                                             std::chrono::steady_clock::time_point mfa_verified_at) {
     std::unique_lock lock(mu_);
 
     // Determine role: admin if user is in the configured admin group.
@@ -704,6 +799,7 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
     s.oidc_sub = oidc_sub;
+    s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
     spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",

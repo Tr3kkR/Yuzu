@@ -6,11 +6,14 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -22,6 +25,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 
 // Forward declarations to avoid pulling in full store headers
@@ -39,6 +43,9 @@ class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
 class HeartbeatIngestion;
+class GuaranteedStateStore;
+class BlastRadiusDetector;
+class DexAlertRouter;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -57,6 +64,14 @@ public:
                      UpdateRegistry* update_registry = nullptr);
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+    /// #1128: operator-declared multi-egress NAT/proxy CIDRs for the NAT-aware
+    /// Subscribe binding relaxation. Empty (default) keeps strict exact-match.
+    void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
+        trusted_nat_cidrs_ = std::move(cidrs);
+    }
+    /// #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. Default
+    /// false; only safe with per-agent client certs (see Config doc).
+    void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
@@ -76,6 +91,23 @@ public:
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
     void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+    /// Guardian (Guaranteed State) store — receives drift/remediation events
+    /// ingested from the agent `__guard__` side-channel on the Subscribe stream
+    /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
+    /// build a Guardian store.
+    void set_guaranteed_state_store(GuaranteedStateStore* store) {
+        guaranteed_state_store_ = store;
+    }
+    /// Fleet-wide DEX incident detector (blast radius, coverage-map D3) — the
+    /// shared Guardian ingest feeds it each ruleless observation. nullptr
+    /// disables detection. Set-before-traffic, like the store setters above.
+    void set_blast_radius_detector(BlastRadiusDetector* detector) {
+        blast_radius_detector_ = detector;
+    }
+    /// Operator-routed per-signal alerting (coverage-map F1) — fed alongside
+    /// the blast-radius detector at the same ingest chokepoint. nullptr
+    /// disables routing. Set-before-traffic.
+    void set_dex_alert_router(DexAlertRouter* router) { dex_alert_router_ = router; }
 
     /// UAT 2026-05-12: after a fresh agent registers, the next
     /// `/api/v1/viz/fleet/topology` call must not return a snapshot
@@ -115,6 +147,34 @@ public:
     void set_execution_tracker(ExecutionTracker* tracker) {
         execution_tracker_.store(tracker, std::memory_order_release);
     }
+
+    /// PR3: per-agent mTLS issuance + enforcement. The signer (wired by ServerImpl
+    /// after the default-cert bootstrap, when a CA issuing key is available) signs a
+    /// client leaf bound to agent_id from the agent's CSR, returning
+    /// {leaf_pem, ca_chain_pem}; nullopt = signing unavailable/failed. The revocation
+    /// checker returns true iff a presented peer leaf PEM is revoked (checked against
+    /// ca.db). set_require_client_identity recomputes the mTLS-identity-required
+    /// posture AFTER bootstrap — require_client_identity_ is otherwise baked at ctor,
+    /// before the default CA exists. All set once during bring-up, before the gRPC
+    /// dispatcher accepts traffic.
+    /// `src` records whether issuance entered via the direct Register path or the
+    /// gateway proxy, threaded into the ca.cert.issued audit (#1290).
+    using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
+        const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
+    void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
+    void set_revocation_checker(std::function<bool(const std::string& peer_cert_pem)> checker) {
+        revocation_checker_ = std::move(checker);
+    }
+    /// Recognizer returning true iff a presented client leaf was issued by our
+    /// internal CA (signature-verified). When set, the Register re-auth gate
+    /// enforces identity/revocation ONLY for Yuzu-issued certs — a foreign cert in
+    /// a multi-CA trust bundle falls through to bootstrap rather than being trusted
+    /// as an agent identity (Hermes CRITICAL-1). Null = single-trust-root
+    /// deployment: every authenticated cert is treated as an agent (legacy).
+    void set_peer_cert_recognizer(std::function<bool(const std::string& peer_cert_pem)> r) {
+        peer_cert_recognizer_ = std::move(r);
+    }
+    void set_require_client_identity(bool v) { require_client_identity_ = v; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
@@ -161,6 +221,20 @@ public:
     ///
     /// Public for unit testability — exercised in test_agent_service_impl.cpp.
     static std::string extract_peer_ip(std::string_view peer);
+
+    /// #1128 — NAT-aware per-session peer-binding decision (pure). `exact_ok` is
+    /// the strict result (Subscribe IP == Register IP, or a trusted-gateway IP
+    /// under gateway-mode). When that fails, a mismatch is DOWNGRADED to advisory
+    /// iff a stronger accommodation applies: a matching mTLS client identity
+    /// (`client_identity_matches`), or both IPs sharing one operator-declared
+    /// trusted NAT CIDR. Anything else is reject. An empty `register_ip` or
+    /// `subscribe_ip` is always reject (#826: empty is a mismatch, never a
+    /// wildcard) regardless of accommodation. Pure + static for unit testability.
+    enum class PeerBindingOutcome { exact_ok, advisory_mtls, advisory_nat_cidr, reject };
+    static PeerBindingOutcome evaluate_peer_binding(bool exact_ok, std::string_view register_ip,
+                                                    std::string_view subscribe_ip,
+                                                    bool client_identity_matches,
+                                                    const std::vector<std::string>& trusted_nat_cidrs);
 
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
@@ -231,6 +305,14 @@ private:
     std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};
     bool gateway_mode_{false};
+    // #1128: operator-declared multi-egress NAT/proxy ranges (see Config). Empty
+    // = strict exact-match peer binding (default). Set once at wiring time via
+    // set_trusted_nat_cidrs; read-only on the Subscribe path thereafter.
+    std::vector<std::string> trusted_nat_cidrs_;
+    // #1128 / gov UP-2: gate for the mTLS-identity NAT accommodation. Default
+    // false — identity-match relaxes the IP binding ONLY when the operator
+    // affirms per-agent certs. See Config::nat_trust_mtls_identity.
+    bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
@@ -242,6 +324,9 @@ private:
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    BlastRadiusDetector* blast_radius_detector_{nullptr};
+    DexAlertRouter* dex_alert_router_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached
@@ -249,7 +334,15 @@ private:
     /// pair instead of a plain raw pointer.
     std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
 
+    // PR3 per-agent mTLS (set post-bootstrap; empty = disabled / legacy path).
+    AgentCertSigner agent_cert_signer_;
+    std::function<bool(const std::string&)> revocation_checker_;
+    std::function<bool(const std::string&)> peer_cert_recognizer_;
+
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
+    /// PR3: the presented client leaf PEM from the gRPC auth context (the
+    /// x509_pem_cert property), or empty if no client cert was presented.
+    static std::string extract_peer_cert_pem(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
                                                const std::string& agent_id);
     static std::string client_metadata_value(const grpc::ServerContext& context,
@@ -259,6 +352,14 @@ private:
 
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
+
+    /// PR3: if a Yuzu-issued client leaf is presented and revoked, return a
+    /// non-OK status to send back; otherwise grpc::Status::OK. Lets the
+    /// agent-initiated RPCs (Heartbeat, DownloadUpdate) lock out a revoked agent
+    /// from liveness + OTA, not just the command channel — `Subscribe` keeps its
+    /// own richer audited gate. No-op when no checker is wired or no/foreign cert
+    /// is presented (the checker is issuer-scoped). `rpc` labels the metric/log.
+    grpc::Status reject_revoked_peer(grpc::ServerContext* context, std::string_view rpc);
 
     /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
     /// state change for the given command_id. Resolves command_id →

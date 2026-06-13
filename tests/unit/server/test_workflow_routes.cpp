@@ -162,7 +162,8 @@ struct ExecHarness {
         };
         auto emit_fn = [](const std::string&, const httplib::Request&) {
         };
-        auto scope_fn = [](const std::string&) -> std::pair<std::size_t, std::size_t> {
+        auto scope_fn = [](const std::string&,
+                           const std::string&) -> std::pair<std::size_t, std::size_t> {
             return {0, 0};
         };
         // PR 2: cmd_dispatch signature gained `execution_id` parameter so

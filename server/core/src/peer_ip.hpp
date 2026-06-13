@@ -156,4 +156,24 @@ inline std::string extract_peer_ip(std::string_view peer) {
     return {};
 }
 
+/// Normalize a BARE IP literal (no gRPC `ipv4:`/`ipv6:[...]` scheme, no port)
+/// to canonical form, or return empty if it is not a valid IPv4 / IPv6 literal.
+///
+/// For cross-process IP values that arrive WITHOUT the gRPC peer framing — e.g.
+/// `RegisterRequest.gateway_observed_peer` (#1064), filled by the Erlang gateway
+/// with the agent's origin IP. Reuses the same strict validators as
+/// extract_peer_ip (leading-zero octets, malformed bodies → empty), so a
+/// crafted value can't smuggle a non-canonical address into an audit row. IPv4
+/// is returned as-is; IPv6 is lowercased to match extract_peer_ip's
+/// canonicalization, so the two sources compare equal.
+inline std::string normalize_bare_ip(std::string_view s) {
+    if (s.empty())
+        return {};
+    if (is_valid_ipv4(s))
+        return std::string(s);
+    if (is_plausible_ipv6(s))
+        return to_lower_ascii(s);
+    return {};
+}
+
 } // namespace yuzu::server::detail

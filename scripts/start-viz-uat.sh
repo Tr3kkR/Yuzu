@@ -17,7 +17,24 @@
 #   VIZ_UAT_DIR           default: /tmp/yuzu-viz-uat
 #   VIZ_UAT_AGENTS        default: 1     (compose --scale agent=N)
 #   VIZ_UAT_AGENT_MODE    default: container
-#                           container  : in-container agent (default; thin host)
+#                           container  : in-container agent (default; thin host;
+#                                        scale with VIZ_UAT_AGENTS, opaque
+#                                        container-hash hostnames)
+#                           cedar-vale-local : three NAMED in-container agents
+#                                        (yuzu-frontend / yuzu-app / yuzu-db) via
+#                                        the cedar-vale-local compose profile, so
+#                                        /viz/fleet labels the three tiers by name
+#                                        WITHOUT needing OrbStack VMs. No orb, no
+#                                        macOS dependency. Each tier is exactly one
+#                                        replica (VIZ_UAT_AGENTS is ignored).
+#                           cedar-vale-app : three NAMED tiers running REAL
+#                                        services (Envoy -> node -> Postgres),
+#                                        each co-hosting an agent, so /viz/fleet
+#                                        renders the stack (frontend top / app
+#                                        middle / db bottom) with two persistent
+#                                        blue tubes. node serves an impress.js
+#                                        deck whose slides live in Postgres; the
+#                                        deck is at http://localhost:8088.
 #                           vm         : skip in-container agent, print enrollment-
 #                                        token + host gateway addr for native
 #                                        yuzu-agent on OrbStack VM / bare metal
@@ -27,7 +44,9 @@
 #                                        three-tier company (yuzu-frontend /
 #                                        yuzu-app / yuzu-db) and restart their
 #                                        agents so /viz/fleet renders all three
-#                                        tiers with real loopback IPC traffic
+#                                        tiers with real loopback IPC traffic.
+#                                        (macOS/orb only — use cedar-vale-local
+#                                        on a Linux/WSL2 box.)
 #                           none       : skip agent startup entirely
 #   VIZ_UAT_CV_VMS        default: "yuzu-frontend yuzu-app yuzu-db"
 #                           Space-separated list of OrbStack VMs for cedar-vale
@@ -79,7 +98,8 @@ cmd_stop() {
   # down explicitly rather than relying on --remove-orphans heuristic
   # (gov R8 build-ci SHOULD).
   ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-      docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
+      docker compose -f "$COMPOSE_FILE" \
+        --profile in-container-agent --profile cedar-vale-local --profile cedar-vale-app \
         down -v --remove-orphans ) || true
 
   # Stop the Cedar & Vale VM agents (if present) so they don't sit in a
@@ -100,13 +120,15 @@ cmd_stop() {
 
 cmd_status() {
   ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-      docker compose -f "$COMPOSE_FILE" --profile in-container-agent ps )
+      docker compose -f "$COMPOSE_FILE" \
+        --profile in-container-agent --profile cedar-vale-local --profile cedar-vale-app ps )
   echo ""
   info "Last 20 lines from each service:"
-  for svc in server gateway agent; do
+  for svc in server gateway agent agent-frontend agent-app agent-db cv-frontend cv-app cv-db; do
     echo "── $svc ──"
     ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-        docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
+        docker compose -f "$COMPOSE_FILE" \
+          --profile in-container-agent --profile cedar-vale-local --profile cedar-vale-app \
           logs --tail=20 "$svc" 2>/dev/null ) || true
     echo ""
   done
@@ -236,7 +258,14 @@ salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', '${ADMIN_PASS}'.encode(), salt, 100000, dklen=32)
 print(f'${ADMIN_USER}:admin:{salt.hex()}:{dk.hex()}')
 " > "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
-  chmod 600 "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
+  # 644 (not 600): this file is bind-mounted into yuzu-viz-server, which runs
+  # as uid 999 (`yuzu`) inside the container. The host file is owned by the
+  # operator's uid (typically 1000), so mode 600 made it unreadable from the
+  # container → the server's first-run setup fired, read empty stdin (no TTY),
+  # and the password floor killed the start. The content is a PBKDF2-SHA256
+  # hash (no cleartext password) so 644 is the right mode for a containerized
+  # launcher on a single-operator dev box.
+  chmod 644 "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
   ok "Generated server config (admin / adminpassword1) at $VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
 }
 
@@ -524,6 +553,75 @@ cmd_start() {
     cedar-vale)
       register_cedar_vale_agents "$enroll_token"
       ;;
+    cedar-vale-local)
+      # Three NAMED in-container agents (yuzu-frontend / yuzu-app / yuzu-db)
+      # via the cedar-vale-local compose profile. Unlike `cedar-vale` this
+      # needs no OrbStack/orb — it's the macOS-VM-free way to get tier-labelled
+      # hostnames in /viz/fleet. NOT scaled: each tier is exactly one replica
+      # so the hostnames stay distinct (VIZ_UAT_AGENTS is ignored here).
+      info "Starting 3 named Cedar & Vale tier agents (frontend / app / db)..."
+      YUZU_ENROLLMENT_TOKEN="$enroll_token" \
+        docker compose -f "$COMPOSE_FILE" --profile cedar-vale-local \
+          up -d agent-frontend agent-app agent-db
+
+      info "Waiting for the 3 tier agents to register..."
+      local waited=0 reg=0
+      while [ "$waited" -lt 90 ]; do
+        reg=$(curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
+                | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0)
+        reg=${reg:-0}
+        if awk "BEGIN { exit !($reg >= 3) }"; then
+          break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+      done
+      if ! awk "BEGIN { exit !($reg >= 3) }"; then
+        fail "Only $reg of 3 Cedar & Vale tier agents registered within 90s."
+        fail "  Inspect: bash scripts/start-viz-uat.sh status"
+        exit 1
+      fi
+      ok "$reg Cedar & Vale tier agent(s) registered (yuzu-frontend / yuzu-app / yuzu-db)"
+      ;;
+    cedar-vale-app)
+      # Three-tier REAL app: Envoy (frontend) -> node (app) -> Postgres (db),
+      # each co-hosting a yuzu-agent. Renders in /viz/fleet as a stack (frontend
+      # top / app middle / db bottom) with two persistent blue tubes. The node
+      # app serves an impress.js deck whose slide content lives in Postgres.
+      # Container hostnames are yuzu-frontend/app/db (what the viz labels);
+      # container_names are yuzu-cv-* to avoid colliding with the plain-agent
+      # cedar-vale-local containers. VIZ_UAT_AGENTS is ignored (one per tier).
+      if [ -z "$VIZ_UAT_SKIP_BUILD" ]; then
+        info "Building Cedar & Vale tier images (Envoy / node / Postgres + agent)..."
+        YUZU_ENROLLMENT_TOKEN=stub \
+          docker compose -f "$COMPOSE_FILE" --profile cedar-vale-app \
+            build cv-db cv-app cv-frontend
+      fi
+      info "Starting Cedar & Vale 3-tier app (frontend -> app -> db)..."
+      YUZU_ENROLLMENT_TOKEN="$enroll_token" \
+        docker compose -f "$COMPOSE_FILE" --profile cedar-vale-app \
+          up -d cv-db cv-app cv-frontend
+
+      info "Waiting for the 3 tiers to register..."
+      local waited=0 reg=0
+      while [ "$waited" -lt 120 ]; do
+        reg=$(curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
+                | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0)
+        reg=${reg:-0}
+        if awk "BEGIN { exit !($reg >= 3) }"; then
+          break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+      done
+      if ! awk "BEGIN { exit !($reg >= 3) }"; then
+        fail "Only $reg of 3 Cedar & Vale tiers registered within 120s."
+        fail "  Inspect: bash scripts/start-viz-uat.sh status"
+        exit 1
+      fi
+      ok "$reg Cedar & Vale tier(s) registered (yuzu-frontend / yuzu-app / yuzu-db)"
+      ok "Presentation: http://localhost:8088  (Envoy -> node -> Postgres, slides from db)"
+      ;;
     vm)
       ok "Skipping in-container agent; VM-agent mode selected."
       info "Run yuzu-agent on the OrbStack VM (or bare-metal host):"
@@ -547,7 +645,7 @@ cmd_start() {
       ok "Skipping agent startup; VIZ_UAT_AGENT_MODE=none"
       ;;
     *)
-      fail "Unknown VIZ_UAT_AGENT_MODE='$mode'. Allowed: container | vm | cedar-vale | none"
+      fail "Unknown VIZ_UAT_AGENT_MODE='$mode'. Allowed: container | cedar-vale-local | cedar-vale-app | vm | cedar-vale | none"
       exit 1
       ;;
   esac
@@ -596,11 +694,22 @@ Env overrides:
   VIZ_UAT_AGENTS=1     (--scale agent=N)
   VIZ_UAT_SKIP_BUILD=1 (skip docker build)
   VIZ_UAT_PLATFORM=linux/arm64
-  VIZ_UAT_AGENT_MODE=container|vm|cedar-vale|none
+  VIZ_UAT_AGENT_MODE=container|cedar-vale-local|cedar-vale-app|vm|cedar-vale|none
+                       cedar-vale-local = three NAMED in-container agents
+                                    (yuzu-frontend / yuzu-app / yuzu-db) so
+                                    /viz/fleet labels the tiers by name with
+                                    NO OrbStack/orb dependency. Best choice on
+                                    a Linux / WSL2 box.
+                       cedar-vale-app = three NAMED tiers running REAL services
+                                    (Envoy -> node -> Postgres), each co-hosting
+                                    an agent, so /viz/fleet shows the stack with
+                                    live blue tubes. node serves an impress.js
+                                    deck whose slides live in Postgres; the deck
+                                    is at http://localhost:8088.
                        cedar-vale = register agents on the three Alpine
                                     OrbStack VMs that model the Cedar &
                                     Vale three-tier company so /viz/fleet
-                                    renders all three tiers
+                                    renders all three tiers (macOS/orb only)
   VIZ_UAT_CV_VMS="yuzu-frontend yuzu-app yuzu-db"
                        VM names for cedar-vale mode
 USAGE

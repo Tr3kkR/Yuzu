@@ -18,11 +18,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Data Storage and Encryption](#data-storage-and-encryption)
-13. [Retention Settings](#retention-settings)
-14. [Settings API Reference](#settings-api-reference)
-15. [Deployment](#deployment)
-16. [Windows Service Installation](#windows-service-installation)
-17. [Planned Features](#planned-features)
+13. [PostgreSQL Substrate](#postgresql-substrate)
+14. [Retention Settings](#retention-settings)
+15. [Settings API Reference](#settings-api-reference)
+16. [Deployment](#deployment)
+17. [Windows Service Installation](#windows-service-installation)
+18. [Planned Features](#planned-features)
 
 ---
 
@@ -40,15 +41,20 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--no-tls` | off | Disable **all** gRPC TLS (agent listener AND management listener). Plaintext gRPC, no encryption, no peer authentication. **The administrative surface is ungated when this flag is passed.** Intended for local UAT, customer demos, and development. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder when running in this mode. |
 | `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
 | `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
+| `--no-default-certs` | off | Do **not** auto-generate built-in default certificates on first boot. Restores the legacy refuse-to-start: the server will not start unless `--cert`/`--key` (and `--https-cert`/`--https-key` when HTTPS is enabled) are supplied. Use where operator- or HSM-provided certs are mandatory policy. (Defaults emit a startup banner, the audit actions `server.default_certs_generated` + `server.default_certs_in_use`, and the Prometheus gauge `yuzu_server_default_certs_active`.) Env: `YUZU_NO_DEFAULT_CERTS`. |
+| `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux/macOS), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
+| `--cert-san` | *(none)* | **Repeatable.** Extra Subject Alternative Name to add to *every* auto-generated default leaf (dashboard HTTPS, agent/management gRPC, and gateway), on top of the base `localhost` / `127.0.0.1` / `::1` / `<hostname>`. Forms: `dns:<name>`, `ip:<addr>`, or a bare value (auto-classified as IP vs DNS by shape); a single value may be comma-separated. Use this so the built-in certs validate for a name a client actually dials — e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service name passes TLS hostname verification, or `--cert-san dns:yuzu.corp.example --cert-san ip:10.0.0.5` for a load-balancer name / VIP. An `ip:` value that is not an IP literal is ignored with a warning. **Ignored** when operator certs are supplied or `--no-default-certs` is set; **changing it does not rotate an existing cert set** — clear `--ca-dir` (or replace the certs) for new SANs to take effect (in a container the cert dir lives in the image layer unless a volume is mounted there, so *recreate* the container — a restart alone won't regenerate). Env: `YUZU_CERT_SAN`. |
 | `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
 | `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
 | `--allow-one-way-tls` | off | **[DEPRECATED]** Renamed to `--insecure-skip-client-verify`. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release. |
 | `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
 | `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
 | `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
+| `--trusted-nat-cidr` | *(none)* | Comma-separated (or repeatable) CIDR ranges (IPv4 or IPv6) declaring a trusted NAT boundary for **direct-connect** agents. When an agent's Register and Subscribe source IPs *both* fall within one declared range, a per-session peer-IP mismatch is downgraded from a hard reject to an *advisory* (audit `result="ok" outcome=advisory`; counted on `yuzu_grpc_subscribe_peer_advisory_total`) instead of rejecting the stream. Strict exact-match is the default when absent; mismatches outside every declared range still reject (the stolen-session guard stays intact). Use for fleets behind multi-egress NAT, proxy pools, CG-NAT, or SD-WAN where an agent may egress from different public IPs on its two connections. **Security note:** declaring a range asserts the hosts in it are mutually trusted not to replay each other's sessions; keep ranges as narrow as possible (never `0.0.0.0/0`). Malformed entries are logged and ignored at startup. Env: `YUZU_TRUSTED_NAT_CIDR`. |
+| `--nat-trust-mtls-identity` | off | Also downgrade a peer-IP mismatch to advisory when the Subscribe mTLS client identity matches the identity bound at Register (#1128). **SAFE ONLY WITH PER-AGENT CLIENT CERTIFICATES.** With a shared/fleet-wide client cert every identity "matches", turning this into a session-replay bypass (an insider agent could hijack another agent's session from its own IP). Off by default; enable only if each agent presents a unique client certificate. When both `--nat-trust-mtls-identity` and `--trusted-nat-cidr` are configured, mTLS-identity match takes precedence: a session whose mTLS identity matches records `reason=mtls_identity_match` (visible on the audit `detail` and the `yuzu_grpc_subscribe_peer_advisory_total{reason=...}` label), and CIDR containment is not consulted for that session. Enabling the flag emits a `warn`-level startup line — confirm it appears in the boot log so the operator who pulled the lever can sign off on the per-agent-cert posture. Env: `YUZU_NAT_TRUST_MTLS_IDENTITY`. |
 | `--https-port` | `8443` | HTTPS listen port. |
-| `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
-| `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
+| `--https-cert` | *(auto)* | Path to PEM-encoded TLS certificate for the dashboard. **A per-install default cert is auto-generated when omitted** (unless `--no-default-certs`); `--no-https` disables HTTPS entirely. |
+| `--https-key` | *(auto)* | Path to PEM-encoded TLS private key. Auto-generated default used when omitted (unless `--no-default-certs`). The file must not be world-readable (Unix: `chmod 600`). |
 | `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
@@ -65,6 +71,10 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
 | `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
+| `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 11 high-risk REST + Settings endpoints (PR2 of the MFA ladder) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
+| `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
@@ -119,7 +129,12 @@ The server stores its configuration in files located in the **same directory as 
 | `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, and the rest of the `--data-dir` SQLite stores on the same schedule. Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores (including **`ca.db`** — the internal-CA inventory + CRL history), and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant.
+
+> **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
+> - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
+> - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
+> - **No silent re-root.** If `ca.db` already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent. Restore `default-*.{pem,key}` from backup (matching the `ca.db` root), or remove `ca.db` too for a deliberate clean re-root.
 
 > **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
 
@@ -152,6 +167,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
+
+This release adds per-application resource sampling (top-N processes by CPU and
+working set, by image name) to the TAR edge warehouse. **It is off by default**
+(`procperf_enabled=false`) and collects nothing until an operator opts in — it
+is a distinct, usage-class telemetry category subject to works-council / DPA
+review, separate from the device-level performance sampling (`perf_enabled`,
+on by default, no per-app identity) that shipped in the prior release. To
+enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
+instruction (fleet-wide or per-device). The data is image names only (no
+command lines), 7-day raw / 31-day hourly retention, and is captured in the
+Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.
+TAR warehouse tables are now also created on every database open, so upgraded
+agents need no manual table-creation step. New webhook egress: the `dex.signal`
+event (operator-routed signals) — see the security questionnaire note in the
+assurance package if you answer data-egress questions.
+
+### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
+
+Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
+
+MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
 ### v0.10.0 — API token revocation is owner-scoped
 
@@ -312,6 +350,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts. |
+| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
@@ -321,6 +360,32 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
+| Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
+| DEX Alerts | `/fragments/settings/dex-alerts` | Route individual DEX signal types to operator notifications and the `dex.signal` webhook, and tune the fleet blast-radius thresholds (min devices / window / cooldown). Admin-only; changes apply live (no restart) and are audit-logged (`settings.dex_alerts.routing`, `settings.dex_alerts.blast`). See the user-manual *DEX → Routing signals to alerts* section for guidance on which types to route. |
+
+### Revoking an agent certificate from the dashboard
+
+When the server runs its built-in CA, **Settings → Internal CA** lists every
+issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
+
+1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
+   the **Serial**).
+2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
+   stored on the revocation record and audited.
+3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
+   *Revoked* and the public CRL is republished automatically.
+
+Revocation takes effect **immediately server-side**: the agent is refused on its
+next connection, and any already-open command stream is torn down by the
+revocation sweep within ~15s. A revoked agent cannot re-enroll its way back by
+deleting its key (re-issuance is refused while the revocation stands). The same
+operation is available over REST (`POST /api/v1/ca/revoke`) for automation. The
+dashboard action is CSRF-protected and requires `Security:Delete`.
+
+> **Gateway-proxied agents:** revocation is enforced on direct-connect agents
+> only — an agent reaching the server through a gateway presents its cert to the
+> gateway, not the server, so also disconnect it at the gateway. See
+> `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ---
 
@@ -744,6 +809,79 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 
 ---
 
+## PostgreSQL Substrate
+
+The server's storage substrate is moving from SQLite to **PostgreSQL** (ADR-0006; the agent stays SQLite). Today the database is **inert-but-ready**: the bundled containers, the provisioning helper, and the backup procedure below all exist so that deployments are Postgres-ready *before* the release that makes the server require a DSN at boot (#1320 — a **breaking** change; the CHANGELOG entry for that release will say so explicitly).
+
+### Provisioning a native (non-container) install
+
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+
+| Install method | Helper location | Invocation |
+|---|---|---|
+| `.deb` / `.rpm` | `/usr/share/yuzu/scripts/install-server-postgres.sh` | Run automatically (non-fatally) by the package post-install hook |
+| Release tarball | `scripts/install-server-postgres.sh` inside the archive | Run manually as root after unpacking |
+| Git checkout | `scripts/install-server-postgres.sh` | Run manually as root |
+
+Two modes:
+
+```bash
+# Mode 1 — external/managed Postgres: writes the DSN to
+# /etc/yuzu/yuzu-server.env (0600), which the systemd unit loads
+# via EnvironmentFile=. No local Postgres is touched.
+sudo bash install-server-postgres.sh --dsn 'postgresql://yuzu:...@db.example.com:5432/yuzu'
+
+# Mode 2 (default) — local Postgres: provisions the app role + database
+# on an already-installed local PostgreSQL 16+ and writes the DSN env file.
+# Idempotent — never clobbers an existing role, database, or env file.
+sudo bash install-server-postgres.sh
+```
+
+The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008).
+
+### Backing up PostgreSQL state
+
+The SQLite backup guidance in [Configuration Files](#configuration-files) continues to apply while stores migrate incrementally — during the transition, a complete backup covers **both** the remaining SQLite stores **and** the Postgres database.
+
+Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies).
+
+**Native installs** — the DSN lives only in the root-only systemd environment file (`/etc/yuzu/yuzu-server.env`), **not** in interactive shells, so load it first. Then split the password out so it rides the `PGPASSWORD` environment variable instead of the process argv (`/proc/<pid>/cmdline` is world-readable, and the command lands in shell history):
+
+```bash
+# Run as root. Assumes the standard helper-written DSN shape
+# scheme://user:password@host:port/db.
+. /etc/yuzu/yuzu-server.env
+export PGPASSWORD="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^[a-z]+://[^:/@]*:([^@]*)@.*$!\1!')"
+DSN_NOPASS="$(printf '%s\n' "$YUZU_POSTGRES_DSN" | sed -E 's!^([a-z]+://[^:/@]*):[^@]*@!\1@!')"
+
+pg_dump --format=custom --file="yuzu-pg-$(date +%F).dump" "$DSN_NOPASS"
+```
+
+**Docker Compose** (reference template — superuser peer auth inside the container; no credential on the host command line):
+
+```bash
+docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
+  > "yuzu-pg-$(date +%F).dump"
+```
+
+Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
+
+```bash
+# Native — same env-file + PGPASSWORD/DSN_NOPASS preamble as the backup recipe
+pg_restore --clean --if-exists --no-owner --role=yuzu \
+  --dbname="$DSN_NOPASS" "yuzu-pg-YYYY-MM-DD.dump"
+
+# Docker Compose
+docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
+  --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
+```
+
+Schedule the dump alongside the existing SQLite/cert-dir backups; verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
+
+> **The restore-pairing invariant (ADR-0010 — forward reference).** Once envelope-encrypted secrets land (ADR-0010), `pg_dump` output and volume snapshots will contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching `KeyProvider` keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and treat the KEK file like the CA root key (separate, offline copy). The restore-verification drill must restore both halves and confirm a clean fingerprint check at boot. The full key-management runbook (rotation, DR drill) is tracked in #1341. Plan your backup automation for this pairing **now** so the secrets migration doesn't invalidate your procedure.
+
+---
+
 ## Retention Settings
 
 The server applies retention policies to stored data to manage disk usage. Retention values are set via CLI flags at startup.
@@ -845,6 +983,31 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
+### DEX Alerts
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration fragment (HTMX). Admin-only. |
+| `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
+| `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
+
+**New `runtime_config` keys.** All four are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dex_alert_routing` | JSON array string | `[]` | DEX `obs_type` strings routed to operator notifications + the `dex.signal` webhook. Empty = nothing routed. |
+| `dex_blast_min_devices` | integer string | `5` | Blast-radius minimum distinct-device threshold. Clamped `[2, 100000]`. |
+| `dex_blast_window_seconds` | integer string | `900` | Blast-radius detection window (seconds). Clamped `[60, 86400]`. |
+| `dex_blast_cooldown_seconds` | integer string | `3600` | Blast-radius per-incident re-alert cooldown (seconds). Clamped `[0, 604800]`. |
+
+**New audit actions.**
+
+| Action | Emitted when |
+|---|---|
+| `settings.dex_alerts.routing` | An admin changes the routed signal-type list. Detail records the full new routed set (the runtime-config store keeps no history, so this row is the change-management evidence). |
+| `settings.dex_alerts.blast` | An admin changes the blast-radius thresholds (detail records the new min/window/cooldown). |
+| `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
+
 ---
 
 ## File Logging
@@ -942,8 +1105,8 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 
 ```bash
 # Copy binaries
-sudo cp builddir/yuzu-server /usr/local/bin/
-sudo cp builddir/yuzu-agent /usr/local/bin/
+sudo cp build-linux/server/core/yuzu-server /usr/local/bin/
+sudo cp build-linux/agents/core/yuzu-agent /usr/local/bin/
 
 # Create service user
 sudo useradd --system --no-create-home yuzu

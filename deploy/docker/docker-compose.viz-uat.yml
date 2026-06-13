@@ -34,6 +34,37 @@
 # credentials). Without VIZ_UAT_CONFIG set, compose treats the bind path as
 # missing -- there is no safe default.
 
+# Shared body for the three Cedar & Vale local tier agents (see the
+# agent-frontend / agent-app / agent-db services below). `x-`-prefixed
+# top-level keys are ignored by Compose's schema and exist only to host the
+# YAML anchor. Identical to the `agent` service body except (a) it lives under
+# the cedar-vale-local profile and (b) hostname/container_name are set per
+# tier on the merging service, not here.
+x-cedar-vale-agent: &cedar_vale_agent
+  profiles: ["cedar-vale-local"]
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.agent
+  image: yuzu-agent-viz-uat:latest
+  environment:
+    YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+    NO_PROXY: "*"
+    no_proxy: "*"
+  entrypoint: ["/bin/bash", "-c"]
+  command:
+    - |
+      exec yuzu-agent \
+        --server gateway:50051 \
+        --no-tls \
+        --plugin-dir /usr/lib/yuzu/plugins \
+        --data-dir /var/lib/yuzu-agent \
+        --log-level info \
+        --enrollment-token "$$YUZU_ENROLLMENT_TOKEN"
+  depends_on:
+    gateway:
+      condition: service_healthy
+  restart: unless-stopped
+
 services:
   # ── Yuzu Server (gateway mode, no analytics, no NVD sync) ───────────────
   server:
@@ -77,9 +108,17 @@ services:
       # and doesn't need a proxy.
       NO_PROXY: "*"
       no_proxy: "*"
+      # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
+      # the server-side consumer; env var (not CLI flag) on purpose because
+      # the current binary rejects unknown flags. ⚠ DEV/UAT-ONLY default
+      # password ('yuzu-app') — distinct from the superuser default.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     ports:
       - "8080:8080"   # Web dashboard + REST API (operator-facing)
       - "50055:50055" # Gateway upstream (debugging convenience)
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       # VIZ_UAT_CONFIG must be set explicitly -- the launcher always exports
       # it after generate_config() writes the cfg file. There is no compose
@@ -97,6 +136,36 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+    restart: unless-stopped
+
+  # ── PostgreSQL (server storage substrate, ADR-0006) ──────────────────────
+  postgres:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.postgres
+    image: yuzu-postgres:local
+    container_name: yuzu-viz-postgres
+    environment:
+      # ⚠ DEV/UAT-ONLY default passwords — superuser ('yuzu') and app role
+      # ('yuzu-app') must stay DISTINCT: first-boot init refuses to run if
+      # they are equal (PR #1334 review, S1).
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-app}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forces TCP — the init-phase temporary server is
+      # unix-socket-only, so a socket probe could pass mid-init. psql
+      # SELECT 1 over the app DSN proves the app credential authenticates
+      # ($$ defers expansion to the container's shell). The psql leg
+      # dials the container's own hostname, NOT loopback: initdb leaves
+      # 'trust' auth on 127.0.0.1, so only a non-loopback connection
+      # actually verifies the password (scram).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # ── Erlang Gateway ──────────────────────────────────────────────────────
@@ -173,5 +242,118 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Cedar & Vale local tier agents (cedar-vale-local profile) ────────────
+  # Three NAMED in-container agents that model the fictional Cedar & Vale
+  # three-tier company WITHOUT needing OrbStack VMs (the `cedar-vale` launcher
+  # mode requires the macOS-only `orb` CLI). Each service sets `hostname:` so
+  # the agent reports yuzu-frontend / yuzu-app / yuzu-db to the server via
+  # gethostname() — that's what makes /viz/fleet label the three planes by
+  # tier instead of by opaque container hash. Bring up with:
+  #   VIZ_UAT_AGENT_MODE=cedar-vale-local bash scripts/start-viz-uat.sh start
+  # (the launcher activates the profile; do not `--scale` these — they are
+  # one-replica-each by design so the hostnames stay distinct).
+  #
+  # The shared body lives in the x-cedar-vale-agent anchor below; each service
+  # merges it and overrides only container_name + hostname. The agent auto-
+  # generates its own UUID agent-id on first boot (no --agent-id, no data
+  # volume — ephemeral, matching the `agent` service), so the three are
+  # distinct on both agent_id and hostname.
+  agent-frontend:
+    <<: *cedar_vale_agent
+    container_name: yuzu-frontend
+    hostname: yuzu-frontend
+
+  agent-app:
+    <<: *cedar_vale_agent
+    container_name: yuzu-app
+    hostname: yuzu-app
+
+  agent-db:
+    <<: *cedar_vale_agent
+    container_name: yuzu-db
+    hostname: yuzu-db
+
+  # ── Cedar & Vale REAL three-tier app (cedar-vale-app profile) ────────────
+  # Envoy (frontend) -> node (app, impress.js deck) -> Postgres (db, slide
+  # content). Each tier co-hosts a yuzu-agent (see deploy/docker/cedar-vale/
+  # tier-entrypoint.sh) so the agent natively sees that tier's listeners and
+  # connections. Renders in /viz/fleet as a stack — frontend on top (Envoy
+  # :8080 is a web port), app in the middle (node :3000 is deliberately NOT a
+  # web port), db at the bottom (Postgres :5432) — with two persistent blue
+  # tubes (Envoy->node via Envoy health checks, node->Postgres via the pg pool
+  # keepalive). Bring up with:
+  #   VIZ_UAT_AGENT_MODE=cedar-vale-app bash scripts/start-viz-uat.sh restart
+  #
+  # hostname: is the tier label the viz shows; container_name is yuzu-cv-* to
+  # avoid colliding with the plain-agent cedar-vale-local containers above.
+  # All three COPY the trixie-built agent from yuzu-agent-viz-uat:latest, so
+  # the launcher must build that image first (build_images does, before the
+  # mode switch). Tiers run on trixie bases so the agent's glibc matches.
+  cv-db:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-db
+    image: yuzu-cv-db:latest
+    container_name: yuzu-cv-db
+    hostname: yuzu-db
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      POSTGRES_USER: cedar
+      POSTGRES_PASSWORD: vale
+      POSTGRES_DB: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cv-app:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-app
+    image: yuzu-cv-app:latest
+    container_name: yuzu-cv-app
+    hostname: yuzu-app
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      PGHOST: cv-db
+      PGPORT: "5432"
+      PGUSER: cedar
+      PGPASSWORD: vale
+      PGDATABASE: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-db:
+        condition: service_started
+    restart: unless-stopped
+
+  cv-frontend:
+    profiles: ["cedar-vale-app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/cedar-vale/Dockerfile.tier-frontend
+    image: yuzu-cv-frontend:latest
+    container_name: yuzu-cv-frontend
+    hostname: yuzu-frontend
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "8088:8080"   # the presentation (Envoy listener) — operator-facing
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-app:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   server-data:
+  postgres-data:

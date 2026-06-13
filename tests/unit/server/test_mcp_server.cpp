@@ -15,6 +15,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "ca_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "response_store.hpp"
@@ -494,6 +495,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include "mcp_server.hpp"
 
+#include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
+
 #include <httplib.h>
 
 #include <memory>
@@ -518,6 +521,7 @@ struct McpTestServer {
     std::string mock_tier;              // MCP tier for mock auth
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
+    bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
 
@@ -539,6 +543,20 @@ struct McpTestServer {
     /// Default nullptr preserves backwards-compat with every existing
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
+
+    /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
+    /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
+    /// nullptr keeps every existing test on the no-CA path (tools report
+    /// "CA not available").
+    yuzu::server::CaStore* ca_store_for_test{nullptr};
+    bool crl_publish_succeeds_{true};
+    int crl_publish_calls_{0};
+
+    /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
+    /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
+    /// exercised. Default nullptr keeps every existing test on the no-store path
+    /// (tools report "Guaranteed State store unavailable").
+    yuzu::server::GuaranteedStateStore* guaranteed_state_store_for_test{nullptr};
 
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
@@ -600,11 +618,14 @@ private:
             return true;
         };
 
-        // Mock audit: record calls
+        // Mock audit: record calls. Returns audit_succeeds_ so a test can simulate
+        // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/, const std::string& /*detail*/) {
+                               const std::string& /*target_id*/, const std::string& /*detail*/)
+            -> bool {
             audit_log.push_back(action + "|" + result);
+            return audit_succeeds_;
         };
 
         // Mock agents: return two test agents
@@ -633,7 +654,16 @@ private:
             /*policy_store=*/nullptr,
             /*mgmt_store=*/nullptr,
             /*approval_manager=*/nullptr,
-            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn));
+            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn),
+            /*ca_store=*/ca_store_for_test,
+            /*publish_crl_fn=*/
+            [this]() -> std::optional<std::vector<std::uint8_t>> {
+                ++crl_publish_calls_;
+                if (!crl_publish_succeeds_)
+                    return std::nullopt;
+                return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
+            },
+            /*guaranteed_state_store=*/guaranteed_state_store_for_test);
     }
 };
 
@@ -681,7 +711,7 @@ TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
     CHECK(body["result"].empty()); // {}
 }
 
-// ── 3. tools/list — verify 23 tools ─────────────────────────────────────────
+// ── 3. tools/list — verify the advertised tool set ──────────────────────────
 
 TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integration]") {
     McpTestServer ts;
@@ -718,9 +748,10 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
 
     // Spot-check specific tool names are present
     std::vector<std::string> expected_names = {
-        "list_agents",      "get_agent_details",     "query_audit_log",
-        "list_definitions", "get_definition",        "query_responses",
-        "validate_scope",   "preview_scope_targets", "list_pending_approvals"};
+        "list_agents",       "get_agent_details",     "query_audit_log",
+        "list_definitions",  "get_definition",        "query_responses",
+        "validate_scope",    "preview_scope_targets", "list_pending_approvals",
+        "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail"};
     for (const auto& name : expected_names) {
         bool found = false;
         for (const auto& tool : tools) {
@@ -768,6 +799,200 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
+}
+
+// ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
+// The schema catalog must be discoverable on BOTH the REST plane and the MCP
+// plane, byte-for-byte identical (single source: guardian_schema_catalog), so an
+// agentic client on either channel self-discovers Guard authoring the same way.
+
+TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
+          "[mcp][integration][guardian]") {
+    McpTestServer ts;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    const auto rest_catalog =
+        nlohmann::json::parse(yuzu::server::guardian::guardian_schema_catalog().json);
+
+    // tools/call get_guardian_schemas → content[0].text is the catalog JSON.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"get_guardian_schemas"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    CHECK(content[0]["type"] == "text");
+    auto tool_catalog = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    REQUIRE(tool_catalog.contains("schemas"));
+    CHECK(tool_catalog == rest_catalog); // identical to REST — single source
+    CHECK(ts.audit_log.back() == "mcp.get_guardian_schemas|success");
+
+    // resources/read yuzu://guardian/schemas → contents[0].text is the same.
+    auto rres = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":8,"params":{"uri":"yuzu://guardian/schemas"}})");
+    REQUIRE(rres);
+    CHECK(rres->status == 200);
+    auto rbody = nlohmann::json::parse(rres->body);
+    REQUIRE(rbody.contains("result"));
+    auto& contents = rbody["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() >= 1);
+    auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(resource_catalog == rest_catalog);
+}
+
+// ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
+// The audit BOUNDARY is the load-bearing contract: the catalogue rollup and the
+// per-OS scope are fleet aggregates (only the generic mcp.<tool> tool-call audit
+// fires); the per-signal detail returns a most-affected DEVICES list (agent_ids
+// — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
+// catches the dashboard, REST and MCP behavioral-access surfaces alike.
+
+// Seed one ruleless DEX observation (the __observation__ projection the DEX
+// aggregations read) — subject + platform land in detail_json.
+static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
+                         const std::string& agent, const std::string& obs_type,
+                         const std::string& subject, const std::string& platform,
+                         const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = obs_type;
+    e.severity = "info";
+    e.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + platform + "\"}";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":40,"params":{"name":"list_dex_signals","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    bool found = false;
+    for (const auto& r : rows) {
+        if (r["obs_type"] == "process.crashed") {
+            CHECK(r["count"].get<int>() == 2);
+            CHECK(r["distinct_devices"].get<int>() == 2);
+            found = true;
+        }
+    }
+    CHECK(found);
+    // Fleet aggregate — only the generic tool-call audit, never dex.signal.view.
+    CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "o3", "MB-1", "storage.low", "disk", "macos", "2026-06-10T12:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":41,"params":{"name":"get_dex_signal_scope","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    int macos_types = -1;
+    for (const auto& r : rows)
+        if (r["platform"] == "macos")
+            macos_types = r["distinct_types"].get<int>();
+    CHECK(macos_types == 2); // process.crashed + storage.low
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":42,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["obs_type"] == "process.crashed");
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2); // WS-1 + WS-2
+    REQUIRE(payload["subjects"].is_array());
+    CHECK(payload["subjects"][0]["subject"] == "chrome.exe");
+
+    // Behavioral access → dex.signal.view fired, THEN the generic tool-call audit
+    // (same dual-audit convention as revoke_certificate).
+    REQUIRE(ts.audit_log.size() >= 2);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.signal.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+    CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":43,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"foo!bar"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // Validation precedes the audit — no dex.signal.view for a view that never ran.
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.signal.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":44,"params":{"name":"list_dex_signals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 // ── 5. tools/call with unknown tool — kMethodNotFound ───────────────────────
@@ -851,7 +1076,8 @@ TEST_CASE("MCP Integration: invalid JSON returns parse error", "[mcp][integratio
 
 // ── 10. resources/list — verify resource count ──────────────────────────────
 
-TEST_CASE("MCP Integration: resources/list returns 3 resources", "[mcp][integration]") {
+TEST_CASE("MCP Integration: resources/list returns the expected resources",
+          "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
@@ -865,7 +1091,13 @@ TEST_CASE("MCP Integration: resources/list returns 3 resources", "[mcp][integrat
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 3);
+    CHECK(resources.size() == 4); // health, compliance, audit, guardian schemas
+
+    // The Guardian schema discovery resource is advertised on the MCP plane.
+    std::set<std::string> uris;
+    for (const auto& r : resources)
+        uris.insert(r["uri"].get<std::string>());
+    CHECK(uris.count("yuzu://guardian/schemas") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -1640,4 +1872,140 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
 
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|failure");
+}
+
+// ── PR4 B-2: internal-CA MCP tools (MCP/REST parity for /api/v1/ca/*) ─────────
+
+TEST_CASE("MCP CA: list_issued_certs + revoke_certificate are advertised in tools/list",
+          "[mcp][integration][pki]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> names;
+    for (const auto& t : body["result"]["tools"])
+        names.insert(t["name"].get<std::string>());
+    CHECK(names.count("list_issued_certs") == 1);  // discoverability (A1)
+    CHECK(names.count("revoke_certificate") == 1);
+}
+
+TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
+          "[mcp][integration][pki]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    REQUIRE(store.is_open());
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "AB12";
+    rec.subject = "agent-007";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800; // 2100
+    rec.issued_at = 1700000000;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator"); // operator tier allows Security:Read
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    // content[0].text is the JSON payload (mirrors REST /ca/issued shape).
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+    REQUIRE(payload["items"].size() == 1);
+    CHECK(payload["items"][0]["serial_hex"] == "AB12");
+    CHECK(payload["items"][0]["subject"] == "agent-007");
+    CHECK(payload["items"][0]["status"] == "active");
+    CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
+}
+
+TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
+          "[mcp][integration][pki][security]") {
+    // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
+    // worker can inventory the CA. Pin this so a tier_allows regression can't
+    // silently narrow (or widen) the access boundary.
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "C0DE";
+    rec.subject = "agent-ro";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // allowed, not tier-denied
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["count"] == 1);
+}
+
+TEST_CASE("MCP CA: list_issued_certs without a CA returns an error, not a crash",
+          "[mcp][integration][pki]") {
+    McpTestServer ts; // ca_store_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // CA not available
+}
+
+TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:Delete)",
+          "[mcp][integration][pki][security]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "DEAD";
+    rec.subject = "agent-x";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator"); // operator cannot do Security:Delete
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"DEAD"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // tier denied — the generic gate fired
+    // The cert must NOT have been revoked (gate ran before dispatch).
+    CHECK_FALSE(store.is_revoked("DEAD"));
+    CHECK(ts.crl_publish_calls_ == 0);
+}
+
+TEST_CASE("MCP CA: revoke_certificate on supervised tier is approval-gated (not silently executed)",
+          "[mcp][integration][pki][security]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "BEEF";
+    rec.subject = "agent-y";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("supervised"); // tier allows Security:Delete, but it requires approval
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // approval-required (platform-wide, not CA-specific)
+    // Destructive op must NOT execute without approval: cert stays valid, no CRL.
+    CHECK_FALSE(store.is_revoked("BEEF"));
+    CHECK(ts.crl_publish_calls_ == 0);
 }
