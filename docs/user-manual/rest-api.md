@@ -3414,9 +3414,9 @@ Guard authoring schema catalog — the static registry of `spark` / `assertion` 
 
 ### DEX (Digital Employee Experience)
 
-The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. They read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row) and are gated on the same `GuaranteedState:Read` securable. All three accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`).
+The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`); the perf endpoints are now-views with no window.
 
-**Audit boundary.** The catalogue rollup and per-OS scope are fleet aggregates and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
+**Audit boundary.** The catalogue rollup, per-OS scope and the perf endpoints are aggregates / machine-health telemetry and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
 
 #### `GET /api/v1/dex/signals`
 
@@ -3444,6 +3444,29 @@ One signal type's drill-down.
 - **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
 - **Audit (behavioral PII):** emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) on every successful access — see the audit boundary note above.
+
+#### `GET /api/v1/dex/perf/fleet`
+
+Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` is the coverage-honest denominator (perf collectors are Windows-only today). Not audited.
+
+#### `GET /api/v1/dex/perf/cohorts`
+
+Fleet-relative performance percentiles per **cohort** — the distinct values of an operator-chosen tag key (see [Cohort benchmarking](dex.md#performance)).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`).
+- **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (10) reporting devices carry `suppressed: true` with their population and **no stats**; devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
+
+#### `GET /api/v1/dex/perf/devices`
+
+The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
 ---
 

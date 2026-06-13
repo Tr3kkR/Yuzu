@@ -30,6 +30,8 @@ static const std::vector<std::string> kAllowedKeys = {
     "dex_blast_min_devices",         // blast-radius alert shape (clamped on apply)
     "dex_blast_window_seconds",      //
     "dex_blast_cooldown_seconds",    //
+    // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
+    "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {

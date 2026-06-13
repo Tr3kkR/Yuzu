@@ -9,6 +9,7 @@
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
@@ -1755,6 +1756,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     std::string min_dev = std::to_string(kBlastDefaults.min_devices);
     std::string win_s = std::to_string(kBlastDefaults.window_seconds);
     std::string cool_s = std::to_string(kBlastDefaults.cooldown_seconds);
+    std::string export_key; // F2a PR3: empty = cohort export disabled (the default)
     if (runtime_config_store_ && runtime_config_store_->is_open()) {
         routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
         auto v = runtime_config_store_->get_value("dex_blast_min_devices");
@@ -1763,6 +1765,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
         if (!v.empty()) win_s = v;
         v = runtime_config_store_->get_value("dex_blast_cooldown_seconds");
         if (!v.empty()) cool_s = v;
+        export_key = runtime_config_store_->get_value("dex_cohort_export_key");
     }
 
     std::string html;
@@ -1785,6 +1788,29 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     num_row("Cooldown (s)", "cooldown_seconds", cool_s, "per-incident re-alert suppression");
     html += "<button type=\"submit\" class=\"btn btn-secondary\" "
             "style=\"margin-top:0.3rem\">Save thresholds</button></form>";
+
+    // ── Cohort metrics export (F2a PR3 — Grafana) ────────────────────────────
+    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+            "margin:1rem 0 0.4rem\">COHORT METRICS EXPORT (PROMETHEUS)</div>"
+            "<p style=\"font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem\">"
+            "When a tag key is set, per-cohort fleet performance gauges "
+            "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
+            "cohorts &mdash; top 50 by population, 10-device statistical floor, a "
+            "<code>_clipped</code> gauge makes any capping visible. Empty disables the export "
+            "(the default). Fleet-level gauges are always exported. <b>The key's tag values "
+            "become Prometheus labels</b> visible to whatever scrapes /metrics &mdash; choose "
+            "keys whose values are non-sensitive organizational identifiers (hardware model, "
+            "image name), never personnel-relevant strings.</p>";
+    html += "<form hx-post=\"/api/settings/dex-alerts/cohort-export\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">"
+            "<div class=\"form-row\"><label>Export tag key</label>"
+            "<input type=\"text\" name=\"export_key\" value=\"" +
+            html_escape(export_key) +
+            "\" placeholder=\"e.g. model\" style=\"width:12rem\"> "
+            "<span style=\"font-size:0.7rem;color:#8b949e\">[A-Za-z0-9_.:-], max 64; empty = "
+            "off</span></div>"
+            "<button type=\"submit\" class=\"btn btn-secondary\" "
+            "style=\"margin-top:0.3rem\">Save export key</button></form>";
 
     // ── Per-signal routing ───────────────────────────────────────────────────
     html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
@@ -2594,6 +2620,56 @@ void SettingsRoutes::register_routes(
         res.set_header(
             "HX-Trigger",
             R"({"showToast":{"message":"Blast-radius thresholds saved","level":"success"}})");
+        res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+    });
+
+    // -- F2a PR3: cohort metrics export key (Grafana) --------------------------
+    sink.Post("/api/settings/dex-alerts/cohort-export", [this](const httplib::Request& req,
+                                                               httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            return;
+        }
+        // extract_form_value already percent-decodes (':' → %3A is in the
+        // tag-key alphabet) — do NOT decode twice (G2 sec-L1: a double decode
+        // diverges from the sibling POSTs; validate_key runs after and fails
+        // closed either way). Empty disables the export — a valid, auditable
+        // choice.
+        const std::string key = extract_form_value(req.body, "export_key");
+        if (!key.empty() && !TagStore::validate_key(key)) {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"j({"showToast":{"message":"Invalid tag key ([A-Za-z0-9_.:-], max 64)","level":"error"}})j");
+            res.set_content("<span class=\"feedback-error\">Invalid tag key.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto session = auth_fn_(req, res);
+        auto rc = runtime_config_store_->set("dex_cohort_export_key", key,
+                                             session ? session->username : "unknown");
+        if (!rc) {
+            res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to save export key","level":"error"}})");
+            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
+                                "</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (dex_alert_apply_fn_)
+            dex_alert_apply_fn_(); // live — next gauge sweep uses the new key
+        audit_fn_(req, "settings.dex_alerts.cohort_export", "success", "RuntimeConfig",
+                  "dex_cohort_export_key",
+                  key.empty() ? "export disabled" : "export_key=" + key);
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"Cohort export key saved","level":"success"}})");
         res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
     });
 

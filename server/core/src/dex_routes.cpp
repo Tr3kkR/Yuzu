@@ -257,6 +257,18 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// F2a: cohort tag-key validation — mirrors TagStore::validate_key (max 64,
+// [a-zA-Z0-9_.:-]) so an arbitrary `?key=` can never reach the snapshot
+// provider or markup. Validation here (not a TagStore dep) keeps DexRoutes
+// decoupled; the alphabets are pinned together by a unit test.
+bool valid_tag_key(const std::string& key) {
+    if (key.empty() || key.size() > 64)
+        return false;
+    return key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                 "abcdefghijklmnopqrstuvwxyz0123456789_.:-") ==
+           std::string::npos;
+}
+
 // An htmx drill-down link: clickable text that swaps the fragment into the shared
 // page mount. htmx core attrs only (CSP-safe; no hx-on). `disp` is already
 // html-escaped; `qs` is the already-encoded query string.
@@ -372,7 +384,8 @@ std::string dex_subnav(const std::string& active, int window_days) {
     return "<div class=\"gp-subnav\">" + tab("overview", "Overview", "/fragments/dex/overview") +
            tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
            tab("health", "Health score", "/fragments/dex/health") +
-           tab("trends", "Trends", "/fragments/dex/trends") + "</div>";
+           tab("trends", "Trends", "/fragments/dex/trends") +
+           tab("perf", "Performance", "/fragments/dex/perf") + "</div>";
 }
 
 // Window chips for a given fragment path (reuses the overview pattern).
@@ -1512,7 +1525,8 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 }
 
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& window) {
+                                       const std::string& agent_id, const std::string& window,
+                                       const DexPerfSnapshot* perf_snap) {
     // This is behavioral data (which apps a person runs): the access posture is
     // enforced server-side — permission-gated on GuaranteedState:Read and each
     // open audit-logged (dex.device.view) — without an on-page banner.
@@ -1529,13 +1543,33 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     // every operator (grill finding 1). A click is an attempted action, so
     // both side effects become honest. Rendered for EVERY device, signals or
     // not: a quiet device still has perf history.
-    const std::string perf_panel =
+    std::string perf_panel =
         "<div class=\"gp-sech\">Device performance (hourly, on-device warehouse)</div>"
         "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
         "hx-get=\"/fragments/dex/device/perf?agent_id=" +
         url_encode(agent_id) +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load performance</button> "
         "<span class=\"gp-mute\">runs a live read-only query on the device</span></div>";
+
+    // PR2: vs-fleet/cohort percentile strips — render-time registry state, no
+    // dispatch, no extra permission, so they render directly (no click).
+    if (perf_snap) {
+        perf_panel += render_dex_device_perf_context(
+            dex_perf_device_context(*perf_snap, agent_id), perf_snap->cohort_key, window);
+    }
+
+    // PR2: per-app panel behind its OWN click + OWN audit action
+    // (dex.device.procperf.query) — usage-class reads stay separately
+    // countable from the machine-health load above (works-council access-audit
+    // posture; the W0 kill switch gets a one-button seam).
+    perf_panel +=
+        "<div class=\"gp-sech\">Top applications (this device, last 24 h)</div>"
+        "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
+        "hx-get=\"/fragments/dex/device/procperf?agent_id=" +
+        url_encode(agent_id) + "&amp;window=" + window +
+        "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load applications</button> "
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; audited "
+        "separately &mdash; per-app is usage-class telemetry</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
@@ -1584,6 +1618,27 @@ constexpr const char* kDexPerfSql =
     "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
     "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48";
 
+// PR2: the canned per-app query (A2 `$ProcPerf_Hourly` tier) — last 24 h
+// aggregated per application, top 25 by sample-weighted CPU. Runs through the
+// same read-only authorizer chokepoint (aggregate functions are permitted;
+// #760/#631). The epoch cutoff is computed server-side and embedded as a
+// literal — no SQL date functions, no user input. AS aliases pin the schema
+// line names the parser locates columns by.
+std::string dex_procperf_sql() {
+    const auto cutoff = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        86400;
+    return std::format(
+        "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
+        "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
+        "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "FROM $ProcPerf_Hourly WHERE hour_ts >= {} "
+        "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25",
+        cutoff);
+}
+
 std::vector<std::string> split_pipe(const std::string& line) {
     std::vector<std::string> out;
     std::size_t pos = 0;
@@ -1600,12 +1655,27 @@ std::vector<std::string> split_pipe(const std::string& line) {
 
 // One finite, non-negative double out of an agent-supplied cell; nullopt on
 // garbage so the whole row is skipped (a forged cell must not render).
+//
+// Bounded above by kMaxSaneCell (1e15): every consumer either renders the
+// value or casts it to int64_t, and a finite-but-huge double (1e30) makes the
+// float→int conversion UNDEFINED BEHAVIOR per [conv.fpint] — remote-agent-
+// controlled UB (governance G3 BLOCKING, cpp-safety + cpp-expert consensus).
+// 1e15 comfortably covers every legitimate cell (epoch seconds, sample
+// counts, working-set bytes up to ~1 PB) and is exactly representable.
+//
+// Full-token parse: stod("42.5xyz") returns 42.5 and stod is LC_NUMERIC-
+// sensitive; requiring pos == size() rejects trailing garbage AND turns a
+// comma-decimal-locale mis-parse of "42.5" into a rejection instead of a
+// silent value distortion (G3 cpp-expert). libc++ on Apple Clang has no FP
+// from_chars, so stod+pos is the portable form.
 std::optional<double> cell_double(const std::string& s) {
+    constexpr double kMaxSaneCell = 1.0e15;
     if (s.empty() || s.size() > 32)
         return std::nullopt;
     try {
-        const double v = std::stod(s);
-        if (std::isfinite(v) && v >= 0.0)
+        std::size_t pos = 0;
+        const double v = std::stod(s, &pos);
+        if (pos == s.size() && std::isfinite(v) && v >= 0.0 && v <= kMaxSaneCell)
             return v;
     } catch (...) {}
     return std::nullopt;
@@ -1708,6 +1778,82 @@ std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output) {
     return out;
 }
 
+std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output) {
+    std::vector<DexProcPerfRow> out;
+    // Same defensive contract as parse_dex_perf_output: columns by NAME from
+    // the __schema__ line (schema cell i names data cell i-1), per-field
+    // validation, malformed rows skipped, bounded row count.
+    int col_name = -1, col_samples = -1, col_inst = -1, col_cpu_avg = -1, col_cpu_max = -1,
+        col_ws_avg = -1, col_ws_max = -1, col_hours = -1;
+    bool have_schema = false;
+    std::size_t pos = 0;
+    int rows = 0;
+    constexpr double kMaxSaneWsBytes = 1.125899906842624e15; // 1 PiB — beyond absurd
+    while (pos < output.size() && rows < 100) {
+        const auto nl = output.find('\n', pos);
+        std::string line =
+            output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return out; // agent-side error payload — nothing to parse
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto cols = split_pipe(line);
+            for (int i = 1; i < static_cast<int>(cols.size()); ++i) {
+                if (cols[i] == "name") col_name = i - 1;
+                else if (cols[i] == "samples") col_samples = i - 1;
+                else if (cols[i] == "instances_max") col_inst = i - 1;
+                else if (cols[i] == "cpu_avg") col_cpu_avg = i - 1;
+                else if (cols[i] == "cpu_max") col_cpu_max = i - 1;
+                else if (cols[i] == "ws_avg") col_ws_avg = i - 1;
+                else if (cols[i] == "ws_max") col_ws_max = i - 1;
+                else if (cols[i] == "hours") col_hours = i - 1;
+            }
+            if (col_name < 0 || col_samples < 0 || col_inst < 0 || col_cpu_avg < 0 ||
+                col_cpu_max < 0 || col_ws_avg < 0 || col_ws_max < 0 || col_hours < 0)
+                return out; // wrong shape — refuse rather than guess
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        const int need = (std::max)({col_name, col_samples, col_inst, col_cpu_avg, col_cpu_max,
+                                     col_ws_avg, col_ws_max, col_hours});
+        if (static_cast<int>(cells.size()) <= need)
+            continue; // trailer ("total|N") or a torn row
+        const auto& name = cells[static_cast<std::size_t>(col_name)];
+        if (name.empty() || name.size() > 256)
+            continue; // a forged/torn name cell must not render
+        const auto samples = cell_double(cells[static_cast<std::size_t>(col_samples)]);
+        const auto inst = cell_double(cells[static_cast<std::size_t>(col_inst)]);
+        const auto cpu_avg = cell_double(cells[static_cast<std::size_t>(col_cpu_avg)]);
+        const auto cpu_max = cell_double(cells[static_cast<std::size_t>(col_cpu_max)]);
+        const auto ws_avg = cell_double(cells[static_cast<std::size_t>(col_ws_avg)]);
+        const auto ws_max = cell_double(cells[static_cast<std::size_t>(col_ws_max)]);
+        const auto hours = cell_double(cells[static_cast<std::size_t>(col_hours)]);
+        if (!samples || !inst || !cpu_avg || !cpu_max || !ws_avg || !ws_max || !hours)
+            continue;
+        if (*ws_avg > kMaxSaneWsBytes || *ws_max > kMaxSaneWsBytes)
+            continue; // forged working-set claim — reject the row
+        ++rows;
+        DexProcPerfRow r;
+        r.name = name;
+        r.samples = static_cast<std::int64_t>(*samples);
+        r.instances_max = static_cast<std::int64_t>(*inst);
+        r.cpu_avg = std::clamp(*cpu_avg, 0.0, 100.0); // a >100% share is a lie
+        r.cpu_max = std::clamp(*cpu_max, 0.0, 100.0);
+        r.ws_avg_bytes = *ws_avg;
+        r.ws_max_bytes = *ws_max;
+        r.hours = static_cast<std::int64_t>(*hours);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
 std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
     if (points.empty())
         return "<div class=\"gp-note\">No performance history on this device yet &mdash; the "
@@ -1753,17 +1899,18 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
-                    std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn));
+                    std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
+                    std::move(perf_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     store_ = store;
@@ -1771,6 +1918,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     audit_fn_ = std::move(audit_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
+    perf_fn_ = std::move(perf_fn);
 
     // -- Page shell (auth-only static chrome; the fragment it loads gates on Read) --
     sink.Get("/dex", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1905,7 +2053,84 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (audit_fn_)
             audit_fn_(req, "dex.device.view", "success", "Agent", id,
                       "DEX per-device signal history");
-        res.set_content(render_dex_device_fragment(store_, id, w), "text/html; charset=utf-8");
+        // PR2: feed the percentile strips from the perf snapshot (default
+        // cohort key — the strips compare against the conventional cohort).
+        std::optional<DexPerfSnapshot> snap;
+        if (perf_fn_)
+            snap = perf_fn_(kDexDefaultCohortKey);
+        res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- F2a: fleet Performance tab (now-view over registry heartbeat state) ---
+    //
+    // Render-time aggregation, ZERO new storage. Gates on GuaranteedState:Read
+    // like the sibling DEX fragments. NOT audited: the fleet/cohort views are
+    // aggregates, and the devices drill lists machine-health telemetry (CPU /
+    // commit / disk latency — device state, not behavioral data about what a
+    // person runs; the behavioral surfaces — per-device signal history and the
+    // per-app procperf view — keep their per-open audit rows).
+    sink.Get("/fragments/dex/perf", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Cohort tag key: validated to the TagStore key alphabet so garbage
+        // never reaches the provider or markup; invalid/absent falls back to
+        // the conventional default ("model" — the asset-tagging recipe's key).
+        std::string key =
+            req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+        if (!valid_tag_key(key))
+            key = kDexDefaultCohortKey;
+        res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
+                        "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/dex/perf/devices", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const DexPerfMetric metric = dex_perf_metric_from_token(
+            req.has_param("metric") ? req.get_param_value("metric") : "cpu");
+        const bool not_reporting = req.has_param("filter") &&
+                                   req.get_param_value("filter") == "not_reporting";
+        // Grill fix: the cohort KEY is always resolved (default "model") so
+        // the Cohort column shows real values even when the drill came from a
+        // metric/Reporting card — without this, every device read "(untagged)",
+        // which is a lie. FILTERING is a separate decision: it applies only
+        // when cohort_value is present ("" = the untagged residual).
+        std::string cohort_key =
+            req.has_param("cohort_key") ? req.get_param_value("cohort_key")
+                                        : kDexDefaultCohortKey;
+        if (!valid_tag_key(cohort_key))
+            cohort_key = kDexDefaultCohortKey;
+        std::optional<std::string> cohort_filter;
+        if (req.has_param("cohort_value"))
+            cohort_filter = req.get_param_value("cohort_value");
+        int limit = 50;
+        if (req.has_param("limit")) {
+            try {
+                limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
+            } catch (...) {}
+        }
+        res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
+                                                         not_reporting, cohort_filter, limit,
+                                                         window_days),
+                        "text/html; charset=utf-8");
     });
 
     // -- A4: device perf panel — live federated TAR query + result poll --------
@@ -2029,6 +2254,128 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         res.set_content(pending_div(command_id, id, attempt + 1), "text/html; charset=utf-8");
     });
+
+    // -- PR2: per-app panel — OWN click, OWN audit class ------------------------
+    //
+    // Same dispatch/poll shape as the perf panel above, but a separate route
+    // pair with its own audit action (`dex.device.procperf.query`): per-app is
+    // usage-class telemetry (what people run), and the audit trail must keep
+    // usage reads separately countable from machine-health reads (grill
+    // decision 5; works-council access-audit posture; W0 kill-switch seam).
+    auto procperf_pending = [](const std::string& command_id, const std::string& agent_id,
+                               int attempt, const std::string& w) {
+        return "<div hx-get=\"/fragments/dex/device/procperf/result?command_id=" +
+               url_encode(command_id) + "&amp;agent_id=" + url_encode(agent_id) +
+               "&amp;n=" + std::to_string(attempt) + "&amp;window=" + w +
+               "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\" class=\"gp-note\">"
+               "Querying the device&rsquo;s edge warehouse&hellip;</div>";
+    };
+
+    sink.Get("/fragments/dex/device/procperf",
+             [this, note, can_execute, procperf_pending](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!can_execute(req)) {
+                     note(res, "Per-application data needs the <b>Execute</b> permission "
+                               "&mdash; this panel runs a read-only TAR query on the device.");
+                     return;
+                 }
+                 if (!dispatch_fn_ || !responses_fn_) {
+                     note(res, "Live device query unavailable on this server.");
+                     return;
+                 }
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (id.empty()) {
+                     res.status = 400;
+                     return;
+                 }
+                 // Canonicalise before the token can reach markup (Gate-8 XSS).
+                 const std::string w = window_token(window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d"));
+                 std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
+                 const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+                 if (audit_fn_)
+                     audit_fn_(req, "dex.device.procperf.query",
+                               sent > 0 ? "success" : "no_agents", "Agent", id,
+                               "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
+                                   std::to_string(sent) + " agent(s) command_id=" + command_id);
+                 if (sent == 0) {
+                     note(res, "Device offline &mdash; the live per-app query needs a connected "
+                               "agent.");
+                     return;
+                 }
+                 res.set_content(procperf_pending(command_id, id, 1, w),
+                                 "text/html; charset=utf-8");
+             });
+
+    sink.Get("/fragments/dex/device/procperf/result",
+             [this, note, can_execute, procperf_pending](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 // Same Execute posture as the dispatching route (stops a
+                 // read-only principal polling someone else's command_id).
+                 if (!can_execute(req)) {
+                     note(res, "Per-application data needs the <b>Execute</b> permission.");
+                     return;
+                 }
+                 if (!responses_fn_) {
+                     note(res, "Live device query unavailable on this server.");
+                     return;
+                 }
+                 const std::string command_id =
+                     req.has_param("command_id") ? req.get_param_value("command_id") : "";
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
+                     res.status = 400;
+                     return;
+                 }
+                 const std::string w = window_token(window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d"));
+                 int attempt = 1;
+                 if (req.has_param("n")) {
+                     try {
+                         attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30);
+                     } catch (...) {}
+                 }
+                 const DexAgentResponse* with_output = nullptr;
+                 const DexAgentResponse* failed = nullptr;
+                 const auto rows = responses_fn_(command_id);
+                 for (const auto& r : rows) {
+                     if (r.agent_id != id)
+                         continue; // another agent's rows are never rendered here
+                     if (!r.output.empty())
+                         with_output = &r; // data rides RUNNING rows
+                     else if (r.status >= 2)
+                         failed = &r;
+                 }
+                 if (with_output) {
+                     if (with_output->output.starts_with("error|")) {
+                         note(res, "The device reported an error: " +
+                                       esc(with_output->output.substr(6, 200)));
+                         return;
+                     }
+                     res.set_content(render_dex_procperf_panel(
+                                         parse_dex_procperf_output(with_output->output), w),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 if (failed) {
+                     note(res, "Query failed on the device: " +
+                                   esc(failed->error_detail.substr(0, 200)));
+                     return;
+                 }
+                 if (attempt >= 20) {
+                     note(res, "No response from the device (timed out) &mdash; it may have "
+                               "gone offline. Reload the page to retry.");
+                     return;
+                 }
+                 res.set_content(procperf_pending(command_id, id, attempt + 1, w),
+                                 "text/html; charset=utf-8");
+             });
 }
 
 } // namespace yuzu::server

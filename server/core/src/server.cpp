@@ -64,6 +64,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -314,6 +315,23 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
                           "Current count of tracked (obs_type,subject) pairs", "gauge");
+        // F2a PR3: per-cohort fleet perf gauges (exported only when the operator
+        // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
+        metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
+                          "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
+                          "cohorts of the configured export tag key, ≥10 reporting devices)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
+                          "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_disk_lat_ms",
+                          "Per-cohort disk per-IO service time ms (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_reporting",
+                          "Devices contributing perf samples per exported cohort", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_clipped",
+                          "Exportable cohorts dropped by the top-50 cardinality cap this sweep "
+                          "(0 = nothing clipped; absent = export disabled)", "gauge");
         // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
         metrics_.describe("yuzu_server_dex_alert_fired_total",
                           "Operator-routed per-signal alerts fired (notification + dex.signal "
@@ -341,10 +359,12 @@ public:
         // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
         // no agent reports — never a fabricated zero).
         metrics_.describe("yuzu_fleet_perf_reporting",
-                          "Agents whose latest heartbeat carried CPU/commit perf tags (the "
-                          "population behind yuzu_fleet_perf_cpu_pct and _commit_pct). The "
-                          "disk-latency gauge may cover a SUBSET — agents on virtual disks that "
-                          "don't answer IOCTL_DISK_PERFORMANCE omit that tag", "gauge");
+                          "Agents whose latest heartbeat carried at least ONE perf tag — the "
+                          "same any-of-three definition the /dex Performance tab's Reporting "
+                          "card uses, so the two always agree. Each per-metric gauge may cover "
+                          "a SUBSET of this population (its {stat} series carry their own n via "
+                          "the tab/REST; e.g. agents on virtual disks that don't answer "
+                          "IOCTL_DISK_PERFORMANCE omit the disk-latency tag)", "gauge");
         metrics_.describe("yuzu_fleet_perf_cpu_pct",
                           "Fleet device CPU busy % over each agent's last heartbeat interval, "
                           "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
@@ -2155,7 +2175,15 @@ public:
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                // G6 SRE: the sweep body is a serial budget shared with the
+                // SECURITY-relevant revocation sweep below — a stall here (e.g.
+                // a locked tags.db inside the cohort gauge publish) delays
+                // revoked-agent teardown by the same amount. Make it visible.
+                const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // F2a PR3: per-cohort fleet perf gauges — same cycle, same
+                // staleness window as the fleet families above.
+                publish_cohort_perf_gauges();
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
@@ -2336,6 +2364,15 @@ public:
                                         .count();
                     metrics_.gauge("yuzu_server_uptime_seconds").set(static_cast<double>(uptime_s));
                 }
+                // G6 SRE: sweep-body duration (excludes the sleep) — the
+                // revocation sweep above shares this serial budget, so a stall
+                // (locked tags.db, slow fleet walk) is a security-relevant
+                // delay, not just stale metrics.
+                metrics_
+                    .histogram("yuzu_server_reaper_sweep_duration_seconds")
+                    .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           sweep_start)
+                                 .count());
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
@@ -3626,6 +3663,39 @@ private:
             get_int("dex_blast_min_devices", defaults.min_devices),
             get_int("dex_blast_window_seconds", defaults.window_seconds),
             get_int("dex_blast_cooldown_seconds", defaults.cooldown_seconds));
+        // F2a PR3: cohort metrics export key — read+validated here, consumed by
+        // the reaper-thread gauge sweep. Invalid stored values disable the
+        // export (fail closed) rather than reaching the snapshot provider.
+        {
+            std::string key = runtime_config_store_->get_value("dex_cohort_export_key");
+            if (!key.empty() && !TagStore::validate_key(key))
+                key.clear();
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_cohort_export_key_ = std::move(key);
+        }
+    }
+
+    /// F2a PR3: publish the per-cohort fleet perf gauges for the configured
+    /// export tag key. Runs on the reaper thread each sweep, right after
+    /// recompute_metrics (same cycle, same staleness window → the cohort
+    /// gauges can never disagree with the fleet families). The export logic
+    /// (clear-first absent-not-stale, floor, top-N cap + visible clipped
+    /// count, "(untagged)" residual label) lives in dex_perf_model so the
+    /// gauges are pinned by unit tests against the same cohort rows the tab
+    /// and REST render.
+    void publish_cohort_perf_gauges() {
+        std::string key;
+        DexPerfFn perf;
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            key = dex_cohort_export_key_;
+            perf = dex_perf_fn_;
+        }
+        if (key.empty() || !perf) {
+            dex_perf_clear_cohort_gauges(metrics_); // export disabled — absent
+            return;
+        }
+        dex_perf_export_cohort_gauges(metrics_, dex_perf_cohorts(perf(key)));
     }
 
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -7632,6 +7702,158 @@ private:
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             });
 
+        // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
+        // perf tags (validated through the SAME dex_perf_rules the Prometheus
+        // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
+        // TagStore (operator tags, ONE bulk query per render — not N point
+        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
+        // first, then the tag store. Shared by the /dex Performance fragments,
+        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
+        // three can never disagree.
+        auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
+            DexPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            std::unordered_map<std::string, std::string> cohort_values;
+            if (tag_store_ && !cohort_key.empty()) {
+                // available_keys feed the tab's key picker and the cohorts
+                // REST response — both always pass a key. Key-less callers
+                // (the pollable fleet endpoint, the disabled gauge sweep)
+                // don't pay the extra query (grill NFR fix).
+                snap.available_keys = tag_store_->get_distinct_keys();
+                cohort_values = tag_store_->get_values_for_key(cohort_key);
+            }
+            // Same staleness the recompute_metrics sweep prunes by — the tab and
+            // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
+            // copies ONLY the perf tags (G3 performance S1 — the copy runs under
+            // the heartbeat-upsert mutex).
+            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
+            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
+            by_id.reserve(health.size());
+            for (const auto& h : health)
+                by_id[h.agent_id] = &h;
+            for (const auto& id : registry_.all_ids()) {
+                auto s = registry_.get_session(id);
+                if (!s)
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = id;
+                std::string os = s->os;
+                for (auto& c : os)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
+                // match classifies every macOS agent as Windows (G4 UP-1
+                // BLOCKING). Agents report "windows" / "darwin" / "linux"
+                // (agents/core/src/agent.cpp kAgentOs).
+                d.is_windows = os.starts_with("win");
+                if (auto it = by_id.find(id); it != by_id.end()) {
+                    const auto& tags = it->second->status_tags;
+                    auto get = [&](const char* k) -> std::string {
+                        auto t = tags.find(k);
+                        return t != tags.end() ? t->second : std::string{};
+                    };
+                    d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                    d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                    d.disk_lat_ms =
+                        detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                }
+                if (!cohort_key.empty()) {
+                    // STORE-FIRST precedence — deliberately the OPPOSITE of
+                    // evaluate_scope's agent-first order: a benchmark cohort is
+                    // an operator-declared comparison population, so a rogue
+                    // agent must not self-assign into "executive-laptops" and
+                    // drag its p90 (G4 UP-5). The store already carries honest
+                    // agents' tags via sync_agent_tags, so store-first loses
+                    // nothing; the in-memory fallback only covers a tag not yet
+                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
+                    // are unvalidated at session ingest) so oversized/garbage
+                    // bytes never become a cohort label.
+                    if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
+                        d.cohort = cv->second;
+                    } else if (auto it = s->scopable_tags.find(cohort_key);
+                               it != s->scopable_tags.end() &&
+                               TagStore::validate_value(it->second)) {
+                        d.cohort = it->second;
+                    }
+                }
+                snap.devices.push_back(std::move(d));
+            }
+            // C-S1 (consistency): the fleet yuzu_fleet_perf_* gauges aggregate
+            // EVERY fresh health snapshot; an agent whose Subscribe session was
+            // reaped while its heartbeat is still <90s old must therefore also
+            // appear here, or the tab and the gauges disagree about the same
+            // sweep. Session-less devices carry values but no OS/cohort context
+            // (is_windows=false keeps them out of the Windows denominator;
+            // store-side cohort still resolves).
+            std::unordered_set<std::string> seen;
+            seen.reserve(snap.devices.size());
+            for (const auto& d : snap.devices)
+                seen.insert(d.agent_id);
+            for (const auto& h : health) {
+                if (seen.contains(h.agent_id))
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = h.agent_id;
+                auto get = [&](const char* k) -> std::string {
+                    auto t = h.status_tags.find(k);
+                    return t != h.status_tags.end() ? t->second : std::string{};
+                };
+                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                if (!cohort_key.empty())
+                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+        // G3 performance S2: a 5s TTL memo keyed by cohort key. Heartbeat data
+        // changes on a ~30s cadence, so every consumer (operator clicks, agentic
+        // pollers, per-device drills, the 15s gauge sweep) can share one build
+        // per key per 5s — bounding the fleet-walk + tag-query cost no matter
+        // how hard the REST surface is polled. Consumers may therefore see a
+        // snapshot up to 5s stale; that is well inside the heartbeat cadence.
+        struct DexPerfMemo {
+            std::mutex mu;
+            struct Entry {
+                std::chrono::steady_clock::time_point at;
+                DexPerfSnapshot snap;
+            };
+            std::unordered_map<std::string, Entry> by_key;
+        };
+        auto dex_perf_memo = std::make_shared<DexPerfMemo>();
+        auto dex_perf_fn = [memo = dex_perf_memo,
+                            dex_perf_uncached](const std::string& cohort_key) -> DexPerfSnapshot {
+            constexpr auto kTtl = std::chrono::seconds{5};
+            constexpr std::size_t kMaxMemoEntries = 8; // "", default key, export key, picker keys
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lk(memo->mu);
+                if (auto it = memo->by_key.find(cohort_key);
+                    it != memo->by_key.end() && now - it->second.at < kTtl)
+                    return it->second.snap;
+            }
+            auto snap = dex_perf_uncached(cohort_key);
+            {
+                std::lock_guard lk(memo->mu);
+                if (memo->by_key.size() >= kMaxMemoEntries &&
+                    !memo->by_key.contains(cohort_key)) {
+                    auto oldest = memo->by_key.begin();
+                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
+                        if (it->second.at < oldest->second.at)
+                            oldest = it;
+                    memo->by_key.erase(oldest);
+                }
+                memo->by_key[cohort_key] = {now, snap};
+            }
+            return snap;
+        };
+        // PR3: the reaper-thread cohort gauge sweep uses the same provider.
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_perf_fn_ = dex_perf_fn;
+        }
+
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
         // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
@@ -7651,7 +7873,9 @@ private:
                         std::string os = s->os;
                         for (auto& c : os)
                             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        if (os.find("win") != std::string::npos)
+                        // starts_with, NOT find — "darwin" contains "win"
+                        // (G4 UP-1; pre-existing here, fixed with the sibling).
+                        if (os.starts_with("win"))
                             ++f.windows_online;
                     }
                 }
@@ -7677,7 +7901,9 @@ private:
                 for (const auto& r : response_store_->query(command_id))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
-            });
+            },
+            // F2a: the shared fleet perf snapshot provider (defined above).
+            dex_perf_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -8083,7 +8309,11 @@ private:
                 // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
                 forward_gateway_pending();
                 return sent;
-            }));
+            }),
+            // F2a: the shared fleet perf snapshot provider — the same closure
+            // the /dex Performance fragments and the MCP perf tools use, so
+            // REST, dashboard and MCP can never disagree.
+            dex_perf_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -8193,7 +8423,10 @@ private:
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
                 ca_store_.get(), [this]() { return publish_crl(); },
                 // ar-S1: DEX read tools (parity with /api/v1/dex/*).
-                guaranteed_state_store_.get());
+                guaranteed_state_store_.get(),
+                // F2a: the shared fleet perf snapshot provider (one closure,
+                // three surfaces — fragments, REST, MCP).
+                dex_perf_fn);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -8372,6 +8605,12 @@ private:
     /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
     BlastRadiusDetector blast_radius_detector_;
     DexAlertRouter dex_alert_router_;
+    /// F2a PR3: cohort metrics export — written by apply_dex_alert_config
+    /// (boot + settings POST) and start_web_server (the provider closure),
+    /// read by the reaper-thread gauge sweep. One mutex guards both.
+    std::mutex dex_cohort_export_mu_;
+    std::string dex_cohort_export_key_;
+    DexPerfFn dex_perf_fn_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
