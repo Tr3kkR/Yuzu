@@ -22,6 +22,7 @@
 #include <yuzu/agent/guard_file.hpp>
 #include <yuzu/agent/guard_registry.hpp>
 #include <yuzu/agent/guard_service.hpp>
+#include <yuzu/agent/guard_systemd.hpp> // make_service_guard (platform factory)
 #include <yuzu/agent/kv_store.hpp>
 
 #include "agent.grpc.pb.h"
@@ -632,7 +633,9 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 it->second->stop();
             guards_.erase(it);
         }
-        auto sguard = std::make_unique<ServiceGuard>(std::move(cfg), std::move(service_sink));
+        // Platform factory: Windows SCM ServiceGuard or Linux systemd
+        // SystemdServiceGuard, both IGuard. Keeps this dispatch platform-clean.
+        auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
         if (sguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(sguard));
             spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
@@ -642,7 +645,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
             return true;
         }
         spdlog::warn("Guardian: service guard for rule '{}' did not start "
-                     "(non-Windows or invalid service name)",
+                     "(unsupported platform / no service-control backend / invalid service name)",
                      rule.rule_id());
         return false;
     }
