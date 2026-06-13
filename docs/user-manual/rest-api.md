@@ -49,6 +49,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [API Tokens](#api-tokens)
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
+  - [Internal CA](#internal-ca)
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
@@ -557,6 +558,8 @@ Remove a role assignment from this management group.
 
 API tokens provide non-interactive authentication for scripts and automation. Tokens are scoped to the creating user's permissions. The raw token string is returned exactly once at creation time and cannot be retrieved afterward.
 
+**Storage failure:** if the server's token store database failed to open at startup (bad data directory, permissions), all three token endpoints return `503` with message `service unavailable` rather than `404` or an empty list, so automation can distinguish a server-side outage from a missing token. Note that Bearer-token *authentication* against an unavailable token store deliberately fails closed with `401`, not `503` — an automation client seeing unexpected `401`s during an outage should check server health (`/readyz` reports `api_token_store`) before rotating credentials.
+
 #### `GET /api/v1/tokens`
 
 List the current user's API tokens. Raw token values are never returned.
@@ -854,6 +857,167 @@ Release a device from quarantine.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Internal CA
+
+The server's built-in certificate authority (see `docs/pki-architecture.md`) can
+be managed via the **Settings → Internal CA** dashboard panel or the REST
+endpoints below. `root` and `crl` are **public** (clients and browsers need
+them to establish trust / check revocation before they have a session); the
+inventory and revoke endpoints are gated by the `Security` securable.
+
+> Note on `Security` operations: certificate **revocation** uses `Security:Delete`
+> (a destructive operation on an issued cert), while device **quarantine** uses
+> `Security:Execute`. A custom role scoped to security operations needs both.
+
+#### `GET /api/v1/ca/root`
+
+Download the CA root certificate (PEM) and add it to an OS/browser trust store.
+**Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
+`Content-Disposition: attachment; filename="yuzu-ca.pem"`,
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
+openssl x509 -in yuzu-ca.pem -noout -fingerprint -sha256
+```
+
+#### `GET /api/v1/ca/crl`
+
+Download the current certificate revocation list (DER). **Public** — no
+authentication. Returns `Content-Type: application/pkix-crl`,
+`Cache-Control: no-cache, must-revalidate`. `503` if no CRL has been published
+yet (transient — the server pre-publishes at startup and republishes on each
+revocation).
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/crl -o yuzu.crl
+openssl crl -inform DER -in yuzu.crl -noout -text
+```
+
+#### `GET /api/v1/ca/issued`
+
+List certificates issued by the internal CA. **Permission:** `Security:Read`.
+Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
+certificate PEM and enrollment reference are intentionally omitted.
+
+`meta.has_more` is `true` when more rows exist beyond the current page; when it is,
+`meta.next_offset` carries the `offset` to pass for the next page. Iterate until
+`has_more` is `false` (do **not** infer end-of-list from `count < limit`).
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "active",
+      "not_after": 1780000000,
+      "issued_at": 1710849600,
+      "issued_by": "agent:agent-prod-01"
+    }
+  ],
+  "count": 1,
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
+}
+```
+
+The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
+
+#### `POST /api/v1/ca/revoke`
+
+Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
+takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
+the CRL); the CRL is then republished. Request body (max 64 KB):
+
+```json
+{ "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
+```
+
+`serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
+are rejected. Response:
+
+```json
+{ "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+`crl_republished: false` means the revocation stands (the agent is refused on its
+next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
+will not see it until the next successful publish. Errors: `400` (missing/invalid
+serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
+not found or already revoked), `413` (body too large), `503` (CA unavailable).
+
+#### Subordinate-CA (root your CA in an enterprise PKI)
+
+By default Yuzu's CA is a self-signed install root (`trust mode: built-in`). An
+enterprise can instead make Yuzu's issuing CA a **subordinate** of its own root,
+so every Yuzu-issued certificate chains to the corporate trust anchor. The
+issuing **key never changes** — the enterprise signs Yuzu's *existing* public
+key — so certificates already issued keep validating across the switch.
+
+Workflow:
+
+1. **Export** Yuzu's CA signing request and have your enterprise root sign it as
+   a subordinate CA (the signed cert **must** carry `basicConstraints: CA:TRUE`,
+   `keyUsage: keyCertSign, cRLSign`).
+2. **Import** the signed intermediate plus the parent chain (enterprise root and
+   any intermediates above Yuzu's).
+
+This is also available in **Settings → Internal CA → "Subordinate this CA…"**.
+
+#### `GET /api/v1/ca/root-csr`
+
+Export the install CA's PKCS#10 CSR (PEM), over its existing key, for an
+enterprise root to sign. **Permission:** `Security:Read`. The CSR carries only
+the CA's public key (already public via `GET /api/v1/ca/root`) and subject — no
+secret. Audited (`ca.root_csr.exported`).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://yuzu.example.com/api/v1/ca/root-csr -o yuzu-ca.csr
+# → hand yuzu-ca.csr to your enterprise CA; it returns a signed intermediate.
+```
+
+Errors: `403` (missing `Security:Read`), `500` (CSR generation failed), `503`
+(CA unavailable).
+
+#### `POST /api/v1/ca/import-chain`
+
+Import the enterprise-signed intermediate + parent chain, switching the issuing
+identity to subordinate mode. **Permission:** `Security:Write`. Request body
+(max 256 KB):
+
+```json
+{
+  "intermediate_pem": "-----BEGIN CERTIFICATE-----\n... (Yuzu's key, signed by the enterprise) ...\n-----END CERTIFICATE-----\n",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n... (enterprise root [+ intermediates]) ...\n-----END CERTIFICATE-----\n"
+}
+```
+
+The server validates that the intermediate (a) is a CA certificate, (b) carries
+**this install's** CA public key (proof the enterprise signed the CSR you
+exported), and (c) verifies up to the supplied parent chain — then swaps the
+issuing cert and re-publishes the CRL under the new issuer. Response:
+
+```json
+{ "imported": true, "mode": "subordinate", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+Errors: `400` (bad JSON / missing field / unparseable intermediate), `403`
+(missing `Security:Write`), `409` (no existing CA to subordinate — generate
+default certs first), `422` (intermediate is not a CA / does not carry this CA's
+key / does not verify to the chain), `413` (body too large), `500` (validated but
+persistence failed), `503` (CA unavailable). A rejected import is audited
+`ca.subordinate.imported` with `result=denied`; success with `result=success`.
+
+> **Bring-your-own-leaf** (orthogonal): any surface given an explicit
+> `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
+> the internal CA for that surface entirely — unchanged behaviour, supported and
+> independent of subordinate mode.
 
 ---
 
@@ -1367,6 +1531,11 @@ Query audit events.
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
+| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
+| `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
+| `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
 | `tag.set` | Tag created or updated |
 | `tag.delete` | Tag deleted |
 
@@ -2032,8 +2201,18 @@ Create a new webhook subscription.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `url` | string | Yes | HTTPS endpoint to receive POST notifications |
-| `event_types` | array | Yes | Events to subscribe to |
+| `event_types` | array | Yes | Events to subscribe to (see the table below) |
 | `secret` | string | No | HMAC-SHA256 secret for payload signing |
+
+**Event types** (the `event_types` filter matches these literal strings):
+
+| Event type | Fired when | Notable payload fields |
+|---|---|---|
+| `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
+| `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
+| `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
+| `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
+| `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
@@ -3199,8 +3378,10 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
-- **Response:** `data[]` of event objects.
+- **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 - **4xx:** `400` on non-integer or negative `limit` / `offset`.
+- **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
+- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. A query with no `agent_id` filter is a bulk operational query and is not individually audited.
 
 #### `GET /api/v1/guaranteed-state/status`
 
@@ -3230,6 +3411,64 @@ Guard authoring schema catalog — the static registry of `spark` / `assertion` 
 - **Permission:** `GuaranteedState:Read`
 - **Response:** `200` with `{version, schemas[]}`, each entry `{kind, type, json_schema}`. Includes the discriminated `registry-value-equals` encoding (per `value_type`), the `file-hash-equals` `expected_hash` hex format, and the `service-running` / `service-stopped` assertion schemas (with `service_name` pattern validation mirroring the agent's accepted service-name charset). The catalog is the source of truth for which spark/assertion/remediation types the agent actually implements — author against what it lists.
 - **Caching:** carries a content-derived `ETag` and `Cache-Control: public, max-age=300`; a conditional request with `If-None-Match` returns `304 Not Modified`. The catalog is compiled-in, so this endpoint answers even when the rules store is unavailable.
+
+---
+
+### DEX (Digital Employee Experience)
+
+The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`); the perf endpoints are now-views with no window.
+
+**Audit boundary.** The catalogue rollup, per-OS scope and the perf endpoints are aggregates / machine-health telemetry and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
+
+#### `GET /api/v1/dex/signals`
+
+Whole-catalogue rollup — every observation type present in the window.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `window`.
+- **Response:** `data[]` of `{obs_type, count, distinct_devices, last_seen}`. `obs_type` is the stable machine key (e.g. `process.crashed`, `os.boot`); map your own labels. Not audited.
+
+#### `GET /api/v1/dex/scope`
+
+Per-OS signal coverage — how many distinct observation types each platform reports, with total event count (the live cross-OS coverage the dashboard derives).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `window`.
+- **Response:** `data[]` of `{platform, distinct_types, total_events}`. Not audited.
+
+#### `GET /api/v1/dex/signals/{obs_type}`
+
+One signal type's drill-down.
+
+- **Permission:** `GuaranteedState:Read`
+- **Path parameter:** `obs_type` — must match `[A-Za-z0-9._-]{1,64}`.
+- **Query parameters:** `window`; `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
+- **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
+- **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
+- **Audit (behavioral PII):** emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) on every successful access — see the audit boundary note above.
+
+#### `GET /api/v1/dex/perf/fleet`
+
+Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` is the coverage-honest denominator (perf collectors are Windows-only today). Not audited.
+
+#### `GET /api/v1/dex/perf/cohorts`
+
+Fleet-relative performance percentiles per **cohort** — the distinct values of an operator-chosen tag key (see [Cohort benchmarking](dex.md#performance)).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`).
+- **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (10) reporting devices carry `suppressed: true` with their population and **no stats**; devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
+
+#### `GET /api/v1/dex/perf/devices`
+
+The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
 ---
 
@@ -4605,7 +4844,15 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
-    "policies": "ok"
+    "policies": "ok",
+    "guaranteed_state": "ok",
+    "offload_target": "ok",
+    "ca": "ok"
+  },
+  "tls": {
+    "default_certs_active": false,
+    "ca_fingerprint": "",
+    "ca_expires_at": 0
   },
   "executions": {
     "in_flight": 5,
@@ -4622,7 +4869,10 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`) |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca.db`) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
+| `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
+| `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
 | `executions.in_flight` | integer | Currently running instruction executions |
 | `executions.completed_last_hour` | integer | Executions completed in the past 60 minutes |
 | `executions.failed_last_hour` | integer | Executions that failed in the past 60 minutes |

@@ -48,28 +48,12 @@ agent_test_() ->
      ]}.
 
 setup() ->
-    %% Start pg and registry (real).
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _ -> ok
-    end,
-    %% A bare whereis check is not enough — health_nf_tests leaves a
-    %% mock_loop process registered as yuzu_gw_registry on cleanup
-    %% (see #336). Detect that case and replace it with a real registry
-    %% so register_agent doesn't hang on a process that swallows calls.
-    case whereis(yuzu_gw_registry) of
-        undefined ->
-            {ok, _} = yuzu_gw_registry:start_link();
-        Existing ->
-            case proc_lib:initial_call(Existing) of
-                {gen_server, init_it, _} ->
-                    ok;
-                _NotAGenServer ->
-                    catch unregister(yuzu_gw_registry),
-                    catch exit(Existing, kill),
-                    {ok, _} = yuzu_gw_registry:start_link()
-            end
-    end,
+    %% Ensure pg + a real registry under its registered name. The helper
+    %% navigates both #336 hazards: a mock_loop impostor left by
+    %% health_nf_tests (which would hang register_agent), and the
+    %% orphaned-but-not-yet-reaped registry whose still-owned named ETS
+    %% tables crash a fresh start_link's init/1 (issue #1403).
+    yuzu_gw_test_registry:ensure(),
     %% Clean up stale mocks from prior modules.
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(telemetry),

@@ -157,6 +157,27 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")->envname("YUZU_CERT");
     app.add_option("--key", cfg.tls_server_key, "PEM server private key")->envname("YUZU_KEY");
+    app.add_flag("--no-default-certs",
+                 "Do not auto-generate built-in default certificates on first boot; require "
+                 "operator-provided certs instead (legacy refuse-to-start behaviour)")
+        ->each([&cfg](const std::string&) { cfg.no_default_certs = true; })
+        ->envname("YUZU_NO_DEFAULT_CERTS");
+    app.add_option("--ca-dir", cfg.ca_dir,
+                   "Directory for the built-in CA + default certs (default: platform cert dir)")
+        ->envname("YUZU_CA_DIR");
+    app.add_option("--cert-san", cfg.cert_sans,
+                   "Extra Subject Alternative Name for the auto-generated default certs "
+                   "(repeatable). Forms: 'dns:<name>', 'ip:<addr>', or a bare value "
+                   "(auto-classified); a single value may be comma-separated. Added to the "
+                   "https/agent/gateway default leaves so they validate for a deployment "
+                   "hostname or IP (e.g. 'dns:gateway'). Ignored when operator certs are "
+                   "supplied or --no-default-certs is set.")
+        // #1271 cpp-expert: comma-splitting is done ONCE, in parse_extra_sans
+        // (default_certs.cpp), NOT here — do NOT add CLI11 `->delimiter(',')`, or a
+        // comma-separated value would be split twice (CLI11 tokens × the parser's
+        // own comma loop) and mangle entries. Each CLI/env token reaches the parser
+        // whole; the parser owns the comma semantics.
+        ->envname("YUZU_CERT_SAN");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;
@@ -844,6 +865,12 @@ int main(int argc, char* argv[]) {
         auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
         g_server.store(server.get(), std::memory_order_release);
         server->run();
+        if (server->startup_failed()) {
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return EXIT_FAILURE;
+        }
     } catch (const std::exception& ex) {
         spdlog::error("Fatal exception: {}", ex.what());
 #ifdef _WIN32

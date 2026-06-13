@@ -441,7 +441,17 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
                             .count();
     const auto seq = event_seq_.fetch_add(1, std::memory_order_relaxed);
     gpb::GuaranteedStateEvent ev;
-    ev.set_event_id(d.rule_id + "-" + std::to_string(now_ms) + "-" + std::to_string(seq));
+    // event_id folds in agent_id_ because the server's events table keys on a
+    // GLOBAL `event_id` PRIMARY KEY and drops on UNIQUE conflict (#1307). Without
+    // agent_id, two agents drifting on the same rule in the same millisecond mint
+    // an identical id (rule_id-{ms}-{seq}, seq being a per-agent counter that both
+    // start at 0) → the server silently keeps one and loses the rest during a
+    // fleet-wide drift wave. The agent_id segment alone guarantees cross-agent
+    // distinctness regardless of clock skew. (The crash/observation path landing
+    // with the DEX slice uses the same {discriminator}-{agent_id}-{ms}-{seq}
+    // layout — keep them aligned when that branch merges.)
+    ev.set_event_id(d.rule_id + "-" + agent_id_ + "-" + std::to_string(now_ms) + "-" +
+                    std::to_string(seq));
     ev.set_rule_id(d.rule_id);
     ev.set_rule_name(d.rule_name);
     ev.set_guard_type(d.guard_type); // "registry" | "file" — set by the producing guard
@@ -708,6 +718,13 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
     cmd.set_action(std::string{kActionPushRules});
     cmd.set_payload(std::string{push_param_bytes});
     return engine.dispatch(cmd);
+}
+
+// Test-support helper — see guardian_engine.hpp. Friend of GuardianEngine so it
+// can reach the private emit_guard_event(); production drift only ever enters
+// that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
+void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
+    engine.emit_guard_event(drift);
 }
 
 } // namespace yuzu::agent

@@ -102,7 +102,8 @@
         machine_certificate     => iodata(),        % = 3, optional
         attestation_signature   => iodata(),        % = 4, optional
         attestation_provider    => unicode:chardata(), % = 5, optional
-        gateway_observed_peer   => unicode:chardata() % = 6, optional
+        gateway_observed_peer   => unicode:chardata(), % = 6, optional
+        csr_pem                 => unicode:chardata() % = 7, optional
        }.
 
 -type 'yuzu.agent.v1.RegisterResponse'() ::
@@ -111,7 +112,9 @@
         reject_reason           => unicode:chardata(), % = 3, optional
         pending_commands        => ['yuzu.agent.v1.CommandRequest'()], % = 4, repeated
         enrollment_status       => unicode:chardata(), % = 5, optional
-        agent_credential        => unicode:chardata() % = 6, optional
+        agent_credential        => unicode:chardata(), % = 6, optional
+        issued_certificate      => unicode:chardata(), % = 7, optional
+        issued_ca_chain         => unicode:chardata() % = 8, optional
        }.
 
 -type 'yuzu.agent.v1.HeartbeatRequest'() ::
@@ -553,16 +556,27 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B4
          end,
+    B6 = case M of
+             #{gateway_observed_peer := F6} ->
+                 begin
+                     TrF6 = id(F6, TrUserData),
+                     case is_empty_string(TrF6) of
+                         true -> B5;
+                         false -> e_type_string(TrF6, <<B5/binary, 50>>, TrUserData)
+                     end
+                 end;
+             _ -> B5
+         end,
     case M of
-        #{gateway_observed_peer := F6} ->
+        #{csr_pem := F7} ->
             begin
-                TrF6 = id(F6, TrUserData),
-                case is_empty_string(TrF6) of
-                    true -> B5;
-                    false -> e_type_string(TrF6, <<B5/binary, 50>>, TrUserData)
+                TrF7 = id(F7, TrUserData),
+                case is_empty_string(TrF7) of
+                    true -> B6;
+                    false -> e_type_string(TrF7, <<B6/binary, 58>>, TrUserData)
                 end
             end;
-        _ -> B5
+        _ -> B6
     end.
 
 'encode_msg_yuzu.agent.v1.RegisterResponse'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.RegisterResponse'(Msg, <<>>, TrUserData).
@@ -620,16 +634,38 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B4
          end,
+    B6 = case M of
+             #{agent_credential := F6} ->
+                 begin
+                     TrF6 = id(F6, TrUserData),
+                     case is_empty_string(TrF6) of
+                         true -> B5;
+                         false -> e_type_string(TrF6, <<B5/binary, 50>>, TrUserData)
+                     end
+                 end;
+             _ -> B5
+         end,
+    B7 = case M of
+             #{issued_certificate := F7} ->
+                 begin
+                     TrF7 = id(F7, TrUserData),
+                     case is_empty_string(TrF7) of
+                         true -> B6;
+                         false -> e_type_string(TrF7, <<B6/binary, 58>>, TrUserData)
+                     end
+                 end;
+             _ -> B6
+         end,
     case M of
-        #{agent_credential := F6} ->
+        #{issued_ca_chain := F8} ->
             begin
-                TrF6 = id(F6, TrUserData),
-                case is_empty_string(TrF6) of
-                    true -> B5;
-                    false -> e_type_string(TrF6, <<B5/binary, 50>>, TrUserData)
+                TrF8 = id(F8, TrUserData),
+                case is_empty_string(TrF8) of
+                    true -> B7;
+                    false -> e_type_string(TrF8, <<B7/binary, 66>>, TrUserData)
                 end
             end;
-        _ -> B5
+        _ -> B7
     end.
 
 'encode_msg_yuzu.agent.v1.HeartbeatRequest'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.HeartbeatRequest'(Msg, <<>>, TrUserData).
@@ -2195,55 +2231,59 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
 'skip_64_yuzu.agent.v1.AgentInfo'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.AgentInfo'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
 
 'decode_msg_yuzu.agent.v1.RegisterRequest'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Bin, 0, 0, 0, id('$undef', TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Bin, 0, 0, 0, id('$undef', TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) ->
-    S1 = #{enrollment_token => F@_2, machine_certificate => F@_3, attestation_signature => F@_4, attestation_provider => F@_5, gateway_observed_peer => F@_6},
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<58, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterRequest_csr_pem'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _) ->
+    S1 = #{enrollment_token => F@_2, machine_certificate => F@_3, attestation_signature => F@_4, attestation_provider => F@_5, gateway_observed_peer => F@_6, csr_pem => F@_7},
     if F@_1 == '$undef' -> S1;
        true -> S1#{info => F@_1}
     end;
-'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 32 - 7 ->
-    'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        10 -> 'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        18 -> 'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        26 -> 'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        34 -> 'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        42 -> 'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        50 -> 'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
+        10 -> 'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        18 -> 'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        26 -> 'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        34 -> 'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        42 -> 'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        50 -> 'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        58 -> 'd_field_yuzu.agent.v1.RegisterRequest_csr_pem'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.RegisterRequest'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) ->
-    S1 = #{enrollment_token => F@_2, machine_certificate => F@_3, attestation_signature => F@_4, attestation_provider => F@_5, gateway_observed_peer => F@_6},
+'dg_read_field_def_yuzu.agent.v1.RegisterRequest'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _) ->
+    S1 = #{enrollment_token => F@_2, machine_certificate => F@_3, attestation_signature => F@_4, attestation_provider => F@_5, gateway_observed_peer => F@_6, csr_pem => F@_7},
     if F@_1 == '$undef' -> S1;
        true -> S1#{info => F@_1}
     end.
 
-'d_field_yuzu.agent.v1.RegisterRequest_info'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_info'(<<0:1, X:7, Rest/binary>>, N, Acc, F, Prev, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_info'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_info'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_info'(<<0:1, X:7, Rest/binary>>, N, Acc, F, Prev, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_yuzu.agent.v1.AgentInfo'(Bs, TrUserData), TrUserData), Rest2} end,
     'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF,
                                                        0,
@@ -2257,157 +2297,203 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
                                                        F@_4,
                                                        F@_5,
                                                        F@_6,
+                                                       F@_7,
                                                        TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_enrollment_token'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_machine_certificate'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_attestation_signature'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_attestation_provider'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_gateway_observed_peer'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, F@_7, TrUserData).
 
-'skip_varint_yuzu.agent.v1.RegisterRequest'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'skip_varint_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_varint_yuzu.agent.v1.RegisterRequest'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'d_field_yuzu.agent.v1.RegisterRequest_csr_pem'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterRequest_csr_pem'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.RegisterRequest_csr_pem'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, NewFValue, TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_varint_yuzu.agent.v1.RegisterRequest'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'skip_varint_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_varint_yuzu.agent.v1.RegisterRequest'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.RegisterRequest'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_group_yuzu.agent.v1.RegisterRequest'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_group_yuzu.agent.v1.RegisterRequest'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_32_yuzu.agent.v1.RegisterRequest'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_32_yuzu.agent.v1.RegisterRequest'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_64_yuzu.agent.v1.RegisterRequest'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_64_yuzu.agent.v1.RegisterRequest'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
 'decode_msg_yuzu.agent.v1.RegisterResponse'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Bin, 0, 0, 0, id(<<>>, TrUserData), id(false, TrUserData), id(<<>>, TrUserData), id([], TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Bin,
+                                                        0,
+                                                        0,
+                                                        0,
+                                                        id(<<>>, TrUserData),
+                                                        id(false, TrUserData),
+                                                        id(<<>>, TrUserData),
+                                                        id([], TrUserData),
+                                                        id(<<>>, TrUserData),
+                                                        id(<<>>, TrUserData),
+                                                        id(<<>>, TrUserData),
+                                                        id(<<>>, TrUserData),
+                                                        TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<16, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, R1, F@_5, F@_6, TrUserData) ->
-    S1 = #{session_id => F@_1, accepted => F@_2, reject_reason => F@_3, enrollment_status => F@_5, agent_credential => F@_6},
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<16, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<58, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_issued_certificate'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<66, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'd_field_yuzu.agent.v1.RegisterResponse_issued_ca_chain'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, R1, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    S1 = #{session_id => F@_1, accepted => F@_2, reject_reason => F@_3, enrollment_status => F@_5, agent_credential => F@_6, issued_certificate => F@_7, issued_ca_chain => F@_8},
     if R1 == '$undef' -> S1;
        true -> S1#{pending_commands => lists_reverse(R1, TrUserData)}
     end;
-'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 32 - 7 ->
-    'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        10 -> 'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        16 -> 'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        26 -> 'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        34 -> 'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        42 -> 'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        50 -> 'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
+        10 -> 'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        16 -> 'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        26 -> 'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        34 -> 'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        42 -> 'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        50 -> 'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        58 -> 'd_field_yuzu.agent.v1.RegisterResponse_issued_certificate'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+        66 -> 'd_field_yuzu.agent.v1.RegisterResponse_issued_ca_chain'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.RegisterResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, R1, F@_5, F@_6, TrUserData) ->
-    S1 = #{session_id => F@_1, accepted => F@_2, reject_reason => F@_3, enrollment_status => F@_5, agent_credential => F@_6},
+'dg_read_field_def_yuzu.agent.v1.RegisterResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, R1, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    S1 = #{session_id => F@_1, accepted => F@_2, reject_reason => F@_3, enrollment_status => F@_5, agent_credential => F@_6, issued_certificate => F@_7, issued_ca_chain => F@_8},
     if R1 == '$undef' -> S1;
        true -> S1#{pending_commands => lists_reverse(R1, TrUserData)}
     end.
 
-'d_field_yuzu.agent.v1.RegisterResponse_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterResponse_accepted'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_accepted'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_accepted'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_accepted'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_accepted'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterResponse_reject_reason'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_reject_reason'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_reject_reason'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_reject_reason'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_reject_reason'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterResponse_pending_commands'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_pending_commands'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, Prev, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_pending_commands'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_pending_commands'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_pending_commands'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, Prev, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_yuzu.agent.v1.CommandRequest'(Bs, TrUserData), TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, cons(NewFValue, Prev, TrUserData), F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, cons(NewFValue, Prev, TrUserData), F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_enrollment_status'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, F@_7, F@_8, TrUserData).
 
-'d_field_yuzu.agent.v1.RegisterResponse_agent_credential'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.RegisterResponse_agent_credential'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_agent_credential'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_agent_credential'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_agent_credential'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, F@_7, F@_8, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, F@_7, F@_8, TrUserData).
 
-'skip_varint_yuzu.agent.v1.RegisterResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'skip_varint_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_varint_yuzu.agent.v1.RegisterResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'d_field_yuzu.agent.v1.RegisterResponse_issued_certificate'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_issued_certificate'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_issued_certificate'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _, F@_8, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, NewFValue, F@_8, TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.RegisterResponse_issued_ca_chain'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.RegisterResponse_issued_ca_chain'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'d_field_yuzu.agent.v1.RegisterResponse_issued_ca_chain'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, NewFValue, TrUserData).
+
+'skip_varint_yuzu.agent.v1.RegisterResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'skip_varint_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'skip_varint_yuzu.agent.v1.RegisterResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.RegisterResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'skip_group_yuzu.agent.v1.RegisterResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_group_yuzu.agent.v1.RegisterResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'skip_32_yuzu.agent.v1.RegisterResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_32_yuzu.agent.v1.RegisterResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
-'skip_64_yuzu.agent.v1.RegisterResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_64_yuzu.agent.v1.RegisterResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.RegisterResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
 'decode_msg_yuzu.agent.v1.HeartbeatRequest'(Bin, TrUserData) ->
     'dfp_read_field_def_yuzu.agent.v1.HeartbeatRequest'(Bin, 0, 0, 0, id(<<>>, TrUserData), id('$undef', TrUserData), 'tr_decode_init_default_yuzu.agent.v1.HeartbeatRequest.status_tags'([], TrUserData), id(<<>>, TrUserData), TrUserData).
@@ -4154,10 +4240,15 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{attestation_provider := PFattestation_provider}, _} -> S5#{attestation_provider => PFattestation_provider};
              _ -> S5
          end,
+    S7 = case {PMsg, NMsg} of
+             {_, #{gateway_observed_peer := NFgateway_observed_peer}} -> S6#{gateway_observed_peer => NFgateway_observed_peer};
+             {#{gateway_observed_peer := PFgateway_observed_peer}, _} -> S6#{gateway_observed_peer => PFgateway_observed_peer};
+             _ -> S6
+         end,
     case {PMsg, NMsg} of
-        {_, #{gateway_observed_peer := NFgateway_observed_peer}} -> S6#{gateway_observed_peer => NFgateway_observed_peer};
-        {#{gateway_observed_peer := PFgateway_observed_peer}, _} -> S6#{gateway_observed_peer => PFgateway_observed_peer};
-        _ -> S6
+        {_, #{csr_pem := NFcsr_pem}} -> S7#{csr_pem => NFcsr_pem};
+        {#{csr_pem := PFcsr_pem}, _} -> S7#{csr_pem => PFcsr_pem};
+        _ -> S7
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.RegisterResponse'/3}).
@@ -4189,10 +4280,20 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{enrollment_status := PFenrollment_status}, _} -> S5#{enrollment_status => PFenrollment_status};
              _ -> S5
          end,
+    S7 = case {PMsg, NMsg} of
+             {_, #{agent_credential := NFagent_credential}} -> S6#{agent_credential => NFagent_credential};
+             {#{agent_credential := PFagent_credential}, _} -> S6#{agent_credential => PFagent_credential};
+             _ -> S6
+         end,
+    S8 = case {PMsg, NMsg} of
+             {_, #{issued_certificate := NFissued_certificate}} -> S7#{issued_certificate => NFissued_certificate};
+             {#{issued_certificate := PFissued_certificate}, _} -> S7#{issued_certificate => PFissued_certificate};
+             _ -> S7
+         end,
     case {PMsg, NMsg} of
-        {_, #{agent_credential := NFagent_credential}} -> S6#{agent_credential => NFagent_credential};
-        {#{agent_credential := PFagent_credential}, _} -> S6#{agent_credential => PFagent_credential};
-        _ -> S6
+        {_, #{issued_ca_chain := NFissued_ca_chain}} -> S8#{issued_ca_chain => NFissued_ca_chain};
+        {#{issued_ca_chain := PFissued_ca_chain}, _} -> S8#{issued_ca_chain => PFissued_ca_chain};
+        _ -> S8
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.HeartbeatRequest'/3}).
@@ -4823,12 +4924,17 @@ verify_msg(Msg, MsgName, Opts) ->
         #{gateway_observed_peer := F6} -> v_type_string(F6, [gateway_observed_peer | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{csr_pem := F7} -> v_type_string(F7, [csr_pem | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (info) -> ok;
                       (enrollment_token) -> ok;
                       (machine_certificate) -> ok;
                       (attestation_signature) -> ok;
                       (attestation_provider) -> ok;
                       (gateway_observed_peer) -> ok;
+                      (csr_pem) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -4868,12 +4974,22 @@ verify_msg(Msg, MsgName, Opts) ->
         #{agent_credential := F6} -> v_type_string(F6, [agent_credential | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{issued_certificate := F7} -> v_type_string(F7, [issued_certificate | Path], TrUserData);
+        _ -> ok
+    end,
+    case M of
+        #{issued_ca_chain := F8} -> v_type_string(F8, [issued_ca_chain | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (session_id) -> ok;
                       (accepted) -> ok;
                       (reject_reason) -> ok;
                       (pending_commands) -> ok;
                       (enrollment_status) -> ok;
                       (agent_credential) -> ok;
+                      (issued_certificate) -> ok;
+                      (issued_ca_chain) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -5671,14 +5787,17 @@ get_msg_defs() ->
        #{name => machine_certificate, fnum => 3, rnum => 4, type => bytes, occurrence => optional, opts => []},
        #{name => attestation_signature, fnum => 4, rnum => 5, type => bytes, occurrence => optional, opts => []},
        #{name => attestation_provider, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-       #{name => gateway_observed_peer, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []}]},
+       #{name => gateway_observed_peer, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []},
+       #{name => csr_pem, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.agent.v1.RegisterResponse'},
       [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => accepted, fnum => 2, rnum => 3, type => bool, occurrence => optional, opts => []},
        #{name => reject_reason, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
        #{name => pending_commands, fnum => 4, rnum => 5, type => {msg, 'yuzu.agent.v1.CommandRequest'}, occurrence => repeated, opts => []},
        #{name => enrollment_status, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-       #{name => agent_credential, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []}]},
+       #{name => agent_credential, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []},
+       #{name => issued_certificate, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []},
+       #{name => issued_ca_chain, fnum => 8, rnum => 9, type => string, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.agent.v1.HeartbeatRequest'},
       [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => sent_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
@@ -5865,14 +5984,17 @@ find_msg_def('yuzu.agent.v1.RegisterRequest') ->
      #{name => machine_certificate, fnum => 3, rnum => 4, type => bytes, occurrence => optional, opts => []},
      #{name => attestation_signature, fnum => 4, rnum => 5, type => bytes, occurrence => optional, opts => []},
      #{name => attestation_provider, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-     #{name => gateway_observed_peer, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []}];
+     #{name => gateway_observed_peer, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []},
+     #{name => csr_pem, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []}];
 find_msg_def('yuzu.agent.v1.RegisterResponse') ->
     [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => accepted, fnum => 2, rnum => 3, type => bool, occurrence => optional, opts => []},
      #{name => reject_reason, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
      #{name => pending_commands, fnum => 4, rnum => 5, type => {msg, 'yuzu.agent.v1.CommandRequest'}, occurrence => repeated, opts => []},
      #{name => enrollment_status, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-     #{name => agent_credential, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []}];
+     #{name => agent_credential, fnum => 6, rnum => 7, type => string, occurrence => optional, opts => []},
+     #{name => issued_certificate, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []},
+     #{name => issued_ca_chain, fnum => 8, rnum => 9, type => string, occurrence => optional, opts => []}];
 find_msg_def('yuzu.agent.v1.HeartbeatRequest') ->
     [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => sent_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},

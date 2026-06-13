@@ -150,6 +150,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   <a href="/instructions" class="nav-link active">Instructions</a>
   <a href="/compliance" class="nav-link">Compliance</a>
   <a href="/guardian" class="nav-link">Guardian</a>
+  <a href="/dex" class="nav-link">DEX</a>
   <a href="/tar" class="nav-link">TAR</a>
   <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>

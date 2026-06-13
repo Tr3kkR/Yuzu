@@ -222,14 +222,20 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
 
     auto db = TarDatabase{raw_db};
 
-    // Migrate to warehouse schema if needed
-    if (db.schema_version() < 2) {
-        if (db.create_warehouse_tables()) {
+    // Ensure every registry-declared warehouse table exists on EVERY open —
+    // the DDL is IF-NOT-EXISTS-idempotent, and gating it on schema_version<2
+    // left upgraded fleets without tables added by NEWER releases (the A1
+    // perf tier never materialised on a pre-existing v3 tar.db, so
+    // insert_perf_sample failed every 30 s; found during A2). The version
+    // marker keeps its legacy meaning (>=2 = typed warehouse present).
+    if (db.create_warehouse_tables()) {
+        if (db.schema_version() < 2) {
             db.set_config("schema_version", "2");
             spdlog::info("TarDatabase: migrated to schema version 2 (typed warehouse tables)");
-        } else {
-            spdlog::warn("TarDatabase: warehouse table creation failed, continuing in legacy mode");
         }
+    } else {
+        spdlog::warn("TarDatabase: warehouse table creation failed{}",
+                     db.schema_version() < 2 ? ", continuing in legacy mode" : "");
     }
 
     // Disable load_extension for defense-in-depth (H2)
@@ -820,6 +826,98 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;
     }
+    return true;
+}
+
+bool TarDatabase::insert_perf_sample(const PerfRow& row) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+
+    // Single row per sample interval — no transaction wrapper needed (one
+    // statement is already atomic; one fsync per 30 s is the WAL cost).
+    const char* sql = R"(
+        INSERT INTO perf_live (ts, snapshot_id, cpu_pct, mem_used_pct, commit_pct,
+                               disk_read_bps, disk_write_bps, disk_read_lat_us,
+                               disk_write_lat_us, net_rx_bps, net_tx_bps)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_perf_sample prepare: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_int64(stmt.get(), 1, row.ts);
+    sqlite3_bind_int64(stmt.get(), 2, row.snapshot_id);
+    sqlite3_bind_double(stmt.get(), 3, row.cpu_pct);
+    sqlite3_bind_double(stmt.get(), 4, row.mem_used_pct);
+    sqlite3_bind_double(stmt.get(), 5, row.commit_pct);
+    sqlite3_bind_int64(stmt.get(), 6, row.disk_read_bps);
+    sqlite3_bind_int64(stmt.get(), 7, row.disk_write_bps);
+    sqlite3_bind_int64(stmt.get(), 8, row.disk_read_lat_us);
+    sqlite3_bind_int64(stmt.get(), 9, row.disk_write_lat_us);
+    sqlite3_bind_int64(stmt.get(), 10, row.net_rx_bps);
+    sqlite3_bind_int64(stmt.get(), 11, row.net_tx_bps);
+
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        spdlog::error("insert_perf_sample step: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    return true;
+}
+
+bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows) {
+    std::lock_guard lock(mu_);
+    if (!db_ || rows.empty())
+        return rows.empty();
+
+    // <= 2*kProcTopN rows per tick — one transaction, one fsync per 30 s.
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_proc_perf_samples BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO procperf_live (ts, snapshot_id, name, instances, cpu_pct, ws_bytes)
+        VALUES (?, ?, ?, ?, ?, ?)
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_proc_perf_samples prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& r : rows) {
+        sqlite3_bind_int64(stmt.get(), 1, r.ts);
+        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt.get(), 4, r.instances);
+        sqlite3_bind_double(stmt.get(), 5, r.cpu_pct);
+        sqlite3_bind_int64(stmt.get(), 6, r.ws_bytes);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_proc_perf_samples step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_proc_perf_samples COMMIT: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    sqlite3_free(err_msg);
     return true;
 }
 

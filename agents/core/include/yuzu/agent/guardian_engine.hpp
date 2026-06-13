@@ -152,6 +152,14 @@ private:
     /// which hold mtx_, and taking mtx_ here would deadlock the stop-join.
     void emit_guard_event(const GuardDrift& drift);
 
+    // Test seam: drift emission is otherwise reachable only through an armed
+    // guard, and guards are Windows-only / no-op elsewhere — so the event_id
+    // shape (the #1307 agent_id fold) has no cross-platform test path without
+    // this. The helper drives emit_guard_event() with a synthetic GuardDrift;
+    // a sink installed via set_event_sink() captures the resulting event.
+    friend YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
+                                                         const GuardDrift& drift);
+
     // event_sink_ is guarded by its own mutex (not mtx_) so a guard worker can
     // deliver an event without contending with — or deadlocking against — the
     // engine's rule-management path. The dedicated lock makes the A2 pre-network
@@ -202,5 +210,13 @@ private:
 YUZU_EXPORT GuardianDispatchResult
 guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
                                       std::string_view push_param_bytes);
+
+/// Test-support helper: emit a synthetic GuardDrift through the engine's
+/// private emit_guard_event() so the resulting GuaranteedStateEvent can be
+/// captured by a sink installed via set_event_sink(). Intended ONLY for unit
+/// tests — production drift originates inside Windows-only guard workers. Used
+/// by the #1307 regression test to assert the event_id embeds the agent_id.
+YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
+                                              const GuardDrift& drift);
 
 } // namespace yuzu::agent

@@ -1,9 +1,12 @@
 ---
-status: proposed
+status: accepted
 date: 2026-06-08
+accepted: 2026-06-09
 owner: "@lesault (Andy Younie)"
+deciders: Nathan Dornbrook (decision); @fjarvis + FortitudeEtc (requested a standalone server DB); @lesault (indifferent)
 scope: platform — affects Guardian, viz, vuln-scan graph, offline-state, secrets
-note: contradicts the standing "SQLite for embedded storage" principle — needs wider buy-in
+note: supersedes the standing "SQLite for embedded storage" principle for server-side derived/durable state; agent-side SQLite (the federated edge warehouse) is unchanged
+generalised-by: ADR-0006 — the 2026-06-09 widening made Postgres the standard server substrate for ALL server stores; this ADR is its first instance
 ---
 
 # 0004 — Introduce server-side PostgreSQL; agent SQLite stays the federated edge warehouse
@@ -42,9 +45,11 @@ paths don't need a graph-native store).
 
 ## Consequences
 
-- This **contradicts the embedded-SQLite principle** and is a real operational departure
-  (a server-attached Postgres, likely on a separate box). Surprising without this record —
-  hence the ADR. Needs wider platform buy-in before implementation.
+- This **supersedes the embedded-SQLite principle** for server-side derived/durable state
+  and is a real operational departure (a server-attached Postgres, likely on a separate
+  box). **Platform buy-in obtained 2026-06-09** — @fjarvis and FortitudeEtc requested a
+  standalone server database, @lesault indifferent, Nathan decided; implementation is now
+  unblocked. The agent-side SQLite edge warehouse (ADR-0003) is unchanged.
 - **Secrets caveat (load-bearing):** "off-box durable state" ≠ "secrets in a Postgres
   column." Secrets require envelope encryption / KMS / `pgcrypto`, a separate decision and a
   `security-guardian` review. Do not let this ADR quietly become "we put secrets in a table."

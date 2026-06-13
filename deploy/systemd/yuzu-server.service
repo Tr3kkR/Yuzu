@@ -1,8 +1,14 @@
 [Unit]
 Description=Yuzu Endpoint Management Server
 Documentation=https://github.com/Tr3kkR/Yuzu
-After=network-online.target
-Wants=network-online.target
+# postgresql.service ordering is SOFT (Wants=, not Requires=): a missing
+# unit in Wants= is silently ignored, so installs without a local Postgres
+# — including those pointing YUZU_POSTGRES_DSN at an external/managed
+# database via the EnvironmentFile below — are unaffected. When a local
+# postgresql.service IS present, the server starts after it. (ADR-0006 /
+# #1318; the server-side DSN consumer lands in #1320.)
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
 # Restart-loop guard. If the process crashes more than StartLimitBurst
 # times within StartLimitIntervalSec, systemd stops restarting it and
 # the unit enters `failed` state. Without this, an auth.db corruption
@@ -20,6 +26,12 @@ StartLimitBurst=3
 Type=simple
 User=yuzu
 Group=yuzu
+# Optional environment file (leading '-' = no error when absent). Written
+# by scripts/install-server-postgres.sh; carries YUZU_POSTGRES_DSN for
+# either a locally-provisioned Postgres or an external/managed one —
+# external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
+# (the DSN embeds a credential).
+EnvironmentFile=-/etc/yuzu/yuzu-server.env
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \

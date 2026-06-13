@@ -98,6 +98,14 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_CERT_THUMBPRINT");
     app.add_flag("--no-cert-discovery", "Disable auto-discovery of certs from well-known paths")
         ->each([&cfg](const std::string&) { cfg.cert_auto_discovery = false; });
+    app.add_option("--cert-dir", cfg.cert_dir,
+                   "Directory for the auto-provisioned per-agent mTLS credential "
+                   "(default: <data-dir>/certs)")
+        ->envname("YUZU_CERT_DIR");
+    app.add_flag("--no-auto-provision-cert",
+                 "Disable PKI auto-provisioning (do not generate a CSR / request a "
+                 "per-agent client certificate at enrollment)")
+        ->each([&cfg](const std::string&) { cfg.auto_provision_cert = false; });
     app.add_option("--enrollment-token", cfg.enrollment_token,
                    "Pre-shared enrollment token for server registration")
         ->envname("YUZU_ENROLLMENT_TOKEN");
@@ -140,6 +148,10 @@ int main(int argc, char* argv[]) {
                    "Update check interval in seconds (default: 21600 = 6h)")
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
+    app.add_flag("--dex-disable", cfg.dex_disable,
+                 "Disable the Guardian DEX crash recorder (collect no process-crash "
+                 "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
+        ->envname("YUZU_AGENT_DEX_DISABLE");
 
     // Windows service management
     bool install_service = false;

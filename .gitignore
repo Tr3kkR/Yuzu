@@ -176,6 +176,5 @@ __pycache__/
 enrollment-tokens.cfg
 pending-agents.cfg
 
-# vuln_scan standalone tool build artifacts (built from scripts/scan_local.cpp)
-/scan_local
-/scan_local_test
+# Commercially sensitive planning docs — local-only, never commit
+docs/dex-brd-coverage.md

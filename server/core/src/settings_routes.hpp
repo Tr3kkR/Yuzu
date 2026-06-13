@@ -50,6 +50,13 @@ public:
     /// Callback to get gateway session count (avoids incomplete-type dep).
     using GatewaySessionCountFn = std::function<std::size_t()>;
 
+    /// F1: callback the DEX-alerts POST handlers invoke after persisting a
+    /// change, so the live router/detector pick it up without a restart.
+    /// Wired by server.cpp after registration, BEFORE the listener starts
+    /// (so no request can race the set). May stay empty (tests) — the
+    /// handlers then persist without the live apply.
+    void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
     /// HttplibRouteSink and delegates to the sink-based overload below.
@@ -141,6 +148,10 @@ private:
     std::string render_https_fragment();
     std::string render_analytics_fragment();
     std::string render_data_retention_fragment();
+    /// F1 DEX alerting — per-signal routing checkboxes (rendered from the
+    /// dex_signal_groups() catalogue) + the blast-radius alert-shape trio.
+    /// State lives in runtime_config; applied live via dex_alert_apply_fn_.
+    std::string render_dex_alerts_fragment();
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
     std::string render_directory_fragment();
@@ -159,6 +170,7 @@ private:
     AdminFn admin_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;
+    std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};

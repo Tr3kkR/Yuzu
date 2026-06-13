@@ -61,6 +61,13 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_agent_` | Agent process | `yuzu_agent_commands_executed_total`, `yuzu_agent_uptime_seconds` |
 | `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
 
+## Internal-CA / default-certificate metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
+
 ## Fleet visualization metrics
 
 The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
@@ -293,11 +300,48 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+## Fleet performance gauges (DEX)
+
+Published on every fleet-health sweep (~15 s). A metric nobody reported is
+**absent**, never zero; values are validated server-side (forged non-finite /
+out-of-range readings are rejected).
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
+| `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
+| `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |
+| `yuzu_fleet_perf_disk_lat_ms{stat}` | gauge | Fleet per-IO disk service time (ms), same `stat` labels |
+
+**Per-cohort export (opt-in)** — published only when a cohort export tag key
+is configured (Settings → DEX alerts; `runtime_config` key
+`dex_cohort_export_key`):
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_perf_cohort_cpu_pct{cohort,stat}` | gauge | Per-cohort CPU busy % |
+| `yuzu_fleet_perf_cohort_commit_pct{cohort,stat}` | gauge | Per-cohort memory commit % |
+| `yuzu_fleet_perf_cohort_disk_lat_ms{cohort,stat}` | gauge | Per-cohort disk latency (ms) |
+| `yuzu_fleet_perf_cohort_reporting{cohort}` | gauge | Reporting devices per exported cohort |
+| `yuzu_fleet_perf_cohort_clipped` | gauge | Exportable cohorts dropped by the top-50 cardinality cap (a measured 0 when nothing was cut; **absent when the export is off** — use this gauge, not `absent()` on the cohort families, as the export-liveness probe) |
+
+Cohorts under 10 reporting devices and cohorts beyond the top-50-by-population
+cap never export; devices without the key export as `cohort="(untagged)"`.
+Families clear on every sweep — series go absent, never stale. Alerting
+recipe: `max_over_time(yuzu_fleet_perf_cohort_clipped[1m])` for liveness,
+`yuzu_fleet_perf_cohort_clipped > 0 for 5m` for cap pressure; with the ~15 s
+sweep cadence, scrape at ≤10 s intervals when the export is enabled. See the
+label-exposure note under Security considerations before choosing a key.
+
 ## Guardian metrics
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_guardian_baselines_total` | gauge | Number of persisted Guardian Baselines. Refreshed on every `/metrics` scrape. |
+| `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
+| `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
+| `yuzu_server_guardian_proj_failures_total` | gauge | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
+| `yuzu_server_guardian_observations_reaped_total` | gauge | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). |
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
@@ -494,6 +538,7 @@ The `/metrics` endpoint exposes aggregated fleet composition data through gauge 
 | `yuzu_fleet_agents_by_os` | `os` | OS distribution (windows, linux, darwin counts) |
 | `yuzu_fleet_agents_by_arch` | `arch` | CPU architecture distribution (x64, arm64 counts) |
 | `yuzu_fleet_agents_by_version` | `version` | Agent version inventory |
+| `yuzu_fleet_perf_cohort_*` | `cohort` | **Operator tag values** (only when the opt-in cohort export key is set — Settings → DEX alerts). Cohort labels carry the raw tag values of the exported key; if those values encode personnel-relevant or confidential groupings (`department`, `cost-center`, owner names…), they flow to whatever scrapes `/metrics`, including third-party monitoring stacks. **Choose export keys whose values are non-sensitive organizational identifiers** (hardware model, image name). |
 
 This data reveals your fleet's attack surface to anyone who can reach the metrics endpoint. An attacker who learns that 80% of your fleet runs Windows x64 with agent v0.4.2 can target known vulnerabilities for that specific combination.
 

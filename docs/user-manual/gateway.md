@@ -130,6 +130,19 @@ server handles enrollment logic (token validation, pending approval queue)
 and returns a `RegisterResponse` with a session ID. The gateway relays the
 response to the agent and starts an agent process.
 
+When the server's built-in CA is active, that `RegisterResponse` now also carries
+a signed **per-agent client certificate** — the same certificate an agent would
+receive on the direct-connect path (PKI PR5d). The gateway relays the full
+response verbatim, so the certificate reaches the agent with no gateway
+configuration change. **Revocation note:** revoking a certificate invalidates the
+presented leaf but does **not** prevent re-enrollment; to stop an agent from
+re-enrolling and re-obtaining a certificate, **deny** the agent (dashboard
+Devices → deny). Both the direct and gateway paths reject a denied agent before
+signing. (In M1 the agent↔gateway hop is one-way TLS, so the agent's client cert
+is not yet verified at the gateway transport — through-gateway identity remains
+the app-layer `gateway_observed_peer`; the issued cert is for inventory,
+revocation, and the future gateway-mTLS cutover.)
+
 ### Heartbeat Batching
 
 Individual agent heartbeats are not forwarded one-by-one. Instead,
@@ -248,19 +261,105 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 ]}
 ```
 
-### TLS Configuration (Optional)
+### TLS posture (M1)
 
-To enable mTLS between agents and the gateway, add the `tls` key:
+> **⚠ SECURITY — do not expose the agent listener (`:50051`) to an untrusted
+> network.** The gateway is the command fan-out plane. A plaintext,
+> internet-reachable agent listener has **no confidentiality, no integrity, and no
+> gateway authentication** — an on-path attacker can inject commands → **remote
+> code execution across the fleet**. **One-way (server-authenticated) TLS now
+> exists for the agent listener (PKI PR5c)** — enable it (see below) and distribute
+> the CA to agents. **Until your deployment turns it on (the shipped composes are
+> still plaintext pending PR5b), a gateway exposed to an untrusted network MUST**
+> either (a) terminate TLS in front of the gateway (a reverse proxy doing TLS on
+> `:50051`, forwarding only over loopback / a trusted segment), or (b) keep
+> `:50051` on a trusted network (VPN / private subnet / service mesh). Direct
+> agent→server connections are already full mTLS (PR2/PR3) — this gap is specific
+> to the gateway edge.
 
-```erlang
-{tls, [
-    {certfile, "/etc/yuzu/gateway.crt"},
-    {keyfile,  "/etc/yuzu/gateway.key"},
-    {cacertfile, "/etc/yuzu/ca.crt"},
-    {verify, verify_peer},
-    {fail_if_no_peer_cert, true}
-]}
+| Hop | State | Notes |
+|---|---|---|
+| gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. |
+| operator → gateway mgmt (`:50063`) | **plaintext / strict mTLS** | Do NOT one-way-TLS the privileged mgmt plane (would be unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (omit `verify`/`fail_if_no_peer_cert`). |
+
+TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
+config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
+in PKI PR5 and does **nothing**). To enable upstream mutual TLS, copy the
+`{grpcbox, [{client, ...}]}` `{https,...}` channel from
+`gateway/config/sys.config.prod`.
+
+To enable mTLS on the agent listener for a deployment where **every agent already
+holds a CA-issued client cert** (not the normal enrollment path), add a
+`transport_opts` map to each server entry — see the commented block in
+`sys.config.prod`. **`ssl => true` is mandatory**; omit it and grpcbox silently
+runs plaintext regardless of the other options. Full detail:
+`docs/pki-architecture.md` "Gateway TLS".
+
+#### Enabling agent-listener TLS — order of operations + caveats (#1244)
+
+One-way TLS on the agent listener only helps if the **agent dials TLS and
+verifies the CA**. A listener doing TLS while agents still dial plaintext (or dial
+TLS without pinning the CA) is either inert or **MITM-able** — if the gateway leaf
+chains to a *public* CA and the agent falls back to the system trust store, any
+publicly-trusted impostor cert for the dial host is accepted. The agent half (CA
+distribution + TLS-dial wiring + a fail-closed guard for `tls_enabled` with an
+empty CA path) lands in **PR5b**; do not flip the listener ahead of it.
+
+**Flag-day upgrade order (enabling the listener disconnects every plaintext agent
+at once — there is no dual-listen transition):**
+
+1. **Distribute the CA** (`default-gateway`'s issuing CA, i.e. the install root)
+   to every agent's `--ca-cert` / cert dir.
+2. **Reconfigure agents** to dial the gateway over TLS and verify that CA.
+3. **Only then flip the listener** to `ssl => true` in `sys.config.prod`.
+
+Reversing the order strands the fleet until every agent is re-pointed.
+
+**Compromised-gateway caveat:** one-way TLS authenticates the **gateway to the
+agent**, not the agent to the gateway. It closes the on-path eavesdrop/inject of
+the plaintext edge, but a *compromised gateway itself* can still inject commands
+to the fleet — the compensating controls are app-layer: the server's
+gateway-authoritative `gateway_observed_peer` attribution and the enrollment
+approval workflow. Full cryptographic agent-to-gateway identity (so the gateway
+can't forge an agent) arrives with the through-gateway attestation work gated on
+PR5d / the QUIC migration (#376).
+
+#### End-to-end enablement runbook (manual / interim)
+
+The shipped composes are still plaintext (the automated flip is tracked in
+issue **#1289**). To stand up an **encrypted** agent↔gateway↔server stack from the
+current artifacts today, wire it by hand in this order:
+
+```bash
+# 0. Server first boot generates the install CA + default-gateway leaf under the
+#    cert dir. If agents reach the gateway by a name/VIP, mint the leaf with that
+#    SAN so SNI verification passes:
+yuzu-server --cert-san dns:gateway --cert-san dns:gw.corp.example
+#    (repeatable; dns:/ip: prefixes, or a bare value auto-classified. Copy the
+#    issuing CA out for step 2:)
+cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
+
+# 1. Point the gateway's upstream at the server over mutual TLS (PR5) and turn on
+#    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
+#      {grpcbox,[{client,...,{https,...,[{ssl_options,...}]}}]}   % upstream mTLS
+#      listener transport_opts => #{ssl=>true, certfile, keyfile, cacertfile,
+#                                   verify=>verify_none, fail_if_no_peer_cert=>false}
+#    (needs the vendored _checkouts/grpcbox — the image build asserts it.)
+
+# 2. Distribute install-ca.pem to every agent and have them dial the gateway over
+#    TLS, verifying that CA:
+yuzu-agent --server gateway:50051 --ca-cert /etc/yuzu/install-ca.pem \
+           --enrollment-token "$TOKEN"
+
+# 3. ONLY after every agent has the CA + dials TLS, flip the listener live
+#    (restart the gateway). Enabling it ahead of step 2 disconnects the fleet.
 ```
+
+Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
+connects and enrolls; `openssl s_client -connect gateway:50051` presents the
+`default-gateway` leaf. Direct agent→server (no gateway) is already full mTLS and
+needs none of this.
 
 ### Distribution Cookie (Required in Production)
 

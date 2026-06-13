@@ -179,6 +179,7 @@ extern const char* const kSettingsHtml =
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/guardian" class="nav-link">Guardian</a>
+    <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
@@ -238,6 +239,24 @@ extern const char* const kSettingsHtml =
         </p>
         <div id="https-section"
              hx-get="/fragments/settings/https"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Internal Certificate Authority ─────────────────── -->
+    <div class="section">
+      <div class="section-header">Internal Certificate Authority</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          The built-in CA that issues the default server certificates and per-agent
+          mTLS client certificates. Download the root to trust the dashboard, review
+          issued certificates, and revoke a compromised agent.
+        </p>
+        <div id="ca-section"
+             hx-get="/fragments/settings/ca"
              hx-trigger="load"
              hx-swap="innerHTML">
           <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
@@ -428,6 +447,24 @@ extern const char* const kSettingsHtml =
         </p>
         <div id="data-retention-section"
              hx-get="/fragments/settings/data-retention"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DEX Alerts (F1) ────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">DEX Alerts</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Route DEX reliability signals to operator notifications and the
+          <code>dex.signal</code> webhook event, and tune the fleet blast-radius
+          incident thresholds. Changes apply immediately.
+        </p>
+        <div id="dex-alerts-section"
+             hx-get="/fragments/settings/dex-alerts"
              hx-trigger="load"
              hx-swap="innerHTML">
           <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>

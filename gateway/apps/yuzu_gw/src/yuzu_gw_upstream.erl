@@ -45,6 +45,7 @@
          notify_stream_status/4,
          forward_guardian_message/2,
          circuit_state/0]).
+-export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -516,11 +517,57 @@ do_rpc(Method, Request, Tag) ->
             logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, Message]),
             {error, {Status, Message}};
         {error, Reason} ->
+            %% R-3 (#1243): emit a DISTINCT metric for a TLS handshake failure
+            %% (cert expiry / CA rotation / wrong-SAN / unreadable cert) so it is
+            %% not lost in the generic rpc_error → circuit-open noise. The generic
+            %% rpc_error still fires too (the circuit breaker keys off it).
+            case classify_tls_error(Reason) of
+                {true, Kind} ->
+                    telemetry:execute([yuzu, gw, upstream, tls_handshake_failure],
+                                      #{count => 1},
+                                      #{rpc_name => atom_to_binary(Tag, utf8), kind => Kind}),
+                    logger:warning("Upstream RPC ~s TLS handshake failure (~s): ~p",
+                                   [Method, Kind, Reason]);
+                {false, _} ->
+                    ok
+            end,
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Reason}),
             {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
+    end.
+
+%% @private Classify whether an upstream transport error is a TLS handshake
+%% failure, returning {true, KindBin} (the alert/cause, for the metric label) or
+%% {false, _}. gun/ssl surface these as nested {tls_alert, {Alert,_}} or
+%% {options,_} terms (e.g. {shutdown,{tls_alert,{unknown_ca,_}}}); search a
+%% bounded depth so an arbitrary error term can't loop. R-3 (#1243).
+-spec classify_tls_error(term()) -> {boolean(), binary()}.
+classify_tls_error(Term) ->
+    classify_tls_error(Term, 4).
+
+classify_tls_error(_Term, 0) ->
+    {false, <<>>};
+classify_tls_error({tls_alert, {Alert, _}}, _D) when is_atom(Alert) ->
+    {true, atom_to_binary(Alert, utf8)};
+classify_tls_error({tls_alert, Alert}, _D) when is_atom(Alert) ->
+    {true, atom_to_binary(Alert, utf8)};
+classify_tls_error({options, _}, _D) ->
+    {true, <<"bad_tls_options">>};
+classify_tls_error(T, D) when is_tuple(T) ->
+    classify_tls_error_list(tuple_to_list(T), D);
+classify_tls_error(L, D) when is_list(L) ->
+    classify_tls_error_list(L, D);
+classify_tls_error(_Other, _D) ->
+    {false, <<>>}.
+
+classify_tls_error_list([], _D) ->
+    {false, <<>>};
+classify_tls_error_list([H | Rest], D) ->
+    case classify_tls_error(H, D - 1) of
+        {true, _} = R -> R;
+        {false, _}    -> classify_tls_error_list(Rest, D)
     end.
 
 ensure_binary(undefined) -> <<>>;

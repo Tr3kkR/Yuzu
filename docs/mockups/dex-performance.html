@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — DEX fleet performance (F2)</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile). F2a: the in-product FLEET
+  PERFORMANCE view (BRD rows 13-15 residual) + cohort benchmarking
+  (rows 98-100, 103). GRILLED 2026-06-12 — decisions baked in:
+   - New 5th "Performance" subnav tab (DECIDED — levels vs Trends' events).
+   - F2a = now-view ONLY: fleet-now cards + cohort table, computed at render
+     time over registry heartbeat state, zero new storage. NO window chips
+     (nothing on this page has a history yet).
+   - F2b = the trend band charts (kept below, badged DEFERRED): needs a
+     server-side retained rollup series -> new Postgres store (ADR-0006),
+     blocked on the first existing-store migrations proving the substrate.
+   - Cohorts = operator-chosen TAG KEY (hardware model is NOT centrally
+     queryable, ADR-0004 thin-center; auto-tag via the asset-tagging recipe).
+     n>=10 floor renders "n too small"; "(untagged)" residual row, never a
+     silent omission.
+   - Session responsiveness composite (row 38) DROPPED — answered by the
+     health score's Performance-family weighting; one derived score, not two.
+   - REST /api/v1/dex/perf/{fleet,cohorts} + MCP parity ship WITH F2a (A1).
+  DRILL MAP (added 2026-06-12 — every aggregate opens the list behind it):
+   - Metric card -> worst devices by that metric (demo section below);
+     Reporting card -> devices NOT reporting; cohort row -> that cohort's
+     device list; "(untagged)" row -> untagged device list. All four are ONE
+     fragment/endpoint with filters: /fragments/dex/perf/devices +
+     GET /api/v1/dex/perf/devices?metric=&cohort_key=&cohort_value=&filter=
+     — each device row -> the existing device drill-down.
+   - F2b band charts will drill to a per-metric trend page when they land.
+  GRAFANA (added 2026-06-12):
+   - Fleet gauges already exported (A4): yuzu_fleet_perf_*{stat} + _reporting.
+   - F2a ADDS per-cohort families for ONE operator-configured tag key
+     (runtime_config `dex_cohort_export_key`, default unset = no series;
+     Settings -> DEX alerts gains the field, same F1 pattern):
+     yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,disk_lat_ms}{cohort,stat}
+     + yuzu_fleet_perf_cohort_reporting{cohort}. Cardinality cap: top 50
+     cohort values by population, n>=10 floor applies, plus a
+     yuzu_fleet_perf_cohort_clipped count so clipping is visible.
+   - Per-device/per-app NOT exported to Prometheus (cardinality + the
+     agent-metrics-via-heartbeat principle); Grafana reaches those via the
+     REST endpoints (JSON/Infinity datasource) on demand.
+  Honesty rules from the live A4 machinery:
+   - Perf telemetry is WINDOWS agents only today; the reporting-population
+     caption carries that scope; macOS/Linux absent, not zero.
+   - Gauges are ABSENT when nobody reports (no fabricated 0s); the F2b band
+     chart demos a deliberate 2-day hole.
+  Fake data consistent with dex-trends.html (636 Windows reporting of 690).
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#243553; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --white:#fff; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff; --slate:#6f86a6;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:1.4rem;margin:0;color:var(--white);font-weight:700}
+  .sub{color:var(--muted);font-size:.78rem;margin-top:.3rem}
+  a{color:var(--accent);text-decoration:none;cursor:pointer}
+
+  .subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border);padding-bottom:.7rem;margin-bottom:1rem;flex-wrap:wrap}
+  .subnav a{font-size:.78rem;color:var(--muted);border:1px solid transparent;border-radius:.35rem;padding:.22rem .6rem}
+  .subnav a.on{color:var(--white);border-color:var(--accent)}
+  .subnav .sp{margin-left:auto;font-size:.7rem;color:var(--muted)}
+
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.4rem 0 .55rem}
+  .filters{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
+  .chip{font-size:.7rem;padding:.22rem .6rem;border-radius:.35rem;border:1px solid var(--border);color:var(--muted);background:var(--surface);cursor:pointer}
+  .chip.on{color:var(--white);border-color:var(--accent)}
+
+  /* "fleet now" metric cards */
+  .mcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.7rem}
+  .mcard{background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:.85rem 1rem;cursor:pointer}
+  .mcard:hover{border-color:var(--accent)}
+  .mcard .drill{font-size:.58rem;color:var(--slate);margin-top:.45rem}
+  .mcard:hover .drill{color:var(--accent)}
+  tbody tr.click{cursor:pointer}
+  tbody tr.click:hover td{background:rgba(0,188,235,.05)}
+  tbody tr.click:hover td.coh{color:var(--accent)}
+  .mcard .mn{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .mcard .big{font-size:1.8rem;font-weight:700;color:var(--white);line-height:1.15}
+  .mcard .big small{font-size:.85rem;color:var(--muted);font-weight:400}
+  .mcard .stats{display:flex;gap:.9rem;margin-top:.5rem}
+  .mcard .stats div{font-size:.62rem;color:var(--muted)}
+  .mcard .stats b{display:block;font-size:.85rem;color:var(--fg);font-weight:600}
+  .mcard.pop .big{color:var(--lightblue)}
+
+  /* band trend charts */
+  .bandgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:.7rem}
+  .band{background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:.7rem .85rem}
+  .band .bh{display:flex;justify-content:space-between;align-items:baseline}
+  .band .bn{font-size:.74rem;color:var(--white);font-weight:600}
+  .band .bv{font-size:.62rem;color:var(--muted)}
+  .legend{display:flex;gap:.8rem;font-size:.6rem;color:var(--muted);margin-top:.3rem}
+  .legend i{display:inline-block;width:14px;height:8px;border-radius:2px;margin-right:.25rem;vertical-align:-1px}
+
+  /* cohort table */
+  table{width:100%;border-collapse:collapse;font-size:.74rem}
+  th{font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--border)}
+  td{padding:.42rem .5rem;border-bottom:1px solid var(--surface2)}
+  td.coh{color:var(--white);font-weight:600}
+  td.num{font-variant-numeric:tabular-nums}
+  .pill{font-size:.56rem;border-radius:.3rem;padding:.02rem .3rem;margin-left:.3rem;white-space:nowrap}
+  .pill.up{color:var(--red);border:1px solid rgba(255,87,101,.4)}
+  .pill.down{color:var(--green);border:1px solid rgba(78,210,126,.4)}
+  .pill.flat{color:var(--slate);border:1px solid var(--border)}
+  tr.vdi td{background:rgba(0,188,235,.04)}
+
+  /* responsiveness composite */
+  .resp{display:flex;gap:1rem;align-items:stretch;flex-wrap:wrap}
+  .respscore{background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:.85rem 1.1rem;min-width:170px}
+  .respscore .n{font-size:2.2rem;font-weight:700;color:var(--green);line-height:1.1}
+  .respscore .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .respscore .d{font-size:.6rem;color:var(--slate);margin-top:.3rem}
+  .respparts{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:.7rem 1rem;min-width:300px}
+  .rp{display:grid;grid-template-columns:160px 1fr 52px;gap:.5rem;align-items:center;font-size:.68rem;margin:.3rem 0}
+  .rp .t{height:8px;border-radius:3px;background:var(--surface2);overflow:hidden}
+  .rp .t i{display:block;height:100%}
+  .rp .v{text-align:right;color:var(--fg);font-variant-numeric:tabular-nums}
+
+  .caveat{font-size:.68rem;color:var(--yellow);background:rgba(255,204,0,.07);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .6rem;margin:.55rem 0}
+  .note{margin-top:1.4rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .note b{color:var(--lightblue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="subnav">
+    <a href="dex-overview.html">Overview</a>
+    <a href="dex-catalogue.html">Catalogue</a>
+    <a href="dex-health-score.html">Health score</a>
+    <a href="dex-trends.html">Trends</a>
+    <a class="on">Performance</a>
+    <span class="sp">live &middot; last rollup cycle</span>
+  </div>
+
+  <h1>Fleet performance</h1>
+  <div class="sub">Continuous device telemetry (30 s sampling on each endpoint) rolled up across the fleet
+    &mdash; the levels, where <a href="dex-trends.html">Trends</a> shows the events. Fleet stats carry their
+    <b style="color:var(--lightblue)">reporting population</b>: an average over 612 devices is never silently
+    presented as fleet-wide truth.</div>
+
+  <!-- ───── Fleet now ───── -->
+  <div class="sech">Fleet now (last rollup cycle)</div>
+  <div class="mcards">
+    <div class="mcard">
+      <div class="mn">CPU utilization</div>
+      <div class="big">11.4<small> % avg</small></div>
+      <div class="stats"><div><b>6.2%</b>p50</div><div><b>24.8%</b>p90</div><div><b>96.1%</b>max</div></div>
+      <div class="drill">&rarr; worst devices by CPU</div>
+    </div>
+    <div class="mcard">
+      <div class="mn">Memory (commit charge)</div>
+      <div class="big">54.7<small> % avg</small></div>
+      <div class="stats"><div><b>52.1%</b>p50</div><div><b>78.3%</b>p90</div><div><b>97.4%</b>max</div></div>
+      <div class="drill">&rarr; worst devices by commit</div>
+    </div>
+    <div class="mcard">
+      <div class="mn">Disk I/O latency</div>
+      <div class="big">1.8<small> ms avg</small></div>
+      <div class="stats"><div><b>0.9ms</b>p50</div><div><b>4.2ms</b>p90</div><div><b>212ms</b>max</div></div>
+      <div class="drill">&rarr; worst devices by disk latency</div>
+    </div>
+    <div class="mcard pop">
+      <div class="mn">Reporting</div>
+      <div class="big">612</div>
+      <div class="stats"><div><b>of 636</b>Windows online</div><div><b>24</b>not yet reporting</div></div>
+      <div class="drill">&rarr; devices not reporting perf</div>
+    </div>
+  </div>
+
+  <!-- ───── Drill demo: what a metric-card click opens ───── -->
+  <div class="sech">Drill: worst devices by current CPU <span style="color:var(--slate)">(opens from the CPU card &mdash; same list serves every card, cohort row and the untagged residual, via filters)</span></div>
+  <table>
+    <thead><tr><th>#</th><th>Device</th><th>Cohort (model)</th><th>CPU now</th><th>vs fleet</th><th>Commit</th><th>Disk lat</th></tr></thead>
+    <tbody>
+      <tr class="click"><td class="num">1</td><td class="coh">WIN-SL5-0418</td><td>Surface Laptop 5</td><td class="num">96.1%</td><td class="num">99th pctile</td><td class="num">84.6%</td><td class="num">2.1 ms</td></tr>
+      <tr class="click"><td class="num">2</td><td class="coh">WIN-VDI-L-0007</td><td>VMware Virtual Platform</td><td class="num">88.9%</td><td class="num">99th pctile</td><td class="num">90.2%</td><td class="num">9.8 ms</td></tr>
+      <tr class="click"><td class="num">3</td><td class="coh">WIN-T14-0188</td><td>ThinkPad T14 G4</td><td class="num">71.3%</td><td class="num">98th pctile</td><td class="num">62.0%</td><td class="num">1.2 ms</td></tr>
+      <tr class="click"><td class="num">4</td><td class="coh">WIN-EB-0034</td><td>EliteBook 840 G9</td><td class="num">64.0%</td><td class="num">97th pctile</td><td class="num">71.5%</td><td class="num">0.9 ms</td></tr>
+      <tr class="click"><td class="num">5</td><td class="coh">WIN-7440-0102</td><td>Latitude 7440</td><td class="num">58.7%</td><td class="num">96th pctile</td><td class="num">49.3%</td><td class="num">0.7 ms</td></tr>
+    </tbody>
+  </table>
+  <div class="sub" style="font-size:.64rem;margin-top:.3rem">Each row opens the device drill-down (signal
+    history + the on-device performance panel). Values are the device&rsquo;s current heartbeat sample
+    &mdash; the same data the fleet cards aggregate, so the list and the cards can never disagree.</div>
+  <div class="caveat">Perf telemetry is collected by <b>Windows agents only</b> today (the TAR perf capture
+    source). macOS and Linux devices are <b>absent</b> from every number on this page &mdash; not zero, not
+    averaged in. The population tile is the denominator for everything above.</div>
+
+  <!-- ───── Fleet trends — F2b, DEFERRED ───── -->
+  <div class="sech">Fleet trends (30d) &mdash; <span style="color:var(--yellow)">F2b, deferred</span></div>
+  <div class="caveat"><b>Not in F2a.</b> These charts need a server-side retained rollup series &mdash; a new
+    Postgres store (ADR-0006) &mdash; and are blocked on the first existing-store migrations proving the
+    substrate. Kept here as the agreed F2b design; window chips (7d/30d/90d) return with them.</div>
+  <div class="sub" style="font-size:.66rem;margin-bottom:.5rem">Shaded band = p50&ndash;p90 across reporting
+    devices; solid line = fleet avg; faint line = max. A gap in the band is a gap in the data
+    (server retained no rollup for that period) &mdash; never a drawn-in zero.</div>
+  <div class="bandgrid" id="bands"></div>
+  <div class="legend"><span><i style="background:rgba(0,188,235,.25)"></i>p50&ndash;p90 band</span>
+    <span><i style="background:var(--accent)"></i>avg</span>
+    <span><i style="background:#56657f"></i>max (faint)</span></div>
+
+  <!-- ───── Cohort benchmarking ───── -->
+  <div class="sech">Cohort benchmarking</div>
+  <div class="sub" style="font-size:.66rem;margin-bottom:.5rem">Fleet-relative
+    percentiles per cohort, so a model (or image) that runs hot stands out. &Delta; pills compare the
+    cohort p50 to the fleet p50. Read within a column. Cohorts are the distinct values of an
+    <b>operator-chosen tag key</b> &mdash; hardware-model cohorts come from the asset-tagging recipe
+    (tag the fleet once via REST/MCP), not a central inventory column.</div>
+  <div class="filters">
+    <span style="font-size:.7rem;color:var(--muted)">cohort by tag key:</span>
+    <select class="chip" style="background:var(--surface)">
+      <option selected>model</option><option>image</option><option>location</option><option>role</option>
+    </select>
+    <span class="mute" style="font-size:.62rem;color:var(--muted)">defaults to <b>model</b> when the key exists on any device</span>
+  </div>
+  <table>
+    <thead><tr><th>Cohort</th><th>Devices</th><th>CPU p50 / p90</th><th>Commit p50 / p90</th><th>Disk lat p50 / p90</th></tr></thead>
+    <tbody>
+      <tr class="click"><td class="coh">Dell Latitude 7440</td><td class="num">212</td>
+        <td class="num">5.8% / 22.1% <span class="pill flat">&minus;6%</span></td>
+        <td class="num">51.0% / 74.2% <span class="pill flat">&minus;2%</span></td>
+        <td class="num">0.8 / 3.6 ms <span class="pill flat">&minus;11%</span></td></tr>
+      <tr class="click"><td class="coh">Lenovo ThinkPad T14 G4</td><td class="num">174</td>
+        <td class="num">6.4% / 25.0% <span class="pill flat">+3%</span></td>
+        <td class="num">53.2% / 79.8% <span class="pill flat">+2%</span></td>
+        <td class="num">0.9 / 4.1 ms <span class="pill flat">0%</span></td></tr>
+      <tr class="click"><td class="coh">HP EliteBook 840 G9</td><td class="num">98</td>
+        <td class="num">6.1% / 23.4% <span class="pill flat">&minus;2%</span></td>
+        <td class="num">55.7% / 81.0% <span class="pill up">+7%</span></td>
+        <td class="num">1.0 / 4.4 ms <span class="pill flat">+5%</span></td></tr>
+      <tr class="click"><td class="coh">Surface Laptop 5</td><td class="num">64</td>
+        <td class="num">7.9% / 31.2% <span class="pill up">+27%</span></td>
+        <td class="num">61.4% / 88.6% <span class="pill up">+18%</span></td>
+        <td class="num">1.3 / 6.0 ms <span class="pill up">+39%</span></td></tr>
+      <tr class="click"><td class="coh">VMware Virtual Platform</td><td class="num">88</td>
+        <td class="num">6.9% / 26.7% <span class="pill up">+11%</span></td>
+        <td class="num">55.9% / 80.3% <span class="pill up">+7%</span></td>
+        <td class="num">1.4 / 6.4 ms <span class="pill up">+48%</span></td></tr>
+      <tr class="click"><td class="coh" style="color:var(--slate)">Precision 5680</td><td class="num">6</td>
+        <td class="num" colspan="3" style="color:var(--slate)">&mdash; (n too small: fewer than 10 reporting devices)</td></tr>
+      <tr class="click"><td class="coh" style="color:var(--slate)">(untagged)</td><td class="num">168</td>
+        <td class="num">6.0% / 23.9% <span class="pill flat">&minus;3%</span></td>
+        <td class="num">53.0% / 77.6% <span class="pill flat">&minus;1%</span></td>
+        <td class="num">0.9 / 4.0 ms <span class="pill flat">&minus;5%</span></td></tr>
+    </tbody>
+  </table>
+  <div class="sech" style="margin-top:1rem">Same view, key = <span style="color:var(--lightblue)">image</span> (BRD row 103: vanilla vs layered)</div>
+  <table>
+    <thead><tr><th>Cohort</th><th>Devices</th><th>CPU p50 / p90</th><th>Commit p50 / p90</th><th>Disk lat p50 / p90</th></tr></thead>
+    <tbody>
+      <tr class="vdi"><td class="coh">vanilla</td><td class="num">44</td>
+        <td class="num">4.9% / 18.7% <span class="pill down">&minus;21%</span></td>
+        <td class="num">48.8% / 70.1% <span class="pill down">&minus;6%</span></td>
+        <td class="num">0.7 / 2.9 ms <span class="pill down">&minus;25%</span></td></tr>
+      <tr class="vdi"><td class="coh">layered</td><td class="num">44</td>
+        <td class="num">8.8% / 34.6% <span class="pill up">+42%</span></td>
+        <td class="num">63.0% / 90.2% <span class="pill up">+21%</span></td>
+        <td class="num">2.1 / 9.8 ms <span class="pill up">+125%</span></td></tr>
+      <tr class="click"><td class="coh" style="color:var(--slate)">(untagged)</td><td class="num">548</td>
+        <td class="num" colspan="3" style="color:var(--slate)">physical fleet &mdash; not part of this comparison, shown so nothing is silently missing</td></tr>
+    </tbody>
+  </table>
+  <div class="caveat">Row 103 by construction: tag both VDI cohorts with an <b>image</b> key, diff the
+    distributions &mdash; the layered image costs +42% CPU p50 and double the disk latency against vanilla
+    on identical hardware. Honesty rules: cohorts under <b>10 reporting devices</b> render
+    &ldquo;n too small&rdquo;, never noisy percentiles; devices without the chosen key always appear as an
+    explicit <b>(untagged)</b> residual.</div>
+  <div class="sub" style="font-size:.68rem">Per-device comparison (&ldquo;where does <i>this</i> machine sit
+    in its cohort?&rdquo;) lives on the device drill-down &rarr; <a href="dex-device-perf.html">device
+    performance mockup</a>.</div>
+
+  <div class="note">
+    <b>Resolved (grilled 2026-06-12)</b> &mdash; this mockup is the F2a porting spec:
+    (1) New <b>Performance</b> tab — decided, stays.
+    (2) <b>F2a = now-view only</b> (fleet-now cards + cohort tables, render-time over registry heartbeat
+    state, zero new storage); the trend band charts above are <b>F2b</b>, blocked on the first
+    existing-store Postgres migrations proving the substrate.
+    (3) <b>Cohorts = operator-chosen tag key</b> (n&ge;10 floor fixed, explicit untagged residual);
+    hardware-model cohorts via the asset-tagging recipe, documented in F2a.
+    (4) <b>Responsiveness composite dropped</b> (row 38 is answered by the health score&rsquo;s
+    Performance-family weighting — one derived score, not two).
+    (5) <code>GET /api/v1/dex/perf/fleet</code> + <code>/api/v1/dex/perf/cohorts?key=</code> + MCP parity
+    tools ship <b>with</b> F2a (GuaranteedState:Read, unaudited aggregates).
+    Landing: two PRs — PR1 read model + REST + MCP + this tab; PR2 the device drill extension.
+  </div>
+
+<script>
+/* Band charts: 30 days of {p50,p90,avg,max} per metric, with a deliberate
+   2-day data gap (days 12-13) rendered as a hole — the absent-not-zero rule. */
+const METRICS=[
+  {n:'CPU utilization', unit:'%',  base:[6.2,24.8,11.4,62], jit:[1.2,4.5,2.0,18]},
+  {n:'Memory commit',   unit:'%',  base:[52.1,78.3,54.7,93],jit:[1.5,3.0,1.8,4]},
+  {n:'Disk I/O latency',unit:'ms', base:[0.9,4.2,1.8,38],   jit:[0.25,1.4,0.5,60]},
+];
+function series(m){
+  const out=[];
+  for(let d=0;d<30;d++){
+    if(d===12||d===13){out.push(null);continue}     // the gap
+    const wk=(d%7===5||d%7===6)?0.55:1;             // quieter weekends
+    const t=1+0.12*Math.sin(d/4.5);
+    const r=i=>Math.max(0.05,(m.base[i]+(Math.sin(d*2.7+i*9)*m.jit[i]))*wk*t);
+    let p50=r(0),p90=Math.max(r(1),p50*1.4),avg=Math.min(Math.max(r(2),p50*0.9),p90),mx=Math.max(r(3),p90*1.3);
+    out.push({p50,p90,avg,mx});
+  }
+  return out;
+}
+function bandSvg(s,unit,w=320,h=86){
+  const pad=3, vals=s.filter(Boolean);
+  const hi=Math.max(...vals.map(v=>v.mx)), x=i=>pad+(w-2*pad)*i/(s.length-1),
+        y=v=>h-pad-(h-2*pad)*(v/hi);
+  // split into contiguous runs so the gap renders as a hole
+  const runs=[];let cur=[];
+  s.forEach((v,i)=>{ if(v)cur.push([i,v]); else if(cur.length){runs.push(cur);cur=[]} });
+  if(cur.length)runs.push(cur);
+  let g='';
+  for(const r of runs){
+    const top=r.map(([i,v])=>`${x(i).toFixed(1)},${y(v.p90).toFixed(1)}`).join(' ');
+    const bot=r.slice().reverse().map(([i,v])=>`${x(i).toFixed(1)},${y(v.p50).toFixed(1)}`).join(' ');
+    g+=`<polygon points="${top} ${bot}" fill="rgba(0,188,235,.22)"/>`;
+    g+=`<polyline points="${r.map(([i,v])=>`${x(i).toFixed(1)},${y(v.avg).toFixed(1)}`).join(' ')}" fill="none" stroke="#00bceb" stroke-width="1.6"/>`;
+    g+=`<polyline points="${r.map(([i,v])=>`${x(i).toFixed(1)},${y(v.mx).toFixed(1)}`).join(' ')}" fill="none" stroke="#56657f" stroke-width="1" opacity=".6"/>`;
+  }
+  return `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${g}</svg>`;
+}
+document.getElementById('bands').innerHTML=METRICS.map(m=>{
+  const s=series(m), last=s.filter(Boolean).slice(-1)[0];
+  return `<div class="band"><div class="bh"><span class="bn">${m.n}</span>
+    <span class="bv">now avg ${last.avg.toFixed(1)}${m.unit} &middot; p90 ${last.p90.toFixed(1)}${m.unit}</span></div>
+    ${bandSvg(s,m.unit)}
+    <div class="bv" style="margin-top:.15rem">gap on days 12&ndash;13 = no retained rollup (absent, not zero)</div></div>`;
+}).join('');
+</script>
+</div>
+</body>
+</html>

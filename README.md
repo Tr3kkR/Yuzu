@@ -172,6 +172,12 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
   on MSYS2). Required at `meson setup` for the build-time
   `InstructionDefinition` content embed; meson configure fails fast
   with a clear error if missing.
+- **Linux:** `bison` and `flex` (`sudo apt-get install -y bison flex`) —
+  vcpkg's libpq port (PostgreSQL client library, part of the server storage
+  substrate) builds postgresql from source and cannot auto-acquire them.
+- **macOS:** `autoconf`, `automake`, `libtool`
+  (`brew install autoconf automake libtool`) — same libpq port runs
+  autoreconf. Windows needs nothing extra (vcpkg auto-acquires winflexbison).
 
 ### Quick Start
 

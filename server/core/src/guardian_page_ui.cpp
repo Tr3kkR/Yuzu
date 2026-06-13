@@ -125,6 +125,102 @@ extern const char* const kGuardianDetailPageHtml =
               border: 1px solid var(--border); background: var(--mds-color-state-hover); color: var(--fg); cursor: pointer; }
     .gp-btn.accent { border-color: var(--accent); color: var(--accent); background: none; }
     .gp-btn.danger { color: var(--red); }
+
+    /* DEX sub-nav (Overview / Catalogue / Health / Trends) — reuses chip styling */
+    .gp-subnav { display: flex; gap: 0.3rem; align-items: center; border-bottom: 1px solid var(--border);
+                 padding-bottom: 0.7rem; margin-bottom: 0.6rem; flex-wrap: wrap; }
+    .gp-subnav a, .gp-subnav span { font-size: 0.78rem; color: var(--muted); border: 1px solid transparent;
+                 border-radius: 0.35rem; padding: 0.22rem 0.6rem; cursor: pointer; }
+    .gp-subnav a.on { color: var(--fg); border-color: var(--accent); }
+    .gp-subnav span.soon { color: #5b6b80; cursor: default; }
+    .gp-subnav .sp { margin-left: auto; font-size: 0.7rem; color: var(--muted); cursor: default; }
+
+    /* DEX catalogue family-card grid (mockup dex-catalogue.html, View 1) */
+    .gp-fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr));
+                gap: 0.7rem; margin-top: 0.6rem; }
+    .gp-fcard { background: var(--surface); border: 1px solid var(--border); border-radius: 0.55rem;
+                padding: 0.75rem 0.85rem; cursor: pointer; color: var(--fg); display: block;
+                transition: border-color 0.12s, transform 0.12s; }
+    .gp-fcard:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .gp-fcard.quiet { opacity: 0.6; }
+    .gp-fcard .fn { color: var(--fg); font-weight: 600; font-size: 0.86rem; display: flex;
+                justify-content: space-between; align-items: baseline; gap: 0.4rem; }
+    .gp-fcard .fn .cnt { font-size: 0.62rem; color: var(--muted); font-weight: 400; white-space: nowrap; }
+    .gp-fcard .fev { font-size: 1.5rem; font-weight: 700; color: var(--fg); line-height: 1; margin-top: 0.5rem; }
+    .gp-fcard .fev.bad { color: var(--red); } .gp-fcard .fev.warn { color: var(--yellow); }
+    .gp-fcard .fev.ok { color: var(--green); }
+    .gp-fcard .fmeta { font-size: 0.62rem; color: var(--muted); }
+    .gp-fcard .ftop { font-size: 0.64rem; color: var(--muted); margin-top: 0.45rem;
+                border-top: 1px solid var(--border); padding-top: 0.4rem; }
+    .gp-fcard .ftop b { color: var(--accent); font-weight: 600; }
+)HTM"
+    // MSVC caps a single string literal at ~16 KB; the page shell + component CSS
+    // outgrew it, so the literal is split here (adjacent literals concatenate).
+    R"HTM(
+    /* DEX health-score page (mockup dex-health-score.html) */
+    .gp-reversal { font-size: 0.72rem; color: var(--accent); background: rgba(0,188,235,0.06);
+                border: 1px solid rgba(0,188,235,0.3); border-radius: 0.45rem;
+                padding: 0.55rem 0.75rem; margin: 0.9rem 0; }
+    .gp-primary { display: flex; gap: 1.1rem; align-items: center; flex-wrap: wrap;
+                background: var(--surface); border: 1px solid var(--border);
+                border-radius: 0.6rem; padding: 0.85rem 1.05rem; }
+    .gp-primary .big { font-size: 2.1rem; font-weight: 700; color: var(--green); line-height: 1; }
+    .gp-primary .big.sec { color: var(--fg); font-size: 1.5rem; }
+    .gp-primary .lbl { font-size: 0.64rem; color: var(--muted); text-transform: uppercase;
+                letter-spacing: 0.05em; }
+    .gp-primary .vdiv { width: 1px; align-self: stretch; background: var(--border); }
+    .gp-composite { display: flex; gap: 1.4rem; align-items: center; flex-wrap: wrap; margin-top: 0.5rem; }
+    .gp-gauge { position: relative; width: 140px; height: 140px; flex-shrink: 0; }
+    .gp-gauge .val { position: absolute; inset: 0; display: flex; flex-direction: column;
+                align-items: center; justify-content: center; }
+    .gp-gauge .val .num { font-size: 2.2rem; font-weight: 700; color: var(--fg); line-height: 1; }
+    .gp-gauge .val .band { font-size: 0.66rem; font-weight: 700; text-transform: uppercase;
+                letter-spacing: 0.05em; }
+    .band-excellent, .band-good { color: var(--green); } .band-fair { color: var(--yellow); }
+    .band-poor { color: var(--red); }
+    .gp-derived { font-size: 0.6rem; color: var(--muted); border: 1px solid var(--border);
+                border-radius: 0.3rem; padding: 0.05rem 0.4rem; display: inline-block; margin-bottom: 0.35rem; }
+    .gp-stack { display: flex; height: 26px; border-radius: 5px; overflow: hidden;
+                border: 1px solid var(--border); margin-bottom: 0.7rem; }
+    .gp-stack > span { display: flex; align-items: center; justify-content: center;
+                font-size: 0.56rem; color: #04101f; font-weight: 700; min-width: 0; white-space: nowrap; }
+    .gp-ded { display: grid; grid-template-columns: 1.6fr auto 1fr auto; gap: 0.6rem;
+                align-items: center; padding: 0.32rem 0; border-bottom: 1px solid var(--border); font-size: 0.78rem; }
+    .gp-ded .fam { color: var(--fg); font-weight: 600; }
+    .gp-ded .wt { font-size: 0.62rem; text-transform: uppercase; }
+    .wt-high { color: var(--red); } .wt-med { color: var(--yellow); } .wt-low { color: var(--muted); }
+    .gp-ded .bar { height: 8px; border-radius: 2px; background: var(--red); opacity: 0.8; }
+    .gp-ded .pts { text-align: right; font-variant-numeric: tabular-nums; color: var(--red);
+                font-weight: 600; min-width: 48px; }
+    .gp-subgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.55rem; }
+    .gp-sscore { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem;
+                padding: 0.55rem 0.7rem; }
+    .gp-sscore .nm { font-size: 0.7rem; color: var(--muted); }
+    .gp-sscore .vv { font-size: 1.5rem; font-weight: 700; line-height: 1.1; }
+    .gp-sscore .ds { font-size: 0.58rem; color: var(--muted); }
+
+    /* DEX trends page (mockup dex-trends.html) */
+    .gp-oscards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.7rem; }
+    .gp-oscard { background: var(--surface); border: 1px solid var(--border); border-radius: 0.55rem;
+                padding: 0.85rem 1rem; }
+    .gp-oscard.pending { opacity: 0.62; border-style: dashed; }
+    .gp-oscard .os { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem;
+                color: var(--fg); font-weight: 600; }
+    .gp-oscard .state { font-size: 0.58rem; border-radius: 0.3rem; padding: 0.05rem 0.4rem;
+                border: 1px solid var(--border); }
+    .gp-oscard .state.live { color: var(--green); } .gp-oscard .state.limited { color: var(--yellow); }
+    .gp-oscard .state.pending { color: var(--muted); }
+    .gp-oscard .scope { font-size: 0.62rem; color: var(--muted); margin-top: 0.15rem; }
+    .gp-smgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.6rem; }
+    .gp-sm { background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem;
+                padding: 0.6rem 0.7rem; }
+    .gp-sm .smh { display: flex; justify-content: space-between; align-items: baseline; gap: 0.3rem; }
+    .gp-sm .smn { font-size: 0.72rem; color: var(--fg); font-weight: 600; }
+    .gp-sm .smv { font-size: 0.62rem; color: var(--muted); }
+    .gp-heat { display: flex; flex-direction: column; gap: 3px; margin-top: 0.4rem; }
+    .gp-heat .hrow { display: flex; align-items: center; gap: 4px; }
+    .gp-heat .hlbl { width: 150px; flex-shrink: 0; font-size: 0.62rem; color: var(--muted); text-align: right; }
+    .gp-heat .hrow > i { flex: 1; height: 14px; border-radius: 2px; min-width: 6px; }
   </style>
 </head>
 <body>
@@ -136,6 +232,7 @@ extern const char* const kGuardianDetailPageHtml =
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/guardian" class="nav-link active">Guardian</a>
+    <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>

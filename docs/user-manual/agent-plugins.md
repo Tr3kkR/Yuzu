@@ -63,6 +63,7 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `processors` | CPU model, core count, clock speed, and socket information. |
 | `memory` | Total physical memory, speed, and slot details. |
 | `disks` | Physical disk model, size, interface type, and health status. |
+| `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
 ### device_identity
 
@@ -256,6 +257,20 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | `flush_dns` | Flush the local DNS resolver cache. |
 | `ping` | ICMP ping a target host and return round-trip statistics. |
+
+### netprobe
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Active network measurement — RTT, jitter, and packet loss to operator-chosen targets using native system calls (no shell-out). Complements `network_actions.ping` (a one-shot reachability check) with structured, schedulable, trendable measurements that land in the response store for historical queries. **Admin-only** (a network-reconnaissance primitive). Bounded at 4 targets × 10 samples × 3 s per invocation. |
+
+| Action | Description |
+|---|---|
+| `icmp` | ICMP echo RTT, jitter (population stddev), and packet loss to up to 4 comma-separated IPv4 targets. `IcmpSendEcho` on Windows (whole-millisecond granularity — a sub-ms LAN hop reads 0.0 ms; use `tcp` for LAN fidelity); unprivileged ICMP datagram sockets on macOS/Linux. **On Linux, ICMP requires `net.ipv4.ping_group_range` to include the agent's GID** — a restricted kernel returns `status: not-permitted` (never fake loss). Use `tcp` on fleets where the sysctl is not set. |
+| `tcp` | TCP connect-time RTT, jitter, and connection failure rate to up to 4 targets on a chosen port (default 443). Sub-millisecond, unprivileged everywhere — the right probe for targets that drop ICMP (VPN gateways, SaaS edges). |
+| `dns` | Name-resolution wall time (`getaddrinfo`) for up to 4 names — reports `resolve_ms`, status, and address count. |
 
 ### wifi
 
@@ -732,6 +747,21 @@ Plugins for Windows-specific system management: registry operations and WMI quer
 |---|---|
 | `query` | Execute a WQL SELECT query. Only SELECT statements are allowed. Parameters: `wql` (required, e.g., `"SELECT * FROM Win32_OperatingSystem"`), `namespace` (optional, default `root\cimv2`). Returns property/value pairs. |
 | `get_instance` | Get all properties of the first instance of a WMI class. Parameters: `class` (required, e.g., `Win32_OperatingSystem`), `namespace` (optional). |
+
+---
+
+### rdp_control
+
+| | |
+|---|---|
+| **Version** | v0.1.0 |
+| **Platforms** | W |
+| **Description** | Enable, disable, and report the Remote Desktop (RDP) posture of a Windows endpoint. Manages three gates: the `fDenyTSConnections` value under `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`, the built-in Remote Desktop firewall rule group (addressed locale-independently via `@FirewallAPI.dll,-28752` through `INetFwPolicy2`), and the `TermService` start state. Built for change-gated remote access — an ITSM system enables RDP for an approved change window and disables it afterward. **Prerequisite:** the agent service account must be a member of the local `Administrators` group — *not* the default install, and **not** granted by `scripts/install-agent-user.ps1` (which only adds Event Log / Performance groups). Grant it out of band via GPO Restricted Groups / Intune, or `Add-LocalGroupMember Administrators 'NT SERVICE\YuzuAgent'`, and verify with `Get-LocalGroupMember Administrators`. A non-elevated agent returns `reg_status\|error:5` on every `set_state`. **Dispatch gate:** only `Execution:Execute` is enforced on every path; the definition's role-gated approval and `executeRoles` apply solely on `POST /api/instructions/{id}/execute`, not on raw `/api/command` or MCP dispatch — restrict `Execution:Execute`/MCP token scope and keep a Guardian `fDenyTSConnections=1` backstop. |
+
+| Action | Description |
+|---|---|
+| `set_state` | Enable or disable RDP. Parameter: `state` (`enable` or `disable`). Enable sets `fDenyTSConnections=0`, enables the firewall rule group, and starts `TermService`. Disable sets `fDenyTSConnections=1` and disables the firewall rule group (the service is left running; the registry and firewall gates block new connections). Emits per-step columns `reg_status`, `firewall_status`, `service_status`, and an `overall` verdict; `overall=ok` only when every step succeeded — callers should retry until `overall=ok`, especially on disable. `service_status=running` is reported only after polling the SCM to a confirmed `SERVICE_RUNNING` (not at start-dispatch); `firewall_status=error:group_not_found` if the built-in Remote Desktop group is absent (never a silent no-op). Disable blocks *new* connections only; it does not terminate an already-established session. Gated by `Execution:Execute` on raw dispatch (see the Description's dispatch-gate note; the definition advertises role-gated approval, enforced only on the governed instruction-execute path). |
+| `status` | Read the current RDP posture. Returns `deny_ts_connections` (registry value), `firewall_group` (rule-group enabled state), `term_service` (service state), and a derived `rdp` verdict: `on` only when all three gates are readable and open; `unknown` when any gate could not be read (e.g. a non-elevated agent); `off` when all gates are readable but at least one is closed. A non-zero exit code also signals an unreadable gate — verify a state change by the exit code and per-gate rows, not the `rdp` summary alone. |
 
 ---
 
