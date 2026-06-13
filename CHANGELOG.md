@@ -1044,6 +1044,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SSE channel GC no longer aborts the server (#1198).** `gc_terminal_channels()`
+  destroyed each collected execution channel — and the `std::mutex` inside it —
+  while a `lock_guard` still owned that mutex: the channel map held the only
+  `shared_ptr`, so the erase ran the destructor synchronously and the guard then
+  unlocked freed memory. On MSVC this aborted the whole server
+  (`mutex.cpp(150): unlock of unowned mutex`); on every toolchain it was UB.
+  Reachable from normal operator activity: any execution that completes, loses
+  its SSE subscribers (executions drawer closed), and ages past the 60 s
+  retention window triggered the bad path on the next publish-driven GC sweep.
+  Fixed by pinning each victim with an extra `shared_ptr` and deferring
+  destruction until all per-channel locks are released.
 - **Agents enrolling *through the gateway* now receive a per-agent client
   certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
   per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the

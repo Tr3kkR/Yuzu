@@ -149,19 +149,33 @@ std::size_t ExecutionEventBus::gc_terminal_channels() {
     if (victims.empty()) return 0;
 
     std::size_t removed = 0;
-    std::unique_lock<std::shared_mutex> wl(map_mu_);
-    for (const auto& id : victims) {
-        auto it = channels_.find(id);
-        if (it == channels_.end()) continue;
-        // Re-check terminal+empty under the per-channel mutex — a late
-        // subscriber may have joined between the two passes.
-        std::lock_guard<std::mutex> g(it->second->mu);
-        if (it->second->terminal && it->second->terminal_at_ms <= deadline &&
-            it->second->listeners.empty()) {
-            channels_.erase(it);
-            ++removed;
+    // The map holds the only shared_ptr to each channel collected here
+    // (terminal, no listeners), so erase() would destroy the Channel —
+    // and the mutex the lock_guard below still holds — synchronously
+    // inside the loop. Park victims in `dead` so destruction happens
+    // only after every per-channel lock has been released (#1198).
+    std::vector<std::shared_ptr<Channel>> dead;
+    dead.reserve(victims.size()); // no alloc (throw path) under the write lock
+    {
+        std::unique_lock<std::shared_mutex> wl(map_mu_);
+        for (const auto& id : victims) {
+            auto it = channels_.find(id);
+            if (it == channels_.end()) continue;
+            // `keep` must be declared before `g`: if anything below throws,
+            // unwinding unlocks `g` before `keep` can drop the last reference.
+            std::shared_ptr<Channel> keep = it->second; // outlives erase()
+            // Re-check terminal+empty under the per-channel mutex — a late
+            // subscriber may have joined between the two passes.
+            std::lock_guard<std::mutex> g(keep->mu);
+            if (keep->terminal && keep->terminal_at_ms <= deadline &&
+                keep->listeners.empty()) {
+                channels_.erase(it);
+                dead.push_back(std::move(keep));
+                ++removed;
+            }
         }
     }
+    // `dead` is destroyed at function exit, after all locks are released.
     if (removed > 0) {
         gc_channels_.fetch_add(removed, std::memory_order_relaxed);
     }
