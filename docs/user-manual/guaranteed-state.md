@@ -11,7 +11,7 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 | Term | Meaning |
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
-| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry`, `file`, and `service` (run-state) guards are live; service start-type, ETW, and non-Windows guards are on the roadmap. |
+| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event; Linux systemd unit-state via sd-bus) and evaluates the rule. The `registry` and `file` guards are Windows-only and live; the `service` (run-state) guard is live on **Windows** (SCM `NotifyServiceStatusChange`) and **Linux** (systemd sd-bus `ActiveState` watch, **observe-only** — enforce is Windows-only for now). Service start-type, ETW, macOS, and non-systemd Linux guards are on the roadmap. |
 | **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values (all guard types — registry, file, service): `drift.detected` (drift observed in **audit** mode — no remediation), `drift.remediated` (enforce restored the expected state — a registry write-back, or a service start/stop), `remediation.failed` (enforce attempted but the action was denied — e.g. a read-only-fallback registry key or a service-control access denial), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). A distinct **`process.crashed`** value records a *ruleless* fleet-wide crash observation that belongs to no rule — see [Crash observations (DEX)](#crash-observations-dex). |
 | **Baseline** | The named, **deployable** collection of Guards — the *only* deployable unit. A Guard reaches an agent **exclusively** as a member of a *deployed* Baseline; authoring a Guard alone never enforces it anywhere. Has a draft → deployed lifecycle. See [Baselines](#baselines--how-guards-reach-agents). |
 | **Assignment** | A Baseline's targeting: a set of *included* minus *excluded* management groups (exclude wins). **Deferred** — management-group targeting is not wired yet, so deploy is fleet-wide for now and the dashboard labels the assignment area "coming soon." |
@@ -63,7 +63,7 @@ spec:
     value_type: REG_DWORD
 ```
 
-Three Windows guard types ship today: the **registry** guard (above), the **file** guard (below), and the **service** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
+Three guard types ship today: the **registry** guard (above, Windows-only), the **file** guard (below, Windows-only), and the **service** guard (below, Windows + Linux/systemd). On Linux the service guard is **observe-only** — it detects and reports drift but does not start/stop units; an `enforce`-mode rule on a Linux agent degrades to observe (drift is reported, never remediated), with no error. macOS (Endpoint Security / FSEvents), the remaining Linux event guards (inotify/netlink), and non-systemd Linux fallback are on the roadmap.
 
 ## File guards — detect a file changed or deleted, in realtime
 
@@ -91,9 +91,11 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
 
 The full type catalog — including these file types and the `expected_hash` format — is discoverable at `GET /api/v1/guaranteed-state/schemas` (see [Schema discovery](#schema-discovery)).
 
-## Service guards — keep a Windows service running (or stopped), in realtime
+## Service guards — keep a service running (or stopped), in realtime
 
-A `service-status-change` spark watches one Windows service via `NotifyServiceStatusChange` — kernel-notified by the Service Control Manager, **no polling**, so a stop or start is detected in ~0 ms. The watch is resilient: it survives the service being deleted and recreated, and re-arms automatically. The assertion *type* encodes the desired run state; the only param is the service (key) name:
+A `service-status-change` spark watches one service in real time, **no polling**: on Windows via `NotifyServiceStatusChange` (kernel-notified by the Service Control Manager, ~0 ms); on Linux via the systemd `PropertiesChanged` D-Bus signal on the watched unit's `ActiveState` (sd-bus, event-driven). The watch is resilient: it survives the service being deleted and recreated, re-arms automatically, and on Linux reconnects after a `systemctl daemon-reexec` / dbus restart. The assertion *type* encodes the desired run state; the only param is the service / unit name:
+
+**Linux (observe-only, v1).** On a systemd host, `service-running` / `service-stopped` detect and report drift exactly as audit mode does; the guard does **not** start, stop, or mask units — enforcement is gated behind a forthcoming polkit-grant change. An `enforcement_mode: enforce` rule on a Linux agent still detects drift and emits `drift.detected` (with `platform=linux`); a `drift.remediated` event is never emitted on Linux today. The unit name follows `systemctl` ergonomics — a bare name defaults to `.service` (so `ssh` means `ssh.service`). On a non-systemd host (no system D-Bus) the guard does not arm and the rule reports unarmed rather than compliant. systemd's richer `ActiveState` maps onto the two run-state tokens: `active` → running; `inactive`, `failed`, or an absent unit → stopped; `activating` / `deactivating` / `reloading` are transitional and held (no event), mirroring the Windows guard's `*_PENDING` hold.
 
 Like every Guard, a service Guard reaches an agent — and therefore enforces — **only as a member of a [deployed Baseline](#baselines--how-guards-reach-agents)**; authoring one alone does nothing on any endpoint.
 

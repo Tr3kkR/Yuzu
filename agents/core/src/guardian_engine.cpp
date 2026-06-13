@@ -638,10 +638,17 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
         if (sguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(sguard));
+            // Honest mode label: the Linux systemd guard is observe-only in v1, so an
+            // enforce-authored rule observes (it logs its own downgrade too) — don't
+            // claim "enforce" on a platform that won't remediate (happy-path Q4).
+            const char* mode = enforce ? "enforce" : "audit";
+#if defined(__linux__)
+            if (enforce)
+                mode = "enforce (observe-only on Linux)";
+#endif
             spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
                          rule.rule_id(), log_service,
-                         desired == ServiceGuard::Desired::Running ? "running" : "stopped",
-                         enforce ? "enforce" : "audit");
+                         desired == ServiceGuard::Desired::Running ? "running" : "stopped", mode);
             return true;
         }
         spdlog::warn("Guardian: service guard for rule '{}' did not start "

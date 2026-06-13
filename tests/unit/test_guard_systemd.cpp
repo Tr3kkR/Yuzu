@@ -26,14 +26,24 @@
 using namespace yuzu::agent;
 using Desired = ServiceGuard::Desired;
 
+namespace {
+// A fixed steady_clock instant at `ms` milliseconds past the epoch — lets the
+// decision-machine tests drive the debounce window deterministically (the absolute
+// origin is irrelevant; only deltas matter to systemd_decide_emit).
+std::chrono::steady_clock::time_point at(long long ms) {
+    return std::chrono::steady_clock::time_point{std::chrono::milliseconds(ms)};
+}
+} // namespace
+
 // Ownership contract (cpp-safety): the guard owns an eventfd + an sd_bus* + a
 // std::thread; copy or move would double-close / double-join. Non-copyable AND
 // non-movable, exactly like the other guards.
 static_assert(!std::is_copy_constructible_v<SystemdServiceGuard>);
 static_assert(!std::is_copy_assignable_v<SystemdServiceGuard>);
 static_assert(!std::is_move_constructible_v<SystemdServiceGuard>);
+static_assert(!std::is_move_assignable_v<SystemdServiceGuard>);
 
-TEST_CASE("parse_active_state maps every systemd ActiveState", "[guard][systemd][state]") {
+TEST_CASE("parse_active_state maps every systemd ActiveState", "[guardian][guard][systemd][state]") {
     CHECK(parse_active_state("active") == SystemdState::Active);
     CHECK(parse_active_state("reloading") == SystemdState::Reloading);
     CHECK(parse_active_state("inactive") == SystemdState::Inactive);
@@ -47,7 +57,7 @@ TEST_CASE("parse_active_state maps every systemd ActiveState", "[guard][systemd]
     CHECK(parse_active_state("ACTIVE") == SystemdState::Unknown); // case-sensitive: D-Bus is lower
 }
 
-TEST_CASE("transitional states are held (never compared)", "[guard][systemd][state]") {
+TEST_CASE("transitional states are held (never compared)", "[guardian][guard][systemd][state]") {
     // Mid-transition or not-understood → held: the guard waits for a terminal state.
     CHECK(systemd_state_is_transitional(SystemdState::Reloading));
     CHECK(systemd_state_is_transitional(SystemdState::Activating));
@@ -61,7 +71,7 @@ TEST_CASE("transitional states are held (never compared)", "[guard][systemd][sta
     CHECK_FALSE(systemd_state_is_transitional(SystemdState::Absent));
 }
 
-TEST_CASE("service-running is satisfied only by active", "[guard][systemd][compliance]") {
+TEST_CASE("service-running is satisfied only by active", "[guardian][guard][systemd][compliance]") {
     CHECK(systemd_is_compliant(Desired::Running, SystemdState::Active));
     CHECK_FALSE(systemd_is_compliant(Desired::Running, SystemdState::Inactive));
     CHECK_FALSE(systemd_is_compliant(Desired::Running, SystemdState::Failed));
@@ -69,7 +79,7 @@ TEST_CASE("service-running is satisfied only by active", "[guard][systemd][compl
 }
 
 TEST_CASE("service-stopped is satisfied by inactive, failed, or absent",
-          "[guard][systemd][compliance]") {
+          "[guardian][guard][systemd][compliance]") {
     CHECK(systemd_is_compliant(Desired::Stopped, SystemdState::Inactive));
     CHECK(systemd_is_compliant(Desired::Stopped, SystemdState::Failed)); // dead ⇒ not running
     CHECK(systemd_is_compliant(Desired::Stopped, SystemdState::Absent)); // gone ⇒ not running
@@ -77,7 +87,7 @@ TEST_CASE("service-stopped is satisfied by inactive, failed, or absent",
 }
 
 TEST_CASE("detected_value token stays in the cross-platform vocabulary",
-          "[guard][systemd][token]") {
+          "[guardian][guard][systemd][token]") {
     // running/stopped/absent reuse the Windows guard's words so the dashboard renders
     // uniformly; systemd-native words are kept for the states Windows has no name for.
     CHECK(systemd_state_token(SystemdState::Active) == "running");
@@ -85,21 +95,28 @@ TEST_CASE("detected_value token stays in the cross-platform vocabulary",
     CHECK(systemd_state_token(SystemdState::Absent) == "absent");
     CHECK(systemd_state_token(SystemdState::Failed) == "failed");
     CHECK(systemd_state_token(SystemdState::Activating) == "activating");
+    // The remaining tokens are the dashboard contract for these states too — pin them
+    // so a future rename can't silently change what an operator sees.
+    CHECK(systemd_state_token(SystemdState::Reloading) == "reloading");
+    CHECK(systemd_state_token(SystemdState::Deactivating) == "deactivating");
+    CHECK(systemd_state_token(SystemdState::Maintenance) == "maintenance");
+    CHECK(systemd_state_token(SystemdState::Unknown) == "unknown");
 }
 
 TEST_CASE("normalize_unit_name applies the systemctl .service default",
-          "[guard][systemd][unit]") {
+          "[guardian][guard][systemd][unit]") {
     CHECK(normalize_unit_name("ssh") == "ssh.service");      // bare name ⇒ .service
     CHECK(normalize_unit_name("ssh.service") == "ssh.service"); // already suffixed
     CHECK(normalize_unit_name("foo.socket") == "foo.socket");   // other suffix preserved
     CHECK(normalize_unit_name("getty@tty1.service") == "getty@tty1.service");
 }
 
-TEST_CASE("valid_unit_name mirrors the server authoring charset", "[guard][systemd][unit]") {
+TEST_CASE("valid_unit_name mirrors the server authoring charset", "[guardian][guard][systemd][unit]") {
     CHECK(valid_unit_name("ssh"));
     CHECK(valid_unit_name("ssh.service"));
     CHECK(valid_unit_name("getty@tty1.service"));
     CHECK(valid_unit_name("my-app_1.timer"));
+    CHECK(valid_unit_name(std::string(256, 'a')));    // exactly at the 256 cap — accepted
     CHECK_FALSE(valid_unit_name(""));                 // empty
     CHECK_FALSE(valid_unit_name("ssh service"));      // space
     CHECK_FALSE(valid_unit_name("evil;rm -rf"));      // shell metachars
@@ -107,7 +124,7 @@ TEST_CASE("valid_unit_name mirrors the server authoring charset", "[guard][syste
 }
 
 TEST_CASE("make_service_guard returns a non-null guard carrying the rule id",
-          "[guard][systemd][factory]") {
+          "[guardian][guard][systemd][factory]") {
     ServiceGuard::Config cfg;
     cfg.rule_id = "rule-abc";
     cfg.rule_name = "watch ssh";
@@ -121,6 +138,75 @@ TEST_CASE("make_service_guard returns a non-null guard carrying the rule id",
     // unit test. Off Linux start() is a no-op returning false by construction.
 }
 
+// ── systemd_decide_emit — the transition state machine (pure, runs everywhere) ──
+// This is the logic that previously lived only inside run()'s emit lambda, reachable
+// only against a live bus. Extracted so the dedup + collapse-debounce + the UP-5
+// commit rule are table-testable off Linux.
+
+TEST_CASE("systemd_decide_emit: terminal-change machine", "[guardian][guard][systemd][emit]") {
+    EmitState st;
+    constexpr std::uint64_t deb = 1000;
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Activating, st, deb, at(0)).action ==
+          EmitAction::Hold); // transitional → held, no commit
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Active, st, deb, at(10)).action ==
+          EmitAction::CompliantSilent); // compliant edge committed, silent
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Active, st, deb, at(20)).action ==
+          EmitAction::NoChange); // same terminal — silent
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Deactivating, st, deb, at(30)).action ==
+          EmitAction::Hold);
+    const auto d = systemd_decide_emit(Desired::Running, SystemdState::Inactive, st, deb, at(40));
+    CHECK(d.action == EmitAction::Emit); // drift edge
+    CHECK(d.collapsed_count == 0);
+}
+
+TEST_CASE("systemd_decide_emit: a debounce-suppressed drift is never lost (UP-5)",
+          "[guardian][guard][systemd][emit]") {
+    EmitState st;
+    constexpr std::uint64_t deb = 1000;
+    // First drift emits and opens the debounce window.
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Inactive, st, deb, at(0)).action ==
+          EmitAction::Emit);
+    // A DIFFERENT drift state inside the window is folded — and crucially NOT committed
+    // to last_terminal, so the same state recurring inside the window stays foldable.
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Failed, st, deb, at(100)).action ==
+          EmitAction::Suppressed);
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Failed, st, deb, at(200)).action ==
+          EmitAction::Suppressed);
+    // Past the window the Failed drift re-surfaces with its collapsed count. The bug was:
+    // last_terminal advanced on suppress → this read as NoChange and Failed was lost.
+    const auto d = systemd_decide_emit(Desired::Running, SystemdState::Failed, st, deb, at(1500));
+    CHECK(d.action == EmitAction::Emit);
+    CHECK(d.collapsed_count == 2);
+}
+
+TEST_CASE("systemd_decide_emit: re-drift after recovery still reports",
+          "[guardian][guard][systemd][emit]") {
+    EmitState st;
+    constexpr std::uint64_t deb = 100;
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Failed, st, deb, at(0)).action ==
+          EmitAction::Emit);
+    // Recovery commits the compliant state...
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Active, st, deb, at(2000)).action ==
+          EmitAction::CompliantSilent);
+    // ...so a later relapse into the SAME failed state is a genuine change and re-emits.
+    // (A naive "commit last_terminal only on emit" fix would lose this — the compliant
+    // branch must commit too.)
+    CHECK(systemd_decide_emit(Desired::Running, SystemdState::Failed, st, deb, at(4000)).action ==
+          EmitAction::Emit);
+}
+
+TEST_CASE("systemd_decide_emit: service-stopped compliance direction",
+          "[guardian][guard][systemd][emit]") {
+    EmitState st;
+    constexpr std::uint64_t deb = 1000;
+    CHECK(systemd_decide_emit(Desired::Stopped, SystemdState::Inactive, st, deb, at(0)).action ==
+          EmitAction::CompliantSilent); // stopped is compliant for want-stopped
+    CHECK(systemd_decide_emit(Desired::Stopped, SystemdState::Active, st, deb, at(10)).action ==
+          EmitAction::Emit);            // running is the drift
+    CHECK(systemd_decide_emit(Desired::Stopped, SystemdState::Failed, st, deb, at(2000)).action ==
+          EmitAction::CompliantSilent); // failed ⇒ not running ⇒ compliant
+}
+
 #if defined(__linux__)
 // LIVE integration test — exercises the one path the pure cases cannot: the
 // event-driven sd-bus PropertiesChanged transition on a REAL unit. Gated on
@@ -132,7 +218,7 @@ TEST_CASE("make_service_guard returns a non-null guard carrying the rule id",
 // Arms desired=running: the active unit is compliant (silent) until it stops, when
 // the guard must emit a "stopped" drift via the PropertiesChanged path.
 TEST_CASE("live: SystemdServiceGuard detects a real unit transition",
-          "[guard][systemd][live]") {
+          "[guardian][guard][systemd][live]") {
     const char* unit = std::getenv("YUZU_SYSTEMD_LIVE_UNIT");
     if (!unit || !*unit) {
         SUCCEED("YUZU_SYSTEMD_LIVE_UNIT unset — skipping live systemd integration test");

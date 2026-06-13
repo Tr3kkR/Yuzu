@@ -24,8 +24,9 @@
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -111,6 +112,35 @@ bool valid_unit_name(std::string_view unit) {
     return true;
 }
 
+EmitDecision systemd_decide_emit(ServiceGuard::Desired want, SystemdState got, EmitState& state,
+                                 std::uint64_t debounce_ms,
+                                 std::chrono::steady_clock::time_point now) {
+    if (systemd_state_is_transitional(got))
+        return {EmitAction::Hold, 0}; // mid-transition / not understood — never commit
+    if (got == state.last_terminal)
+        return {EmitAction::NoChange, 0}; // already committed this terminal state
+    if (systemd_is_compliant(want, got)) {
+        // Compliant edge: commit so a LATER drift back to a previously-drifted state
+        // reads as a real change (re-drift-after-recovery). Drift-only sink → silent.
+        state.last_terminal = got;
+        return {EmitAction::CompliantSilent, 0};
+    }
+    // Non-compliant terminal change → a drift, subject to the collapse debounce.
+    if (state.last_emit &&
+        (now - *state.last_emit) < std::chrono::milliseconds(debounce_ms)) {
+        // Fold into the count but do NOT commit last_terminal — leaving it uncommitted
+        // lets this drift re-surface at the next reconcile instead of being deduped
+        // away if the unit settles back into this same state.
+        ++state.suppressed;
+        return {EmitAction::Suppressed, 0};
+    }
+    state.last_terminal = got; // commit on emit
+    const std::uint64_t collapsed = state.suppressed;
+    state.suppressed = 0;
+    state.last_emit = now;
+    return {EmitAction::Emit, collapsed};
+}
+
 std::unique_ptr<IGuard> make_service_guard(ServiceGuard::Config cfg, GuardSink sink) {
 #if defined(__linux__)
     return std::make_unique<SystemdServiceGuard>(std::move(cfg), std::move(sink));
@@ -128,10 +158,12 @@ std::unique_ptr<IGuard> make_service_guard(ServiceGuard::Config cfg, GuardSink s
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib> // free
-#include <cstring> // std::strerror
+#include <cstdlib>     // free
 #include <ctime>
+#include <memory>      // unique_ptr (sd_bus_slot RAII)
 #include <optional>
+#include <string>
+#include <system_error> // std::generic_category — thread-safe strerror replacement
 
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -152,6 +184,18 @@ constexpr const char* kPropsIface = "org.freedesktop.DBus.Properties";
 // missed signal or the unit object being destroyed/re-created.
 constexpr std::uint64_t kAbsentRetryMs = 30000;
 constexpr std::uint64_t kHealthyReconcileMs = 60000;
+
+// Thread-safe strerror: std::strerror returns a pointer into a shared global buffer,
+// which races across the N watch threads (one per rule). generic_category().message
+// returns an owned std::string. `e` is a POSITIVE errno (negate sd-bus's -errno).
+std::string err_str(int e) { return std::generic_category().message(e); }
+
+// Outcome of resolving a unit's object path — distinguishes "the unit genuinely is
+// not loadable" (a real Absent drift) from "the bus call failed at the transport
+// layer" (reopen the connection, do NOT report a false Absent). Without this split a
+// systemd daemon-reexec / dbus restart would emit a spurious "service stopped" drift
+// fleet-wide (UP-4) on top of going deaf (sec-M1).
+enum class ResolveResult { Resolved, NotFound, BusError };
 
 std::uint64_t monotonic_us() {
     struct timespec ts{};
@@ -190,7 +234,7 @@ bool SystemdServiceGuard::start() {
         // unarmed (detect-only requires the /proc fallback, a later slice).
         spdlog::warn("Guardian SystemdServiceGuard[{}]: system bus unavailable ({}) — unit '{}' "
                      "unwatched (non-systemd host?)",
-                     cfg_.rule_id, (r < 0 ? std::strerror(-r) : "no bus"), cfg_.service_name);
+                     cfg_.rule_id, (r < 0 ? err_str(-r) : std::string("no bus")), cfg_.service_name);
         if (bus)
             sd_bus_unref(bus);
         return false;
@@ -229,7 +273,7 @@ void SystemdServiceGuard::stop() {
 }
 
 void SystemdServiceGuard::run() try {
-    auto* bus = static_cast<sd_bus*>(bus_);
+    auto* bus = static_cast<sd_bus*>(bus_); // working pointer; reopen_bus() reseats it
     const std::string unit = normalize_unit_name(cfg_.service_name);
     const char* expected_token = (cfg_.desired == Desired::Running) ? "running" : "stopped";
 
@@ -238,11 +282,50 @@ void SystemdServiceGuard::run() try {
                      "observing unit '{}' only (drift reported, not remediated)",
                      cfg_.rule_id, unit);
 
-    // Best-effort Subscribe so the Manager emits unit signals to us. Not fatal if
-    // it fails — PropertiesChanged on the unit object still works without it on most
+    int bus_fd = sd_bus_get_fd(bus);
+    bool bus_ok = true; // false after a transport failure, until reopen_bus() succeeds
+
+    std::string unit_path;     // resolved object path of the watched unit
+    // `dirty` MUST out-live `match_slot` (the match callback holds &dirty as its
+    // userdata). It is declared first so it destructs LAST — reordering these two
+    // would leave the callback pointing at freed stack. Reinforced by: no
+    // sd_bus_process runs during teardown, so the callback can't fire post-scope.
+    bool dirty = false;        // set by on_props_changed; drained each loop iteration
+    EmitState emit_state;      // change-dedup + collapse debounce (this thread only)
+
+    // RAII for the PropertiesChanged match slot. The slot holds a ref on `bus`, so its
+    // unref MUST happen before the bus it belongs to is unref'd — the unique_ptr's
+    // scope-exit unref (and reset() in reopen_bus / reconcile) guarantees that on every
+    // path, including an exception unwind (cppsafe-B: the old manual unref leaked on a
+    // throwing sink, holding a bus ref → fd exhaustion over guard churn).
+    std::unique_ptr<sd_bus_slot, decltype(&sd_bus_slot_unref)> match_slot{nullptr,
+                                                                          &sd_bus_slot_unref};
+
+    auto emit = [&](SystemdState got) {
+        const EmitDecision d = systemd_decide_emit(cfg_.desired, got, emit_state,
+                                                   cfg_.event_debounce_ms,
+                                                   std::chrono::steady_clock::now());
+        if (d.action != EmitAction::Emit)
+            return;
+        ServiceDrift drift;
+        drift.guard_type = "service";
+        drift.rule_id = cfg_.rule_id;
+        drift.rule_name = cfg_.rule_name;
+        drift.detected_value = std::string(systemd_state_token(got));
+        drift.expected_value = expected_token;
+        drift.detection_latency_us = 0; // v1: not measured (sd-bus gives no kernel event time)
+        drift.collapsed_count = d.collapsed_count;
+        spdlog::info("Guardian SystemdServiceGuard[{}]: drift unit '{}' detected={} expected={}",
+                     cfg_.rule_id, unit, drift.detected_value, expected_token);
+        if (sink_)
+            sink_(drift);
+    };
+
+    // Best-effort Subscribe so the Manager emits unit signals to us. Not fatal if it
+    // fails — PropertiesChanged on the unit object still works without it on most
     // systemd versions; we just lose the Manager-level UnitNew/Removed stream (the
-    // bounded reconcile backstop covers add/remove anyway).
-    {
+    // bounded reconcile backstop covers add/remove anyway). Re-run after every reopen.
+    auto subscribe = [&] {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
         if (sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "Subscribe", &err, &reply, "") < 0)
@@ -251,68 +334,41 @@ void SystemdServiceGuard::run() try {
         if (reply)
             sd_bus_message_unref(reply);
         sd_bus_error_free(&err);
-    }
-
-    std::string unit_path; // resolved object path of the watched unit
-    bool dirty = false;    // set by on_props_changed; drained each loop iteration
-
-    // Sink-debounce (H3 / #1209) + change-dedup: only this thread touches these.
-    std::optional<std::chrono::steady_clock::time_point> last_emit;
-    std::uint64_t suppressed = 0;
-    SystemdState last_terminal = SystemdState::Unknown; // last terminal state acted on
-
-    auto emit = [&](SystemdState got) {
-        if (systemd_state_is_transitional(got))
-            return;                  // hold on transitional / not-understood states
-        if (got == last_terminal)
-            return;                  // no change since last terminal observation (incl. backstop)
-        last_terminal = got;
-        if (systemd_is_compliant(cfg_.desired, got))
-            return;                  // compliant edge — drift-only sink, mirrors ServiceGuard
-        ServiceDrift d;
-        d.guard_type = "service";
-        d.rule_id = cfg_.rule_id;
-        d.rule_name = cfg_.rule_name;
-        d.detected_value = std::string(systemd_state_token(got));
-        d.expected_value = expected_token;
-        d.detection_latency_us = 0; // v1: not measured (sd-bus gives no kernel event time)
-        const auto now = std::chrono::steady_clock::now();
-        if (last_emit &&
-            (now - *last_emit) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
-            ++suppressed;
-            return;
-        }
-        d.collapsed_count = suppressed;
-        suppressed = 0;
-        last_emit = now;
-        spdlog::info("Guardian SystemdServiceGuard[{}]: drift unit '{}' detected={} expected={}",
-                     cfg_.rule_id, unit, d.detected_value, expected_token);
-        if (sink_)
-            sink_(d);
     };
 
     // LoadUnit force-loads the unit and returns its object path (valid even when
-    // inactive). Failure (NoSuchUnit / LoadFailed) → the unit is absent.
-    auto resolve_path = [&]() -> bool {
+    // inactive). A remote D-Bus error (NoSuchUnit / LoadFailed) means the unit is
+    // genuinely Absent; a bare transport failure (no error name) means the bus is
+    // gone — reopen rather than report a false Absent.
+    auto resolve_path = [&]() -> ResolveResult {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
-        bool ok = false;
+        // Fail-safe default: if a future branch forgets to assign, reopen the bus
+        // rather than fabricate a false Absent drift (cpp-safety Gate-8).
+        ResolveResult res = ResolveResult::BusError;
         int r = sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "LoadUnit", &err, &reply, "s",
                                    unit.c_str());
         if (r >= 0 && reply) {
             const char* p = nullptr;
             if (sd_bus_message_read(reply, "o", &p) >= 0 && p && *p) {
-                unit_path = p;
-                ok = true;
+                unit_path = p; // copied into our std::string before the reply is unref'd
+                res = ResolveResult::Resolved;
+            } else {
+                res = ResolveResult::NotFound;
             }
+        } else if (sd_bus_error_is_set(&err)) {
+            spdlog::debug("Guardian SystemdServiceGuard[{}]: unit '{}' not loadable: {}",
+                          cfg_.rule_id, unit, err.message ? err.message : "(none)");
+            res = ResolveResult::NotFound;
         } else {
-            spdlog::debug("Guardian SystemdServiceGuard[{}]: LoadUnit '{}' failed: {}", cfg_.rule_id,
-                          unit, err.message ? err.message : "(none)");
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit '{}' bus error: {}",
+                         cfg_.rule_id, unit, err_str(r < 0 ? -r : 0));
+            res = ResolveResult::BusError;
         }
         if (reply)
             sd_bus_message_unref(reply);
         sd_bus_error_free(&err);
-        return ok;
+        return res;
     };
 
     auto read_state = [&]() -> SystemdState {
@@ -331,106 +387,159 @@ void SystemdServiceGuard::run() try {
         return st;
     };
 
-    sd_bus_slot* match_slot = nullptr;
-
     // Re-resolve from scratch: drop the old match, LoadUnit, arm a PropertiesChanged
-    // match on the (possibly new) object path, and do the compare. Returns the
-    // backstop cadence to use until the next forced reconcile.
+    // match on the (possibly new) object path, and do the compare. Returns the backstop
+    // cadence; sets bus_ok=false on a transport failure so the loop reopens the bus.
     auto reconcile = [&]() -> std::uint64_t {
-        if (match_slot) {
-            sd_bus_slot_unref(match_slot);
-            match_slot = nullptr;
-        }
-        if (!resolve_path()) {
+        match_slot.reset(); // drop the old match (and its bus ref) first
+        switch (resolve_path()) {
+        case ResolveResult::BusError:
+            bus_ok = false; // loop reopens; do NOT emit a false Absent
+            return kAbsentRetryMs;
+        case ResolveResult::NotFound:
             unit_path.clear();
             emit(SystemdState::Absent);
             return kAbsentRetryMs;
+        case ResolveResult::Resolved:
+            break;
         }
-        int r = sd_bus_match_signal(bus, &match_slot, kDest, unit_path.c_str(), kPropsIface,
+        sd_bus_slot* slot = nullptr;
+        int r = sd_bus_match_signal(bus, &slot, kDest, unit_path.c_str(), kPropsIface,
                                     "PropertiesChanged", &on_props_changed, &dirty);
         if (r < 0) {
             spdlog::warn("Guardian SystemdServiceGuard[{}]: match arm failed for '{}': {}",
-                         cfg_.rule_id, unit, std::strerror(-r));
+                         cfg_.rule_id, unit, err_str(-r));
             emit(read_state());
             return kAbsentRetryMs;
         }
+        match_slot.reset(slot);
         emit(read_state()); // initial / re-resolved compare
         return kHealthyReconcileMs;
+    };
+
+    // Reopen the system bus after a transport failure (systemd daemon-reexec / dbus
+    // restart). Reset the match slot BEFORE unref'ing the old bus — the slot holds a
+    // ref on it, so the order matters (cppsafe / advisor: reversing it trades the
+    // leak for a use-after-free). Updates `bus_` so stop()'s post-join unref frees the
+    // live connection.
+    auto reopen_bus = [&]() -> bool {
+        match_slot.reset();
+        if (bus) {
+            sd_bus_flush(bus);
+            sd_bus_unref(bus);
+        }
+        bus = nullptr;
+        bus_ = nullptr;
+        sd_bus* nb = nullptr;
+        if (sd_bus_open_system(&nb) < 0 || !nb) {
+            if (nb)
+                sd_bus_unref(nb);
+            return false;
+        }
+        bus = nb;
+        bus_ = nb;
+        bus_fd = sd_bus_get_fd(bus);
+        subscribe();
+        return true;
     };
 
     spdlog::info("Guardian SystemdServiceGuard[{}]: watching unit '{}' (expect {})", cfg_.rule_id,
                  unit, expected_token);
 
+    subscribe();
     std::uint64_t backstop_ms = reconcile();
     auto next_backstop = std::chrono::steady_clock::now() + std::chrono::milliseconds(backstop_ms);
-    const int bus_fd = sd_bus_get_fd(bus);
 
     while (!stop_.load(std::memory_order_acquire)) {
-        // 1) Drain all queued bus messages (dispatches the match → may set dirty).
-        for (;;) {
-            int r = sd_bus_process(bus, nullptr);
-            if (r < 0) {
-                spdlog::warn("Guardian SystemdServiceGuard[{}]: sd_bus_process: {}", cfg_.rule_id,
-                             std::strerror(-r));
-                break;
+        // 1) While the bus is healthy, drain all queued messages (dispatches the match
+        //    → may set dirty). A transport failure flips bus_ok and triggers a reopen.
+        if (bus_ok) {
+            for (;;) {
+                int r = sd_bus_process(bus, nullptr);
+                if (r < 0) {
+                    spdlog::warn("Guardian SystemdServiceGuard[{}]: bus lost ({}) — reconnecting",
+                                 cfg_.rule_id, err_str(-r));
+                    bus_ok = false;
+                    next_backstop = std::chrono::steady_clock::now(); // reopen promptly
+                    break;
+                }
+                if (stop_.load(std::memory_order_acquire) || r == 0)
+                    break;
             }
-            if (stop_.load(std::memory_order_acquire) || r == 0)
+            if (stop_.load(std::memory_order_acquire))
                 break;
+            if (bus_ok && dirty) {
+                dirty = false;
+                emit(read_state());
+            }
         }
         if (stop_.load(std::memory_order_acquire))
             break;
 
-        // 2) A PropertiesChanged fired → re-read ActiveState and compare.
-        if (dirty) {
-            dirty = false;
-            emit(read_state());
-        }
-
-        // 3) Compute the poll timeout: until the next backstop, capped by sd-bus's
+        // 2) Poll timeout: until the next backstop, capped (when healthy) by sd-bus's
         //    own next-operation deadline (an ABSOLUTE CLOCK_MONOTONIC us value).
         const auto now = std::chrono::steady_clock::now();
         long long timeout_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(next_backstop - now).count();
         if (timeout_ms < 0)
             timeout_ms = 0;
-        std::uint64_t bus_to_us = UINT64_MAX;
-        if (sd_bus_get_timeout(bus, &bus_to_us) >= 0 && bus_to_us != UINT64_MAX) {
-            const std::uint64_t now_us = monotonic_us();
-            const long long bus_ms =
-                bus_to_us > now_us ? static_cast<long long>((bus_to_us - now_us) / 1000) : 0;
-            if (bus_ms < timeout_ms)
-                timeout_ms = bus_ms;
+        if (bus_ok) {
+            std::uint64_t bus_to_us = UINT64_MAX;
+            if (sd_bus_get_timeout(bus, &bus_to_us) >= 0 && bus_to_us != UINT64_MAX) {
+                const std::uint64_t now_us = monotonic_us();
+                const long long bus_ms =
+                    bus_to_us > now_us ? static_cast<long long>((bus_to_us - now_us) / 1000) : 0;
+                if (bus_ms < timeout_ms)
+                    timeout_ms = bus_ms;
+            }
         }
 
+        // While the bus is dead we poll ONLY the wake eventfd — never the stale bus fd
+        // (polling a closed/HUP fd would busy-spin, the sec-M1/UP-3 CPU risk).
         struct pollfd fds[2];
-        fds[0].fd = bus_fd;
-        fds[0].events = static_cast<short>(sd_bus_get_events(bus));
-        fds[0].revents = 0;
-        fds[1].fd = wake_fd_;
-        fds[1].events = POLLIN;
-        fds[1].revents = 0;
-        int pr = ::poll(fds, 2, static_cast<int>(timeout_ms));
+        int wake_idx;
+        if (bus_ok) {
+            fds[0] = {bus_fd, static_cast<short>(sd_bus_get_events(bus)), 0};
+            fds[1] = {wake_fd_, POLLIN, 0};
+            wake_idx = 1;
+        } else {
+            fds[0] = {wake_fd_, POLLIN, 0};
+            wake_idx = 0;
+        }
+        const int nfds = bus_ok ? 2 : 1;
+        int pr = ::poll(fds, nfds, static_cast<int>(timeout_ms));
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
-            spdlog::warn("Guardian SystemdServiceGuard[{}]: poll: {}", cfg_.rule_id,
-                         std::strerror(errno));
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: poll: {}", cfg_.rule_id, err_str(errno));
             break;
         }
-        if (fds[1].revents & POLLIN)
+        if (fds[wake_idx].revents & POLLIN)
             break; // stop() signalled
 
         if (std::chrono::steady_clock::now() >= next_backstop) {
-            backstop_ms = reconcile();
+            if (!bus_ok) {
+                if (reopen_bus()) {
+                    bus_ok = true;
+                    spdlog::info("Guardian SystemdServiceGuard[{}]: system bus reconnected",
+                                 cfg_.rule_id);
+                    backstop_ms = reconcile();
+                } else {
+                    backstop_ms = kAbsentRetryMs; // retry reopen next tick
+                }
+            } else {
+                backstop_ms = reconcile(); // may itself flip bus_ok on a transport error
+            }
+            if (!bus_ok)
+                backstop_ms = kAbsentRetryMs;
             next_backstop =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(backstop_ms);
         }
         // Otherwise the bus fd is readable → loop; sd_bus_process drains it.
     }
 
-    if (match_slot)
-        sd_bus_slot_unref(match_slot);
-    // bus_ is unref'd in stop() after the join (single owner of the handle there).
+    // match_slot RAII unref's on scope exit here — BEFORE stop() unrefs bus_ after the
+    // join — so the slot's bus ref is always dropped first, on every path incl. throw.
 } catch (const std::exception& e) {
     spdlog::error("Guardian SystemdServiceGuard[{}]: watch thread exception: {} — watch stopping",
                   cfg_.rule_id, e.what());

@@ -44,7 +44,10 @@
 #include <yuzu/agent/guard_service.hpp> // ServiceGuard::Config / Desired (reused)
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -99,6 +102,47 @@ YUZU_EXPORT std::string normalize_unit_name(std::string_view unit);
 /// the server-side authoring validator: non-empty, <=256 chars, alphanumeric plus
 /// `. _ - @`. Keeps the agent honest if a malformed name slips past the server.
 YUZU_EXPORT bool valid_unit_name(std::string_view unit);
+
+/// Mutable per-watch dedup + debounce state threaded through systemd_decide_emit.
+/// `last_terminal` is the last terminal state we COMMITTED to (acted on); a drift is
+/// only a "change" relative to it. `last_emit`/`suppressed` implement the H3/#1209
+/// collapse-with-count debounce. One instance lives in each run() watch loop.
+struct EmitState {
+    SystemdState last_terminal{SystemdState::Unknown};
+    std::optional<std::chrono::steady_clock::time_point> last_emit;
+    std::uint64_t suppressed{0};
+};
+
+/// What systemd_decide_emit decided for one observed state. Only `Emit` produces a
+/// drift on the sink; `collapsed_count` is valid then (folded debounce-suppressed
+/// drifts, → GuardDrift.collapsed_count).
+enum class EmitAction {
+    Hold,            ///< transitional / not-understood state — no compare, no commit
+    NoChange,        ///< same terminal state already committed — silent
+    CompliantSilent, ///< compliant terminal edge — silent (drift-only sink), state committed
+    Suppressed,      ///< would drift but within the debounce window — folded, NOT committed
+    Emit,            ///< emit a drift now; collapsed_count carries the folded count
+};
+
+struct EmitDecision {
+    EmitAction action;
+    std::uint64_t collapsed_count;
+};
+
+/// PURE transition evaluator (compiled + tested on every platform). Given the rule's
+/// desired state, the observed state, and the mutable EmitState, decide whether to
+/// emit a drift and mutate the dedup/debounce state accordingly.
+///
+/// The commit rule is load-bearing (issue: a drift permanently lost): `last_terminal`
+/// is committed on the compliant edge AND on an actual emit, but NEVER on a
+/// transitional hold or a debounce-suppressed drift. Committing on suppress would let
+/// a unit that flaps back into the SAME drift state read as NoChange and be silently
+/// lost; leaving it uncommitted lets the suppressed drift re-surface (with its
+/// collapsed_count) at the next reconcile, while still preserving re-drift-after-
+/// recovery (compliant commits, so a later same-state drift is a real change).
+YUZU_EXPORT EmitDecision systemd_decide_emit(ServiceGuard::Desired want, SystemdState got,
+                                             EmitState& state, std::uint64_t debounce_ms,
+                                             std::chrono::steady_clock::time_point now);
 
 /// One live systemd unit run-state watch. start() opens the system bus and starts
 /// the watch thread; the thread Subscribes, resolves the unit path, reads

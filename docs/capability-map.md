@@ -1174,16 +1174,16 @@ Each guard implements `self_test()` on start to prove kernel wiring (sentinel wr
 
 Not implemented (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines `Microsoft-Windows-Kernel-Process` ETW (events 1/2 for start/stop, near-real-time) with periodic `CreateToolhelp32Snapshot` poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.
 
-### 31.4 Event Guards — Linux :x: `T3`
+### 31.4 Event Guards — Linux :large_orange_diamond: `T3`
 
-Not implemented (PR 16). Linux equivalents of the Windows event-guard primitives:
+**Partial.** The **systemd service guard** (`SystemdServiceGuard`, `guard_systemd.{hpp,cpp}`) ships: `org.freedesktop.systemd1` `PropertiesChanged` subscriptions over sd-bus watch a unit's `ActiveState` ("sshd.service must remain running"), **observe-only** in v1 — drift is detected and reported (`platform=linux`); enforcement (mask/stop) is deferred to a polkit-gated change. The remaining Linux event-guard primitives are roadmap:
 - **Inotify Guard** — `inotify_add_watch` for file/directory state assertions (config files, certificate files, sshd config).
 - **Netlink Guard** — `NETLINK_KOBJECT_UEVENT` for process-tree and device-event monitoring.
-- **D-Bus Guard** — `org.freedesktop.systemd1` signal subscriptions for service state ("sshd.service must remain running").
+- **D-Bus / systemd Guard** — service-state observation **shipped** (above); enforcement + non-systemd fallback remain roadmap.
 - **Audit Guard** — Linux audit subsystem (`auditd`) consumer for syscall-level assertions.
 - **Sysctl Guard** — periodic check + `/proc/sys/...` write remediation; monitors kernel parameters that drift would indicate compromise.
 
-Phase 16 Linux delivery is gated on Windows track soaking in production.
+The systemd service guard landed ahead of the rest of the Linux track (the motivating "keep SSH off" case); the remaining primitives stay gated on the Windows track soaking in production.
 
 ### 31.5 Event Guards — macOS :x: `T3`
 
