@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-06-08
 owner: "@lesault (Andy Younie)"
-depends-on: 0004 (storage substrate — still proposed; see Consequences)
+depends-on: 0006/0007/0008 (server-side Postgres substrate chain — accepted 2026-06-09; see Consequences)
 ---
 
 # 0005 — Attack-path & chokepoint scoring: bounded max-probability paths, ROI chokepoints
@@ -52,7 +52,8 @@ generic betweenness centrality is O(V·E) and answers the wrong question.
 - **Substrate dependency (status honesty):** the *algorithm* decisions here
   (Dijkstra / Yen / cost-weighted min-cut / label-propagation) are `accepted` and
   substrate-independent. But the scoring **join** (`edges ⨝ findings ⨝ value ⨝ guardian_state`)
-  and the in-memory adjacency it loads assume the **ADR-0004 storage substrate, which is still
-  `proposed`**. If 0004 is rejected or reshaped, only the load/join mechanics are revisited —
-  not the math. This ADR should not be read as having pre-approved server-side Postgres; that
-  buy-in lives in 0004.
+  and the in-memory adjacency it loads assume the server-side Postgres substrate confirmed by
+  **ADR-0006/0007/0008** (accepted 2026-06-09). ADR-0004 introduced that substrate for the
+  vuln-graph; ADR-0006 widened it to all server stores. If the substrate architecture were
+  reshaped, only the load/join mechanics would be revisited — not the math. This ADR
+  documents the algorithm choices; the storage buy-in lives in the 0006/0007/0008 chain.

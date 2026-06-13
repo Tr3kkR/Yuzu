@@ -246,7 +246,8 @@ graph/topology securable type**.
 - **Read** — the scored graph, attack paths, and chokepoint output get a **dedicated
   securable type**, gated *tighter* than findings. A path map is offensive intelligence; an
   operator who can read findings should not automatically read "here is the cheapest route to
-  the crown jewel."
+  the crown jewel." **Read access is audited** — every graph query carries a principal and
+  timestamp in the audit log (same envelope as findings access).
 - **Write** — authority to declare/edit **trust-zone CIDR-site tiers** and **crown-jewel
   values** is restricted to a privileged role and **audited**. Mis-declaring a tier or a
   jewel silently distorts *every* ranking (it moves entry points and value sinks), so these
