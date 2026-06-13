@@ -60,12 +60,49 @@ TEST_CASE("ProcEventRing drops on overflow and counts the drops", "[tar][procetw
     REQUIRE(ring.dropped() == 2);
 }
 
+TEST_CASE("ProcEventRing clamps a zero capacity to one", "[tar][procetw]") {
+    ProcEventRing ring(0); // 0 is meaningless (every push would drop); clamped to 1
+    REQUIRE(ring.capacity() == 1);
+    REQUIRE(ring.push(ProcEvent{}));       // holds one
+    REQUIRE_FALSE(ring.push(ProcEvent{})); // full → dropped, NOT drop-everything
+    REQUIRE(ring.dropped() == 1);
+    REQUIRE(ring.drain().size() == 1);
+}
+
+TEST_CASE("ProcEventRing drop counter accumulates across overflow cycles", "[tar][procetw]") {
+    ProcEventRing ring(1);
+    REQUIRE(ring.push(ProcEvent{}));
+    REQUIRE_FALSE(ring.push(ProcEvent{})); // dropped #1
+    REQUIRE(ring.drain().size() == 1);
+    REQUIRE(ring.push(ProcEvent{}));       // capacity freed by the drain
+    REQUIRE_FALSE(ring.push(ProcEvent{})); // dropped #2
+    REQUIRE(ring.dropped() == 2);          // monotonic across drains
+}
+
 TEST_CASE("ProcEtwCollector yields nothing before start", "[tar][procetw]") {
     ProcEtwCollector c(16);
     REQUIRE_FALSE(c.running());
     REQUIRE(c.drain().empty());
     REQUIRE(c.dropped() == 0);
     c.stop(); // safe to call when never started
+}
+
+TEST_CASE("ProcEtwCollector stop is idempotent; drain-after-stop is empty", "[tar][procetw]") {
+    ProcEtwCollector c(8);
+    c.stop(); // stop before any start
+    c.stop(); // double stop — must not crash
+    REQUIRE_FALSE(c.running());
+    REQUIRE(c.drain().empty());
+}
+
+TEST_CASE("boot_time_unix is minute-aligned", "[tar][procetw]") {
+    const auto b = yuzu::tar::boot_time_unix();
+    REQUIRE(b % 60 == 0); // rounded to the minute so it is a stable per-boot key
+#ifdef _WIN32
+    REQUIRE(b > 0); // a real boot instant on Windows
+#else
+    REQUIRE(b == 0); // no boot concept off-Windows (backfill is a no-op there)
+#endif
 }
 
 #ifndef _WIN32

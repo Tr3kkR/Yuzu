@@ -127,36 +127,63 @@ std::string prop_image_basename(EVENT_RECORD* rec, const wchar_t* name) {
     return utf8;
 }
 
+// RAII for a Win32 HANDLE: closes on scope exit. Keeps capture_sid exception-
+// safe — an allocation (std::vector / std::string) between OpenProcess and a
+// manual CloseHandle would otherwise leak the handle if it threw.
+struct HandleGuard {
+    HANDLE h{nullptr};
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() {
+        if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
+    }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+};
+
+// RAII for a LocalAlloc'd buffer (ConvertSidToStringSid / ConvertStringSidToSid
+// hand back LocalAlloc memory freed with LocalFree).
+struct LocalMemGuard {
+    void* p{nullptr};
+    explicit LocalMemGuard(void* ptr) noexcept : p(ptr) {}
+    ~LocalMemGuard() {
+        if (p != nullptr) {
+            LocalFree(p);
+        }
+    }
+    LocalMemGuard(const LocalMemGuard&) = delete;
+    LocalMemGuard& operator=(const LocalMemGuard&) = delete;
+};
+
 // Capture the owning user's SID (string form) for a just-started, still-alive
 // process. All-local/fast (OpenProcess + token query + SID→string) — no domain
 // round-trip; that costly step is deferred to drain. "" for protected/system
 // processes or a pid that already exited (best-effort, mirrors the poll).
 std::string capture_sid(std::uint32_t pid) {
-    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (proc == nullptr) {
+    HandleGuard proc{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
+    if (proc.h == nullptr) {
         return {};
     }
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(proc, TOKEN_QUERY, &token)) {
-        CloseHandle(proc);
+    HANDLE token_raw = nullptr;
+    if (!OpenProcessToken(proc.h, TOKEN_QUERY, &token_raw)) {
         return {};
     }
+    HandleGuard token{token_raw};
     std::string sid;
     DWORD need = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &need);
+    GetTokenInformation(token.h, TokenUser, nullptr, 0, &need);
     if (need > 0) {
         std::vector<BYTE> buf(need);
-        if (GetTokenInformation(token, TokenUser, buf.data(), need, &need)) {
+        if (GetTokenInformation(token.h, TokenUser, buf.data(), need, &need)) {
             auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
             LPSTR str = nullptr;
             if (ConvertSidToStringSidA(tu->User.Sid, &str) && str != nullptr) {
+                LocalMemGuard g{str};
                 sid.assign(str);
-                LocalFree(str);
             }
         }
     }
-    CloseHandle(token);
-    CloseHandle(proc);
     return sid;
 }
 
@@ -170,6 +197,7 @@ std::string sid_to_account(const std::string& sid_str) {
     if (!ConvertStringSidToSidA(sid_str.c_str(), &sid) || sid == nullptr) {
         return {};
     }
+    LocalMemGuard g{sid};
     char name[256] = {0};
     char domain[256] = {0};
     DWORD name_len = sizeof(name);
@@ -179,7 +207,6 @@ std::string sid_to_account(const std::string& sid_str) {
     if (LookupAccountSidA(nullptr, sid, name, &name_len, domain, &domain_len, &use)) {
         out = (domain[0] != '\0') ? (std::string(domain) + "\\" + name) : std::string(name);
     }
-    LocalFree(sid);
     return out;
 }
 
@@ -202,9 +229,36 @@ struct ProcEtwCollector::Impl {
     struct ProcIdent {
         std::string sid;
         std::string name;
+        std::uint32_t ppid{0};
     };
     std::unordered_map<std::uint32_t, ProcIdent> pid_info;
     static constexpr std::size_t kPidSidCap = 65536;
+
+    // Idempotent RAII teardown: unblock ProcessTrace, join the worker, stop the
+    // session. Keyed on handle/thread VALIDITY (not `running`, which the worker
+    // clears on session death) so it runs correctly whether stop() was called or
+    // the session died on its own. This is also the cleanup path if start()
+    // throws between acquiring the session/consumer and publishing impl_ (e.g. a
+    // std::thread ctor OOM) — without it the PID-named session + consumer would
+    // leak and the slot would never be reclaimed (ETW slot exhaustion).
+    ~Impl() {
+        running.store(false, std::memory_order_relaxed);
+        if (consumer != INVALID_PROCESSTRACE_HANDLE) {
+            CloseTrace(consumer); // unblocks ProcessTrace if still running
+            consumer = INVALID_PROCESSTRACE_HANDLE;
+        }
+        if (worker.joinable()) {
+            worker.join();
+        }
+        if (session != 0) {
+            auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(props_buf.data());
+            ControlTraceW(session, nullptr, props, EVENT_TRACE_CONTROL_STOP);
+            session = 0;
+        }
+    }
+    Impl() = default;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
 
     // SID → "DOMAIN\\account" cache. Touched ONLY on the drain thread
     // (resolve_users, under the plugin's collect mutex) — no lock needed. Keeps
@@ -225,51 +279,60 @@ struct ProcEtwCollector::Impl {
         }
     }
 
-    static void WINAPI on_event(EVENT_RECORD* rec) {
-        auto* self = static_cast<Impl*>(rec->UserContext);
-        if (self == nullptr || self->ring == nullptr) {
-            return;
-        }
-        if (!IsEqualGUID(rec->EventHeader.ProviderId, kKernelProcessGuid)) {
-            return;
-        }
-        const USHORT id = rec->EventHeader.EventDescriptor.Id;
-        if (id != kEventProcessStart && id != kEventProcessStop) {
-            return;
-        }
-        ProcEvent ev;
-        ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
-        ev.is_start = (id == kEventProcessStart);
-        prop_u32(rec, L"ProcessID", ev.pid);
-        if (ev.is_start) {
-            // Decode the name from the start event (Unicode here). Capture the
-            // SID while the process is (usually) still alive. Remember
-            // pid→{sid,name} so the matching stop — process gone, and its own
-            // name field unreliably encoded — reuses both.
-            ev.image_name = prop_image_basename(rec, L"ImageName");
-            prop_u32(rec, L"ParentProcessID", ev.ppid);
-            ev.sid = capture_sid(ev.pid);
-            if (self->pid_info.size() < kPidSidCap) {
-                self->pid_info[ev.pid] = {ev.sid, ev.image_name};
+    // noexcept: invoked across the ETW (C) ProcessTrace frame, where an escaping
+    // C++ exception is undefined behaviour. Catch-and-drop — an allocation
+    // failure (decode buffers, map insert) costs one event, never the agent.
+    static void WINAPI on_event(EVENT_RECORD* rec) noexcept {
+        try {
+            auto* self = static_cast<Impl*>(rec->UserContext);
+            if (self == nullptr || self->ring == nullptr) {
+                return;
             }
-        } else {
-            std::uint32_t code = 0;
-            // Manifest names the field "ExitCode"; fall back to "ExitStatus".
-            if (prop_u32(rec, L"ExitCode", code) || prop_u32(rec, L"ExitStatus", code)) {
-                ev.exit_code = static_cast<std::int32_t>(code);
+            if (!IsEqualGUID(rec->EventHeader.ProviderId, kKernelProcessGuid)) {
+                return;
             }
-            // Recover name + SID from the cached start. Empty for a process that
-            // started before our session (boot-gap → thread 1b AutoLogger).
-            auto it = self->pid_info.find(ev.pid);
-            if (it != self->pid_info.end()) {
-                ev.image_name = it->second.name;
-                ev.sid = it->second.sid;
-                self->pid_info.erase(it);
+            const USHORT id = rec->EventHeader.EventDescriptor.Id;
+            if (id != kEventProcessStart && id != kEventProcessStop) {
+                return;
             }
+            ProcEvent ev;
+            ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
+            ev.is_start = (id == kEventProcessStart);
+            prop_u32(rec, L"ProcessID", ev.pid);
+            if (ev.is_start) {
+                // Decode the name from the start event (Unicode here). Capture
+                // the SID while the process is (usually) still alive. Remember
+                // pid→{sid,name,ppid} so the matching stop — process gone, and
+                // its own name field unreliably encoded — reuses all three.
+                ev.image_name = prop_image_basename(rec, L"ImageName");
+                prop_u32(rec, L"ParentProcessID", ev.ppid);
+                ev.sid = capture_sid(ev.pid);
+                if (self->pid_info.size() < kPidSidCap) {
+                    self->pid_info[ev.pid] = {ev.sid, ev.image_name, ev.ppid};
+                }
+            } else {
+                std::uint32_t code = 0;
+                // Manifest names the field "ExitCode"; fall back to "ExitStatus".
+                if (prop_u32(rec, L"ExitCode", code) || prop_u32(rec, L"ExitStatus", code)) {
+                    ev.exit_code = static_cast<std::int32_t>(code);
+                }
+                // Recover name + SID + ppid from the cached start. Empty/0 for a
+                // process that started before our session (boot-gap → thread 1b
+                // AutoLogger).
+                auto it = self->pid_info.find(ev.pid);
+                if (it != self->pid_info.end()) {
+                    ev.image_name = it->second.name;
+                    ev.sid = it->second.sid;
+                    ev.ppid = it->second.ppid;
+                    self->pid_info.erase(it);
+                }
+            }
+            // user (SID→name) is resolved at drain, off this thread (keeps the
+            // callback cheap and the costly lookup cached).
+            self->ring->push(std::move(ev));
+        } catch (...) {
+            // Never let an exception unwind across the ETW C frame.
         }
-        // user (SID→name) is resolved at drain, off this thread (keeps the
-        // callback cheap and the costly lookup cached).
-        self->ring->push(std::move(ev));
     }
 };
 
@@ -321,8 +384,7 @@ bool ProcEtwCollector::start() {
                         EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_INFORMATION,
                         kKeywordProcess, 0, 0, &params);
     if (rc != ERROR_SUCCESS) {
-        ControlTraceW(impl->session, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        return false;
+        return false; // ~Impl stops the session as `impl` unwinds
     }
 
     EVENT_TRACE_LOGFILEW logfile{};
@@ -333,15 +395,20 @@ bool ProcEtwCollector::start() {
 
     impl->consumer = OpenTraceW(&logfile);
     if (impl->consumer == INVALID_PROCESSTRACE_HANDLE) {
-        ControlTraceW(impl->session, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        return false;
+        return false; // ~Impl stops the session as `impl` unwinds
     }
 
     Impl* raw = impl.get();
     raw->running.store(true);
+    // If the std::thread ctor throws here (OOM / EAGAIN), `impl` unwinds and
+    // ~Impl stops the session + closes the consumer — no leak.
     raw->worker = std::thread([raw]() {
-        // Blocks until CloseTrace() is called from stop().
+        // Blocks until CloseTrace() is called from stop()/~Impl — or returns on
+        // its own if the session dies (another tool stops it, buffer loss, …).
+        // Either way, mark not-running so the plugin can detect a dead session
+        // and fall back to the poll instead of going silently blind.
         ProcessTrace(&raw->consumer, 1, nullptr, nullptr);
+        raw->running.store(false, std::memory_order_relaxed);
     });
 
     impl_ = std::move(impl);
@@ -349,21 +416,10 @@ bool ProcEtwCollector::start() {
 }
 
 void ProcEtwCollector::stop() {
-    if (!impl_) {
-        return;
-    }
-    if (impl_->running.exchange(false)) {
-        if (impl_->consumer != INVALID_PROCESSTRACE_HANDLE) {
-            CloseTrace(impl_->consumer); // unblocks ProcessTrace
-        }
-        if (impl_->worker.joinable()) {
-            impl_->worker.join();
-        }
-        if (impl_->session != 0) {
-            auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(impl_->props_buf.data());
-            ControlTraceW(impl_->session, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        }
-    }
+    // ~Impl performs the idempotent teardown (CloseTrace + join the worker +
+    // ControlTrace STOP), keyed on handle validity so it is correct whether we
+    // are stopping a live session or one that already died on its own (in which
+    // case the worker has cleared `running` and exited). Safe if never started.
     impl_.reset();
 }
 
@@ -390,42 +446,48 @@ struct BackfillCtx {
     std::unordered_map<std::uint32_t, std::string> pid_name; // start→stop name recovery
 };
 
-void WINAPI backfill_cb(EVENT_RECORD* rec) {
-    auto* ctx = static_cast<BackfillCtx*>(rec->UserContext);
-    if (ctx == nullptr || ctx->out == nullptr) {
-        return;
-    }
-    if (!IsEqualGUID(rec->EventHeader.ProviderId, kKernelProcessGuid)) {
-        return;
-    }
-    const USHORT id = rec->EventHeader.EventDescriptor.Id;
-    if (id != kEventProcessStart && id != kEventProcessStop) {
-        return;
-    }
-    ProcEvent ev;
-    ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
-    if (ev.ts_unix >= ctx->before_ts) {
-        return; // the live session owns everything from its start onward
-    }
-    ev.is_start = (id == kEventProcessStart);
-    prop_u32(rec, L"ProcessID", ev.pid);
-    if (ev.is_start) {
-        ev.image_name = prop_image_basename(rec, L"ImageName");
-        prop_u32(rec, L"ParentProcessID", ev.ppid);
-        ctx->pid_name[ev.pid] = ev.image_name;
-    } else {
-        std::uint32_t code = 0;
-        if (prop_u32(rec, L"ExitCode", code) || prop_u32(rec, L"ExitStatus", code)) {
-            ev.exit_code = static_cast<std::int32_t>(code);
+// noexcept: invoked across the ETW (C) ProcessTrace frame during file replay,
+// same UB-on-throw constraint as on_event. Catch-and-drop.
+void WINAPI backfill_cb(EVENT_RECORD* rec) noexcept {
+    try {
+        auto* ctx = static_cast<BackfillCtx*>(rec->UserContext);
+        if (ctx == nullptr || ctx->out == nullptr) {
+            return;
         }
-        auto it = ctx->pid_name.find(ev.pid);
-        if (it != ctx->pid_name.end()) {
-            ev.image_name = it->second;
-            ctx->pid_name.erase(it);
+        if (!IsEqualGUID(rec->EventHeader.ProviderId, kKernelProcessGuid)) {
+            return;
         }
+        const USHORT id = rec->EventHeader.EventDescriptor.Id;
+        if (id != kEventProcessStart && id != kEventProcessStop) {
+            return;
+        }
+        ProcEvent ev;
+        ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
+        if (ev.ts_unix >= ctx->before_ts) {
+            return; // the live session owns everything from its start onward
+        }
+        ev.is_start = (id == kEventProcessStart);
+        prop_u32(rec, L"ProcessID", ev.pid);
+        if (ev.is_start) {
+            ev.image_name = prop_image_basename(rec, L"ImageName");
+            prop_u32(rec, L"ParentProcessID", ev.ppid);
+            ctx->pid_name[ev.pid] = ev.image_name;
+        } else {
+            std::uint32_t code = 0;
+            if (prop_u32(rec, L"ExitCode", code) || prop_u32(rec, L"ExitStatus", code)) {
+                ev.exit_code = static_cast<std::int32_t>(code);
+            }
+            auto it = ctx->pid_name.find(ev.pid);
+            if (it != ctx->pid_name.end()) {
+                ev.image_name = it->second;
+                ctx->pid_name.erase(it);
+            }
+        }
+        // No user for boot-backfill — the process is gone by replay time.
+        ctx->out->push_back(std::move(ev));
+    } catch (...) {
+        // Never let an exception unwind across the ETW C frame.
     }
-    // No user for boot-backfill — the process is gone by replay time.
-    ctx->out->push_back(std::move(ev));
 }
 
 } // namespace
@@ -469,6 +531,20 @@ std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path
     return out;
 }
 
+std::int64_t boot_time_unix() {
+    // boot ≈ now - uptime. GetTickCount64 is ms of uptime; round the result to
+    // the nearest minute so sub-second measurement jitter doesn't change the key
+    // across restarts within a boot, while the prior boot's uptime (>> 60s)
+    // keeps boots distinct. (Sleep is excluded from uptime — see the header note
+    // on the bounded re-backfill edge.)
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const std::int64_t uptime_s = static_cast<std::int64_t>(GetTickCount64() / 1000ULL);
+    const std::int64_t boot = now - uptime_s;
+    return (boot / 60) * 60;
+}
+
 } // namespace yuzu::tar
 
 #else // !_WIN32 — no-op collector
@@ -489,6 +565,8 @@ std::uint64_t ProcEtwCollector::dropped() const noexcept { return ring_.dropped(
 std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string&, std::int64_t) {
     return {}; // no ETW off-Windows
 }
+
+std::int64_t boot_time_unix() { return 0; } // backfill is a no-op off-Windows
 
 } // namespace yuzu::tar
 

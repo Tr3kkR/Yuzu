@@ -68,6 +68,8 @@ Example:
 1711050423|user|login|1711050423002|{"user":"admin","domain":"CORP","logon_type":"remote","session_id":"pts/0"}
 ```
 
+> The `cmdline` field above is shown populated for a Linux example. **On Windows the process feeder is ETW (names-only), so `cmdline` is empty** — see the OS compatibility matrix below.
+
 ### JSON export
 
 Use the `export` action for JSON output suitable for integration with Splunk, ClickHouse, or ELK:
@@ -158,6 +160,8 @@ POST /api/v1/instructions/execute
 ## Security: command-line redaction
 
 TAR automatically redacts sensitive command-line arguments before storing process events. Any command line matching a redaction pattern has its `cmdline` field replaced with `[REDACTED by TAR]`.
+
+> **Windows scope.** On Windows the process source is the ETW Kernel-Process feeder, which captures **image names only — it never captures a command line** (the start event carries none). The `cmdline` column is therefore empty for Windows process rows, and these redaction patterns have **no effect on Windows process events** (there is nothing to redact). They still apply to Windows **per-app perf** rows (`procperf`, matched against the image *name*) and to Linux/macOS process command lines captured by the poll. If your threat model depends on never storing command-line secrets on Windows, the ETW feeder already guarantees that structurally.
 
 Default redaction patterns:
 
@@ -273,6 +277,35 @@ TAR is designed for minimal performance overhead:
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
+
+> **Upgrade note (Windows process capture → ETW). BREAKING for `cmdline`
+> consumers.** On upgrade, the Windows process source switches from the
+> 60-second snapshot-diff poll to an event-driven ETW Kernel-Process feeder.
+> Three operator-visible changes:
+> - **`cmdline` is now empty for Windows process rows** (the feeder is
+>   names-only). Any dashboard, SIEM export, or Guardian rule that relied on the
+>   Windows process command line will see an empty field after upgrade. Linux and
+>   macOS are unchanged (the poll still captures command lines there). This is
+>   intentional (works-council / data-minimization posture) and not reversible by
+>   configuration — see the redaction section.
+> - **Live capture is active from the next agent start** — gap-free, so
+>   short-lived processes the poll missed now appear, and `$Process_Live` holds
+>   more rows (cap raised to 100000). If the ETW session cannot start, the agent
+>   logs the reason and falls back to the `toolhelp32` poll automatically; if the
+>   session later dies, it self-heals to the poll. The active path is reported by
+>   the `status` action as `process_capture_method` (`etw` or `polling`).
+> - **Boot-window backfill requires the boot AutoLogger**, which today is
+>   configured only by the developer install path (`install-agent-user.ps1`),
+>   **not yet by the production MSI/InnoSetup installer** — wiring it there is a
+>   tracked follow-up. Until then, packaged installs get live ETW capture but no
+>   boot-window backfill (the narrow window of processes that start *and* exit
+>   before the agent's session opens), and a reboot is required for the
+>   AutoLogger to take effect where it is configured. Boot-window events are
+>   names-only with **no user**.
+>
+> To disable Windows process capture entirely (ETW and poll), set
+> `process_enabled=false` via `configure`; there is no separate "disable ETW but
+> keep polling" switch today.
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System
@@ -285,14 +318,14 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 
 | Source | Live | Hourly | Daily | Monthly |
 |--------|:----:|:------:|:-----:|:-------:|
-| **Process** | `$Process_Live` (5000 rows) | `$Process_Hourly` (24h) | `$Process_Daily` (31d) | `$Process_Monthly` (12mo) |
+| **Process** | `$Process_Live` (100000 rows) | `$Process_Hourly` (24h) | `$Process_Daily` (31d) | `$Process_Monthly` (12mo) |
 | **TCP** | `$TCP_Live` (5000 rows) | `$TCP_Hourly` (24h) | `$TCP_Daily` (31d) | `$TCP_Monthly` (12mo) |
 | **Service** | `$Service_Live` (5000 rows) | `$Service_Hourly` (24h) | -- | -- |
 | **User** | `$User_Live` (5000 rows) | -- | `$User_Daily` (31d) | -- |
 | **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
 
-- **Live** tables hold the most recent raw events with a 5000-row cap (oldest rows are evicted). **Exception: `$Perf_Live` and `$ProcPerf_Live` are time-based (7 days), not row-capped** — a fixed-cadence sampler keeps a *time window*, so raising `perf_interval_seconds` must not shrink the history it covers.
+- **Live** tables hold the most recent raw events with a row cap (oldest rows are evicted): **5000 rows** for TCP / Service / User, and **100000 rows for `$Process_Live`** — raised because the Windows ETW feeder is event-driven (every start/stop, including short-lived processes) and fills a 5000-row window far faster than the old 60-second poll did, so a larger raw window keeps a meaningful history before rows roll up into the hourly/daily/monthly count tiers. **Exception: `$Perf_Live` and `$ProcPerf_Live` are time-based (7 days), not row-capped** — a fixed-cadence sampler keeps a *time window*, so raising `perf_interval_seconds` must not shrink the history it covers.
 - **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours (perf/procperf hourly: 31 days).
 - **Daily** tables aggregate per day, retained for 31 days.
 - **Monthly** tables aggregate per month, retained for 12 months.
@@ -300,7 +333,7 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 
 ### Key columns by table type
 
-**Process tables:** `ts`, `name`, `pid`, `ppid`, `cmdline`, `user`, `action` (started/stopped). Aggregated tiers add `start_count`, `stop_count`.
+**Process tables:** `ts`, `name`, `pid`, `ppid`, `cmdline`, `user`, `action` (started/stopped). Aggregated tiers add `start_count`, `stop_count`. **`cmdline` is empty on Windows** (the ETW feeder is names-only — see the OS compatibility matrix and the command-line redaction section); it is populated on Linux/macOS by the poll.
 
 **TCP tables:** `ts`, `process_name`, `pid`, `remote_addr`, `remote_port`, `local_port`, `proto`, `state`. Aggregated tiers add `connect_count`.
 

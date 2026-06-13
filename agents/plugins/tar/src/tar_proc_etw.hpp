@@ -61,7 +61,9 @@ struct ProcEvent {
 /// callback. push() never blocks.
 class ProcEventRing {
 public:
-    explicit ProcEventRing(std::size_t capacity) : cap_(capacity) {}
+    /// A capacity of 0 is meaningless (every push would drop); clamp to 1 so a
+    /// mis-sized ring degrades to "holds one event" rather than "drops all".
+    explicit ProcEventRing(std::size_t capacity) : cap_(capacity == 0 ? 1 : capacity) {}
 
     /// Append one event. Returns false (and increments dropped()) when full.
     bool push(ProcEvent ev);
@@ -137,5 +139,19 @@ private:
 /// missing/empty file.
 std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path,
                                                      std::int64_t before_ts_unix);
+
+/// This machine's boot instant as unix seconds, rounded to the nearest minute so
+/// it is STABLE across agent restarts within the same boot yet distinct between
+/// boots. Used as the per-boot backfill dedup key: keying on the boot instant
+/// (rather than the earliest event in the circular .etl, which shifts as the
+/// buffer wraps) makes the dedup immune to .etl wrap and to late restarts — a
+/// restarted agent computes the same key and skips re-inserting the boot window.
+/// Returns 0 off-Windows (where the backfill is a no-op anyway).
+///
+/// Known limitation: derived from GetTickCount64 (uptime), which excludes sleep,
+/// so a sleep/resume of more than a minute between two agent restarts in the same
+/// boot can shift the key and cause one extra (bounded, user-empty) backfill. A
+/// precise sleep-immune boot id is a tracked follow-up.
+std::int64_t boot_time_unix();
 
 } // namespace yuzu::tar

@@ -83,7 +83,7 @@ This table is the source of truth for what each plugin requires. When you add a 
 | `event_logs.*` | default | `systemd-journal` group | `Event Log Readers` group; `Security` log additionally needs `SeSecurityPrivilege` |
 | `services.list`, `services.running` | default | default | default |
 | `certificates.list`, `certificates.details` | default | default | default |
-| `tar.*` (TAR snapshots) | default | `cap_dac_read_search` (read all `/proc/<pid>/*`) | `SeBackupPrivilege` (read regardless of DACL) |
+| `tar.*` (TAR snapshots) | default | `cap_dac_read_search` (read all `/proc/<pid>/*`) | `SeBackupPrivilege` (read regardless of DACL). **Process capture runs a real-time ETW session on `Microsoft-Windows-Kernel-Process`** — enabled by the agent account's `Performance Log Users` membership (see Group memberships above; no extra LSA privilege). Per-process user attribution uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` on still-alive processes only. See the deployment-footprint note below for the boot AutoLogger. |
 | `netstat.*`, `sockwho.*` | default | default | default |
 | `bitlocker.state` | n/a | n/a | `SeBackupPrivilege` (some BitLocker WMI properties require this on system drives) |
 
@@ -202,6 +202,15 @@ Procedure for any change that introduces a new privileged shell-out:
 | Account password (Windows) | virtual service account; SCM manages credentials | random password stashed in DPAPI blob; only relevant if the operator wants to log in as the account for debugging |
 
 The dev path produces an account-and-grants combination that is **functionally equivalent** to the production virtual-service-account path for everything except service registration. This means `/test --instructions-quarantine` produces the same firewall behaviour as a production deployment would when the operator runs the same instruction.
+
+### Windows ETW telemetry footprint (TAR process capture)
+
+TAR's Windows process capture introduces two persistent Windows system facts a customer security questionnaire should know about:
+
+- **A real-time ETW session** on `Microsoft-Windows-Kernel-Process`, opened by the agent process at startup and closed at shutdown. It needs no extra LSA privilege — the agent account's `Performance Log Users` membership covers it. It is user-mode telemetry (event subscription), not a kernel driver. If it cannot start, the agent falls back to the snapshot-diff poll.
+- **A boot AutoLogger** named `YuzuProcBoot` — a persistent registry entry under `HKLM\System\CurrentControlSet\Control\WMI\Autologger\YuzuProcBoot` that makes the kernel start a circular, 16 MB, FlushTimer-enabled Kernel-Process `.etl` (`<data_dir>\procboot.etl`) early on every boot, so the agent can backfill the boot window it would otherwise miss. It is **configured today only by the developer install script (`install-agent-user.ps1`), not yet by the production MSI/InnoSetup installer** (wiring it there, and reconciling the `.etl` path with the service's `--data-dir`, is a tracked follow-up). `install-agent-user.ps1 -Uninstall` removes the AutoLogger config and the `.etl`; a production uninstall does **not** today (so an MSI uninstall can leave an orphan AutoLogger writing a 16 MB circular file each boot — also tracked).
+
+Neither captures command lines (names-only); the boot-window events additionally carry no user. The capture respects the `process_enabled` toggle (an operator who disables process collection gets no boot-backfill insert on the next restart).
 
 ---
 

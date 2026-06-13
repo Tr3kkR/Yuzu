@@ -835,14 +835,20 @@ function Test-Install {
 # a circular, size-capped .etl; the agent drains that file at startup to backfill
 # the boot window its live session missed. **Takes effect on the NEXT boot.**
 #
-# The .etl path MUST match the agent's data_dir (it reads `procboot.etl` next to
-# tar.db) — both default to $StateDir. `-ClockType System` is load-bearing: the
-# agent decodes the file's timestamps as FILETIME. Best-effort by design — a
-# failure here loses only boot-backfill, not the live capture, so it WARNS
-# rather than aborting the install.
+# The .etl path MUST match the agent's --data-dir: the agent reads `procboot.etl`
+# from the SAME directory it writes `tar.db` to, i.e. the value passed to
+# `--data-dir` (NOT a `state` subdirectory). The production installer runs the
+# service with `--data-dir C:\ProgramData\Yuzu` (= $RootDir), so the .etl belongs
+# at $RootDir\procboot.etl. If you launch the agent with a DIFFERENT --data-dir
+# (e.g. a UAT data dir), point this at that directory or the backfill silently
+# finds no file. (A -DataDir parameter to override this is a tracked follow-up;
+# wiring the AutoLogger into the production MSI/InnoSetup installer is too.)
+# `-ClockType System` is load-bearing: the agent decodes the file's timestamps as
+# FILETIME. Best-effort by design — a failure here loses only boot-backfill, not
+# the live capture, so it WARNS rather than aborting the install.
 
 $Script:AutologgerName = "YuzuProcBoot"
-$Script:ProcBootEtl    = Join-Path $StateDir "procboot.etl"
+$Script:ProcBootEtl    = Join-Path $RootDir "procboot.etl"
 $Script:KernelProcessProviderGuid = "{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}"
 
 function New-ProcBootAutologger {

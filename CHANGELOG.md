@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
   ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
   (which the poll misses entirely) are captured — with exact timestamps and exit
-  codes. Same `process_live` schema and `$Process_*` query surface, so rollups
-  and existing queries are unchanged. Events are **names-only** (no command
+  codes. Same `process_live` schema and `$Process_*` query surface and the same
+  `started`/`stopped` rollups — but the Windows `cmdline` column is now **empty**
+  (see Breaking Changes). Events are **names-only** (no command
   line); the owning user is resolved from the process SID at start (best-effort,
   empty for processes that exit faster than the ~1 s buffer flush — the same
   limit the poll had). The poll remains the feeder on Linux/macOS and the Windows
@@ -60,6 +61,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Windows TAR process events no longer carry a command line (`cmdline` is
+  empty).** With the Windows `process` source moving from the snapshot-diff poll
+  to the ETW Kernel-Process feeder (see Added), process rows on Windows are
+  names-only — the ETW start event carries no command line. Any dashboard, SIEM
+  export, `tar.sql` query, or Guardian rule that read `cmdline` from
+  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
+  (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not reversible by
+  configuration; `process_enabled=false` disables Windows process capture
+  entirely (ETW and poll) if required. Command-line redaction patterns
+  consequently have no effect on Windows process rows (there is nothing to
+  redact). The boot-window AutoLogger backfill is configured only by the
+  developer install script today, **not** the production InnoSetup installer —
+  packaged Windows installs get live ETW capture but no boot-window backfill
+  until that wiring lands (tracked follow-up). See
+  `docs/user-manual/tar.md` "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
