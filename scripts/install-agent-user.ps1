@@ -187,6 +187,13 @@ param(
     [switch]$Uninstall,
     [string]$AccountName = "YuzuAgent",
     [string]$BinaryPath  = "C:\Program Files\Yuzu\yuzu-agent.exe",
+    # The agent's data directory — MUST equal the value passed to the agent's
+    # `--data-dir`, because the boot AutoLogger writes `procboot.etl` here and the
+    # agent reads it from the same directory it writes `tar.db` to. Defaults to
+    # the production service data dir (C:\ProgramData\Yuzu); override when the
+    # agent runs with a different --data-dir (e.g. a UAT data dir) so the
+    # boot-window backfill actually finds the trace.
+    [string]$DataDir = "C:\ProgramData\Yuzu",
     [switch]$SkipDenyInteractive
 )
 
@@ -836,19 +843,18 @@ function Test-Install {
 # the boot window its live session missed. **Takes effect on the NEXT boot.**
 #
 # The .etl path MUST match the agent's --data-dir: the agent reads `procboot.etl`
-# from the SAME directory it writes `tar.db` to, i.e. the value passed to
-# `--data-dir` (NOT a `state` subdirectory). The production installer runs the
-# service with `--data-dir C:\ProgramData\Yuzu` (= $RootDir), so the .etl belongs
-# at $RootDir\procboot.etl. If you launch the agent with a DIFFERENT --data-dir
-# (e.g. a UAT data dir), point this at that directory or the backfill silently
-# finds no file. (A -DataDir parameter to override this is a tracked follow-up;
-# wiring the AutoLogger into the production MSI/InnoSetup installer is too.)
+# from the SAME directory it writes `tar.db` to (NOT a `state` subdirectory).
+# Driven by the -DataDir parameter (default C:\ProgramData\Yuzu = the production
+# service data dir). Override -DataDir when the agent runs with a different
+# --data-dir, or the backfill silently finds no file. (Wiring the AutoLogger into
+# the production MSI/InnoSetup installer — which would pass -DataDir — is a
+# tracked follow-up.)
 # `-ClockType System` is load-bearing: the agent decodes the file's timestamps as
 # FILETIME. Best-effort by design — a failure here loses only boot-backfill, not
 # the live capture, so it WARNS rather than aborting the install.
 
 $Script:AutologgerName = "YuzuProcBoot"
-$Script:ProcBootEtl    = Join-Path $RootDir "procboot.etl"
+$Script:ProcBootEtl    = Join-Path $DataDir "procboot.etl"
 $Script:KernelProcessProviderGuid = "{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}"
 
 function New-ProcBootAutologger {

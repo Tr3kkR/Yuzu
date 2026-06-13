@@ -299,6 +299,9 @@ struct ProcEtwCollector::Impl {
             ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
             ev.is_start = (id == kEventProcessStart);
             prop_u32(rec, L"ProcessID", ev.pid);
+            if (ev.pid == 0) {
+                return; // failed/torn TDH decode — pid 0 is never a real process
+            }
             if (ev.is_start) {
                 // Decode the name from the start event (Unicode here). Capture
                 // the SID while the process is (usually) still alive. Remember
@@ -468,6 +471,9 @@ void WINAPI backfill_cb(EVENT_RECORD* rec) noexcept {
         }
         ev.is_start = (id == kEventProcessStart);
         prop_u32(rec, L"ProcessID", ev.pid);
+        if (ev.pid == 0) {
+            return; // failed/torn TDH decode (corrupt .etl record) — drop it
+        }
         if (ev.is_start) {
             ev.image_name = prop_image_basename(rec, L"ImageName");
             prop_u32(rec, L"ParentProcessID", ev.ppid);
