@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
+  `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
+  ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
+  (which the poll misses entirely) are captured — with exact timestamps and exit
+  codes. Same `process_live` schema and `$Process_*` query surface, so rollups
+  and existing queries are unchanged. Events are **names-only** (no command
+  line); the owning user is resolved from the process SID at start (best-effort,
+  empty for processes that exit faster than the ~1 s buffer flush — the same
+  limit the poll had). The poll remains the feeder on Linux/macOS and the Windows
+  fallback if the ETW session cannot start. The **boot window** (processes that
+  start *and* exit before the agent's live session opens) is backfilled from a
+  boot **AutoLogger** — a circular, FlushTimer-enabled Kernel-Process `.etl`
+  configured by `install-agent-user.ps1` (admin, install-time) and started by the
+  kernel early each boot; the agent reads it directly at startup for events
+  before its live session began (no session stop / no elevation — read access
+  only), de-duplicated per boot. Boot-window events are names-only with no user
+  (the start event carries only SessionID + integrity label; precise attribution
+  would need the Security-Auditing 4688 provider). `process_live` raw cap raised
+  5k→100k for the higher event rate; disk stays bounded (count rollups carry the
+  long tail). `install-agent-user.ps1` is now UTF-8-BOM-encoded so Windows
+  PowerShell 5.1 parses it (it has non-ASCII characters).
+
 ### Changed
 
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
