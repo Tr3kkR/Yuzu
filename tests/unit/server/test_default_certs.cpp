@@ -16,6 +16,11 @@
 
 #include "../test_helpers.hpp"
 
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
@@ -59,6 +64,20 @@ std::size_t count_of(const std::vector<std::string>& v, const std::string& s) {
     return static_cast<std::size_t>(std::count(v.begin(), v.end(), s));
 }
 
+// Returns the X509 extended-key-usage flag word (XKU_SSL_SERVER / XKU_SSL_CLIENT
+// bits) for a PEM leaf. UINT32_MAX means "no EKU extension" (all purposes).
+uint32_t leaf_eku_flags(const std::filesystem::path& pem_path) {
+    std::string pem = read_file(pem_path);
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    REQUIRE(bio != nullptr);
+    X509* x = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    REQUIRE(x != nullptr);
+    uint32_t flags = X509_get_extended_key_usage(x); // forces the lazy EKU parse
+    X509_free(x);
+    return flags;
+}
+
 } // namespace
 
 TEST_CASE("default_certs: first boot generates a full, chained set", "[default_certs]") {
@@ -93,6 +112,31 @@ TEST_CASE("default_certs: first boot generates a full, chained set", "[default_c
 
     // Leaf notAfter must equal the CA notAfter (sized to the issuer).
     REQUIRE(https->not_after == ca_info->not_after);
+}
+
+TEST_CASE("default_certs: leaf EKUs match each role (server is also a client — #1314)",
+          "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+
+    // The server forwards commands to the gateway's mgmt plane over MUTUAL TLS
+    // (#1314), so it acts as a TLS *client* and its leaf MUST carry clientAuth in
+    // addition to serverAuth — otherwise a strict verifier rejects it as a client
+    // cert and the command-forwarding dial fails.
+    const uint32_t server_eku = leaf_eku_flags(set.server_cert);
+    REQUIRE((server_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((server_eku & XKU_SSL_CLIENT) != 0);
+
+    // The gateway is a server to agents AND a client to the server upstream.
+    const uint32_t gateway_eku = leaf_eku_flags(set.gateway_cert);
+    REQUIRE((gateway_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((gateway_eku & XKU_SSL_CLIENT) != 0);
+
+    // The HTTPS dashboard leaf is server-only — no need for clientAuth.
+    const uint32_t https_eku = leaf_eku_flags(set.https_cert);
+    REQUIRE((https_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((https_eku & XKU_SSL_CLIENT) == 0);
 }
 
 TEST_CASE("default_certs: --cert-san extra SANs land on every default leaf", "[default_certs]") {

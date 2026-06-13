@@ -133,7 +133,12 @@ FROM scratch
 
 COPY --from=chisel /rootfs /
 
-USER 1000:1000
+# MEDIUM (#1314): use the NAMED user, not numeric `USER 1000:1000`. runc only
+# resolves supplementary groups from /etc/group for a named USER — with a bare
+# numeric uid the `yuzu-pki` (gid 2000) membership baked above is dropped, so
+# `--cert-group yuzu-pki` would be inert. `yuzu` (uid 1000) is a member of
+# yuzu-pki per /etc/group above, matching the non-chisel Dockerfile.server.
+USER yuzu
 WORKDIR /var/lib/yuzu
 
 # 8443 = HTTPS dashboard (secure-by-default); 8080 = HTTP→HTTPS redirect.

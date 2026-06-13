@@ -630,7 +630,12 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
 
     const std::array<LeafSpec, 3> leaves = {{
         {"default-https", "default-https.pem", "https", pki::LeafUsage{.server_auth = true}},
-        {"default-server", "default-server.pem", "server", pki::LeafUsage{.server_auth = true}},
+        // The server is a server to agents/gateway AND a client when it forwards
+        // commands to the gateway's mgmt plane over mutual TLS (#1314), so its leaf
+        // needs clientAuth too — otherwise a strict verifier rejects it as a client
+        // cert and the mTLS command-forwarding dial fails.
+        {"default-server", "default-server.pem", "server",
+         pki::LeafUsage{.server_auth = true, .client_auth = true}},
         // The gateway is a server to agents AND a client to the server upstream.
         {"default-gateway", "default-gateway.pem", "gateway",
          pki::LeafUsage{.server_auth = true, .client_auth = true}},

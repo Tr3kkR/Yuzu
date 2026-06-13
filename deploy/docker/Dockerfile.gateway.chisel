@@ -125,7 +125,12 @@ COPY --from=chisel /rootfs /
 ENV HOME=/opt/yuzu_gw \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/yuzu_gw/bin
 
-USER 1000:1000
+# MEDIUM (#1314): use the NAMED user, not numeric `USER 1000:1000`. runc only
+# resolves supplementary groups from /etc/group for a named USER — with a bare
+# numeric uid the `yuzu-pki` (gid 2000) membership baked above is dropped, so the
+# gateway could not read the shared default-gateway.key. `yuzu-gw` (uid 1000) is
+# a member of yuzu-pki per /etc/group above.
+USER yuzu-gw
 WORKDIR /opt/yuzu_gw
 
 EXPOSE 50051 50063 8081 9568

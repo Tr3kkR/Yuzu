@@ -169,7 +169,12 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/yuzu/plugins
 
 COPY --from=chisel /rootfs /
 
-USER 1000:1000
+# MEDIUM (#1314): use the NAMED user, not numeric `USER 1000:1000`. runc only
+# resolves supplementary groups from /etc/group for a named USER — with a bare
+# numeric uid the `yuzu-pki` (gid 2000) membership baked above is dropped, so
+# `--cert-group yuzu-pki` would be inert and the agent could not read the shared
+# install CA. `yuzu` (uid 1000) is a member of yuzu-pki per /etc/group above.
+USER yuzu
 WORKDIR /var/lib/yuzu-agent
 
 # Secure by default (PKI #1289): connect to the gateway over TLS. With no

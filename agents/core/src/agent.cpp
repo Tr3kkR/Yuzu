@@ -53,6 +53,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <random>
 #include <string>
@@ -836,6 +837,22 @@ public:
         int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
         const std::filesystem::path cert_dir =
             cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
+        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
+        // The install-CA auto-discovery used to live only inside build_channel and
+        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
+        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
+        // no CSR and never got its per-agent client leaf, with no error. Promoting the
+        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
+        // and build_channel see the same effective CA (an explicit --ca-cert is left
+        // untouched, so this is a no-op when one was given).
+        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
+            if (auto ca = discover_install_ca_path()) {
+                cfg_.tls_ca_cert = *ca;
+                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
+                             "anchor and enabling per-agent enrollment",
+                             cfg_.tls_ca_cert.string());
+            }
+        }
         const bool provisioning_eligible =
             cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
             cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();
@@ -881,36 +898,19 @@ public:
                         return false;
                     }
                 } else {
-                    // Secure-by-default (PKI #1289): no --ca-cert given. Auto-discover
-                    // the install CA at the standard shared-cert-volume path BEFORE
-                    // grpc falls back to the system trust store — a Yuzu self-signed
-                    // install CA is not in the system roots, so without this an agent
-                    // pointed at a default-cert server/gateway silently fails the TLS
-                    // handshake. The deployment may still pass --ca-cert explicitly.
-                    static constexpr const char* kInstallCaPaths[] = {
-#ifdef _WIN32
-                        "C:/ProgramData/Yuzu/certs/default-ca.pem",
-#else
-                        "/etc/yuzu/certs/default-ca.pem",
-#endif
-                    };
-                    for (const char* p : kInstallCaPaths) {
-                        std::error_code ec;
-                        if (!std::filesystem::exists(p, ec))
-                            continue;
-                        ssl_opts.pem_root_certs = read_file_contents(p);
-                        if (!ssl_opts.pem_root_certs.empty()) {
-                            spdlog::info("Auto-discovered install CA at {}", p);
-                            break;
-                        }
-                    }
-                    if (ssl_opts.pem_root_certs.empty())
-                        spdlog::warn("TLS is enabled but no --ca-cert was given and no install CA "
-                                     "was found at the standard path — verification will use the "
-                                     "SYSTEM trust store, which does NOT trust a Yuzu self-signed "
-                                     "install CA. Provide --ca-cert (e.g. "
-                                     "/etc/yuzu/certs/default-ca.pem) or use --no-tls for a "
-                                     "dev/demo stack.");
+                    // Secure-by-default (PKI #1289 / HIGH-1 #1314): no --ca-cert was
+                    // given and the install-CA auto-discovery above run() found nothing
+                    // usable at the standard shared-cert-volume path (a found CA is
+                    // promoted into cfg_.tls_ca_cert there, so reaching this branch means
+                    // none existed). Fall back to the system trust store — which does NOT
+                    // trust a Yuzu self-signed install CA — and warn so the resulting
+                    // handshake failure is diagnosable.
+                    spdlog::warn("TLS is enabled but no --ca-cert was given and no install CA "
+                                 "was found at the standard path — verification will use the "
+                                 "SYSTEM trust store, which does NOT trust a Yuzu self-signed "
+                                 "install CA. Provide --ca-cert (e.g. "
+                                 "/etc/yuzu/certs/default-ca.pem) or use --no-tls for a "
+                                 "dev/demo stack.");
                 }
 
                 // Client certificate: prefer cert store, fall back to PEM files

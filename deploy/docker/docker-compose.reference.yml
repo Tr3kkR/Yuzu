@@ -34,7 +34,7 @@
 ## with a reverse proxy, and review docs/user-manual/ before exposing it.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.13.0
+##   export YUZU_VERSION=0.12.0
 ##   docker compose -f docker-compose.reference.yml up -d
 ##   docker compose -f docker-compose.reference.yml logs -f server
 ##   # trust the CA, then browse https://localhost:8443/
@@ -55,7 +55,7 @@
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0}
     container_name: yuzu-server
     restart: unless-stopped
     # The image's default CMD is already secure (no --no-tls/--no-https): it

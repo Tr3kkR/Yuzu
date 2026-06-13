@@ -28,9 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
   Native installs (deb/systemd, Windows installer) were already secure-by-default.
   New secure reference composes: `docker-compose.reference.yml` (single server) and
-  `docker-compose.reference-gateway.yml` (server + gateway + agent). To run the old
-  insecure posture, pass `--no-tls --no-https` explicitly. See
-  `docs/pki-architecture.md` "Secure-by-default deployment".
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
+  gateway topology the **privileged server→gateway command plane (`:50063`) is now
+  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
+  CA-issued client cert, so a container with no Yuzu cert — including a compromised
+  agent — can no longer push commands to the fleet over that plane (previously it
+  was plaintext + unauthenticated). To run the old insecure posture, pass
+  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
+  "Secure-by-default deployment".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
