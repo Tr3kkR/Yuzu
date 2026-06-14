@@ -164,7 +164,7 @@ std::unique_ptr<IGuard> make_service_guard(ServiceGuard::Config cfg, GuardSink s
 
 } // namespace yuzu::agent
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
 
 #include <systemd/sd-bus.h>
 
@@ -601,7 +601,7 @@ void SystemdServiceGuard::run() try {
 
 } // namespace yuzu::agent
 
-#else // ── Non-Linux: no-op (no sd-bus) ─────────────────────────────────────────
+#else // ── No sd-bus (non-Linux, or Linux built without libsystemd): no-op stub ──
 
 namespace yuzu::agent {
 

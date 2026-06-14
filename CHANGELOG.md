@@ -194,11 +194,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Non-systemd Linux hosts (no system D-Bus) degrade gracefully: the guard
   does not arm and the rule reports unarmed rather than compliant. The watch
   reconnects automatically after a `systemctl daemon-reexec` / dbus restart.
-  **New runtime dependency on Linux agents:** `libsystemd.so.0` (package
-  `libsystemd0` on Debian/Ubuntu, `systemd-libs` on RHEL/Fedora). Systemd hosts
-  already have it; container and minimal Linux deployments must add `libsystemd0`
-  (runtime) and `libsystemd-dev` (build) — the shipped `Dockerfile.agent`,
-  `Dockerfile.agent.chisel`, and the asan/tsan images are updated accordingly.
+  **Build/runtime dependency on Linux agents:** `libsystemd` — build `libsystemd-dev`
+  (`systemd-devel` on RHEL/Fedora), runtime `libsystemd.so.0` (`libsystemd0` /
+  `systemd-libs`). The default build (`-Dsystemd_guard=enabled`) **requires** it so the
+  shipped agent always offers the guard — a build that has lost libsystemd fails loudly
+  rather than silently shipping a guard-less agent; the shipped `Dockerfile.agent`,
+  `Dockerfile.agent.chisel`, and the asan/tsan images install it and keep that default.
+  Pass `-Dsystemd_guard=auto` (use if present) or `disabled` to build the guard as a
+  no-op stub on musl/Alpine/non-systemd/minimal images that lack libsystemd.
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
   Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
   default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
