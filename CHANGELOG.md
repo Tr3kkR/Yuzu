@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
+  agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
+  into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
+  `statvfs` reads — reusing the same obs_types, `detail_json` shape and thresholds as
+  Windows/macOS, so they render in the same `/dex` display groups with zero server or
+  dashboard change. Linux CPU% and commit% also feed the perf heartbeat tags
+  (`yuzu.perf_*`). Observe-only; controlled by the existing `--dex-disable` /
+  `YUZU_AGENT_DEX_DISABLE` flag. **Edge-privacy:** `storage.low` subjects are the
+  backing-device identifier (e.g. `sda1`, or the ZFS pool) — never the mount path,
+  which can carry usernames/tenant names; pinned by `[dex][privacy]` regression tests.
+  **Upgrade note:** Linux agents begin emitting this telemetry on upgrade with no
+  operator action (EU works-council co-determination triggers on the *capability* to
+  observe); `--dex-disable` suppresses it fleet-wide.
+
 - **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
   `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
   ETW session instead of the 60 s snapshot-diff poll, so short-lived processes

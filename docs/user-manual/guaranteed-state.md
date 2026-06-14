@@ -300,7 +300,7 @@ Each row carries a human `detected_value` sentence plus a structured **`detail_j
 
 **Scope and limitations:**
 
-- **Windows only.** The observer is a no-op on Linux and macOS until those collectors land (gated behind broader Guardian work on those platforms).
+- **Windows, macOS, and Linux.** The Windows observer arms the full event-channel catalogue; the macOS observer (`dex_macos_collector.cpp`) covers ~10 of 11 headings via DiagnosticReports / unified log / IOKit; the Linux observer (`dex_linux_collector.cpp`) targets **headless servers** — Performance (`/proc/stat`, `/proc/meminfo`) and Hardware & storage (`statvfs`) — with workstation-only headings (battery, Wi-Fi, display, GUI app dialogs) staying at zero, not gapped.
 - **Windows 11 / Server 2022+ field layout.** Extractors target the field layouts those builds emit; an unexpected layout degrades to a counted occurrence with empty subject rather than a dropped or crashing signal. Channels absent on a given SKU fail to arm individually and are skipped (the rest still collect).
 - **Forward-only.** Signals are captured from subscription time onward; events written before the agent armed (e.g. a bugcheck during boot) are not back-filled.
 

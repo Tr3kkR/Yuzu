@@ -208,8 +208,13 @@ F1 follow-up, same as the blast-radius detector's). A
 collector that reuses the same OS-neutral signal types and covers roughly ten
 of the eleven experience headings (crashes and hangs, resource pressure,
 service failures, boot/resume reports, storage pressure, battery health, and
-more). **Linux** endpoints report no DEX signals yet — a collector is a
-planned follow-up. Because the by-OS and cross-OS views
+more). A **Linux** server collector ships too (`/proc` CPU + memory-commit pressure and
+`statvfs` storage), reusing the same signal types, so Linux servers appear in the
+Performance and Hardware/storage views; workstation-only headings (battery, Wi-Fi,
+display, GUI) are **N/A on headless servers**, not gaps. `storage.low` uses a fixed
+5 GiB-free floor (small cloud/VM root volumes can read as low until the F1
+configurable thresholds land), and inside an unmodified container `/proc` reflects
+the *host*, so the collector targets host/VM deployment. Because the by-OS and cross-OS views
 label each OS with its live *signal scope*, a fleet running a narrower collector
 reads as **less observed**, never as healthier; the rates are read *within* an
 OS, never across. The exact macOS source mapping — and what additional fidelity
