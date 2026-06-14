@@ -77,6 +77,25 @@ struct MountPoint {
 /// "100% full by design" storm and never statvfs()'s a pseudo or (potentially
 /// hung) network mount. Deduped by backing device so a bind mount of the same
 /// filesystem is not counted twice.
+///
+/// Deliberately EXCLUDED (parity with the Windows fixed-disk-only storage.low):
+/// tmpfs (/run, /dev/shm, /tmp), other RAM-backed/pseudo fs (proc, sysfs, cgroup,
+/// overlay), and network mounts (nfs/cifs). A full tmpfs is a MEMORY condition, not
+/// disk-full — it is RAM-backed and sized by design — so it belongs to a future
+/// memory/tmpfs obs_type, not storage.low; excluding network fs also keeps a hung
+/// NFS server from blocking the poll thread in statvfs().
 YUZU_EXPORT std::vector<MountPoint> parse_storage_mounts(std::string_view proc_mounts);
+
+/// PURE: a stable, NON-PII storage.low subject derived from the backing DEVICE,
+/// never the mount path. A mount path is *where users put files* and routinely
+/// carries usernames / tenant / project names (`/home/alice/...`,
+/// `/srv/acme-data`) — exactly the content the DEX edge-privacy contract forbids
+/// leaving the device (`docs/dex-signal-catalog.md`). The backing-device
+/// identifier is infrastructure config (the same class as the hostname), so it is
+/// the Linux analogue of the Windows drive letter ("C:") and the macOS volume
+/// label ("Macintosh HD") the other collectors emit. Returns the device basename
+/// ("/dev/sda1" -> "sda1", "/dev/mapper/vg0-root" -> "vg0-root"), or "disk" when
+/// the device is empty or has no basename (trailing slash).
+YUZU_EXPORT std::string device_label(std::string_view device);
 
 } // namespace yuzu::agent::lnx

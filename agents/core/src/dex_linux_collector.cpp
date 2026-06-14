@@ -38,6 +38,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
@@ -59,7 +60,9 @@ std::optional<std::string> read_proc_file(const char* path) {
         return std::nullopt;
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str(); // possibly empty/partial — the pure parser validates and bails
+    if (ss.fail() || f.bad()) // empty / errored read — treat as unreadable (review MEDIUM)
+        return std::nullopt;
+    return ss.str();
 }
 
 /// The Linux DEX observer: a single owned poll thread (the WinStatePoller
@@ -71,12 +74,11 @@ class LinuxDexObserver final : public ISignalObserver {
 public:
     ~LinuxDexObserver() override { stop(); }
 
-    bool start(SignalSink sink, std::function<void()> /*on_error*/) override {
-        // A poll loop has no async "subscription error" the way EvtSubscribe does,
-        // so on_error is accepted for interface parity and never called.
+    bool start(SignalSink sink, std::function<void()> on_error) override {
         if (thread_.joinable())
             return true; // already armed (idempotent)
         sink_ = std::move(sink);
+        on_error_ = std::move(on_error); // fired at runtime if /proc becomes unreadable (HIGH-3)
         stopping_ = false;
         thread_ = std::thread([this] { run(); });
         spdlog::info("dex_observer(linux): armed — /proc perf + storage poll");
@@ -92,6 +94,7 @@ public:
         if (thread_.joinable())
             thread_.join();
         sink_ = nullptr;
+        on_error_ = nullptr;
     }
 
     int armed_channels() const override { return thread_.joinable() ? 1 : 0; }
@@ -144,6 +147,12 @@ private:
             prev_cpu_ = cur; // baseline the next interval (even if this one was invalid)
         } else {
             prev_cpu_ = lnx::CpuJiffies{}; // unreadable — drop the baseline
+            // /proc/stat unreadable (restricted container / seccomp / mount ns) is a
+            // persistent runtime failure → flag the observer unhealthy so the heartbeat
+            // reports disarmed rather than a silently-deaf armed=1 (review HIGH-3, the
+            // Windows on_error equivalent). Idempotent: safe to call every poll.
+            if (on_error_)
+                on_error_();
         }
         if (const auto avg = win::breach_update(cpu_breach_, cpu_pct, cpu_valid, win::kCpuBreach))
             emit(win::cpu_sustained_observation(*avg));
@@ -176,7 +185,9 @@ private:
         const auto mounts = read_proc_file("/proc/mounts");
         if (!mounts)
             return;
+        std::unordered_set<std::string> current;
         for (const auto& m : lnx::parse_storage_mounts(*mounts)) {
+            current.insert(m.path);
             win::DiskLevel level;
             struct statvfs vfs{};
             if (::statvfs(m.path.c_str(), &vfs) == 0 && vfs.f_blocks > 0) {
@@ -187,11 +198,20 @@ private:
                 // signal), not f_bfree which includes the root-reserved slack.
                 level.free_bytes = static_cast<std::uint64_t>(vfs.f_bavail) * bs;
             }
-            const auto obs = win::low_disk_observation(level, m.path);
+            // Subject = the backing-device basename (parity with Windows "C:" / macOS
+            // "Macintosh HD"), NEVER the mount path — a path carries usernames / tenant /
+            // project names that must not leave the device (DEX edge-privacy,
+            // dex-signal-catalog.md §"Privacy / works-council contract"). m.path is used
+            // ONLY for the local statvfs() above; it is never emitted, serialized, or logged.
+            const auto obs = win::low_disk_observation(level, lnx::device_label(m.device));
             bool& reported = disk_low_reported_[m.path];
             if (win::latch_should_emit(obs.has_value(), level.valid, reported))
                 emit(*obs);
         }
+        // Drop latch entries for mounts that have gone away, so the map stays bounded
+        // by the live mount count, not every path ever seen (review MEDIUM).
+        std::erase_if(disk_low_reported_,
+                      [&](const auto& kv) { return !current.contains(kv.first); });
     }
 
     // Stamp platform + delivery time centrally (an empty platform would vanish from
@@ -216,6 +236,7 @@ private:
     bool stopping_ = false;
     std::thread thread_;
     SignalSink sink_; // set before the thread starts, cleared after join — stable in run()
+    std::function<void()> on_error_; // flips dex_health_ when /proc is unreadable (review HIGH-3)
     std::int64_t last_perf_poll_ = 0;
     std::int64_t last_disk_poll_ = 0;
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read

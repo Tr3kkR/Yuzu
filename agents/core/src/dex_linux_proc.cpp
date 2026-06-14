@@ -89,6 +89,29 @@ std::optional<std::uint64_t> meminfo_kb(std::string_view meminfo, std::string_vi
     return result;
 }
 
+bool is_octal(char c) { return c >= '0' && c <= '7'; }
+
+// Decode /proc/mounts octal escapes (\040 space, \011 tab, \012 newline, \134
+// backslash). The kernel escapes exactly these in the device and mount-point
+// fields, so without this a valid local mount whose path contains a space is
+// statvfs'd on the wrong spelling and silently never checked. A backslash NOT
+// followed by three octal digits is copied verbatim (defensive — never throws).
+std::string decode_octal(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() && is_octal(s[i + 1]) && is_octal(s[i + 2]) &&
+            is_octal(s[i + 3])) {
+            out.push_back(static_cast<char>((s[i + 1] - '0') * 64 + (s[i + 2] - '0') * 8 +
+                                            (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
 // A mount option flag ("ro") present in a comma-separated options field.
 bool has_opt(std::string_view opts, std::string_view flag) {
     std::size_t i = 0;
@@ -176,7 +199,7 @@ std::vector<MountPoint> parse_storage_mounts(std::string_view proc_mounts) {
     static constexpr std::array<std::string_view, 7> kLocalFs{"ext2", "ext3",  "ext4", "xfs",
                                                               "btrfs", "f2fs", "zfs"};
     std::vector<MountPoint> out;
-    std::vector<std::string_view> seen_devices;
+    std::vector<std::string> seen_devices;
     for_each_line(proc_mounts, [&](std::string_view line) {
         // /proc/mounts fields: device mountpoint fstype options dump pass
         std::array<std::string_view, 4> f{};
@@ -188,17 +211,34 @@ std::vector<MountPoint> parse_storage_mounts(std::string_view proc_mounts) {
         });
         if (n < 4)
             return;
-        const std::string_view device = f[0], path = f[1], fstype = f[2], opts = f[3];
+        const std::string_view fstype = f[2], opts = f[3];
         if (std::find(kLocalFs.begin(), kLocalFs.end(), fstype) == kLocalFs.end())
             return; // pseudo / network / squashfs etc. — never a server storage volume
         if (has_opt(opts, "ro"))
             return; // a read-only mount (snap, image) is "full" by design
+        // Decode the kernel's octal escapes BEFORE dedup/use: the device is both the
+        // dedup key and the source of device_label(); the path is what statvfs reads,
+        // so an escaped space must be restored or the mount is silently never checked.
+        std::string device = decode_octal(f[0]);
         if (std::find(seen_devices.begin(), seen_devices.end(), device) != seen_devices.end())
             return; // bind mount of an already-seen device
         seen_devices.push_back(device);
-        out.push_back(MountPoint{std::string(device), std::string(path), std::string(fstype)});
+        out.push_back(MountPoint{std::move(device), decode_octal(f[1]), std::string(fstype)});
     });
     return out;
+}
+
+std::string device_label(std::string_view device) {
+    // Basename only — never a path component of the device string, and the mount
+    // PATH is never consulted here (it carries user content; see the header). For a
+    // device-mapper/LVM device the basename is the admin-assigned VG-LV name
+    // ("/dev/mapper/vg0-root" -> "vg0-root"): infrastructure config, the sibling of
+    // the hostname, not captured user activity — the same subject class as the
+    // drive-name / device-path / SSID subjects elsewhere in the catalogue.
+    const auto slash = device.find_last_of('/');
+    const std::string_view base =
+        (slash == std::string_view::npos) ? device : device.substr(slash + 1);
+    return base.empty() ? "disk" : std::string(base);
 }
 
 } // namespace yuzu::agent::lnx

@@ -9,11 +9,29 @@
 
 #include "dex_linux_proc.hpp"
 
+#include "dex_event.hpp"    // signal_detail_json — prove no path PII reaches the wire payload
+#include "dex_win_poll.hpp" // low_disk_observation — the exact builder the collector calls
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <string>
+#include <string_view>
+
+using namespace yuzu::agent;
 using namespace yuzu::agent::lnx;
 using Catch::Matchers::WithinAbs;
+
+namespace {
+// A near-full local volume (100 GiB total, 1 GiB free = 99% used) — trips storage.low.
+win::DiskLevel near_full() {
+    win::DiskLevel d;
+    d.valid = true;
+    d.total_bytes = 100ULL * 1024 * 1024 * 1024;
+    d.free_bytes = 1ULL * 1024 * 1024 * 1024;
+    return d;
+}
+} // namespace
 
 TEST_CASE("parse_proc_stat reads the aggregate cpu line", "[guardian][dex][linux][proc]") {
     const std::string s = "cpu  2180059 2396 206543 27474468 18799 0 3876 0 0 0\n"
@@ -101,4 +119,57 @@ TEST_CASE("parse_storage_mounts dedups by backing device", "[guardian][dex][linu
     const std::string m = "/dev/sda1 / ext4 rw 0 0\n"
                           "/dev/sda1 /mnt/bind ext4 rw 0 0\n";
     CHECK(parse_storage_mounts(m).size() == 1);
+}
+
+TEST_CASE("parse_storage_mounts decodes octal-escaped mount paths",
+          "[guardian][dex][linux][proc]") {
+    // A mount point containing a space: the kernel writes it as \040 in /proc/mounts.
+    // Without decoding, statvfs would be handed the wrong spelling and silently skip it.
+    const auto mounts = parse_storage_mounts("/dev/sdb1 /mnt/My\\040Backup ext4 rw 0 0\n");
+    REQUIRE(mounts.size() == 1);
+    CHECK(mounts[0].path == "/mnt/My Backup");
+}
+
+TEST_CASE("parse_storage_mounts keeps the rw mount when an ro mount of the same device precedes it",
+          "[guardian][dex][linux][proc]") {
+    // The reviewer's LOW edge: ro-first, rw-second. The ro filter runs BEFORE the dedup,
+    // so the ro mount never occupies the dedup slot and the writable mount is the one kept.
+    const auto mounts = parse_storage_mounts("/dev/sda1 /snap/x ext4 ro 0 0\n"
+                                             "/dev/sda1 / ext4 rw 0 0\n");
+    REQUIRE(mounts.size() == 1);
+    CHECK(mounts[0].path == "/"); // the rw mount, not the ro one
+}
+
+TEST_CASE("device_label is the backing-device basename, never a path component",
+          "[guardian][dex][linux][proc][privacy]") {
+    CHECK(device_label("/dev/sda1") == "sda1");
+    CHECK(device_label("/dev/nvme0n1p2") == "nvme0n1p2");
+    CHECK(device_label("/dev/mapper/vg0-root") == "vg0-root"); // LVM friendly name = infra config
+    CHECK(device_label("sda1") == "sda1");                     // already a basename
+    CHECK(device_label("") == "disk");                         // empty → safe fallback
+    CHECK(device_label("/dev/") == "disk");                    // trailing slash → empty basename
+}
+
+TEST_CASE("storage.low carries the device label, NEVER the mount path (edge-privacy)",
+          "[guardian][dex][linux][proc][privacy]") {
+    // A mount path laden with a username + tenant/project name — the exact content the
+    // DEX edge-privacy contract forbids leaving the device.
+    const auto mounts = parse_storage_mounts("/dev/sdb1 /home/alice/Acquisition-X ext4 rw 0 0\n");
+    REQUIRE(mounts.size() == 1);
+    CHECK(mounts[0].path == "/home/alice/Acquisition-X"); // retained ONLY for the local statvfs()
+
+    // Reproduce the EXACT expression the collector emits (dex_linux_collector.cpp):
+    //   win::low_disk_observation(level, lnx::device_label(m.device))
+    const auto obs = win::low_disk_observation(near_full(), device_label(mounts[0].device));
+    REQUIRE(obs);
+    CHECK(obs->subject == "sdb1");
+
+    // No path component may appear in ANY emitted surface: the subject, the sentence
+    // (→ detected_value / the event name), or the structured detail_json (→ wire + dashboard).
+    const std::string detail = signal_detail_json(*obs);
+    for (const std::string_view leak : {"alice", "Acquisition", "/home", "home/"}) {
+        CHECK(obs->subject.find(leak) == std::string_view::npos);
+        CHECK(obs->sentence.find(leak) == std::string_view::npos);
+        CHECK(detail.find(leak) == std::string_view::npos);
+    }
 }
