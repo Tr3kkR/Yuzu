@@ -166,6 +166,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian: Linux systemd service guard (observe-only).** The
+  `service-status-change` Guardian Spark now arms on Linux hosts with systemd,
+  watching each unit's `ActiveState` over sd-bus (`Subscribe` + `PropertiesChanged`
+  match + a bounded reconcile backstop) and emitting `drift.detected` events with
+  `platform=linux`, matching the Windows SCM guard's event shape — both service
+  guards are silent on the compliant edge (neither emits `guard.compliant`).
+  systemd's richer `ActiveState` collapses onto the published
+  `{running, stopped}` tokens with no schema change. **Observe-only in this
+  release:** drift is detected and reported but not remediated — enforcement
+  (mask/stop) is gated behind a forthcoming, governance-reviewed change, and an
+  `enforcement_mode: enforce` rule on a Linux agent degrades to observe without
+  error. Non-systemd Linux hosts (no system D-Bus) degrade gracefully: the guard
+  does not arm and the rule reports unarmed rather than compliant. The watch
+  reconnects automatically after a `systemctl daemon-reexec` / dbus restart.
+  **New runtime dependency on Linux agents:** `libsystemd.so.0` (package
+  `libsystemd0` on Debian/Ubuntu, `systemd-libs` on RHEL/Fedora). Systemd hosts
+  already have it; container and minimal Linux deployments must add `libsystemd0`
+  (runtime) and `libsystemd-dev` (build) — the shipped `Dockerfile.agent`,
+  `Dockerfile.agent.chisel`, and the asan/tsan images are updated accordingly.
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
   Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
   default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
