@@ -75,6 +75,16 @@ enum class SystemdState {
 /// the engine sets it when the unit fails to load.)
 YUZU_EXPORT SystemdState parse_active_state(std::string_view active_state);
 
+/// Classify a D-Bus error NAME from a unit lookup / property read as genuine
+/// absence vs a transient fault. Only the "does not exist" names (NoSuchUnit /
+/// UnknownObject / ServiceUnknown / FileNotFound) mean the unit is truly gone →
+/// Absent; EVERY other named error (AccessDenied, NoReply, TimedOut, Disconnected,
+/// …) and an empty/unset name (a bare transport failure) are transient and must
+/// NOT read as absence — otherwise a permission or timeout blip fabricates a false
+/// "stopped" drift (a false-compliant for a `service-stopped` rule). Pure +
+/// cross-platform-tested; the caller passes `sd_bus_error.name`.
+YUZU_EXPORT bool systemd_error_name_is_absence(std::string_view error_name);
+
 /// True for the systemd states that are MID-TRANSITION (or not understood): the
 /// guard holds on these — no compare, no drift — and waits for a terminal state,
 /// mirroring the Windows guard holding on *_PENDING.

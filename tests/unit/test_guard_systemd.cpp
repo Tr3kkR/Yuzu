@@ -35,6 +35,23 @@ std::chrono::steady_clock::time_point at(long long ms) {
 }
 } // namespace
 
+TEST_CASE("systemd_error_name_is_absence: only not-exist names read as absence",
+          "[guardian][guard][systemd][absence]") {
+    // The genuine "unit/object is gone" names → Absent.
+    CHECK(systemd_error_name_is_absence("org.freedesktop.systemd1.NoSuchUnit"));
+    CHECK(systemd_error_name_is_absence("org.freedesktop.DBus.Error.UnknownObject"));
+    CHECK(systemd_error_name_is_absence("org.freedesktop.DBus.Error.ServiceUnknown"));
+    CHECK(systemd_error_name_is_absence("org.freedesktop.DBus.Error.FileNotFound"));
+    // Transient / fault names must NOT read as absence — else a permission/timeout
+    // blip fabricates a false "stopped" drift (fjarvis #2 / UP-4).
+    CHECK_FALSE(systemd_error_name_is_absence("org.freedesktop.DBus.Error.AccessDenied"));
+    CHECK_FALSE(systemd_error_name_is_absence("org.freedesktop.DBus.Error.NoReply"));
+    CHECK_FALSE(systemd_error_name_is_absence("org.freedesktop.DBus.Error.TimedOut"));
+    CHECK_FALSE(systemd_error_name_is_absence("org.freedesktop.DBus.Error.Disconnected"));
+    CHECK_FALSE(systemd_error_name_is_absence("org.freedesktop.systemd1.LoadFailed"));
+    CHECK_FALSE(systemd_error_name_is_absence("")); // bare transport failure → reopen
+}
+
 // Ownership contract (cpp-safety): the guard owns an eventfd + an sd_bus* + a
 // std::thread; copy or move would double-close / double-join. Non-copyable AND
 // non-movable, exactly like the other guards.

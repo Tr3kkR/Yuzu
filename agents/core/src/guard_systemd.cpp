@@ -53,6 +53,19 @@ SystemdState parse_active_state(std::string_view s) {
     return SystemdState::Unknown;
 }
 
+bool systemd_error_name_is_absence(std::string_view name) {
+    // Only the "does not exist" D-Bus error names mean the unit/object is genuinely
+    // gone (→ Absent). Every other named error (AccessDenied, NoReply, TimedOut,
+    // Disconnected, …) is transient and must NOT read as absence — otherwise a
+    // permission or timeout blip fabricates a false "stopped" drift / false-compliant
+    // (fjarvis review #2 / UP-4). An empty name is a bare transport failure → not
+    // absence (the caller reopens).
+    return name == "org.freedesktop.systemd1.NoSuchUnit" ||
+           name == "org.freedesktop.DBus.Error.UnknownObject" ||
+           name == "org.freedesktop.DBus.Error.ServiceUnknown" ||
+           name == "org.freedesktop.DBus.Error.FileNotFound";
+}
+
 bool systemd_state_is_transitional(SystemdState s) {
     switch (s) {
     case SystemdState::Reloading:
@@ -359,13 +372,18 @@ void SystemdServiceGuard::run() try {
             } else {
                 res = ResolveResult::NotFound;
             }
-        } else if (sd_bus_error_is_set(&err)) {
-            spdlog::debug("Guardian SystemdServiceGuard[{}]: unit '{}' not loadable: {}",
-                          cfg_.rule_id, unit, err.message ? err.message : "(none)");
+        } else if (systemd_error_name_is_absence(err.name ? err.name : "")) {
+            spdlog::debug("Guardian SystemdServiceGuard[{}]: unit '{}' absent (name='{}')",
+                          cfg_.rule_id, unit, err.name ? err.name : "(none)");
             res = ResolveResult::NotFound;
         } else {
-            spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit '{}' bus error: {}",
-                         cfg_.rule_id, unit, err_str(r < 0 ? -r : 0));
+            // A named-but-transient error (AccessDenied/NoReply/TimedOut/…) or a bare
+            // transport failure — neither proves the unit is gone, so reopen rather than
+            // fabricate a false Absent drift (fjarvis #2 / UP-4).
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit '{}' transient error "
+                         "(name='{}', {}) — reopening, no false Absent",
+                         cfg_.rule_id, unit, err.name ? err.name : "(none)",
+                         err.message ? err.message : err_str(r < 0 ? -r : 0));
             res = ResolveResult::BusError;
         }
         if (reply)
@@ -391,12 +409,14 @@ void SystemdServiceGuard::run() try {
                                            &err, &s);
         if (r >= 0 && s) {
             st = parse_active_state(s);
-        } else if (sd_bus_error_is_set(&err)) {
-            st = SystemdState::Absent; // remote error: unit object removed — genuinely absent
+        } else if (systemd_error_name_is_absence(err.name ? err.name : "")) {
+            st = SystemdState::Absent; // unit object genuinely removed/unknown — absent
         } else {
-            spdlog::warn("Guardian SystemdServiceGuard[{}]: ActiveState read bus error ({}) — "
-                         "reopening, no false drift",
-                         cfg_.rule_id, err_str(r < 0 ? -r : 0));
+            // Named-but-transient (AccessDenied/NoReply/TimedOut/…) or a bare transport
+            // failure — reopen, never a false "stopped" (fjarvis #2 / UP-4).
+            spdlog::warn("Guardian SystemdServiceGuard[{}]: ActiveState read transient error "
+                         "(name='{}', {}) — reopening, no false drift",
+                         cfg_.rule_id, err.name ? err.name : "(none)", err_str(r < 0 ? -r : 0));
             // leave nullopt → caller flips bus_ok and reopens
         }
         if (s)

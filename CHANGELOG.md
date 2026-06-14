@@ -124,9 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Guardian: Linux systemd service guard (observe-only).** The
   `service-status-change` Guardian Spark now arms on Linux hosts with systemd,
   watching each unit's `ActiveState` over sd-bus (`Subscribe` + `PropertiesChanged`
-  match + a bounded reconcile backstop) and emitting `drift.detected` /
-  `guard.compliant` events with `platform=linux`, matching the Windows SCM guard's
-  event shape. systemd's richer `ActiveState` collapses onto the published
+  match + a bounded reconcile backstop) and emitting `drift.detected` events with
+  `platform=linux`, matching the Windows SCM guard's event shape — both service
+  guards are silent on the compliant edge (neither emits `guard.compliant`).
+  systemd's richer `ActiveState` collapses onto the published
   `{running, stopped}` tokens with no schema change. **Observe-only in this
   release:** drift is detected and reported but not remediated — enforcement
   (mask/stop) is gated behind a forthcoming, governance-reviewed change, and an
