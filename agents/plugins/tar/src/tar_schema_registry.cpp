@@ -388,6 +388,57 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── netqual (BRD Workstream E — per-connection TCP quality) ──────
+        // One row per (tick, ESTABLISHED connection): smoothed RTT + jitter
+        // + a CURRENT-loss gauge (tcpi_lost) + lifetime retrans/segs context,
+        // joined to the owning process. Co-sampled with the `tcp` source so it
+        // shares the snapshot_id (joins to process/perf on ts). Only a coarse
+        // destination CLASS (`remote_bucket`) is stored — never the raw remote
+        // address — and collection carries its own opt-in toggle + per-tick
+        // top-N cap (collector slice). Row-count retention bounds storage
+        // deterministically regardless of connection churn.
+        {
+            .name = "netqual",
+            .dollar_name = "NetQual",
+            .os_support = {
+                {"linux",   OsSupportStatus::kSupported, "inetdiag",
+                 "netlink SOCK_DIAG / INET_DIAG TCP_INFO dump (the interface "
+                 "`ss -ti` uses — no packet capture, no CAP_NET_ADMIN: a "
+                 "non-root agent reads system TCP_INFO), joined to the "
+                 "connection's owning process by 4-tuple."},
+                {"windows", OsSupportStatus::kPlanned,   "estats",
+                 "ESTATS (GetPerTcpConnectionEStats) for smoothed RTT, or the "
+                 "Microsoft-Windows-TCPIP ETW provider for retransmit/loss — "
+                 "the mechanism is a spike (see /network design)."},
+                {"macos",   OsSupportStatus::kPlanned,   "nstat",
+                 "per-socket tcp_connection_info via the private nstat / "
+                 "PRIVATE_TCP_INFO path."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Per-connection rows are far more numerous than the device
+                    // perf tier; the collector's per-tick top-N cap is the real
+                    // bound, this row cap is the deterministic storage backstop.
+                    .retention_default = 100000,
+                    .columns = {
+                        {"ts",            "INTEGER"},
+                        {"snapshot_id",   "INTEGER"},
+                        {"proto",         "TEXT"},
+                        {"remote_bucket", "TEXT"},
+                        {"process_name",  "TEXT"},
+                        {"rtt_us",        "INTEGER"},
+                        {"rtt_var_us",    "INTEGER"},
+                        {"lost",          "INTEGER"},
+                        {"retrans",       "INTEGER"},
+                        {"segs_out",      "INTEGER"},
+                        {"ca_state",      "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }

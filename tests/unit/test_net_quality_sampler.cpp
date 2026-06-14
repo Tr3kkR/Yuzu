@@ -1,11 +1,13 @@
 /**
- * test_net_quality_sampler.cpp — pure helpers of the slice-4a network-quality
- * sampler (median, throughput delta, degraded threshold). The platform netlink
- * INET_DIAG path is verified EMPIRICALLY on the Linux rig (rtt_p50 matches
- * `ss -ti`), not here — these are the cross-platform, deterministic bits.
+ * test_net_quality_sampler.cpp — pure helpers of the network-quality sampler
+ * (median, throughput delta, and the 4b.3 interval-retransmit-rate window). The
+ * platform netlink INET_DIAG path is verified EMPIRICALLY on the Linux rig
+ * (rtt_p50 matches `ss -ti`; the interval rate separates 0%/4%/12% netem loss),
+ * not here — these are the cross-platform, deterministic bits.
  */
 #include "net_quality_sampler.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -39,9 +41,56 @@ TEST_CASE("throughput_bps: delta over interval, wrap-safe", "[netq]") {
     CHECK(throughput_bps(prev, same_t) == std::nullopt);
 }
 
-TEST_CASE("is_degraded: RTT or retransmit over threshold; invalid metrics ignored", "[netq]") {
-    CHECK_FALSE(is_degraded(true, 40.0, true, 0.5));      // healthy
-    CHECK(is_degraded(true, 200.0, false, 0.0));          // RTT over 150 ms
-    CHECK(is_degraded(false, 0.0, true, 9.0));            // retransmit over 5%
-    CHECK_FALSE(is_degraded(false, 999.0, false, 999.0)); // both invalid → not degraded
+TEST_CASE("RetransWindow: interval delta, not absolute ratio", "[netq]") {
+    RetransWindow w;
+    // <2 readings → no rate (a single sample can't yield an interval delta).
+    CHECK(w.rate_pct() == std::nullopt);
+    w.push(1000, 100000); // huge absolute lifetime ratio (1%) baked into totals
+    CHECK(w.rate_pct() == std::nullopt);
+    // Next interval added 40 retrans over 1000 segments → 4.0% (the INTERVAL
+    // rate), independent of the large pre-existing absolute totals.
+    w.push(1040, 101000);
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(4.0));
+}
+
+TEST_CASE("RetransWindow: idle interval (no segments advance) → absent, not 0", "[netq]") {
+    RetransWindow w;
+    w.push(500, 50000);
+    w.push(500, 50000); // nothing sent → Δsegs == 0
+    CHECK(w.rate_pct() == std::nullopt); // never a fabricated healthy 0%
+}
+
+TEST_CASE("RetransWindow: connection-churn delta is clamped at zero", "[netq]") {
+    RetransWindow w;
+    w.push(900, 100000);
+    // A high-retrans connection closed → Σretrans DROPS, but Σsegs still
+    // advanced on the survivors. Δretrans must clamp to 0 (never negative loss).
+    w.push(300, 101000); // retrans 900→300 (down), segs +1000
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(0.0)); // clamped, not negative
+}
+
+TEST_CASE("RetransWindow: smooths over the window and evicts oldest", "[netq]") {
+    RetransWindow w{3}; // cap 3 readings → 2 intervals
+    w.push(0, 0);
+    w.push(10, 1000);   // interval A: +10/+1000
+    w.push(30, 2000);   // interval B: +20/+1000  → window sum 30/2000 = 1.5%
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(1.5));
+    // 4th push evicts the (0,0) reading; window is now the last 3.
+    w.push(130, 2500);  // interval C: +100/+500; window = B+C = 120/1500 = 8.0%
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(8.0));
+}
+
+TEST_CASE("RetransWindow: a clean link reads ~0 across the window", "[netq]") {
+    RetransWindow w;
+    uint64_t segs = 100000;
+    for (int i = 0; i < 6; ++i) {
+        segs += 5000;        // steady traffic
+        w.push(200, segs);   // retrans never advances → clean
+    }
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(0.0)); // no false positive on a clean link
 }

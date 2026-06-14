@@ -1281,6 +1281,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_net_rtt_ms");
     metrics.clear_gauge_family("yuzu_fleet_net_retrans_pct");
     metrics.clear_gauge_family("yuzu_fleet_net_throughput_bps");
+    // Cleared so it goes ABSENT when no agent reports the (retired) net_degraded
+    // tag — a permanent flatline-0 reads as "0 degraded = healthy", the exact
+    // absent-as-zero anti-pattern this rollup forbids (gov happy-path/sre/UP-8).
+    metrics.clear_gauge_family("yuzu_fleet_net_degraded");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1301,6 +1305,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::vector<double> net_rtt, net_retrans, net_tput;
     int net_reporting = 0;
     int net_degraded = 0;
+    int net_degraded_reporting = 0; // agents that reported the net_degraded tag at all
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1385,9 +1390,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             ++net_reporting;
             // Count degraded only for devices that reported a metric (a forged
             // net_degraded=1 with no valid metric must not exceed the reporting
-            // denominator — UP-9).
-            if (auto d = parse_net_degraded(get(kNetTagDegraded)); d && *d)
-                ++net_degraded;
+            // denominator — UP-9). `net_degraded_reporting` tracks whether ANY
+            // agent emitted the tag at all, so the gauge can go absent (not 0)
+            // when none do — which is now the steady state (the tag is retired;
+            // only old agents mid-rolling-upgrade still emit it).
+            if (auto d = parse_net_degraded(get(kNetTagDegraded))) {
+                ++net_degraded_reporting;
+                if (*d)
+                    ++net_degraded;
+            }
         }
     }
 
@@ -1432,10 +1443,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
 
-    // Network rollup (slice 3): degraded is a COUNT (a fact), the rest are
-    // {stat} distributions. Families cleared above → absent, never a fake zero.
+    // Network rollup (slice 3): the {stat} distributions; families cleared above
+    // → absent, never a fake zero. `net_retrans_reporting` is the retransmit-rate
+    // population (a subset of net_reporting — a device can report RTT while its
+    // RetransWindow is still warming), so an SRE can tell "healthy, low loss"
+    // from "collection broken/absent" (gov sre). `net_degraded` is emitted ONLY
+    // when some agent reported the (retired) tag — otherwise absent, not 0.
     metrics.gauge("yuzu_fleet_net_reporting").set(static_cast<double>(net_reporting));
-    metrics.gauge("yuzu_fleet_net_degraded").set(static_cast<double>(net_degraded));
+    metrics.gauge("yuzu_fleet_net_retrans_reporting")
+        .set(static_cast<double>(net_retrans.size()));
+    if (net_degraded_reporting > 0)
+        metrics.gauge("yuzu_fleet_net_degraded").set(static_cast<double>(net_degraded));
     set_stats("yuzu_fleet_net_rtt_ms", net_rtt);
     set_stats("yuzu_fleet_net_retrans_pct", net_retrans);
     set_stats("yuzu_fleet_net_throughput_bps", net_tput);

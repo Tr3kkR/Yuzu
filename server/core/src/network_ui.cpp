@@ -117,11 +117,14 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
     h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
     h += network_subnav("overview");
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Network quality &mdash; fleet"
-         "</h1></div><div class=\"gp-sub\">Per-connection quality measured on each endpoint from "
-         "kernel counters (no packet capture, no flow export), rolled up across the fleet. The "
-         "headline is <b>where the pain is</b>: because network quality lives in the same on-device "
-         "warehouse as CPU/disk and process events, we can show whether a degraded device "
-         "<i>co-occurs</i> with a device or app problem &mdash; a network-only tool can&rsquo;t.</div>"
+         "</h1></div><div class=\"gp-sub\">Device / <b>local-link</b> health, measured on each "
+         "endpoint from kernel counters (no packet capture, no flow export) and rolled up across the "
+         "fleet. The retransmit figure is an <b>interval rate</b> (loss in the last few minutes, not a "
+         "lifetime average) &mdash; a bad local link drives loss across every connection, so the "
+         "device aggregate flags it cleanly. This is a <b>measurement, not a verdict</b>: a "
+         "<i>degraded</i> classification (and the device/app co-occurrence it gates) needs a "
+         "real-fleet baseline to calibrate, and <i>localization</i> &mdash; is it the network, the "
+         "device, or the app? &mdash; needs the per-destination drill; both are later slices.</div>"
          "</div></div>";
 
     // ── Fleet now ──
@@ -149,49 +152,35 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
                         std::to_string(now.rtt_reporting) + " report smoothed RTT",
                     "filter=not_reporting", "devices not reporting");
     h += "</div>";
-    h += "<div class=\"gp-note\"><b>Linux</b> reports the full per-connection tier (smoothed RTT, "
-         "retransmits, loss) from netlink <span style=\"font-family:var(--mono)\">TCP_INFO</span>; "
-         "<b>Windows</b> reports retransmit/loss today &mdash; smoothed RTT is coarser/absent pending "
-         "the ESTATS-vs-ETW spike, so the RTT card carries its own (smaller) reporting denominator. "
-         "Absent is never averaged in as zero. The same numbers are exported as the "
-         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> Prometheus gauges.</div>";
+    h += "<div class=\"gp-note\"><b>Linux</b> reports these from netlink "
+         "<span style=\"font-family:var(--mono)\">TCP_INFO</span> + "
+         "<span style=\"font-family:var(--mono)\">/proc/net/dev</span>; <b>Windows and macOS emit "
+         "nothing yet</b> (their collectors are later slices), so this reflects the Linux fleet. "
+         "<b>Retransmission</b> is an interval rate &mdash; &Delta;retransmits / &Delta;segments "
+         "smoothed over the last few heartbeats (the lifetime ratio is diluted to noise; the interval "
+         "delta cleanly recovers the real rate). <b>RTT is coarse</b> &mdash; a device-aggregate "
+         "median blended across loopback/LAN/internet connections (a rough signal, not per-flow "
+         "truth; per-destination latency is a later slice). Absent is never averaged in as zero. "
+         "Same numbers as the "
+         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges.</div>";
 
-    // ── Co-occurrence headline ──
+    // ── Measurement-first: degraded classification + co-occurrence deferred ──
+    // The disproven absolute-ratio `degraded` boolean was retired; the interval
+    // rate above is empirically sound (separates 0%/4%/12% netem loss), but a
+    // hard degraded THRESHOLD needs real-fleet baseline data to calibrate (real
+    // internet paths retransmit ~0.5-2% while perfectly healthy — a loopback-
+    // calibrated threshold would cry wolf). So v1 ships the measurement; the
+    // degraded classification and the device/app co-occurrence it gates are a
+    // later slice. The NetCooccurrence model stays wired but unfed.
     h += "<div class=\"gp-sech\">Where the pain is &mdash; co-occurrence "
-         "<span class=\"gp-mute\">(measured, not blamed)</span></div>";
-    if (now.cooc.degraded == 0) {
-        h += "<div class=\"gp-note\">No device is currently flagged network-degraded.</div>";
-    } else {
-        auto band = [&](const char* token, const std::string& label, int64_t n) {
-            return "<tr><td>" +
-                   drill("/fragments/network/devices?cooc=" + std::string(token), label) +
-                   "</td><td style=\"text-align:right\">" + std::to_string(n) + "</td></tr>";
-        };
-        h += "<div class=\"gp-note\"><b>" + std::to_string(now.cooc.degraded) +
-             "</b> devices show degraded network quality. Of those, what <i>else</i> is happening on "
-             "the same box right now:</div>";
-        h += "<table class=\"gp-table\"><tbody>";
-        h += band("device", "&hellip; also under <b>device</b> perf pressure (CPU/mem/disk)",
-                  now.cooc.also_device);
-        // "no device-perf pressure" is what this band actually measures while the
-        // app dimension is unwired — NOT "network stands alone" (that would
-        // overstate it, since app instability isn't measured yet).
-        h += band("network_only", "&hellip; no device-perf pressure", now.cooc.network_only);
-        // App correlation (the DEX crash/hang join) lands with the per-connection
-        // collector slice — render it as PENDING, never a confident 0, so the
-        // panel can't overstate the network-standalone population.
-        h += "<tr><td><span class=\"gp-mute\">&hellip; also showing <b>app</b> instability "
-             "(crash/hang)</span></td><td style=\"text-align:right\">"
-             "<span class=\"gp-mute\">pending</span></td></tr>";
-        h += "</tbody></table>";
-        h += "<div class=\"gp-note\"><b>This is counting, not blaming.</b> &ldquo;Also under device "
-             "pressure&rdquo; means the two facts co-occur on the same box at the same time &mdash; "
-             "not a verdict that the device <i>caused</i> the slowness (memory pressure can look like "
-             "a network fault). The causal verdict is a deliberate overlay; v1 ships the evidence. "
-             "<b>App-instability co-occurrence is pending</b> &mdash; it arrives with the per-connection "
-             "collector; until then a degraded device with no device-perf pressure is shown as exactly "
-             "that, not asserted to be network-only.</div>";
-    }
+         "<span class=\"gp-mute\">(later slice)</span></div>";
+    h += "<div class=\"gp-note\"><b>Measurement-first.</b> v1 surfaces the interval retransmit rate as "
+         "evidence; it does <b>not</b> yet classify a device as <i>network-degraded</i>. A trustworthy "
+         "threshold needs a real-fleet baseline (healthy internet links retransmit a little, so the "
+         "cutoff can&rsquo;t be guessed), and the device/app co-occurrence headline &mdash; the "
+         "<i>where the pain is</i> view &mdash; is gated on that classification. Both land once there "
+         "is baseline data to calibrate against. Until then this page is honest evidence, not a "
+         "verdict.</div>";
     return h;
 }
 

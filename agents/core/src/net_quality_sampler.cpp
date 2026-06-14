@@ -5,7 +5,7 @@
 
 #include "net_quality_sampler.hpp"
 
-// Pure helpers (median / throughput_bps / is_degraded) are header-inline.
+// Pure helpers (median / throughput_bps / RetransWindow) are header-inline.
 
 // ── Linux implementation ─────────────────────────────────────────────────────
 #if defined(__linux__)
@@ -209,8 +209,12 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
             s.rtt_p50_ms = *p50;
         }
         if (segs > 0) {
+            // Raw cumulative device sums — the agent differences these across
+            // heartbeats (RetransWindow) for the interval rate. NOT a ratio here:
+            // the absolute Σretrans/Σsegs is the disproven, dilution-prone signal.
             s.retrans_valid = true;
-            s.retrans_pct = 100.0 * static_cast<double>(retrans) / static_cast<double>(segs);
+            s.retrans_total = retrans;
+            s.segs_out_total = segs;
         }
     }
 
@@ -220,7 +224,6 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
         s.throughput_bps = *bps;
     }
 
-    s.degraded = is_degraded(s.rtt_valid, s.rtt_p50_ms, s.retrans_valid, s.retrans_pct);
     return s;
 }
 

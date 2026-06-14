@@ -1460,6 +1460,12 @@ public:
                         // heartbeat network throughput delta (same re-baseline
                         // semantics as hb_prev_perf).
                         netq::NetCounters hb_prev_net;
+                        // 4b.3: rolling window of raw cumulative Σretrans/Σsegs
+                        // readings — the device retransmit RATE is the interval
+                        // delta over this window, not a single sample's absolute
+                        // ratio. Lambda-local so a reconnect re-baselines (a new
+                        // session ships no rate until it has ≥2 readings again).
+                        netq::RetransWindow hb_net_retrans_window;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1573,15 +1579,25 @@ public:
                                 if (ns.rtt_valid)
                                     tags["yuzu.net_rtt_p50_ms"] =
                                         std::format("{:.1f}", ns.rtt_p50_ms);
+                                // Interval retransmit RATE (ΔΣretr/ΔΣsegs over a
+                                // short window), NOT the absolute lifetime ratio
+                                // (which is diluted to noise). Push this cycle's
+                                // raw device sums, then ship the windowed delta
+                                // once there are ≥2 readings (absent on the first
+                                // of a session — never a fabricated 0).
+                                // MEASUREMENT-FIRST: no `net_degraded` verdict —
+                                // a hard threshold needs real-fleet baseline
+                                // calibration (a later slice), so it is retired
+                                // here rather than shipped loopback-calibrated.
                                 if (ns.retrans_valid)
+                                    hb_net_retrans_window.push(ns.retrans_total,
+                                                               ns.segs_out_total);
+                                if (auto rp = hb_net_retrans_window.rate_pct())
                                     tags["yuzu.net_retrans_pct"] =
-                                        std::format("{:.2f}", ns.retrans_pct);
+                                        std::format("{:.2f}", *rp);
                                 if (ns.throughput_valid)
                                     tags["yuzu.net_throughput_bps"] =
                                         std::format("{:.0f}", ns.throughput_bps);
-                                // net_degraded only when a quality signal exists.
-                                if (ns.rtt_valid || ns.retrans_valid)
-                                    tags["yuzu.net_degraded"] = ns.degraded ? "1" : "0";
                             }
 
                             // PR 10: attach pushed fleet snapshot if the

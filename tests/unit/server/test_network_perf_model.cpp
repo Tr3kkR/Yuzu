@@ -34,6 +34,9 @@ namespace rules = yuzu::server::detail;
 static_assert(std::string_view(rules::kNetTagRttP50Ms) == "yuzu.net_rtt_p50_ms");
 static_assert(std::string_view(rules::kNetTagRetransPct) == "yuzu.net_retrans_pct");
 static_assert(std::string_view(rules::kNetTagThroughputBps) == "yuzu.net_throughput_bps");
+// net_degraded is RETIRED — agents no longer emit this tag (measurement-first;
+// the gauge is dormant). The server still parses it defensively for mixed-version
+// rolling upgrades, so the constant + this pin stay; it is NOT a live-emit guarantee.
 static_assert(std::string_view(rules::kNetTagDegraded) == "yuzu.net_degraded");
 
 namespace {
@@ -231,12 +234,17 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     const auto html = render_network_overview_fragment(snap);
     CHECK(html.find("Network quality") != std::string::npos);
     CHECK(html.find("Round-trip time") != std::string::npos);
-    CHECK(html.find("co-occurrence") != std::string::npos);
-    CHECK(html.find("counting, not blaming") != std::string::npos); // never a verdict
-    CHECK(html.find("TCP_INFO") != std::string::npos);              // Linux/Windows honesty note
-    CHECK(html.find("cooc=device") != std::string::npos);          // real band drill
-    CHECK(html.find("cooc=network_only") != std::string::npos);     // real band drill
-    CHECK(html.find("pending") != std::string::npos);              // app co-occurrence is pending, not a fake 0
+    CHECK(html.find("TCP_INFO") != std::string::npos);                // Linux/Windows honesty note
+    // Measurement-first (4b.3): the retransmit fact is an INTERVAL rate, and the
+    // degraded classification + the co-occurrence headline it gates are a later
+    // slice (a hard threshold needs real-fleet baseline data) — the overview must
+    // say so honestly, never imply "0 degraded == healthy".
+    CHECK(html.find("interval rate") != std::string::npos);           // not the lifetime ratio
+    CHECK(html.find("co-occurrence") != std::string::npos);           // section still named...
+    CHECK(html.find("later slice") != std::string::npos);             // ...but explicitly deferred
+    CHECK(html.find("Measurement-first") != std::string::npos);
+    CHECK(html.find("baseline") != std::string::npos);                // threshold needs a real-fleet baseline
+    CHECK(html.find("not a verdict") != std::string::npos);           // honest evidence, never a verdict
 }
 
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {

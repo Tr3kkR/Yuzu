@@ -11,21 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Network quality dashboard (`/network`).** A new top-level page surfaces
   fleet-wide TCP network quality measured continuously on each endpoint from
-  kernel counters (no packet capture, no flow export). Fleet-now cards show RTT
-  p50/p90/max, TCP retransmit %, and device throughput; a co-occurrence panel
-  counts how many network-degraded devices also show device-perf pressure
-  (CPU/memory/disk) at the same time — **counted, never attributed** (app
-  co-occurrence is pending a later slice). The Devices drill lists
-  worst-by-metric / co-occurrence-band / not-reporting devices with inline
-  flags. **Linux** agents report the full per-connection tier via netlink
-  `INET_DIAG` (smoothed RTT + retransmit ratio + `/proc/net/dev` throughput);
-  Windows v1 is coarser (absent metrics are omitted, never averaged as zero).
-  New device-aggregate heartbeat tags
-  `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps,degraded}` (no per-destination
-  data; gated by `--dex-disable`) and Prometheus gauges
-  `yuzu_fleet_net_{reporting,degraded,rtt_ms,retrans_pct,throughput_bps}`. Page
-  permission: `GuaranteedState:Read`. See `docs/user-manual/network.md` and
-  `docs/user-manual/metrics.md`.
+  kernel counters (no packet capture, no flow export) — a **device / local-link
+  health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+  rate**, and device throughput. The retransmit rate is ΔΣretransmits /
+  ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
+  the lifetime ratio — empirically the lifetime ratio is diluted to noise while
+  the interval delta cleanly recovers the real loss rate. **Measurement-first:**
+  the page ships honest evidence and does **not** yet classify a device as
+  *network-degraded* — a calibrated threshold needs real-fleet baseline data, so
+  the degraded classification and the device/app co-occurrence headline it gates
+  are a later slice (the model stays wired but unfed). **Linux** agents report
+  via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
+  throughput; **Windows and macOS emit nothing yet** (later slices — absent
+  metrics are omitted, never zeroed). Device-aggregate heartbeat tags
+  `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
+  gated by `--dex-disable`) and Prometheus gauges
+  `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
+  (`yuzu_fleet_net_retrans_reporting` is the retransmit-rate denominator;
+  `yuzu_fleet_net_degraded` is dormant/absent until the classification lands).
+  An opt-in per-connection warehouse tier (`netqual_enabled` TAR config →
+  on-device `$NetQual_Live`, bucket-only destination class, top-N capped, Linux)
+  ships as the foundation for the deferred per-destination drill; it has no
+  dashboard consumer in v1. Page permission: `GuaranteedState:Read`. See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
+  *Note:* `yuzu.net_retrans_pct` / `yuzu_fleet_net_retrans_pct` changed meaning
+  within the unreleased cycle (absolute lifetime ratio → interval delta) and
+  `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
+  Prometheus alerts built on the earlier 4a semantics.
 
 ### Changed
 

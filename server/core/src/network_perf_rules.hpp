@@ -16,10 +16,13 @@
 /// still poison the average with the ceiling value); inf/nan/negative/garbage
 /// → nullopt, which the caller MUST treat as "did not report", never 0.
 ///
-/// THE EDGE SHIPS FACTS, NEVER A VERDICT. `net_degraded` is a measured device
-/// fact; `net_device_under_pressure()` is a measured CO-OCCURRENCE threshold
-/// used only to COUNT "this box is also under perf strain right now" — it is
-/// NOT a causal verdict and NOT a Guardian trigger.
+/// THE EDGE SHIPS FACTS, NEVER A VERDICT. `net_degraded` is RETIRED (measurement-
+/// first): agents no longer emit it (the absolute-ratio threshold was disproven;
+/// a calibrated one needs real-fleet baseline data — a later slice). The parser +
+/// `kNetTagDegraded` stay for mixed-version rolling upgrades, but the value is
+/// dormant. `net_device_under_pressure()` is a measured CO-OCCURRENCE threshold
+/// used only to COUNT "this box is also under perf strain right now" — it is NOT
+/// a causal verdict and NOT a Guardian trigger.
 
 #include "dex_perf_rules.hpp"
 

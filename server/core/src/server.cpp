@@ -383,15 +383,24 @@ public:
                           "Agents whose latest heartbeat carried at least ONE network fact — the "
                           "same any-of definition the /network Overview's Reporting card uses",
                           "gauge");
+        metrics_.describe("yuzu_fleet_net_retrans_reporting",
+                          "Agents that reported an interval retransmit RATE this cycle (a subset of "
+                          "net_reporting — a device can report RTT while its retransmit window is "
+                          "still warming). Use as the denominator for net_retrans_pct so a low rate "
+                          "can be told apart from a collection outage", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
-                          "Agents reporting the net_degraded fact this cycle (a COUNT, not a "
-                          "verdict — the /network co-occurrence headline's degraded population)",
-                          "gauge");
+                          "DORMANT (measurement-first): absent unless an agent still emits the "
+                          "retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
+                          "classification needs real-fleet baseline calibration (a later slice) — "
+                          "treat ABSENT as 'not classified', never 0 as 'healthy'", "gauge");
         metrics_.describe("yuzu_fleet_net_rtt_ms",
                           "Fleet smoothed round-trip time in ms, by {stat}: avg / p50 / p90 / max "
                           "(its population is the devices that report RTT — Linux today)", "gauge");
         metrics_.describe("yuzu_fleet_net_retrans_pct",
-                          "Fleet TCP retransmission %, by {stat}: avg / p50 / p90 / max", "gauge");
+                          "Fleet TCP retransmit rate %, by {stat}: avg / p50 / p90 / max. INTERVAL "
+                          "rate (interval delta of retransmits / segments over recent heartbeats), "
+                          "not the lifetime ratio. Population: yuzu_fleet_net_retrans_reporting",
+                          "gauge");
         metrics_.describe("yuzu_fleet_net_throughput_bps",
                           "Fleet device network throughput in bytes/s, by {stat}: avg / p50 / p90 "
                           "/ max", "gauge");
