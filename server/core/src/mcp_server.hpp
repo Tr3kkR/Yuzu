@@ -6,6 +6,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "ca_store.hpp"
+#include "dex_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -96,7 +97,8 @@ public:
                             ScheduleEngine* schedule_engine, const bool& read_only_mode,
                             const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
                             CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
-                            GuaranteedStateStore* guaranteed_state_store = nullptr);
+                            GuaranteedStateStore* guaranteed_state_store = nullptr,
+                            DexPerfFn dex_perf_fn = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -110,7 +112,8 @@ public:
                          const bool& read_only_mode, const bool& mcp_disabled,
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
-                         GuaranteedStateStore* guaranteed_state_store = nullptr);
+                         GuaranteedStateStore* guaranteed_state_store = nullptr,
+                         DexPerfFn dex_perf_fn = {});
 };
 
 } // namespace yuzu::server::mcp

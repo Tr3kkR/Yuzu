@@ -437,7 +437,7 @@ Returns `200 OK` with:
 }
 ```
 
-Returns `404` if the token ID is not found.
+Returns `404` if the token ID is not found. Returns `503 service unavailable` if the server's token store database failed to open at startup — a storage outage is never reported as `404` (see the API Tokens section of the [REST API reference](rest-api.md)).
 
 ## MCP Tokens
 
@@ -562,9 +562,9 @@ All authentication and authorization errors use the standard JSON envelope:
 ```
 
 HTTP status codes:
-- `401 Unauthorized` — No valid authentication provided (missing/invalid token)
+- `401 Unauthorized` — No valid authentication provided (missing/invalid token). Also returned when the token store itself is unavailable: authentication fails closed rather than revealing storage state. If valid tokens suddenly return `401`, check `/readyz` for `api_token_store` before rotating credentials.
 - `403 Forbidden` — Authentication valid but operation not permitted (scope/tier/role restriction)
-- `503 Service Unavailable` — Required backend (e.g., TagStore) unavailable for scope verification
+- `503 Service Unavailable` — Required backend unavailable: TagStore for scope verification, or the API token store database failed to open at startup (token CRUD routes)
 
 ## API Reference Summary
 

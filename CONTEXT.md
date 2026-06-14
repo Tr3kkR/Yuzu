@@ -73,6 +73,14 @@ Whether one node in the fleet can initiate a network connection to another. Yuzu
 
 Distinct from **Scope**, which is a device-*set* target expression, not a graph; reachability is about edges between nodes, not membership.
 
+## Cohort
+
+The comparison population for fleet-relative performance benchmarking: the set of reporting devices sharing a value for an **operator-chosen tag key** (e.g. every device tagged `model: Latitude 7440`, or `image: vanilla` vs `image: layered`). Cohorts are derived from tags — never from self-asserted inventory or a central hardware column — so hardware-model cohorts exist only where an operator (or an agentic worker, via the asset-tagging recipe) has tagged the fleet. A cohort below the statistical floor (10 reporting devices) is reported as too small rather than given noisy percentiles; devices carrying no value for the chosen key form an explicit untagged residual, never a silent omission. Distinct from **Scope** (a targeting expression) and from a Management Group (an authz/targeting grouping): a cohort is a read-side analytical grouping with no authorization meaning.
+
+## Reporting population
+
+The denominator that travels with every fleet-aggregate performance statistic: how many devices actually contributed values in the current cycle. A fleet average over 12 devices is never presented as fleet-wide truth without its population; a metric nobody reported is absent, never a fabricated zero.
+
 ## Asset value (Crown jewel)
 
 A risk-weighting of how much a node matters to defend — a *value* axis, **orthogonal** to tags, management groups, and scope (which are *targeting* axes). **Operator-declared**: the defender knows what matters and Yuzu does not guess it, though optional inference *hints* may suggest a value (never auto-apply it). Value is carried by the **service** — the process/listening unit where a vulnerability and an exposed port actually live — and may also be declared on an addressable instance (container, VM, bare-metal host). A host's **effective value is the maximum** of the values of the services/instances it carries: a box is as valuable a target as its most valuable tenant. A **crown jewel** is the high end of that axis — the service whose compromise is the attacker's objective and the defender's nightmare. New term; does not collide with any existing Yuzu concept.

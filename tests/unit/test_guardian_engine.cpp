@@ -401,6 +401,105 @@ TEST_CASE("GuardianEngine: construction with null KvStore degrades gracefully",
     CHECK(applied.error().find("kv store unavailable") != std::string::npos);
 }
 
+TEST_CASE("GuardianEngine: drift event_id embeds agent_id (#1307)",
+          "[guardian][engine][event][event_id]") {
+    GuardianFixture f;  // agent_id == "agent-test"
+
+    std::string captured_id;
+    f.engine->set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
+        captured_id = ev.event_id();
+    });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "registry";
+    d.rule_id = "rule-A";
+    d.rule_name = "rule-A";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    REQUIRE_FALSE(captured_id.empty());
+    // Layout is "<rule_id>-<agent_id>-<ms>-<seq>"; assert agent_id is present and
+    // sits immediately after the rule_id prefix (the slot the crash path uses).
+    CHECK(captured_id.find("agent-test") != std::string::npos);
+    CHECK(captured_id.rfind("rule-A-agent-test-", 0) == 0);
+}
+
+TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event_ids (#1307)",
+          "[guardian][engine][event][event_id]") {
+    // The fleet-collision regression: per-agent event_seq_ both start at 0, so two
+    // agents drifting on the SAME rule in the SAME millisecond previously minted an
+    // identical "rule_id-ms-0" id and the server's global-PK events table dropped
+    // all but one. Folding agent_id in must make the ids distinct regardless of
+    // timing — so this test does NOT depend on the two emits landing in the same ms.
+    // Declaration order pins the destruction contract (reverse order): eng_b,
+    // eng_a destruct (stop(), no KV touch) before kv_b, kv_a close their SQLite
+    // handles, before the TempDbFiles remove the .db/-wal/-shm trio — same engine
+    // → kv → db ordering GuardianFixture documents at its top.
+    yuzu::test::TempDbFile db_a{unique_kv_path()};
+    yuzu::test::TempDbFile db_b{unique_kv_path()};
+    auto open_a = KvStore::open(db_a.path);
+    auto open_b = KvStore::open(db_b.path);
+    REQUIRE(open_a.has_value());
+    REQUIRE(open_b.has_value());
+    KvStore kv_a{std::move(*open_a)};
+    KvStore kv_b{std::move(*open_b)};
+    GuardianEngine eng_a{&kv_a, "agent-alpha"};
+    GuardianEngine eng_b{&kv_b, "agent-bravo"};
+    REQUIRE(eng_a.start_local().has_value());
+    REQUIRE(eng_b.start_local().has_value());
+
+    std::string id_a, id_b;
+    eng_a.set_event_sink([&id_a](const gpb::GuaranteedStateEvent& ev) { id_a = ev.event_id(); });
+    eng_b.set_event_sink([&id_b](const gpb::GuaranteedStateEvent& ev) { id_b = ev.event_id(); });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "registry";
+    d.rule_id = "shared-rule";
+    d.rule_name = "shared-rule";
+    // Both engines emit their first event (seq 0) for the same rule_id.
+    yuzu::agent::guardian_emit_drift_for_test(eng_a, d);
+    yuzu::agent::guardian_emit_drift_for_test(eng_b, d);
+
+    REQUIRE_FALSE(id_a.empty());
+    REQUIRE_FALSE(id_b.empty());
+    CHECK(id_a != id_b);  // no PK collision
+    // Prefix-anchor each id independently (not just containment): this pins the
+    // "{rule_id}-{agent_id}-..." layout so the test fails against the pre-fix
+    // "{rule_id}-{ms}-{seq}" shape on its own, without depending on a timing
+    // difference between the two emits or on the sibling test having run.
+    CHECK(id_a.rfind("shared-rule-agent-alpha-", 0) == 0);
+    CHECK(id_b.rfind("shared-rule-agent-bravo-", 0) == 0);
+}
+
+TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguous) event_id",
+          "[guardian][engine][event][event_id]") {
+    // Edge bordering the #1307 invariant: agent_id is server-assigned at enrollment
+    // so it is non-empty in production, but assert the degenerate empty case does not
+    // crash and still produces the "{rule_id}-{agent_id}-{ms}-{seq}" skeleton with an
+    // empty agent_id segment ("rule-Z--<ms>-<seq>"). Documents that an empty agent_id
+    // re-opens the cross-agent collision for that (pathological) population — see the
+    // UP-2 follow-up — rather than silently changing shape.
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine eng{&kv, ""};
+    REQUIRE(eng.start_local().has_value());
+
+    std::string captured_id;
+    eng.set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
+        captured_id = ev.event_id();
+    });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "registry";
+    d.rule_id = "rule-Z";
+    d.rule_name = "rule-Z";
+    yuzu::agent::guardian_emit_drift_for_test(eng, d);
+
+    REQUIRE_FALSE(captured_id.empty());
+    CHECK(captured_id.rfind("rule-Z--", 0) == 0);  // empty agent_id segment, not a crash
+}
+
 TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
           "[guardian][engine][lifecycle]") {
     GuardianFixture f;

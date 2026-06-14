@@ -25,6 +25,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 
 // Forward declarations to avoid pulling in full store headers
@@ -43,6 +44,8 @@ class ExecutionTracker;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class GuaranteedStateStore;
+class BlastRadiusDetector;
+class DexAlertRouter;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -95,6 +98,16 @@ public:
     void set_guaranteed_state_store(GuaranteedStateStore* store) {
         guaranteed_state_store_ = store;
     }
+    /// Fleet-wide DEX incident detector (blast radius, coverage-map D3) — the
+    /// shared Guardian ingest feeds it each ruleless observation. nullptr
+    /// disables detection. Set-before-traffic, like the store setters above.
+    void set_blast_radius_detector(BlastRadiusDetector* detector) {
+        blast_radius_detector_ = detector;
+    }
+    /// Operator-routed per-signal alerting (coverage-map F1) — fed alongside
+    /// the blast-radius detector at the same ingest chokepoint. nullptr
+    /// disables routing. Set-before-traffic.
+    void set_dex_alert_router(DexAlertRouter* router) { dex_alert_router_ = router; }
 
     /// UAT 2026-05-12: after a fresh agent registers, the next
     /// `/api/v1/viz/fleet/topology` call must not return a snapshot
@@ -144,8 +157,10 @@ public:
     /// posture AFTER bootstrap — require_client_identity_ is otherwise baked at ctor,
     /// before the default CA exists. All set once during bring-up, before the gRPC
     /// dispatcher accepts traffic.
+    /// `src` records whether issuance entered via the direct Register path or the
+    /// gateway proxy, threaded into the ca.cert.issued audit (#1290).
     using AgentCertSigner = std::function<std::optional<std::pair<std::string, std::string>>(
-        const std::string& csr_pem, const std::string& agent_id)>;
+        const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
     void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
     void set_revocation_checker(std::function<bool(const std::string& peer_cert_pem)> checker) {
         revocation_checker_ = std::move(checker);
@@ -310,6 +325,8 @@ private:
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
+    BlastRadiusDetector* blast_radius_detector_{nullptr};
+    DexAlertRouter* dex_alert_router_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached

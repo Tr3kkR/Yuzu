@@ -63,21 +63,12 @@ scale_test_() ->
       ]}}.
 
 setup() ->
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _ -> ok
-    end,
     %% Kill and restart the registry so we don't inherit a gen_server
-    %% mailbox full of DOWN messages from other test modules.
-    %% Must use exit/2 because gen_server:stop queues behind the DOWNs.
-    case whereis(yuzu_gw_registry) of
-        undefined -> ok;
-        Old ->
-            unlink(Old),
-            exit(Old, kill),
-            timer:sleep(100)
-    end,
-    {ok, _} = yuzu_gw_registry:start_link(),
+    %% mailbox full of DOWN messages from other test modules. ensure_fresh
+    %% evicts the old one and waits for its named ETS tables to be reaped
+    %% before start_link — the fixed-sleep version raced that reap on slow
+    %% runners (#1403 / #336).
+    yuzu_gw_test_registry:ensure_fresh(),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.

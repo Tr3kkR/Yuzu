@@ -35,6 +35,7 @@ Structured JSON envelope:
 - Suitable for direct delivery to Splunk HEC or generic webhook sinks.
 - Indexed by `timestamp` and `principal` for efficient queries.
 - Denied operations MUST emit an audit event — `spdlog::warn` alone breaks the SOC 2 CC7.2 evidence chain.
+- **Store-availability 503 guards do NOT audit.** A request rejected because a store's database never opened (`is_open()` gate, e.g. the `/api/v1/tokens` routes per #347 CH-3) is an *operational* event, not a principal action: the guard runs before any token/principal interaction, so there is no operation to evidence. The CC7.2 evidence for the outage is the boot-time `spdlog::error` plus the store's entry in the `/readyz` conjunction (and, once #1385 lands, the store-readiness gauge). This is the platform-wide convention for every store-down guard — do not add per-request audit rows to these paths.
 
 ## Event format (envelope)
 

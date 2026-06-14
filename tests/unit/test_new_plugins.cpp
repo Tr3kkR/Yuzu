@@ -3,7 +3,7 @@
  *
  * Covers descriptors (name, version, actions, ABI) and validation logic for:
  *   http_client, content_dist, interaction, agent_logging, storage,
- *   registry, wmi
+ *   registry, wmi, rdp_control
  *
  * Also covers service name validation (duplicated from TriggerEngine).
  *
@@ -326,6 +326,7 @@ DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")
 DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear")
 DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
+DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)
@@ -595,6 +596,96 @@ TEST_CASE("wmi: empty and garbage namespaces rejected",
 }
 
 // ============================================================================
+// Section 7b: rdp_control state validation (mirrors rdp_control_plugin
+// anonymous ns — keep in sync with is_valid_rdp_state)
+// ============================================================================
+
+namespace {
+
+/// Mirror of rdp_control_plugin.cpp: is_valid_rdp_state
+bool test_is_valid_rdp_state(std::string_view state) {
+    return state == "enable" || state == "disable";
+}
+
+/// Mirror of rdp_control_plugin.cpp: derive_rdp_verdict — keep in sync.
+/// "on" only when every gate is readable and open; "unknown" when any gate is
+/// unreadable; "off" when all readable but at least one closed.
+std::string_view test_derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
+                                         bool fw_enabled, bool svc_known, bool svc_running) {
+    if (!deny_known || !fw_known || !svc_known)
+        return "unknown";
+    return (deny_allows && fw_enabled && svc_running) ? "on" : "off";
+}
+
+/// Mirror of rdp_control_plugin.cpp: classify_fw_hr — keep in sync. The HRESULT
+/// constants are S_OK=0, S_FALSE=1 (we avoid <windows.h> in this TU). The
+/// security-critical rule: S_FALSE (group absent) is NOT success — it must map
+/// to "group_not_found", never be accepted as a confirmed read (H2).
+enum class TestFwResult { Ok, GroupNotFound, Error };
+TestFwResult test_classify_fw_hr(long hr) {
+    if (hr == 0L) return TestFwResult::Ok;          // S_OK
+    if (hr == 1L) return TestFwResult::GroupNotFound; // S_FALSE
+    return TestFwResult::Error;
+}
+
+} // namespace
+
+TEST_CASE("rdp_control: valid states accepted",
+          "[plugins][rdp_control][validation]") {
+    CHECK(test_is_valid_rdp_state("enable"));
+    CHECK(test_is_valid_rdp_state("disable"));
+}
+
+TEST_CASE("rdp_control: invalid states rejected",
+          "[plugins][rdp_control][validation]") {
+    CHECK_FALSE(test_is_valid_rdp_state(""));
+    CHECK_FALSE(test_is_valid_rdp_state("Enable"));   // case-sensitive
+    CHECK_FALSE(test_is_valid_rdp_state("DISABLE"));
+    CHECK_FALSE(test_is_valid_rdp_state("on"));
+    CHECK_FALSE(test_is_valid_rdp_state("off"));
+    CHECK_FALSE(test_is_valid_rdp_state("enable; rm -rf /"));
+}
+
+TEST_CASE("rdp_control: verdict is 'on' only when all gates readable and open",
+          "[plugins][rdp_control][validation]") {
+    // all readable + all open -> on
+    CHECK(test_derive_rdp_verdict(true, true, true, true, true, true) == "on");
+}
+
+TEST_CASE("rdp_control: verdict is 'unknown' when any gate is unreadable",
+          "[plugins][rdp_control][validation]") {
+    // The security-relevant case: a failed read must NOT report "off"/safe.
+    CHECK(test_derive_rdp_verdict(false, true, true, true, true, true) == "unknown");
+    CHECK(test_derive_rdp_verdict(true, true, false, true, true, true) == "unknown");
+    CHECK(test_derive_rdp_verdict(true, true, true, true, false, true) == "unknown");
+    // unknown dominates even when the readable gates look closed
+    CHECK(test_derive_rdp_verdict(false, false, true, false, true, false) == "unknown");
+}
+
+TEST_CASE("rdp_control: verdict is 'off' when all gates readable but one closed",
+          "[plugins][rdp_control][validation]") {
+    CHECK(test_derive_rdp_verdict(true, false, true, true, true, true) == "off");   // deny=1
+    CHECK(test_derive_rdp_verdict(true, true, true, false, true, true) == "off");   // fw disabled
+    CHECK(test_derive_rdp_verdict(true, true, true, true, true, false) == "off");   // svc not running
+    CHECK(test_derive_rdp_verdict(true, false, true, false, true, false) == "off"); // all closed
+}
+
+TEST_CASE("rdp_control: S_FALSE firewall HRESULT is NOT success (H2 fail-safe)",
+          "[plugins][rdp_control][validation]") {
+    // S_OK is the only success; S_FALSE (group absent) must classify as
+    // group_not_found so an enable is never a silent no-op reported ok and a
+    // status read never derives "off" from an unreadable gate.
+    CHECK(test_classify_fw_hr(0L) == TestFwResult::Ok);              // S_OK
+    CHECK(test_classify_fw_hr(1L) == TestFwResult::GroupNotFound);   // S_FALSE
+    CHECK(test_classify_fw_hr(static_cast<long>(0x80004005)) == TestFwResult::Error); // E_FAIL
+    CHECK(test_classify_fw_hr(static_cast<long>(0x80070005)) == TestFwResult::Error); // E_ACCESSDENIED
+    // The H2 inversion guard: a group-not-found firewall read feeds fw_known=false
+    // into the verdict, which must yield "unknown", never "off".
+    const bool fw_known = (test_classify_fw_hr(1L) == TestFwResult::Ok); // false
+    CHECK(test_derive_rdp_verdict(true, true, fw_known, false, true, true) == "unknown");
+}
+
+// ============================================================================
 // Section 8: Trigger engine — service name validation
 //
 // TriggerEngine::is_valid_service_name is a private static method, so we
@@ -672,7 +763,7 @@ TEST_CASE("all plugins: action strings are non-empty and unique",
     // Build a list of plugin names to try loading
     std::vector<std::string> plugin_names = {
         "http_client", "content_dist", "interaction", "agent_logging",
-        "storage", "registry", "wmi"
+        "storage", "registry", "wmi", "rdp_control"
     };
 
     for (const auto& name : plugin_names) {
@@ -701,7 +792,7 @@ TEST_CASE("all plugins: ABI version is exactly YUZU_PLUGIN_ABI_VERSION",
           "[plugins][descriptor][invariants]") {
     std::vector<std::string> plugin_names = {
         "http_client", "content_dist", "interaction", "agent_logging",
-        "storage", "registry", "wmi"
+        "storage", "registry", "wmi", "rdp_control"
     };
 
     for (const auto& name : plugin_names) {

@@ -23,11 +23,18 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "dex_perf_model.hpp"
+
 #include <httplib.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -42,6 +49,25 @@ struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
 };
+
+/// One display family of the server-side signal catalogue. PUBLIC since F1:
+/// the Settings → DEX alerts panel renders the routable-type list from this
+/// same single source of truth (the /dex Catalogue's grouping).
+struct DexSignalGroup {
+    const char* name;
+    std::vector<const char*> types;
+};
+
+/// The catalogued signal types, grouped for display — the server-side mirror
+/// of the agent catalogue (keep in sync; the paired drift-net tests bite).
+const std::vector<DexSignalGroup>& dex_signal_groups();
+
+/// Total catalogued display types (sum over the groups).
+std::size_t dex_catalogued_type_count();
+
+/// Friendly display label for an obs_type; unknown types fall back to the
+/// HTML-escaped raw obs_type (forward-compatible, render-safe).
+std::string dex_signal_label(const std::string& obs_type);
 
 /// Shared window-selector resolvers — the single source of truth for how both the
 /// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
@@ -63,7 +89,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days,
                                          DexFleet fleet);
 
-/// Catalogue View 1 — the 12 family cards (mockup dex-catalogue.html), each a drill
+/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue.html), each a drill
 /// into its family. Reuses dex_signal_summary + dex_signal_groups. Pure + free.
 std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                                           const std::string& since, int window_days);
@@ -108,9 +134,104 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 /// __observation__ events). This is behavioral PII (which apps a person runs);
 /// the route gates it on Read and audit-logs each open. `window` is the selector
 /// TOKEN (window-scoped to match the linking overview row). Pure + free so it is
-/// unit-testable directly.
+/// unit-testable directly. `perf_snap` (PR2, may be null) feeds the vs-fleet/
+/// cohort percentile strips; null omits the strips section (feature unwired).
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
-                                       const std::string& agent_id, const std::string& window);
+                                       const std::string& agent_id, const std::string& window,
+                                       const DexPerfSnapshot* perf_snap = nullptr);
+
+// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+
+/// One agent's stored response to a dispatched command — the narrow seam the
+/// device perf panel needs from the ResponseStore (a struct, not a store dep,
+/// keeps DexRoutes decoupled and the routes testable with a fake).
+struct DexAgentResponse {
+    std::string agent_id;
+    int status{0}; ///< CommandResponse::Status enum value (0=RUNNING, 1=SUCCESS, 2=FAILURE, …)
+    std::string output;
+    std::string error_detail;
+};
+
+/// One parsed hourly perf point out of the device's TAR edge warehouse
+/// (`$Perf_Hourly` — see agents/plugins/tar perf tier, BRD A1).
+struct DexPerfPoint {
+    std::int64_t hour_ts{0};
+    double cpu_avg{0.0};      ///< % busy, clamped 0..100
+    double mem_avg{0.0};      ///< % physical used, clamped 0..100
+    double disk_lat_ms{0.0};  ///< worse of read/write avg per-IO service time
+};
+
+/// PURE: parse the `tar.sql` pipe-delimited output (`__schema__|col|…` header +
+/// data rows) into perf points, chronologically sorted. Defensive against
+/// agent-controlled bytes: columns are located by NAME from the schema line,
+/// non-finite/negative numbers are rejected per-field, malformed rows are
+/// skipped, and at most 200 rows are read. Returns empty on an `error|…`
+/// payload or a missing schema line.
+std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output);
+
+/// PURE: render the device-performance panel (per-metric sparkline SVG +
+/// now/min/max facts) from parsed points. Empty input renders the honest
+/// "no history" note. Server-rendered SVG — no JS, CSP-safe.
+std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
+
+// ── F2a PR2: device drill perf extensions ────────────────────────────────────
+
+/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
+/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
+struct DexProcPerfRow {
+    std::string name; ///< image name — agent bytes, HTML-escape at render
+    std::int64_t samples{0};
+    std::int64_t instances_max{0};
+    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
+    double cpu_max{0.0};
+    double ws_avg_bytes{0.0};
+    double ws_max_bytes{0.0};
+    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
+};
+
+/// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
+/// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
+/// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
+/// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
+/// outlier); working-set bytes above 1 PiB are rejected as forged.
+std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output);
+
+/// PURE: render the per-application panel from parsed rows. App names link to
+/// the existing app reliability drill (per-app perf ↔ per-app crashes cross-
+/// link). Empty input renders the SOFT truthful empty state: the device's
+/// read-only query surface deliberately hides plugin config, so the server
+/// cannot distinguish "procperf disabled (the default)" from "enabled, no
+/// rollup yet" — the message says both honestly (the crisp distinction needs
+/// the tar-plugin source_state meta table, a filed follow-up).
+std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
+                                      const std::string& window);
+
+/// PURE: render the "this device vs fleet & cohort" percentile strips —
+/// current heartbeat values against the CURRENT registry distributions
+/// (now-vs-now; no retained history). Cohort comparison is withheld below the
+/// kDexCohortFloor with an honest caption; a non-reporting device renders an
+/// honest note, never empty bars.
+std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
+                                           const std::string& cohort_key,
+                                           const std::string& window);
+
+// ── F2a: fleet Performance tab (now-view over registry heartbeat state) ─────
+
+/// PURE: the /fragments/dex/perf content — fleet-now cards (same stats as the
+/// yuzu_fleet_perf_* gauges, via the shared dex_perf_rules) + the cohort
+/// benchmarking tables for `snap.cohort_key`. Every aggregate is a drill: the
+/// metric cards open the worst-devices list, the Reporting card opens the
+/// not-reporting list, cohort rows open their device list. NO window chips —
+/// the page is a now-view (trend charts are F2b, Postgres-gated).
+std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days);
+
+/// PURE: the /fragments/dex/perf/devices drill — the ONE device list serving
+/// every Performance-page drill (worst-by-metric / not-reporting / cohort
+/// membership). Rows link to the per-device drill-down.
+std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
+                                             bool not_reporting,
+                                             const std::optional<std::string>& cohort_filter,
+                                             int limit, int window_days);
 
 /// DEX routes — /dex (page shell) + /fragments/dex/overview (HTMX fragment).
 class DexRoutes {
@@ -132,19 +253,42 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// A4: dispatch a plugin command to specific agents (same 5-param shape as
+    /// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
+    /// perf query. May be empty → the perf panel renders "unavailable".
+    using DispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters)>;
+
+    /// A4: read the stored responses for a command_id (narrow ResponseStore
+    /// seam). May be empty → the perf panel renders "unavailable".
+    using ResponsesFn =
+        std::function<std::vector<DexAgentResponse>(const std::string& command_id)>;
+
+    /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
+    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
+    /// empty → the Performance tab renders an honest "unavailable" placeholder.
+    using PerfFn = DexPerfFn;
+
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
     /// Guardian read surface — a dedicated DEX:Read perm is deferred). `store` may
-    /// be null (fragments render the no-data placeholder); `fleet_fn`/`audit_fn`
-    /// may be empty.
+    /// be null (fragments render the no-data placeholder); `fleet_fn`/`audit_fn`/
+    /// `dispatch_fn`/`responses_fn` may be empty (the device perf panel then
+    /// degrades to an honest "unavailable" note).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                         GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn);
+                         GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         PerfFn perf_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn);
+                         GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         PerfFn perf_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -152,6 +296,9 @@ private:
     GuaranteedStateStore* store_{};
     FleetFn fleet_fn_;
     AuditFn audit_fn_;
+    DispatchFn dispatch_fn_;
+    ResponsesFn responses_fn_;
+    PerfFn perf_fn_;
 };
 
 } // namespace yuzu::server

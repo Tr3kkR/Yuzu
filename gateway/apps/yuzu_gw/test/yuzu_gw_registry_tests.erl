@@ -42,17 +42,12 @@ registry_test_() ->
      ]}.
 
 setup() ->
-    %% pg needs kernel to be started; it should be in test env.
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _         -> ok
-    end,
-    case yuzu_gw_registry:start_link() of
-        {ok, Pid}                       -> Pid;
-        {error, {already_started, Pid}} -> Pid
-    end.
+    %% pg + a real registry, race-safe across modules. The naive
+    %% start_link here previously had no handling for the init/1 crash a
+    %% leaked-ETS-table orphan triggers (#1403 / #336).
+    yuzu_gw_test_registry:ensure().
 
-cleanup(_Pid) ->
+cleanup(_) ->
     %% Don't stop the registry — other test suites share it.
     ok.
 

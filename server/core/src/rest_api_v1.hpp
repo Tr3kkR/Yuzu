@@ -7,6 +7,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "dex_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -173,7 +174,7 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        LockoutClearFn lockout_clear_fn = {});
+        LockoutClearFn lockout_clear_fn = {}, DexPerfFn dex_perf_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -200,7 +201,7 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        LockoutClearFn lockout_clear_fn = {});
+        LockoutClearFn lockout_clear_fn = {}, DexPerfFn dex_perf_fn = {});
 };
 
 } // namespace yuzu::server

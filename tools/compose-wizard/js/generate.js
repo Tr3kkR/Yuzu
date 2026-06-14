@@ -1,6 +1,28 @@
 /* ── Compose File Generator ── */
 
 function generate() {
+  const pgMode = val('pg-mode');
+  const pgSuperPass = val('pg-superuser-pass');
+  const pgAppPass = val('pg-app-pass');
+  const pgDsn = val('pg-dsn');
+
+  // Guard the load-bearing substrate invariants before emitting anything —
+  // a compose/.env pair that the postgres image will refuse to boot is worse
+  // than no output.
+  if (pgMode === 'bundled') {
+    if (!pgSuperPass || !pgAppPass) {
+      alert('Bundled PostgreSQL: set BOTH the superuser and app-role passwords on the Data step (use 🎲 Generate). The yuzu-postgres image refuses to boot without them.');
+      return;
+    }
+    if (pgSuperPass === pgAppPass) {
+      alert('Bundled PostgreSQL: the superuser and app-role passwords must be DISTINCT — the image\'s first-boot init refuses to run if they are equal.');
+      return;
+    }
+  } else if (!pgDsn) {
+    alert('External PostgreSQL: supply a DSN on the Data step, or switch to the bundled mode. The server needs a database to talk to.');
+    return;
+  }
+
   const config = {
     version: val('yuzu-version'),
     adminUser: val('admin-user'),
@@ -13,6 +35,11 @@ function generate() {
     tlsCert: val('tls-cert'),
     tlsKey: val('tls-key'),
     dataDir: val('data-dir'),
+    pgMode: pgMode,
+    pgBundled: pgMode === 'bundled',
+    pgSuperPass: pgSuperPass,
+    pgAppPass: pgAppPass,
+    pgDsn: pgDsn,
     clickhouse: chk('include-clickhouse'),
     chHttpPort: num('ch-http-port'),
     chNativePort: num('ch-native-port'),
@@ -57,6 +84,19 @@ YUZU_GRPC_PORT=${c.grpcPort}
 YUZU_MGMT_PORT=${c.mgmtPort}
 YUZU_GATEWAY_UPSTREAM_PORT=${c.gwUpstreamPort}
 YUZU_ADMIN_USER=${c.adminUser}
+${c.pgBundled ? `
+# ── PostgreSQL (server storage substrate, ADR-0006/0008) ──
+# Two DISTINCT credentials — keep both in a secrets manager, not in git.
+# The superuser password stays inside the postgres container; the app-role
+# password is what the server's DSN carries. They MUST differ (the image's
+# first-boot init refuses to run if they are equal). Rotate with:
+#   openssl rand -hex 24
+YUZU_POSTGRES_PASSWORD=${c.pgSuperPass}
+YUZU_DB_PASSWORD=${c.pgAppPass}` : `
+# ── PostgreSQL (external / managed substrate) ──
+# Full server DSN — carries the app-role password, never a superuser
+# credential. Keep it out of git; this file is the only place it lives.
+YUZU_POSTGRES_DSN=${c.pgDsn}`}
 ${c.clickhouse ? `YUZU_CLICKHOUSE_PASSWORD=${c.chPass}
 YUZU_CLICKHOUSE_DB=${c.chDb}
 YUZU_CLICKHOUSE_USER=${c.chUser}` : ''}
@@ -307,6 +347,18 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   y += `    environment:\n`;
   y += `      - YUZU_LOG_LEVEL=info\n`;
   y += `      - YUZU_LOG_FORMAT=json\n`;
+  // Postgres substrate DSN (ADR-0006/0008). Consumed via env var, NOT a CLI
+  // flag — the server reads YUZU_POSTGRES_DSN from the environment. The DSN
+  // carries the APP role password (interpolated from .env), never the
+  // superuser's, so a leaked server environment can't disclose superuser creds.
+  if (c.pgBundled) {
+    y += `      # Postgres substrate DSN (ADR-0006/0008). App-role password comes\n`;
+    y += `      # from .env (YUZU_DB_PASSWORD) — never baked into this file.\n`;
+    y += `      - YUZU_POSTGRES_DSN=postgresql://yuzu:\${YUZU_DB_PASSWORD}@postgres:5432/yuzu\n`;
+  } else {
+    y += `      # External/managed Postgres — full DSN supplied via .env.\n`;
+    y += `      - YUZU_POSTGRES_DSN=\${YUZU_POSTGRES_DSN}\n`;
+  }
   y += `    command:\n`;
   y += `      - "--listen"\n`;
   y += `      - "0.0.0.0:50051"\n`;
@@ -362,10 +414,58 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   y += `      interval: 10s\n`;
   y += `      timeout: 5s\n`;
   y += `      retries: 5\n`;
-  if (c.clickhouse) {
+  // Gate server start on Postgres (bundled mode) and ClickHouse readiness so
+  // migrations don't race an unready substrate.
+  if (c.pgBundled || c.clickhouse) {
     y += `    depends_on:\n`;
-    y += `      clickhouse:\n`;
-    y += `        condition: service_healthy\n`;
+    if (c.pgBundled) {
+      y += `      postgres:\n`;
+      y += `        condition: service_healthy\n`;
+    }
+    if (c.clickhouse) {
+      y += `      clickhouse:\n`;
+      y += `        condition: service_healthy\n`;
+    }
+  }
+
+  // PostgreSQL (server storage substrate) — bundled mode only. In external
+  // mode the server's YUZU_POSTGRES_DSN points at a managed instance and no
+  // local container is generated.
+  if (c.pgBundled) {
+    y += `\n  # ── PostgreSQL (server storage substrate, ADR-0006/0008) ─────────────\n`;
+    y += `  # Release-pinned yuzu-postgres image: PostgreSQL 16 + pgvector + a\n`;
+    y += `  # first-boot init that creates the app role/database. Per-store schemas\n`;
+    y += `  # are created at runtime by the server's migration runner. Using an\n`;
+    y += `  # external/managed Postgres instead is first-class — re-run the wizard\n`;
+    y += `  # and pick "External / managed".\n`;
+    y += `  postgres:\n`;
+    y += `    image: ghcr.io/tr3kkr/yuzu-postgres:\${YUZU_VERSION:-${c.version}}\n`;
+    y += `    container_name: yuzu-postgres\n`;
+    y += `    restart: unless-stopped\n`;
+    y += `    environment:\n`;
+    y += `      # Both passwords come from .env — the actual secrets never appear\n`;
+    y += `      # in this compose file. They MUST be distinct (first-boot init\n`;
+    y += `      # refuses to run otherwise); the superuser password stays inside\n`;
+    y += `      # this container and is never carried by the server DSN.\n`;
+    y += `      - POSTGRES_PASSWORD=\${YUZU_POSTGRES_PASSWORD}\n`;
+    y += `      - YUZU_DB_PASSWORD=\${YUZU_DB_PASSWORD}\n`;
+    y += `    volumes:\n`;
+    if (c.persistentVolumes) {
+      y += `      - postgres-data:/var/lib/postgresql/data\n`;
+    } else {
+      y += `      - /var/lib/postgresql/data\n`;
+    }
+    y += `    healthcheck:\n`;
+    // -h 127.0.0.1 forces a TCP probe (initdb's temporary server is socket-only
+    // mid-init); the psql leg dials the container hostname (not loopback, which
+    // initdb leaves on 'trust') so it actually verifies the app credential.
+    // $$ defers expansion to the container shell so the password never appears
+    // in `docker compose config` output.
+    y += `      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \\"postgresql://yuzu:$\${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\\" -tA -c 'SELECT 1' >/dev/null"]\n`;
+    y += `      interval: 5s\n`;
+    y += `      timeout: 5s\n`;
+    y += `      retries: 12\n`;
+    y += `      start_period: 10s\n`;
   }
 
   // Gateway
@@ -475,6 +575,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   if (c.persistentVolumes) {
     y += `\nvolumes:\n`;
     y += `  server-data:\n`;
+    if (c.pgBundled) y += `  postgres-data:\n`;
     if (c.prometheus) y += `  prometheus-data:\n`;
     if (c.grafana) y += `  grafana-data:\n`;
     if (c.clickhouse) y += `  clickhouse-data:\n`;

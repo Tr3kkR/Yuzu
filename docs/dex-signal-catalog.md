@@ -10,13 +10,18 @@ in `agents/core/src/dex_signal_catalog.cpp`. **Adding a signal is one catalogue
 entry + one extractor + fixtures — zero server change** (the projection reads
 the uniform `detail_json` keys generically, the `/dex` signal panel GROUP-BYs
 whatever types exist, and unknown types render with a raw-label fallback under
-"Other"). The dashboard groups the catalogue into 12 display groups; the
+"Other"). The dashboard groups the catalogue into 13 display groups; the
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not). The server display
-catalogue totals **104** entries: these 103 Windows types **+ the one macOS-only
-type `storage.low`** the macOS collector adds (see "macOS collector" below). The
-Windows agent catalogue stays 103; the macOS collector reuses the same obs_types
-plus that single addition.
+catalogue totals **107** entries: the 103 Windows event-catalogue types **+
+`storage.low`** (one display entry, now emitted by BOTH platforms from two
+sources — the macOS IOKit poll and the Windows state poll, see those sections
+below; it began macOS-only) **+ the three A3 `perf.*` sustained-breach types**
+(`perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` — the
+"Performance" display family, Windows state poll, see below).
+The Windows *event* catalogue stays 103; the state-poll signals (`storage.low`,
+battery via `hw.error`, the `perf.*` breaches) ride alongside it without
+catalogue entries, exactly like the macOS poll mechanisms.
 
 Channels that do not exist on a given SKU fail to arm individually and are
 logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
@@ -176,6 +181,41 @@ Task Scheduler (channel disabled by default), DCOM 10016 + WMI-Activity 5858
 (noise), app start-times / audio glitches / NCSI (need ETW collectors, not
 event IDs — collector-gated future work).
 
+## Windows state poll (shipped 2026-06-12 — `dex_win_poll.cpp`)
+
+The event engine is blind to bad *states* the OS never logs: a volume filling
+up and a battery wearing out have no Event Log record. `dex_win_poll` is the
+Windows analogue of the macOS IOKit poll — a companion thread owned by the
+Windows DEX observer (started only when at least one event channel armed),
+sleeping to the earliest next-due poll and polling on three cadences with the
+same **poll-and-latch** discipline (emit on the transition INTO a bad state,
+suppress while it persists, re-arm on recovery; the latch replaces a rate
+cap). First poll on the first tick, never at-arm. BRD rows 20–21
+(`docs/dex-brd-coverage.md`, slice D1) + rows 13–15/124 (slice A3).
+
+| obs_type | Source | Cadence | Threshold |
+|---|---|---|---|
+| `storage.low` | `GetDiskFreeSpaceExW` over lettered `DRIVE_FIXED` volumes (per-volume latch; unreadable/locked volumes skipped — never a signal) | 10 min | >= 90% used OR < 5 GiB free (identical to macOS) |
+| `hw.error` (subject=`battery`) | battery device interface + `IOCTL_BATTERY_QUERY_INFORMATION` (DesignedCapacity / FullChargedCapacity / CycleCount; `GENERIC_READ` only) | hourly | full-charge < 80% of design (identical to macOS); no battery / zero design capacity never emits |
+| `perf.cpu_sustained` | `GetSystemTimes` cumulative busy % (`dex_perf_breach.cpp`) | 120 s sample | avg >= 90% busy for 5 consecutive samples (10 min); re-arm < 70% for 3 |
+| `perf.memory_pressure` | `GetPerformanceInfo` commit charge vs limit (commit, not physical RAM — high physical use is normal caching; commit near the limit means allocations fail) | 120 s sample | >= 90% of commit limit for 10 min; re-arm < 80% for 3 samples |
+| `perf.disk_latency_high` | `IOCTL_DISK_PERFORMANCE` per-IO service time summed over physical disks (zero IOs in an interval reads 0 ms — an idle disk is healthy) | 120 s sample | avg >= 25 ms/IO for 10 min; re-arm < 15 ms for 3 samples |
+
+The A3 `perf.*` rows (slice A3, 2026-06-12) are **sustained-breach hysteresis**
+latches (`dex_perf_breach.{hpp,cpp}`): a breach needs the full sustain window
+of consecutive bad samples to fire ONCE with the window average as `metric`,
+then re-arms only after consecutive valid samples below the (lower) exit
+threshold — flap-proof and bounded at ~4 observations/hour/type worst case. An
+invalid sample (read failure, reboot counter reset) resets the streaks but
+never clears the latch. Thresholds are hardcoded sane defaults until F1 makes
+them operator-tunable (the D3 blast-radius precedent). The A1 TAR perf
+warehouse is the *history* of these same counters; this is the *alerting* leg
+(the BRD's "real-time + historical + alerting" decomposition).
+
+The decision functions are pure and unit-tested on every host
+(`test_dex_win_poll.cpp`, `test_dex_perf_breach.cpp`); the Win32 mechanism is
+the impure shell, mirroring the macOS pure-parser/impure-engine split.
+
 ## Privacy / works-council contract
 
 Extractors drop user content **at the edge, before anything leaves the
@@ -273,7 +313,7 @@ parser now would mistake routine scans for detections.
 | File system | `fs.corruption` | unified log: `com.apple.apfs` error/fault | best-effort |
 | Hardware & storage | `disk.smart_failure` | IOKit poll: `diskutil` SMART != Verified | real-record |
 | | `hw.error` (battery) | IOKit poll: `system_profiler` battery condition / capacity <80% | real-record |
-| | `storage.low` | IOKit poll: `df` Data volume >=90% full or <5 GiB free (macOS-only obs_type, "Disk nearly full") | real-record |
+| | `storage.low` | IOKit poll: `df` Data volume >=90% full or <5 GiB free ("Disk nearly full"; same obs_type + thresholds as the Windows state poll) | real-record |
 | | `hw.cpu_throttled` | IOKit poll: `pmset -g therm` CPU speed cap <100% | real-record |
 
 **Boot duration (deliberately NOT shipped):** macOS exposes boot *start*
@@ -300,11 +340,12 @@ device". Lower per-signal richness, but low false-positive and privacy-safe.
 basenames; OSLog raw messages from sensitive daemons are never shipped. Pinned by
 `[dex_macos][privacy]` tests.
 
-**Battery health is the one macOS-native signal with no Windows like-for-like**
-(the Windows catalogue has no battery signal); it rides the generic `hw.error`
-obs_type with subject="battery" so it renders under Hardware without a server
-change. A dedicated `hw.battery_degraded` obs_type + label would be a future
-polish (needs a `dex_signal_groups()` + drift-net edit).
+**Battery health now has a Windows like-for-like** (the Windows state poll,
+2026-06-12): both platforms ride the generic `hw.error` obs_type with
+subject="battery" and the same below-80%-of-design threshold, so they render
+identically under Hardware without a server change. A dedicated
+`hw.battery_degraded` obs_type + label remains a future polish (needs a
+`dex_signal_groups()` + drift-net edit).
 
 ## macOS: what more is possible with ESF / Network Extension / other entitlements
 

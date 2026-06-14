@@ -458,11 +458,11 @@ const std::string& openapi_spec() {
         // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
         R"json(,
     "/tokens": {
-      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}}},
-      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}}}
+      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
+      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
-      "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}}}
+      "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -605,6 +605,15 @@ const std::string& openapi_spec() {
     },
     "/dex/signals/{obs_type}": {
       "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/fleet": {
+      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/cohorts": {
+      "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/perf/devices": {
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
     }
   }
 })json";
@@ -788,7 +797,7 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn) {
+    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn, DexPerfFn dex_perf_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -798,7 +807,7 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn),
-                    std::move(lockout_clear_fn));
+                    std::move(lockout_clear_fn), std::move(dex_perf_fn));
 }
 
 void RestApiV1::register_routes(
@@ -813,7 +822,7 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn) {
+    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn, DexPerfFn dex_perf_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1258,7 +1267,10 @@ void RestApiV1::register_routes(
              [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ApiToken", "Read"))
                      return;
-                 if (!token_store) {
+                 // #347 CH-3: a failed DB open must read as 503, never as an
+                 // empty list or 404 — is_open() distinguishes "no rows" from
+                 // "no database".
+                 if (!token_store || !token_store->is_open()) {
                      res.status = 503;
                      res.set_content(error_json("service unavailable", 503), "application/json");
                      return;
@@ -1292,7 +1304,7 @@ void RestApiV1::register_routes(
                                     const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
             return;
@@ -1445,7 +1457,7 @@ void RestApiV1::register_routes(
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
-        if (!token_store) {
+        if (!token_store || !token_store->is_open()) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
             return;
@@ -5005,6 +5017,166 @@ void RestApiV1::register_routes(
                                              .raw("devices", devices.str())
                                              .raw("by_day", by_day.str())
                                              .str()),
+                                 "application/json");
+             });
+
+    // ── F2a: fleet performance read model (/api/v1/dex/perf/*) ──────────────
+    //
+    // First-class REST for the /dex Performance tab (A1 agentic-first — "is
+    // the fleet's CPU healthy?" must be machine-answerable, not fragment-
+    // scrape-only). Same render-time aggregation over registry heartbeat
+    // state the fragments use (one DexPerfFn provider, three surfaces), same
+    // GuaranteedState:Read gate as the sibling DEX endpoints. NOT audited:
+    // fleet/cohort responses are aggregates, and the devices list is
+    // machine-health telemetry (CPU/commit/disk latency — device state, not
+    // behavioral data; the behavioral DEX surfaces keep their audit rows).
+    // F2b adds /api/v1/dex/perf/trend over the retained series when the
+    // Postgres-backed store lands.
+
+    auto perf_stat_json = [](const std::optional<DexPerfStat>& s) -> std::string {
+        if (!s)
+            return "null"; // absent-not-zero: nobody reported this metric
+        return JObj()
+            .add("avg", s->avg)
+            .add("p50", s->p50)
+            .add("p90", s->p90)
+            .add("max", s->max)
+            .add("n", s->n)
+            .str();
+    };
+
+    // GET /dex/perf/fleet — the now-stats per metric + the honest denominators
+    // (the same numbers the yuzu_fleet_perf_* Prometheus gauges export).
+    sink.Get("/api/v1/dex/perf/fleet",
+             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!dex_perf_fn) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                 res.set_content(ok_json(JObj()
+                                             .raw("cpu_pct", perf_stat_json(now.cpu))
+                                             .raw("commit_pct", perf_stat_json(now.commit))
+                                             .raw("disk_lat_ms", perf_stat_json(now.disk_lat))
+                                             .add("reporting", now.reporting)
+                                             .add("windows_online", now.windows_online)
+                                             .str()),
+                                 "application/json");
+             });
+
+    // GET /dex/perf/cohorts?key=<tag-key> — fleet-relative percentiles per
+    // cohort of the chosen tag key (CONTEXT.md "Cohort"). Sub-floor cohorts
+    // carry suppressed=true with their population and no stats; the untagged
+    // residual is the cohort=="" row.
+    sink.Get("/api/v1/dex/perf/cohorts",
+             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!dex_perf_fn) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const std::string key =
+                     req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+                 if (!TagStore::validate_key(key)) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid tag key"), "application/json");
+                     return;
+                 }
+                 const auto snap = dex_perf_fn(key);
+                 JArr rows;
+                 for (const auto& c : dex_perf_cohorts(snap)) {
+                     JObj o;
+                     o.add("cohort", c.cohort)
+                         .add("devices", c.devices)
+                         .add("suppressed", c.suppressed);
+                     if (!c.suppressed) {
+                         o.raw("cpu_pct", perf_stat_json(c.cpu))
+                             .raw("commit_pct", perf_stat_json(c.commit))
+                             .raw("disk_lat_ms", perf_stat_json(c.disk_lat));
+                     }
+                     rows.add(std::move(o));
+                 }
+                 JArr keys;
+                 for (const auto& k : snap.available_keys)
+                     keys.add(k);
+                 res.set_content(ok_json(JObj()
+                                             .add("key", key)
+                                             .add("floor", kDexCohortFloor)
+                                             .raw("cohorts", rows.str())
+                                             .raw("available_keys", keys.str())
+                                             .str()),
+                                 "application/json");
+             });
+
+    // GET /dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=&limit= —
+    // the ONE device list behind every Performance drill: worst-by-metric
+    // (default), the not-reporting complement (filter=not_reporting), or a
+    // cohort's members (cohort_key + cohort_value; empty value = untagged).
+    sink.Get("/api/v1/dex/perf/devices",
+             [perm_fn, dex_perf_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!dex_perf_fn) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const DexPerfMetric metric = dex_perf_metric_from_token(
+                     req.has_param("metric") ? req.get_param_value("metric") : "cpu");
+                 const bool not_reporting = req.has_param("filter") &&
+                                            req.get_param_value("filter") == "not_reporting";
+                 // Grill fix (parity with the fragment): the cohort KEY always
+                 // resolves (default "model") so rows carry real cohort values;
+                 // FILTERING applies only when cohort_value is present ("" =
+                 // the untagged residual).
+                 std::string cohort_key =
+                     req.has_param("cohort_key") ? req.get_param_value("cohort_key")
+                                                 : kDexDefaultCohortKey;
+                 if (!TagStore::validate_key(cohort_key)) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid cohort_key"), "application/json");
+                     return;
+                 }
+                 std::optional<std::string> cohort_filter;
+                 if (req.has_param("cohort_value"))
+                     cohort_filter = req.get_param_value("cohort_value");
+                 int limit = 50;
+                 if (req.has_param("limit")) {
+                     int v = 0;
+                     auto s = req.get_param_value("limit");
+                     [[maybe_unused]] auto [_, ec] =
+                         std::from_chars(s.data(), s.data() + s.size(), v);
+                     if (ec != std::errc{} || v <= 0) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid limit"), "application/json");
+                         return;
+                     }
+                     limit = std::min(v, 500);
+                 }
+                 const auto rows = dex_perf_device_list(dex_perf_fn(cohort_key), metric,
+                                                        not_reporting, cohort_filter, limit);
+                 JArr arr;
+                 for (const auto& r : rows) {
+                     JObj o;
+                     o.add("agent_id", r.agent_id).add("cohort", r.cohort);
+                     if (r.cpu_pct)
+                         o.add("cpu_pct", *r.cpu_pct);
+                     if (r.commit_pct)
+                         o.add("commit_pct", *r.commit_pct);
+                     if (r.disk_lat_ms)
+                         o.add("disk_lat_ms", *r.disk_lat_ms);
+                     if (r.fleet_pctile >= 0)
+                         o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                     arr.add(std::move(o));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
                                  "application/json");
              });
 
