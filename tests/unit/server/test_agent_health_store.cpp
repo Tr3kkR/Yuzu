@@ -50,6 +50,9 @@ public:
         metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
         metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
         metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
+        metrics.clear_gauge_family("yuzu_fleet_net_rtt_ms");
+        metrics.clear_gauge_family("yuzu_fleet_net_retrans_pct");
+        metrics.clear_gauge_family("yuzu_fleet_net_throughput_bps");
 
         std::unordered_map<std::string, int> os_counts, arch_counts, version_counts;
         double total_commands = 0.0;
@@ -57,6 +60,8 @@ public:
         int dex_observer_disarmed = 0;
         double total_dex_observed = 0.0;
         std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
+        std::vector<double> net_rtt, net_retrans, net_tput;
+        int net_reporting = 0, net_degraded = 0;
 
         for (const auto& [id, snap] : snapshots_) {
             ++healthy_count;
@@ -116,6 +121,18 @@ public:
             collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
             collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
             collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, 1.0e6);
+
+            // Network facts — same forged-value posture (clamp retransmit %,
+            // reject absurd-but-finite RTT/throughput). net_degraded is a count.
+            const auto net_before = net_rtt.size() + net_retrans.size() + net_tput.size();
+            collect_finite(net_rtt, "yuzu.net_rtt_p50_ms", 0.0, 6.0e4);
+            collect_finite(net_retrans, "yuzu.net_retrans_pct", 100.0, 1.0e6);
+            collect_finite(net_tput, "yuzu.net_throughput_bps", 0.0, 1.0e12);
+            if (net_rtt.size() + net_retrans.size() + net_tput.size() > net_before)
+                ++net_reporting;
+            const auto deg = get("yuzu.net_degraded");
+            if (deg == "1" || deg == "true")
+                ++net_degraded;
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -159,6 +176,12 @@ public:
         set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
         set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
         set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
+
+        metrics.gauge("yuzu_fleet_net_reporting").set(static_cast<double>(net_reporting));
+        metrics.gauge("yuzu_fleet_net_degraded").set(static_cast<double>(net_degraded));
+        set_stats("yuzu_fleet_net_rtt_ms", net_rtt);
+        set_stats("yuzu_fleet_net_retrans_pct", net_retrans);
+        set_stats("yuzu_fleet_net_throughput_bps", net_tput);
     }
 
 private:
@@ -396,4 +419,47 @@ TEST_CASE("AgentHealthStore: true nearest-rank percentiles in tiny fleets",
     store.recompute_metrics(metrics, std::chrono::seconds(60));
     CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p50"}}).value() == 10.0);
     CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p90"}}).value() == 90.0);
+}
+
+// ── network fleet rollup (slice 3) ───────────────────────────────────────────
+
+TEST_CASE("AgentHealthStore: network facts aggregate to gauges + degraded count",
+          "[health_store][network]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // a/b/c report RTT 100/300/200; a+b are net_degraded; b's retransmit lie
+    // clamps to 100; d's absurd RTT is rejected (absent, never averaged in).
+    store.upsert("a", {{"yuzu.net_rtt_p50_ms", "100.0"},
+                       {"yuzu.net_retrans_pct", "1.0"},
+                       {"yuzu.net_degraded", "1"}});
+    store.upsert("b", {{"yuzu.net_rtt_p50_ms", "300.0"},
+                       {"yuzu.net_retrans_pct", "250"},
+                       {"yuzu.net_degraded", "true"}});
+    store.upsert("c", {{"yuzu.net_rtt_p50_ms", "200.0"}});
+    store.upsert("d", {{"yuzu.net_rtt_p50_ms", "1e9"}}); // absurd-but-finite → rejected
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    CHECK(metrics.gauge("yuzu_fleet_net_reporting").value() == 3.0); // a,b,c (d rejected)
+    CHECK(metrics.gauge("yuzu_fleet_net_degraded").value() == 2.0);  // a,b
+    CHECK(metrics.gauge("yuzu_fleet_net_rtt_ms", {{"stat", "max"}}).value() == 300.0);
+    CHECK(metrics.gauge("yuzu_fleet_net_retrans_pct", {{"stat", "max"}}).value() == 100.0); // clamped
+}
+
+TEST_CASE("AgentHealthStore: network gauges go absent (not zero) when nobody reports",
+          "[health_store][network]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    store.upsert("a", {{"yuzu.net_rtt_p50_ms", "50.0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    REQUIRE(metrics.gauge("yuzu_fleet_net_rtt_ms", {{"stat", "avg"}}).value() == 50.0);
+
+    // The agent stops reporting network facts — the family must CLEAR (a stale
+    // 50 or a fabricated 0 would both be lies); only the population reads 0.
+    store.upsert("a", {{"yuzu.os", "linux"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    CHECK(metrics.gauge("yuzu_fleet_net_reporting").value() == 0.0);
+    const auto text = metrics.serialize();
+    CHECK(text.find("yuzu_fleet_net_rtt_ms{") == std::string::npos);
 }

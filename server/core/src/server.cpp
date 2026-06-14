@@ -66,6 +66,7 @@
 #include "dex_blast_radius.hpp"
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
+#include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -375,6 +376,25 @@ public:
         metrics_.describe("yuzu_fleet_perf_disk_lat_ms",
                           "Fleet per-IO disk service time in ms, by {stat}: avg / p50 / p90 / max",
                           "gauge");
+        // Network rollup (slice 3; heartbeat net facts, absent when no agent
+        // reports — never a fabricated zero). Same shared validators as the
+        // /network read model, so these gauges and the dashboard always agree.
+        metrics_.describe("yuzu_fleet_net_reporting",
+                          "Agents whose latest heartbeat carried at least ONE network fact — the "
+                          "same any-of definition the /network Overview's Reporting card uses",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_net_degraded",
+                          "Agents reporting the net_degraded fact this cycle (a COUNT, not a "
+                          "verdict — the /network co-occurrence headline's degraded population)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_net_rtt_ms",
+                          "Fleet smoothed round-trip time in ms, by {stat}: avg / p50 / p90 / max "
+                          "(its population is the devices that report RTT — Linux today)", "gauge");
+        metrics_.describe("yuzu_fleet_net_retrans_pct",
+                          "Fleet TCP retransmission %, by {stat}: avg / p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_net_throughput_bps",
+                          "Fleet device network throughput in bytes/s, by {stat}: avg / p50 / p90 "
+                          "/ max", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -7907,11 +7927,90 @@ private:
             dex_perf_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
-        // network-quality lens + net/device/app co-occurrence evidence). The
-        // snapshot provider is wired in the next increment; until then the
-        // fragments render an honest "unavailable" placeholder.
+        // network-quality lens + net/device/app co-occurrence evidence).
+        //
+        // Provider: assemble a NetPerfSnapshot from the health store's network
+        // facts (net_snapshot — SAME 90s staleness as recompute_metrics, so the
+        // page and the yuzu_fleet_net_* gauges see the same population) joined
+        // with session OS + cohort tags. Mirrors dex_perf_uncached. app_unstable
+        // is wired with the per-connection collector slice (the co-occurrence
+        // "also app" band stays empty until net_degraded facts exist).
+        auto net_perf_fn = [this](const std::string& cohort_key) -> NetPerfSnapshot {
+            NetPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            std::unordered_map<std::string, std::string> cohort_values;
+            if (tag_store_ && !cohort_key.empty()) {
+                snap.available_keys = tag_store_->get_distinct_keys();
+                cohort_values = tag_store_->get_values_for_key(cohort_key);
+            }
+            const auto health = health_store_.net_snapshot(std::chrono::seconds{90});
+            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
+            by_id.reserve(health.size());
+            for (const auto& h : health)
+                by_id[h.agent_id] = &h;
+
+            auto fill_facts = [](NetPerfDevice& d,
+                                 const std::unordered_map<std::string, std::string>& tags) {
+                auto get = [&](const char* k) -> std::string {
+                    auto t = tags.find(k);
+                    return t != tags.end() ? t->second : std::string{};
+                };
+                d.rtt_ms = detail::parse_net_rtt_ms(get(detail::kNetTagRttP50Ms));
+                d.retrans_pct = detail::parse_net_retrans_pct(get(detail::kNetTagRetransPct));
+                d.throughput_bps =
+                    detail::parse_net_throughput_bps(get(detail::kNetTagThroughputBps));
+                if (auto deg = detail::parse_net_degraded(get(detail::kNetTagDegraded)))
+                    d.net_degraded = *deg;
+                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                d.app_unstable = false; // wired with the per-connection collector slice
+            };
+
+            std::unordered_set<std::string> seen;
+            for (const auto& id : registry_.all_ids()) {
+                auto s = registry_.get_session(id);
+                if (!s)
+                    continue;
+                NetPerfDevice d;
+                d.agent_id = id;
+                std::string os = s->os;
+                for (auto& c : os)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                d.platform = os; // "windows" / "linux" / "darwin"
+                if (auto it = by_id.find(id); it != by_id.end())
+                    fill_facts(d, it->second->status_tags);
+                if (!cohort_key.empty()) {
+                    // STORE-FIRST precedence (operator-declared cohort wins over
+                    // a self-reported tag) — same posture as dex_perf_uncached.
+                    if (auto cv = cohort_values.find(id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                    else if (auto it = s->scopable_tags.find(cohort_key);
+                             it != s->scopable_tags.end() &&
+                             TagStore::validate_value(it->second))
+                        d.cohort = it->second;
+                }
+                snap.devices.push_back(std::move(d));
+                seen.insert(id);
+            }
+            // C-S1: health-only devices (session reaped, heartbeat still fresh)
+            // must also appear so the page and the gauges agree.
+            for (const auto& h : health) {
+                if (seen.contains(h.agent_id))
+                    continue;
+                NetPerfDevice d;
+                d.agent_id = h.agent_id;
+                fill_facts(d, h.status_tags);
+                if (!cohort_key.empty())
+                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
