@@ -1457,8 +1457,9 @@ public:
                         // device-utilization tags (deriving a rate needs two
                         // readings; lambda-local so a reconnect re-baselines and
                         // the first heartbeat of a session ships no stale rate).
+#if defined(_WIN32)
                         win::PerfBreachCounters hb_prev_perf;
-#if defined(__linux__)
+#elif defined(__linux__)
                         lnx::CpuJiffies hb_prev_cpu_lnx; // A4 Linux heartbeat CPU% delta baseline
 #endif
                         while (!should_stop()) {
@@ -1533,8 +1534,8 @@ public:
                             // sample -> tags omitted; the server simply doesn't
                             // count this agent that cycle). Gated like the DEX
                             // observer: --dex-disable means no DEX telemetry of
-                            // any kind. Off-Windows the read is valid=false
-                            // until those collectors land, so no tags ship.
+                            // any kind. Windows and Linux each read their own
+                            // counters here; macOS / other ship no perf tags yet.
                             if (!cfg_.dex_disable) {
 #if defined(_WIN32)
                                 const auto cur = win::read_perf_breach_counters();
@@ -1570,15 +1571,26 @@ public:
                                     std::string s(begin, end);
                                     return f.bad() ? std::nullopt : std::optional<std::string>(s);
                                 };
-                                if (const auto st = read_proc("/proc/stat")) {
-                                    const lnx::CpuJiffies cur = lnx::parse_proc_stat(*st);
-                                    if (const auto pct = lnx::cpu_busy_pct(hb_prev_cpu_lnx, cur))
-                                        tags["yuzu.perf_cpu_pct"] = std::format("{:.1f}", *pct);
-                                    hb_prev_cpu_lnx = cur;
+                                // A throw here (bad_alloc reading /proc, std::format)
+                                // must not unwind out of the heartbeat thread — that
+                                // would stop heartbeats and read as the agent going
+                                // offline. Swallow; the tag is just omitted this cycle.
+                                try {
+                                    if (const auto st = read_proc("/proc/stat")) {
+                                        const lnx::CpuJiffies cur = lnx::parse_proc_stat(*st);
+                                        if (const auto pct =
+                                                lnx::cpu_busy_pct(hb_prev_cpu_lnx, cur))
+                                            tags["yuzu.perf_cpu_pct"] =
+                                                std::format("{:.1f}", *pct);
+                                        hb_prev_cpu_lnx = cur;
+                                    }
+                                    if (const auto mi = read_proc("/proc/meminfo"))
+                                        if (const auto pct = lnx::parse_commit_pct(*mi))
+                                            tags["yuzu.perf_commit_pct"] =
+                                                std::format("{:.1f}", *pct);
+                                } catch (...) {
+                                    // omit perf tags this heartbeat
                                 }
-                                if (const auto mi = read_proc("/proc/meminfo"))
-                                    if (const auto pct = lnx::parse_commit_pct(*mi))
-                                        tags["yuzu.perf_commit_pct"] = std::format("{:.1f}", *pct);
 #endif
                             }
 

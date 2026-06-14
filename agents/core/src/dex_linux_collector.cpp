@@ -120,13 +120,26 @@ private:
                     return; // stop() requested
             }
             const std::int64_t now = now_unix();
-            if (now - last_perf_poll_ >= win::kPerfSampleIntervalSeconds) {
-                last_perf_poll_ = now;
-                poll_perf();
-            }
-            if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
-                last_disk_poll_ = now;
-                poll_disks();
+            // A poll must NEVER unwind out of this thread (the file invariant): an
+            // allocation failure — most likely exactly when measuring memory pressure —
+            // would otherwise std::terminate the whole agent. Catch-and-continue keeps
+            // the thread alive (so the observer is not silently dead); the next tick
+            // re-baselines. (Bounding statvfs against a hung block device is a separate,
+            // tracked follow-up — a D-state stall throws nothing to catch here.)
+            try {
+                if (now - last_perf_poll_ >= win::kPerfSampleIntervalSeconds) {
+                    last_perf_poll_ = now;
+                    poll_perf();
+                }
+                if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
+                    last_disk_poll_ = now;
+                    poll_disks();
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("dex_observer(linux): poll iteration failed, continuing: {}",
+                             e.what());
+            } catch (...) {
+                spdlog::warn("dex_observer(linux): poll iteration failed (unknown), continuing");
             }
         }
     }
@@ -146,13 +159,17 @@ private:
                 cpu_valid = true;
             }
             prev_cpu_ = cur; // baseline the next interval (even if this one was invalid)
+            proc_stat_fail_streak_ = 0; // a good read clears the disarm streak
         } else {
             prev_cpu_ = lnx::CpuJiffies{}; // unreadable — drop the baseline
-            // /proc/stat unreadable (restricted container / seccomp / mount ns) is a
-            // persistent runtime failure → flag the observer unhealthy so the heartbeat
-            // reports disarmed rather than a silently-deaf armed=1 (review HIGH-3, the
-            // Windows on_error equivalent). Idempotent: safe to call every poll.
-            if (on_error_)
+            // Flag the observer unhealthy only after PERSISTENT failure. The Windows
+            // on_error fires on terminal subscription death; a Linux /proc/stat read miss
+            // is usually TRANSIENT (a momentary EMFILE, a brief seccomp/mount-ns blip),
+            // and the poll thread re-baselines and resumes next tick — so a single miss
+            // must NOT latch armed=0 (that produced fleet-wide false-disarm alerts, sre
+            // Gate-6). Disarm only after kProcFailDisarmThreshold consecutive misses.
+            // (on_error is one-way today; recovery-to-armed is a tracked follow-up.)
+            if (++proc_stat_fail_streak_ >= kProcFailDisarmThreshold && on_error_)
                 on_error_();
         }
         if (const auto avg = win::breach_update(cpu_breach_, cpu_pct, cpu_valid, win::kCpuBreach))
@@ -188,7 +205,10 @@ private:
             return;
         std::unordered_set<std::string> current;
         for (const auto& m : lnx::parse_storage_mounts(*mounts)) {
-            current.insert(m.path);
+            // Latch identity is the backing DEVICE (the dedup key + the subject source),
+            // NOT the mount path: keying by path would re-fire a duplicate storage.low for
+            // the same device if it is remounted at a different path (UP-8, Gate-4).
+            current.insert(m.device);
             win::DiskLevel level;
             struct statvfs vfs{};
             if (::statvfs(m.path.c_str(), &vfs) == 0 && vfs.f_blocks > 0) {
@@ -206,12 +226,12 @@ private:
             // it cannot be emitted, serialized, or logged. The [dex][privacy] test guards
             // this exact call.
             const auto obs = lnx::storage_low_observation(m, level);
-            bool& reported = disk_low_reported_[m.path];
+            bool& reported = disk_low_reported_[m.device];
             if (win::latch_should_emit(obs.has_value(), level.valid, reported))
                 emit(*obs);
         }
-        // Drop latch entries for mounts that have gone away, so the map stays bounded
-        // by the live mount count, not every path ever seen (review MEDIUM).
+        // Drop latch entries for devices that have gone away, so the map stays bounded
+        // by the live device count, not every device ever seen (review MEDIUM).
         std::erase_if(disk_low_reported_,
                       [&](const auto& kv) { return !current.contains(kv.first); });
     }
@@ -232,18 +252,20 @@ private:
 
     static constexpr std::int64_t kFirstPollDelaySeconds = 60;
     static constexpr std::int64_t kDiskIntervalSeconds = 600; // 10 min (the WinStatePoller cadence)
+    static constexpr int kProcFailDisarmThreshold = 3; // consecutive /proc/stat misses before disarm
 
     std::mutex mu_;
     std::condition_variable cv_;
     bool stopping_ = false;
     std::thread thread_;
     SignalSink sink_; // set before the thread starts, cleared after join — stable in run()
-    std::function<void()> on_error_; // flips dex_health_ when /proc is unreadable (review HIGH-3)
+    std::function<void()> on_error_; // disarms dex_health_ after persistent /proc failure (HIGH-3)
     std::int64_t last_perf_poll_ = 0;
     std::int64_t last_disk_poll_ = 0;
+    int proc_stat_fail_streak_ = 0;                          // consecutive /proc/stat read misses
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
     win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
-    std::unordered_map<std::string, bool> disk_low_reported_; // per-mount storage.low latch
+    std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
 };
 
 } // namespace

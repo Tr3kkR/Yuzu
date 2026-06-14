@@ -74,16 +74,19 @@ struct MountPoint {
 /// PURE: the real, writable, LOCAL filesystems to check for storage.low, parsed
 /// from /proc/mounts. Whitelists block-backed fstypes (ext*/xfs/btrfs/zfs/f2fs)
 /// and skips read-only mounts — by construction this avoids the squashfs/snap
-/// "100% full by design" storm and never statvfs()'s a pseudo or (potentially
-/// hung) network mount. Deduped by backing device so a bind mount of the same
-/// filesystem is not counted twice.
+/// "100% full by design" storm and never statvfs()'s a pseudo or network *fstype*.
+/// Deduped by backing device so a bind mount of the same filesystem is not counted
+/// twice. NOTE: excluding network fstypes does NOT make statvfs() hang-proof — a
+/// whitelisted LOCAL fstype on remote-backed or failing block storage (iSCSI / NBD /
+/// multipath / a dying disk) can still block the caller's statvfs() indefinitely; a
+/// bounded/async statvfs is a tracked follow-up (the collector's poll thread owns it).
 ///
 /// Deliberately EXCLUDED (parity with the Windows fixed-disk-only storage.low):
 /// tmpfs (/run, /dev/shm, /tmp), other RAM-backed/pseudo fs (proc, sysfs, cgroup,
 /// overlay), and network mounts (nfs/cifs). A full tmpfs is a MEMORY condition, not
 /// disk-full — it is RAM-backed and sized by design — so it belongs to a future
-/// memory/tmpfs obs_type, not storage.low; excluding network fs also keeps a hung
-/// NFS server from blocking the poll thread in statvfs().
+/// memory/tmpfs obs_type, not storage.low; excluding network fstypes also avoids the
+/// most common statvfs() stall (a hung NFS/CIFS server).
 YUZU_EXPORT std::vector<MountPoint> parse_storage_mounts(std::string_view proc_mounts);
 
 /// PURE: a stable, NON-PII storage.low subject derived from the backing DEVICE,
@@ -93,9 +96,14 @@ YUZU_EXPORT std::vector<MountPoint> parse_storage_mounts(std::string_view proc_m
 /// leaving the device (`docs/dex-signal-catalog.md`). The backing-device
 /// identifier is infrastructure config (the same class as the hostname), so it is
 /// the Linux analogue of the Windows drive letter ("C:") and the macOS volume
-/// label ("Macintosh HD") the other collectors emit. Returns the device basename
-/// ("/dev/sda1" -> "sda1", "/dev/mapper/vg0-root" -> "vg0-root"), or "disk" when
-/// the device is empty or has no basename (trailing slash).
+/// label ("Macintosh HD") the other collectors emit.
+///
+/// For a `/dev/*` block device the label is the BASENAME ("/dev/sda1" -> "sda1",
+/// "/dev/mapper/vg0-root" -> "vg0-root"). For a non-/dev source — notably a ZFS
+/// dataset, whose /proc/mounts source is the dataset path and whose canonical layout
+/// puts the user/tenant in the LEAF ("tank/home/alice", "rpool/USERDATA/alice_x") —
+/// the label is the FIRST segment (the POOL, "tank"/"rpool"): infra config, never the
+/// PII leaf. "disk" when the device is empty or reduces to nothing.
 YUZU_EXPORT std::string device_label(std::string_view device);
 
 } // namespace yuzu::agent::lnx

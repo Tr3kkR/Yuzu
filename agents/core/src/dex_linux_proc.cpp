@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <utility>
 
 namespace yuzu::agent::lnx {
 
@@ -229,16 +230,28 @@ std::vector<MountPoint> parse_storage_mounts(std::string_view proc_mounts) {
 }
 
 std::string device_label(std::string_view device) {
-    // Basename only — never a path component of the device string, and the mount
-    // PATH is never consulted here (it carries user content; see the header). For a
-    // device-mapper/LVM device the basename is the admin-assigned VG-LV name
-    // ("/dev/mapper/vg0-root" -> "vg0-root"): infrastructure config, the sibling of
-    // the hostname, not captured user activity — the same subject class as the
-    // drive-name / device-path / SSID subjects elsewhere in the catalogue.
-    const auto slash = device.find_last_of('/');
-    const std::string_view base =
-        (slash == std::string_view::npos) ? device : device.substr(slash + 1);
-    return base.empty() ? "disk" : std::string(base);
+    // The mount PATH is never consulted here (it carries user content; see the header).
+    // The label is derived from the backing DEVICE, but the safe reduction differs by
+    // source kind:
+    if (device.starts_with("/dev/")) {
+        // Block device: the BASENAME is the stable non-PII identifier
+        // ("/dev/sda1" -> "sda1", "/dev/mapper/vg0-root" -> "vg0-root"): infrastructure
+        // config, the sibling of the hostname — the same subject class as the
+        // drive-name / device-path / SSID subjects elsewhere in the catalogue.
+        const auto slash = device.find_last_of('/'); // present — the device starts "/dev/"
+        const std::string_view base = device.substr(slash + 1);
+        return base.empty() ? "disk" : std::string(base);
+    }
+    // Non-/dev source — notably a ZFS dataset, whose /proc/mounts source is the dataset
+    // PATH ("pool/parent/child") and whose canonical layout is per-user / per-tenant
+    // LEAVES ("tank/home/alice", "rpool/USERDATA/alice_a1b2c3"). The basename would be
+    // that leaf = user/tenant content — a forbidden edge-privacy egress (Gate-2). Use
+    // the FIRST segment (the POOL), which is infrastructure config like a block-device
+    // name, never the leaf.
+    const auto slash = device.find_first_of('/');
+    const std::string_view head =
+        (slash == std::string_view::npos) ? device : device.substr(0, slash);
+    return head.empty() ? "disk" : std::string(head);
 }
 
 } // namespace yuzu::agent::lnx

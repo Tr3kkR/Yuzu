@@ -129,6 +129,15 @@ TEST_CASE("parse_storage_mounts decodes octal-escaped mount paths",
     const auto mounts = parse_storage_mounts("/dev/sdb1 /mnt/My\\040Backup ext4 rw 0 0\n");
     REQUIRE(mounts.size() == 1);
     CHECK(mounts[0].path == "/mnt/My Backup");
+    // The DEVICE field is decoded too (it is the dedup key + the device_label source).
+    const auto dev = parse_storage_mounts("/dev/My\\040Disk / ext4 rw 0 0\n");
+    REQUIRE(dev.size() == 1);
+    CHECK(dev[0].device == "/dev/My Disk");
+    CHECK(device_label(dev[0].device) == "My Disk");
+    // A truncated escape at end-of-field is copied verbatim, never read out of bounds.
+    const auto trunc = parse_storage_mounts("/dev/sda1 /mnt/x\\04 ext4 rw 0 0\n");
+    REQUIRE(trunc.size() == 1);
+    CHECK(trunc[0].path == "/mnt/x\\04");
 }
 
 TEST_CASE("parse_storage_mounts keeps the rw mount when an ro mount of the same device precedes it",
@@ -149,6 +158,12 @@ TEST_CASE("device_label is the backing-device basename, never a path component",
     CHECK(device_label("sda1") == "sda1");                     // already a basename
     CHECK(device_label("") == "disk");                         // empty → safe fallback
     CHECK(device_label("/dev/") == "disk");                    // trailing slash → empty basename
+    // ZFS dataset: /proc/mounts source is the dataset PATH, not a /dev node, and the
+    // canonical layout puts the user/tenant in the LEAF — so the label must be the POOL
+    // (first segment), NEVER the basename (which would leak the leaf). (Gate-2 HIGH.)
+    CHECK(device_label("tank/home/alice") == "tank");
+    CHECK(device_label("rpool/USERDATA/alice_a1b2c3") == "rpool"); // zsys real-world form
+    CHECK(device_label("tank") == "tank");                         // pool root mounted directly
 }
 
 TEST_CASE("storage.low carries the device label, NEVER the mount path (edge-privacy)",
@@ -174,4 +189,24 @@ TEST_CASE("storage.low carries the device label, NEVER the mount path (edge-priv
         CHECK(obs->sentence.find(leak) == std::string_view::npos);
         CHECK(detail.find(leak) == std::string_view::npos);
     }
+}
+
+TEST_CASE("storage.low on a ZFS dataset emits the POOL, never the per-user leaf (edge-privacy)",
+          "[guardian][dex][linux][proc][privacy]") {
+    // ZFS's /proc/mounts source is the dataset PATH; the canonical layout puts the
+    // user/tenant in the LEAF. Both real-world forms must reduce to the pool, with no
+    // leaf token reaching subject / sentence / detail_json. (Gate-2 HIGH regression guard.)
+    const auto check_pool = [](const char* mounts_line, const char* pool, const char* leak) {
+        const auto mounts = parse_storage_mounts(mounts_line);
+        REQUIRE(mounts.size() == 1);
+        const auto obs = storage_low_observation(mounts[0], near_full());
+        REQUIRE(obs);
+        CHECK(obs->subject == pool); // the pool (infra config), not the dataset leaf
+        const std::string detail = signal_detail_json(*obs);
+        CHECK(obs->subject.find(leak) == std::string::npos);
+        CHECK(obs->sentence.find(leak) == std::string::npos);
+        CHECK(detail.find(leak) == std::string::npos);
+    };
+    check_pool("tank/home/alice /home/alice zfs rw 0 0\n", "tank", "alice");
+    check_pool("rpool/USERDATA/alice_a1b2c3 /home/alice zfs rw 0 0\n", "rpool", "alice");
 }
