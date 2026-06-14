@@ -37,6 +37,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "local_dispatcher.hpp"
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
+#include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -1455,6 +1456,10 @@ public:
                         // readings; lambda-local so a reconnect re-baselines and
                         // the first heartbeat of a session ships no stale rate).
                         win::PerfBreachCounters hb_prev_perf;
+                        // Slice 4a: previous interface byte counters for the
+                        // heartbeat network throughput delta (same re-baseline
+                        // semantics as hb_prev_perf).
+                        netq::NetCounters hb_prev_net;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1545,6 +1550,33 @@ public:
                                         tags["yuzu.perf_disk_lat_ms"] =
                                             std::format("{:.2f}", ps.disk_lat_ms);
                                 }
+                            }
+
+                            // Slice 4a: device network-quality facts (Linux
+                            // netlink TCP_INFO + /proc/net/dev throughput) — the
+                            // ONLY channel for the fleet net gauges + /network
+                            // Overview, same as the perf tags above. Gated like
+                            // perf; this is aggregate device telemetry with NO
+                            // per-destination data (that warehouse tier + its
+                            // own opt-in are a later slice). Off Linux the sample
+                            // is all-invalid, so no tags ship (absent, not zero).
+                            if (!cfg_.dex_disable) {
+                                const auto net_cur = netq::read_net_counters();
+                                const auto ns =
+                                    netq::sample_net_quality(hb_prev_net, net_cur);
+                                hb_prev_net = net_cur;
+                                if (ns.rtt_valid)
+                                    tags["yuzu.net_rtt_p50_ms"] =
+                                        std::format("{:.1f}", ns.rtt_p50_ms);
+                                if (ns.retrans_valid)
+                                    tags["yuzu.net_retrans_pct"] =
+                                        std::format("{:.2f}", ns.retrans_pct);
+                                if (ns.throughput_valid)
+                                    tags["yuzu.net_throughput_bps"] =
+                                        std::format("{:.0f}", ns.throughput_bps);
+                                // net_degraded only when a quality signal exists.
+                                if (ns.rtt_valid || ns.retrans_valid)
+                                    tags["yuzu.net_degraded"] = ns.degraded ? "1" : "0";
                             }
 
                             // PR 10: attach pushed fleet snapshot if the
