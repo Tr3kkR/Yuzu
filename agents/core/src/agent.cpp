@@ -1076,6 +1076,17 @@ public:
             }
         }
 
+        // Guard: join snapshot_pump_thread_ on every exit from Run(), including
+        // early returns (hard-rejection at 1218, PKI failures at 1263/1278) that
+        // would otherwise leave a joinable std::thread capturing `this` — causing
+        // UAF→SIGSEGV or std::terminate when AgentImpl is destroyed. Fires before
+        // the plugin cleanup guard (LIFO), so the pump stops before TAR is torn down.
+        ScopeExit pump_cleanup{[this]() {
+            stop_requested_.store(true, std::memory_order_release);
+            if (snapshot_pump_thread_.joinable())
+                snapshot_pump_thread_.join();
+        }};
+
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
