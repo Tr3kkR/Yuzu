@@ -66,6 +66,7 @@
 #include "dex_blast_radius.hpp"
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
+#include "network_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -7905,6 +7906,13 @@ private:
             // F2a: the shared fleet perf snapshot provider (defined above).
             dex_perf_fn);
 
+        // NetworkRoutes — /network (page shell) + /fragments/network/* (the
+        // network-quality lens + net/device/app co-occurrence evidence). The
+        // snapshot provider is wired in the next increment; until then the
+        // fragments render an honest "unavailable" placeholder.
+        network_routes_ = std::make_unique<NetworkRoutes>();
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -8724,6 +8732,7 @@ private:
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
+    std::unique_ptr<NetworkRoutes> network_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

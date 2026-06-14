@@ -13,6 +13,8 @@
  */
 #include "network_perf_model.hpp"
 #include "network_perf_rules.hpp"
+#include "network_routes.hpp"
+#include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -204,4 +206,111 @@ TEST_CASE("metric token round-trips", "[network][model]") {
     CHECK(net_perf_metric_from_token("rtt") == NetPerfMetric::kRtt);
     CHECK(net_perf_metric_from_token("garbage") == NetPerfMetric::kRtt); // default
     CHECK(std::string(net_perf_metric_token(NetPerfMetric::kRetrans)) == "retrans");
+}
+
+// ── renderers ────────────────────────────────────────────────────────────────
+
+TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    snap.devices.push_back(dev("lnx-2", 600.0, 9.0, 2.0e5));
+    snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + device pressure
+    snap.devices.push_back(degraded("deg-app", 10.0, true));  // degraded + app instability
+
+    const auto html = render_network_overview_fragment(snap);
+    CHECK(html.find("Network quality") != std::string::npos);
+    CHECK(html.find("Round-trip time") != std::string::npos);
+    CHECK(html.find("co-occurrence") != std::string::npos);
+    CHECK(html.find("counting, not blaming") != std::string::npos); // never a verdict
+    CHECK(html.find("TCP_INFO") != std::string::npos);              // Linux/Windows honesty note
+    CHECK(html.find("cooc=device") != std::string::npos);           // band drills
+    CHECK(html.find("cooc=app") != std::string::npos);
+}
+
+TEST_CASE("overview render: empty population is honest", "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
+    const auto html = render_network_overview_fragment(snap);
+    CHECK(html.find("No network telemetry yet") != std::string::npos);
+}
+
+TEST_CASE("devices render: worst-first + co-occurrence flags inline", "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-low", 40.0, std::nullopt, std::nullopt));
+    snap.devices.push_back(dev("lnx-high", 600.0, std::nullopt, std::nullopt));
+    snap.devices.push_back(degraded("deg-dev", 95.0, false));
+
+    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+                                                      NetCoocFilter::kNone, std::nullopt, 50);
+    CHECK(html.find("lnx-high") != std::string::npos);
+    CHECK(html.find("Worst devices by RTT") != std::string::npos);
+    CHECK(html.find("device &#9679;") != std::string::npos); // deg-dev pressure flag inline
+    CHECK(html.find("&mdash;") != std::string::npos);        // absent metric cell, never 0
+}
+
+// ── routes ───────────────────────────────────────────────────────────────────
+
+TEST_CASE("network routes: perm gating + provider degradation", "[network][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto noPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                     const std::string&) {
+        res.status = 403;
+        return false;
+    };
+    NetworkRoutes::PerfFn perf = [](const std::string&) {
+        NetPerfSnapshot snap;
+        snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + pressure
+        snap.devices.push_back(degraded("deg-app", 10.0, true));  // degraded + app
+        return snap;
+    };
+
+    SECTION("permitted: overview + devices render through the provider") {
+        yuzu::server::test::TestRouteSink sink;
+        NetworkRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, perf);
+        auto ov = sink.Get("/fragments/network/overview");
+        REQUIRE(ov);
+        CHECK(ov->status == 200);
+        CHECK(ov->body.find("Network quality") != std::string::npos);
+
+        // The device co-occurrence band shows only degraded+pressure devices.
+        auto drill = sink.Get("/fragments/network/devices?cooc=device");
+        REQUIRE(drill);
+        CHECK(drill->status == 200);
+        CHECK(drill->body.find("deg-dev") != std::string::npos);
+        CHECK(drill->body.find("deg-app") == std::string::npos);
+    }
+
+    SECTION("denied without GuaranteedState:Read") {
+        yuzu::server::test::TestRouteSink sink;
+        NetworkRoutes routes;
+        routes.register_routes(sink, okAuth, noPerm, perf);
+        auto ov = sink.Get("/fragments/network/overview");
+        REQUIRE(ov);
+        CHECK(ov->status == 403);
+    }
+
+    SECTION("no provider wired → honest unavailable placeholder") {
+        yuzu::server::test::TestRouteSink sink;
+        NetworkRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm);
+        auto ov = sink.Get("/fragments/network/overview");
+        REQUIRE(ov);
+        CHECK(ov->status == 200);
+        CHECK(ov->body.find("unavailable") != std::string::npos);
+    }
+
+    SECTION("page shell loads the overview fragment") {
+        yuzu::server::test::TestRouteSink sink;
+        NetworkRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, perf);
+        auto page = sink.Get("/network");
+        REQUIRE(page);
+        CHECK(page->status == 200);
+        CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
+    }
 }
