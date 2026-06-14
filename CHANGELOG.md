@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
+  collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
+  `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
+  macOS boottime equivalent), reusing the same observation builder for an identical
+  shape across OSes. Unprivileged, reused obs_type → no server change.
+
 - **Linux server DEX: reliability signals from the systemd journal.** The Linux
   DEX collector now reads the journal on a slow cadence (`journalctl --after-cursor
   -o json`, cursor-checkpointed) and emits, on the **existing** obs_types,

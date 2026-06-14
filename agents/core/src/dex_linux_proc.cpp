@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
+#include <cstdlib>
 #include <utility>
 
 namespace yuzu::agent::lnx {
@@ -266,6 +268,19 @@ bool overcommit_is_always(std::string_view s) {
     while (i < s.size() && !is_ws(s[i]))
         ++i;
     return s.substr(start, i - start) == "1";
+}
+
+std::optional<double> parse_proc_uptime(std::string_view proc_uptime) {
+    // /proc/uptime: "<uptime_seconds> <idle_seconds>" — take the first token.
+    // strtod needs a NUL-terminated buffer and is exception-free (unlike stod); a
+    // non-finite/overflow value reads as inf → rejected, never poisons the metric.
+    const std::string s(proc_uptime);
+    const char* const begin = s.c_str();
+    char* end = nullptr;
+    const double v = std::strtod(begin, &end);
+    if (end == begin || !std::isfinite(v) || v < 0.0)
+        return std::nullopt;
+    return v;
 }
 
 } // namespace yuzu::agent::lnx

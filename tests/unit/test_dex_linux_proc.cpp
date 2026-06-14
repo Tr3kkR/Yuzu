@@ -219,3 +219,18 @@ TEST_CASE("storage.low on a ZFS dataset emits the POOL, never the per-user leaf 
     check_pool("tank/home/alice /home/alice zfs rw 0 0\n", "tank", "alice");
     check_pool("rpool/USERDATA/alice_a1b2c3 /home/alice zfs rw 0 0\n", "rpool", "alice");
 }
+
+TEST_CASE("parse_proc_uptime: first token is the uptime in seconds",
+          "[guardian][dex][linux][proc]") {
+    const auto up = parse_proc_uptime("12345.67 8901.23\n");
+    REQUIRE(up.has_value());
+    CHECK_THAT(*up, WithinAbs(12345.67, 1e-6));
+}
+
+TEST_CASE("parse_proc_uptime: rejects malformed / non-finite / negative",
+          "[guardian][dex][linux][proc]") {
+    CHECK_FALSE(parse_proc_uptime("").has_value());
+    CHECK_FALSE(parse_proc_uptime("not-a-number\n").has_value());
+    CHECK_FALSE(parse_proc_uptime("-5.0 1.0\n").has_value()); // negative
+    CHECK_FALSE(parse_proc_uptime("inf 1.0\n").has_value());  // non-finite
+}

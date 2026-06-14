@@ -24,9 +24,10 @@
 
 #include "dex_linux_journal.hpp" // parse_journal_line, kMsgId* (journald → DEX)
 #include "dex_linux_proc.hpp"
-#include "dex_linux_storage.hpp" // storage_low_observation — the non-PII subject chokepoint
-#include "dex_perf_breach.hpp"   // breach_update, kCpuBreach/kMemoryBreach, *_observation
-#include "dex_win_poll.hpp"      // DiskLevel, latch_should_emit
+#include "dex_linux_storage.hpp"  // storage_low_observation — the non-PII subject chokepoint
+#include "dex_macos_signals.hpp"  // uptime_observation (shared cross-platform os.uptime_report)
+#include "dex_perf_breach.hpp"    // breach_update, kCpuBreach/kMemoryBreach, *_observation
+#include "dex_win_poll.hpp"       // DiskLevel, latch_should_emit
 
 #include <sys/statvfs.h>
 
@@ -127,7 +128,7 @@ public:
         on_error_ = std::move(on_error); // fired at runtime if /proc becomes unreadable (HIGH-3)
         stopping_ = false;
         thread_ = std::thread([this] { run(); });
-        spdlog::info("dex_observer(linux): armed — /proc perf + storage + journald poll");
+        spdlog::info("dex_observer(linux): armed — /proc perf + storage + journald + uptime poll");
         return true;
     }
 
@@ -154,11 +155,13 @@ private:
             last_perf_poll_ = now - win::kPerfSampleIntervalSeconds + kFirstPollDelaySeconds;
             last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
             last_journald_poll_ = now - kJournaldIntervalSeconds + kFirstPollDelaySeconds;
+            last_uptime_poll_ = now - kUptimeIntervalSeconds + kFirstPollDelaySeconds;
         }
         for (;;) {
             const std::int64_t next = std::min({last_perf_poll_ + win::kPerfSampleIntervalSeconds,
                                                 last_disk_poll_ + kDiskIntervalSeconds,
-                                                last_journald_poll_ + kJournaldIntervalSeconds});
+                                                last_journald_poll_ + kJournaldIntervalSeconds,
+                                                last_uptime_poll_ + kUptimeIntervalSeconds});
             const auto wait_s =
                 std::chrono::seconds(std::max(next - steady_now(), std::int64_t{1}));
             {
@@ -185,6 +188,10 @@ private:
                 if (now - last_journald_poll_ >= kJournaldIntervalSeconds) {
                     last_journald_poll_ = now;
                     poll_journald();
+                }
+                if (now - last_uptime_poll_ >= kUptimeIntervalSeconds) {
+                    last_uptime_poll_ = now;
+                    poll_uptime();
                 }
             } catch (const std::exception& e) {
                 spdlog::warn("dex_observer(linux): poll iteration failed, continuing: {}",
@@ -354,6 +361,23 @@ private:
         emit(std::move(obs));
     }
 
+    // os.uptime_report — the cross-platform uptime/reboot heartbeat (the Windows
+    // EventLog 6013 / macOS sysctl-boottime equivalent). Interval-gated (hourly,
+    // trendable) and timer-driven, not at-arm. /proc/uptime is unprivileged; boot
+    // time = now - uptime, fed to the SAME builder macOS uses so the observation is
+    // identical across OSes (parity). Bounded by the cadence — no debounce needed.
+    void poll_uptime() {
+        const auto txt = read_proc_file("/proc/uptime");
+        if (!txt)
+            return;
+        const auto up = lnx::parse_proc_uptime(*txt);
+        if (!up)
+            return;
+        const std::int64_t now = now_unix();
+        if (auto obs = macos::uptime_observation(now - static_cast<std::int64_t>(*up), now))
+            emit(std::move(*obs));
+    }
+
     // Stamp platform + delivery time centrally (an empty platform would vanish from
     // the by-OS panel; "linux" is the render token, matching dex_routes os_label).
     void emit(SignalObservation obs) {
@@ -372,6 +396,7 @@ private:
     static constexpr std::int64_t kDiskIntervalSeconds = 600;     // 10 min (the WinStatePoller cadence)
     static constexpr std::int64_t kJournaldIntervalSeconds = 60;  // reliability events want low latency
     static constexpr std::int64_t kJournaldDebounceSeconds = 300; // collapse a flapping unit/process
+    static constexpr std::int64_t kUptimeIntervalSeconds = 3600;  // hourly uptime/reboot heartbeat
     static constexpr int kProcFailDisarmThreshold = 3; // consecutive /proc/stat misses before disarm
 
     std::mutex mu_;
@@ -383,6 +408,7 @@ private:
     std::int64_t last_perf_poll_ = 0;
     std::int64_t last_disk_poll_ = 0;
     std::int64_t last_journald_poll_ = 0;
+    std::int64_t last_uptime_poll_ = 0;
     int proc_stat_fail_streak_ = 0;                          // consecutive /proc/stat read misses
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
     win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
