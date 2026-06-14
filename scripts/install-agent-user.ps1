@@ -896,6 +896,15 @@ function Remove-ProcBootAutologger {
         Write-Step "removing boot AutoLogger '$AutologgerName'"
         Remove-AutologgerConfig -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
     }
+    # Remove-AutologgerConfig drops only the boot-start *config* — it does NOT stop a
+    # session already running from a prior boot. Stop it explicitly, or uninstall
+    # leaves the YuzuProcBoot session live until the next reboot, holding one of the
+    # scarce (~64) system ETW session slots and still writing procboot.etl. (Verified
+    # on Win11: the file itself deletes fine while the session is open — the leftover
+    # is the running session, not an undeletable file.)
+    if (Get-Command Stop-EtwTraceSession -ErrorAction SilentlyContinue) {
+        Stop-EtwTraceSession -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
+    }
     if (Test-Path $ProcBootEtl) {
         Remove-Item $ProcBootEtl -Force -ErrorAction SilentlyContinue
     }

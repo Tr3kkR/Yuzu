@@ -146,11 +146,14 @@ Filename: "sc.exe"; Parameters: "stop YuzuAgent"; Flags: runhidden waituntilterm
 ; Small delay to let service stop
 Filename: "cmd.exe"; Parameters: "/c timeout /t 3 /nobreak >nul"; Flags: runhidden waituntilterminated; RunOnceId: "WaitStop"
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
-; Tear down the boot AutoLogger + its .etl, or an orphaned YuzuProcBoot session
-; keeps writing a 16 MB circular .etl on every boot after uninstall. Unconditional
-; (harmless no-op if it was never configured). Mirror of
-; scripts/install-agent-user.ps1 Remove-ProcBootAutologger.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
+; Tear down the boot AutoLogger + its .etl on uninstall. Remove-AutologgerConfig
+; drops only the boot-start config — it does NOT stop a session already running
+; from a prior boot, so Stop-EtwTraceSession is needed or uninstall leaves the
+; YuzuProcBoot session live until the next reboot, holding a scarce system ETW
+; session slot and still writing the 16 MB circular .etl. Unconditional (harmless
+; no-op if never configured). Mirror of
+; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
