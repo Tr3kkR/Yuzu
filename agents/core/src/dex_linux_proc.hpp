@@ -106,4 +106,14 @@ YUZU_EXPORT std::vector<MountPoint> parse_storage_mounts(std::string_view proc_m
 /// PII leaf. "disk" when the device is empty or reduces to nothing.
 YUZU_EXPORT std::string device_label(std::string_view device);
 
+/// PURE: true iff /proc/sys/vm/overcommit_memory selects mode 1 ("always
+/// overcommit"), in which CommitLimit is advisory — the kernel never refuses an
+/// allocation against it, so Committed_AS routinely exceeds it on healthy DB / Redis
+/// / HPC hosts. commit% vs CommitLimit is then meaningless and must NOT drive
+/// perf.memory_pressure (it would false-positive-storm). Modes 0 (heuristic, the
+/// default) and 2 (strict) keep CommitLimit meaningful. Anything that is not exactly
+/// the token "1" reads as not-always (so a read failure / empty file leaves the
+/// signal enabled — fail-safe toward keeping the signal, not suppressing it).
+YUZU_EXPORT bool overcommit_is_always(std::string_view proc_overcommit_memory);
+
 } // namespace yuzu::agent::lnx

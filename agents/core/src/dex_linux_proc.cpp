@@ -254,4 +254,18 @@ std::string device_label(std::string_view device) {
     return head.empty() ? "disk" : std::string(head);
 }
 
+bool overcommit_is_always(std::string_view s) {
+    // The file holds a single integer with a trailing newline ("1\n"). Take the first
+    // whitespace-delimited token (newline IS a delimiter here, unlike for_each_token)
+    // and require it to be exactly "1" (mode 1, "always"); "10"/"12" must NOT match.
+    const auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    std::size_t i = 0;
+    while (i < s.size() && is_ws(s[i]))
+        ++i;
+    const std::size_t start = i;
+    while (i < s.size() && !is_ws(s[i]))
+        ++i;
+    return s.substr(start, i - start) == "1";
+}
+
 } // namespace yuzu::agent::lnx

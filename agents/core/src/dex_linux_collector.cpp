@@ -52,6 +52,16 @@ std::int64_t now_unix() {
         .count();
 }
 
+// Monotonic seconds for the poll CADENCE only — immune to wall-clock steps (NTP
+// step-back, VM snapshot-resume) that would otherwise stall the loop until the old
+// stamp is re-passed (Gate-4 UP-12). The emitted observation timestamp still uses
+// now_unix() (wall clock) — that one must reflect real time, not uptime.
+std::int64_t steady_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // Read a small /proc pseudo-file whole. /proc/stat, /proc/meminfo and
 // /proc/mounts report size 0 but stream their content; they are a few KiB at most
 // and must be read in one shot (the parsers expect a complete snapshot).
@@ -105,7 +115,7 @@ private:
         // First poll 60 s after arm (never at-arm — arm-time work delays agent
         // startup), then each source keeps its own cadence. Mirrors WinStatePoller.
         {
-            const std::int64_t now = now_unix();
+            const std::int64_t now = steady_now();
             last_perf_poll_ = now - win::kPerfSampleIntervalSeconds + kFirstPollDelaySeconds;
             last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
         }
@@ -113,13 +123,13 @@ private:
             const std::int64_t next = std::min(last_perf_poll_ + win::kPerfSampleIntervalSeconds,
                                                last_disk_poll_ + kDiskIntervalSeconds);
             const auto wait_s =
-                std::chrono::seconds(std::max(next - now_unix(), std::int64_t{1}));
+                std::chrono::seconds(std::max(next - steady_now(), std::int64_t{1}));
             {
                 std::unique_lock lk(mu_);
                 if (cv_.wait_for(lk, wait_s, [this] { return stopping_; }))
                     return; // stop() requested
             }
-            const std::int64_t now = now_unix();
+            const std::int64_t now = steady_now();
             // A poll must NEVER unwind out of this thread (the file invariant): an
             // allocation failure — most likely exactly when measuring memory pressure —
             // would otherwise std::terminate the whole agent. Catch-and-continue keeps
@@ -177,13 +187,20 @@ private:
 
         // Commit charge vs commit limit — Linux's direct analogue of the Windows
         // commit/limit signal, so memory_pressure_observation's "commit charge …
-        // of limit" wording is correct, not relabelled.
+        // of limit" wording is correct, not relabelled. SKIPPED under
+        // vm.overcommit_memory=1 ("always"): there CommitLimit is advisory and
+        // Committed_AS routinely exceeds it on healthy DB/Redis/HPC hosts, so the
+        // ratio would false-positive-storm (Gate-4 UP-7). A read failure leaves the
+        // signal enabled (fail-safe toward keeping it). Modes 0/2 keep it meaningful.
         bool mem_valid = false;
         double mem_pct = 0.0;
-        if (const auto mem = read_proc_file("/proc/meminfo")) {
-            if (const auto pct = lnx::parse_commit_pct(*mem)) {
-                mem_pct = *pct;
-                mem_valid = true;
+        const auto oc = read_proc_file("/proc/sys/vm/overcommit_memory");
+        if (!(oc && lnx::overcommit_is_always(*oc))) {
+            if (const auto mem = read_proc_file("/proc/meminfo")) {
+                if (const auto pct = lnx::parse_commit_pct(*mem)) {
+                    mem_pct = *pct;
+                    mem_valid = true;
+                }
             }
         }
         if (const auto avg =

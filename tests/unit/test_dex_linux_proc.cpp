@@ -99,6 +99,15 @@ TEST_CASE("parse_commit_pct clamps heuristic overcommit to 100", "[guardian][dex
     CHECK_THAT(*pct, WithinAbs(100.0, 1e-9));
 }
 
+TEST_CASE("overcommit_is_always detects mode 1 only", "[guardian][dex][linux][proc]") {
+    CHECK(overcommit_is_always("1\n"));
+    CHECK(overcommit_is_always("1"));
+    CHECK_FALSE(overcommit_is_always("0\n")); // heuristic (default)
+    CHECK_FALSE(overcommit_is_always("2\n")); // strict — CommitLimit is hard, keep the signal
+    CHECK_FALSE(overcommit_is_always(""));     // unreadable → keep the signal (fail-safe)
+    CHECK_FALSE(overcommit_is_always("10\n")); // must be exactly "1", not a prefix
+}
+
 TEST_CASE("parse_storage_mounts whitelists local fs, skips pseudo/ro/snap",
           "[guardian][dex][linux][proc]") {
     const std::string m = "sysfs /sys sysfs rw,nosuid 0 0\n"
