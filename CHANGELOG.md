@@ -87,11 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; `process_enabled=false` disables Windows process capture
   entirely (ETW and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
-  redact). The boot-window AutoLogger backfill is configured only by the
-  developer install script today, **not** the production InnoSetup installer —
-  packaged Windows installs get live ETW capture but no boot-window backfill
-  until that wiring lands (tracked follow-up). See
-  `docs/user-manual/tar.md` "Upgrade note (Windows process capture → ETW)".
+  redact). The boot-window AutoLogger backfill is configured by the production
+  InnoSetup installer (scoped to the `advanced` component) and by the developer
+  install script (`install-agent-user.ps1`); it takes effect on the next reboot
+  after install. See `docs/user-manual/tar.md`
+  "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC

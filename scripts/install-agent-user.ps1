@@ -887,6 +887,8 @@ function New-ProcBootAutologger {
     }
 }
 
+# Mirror of yuzu-agent.iss [UninstallRun] (RunOnceId RemoveProcBootAutologger) —
+# keep the teardown sequence (remove-config -> stop-session -> delete-.etl) in sync.
 function Remove-ProcBootAutologger {
     if (-not $Script:Effective) {
         Write-Host "[dry-run] Remove-AutologgerConfig $AutologgerName"
