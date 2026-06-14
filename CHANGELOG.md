@@ -30,7 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would need the Security-Auditing 4688 provider). `process_live` raw cap raised
   5k→100k for the higher event rate; disk stays bounded (count rollups carry the
   long tail). `install-agent-user.ps1` is now UTF-8-BOM-encoded so Windows
-  PowerShell 5.1 parses it (it has non-ASCII characters).
+  PowerShell 5.1 parses it (it has non-ASCII characters). Disabling the
+  `process` source drains-and-discards the live ETW ring each cycle, so a paused
+  window is never persisted on re-enable (forensic-pause contract); the
+  boot-backfill replay is memory-bounded and drops corrupt-timestamp / torn
+  records.
 
 ### Changed
 

@@ -79,6 +79,13 @@ constexpr USHORT kEventProcessStop = 2;
 // EVENT_HEADER.TimeStamp a system-time FILETIME, so this is a plain rebase.
 std::int64_t filetime_to_unix(LARGE_INTEGER ft) {
     constexpr std::int64_t kEpochDelta = 116444736000000000LL; // 1601→1970 in 100ns
+    // A corrupt/torn .etl record (or a pre-1970 FILETIME) underflows the rebase to
+    // a bogus ancient/negative timestamp; return 0 so callers can reject ts <= 0
+    // rather than persist a row dated to 1601 (or worse, slip one past a
+    // `ts < cutoff` filter).
+    if (ft.QuadPart < kEpochDelta) {
+        return 0;
+    }
     return (ft.QuadPart - kEpochDelta) / 10000000LL;
 }
 
@@ -297,6 +304,9 @@ struct ProcEtwCollector::Impl {
             }
             ProcEvent ev;
             ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
+            if (ev.ts_unix <= 0) {
+                return; // corrupt/torn timestamp — never emit a bogus-dated row
+            }
             ev.is_start = (id == kEventProcessStart);
             prop_u32(rec, L"ProcessID", ev.pid);
             if (ev.pid == 0) {
@@ -449,6 +459,12 @@ struct BackfillCtx {
     std::unordered_map<std::uint32_t, std::string> pid_name; // start→stop name recovery
 };
 
+// Bound replay memory (output vector + name-recovery map) against an oversized or
+// crafted .etl — the agent data dir is writable by the service account, so a
+// replaced/huge file must not grow memory without limit during init(). Mirrors
+// the live ring's kPidSidCap posture; silently truncates past the cap.
+constexpr std::size_t kBackfillCap = 65536;
+
 // noexcept: invoked across the ETW (C) ProcessTrace frame during file replay,
 // same UB-on-throw constraint as on_event. Catch-and-drop.
 void WINAPI backfill_cb(EVENT_RECORD* rec) noexcept {
@@ -466,18 +482,23 @@ void WINAPI backfill_cb(EVENT_RECORD* rec) noexcept {
         }
         ProcEvent ev;
         ev.ts_unix = filetime_to_unix(rec->EventHeader.TimeStamp);
-        if (ev.ts_unix >= ctx->before_ts) {
-            return; // the live session owns everything from its start onward
+        if (ev.ts_unix <= 0 || ev.ts_unix >= ctx->before_ts) {
+            return; // <=0: corrupt/torn timestamp; >=before_ts: the live session owns it
         }
         ev.is_start = (id == kEventProcessStart);
         prop_u32(rec, L"ProcessID", ev.pid);
         if (ev.pid == 0) {
             return; // failed/torn TDH decode (corrupt .etl record) — drop it
         }
+        if (ctx->out->size() >= kBackfillCap) {
+            return; // replay output bounded — silently truncate an oversized .etl
+        }
         if (ev.is_start) {
             ev.image_name = prop_image_basename(rec, L"ImageName");
             prop_u32(rec, L"ParentProcessID", ev.ppid);
-            ctx->pid_name[ev.pid] = ev.image_name;
+            if (ctx->pid_name.size() < kBackfillCap) {
+                ctx->pid_name[ev.pid] = ev.image_name;
+            }
         } else {
             std::uint32_t code = 0;
             if (prop_u32(rec, L"ExitCode", code) || prop_u32(rec, L"ExitStatus", code)) {

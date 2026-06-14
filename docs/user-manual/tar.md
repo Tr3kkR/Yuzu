@@ -288,9 +288,13 @@ TAR is designed for minimal performance overhead:
 >   macOS are unchanged (the poll still captures command lines there). This is
 >   intentional (works-council / data-minimization posture) and not reversible by
 >   configuration — see the redaction section.
-> - **Live capture is active from the next agent start** — gap-free, so
->   short-lived processes the poll missed now appear, and `$Process_Live` holds
->   more rows (cap raised to 100000). If the ETW session cannot start, the agent
+> - **Live capture is active from the next agent start** — gap-free during the
+>   live session, so short-lived processes the poll missed now appear, and
+>   `$Process_Live` holds more rows (cap raised to 100000). (One narrow seam: at
+>   the boot→live handoff, events in the window between the agent sampling its
+>   boot/live boundary and the live provider becoming active can fall in neither
+>   the backfill nor the live stream — tracked as a follow-up.) If the ETW session
+>   cannot start, the agent
 >   logs the reason and falls back to the `toolhelp32` poll automatically; if the
 >   session later dies, it self-heals to the poll. The active path is reported by
 >   the `status` action as `process_capture_method` (`etw` or `polling`). Once it
@@ -309,7 +313,9 @@ TAR is designed for minimal performance overhead:
 >
 > To disable Windows process capture entirely (ETW and poll), set
 > `process_enabled=false` via `configure`; there is no separate "disable ETW but
-> keep polling" switch today.
+> keep polling" switch today. While disabled, the live ETW session keeps running
+> but its buffered events are drained-and-discarded each cycle, so no process
+> activity from the paused window is persisted when you re-enable.
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System

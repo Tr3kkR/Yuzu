@@ -6,7 +6,12 @@
 
 #include "tar_proc_etw.hpp"
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
+
+#include <cstdio>
+#include <fstream>
 
 using yuzu::tar::ProcEtwCollector;
 using yuzu::tar::ProcEvent;
@@ -103,6 +108,27 @@ TEST_CASE("boot_time_unix is minute-aligned", "[tar][procetw]") {
 #else
     REQUIRE(b == 0); // no boot concept off-Windows (backfill is a no-op there)
 #endif
+}
+
+TEST_CASE("backfill_proc_events_from_etl rejects missing/garbage input without crashing",
+          "[tar][procetw]") {
+    // Empty path → immediate no-op.
+    REQUIRE(yuzu::tar::backfill_proc_events_from_etl("", 0).empty());
+
+    // Non-existent file → OpenTrace fails, no events (off-Windows: a no-op stub).
+    const std::string missing = yuzu::test::unique_temp_path("tar-no-etl").string();
+    REQUIRE(yuzu::tar::backfill_proc_events_from_etl(missing, 1'000'000'000LL).empty());
+
+    // A real file that is NOT a valid .etl (corrupt/torn trace) → the replay must
+    // fail cleanly and return empty, never crash (the data dir is writable by the
+    // service account, so a malformed file is a reachable input).
+    const std::string garbage = yuzu::test::unique_temp_path("tar-garbage").string();
+    {
+        std::ofstream f(garbage, std::ios::binary);
+        f << "this is not a valid ETL trace file";
+    }
+    REQUIRE(yuzu::tar::backfill_proc_events_from_etl(garbage, 1'000'000'000LL).empty());
+    std::remove(garbage.c_str());
 }
 
 #ifndef _WIN32

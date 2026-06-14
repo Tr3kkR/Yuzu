@@ -506,7 +506,21 @@ private:
         // Per-source enable gate (issue #59): if disabled, skip both the
         // diff and the state save so that re-enabling later starts from a
         // clean baseline rather than diffing against a frozen snapshot.
-        if (source_enabled(*db_, "process")) {
+        const bool process_enabled = source_enabled(*db_, "process");
+        // Forensic-pause contract: the ETW collector owns a live session and keeps
+        // filling its ring even while the `process` source is disabled. Unlike the
+        // poll (which simply doesn't enumerate), the buffered events SURVIVE — so on
+        // the first drain after re-enable they would be persisted into process_live,
+        // capturing exactly the paused window the toggle forbids ("the agent will not
+        // STORE what the toggle forbids", as already enforced for boot-backfill).
+        // Drain-and-DISCARD each disabled tick so nothing from the paused window is
+        // ever stored. (Keeps the session warm — no stop/re-arm gap; the kernel
+        // session keeps running, events are captured-then-dropped, never inserted.)
+        if (etw_active_ && !process_enabled) {
+            proc_etw_->drain();       // flush + discard; never inserted
+            pending_etw_evs_.clear(); // and drop any pre-disable insert-retry backlog
+        }
+        if (process_enabled) {
             if (etw_active_) {
                 // Windows: gap-free ETW stream supersedes the snapshot-diff poll.
                 // Same process_live schema + 'started'/'stopped' so rollups and
