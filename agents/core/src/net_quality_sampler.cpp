@@ -17,11 +17,16 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h> // struct tcp_info
 #include <sys/socket.h>
+#include <sys/time.h> // struct timeval (SO_RCVTIMEO)
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstddef> // offsetof
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #ifndef NETLINK_SOCK_DIAG
@@ -42,6 +47,20 @@ struct FdGuard {
     }
     FdGuard(const FdGuard&) = delete;
     FdGuard& operator=(const FdGuard&) = delete;
+};
+static_assert(!std::is_copy_constructible_v<FdGuard> && !std::is_move_constructible_v<FdGuard>,
+              "FdGuard must be a non-copyable, non-movable scope owner");
+
+/// RAII owner for the /proc/net/dev FILE* (twin of FdGuard — no manual fclose).
+struct FileGuard {
+    std::FILE* f{nullptr};
+    explicit FileGuard(std::FILE* p) : f(p) {}
+    ~FileGuard() {
+        if (f)
+            std::fclose(f);
+    }
+    FileGuard(const FileGuard&) = delete;
+    FileGuard& operator=(const FileGuard&) = delete;
 };
 
 bool send_dump(int fd, uint8_t family) {
@@ -70,7 +89,10 @@ bool send_dump(int fd, uint8_t family) {
 
 // Accumulate per-connection RTT (ms) + retransmit/segment totals from one dump.
 void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& segs) {
-    char buf[16384];
+    // alignas: the in-place nlmsghdr/inet_diag_msg/rtattr casts below require
+    // NLMSG_ALIGNTO (4-byte) alignment; a bare char[] is only 1-aligned (UBSan
+    // -fsanitize=alignment). tcp_info (8-aligned) is read via memcpy, not cast.
+    alignas(NLMSG_ALIGNTO) char buf[16384];
     for (;;) {
         struct sockaddr_nl sa{};
         struct iovec iov{buf, sizeof(buf)};
@@ -79,7 +101,13 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
         m.msg_namelen = sizeof(sa);
         m.msg_iov = &iov;
         m.msg_iovlen = 1;
-        ssize_t n = ::recvmsg(fd, &m, 0);
+        // Retry on EINTR (don't abandon a dump on a signal); a SO_RCVTIMEO
+        // timeout returns EAGAIN -> n<0 -> we stop (bounded wait, never a
+        // wedged heartbeat thread).
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd, &m, 0);
+        } while (n < 0 && errno == EINTR);
         if (n <= 0)
             return;
         for (auto* h = reinterpret_cast<struct nlmsghdr*>(buf); NLMSG_OK(h, n);
@@ -100,11 +128,18 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
                 if (RTA_PAYLOAD(attr) < offsetof(struct tcp_info, tcpi_segs_out) +
                                             sizeof(uint32_t))
                     continue;
-                const auto* ti = reinterpret_cast<const struct tcp_info*>(RTA_DATA(attr));
-                if (ti->tcpi_rtt > 0)
-                    rtts_ms.push_back(ti->tcpi_rtt / 1000.0); // tcpi_rtt is microseconds
-                retrans += ti->tcpi_total_retrans;
-                segs += ti->tcpi_segs_out;
+                // memcpy into a local, NOT a reinterpret_cast: RTA_DATA is only
+                // 4-byte aligned but tcp_info needs 8-byte alignment (it has
+                // __u64 members), and no real tcp_info object lives in `buf`.
+                // The cast would be alignment + strict-aliasing UB; memcpy moots
+                // both. Copy at most our struct size (kernel struct may be larger).
+                struct tcp_info ti{};
+                std::memcpy(&ti, RTA_DATA(attr),
+                            std::min<std::size_t>(RTA_PAYLOAD(attr), sizeof ti));
+                if (ti.tcpi_rtt > 0)
+                    rtts_ms.push_back(ti.tcpi_rtt / 1000.0); // tcpi_rtt is microseconds
+                retrans += ti.tcpi_total_retrans;
+                segs += ti.tcpi_segs_out;
             }
         }
     }
@@ -114,15 +149,15 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
 
 NetCounters read_net_counters() {
     NetCounters c;
-    std::FILE* f = std::fopen("/proc/net/dev", "re");
-    if (!f)
+    std::FILE* raw = std::fopen("/proc/net/dev", "re");
+    if (!raw)
         return c; // invalid
+    FileGuard fg(raw); // closes on every return path
+    std::FILE* f = raw;
     char line[512];
     // Skip the two header lines.
-    if (!std::fgets(line, sizeof(line), f) || !std::fgets(line, sizeof(line), f)) {
-        std::fclose(f);
+    if (!std::fgets(line, sizeof(line), f) || !std::fgets(line, sizeof(line), f))
         return c;
-    }
     uint64_t rx_total = 0, tx_total = 0;
     while (std::fgets(line, sizeof(line), f)) {
         char* colon = std::strchr(line, ':');
@@ -145,7 +180,6 @@ NetCounters read_net_counters() {
             tx_total += txb;
         }
     }
-    std::fclose(f);
     c.valid = true;
     c.rx_bytes = rx_total;
     c.tx_bytes = tx_total;
@@ -160,6 +194,11 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
     int raw = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
     if (raw >= 0) {
         FdGuard guard(raw);
+        // Bound the recvmsg wait so a stalled dump (kernel that never sends
+        // NLMSG_DONE) can never wedge the heartbeat thread — it degrades to a
+        // partial/empty sample (absent tags), not a hung agent.
+        struct timeval tv{2, 0}; // 2 s
+        ::setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         std::vector<double> rtts;
         uint64_t retrans = 0, segs = 0;
         for (uint8_t fam : {AF_INET, AF_INET6})

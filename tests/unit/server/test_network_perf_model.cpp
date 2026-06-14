@@ -20,10 +20,21 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
 namespace rules = yuzu::server::detail;
+
+// TAG-KEY PIN: these server-side constants MUST equal the literal strings the
+// agent emits in agents/core/src/agent.cpp (the yuzu.net_* heartbeat block).
+// The agent can't include this header, so the literals are duplicated — a drift
+// here means silent zero-reporting (it already cost a live-UAT debug cycle). If
+// you change a constant, change the agent emit site too.
+static_assert(std::string_view(rules::kNetTagRttP50Ms) == "yuzu.net_rtt_p50_ms");
+static_assert(std::string_view(rules::kNetTagRetransPct) == "yuzu.net_retrans_pct");
+static_assert(std::string_view(rules::kNetTagThroughputBps) == "yuzu.net_throughput_bps");
+static_assert(std::string_view(rules::kNetTagDegraded) == "yuzu.net_degraded");
 
 namespace {
 
@@ -223,8 +234,9 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     CHECK(html.find("co-occurrence") != std::string::npos);
     CHECK(html.find("counting, not blaming") != std::string::npos); // never a verdict
     CHECK(html.find("TCP_INFO") != std::string::npos);              // Linux/Windows honesty note
-    CHECK(html.find("cooc=device") != std::string::npos);           // band drills
-    CHECK(html.find("cooc=app") != std::string::npos);
+    CHECK(html.find("cooc=device") != std::string::npos);          // real band drill
+    CHECK(html.find("cooc=network_only") != std::string::npos);     // real band drill
+    CHECK(html.find("pending") != std::string::npos);              // app co-occurrence is pending, not a fake 0
 }
 
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {
@@ -313,4 +325,24 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
     }
+}
+
+TEST_CASE("devices render: hostile agent_id is HTML-escaped", "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("<b>x</b>&\"", 600.0, std::nullopt, std::nullopt));
+    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+                                                      NetCoocFilter::kNone, std::nullopt, 50);
+    CHECK(html.find("<b>x</b>") == std::string::npos); // raw markup never emitted
+    CHECK(html.find("&lt;b&gt;") != std::string::npos); // escaped form present
+}
+
+TEST_CASE("device_list: kAlsoApp band filters to app-co-occurring degraded", "[network][model]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(degraded("appdev", 10.0, true));  // degraded + app, no pressure
+    snap.devices.push_back(degraded("devdev", 95.0, false)); // degraded + pressure, no app
+    const auto rows = net_perf_device_list(snap, NetPerfMetric::kRtt, false,
+                                           NetCoocFilter::kAlsoApp, std::nullopt, 50);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].agent_id == "appdev");
+    CHECK(rows[0].app_unstable);
 }

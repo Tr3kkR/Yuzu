@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Network quality dashboard (`/network`).** A new top-level page surfaces
+  fleet-wide TCP network quality measured continuously on each endpoint from
+  kernel counters (no packet capture, no flow export). Fleet-now cards show RTT
+  p50/p90/max, TCP retransmit %, and device throughput; a co-occurrence panel
+  counts how many network-degraded devices also show device-perf pressure
+  (CPU/memory/disk) at the same time — **counted, never attributed** (app
+  co-occurrence is pending a later slice). The Devices drill lists
+  worst-by-metric / co-occurrence-band / not-reporting devices with inline
+  flags. **Linux** agents report the full per-connection tier via netlink
+  `INET_DIAG` (smoothed RTT + retransmit ratio + `/proc/net/dev` throughput);
+  Windows v1 is coarser (absent metrics are omitted, never averaged as zero).
+  New device-aggregate heartbeat tags
+  `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps,degraded}` (no per-destination
+  data; gated by `--dex-disable`) and Prometheus gauges
+  `yuzu_fleet_net_{reporting,degraded,rtt_ms,retrans_pct,throughput_bps}`. Page
+  permission: `GuaranteedState:Read`. See `docs/user-manual/network.md` and
+  `docs/user-manual/metrics.md`.
+
 ### Changed
 
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL

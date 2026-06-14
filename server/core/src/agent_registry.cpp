@@ -1381,10 +1381,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             net_tput.push_back(*v);
             net_reported_any = true;
         }
-        if (net_reported_any)
+        if (net_reported_any) {
             ++net_reporting;
-        if (auto d = parse_net_degraded(get(kNetTagDegraded)); d && *d)
-            ++net_degraded;
+            // Count degraded only for devices that reported a metric (a forged
+            // net_degraded=1 with no valid metric must not exceed the reporting
+            // denominator — UP-9).
+            if (auto d = parse_net_degraded(get(kNetTagDegraded)); d && *d)
+                ++net_degraded;
+        }
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));

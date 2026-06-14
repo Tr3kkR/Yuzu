@@ -1565,6 +1565,11 @@ public:
                                 const auto ns =
                                     netq::sample_net_quality(hb_prev_net, net_cur);
                                 hb_prev_net = net_cur;
+                                // TAG-KEY PIN: these literals MUST match
+                                // network_perf_rules.hpp kNetTag* (the server
+                                // parses by those constants) — a drift = silent
+                                // zero-reporting; pinned by static_assert in
+                                // tests/unit/server/test_network_perf_model.cpp.
                                 if (ns.rtt_valid)
                                     tags["yuzu.net_rtt_p50_ms"] =
                                         std::format("{:.1f}", ns.rtt_p50_ms);

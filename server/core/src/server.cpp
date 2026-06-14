@@ -7935,7 +7935,7 @@ private:
         // with session OS + cohort tags. Mirrors dex_perf_uncached. app_unstable
         // is wired with the per-connection collector slice (the co-occurrence
         // "also app" band stays empty until net_degraded facts exist).
-        auto net_perf_fn = [this](const std::string& cohort_key) -> NetPerfSnapshot {
+        auto net_perf_uncached = [this](const std::string& cohort_key) -> NetPerfSnapshot {
             NetPerfSnapshot snap;
             snap.cohort_key = cohort_key;
             std::unordered_map<std::string, std::string> cohort_values;
@@ -8005,6 +8005,44 @@ private:
                     if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
                         d.cohort = cv->second;
                 snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+        // 5s TTL memo keyed by cohort key (mirrors the dex_perf_fn memo) —
+        // heartbeat data changes on a ~30s cadence, so this bounds the per-request
+        // fleet walk (all_ids + per-id get_session + net_snapshot copy-under-mutex)
+        // under hard operator polling and the future REST surface.
+        struct NetPerfMemo {
+            std::mutex mu;
+            struct Entry {
+                std::chrono::steady_clock::time_point at;
+                NetPerfSnapshot snap;
+            };
+            std::unordered_map<std::string, Entry> by_key;
+        };
+        auto net_memo = std::make_shared<NetPerfMemo>();
+        auto net_perf_fn = [memo = net_memo,
+                            net_perf_uncached](const std::string& cohort_key) -> NetPerfSnapshot {
+            constexpr auto kTtl = std::chrono::seconds{5};
+            constexpr std::size_t kMaxMemoEntries = 8;
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lk(memo->mu);
+                if (auto it = memo->by_key.find(cohort_key);
+                    it != memo->by_key.end() && now - it->second.at < kTtl)
+                    return it->second.snap;
+            }
+            auto snap = net_perf_uncached(cohort_key);
+            {
+                std::lock_guard lk(memo->mu);
+                if (memo->by_key.size() >= kMaxMemoEntries && !memo->by_key.contains(cohort_key)) {
+                    auto oldest = memo->by_key.begin();
+                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
+                        if (it->second.at < oldest->second.at)
+                            oldest = it;
+                    memo->by_key.erase(oldest);
+                }
+                memo->by_key[cohort_key] = {now, snap};
             }
             return snap;
         };

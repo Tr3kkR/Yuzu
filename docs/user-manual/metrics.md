@@ -333,6 +333,28 @@ recipe: `max_over_time(yuzu_fleet_perf_cohort_clipped[1m])` for liveness,
 sweep cadence, scrape at ≤10 s intervals when the export is enabled. See the
 label-exposure note under Security considerations before choosing a key.
 
+## Fleet network gauges
+
+Published on every fleet-health sweep (~15 s), fed from the `yuzu.net_*`
+heartbeat tags (device-aggregate facts only — no per-destination data). A metric
+nobody reported is **absent**, never zero. Linux agents report the full tier;
+Windows and macOS are partially covered in v1 (see [Network Quality](network.md)
+→ Platform coverage). The same numbers feed the `/network` Overview cards, via
+the shared validators, so the gauges and the page cannot disagree.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_net_reporting` | gauge | Devices whose latest heartbeat carried at least one network fact (the same any-of definition the `/network` Overview Reporting card uses) |
+| `yuzu_fleet_net_degraded` | gauge | Devices reporting the `net_degraded` fact this cycle — a measured COUNT (RTT > 150 ms or retransmit > 5 %), not a causal verdict; counted only for devices that also reported a metric |
+| `yuzu_fleet_net_rtt_ms{stat}` | gauge | Fleet smoothed RTT in ms, `stat` = `avg` / `p50` / `p90` / `max`. Population: devices that report RTT (Linux today) |
+| `yuzu_fleet_net_retrans_pct{stat}` | gauge | Fleet TCP retransmission %, same `stat` labels |
+| `yuzu_fleet_net_throughput_bps{stat}` | gauge | Fleet device network throughput in bytes/s (rx+tx, non-loopback), same `stat` labels |
+
+Network sampling shares the `--dex-disable` agent flag; disabling DEX also
+disables the network heartbeat tags. The `_rtt_ms` / `_retrans_pct` /
+`_throughput_bps` families clear on every sweep (absent, never stale);
+`_reporting` and `_degraded` are counts set each sweep.
+
 ## Guardian metrics
 
 | Metric | Type | Description |

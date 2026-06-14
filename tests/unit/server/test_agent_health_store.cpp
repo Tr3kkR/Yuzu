@@ -6,6 +6,8 @@
  * that exercises the same MetricsRegistry output contract.
  */
 
+#include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -122,17 +124,30 @@ public:
             collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
             collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, 1.0e6);
 
-            // Network facts — same forged-value posture (clamp retransmit %,
-            // reject absurd-but-finite RTT/throughput). net_degraded is a count.
-            const auto net_before = net_rtt.size() + net_retrans.size() + net_tput.size();
-            collect_finite(net_rtt, "yuzu.net_rtt_p50_ms", 0.0, 6.0e4);
-            collect_finite(net_retrans, "yuzu.net_retrans_pct", 100.0, 1.0e6);
-            collect_finite(net_tput, "yuzu.net_throughput_bps", 0.0, 1.0e12);
-            if (net_rtt.size() + net_retrans.size() + net_tput.size() > net_before)
+            // Use the SHIPPED validators (network_perf_rules.hpp) — not a
+            // hand-rolled parallel copy — so this repro can't drift from
+            // production's forged-value posture (full-token parse, locale
+            // hardening, ceilings/clamps). Mirrors agent_registry.cpp incl. the
+            // UP-9 gate (degraded counted only for metric-reporting devices).
+            namespace rules = yuzu::server::detail;
+            bool net_any = false;
+            if (auto v = rules::parse_net_rtt_ms(get(rules::kNetTagRttP50Ms))) {
+                net_rtt.push_back(*v);
+                net_any = true;
+            }
+            if (auto v = rules::parse_net_retrans_pct(get(rules::kNetTagRetransPct))) {
+                net_retrans.push_back(*v);
+                net_any = true;
+            }
+            if (auto v = rules::parse_net_throughput_bps(get(rules::kNetTagThroughputBps))) {
+                net_tput.push_back(*v);
+                net_any = true;
+            }
+            if (net_any) {
                 ++net_reporting;
-            const auto deg = get("yuzu.net_degraded");
-            if (deg == "1" || deg == "true")
-                ++net_degraded;
+                if (auto d = rules::parse_net_degraded(get(rules::kNetTagDegraded)); d && *d)
+                    ++net_degraded;
+            }
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));

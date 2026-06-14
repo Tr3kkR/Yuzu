@@ -171,16 +171,26 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
              "</b> devices show degraded network quality. Of those, what <i>else</i> is happening on "
              "the same box right now:</div>";
         h += "<table class=\"gp-table\"><tbody>";
-        h += band("network_only", "network signal stands alone", now.cooc.network_only);
         h += band("device", "&hellip; also under <b>device</b> perf pressure (CPU/mem/disk)",
                   now.cooc.also_device);
-        h += band("app", "&hellip; also showing <b>app</b> instability (crash/hang)",
-                  now.cooc.also_app);
+        // "no device-perf pressure" is what this band actually measures while the
+        // app dimension is unwired — NOT "network stands alone" (that would
+        // overstate it, since app instability isn't measured yet).
+        h += band("network_only", "&hellip; no device-perf pressure", now.cooc.network_only);
+        // App correlation (the DEX crash/hang join) lands with the per-connection
+        // collector slice — render it as PENDING, never a confident 0, so the
+        // panel can't overstate the network-standalone population.
+        h += "<tr><td><span class=\"gp-mute\">&hellip; also showing <b>app</b> instability "
+             "(crash/hang)</span></td><td style=\"text-align:right\">"
+             "<span class=\"gp-mute\">pending</span></td></tr>";
         h += "</tbody></table>";
         h += "<div class=\"gp-note\"><b>This is counting, not blaming.</b> &ldquo;Also under device "
              "pressure&rdquo; means the two facts co-occur on the same box at the same time &mdash; "
              "not a verdict that the device <i>caused</i> the slowness (memory pressure can look like "
-             "a network fault). The causal verdict is a deliberate overlay; v1 ships the evidence.</div>";
+             "a network fault). The causal verdict is a deliberate overlay; v1 ships the evidence. "
+             "<b>App-instability co-occurrence is pending</b> &mdash; it arrives with the per-connection "
+             "collector; until then a degraded device with no device-perf pressure is shown as exactly "
+             "that, not asserted to be network-only.</div>";
     }
     return h;
 }

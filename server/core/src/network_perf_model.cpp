@@ -118,7 +118,10 @@ NetPerfFleetNow net_perf_fleet_now(const NetPerfSnapshot& snap) {
             retrans.push_back(*d.retrans_pct);
         if (d.throughput_bps)
             tput.push_back(*d.throughput_bps);
-        if (d.net_degraded) {
+        // Count degraded only for devices that actually reported a metric this
+        // cycle, so a forged net_degraded=1 with no valid metric can never make
+        // the co-occurrence headline exceed the Reporting denominator (UP-9).
+        if (d.net_degraded && reports_any(d)) {
             ++out.cooc.degraded;
             const bool pressure =
                 net_device_under_pressure(d.cpu_pct, d.commit_pct, d.disk_lat_ms);

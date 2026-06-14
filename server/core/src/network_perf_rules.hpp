@@ -29,7 +29,9 @@
 namespace yuzu::server::detail {
 
 /// Heartbeat status-tag keys carrying the thin, fixed-cardinality network
-/// facts. The agent emits these (netqual_enabled / dex_disable-gated); the
+/// facts. The agent emits these (gated by `--dex-disable` today; a dedicated
+/// per-category `netqual_enabled` opt-in arrives with the per-destination
+/// warehouse slice); the
 /// server side must never spell them inline. Dimensioned per-app / per-dest
 /// detail deliberately stays in the device warehouse — NOT on the heartbeat.
 inline constexpr const char* kNetTagRttP50Ms = "yuzu.net_rtt_p50_ms";
