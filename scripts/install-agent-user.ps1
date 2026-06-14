@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Provision the unprivileged Windows account the Yuzu agent runs under,
     plus the narrow privilege grants it needs to operate plugins like
@@ -187,6 +187,13 @@ param(
     [switch]$Uninstall,
     [string]$AccountName = "YuzuAgent",
     [string]$BinaryPath  = "C:\Program Files\Yuzu\yuzu-agent.exe",
+    # The agent's data directory — MUST equal the value passed to the agent's
+    # `--data-dir`, because the boot AutoLogger writes `procboot.etl` here and the
+    # agent reads it from the same directory it writes `tar.db` to. Defaults to
+    # the production service data dir (C:\ProgramData\Yuzu); override when the
+    # agent runs with a different --data-dir (e.g. a UAT data dir) so the
+    # boot-window backfill actually finds the trace.
+    [string]$DataDir = "C:\ProgramData\Yuzu",
     [switch]$SkipDenyInteractive
 )
 
@@ -827,6 +834,70 @@ function Test-Install {
     }
 }
 
+# ── boot-window ETW AutoLogger (thread 1b) ──────────────────────────────────
+#
+# The narrow agent account cannot write the privileged HKLM Autologger config at
+# runtime, so we register it here (install-time, admin). The kernel starts it
+# early on each boot and captures Microsoft-Windows-Kernel-Process start/stop to
+# a circular, size-capped .etl; the agent drains that file at startup to backfill
+# the boot window its live session missed. **Takes effect on the NEXT boot.**
+#
+# The .etl path MUST match the agent's --data-dir: the agent reads `procboot.etl`
+# from the SAME directory it writes `tar.db` to (NOT a `state` subdirectory).
+# Driven by the -DataDir parameter (default C:\ProgramData\Yuzu = the production
+# service data dir). Override -DataDir when the agent runs with a different
+# --data-dir, or the backfill silently finds no file. (Wiring the AutoLogger into
+# the production MSI/InnoSetup installer — which would pass -DataDir — is a
+# tracked follow-up.)
+# `-ClockType System` is load-bearing: the agent decodes the file's timestamps as
+# FILETIME. Best-effort by design — a failure here loses only boot-backfill, not
+# the live capture, so it WARNS rather than aborting the install.
+
+$Script:AutologgerName = "YuzuProcBoot"
+$Script:ProcBootEtl    = Join-Path $DataDir "procboot.etl"
+$Script:KernelProcessProviderGuid = "{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}"
+
+function New-ProcBootAutologger {
+    if (-not $Script:Effective) {
+        Write-Host "[dry-run] New-AutologgerConfig $AutologgerName (Kernel-Process -> $ProcBootEtl, circular 16MB, System clock)"
+        return
+    }
+    if (-not (Get-Command New-AutologgerConfig -ErrorAction SilentlyContinue)) {
+        Write-Warn "New-AutologgerConfig unavailable (EventTracingManagement module) — skipping boot-backfill AutoLogger. Live ETW still captures from agent start."
+        return
+    }
+    try {
+        Write-Step "configuring boot AutoLogger '$AutologgerName' -> $ProcBootEtl"
+        Remove-AutologgerConfig -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
+        # LogFileMode 0x2 = EVENT_TRACE_FILE_MODE_CIRCULAR; bounded to 16 MB.
+        # FlushTimer is LOAD-BEARING: without it the session's buffers never reach
+        # the file, so the agent's startup replay reads an empty .etl (verified on
+        # Win11). 1 s keeps the boot window on disk well before the agent starts.
+        New-AutologgerConfig -Name $AutologgerName -LogFileMode 0x2 -LocalFilePath $ProcBootEtl `
+            -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction Stop | Out-Null
+        # 0x10 = WINEVENT_KEYWORD_PROCESS (start/stop only), level 4 = INFORMATION.
+        Add-EtwTraceProvider -AutologgerName $AutologgerName -Guid $KernelProcessProviderGuid `
+            -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction Stop | Out-Null
+        Write-Info "  boot AutoLogger configured (effective next boot)"
+    } catch {
+        Write-Warn "boot AutoLogger setup failed ($($_.Exception.Message)) — continuing; live ETW still captures from agent start."
+    }
+}
+
+function Remove-ProcBootAutologger {
+    if (-not $Script:Effective) {
+        Write-Host "[dry-run] Remove-AutologgerConfig $AutologgerName"
+        return
+    }
+    if (Get-Command Remove-AutologgerConfig -ErrorAction SilentlyContinue) {
+        Write-Step "removing boot AutoLogger '$AutologgerName'"
+        Remove-AutologgerConfig -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
+    }
+    if (Test-Path $ProcBootEtl) {
+        Remove-Item $ProcBootEtl -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ── action dispatch ─────────────────────────────────────────────────────────
 
 if (-not $Check -and -not $Uninstall) {
@@ -852,6 +923,7 @@ if (-not $Check -and -not $Uninstall) {
     Grant-AccountPrivileges -name $AccountName -privileges $RequiredPrivileges
     New-AgentDirectories -name $AccountName
     Set-DenyInteractiveLogon -name $AccountName
+    New-ProcBootAutologger
 
     # Install marker so check / uninstall can find what we did.
     if ($Script:Effective) {
@@ -890,6 +962,7 @@ if ($Uninstall) {
 
     Revoke-AccountPrivileges -name $AccountName -privileges $RequiredPrivileges
     Remove-AgentFromGroups   -name $AccountName
+    Remove-ProcBootAutologger
     Remove-AgentAccount      -name $AccountName
     Remove-AgentDirectories
 

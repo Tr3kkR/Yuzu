@@ -147,6 +147,7 @@ tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sq
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
+  tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp ETW decode
 endif
 
 tar_test_exe = executable(
@@ -159,6 +160,7 @@ tar_test_exe = executable(
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
+    'unit/test_tar_proc_etw.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -167,6 +169,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_aggregator.cpp',
     '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_perf.cpp',
+    '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
