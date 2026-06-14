@@ -9,8 +9,9 @@
 
 #include "dex_linux_proc.hpp"
 
-#include "dex_event.hpp"    // signal_detail_json — prove no path PII reaches the wire payload
-#include "dex_win_poll.hpp" // low_disk_observation — the exact builder the collector calls
+#include "dex_event.hpp"         // signal_detail_json — prove no path PII reaches the wire payload
+#include "dex_linux_storage.hpp" // storage_low_observation — the exact chokepoint the collector calls
+#include "dex_win_poll.hpp"      // DiskLevel
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -158,9 +159,10 @@ TEST_CASE("storage.low carries the device label, NEVER the mount path (edge-priv
     REQUIRE(mounts.size() == 1);
     CHECK(mounts[0].path == "/home/alice/Acquisition-X"); // retained ONLY for the local statvfs()
 
-    // Reproduce the EXACT expression the collector emits (dex_linux_collector.cpp):
-    //   win::low_disk_observation(level, lnx::device_label(m.device))
-    const auto obs = win::low_disk_observation(near_full(), device_label(mounts[0].device));
+    // Call the SAME chokepoint the collector calls (dex_linux_collector.cpp:
+    //   lnx::storage_low_observation(m, level)) — so this is a regression guard on the
+    // collector's wiring, not just a re-composition of the expression.
+    const auto obs = storage_low_observation(mounts[0], near_full());
     REQUIRE(obs);
     CHECK(obs->subject == "sdb1");
 

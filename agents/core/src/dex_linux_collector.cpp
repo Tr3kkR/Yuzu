@@ -22,8 +22,9 @@
 #if defined(__linux__)
 
 #include "dex_linux_proc.hpp"
-#include "dex_perf_breach.hpp" // breach_update, kCpuBreach/kMemoryBreach, *_observation
-#include "dex_win_poll.hpp"    // DiskLevel, low_disk_observation, latch_should_emit
+#include "dex_linux_storage.hpp" // storage_low_observation — the non-PII subject chokepoint
+#include "dex_perf_breach.hpp"   // breach_update, kCpuBreach/kMemoryBreach, *_observation
+#include "dex_win_poll.hpp"      // DiskLevel, latch_should_emit
 
 #include <sys/statvfs.h>
 
@@ -198,12 +199,13 @@ private:
                 // signal), not f_bfree which includes the root-reserved slack.
                 level.free_bytes = static_cast<std::uint64_t>(vfs.f_bavail) * bs;
             }
-            // Subject = the backing-device basename (parity with Windows "C:" / macOS
-            // "Macintosh HD"), NEVER the mount path — a path carries usernames / tenant /
-            // project names that must not leave the device (DEX edge-privacy,
+            // Single chokepoint: subject = the backing-device basename, NEVER the mount
+            // path (a path carries usernames / tenant / project names — DEX edge-privacy,
             // dex-signal-catalog.md §"Privacy / works-council contract"). m.path is used
-            // ONLY for the local statvfs() above; it is never emitted, serialized, or logged.
-            const auto obs = win::low_disk_observation(level, lnx::device_label(m.device));
+            // ONLY for the local statvfs() above; it is never passed to the observation, so
+            // it cannot be emitted, serialized, or logged. The [dex][privacy] test guards
+            // this exact call.
+            const auto obs = lnx::storage_low_observation(m, level);
             bool& reported = disk_low_reported_[m.path];
             if (win::latch_should_emit(obs.has_value(), level.valid, reported))
                 emit(*obs);
