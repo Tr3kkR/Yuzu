@@ -129,12 +129,28 @@ Name: "{commonappdata}\Yuzu"; Permissions: service-full
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg: "Registering Yuzu Agent service..."; Flags: runhidden waituntilterminated
 Filename: "sc.exe"; Parameters: "config YuzuAgent binPath= ""{app}\bin\yuzu-agent.exe"" --server {code:GetServerAddress} --data-dir ""{commonappdata}\Yuzu"" --plugin-dir ""{app}\plugins"" --log-file ""{app}\logs\yuzu-agent.log"" {code:GetExtraArgs}"; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated shellexec
 Filename: "sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated shellexec; Check: ShouldStartService
+; Configure the boot-window ETW AutoLogger so the kernel captures process
+; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
+; at startup to backfill processes that started AND exited before its live ETW
+; session opened. Takes effect on the NEXT boot. Scoped to plugins\advanced (the
+; component that ships tar.dll) — pointless without the consumer. Best-effort:
+; -ErrorAction SilentlyContinue + trailing `exit 0` keep a failure here from
+; aborting the install (live capture is unaffected). RECIPE MIRRORS
+; scripts/install-agent-user.ps1 New-ProcBootAutologger — keep in sync (LogFileMode
+; 0x2 = circular, 16 MB cap, System clock for FILETIME decode, FlushTimer 1 so the
+; boot window reaches disk before the agent replays, keyword 0x10 = start/stop).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
 Filename: "sc.exe"; Parameters: "stop YuzuAgent"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 ; Small delay to let service stop
 Filename: "cmd.exe"; Parameters: "/c timeout /t 3 /nobreak >nul"; Flags: runhidden waituntilterminated; RunOnceId: "WaitStop"
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+; Tear down the boot AutoLogger + its .etl, or an orphaned YuzuProcBoot session
+; keeps writing a 16 MB circular .etl on every boot after uninstall. Unconditional
+; (harmless no-op if it was never configured). Mirror of
+; scripts/install-agent-user.ps1 Remove-ProcBootAutologger.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

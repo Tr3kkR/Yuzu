@@ -846,9 +846,12 @@ function Test-Install {
 # from the SAME directory it writes `tar.db` to (NOT a `state` subdirectory).
 # Driven by the -DataDir parameter (default C:\ProgramData\Yuzu = the production
 # service data dir). Override -DataDir when the agent runs with a different
-# --data-dir, or the backfill silently finds no file. (Wiring the AutoLogger into
-# the production MSI/InnoSetup installer — which would pass -DataDir — is a
-# tracked follow-up.)
+# --data-dir, or the backfill silently finds no file. The production InnoSetup
+# installer (deploy/packaging/windows/yuzu-agent.iss) carries a SECOND copy of
+# this recipe inline in its [Run]/[UninstallRun] sections (it can't shell out to
+# this script — that would also run the account/ACL setup and collide with the
+# installer's own --install-service). If the recipe changes here (LogFileMode,
+# FlushTimer, keyword, GUID, clock), update the .iss too — they must stay in sync.
 # `-ClockType System` is load-bearing: the agent decodes the file's timestamps as
 # FILETIME. Best-effort by design — a failure here loses only boot-backfill, not
 # the live capture, so it WARNS rather than aborting the install.
