@@ -68,15 +68,8 @@ gauge_tick_test_() ->
       {"tick emits vm process count event", fun tick_emits_process_count/0}]}.
 
 tick_setup() ->
-    %% Start pg scope.
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _ -> ok
-    end,
-    case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _ -> ok
-    end,
+    %% pg + a real registry, race-safe across modules (#1403 / #336).
+    yuzu_gw_test_registry:ensure(),
     %% Use ETS to collect telemetry events (EUnit runs setup and tests
     %% in different processes, so mailbox messaging won't work).
     catch ets:delete(gauge_test_events),

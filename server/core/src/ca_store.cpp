@@ -50,12 +50,13 @@ IssuedCertRecord read_issued_row(sqlite3_stmt* st) {
     r.enrollment_request_id = col_text(st, 10);
     r.cert_pem = col_text(st, 11);
     r.issuer_fingerprint = col_text(st, 12);
+    r.issuer_key_id = col_text(st, 13);
     return r;
 }
 
 constexpr const char* kIssuedCols =
     "serial_hex, subject, san, purpose, not_after, status, revocation_reason, revoked_at, "
-    "issued_at, issued_by, enrollment_request_id, cert_pem, issuer_fingerprint";
+    "issued_at, issued_by, enrollment_request_id, cert_pem, issuer_fingerprint, issuer_key_id";
 
 } // namespace
 
@@ -221,6 +222,20 @@ void CaStore::run_migrations() {
         {4, R"(
             ALTER TABLE ca_root ADD COLUMN chain_pem TEXT NOT NULL DEFAULT '';
         )"},
+        // v5: STABLE key-based CA identity (#1296). issuer_fingerprint (v2) hashes the
+        // whole issuer CERT, so a subordinate re-key (PR6 — same issuing KEY, new
+        // issuer cert) gives a different fingerprint on leaves minted after the swap;
+        // an "issued by THIS CA" query keyed on the current root fingerprint would
+        // silently orphan everything minted before it. issuer_key_id hashes only the
+        // subjectPublicKey (pki::issuer_key_id), so it is invariant across the re-key.
+        // Additive ALTER (not a v1 edit) so an already-migrated ca.db gains the column;
+        // the index backs CaStore::list_issued_by_key_id. NOT NULL DEFAULT '' leaves
+        // historical rows blank (back-compat) — they remain reachable by serial.
+        {5, R"(
+            ALTER TABLE ca_issued       ADD COLUMN issuer_key_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE ca_crl_versions ADD COLUMN issuer_key_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_ca_issued_issuer_key_id ON ca_issued(issuer_key_id);
+        )"},
     };
     if (!MigrationRunner::run(db_, "ca_store", kMigrations)) {
         spdlog::error("CaStore: schema migration failed, closing database");
@@ -327,8 +342,8 @@ bool CaStore::record_issued(const IssuedCertRecord& rec) {
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO ca_issued (serial_hex, subject, san, purpose, not_after, "
                            "status, revocation_reason, revoked_at, issued_at, issued_by, "
-                           "enrollment_request_id, cert_pem, issuer_fingerprint) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                           "enrollment_request_id, cert_pem, issuer_fingerprint, issuer_key_id) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                            -1, &st, nullptr) != SQLITE_OK) {
         spdlog::error("CaStore: prepare record_issued failed: {}", sqlite3_errmsg(db_));
         return false;
@@ -346,6 +361,7 @@ bool CaStore::record_issued(const IssuedCertRecord& rec) {
     bind_text(st, 11, rec.enrollment_request_id);
     bind_text(st, 12, rec.cert_pem);
     bind_text(st, 13, rec.issuer_fingerprint);
+    bind_text(st, 14, rec.issuer_key_id);
     const bool ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (!ok)
@@ -398,6 +414,38 @@ std::vector<IssuedCertRecord> CaStore::list_issued(int limit, int offset) {
         return out;
     sqlite3_bind_int(st, 1, limit);
     sqlite3_bind_int(st, 2, offset);
+    while (sqlite3_step(st) == SQLITE_ROW)
+        out.push_back(read_issued_row(st));
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<IssuedCertRecord> CaStore::list_issued_by_key_id(const std::string& issuer_key_id,
+                                                             int limit, int offset) {
+    std::lock_guard lk(mu_);
+    std::vector<IssuedCertRecord> out;
+    if (!db_)
+        return out;
+    // An EMPTY key id is the historical-row sentinel (pre-v5 / unpopulated), NOT a
+    // CA identity — returning those would conflate "issued by this CA" with "we
+    // don't know". Fail closed: callers asking for the live CA pass its real
+    // pki::issuer_key_id; a backfill is the only legitimate writer of '' and it
+    // does not query by it.
+    if (issuer_key_id.empty())
+        return out;
+    if (limit < 0 || limit > 10000)
+        limit = 10000;
+    if (offset < 0)
+        offset = 0;
+    sqlite3_stmt* st = nullptr;
+    const std::string sql = std::string("SELECT ") + kIssuedCols +
+                            " FROM ca_issued WHERE issuer_key_id = ? "
+                            "ORDER BY issued_at DESC, serial_hex DESC LIMIT ? OFFSET ?;";
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK)
+        return out;
+    bind_text(st, 1, issuer_key_id);
+    sqlite3_bind_int(st, 2, limit);
+    sqlite3_bind_int(st, 3, offset);
     while (sqlite3_step(st) == SQLITE_ROW)
         out.push_back(read_issued_row(st));
     sqlite3_finalize(st);
@@ -533,7 +581,8 @@ bool CaStore::record_crl(const CrlVersionRecord& rec) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO ca_crl_versions (version, der, this_update, "
-                           "next_update, published_at, issuer_fingerprint) VALUES (?, ?, ?, ?, ?, ?);",
+                           "next_update, published_at, issuer_fingerprint, issuer_key_id) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?);",
                            -1, &st, nullptr) != SQLITE_OK) {
         spdlog::error("CaStore: prepare record_crl failed: {}", sqlite3_errmsg(db_));
         return false;
@@ -544,6 +593,7 @@ bool CaStore::record_crl(const CrlVersionRecord& rec) {
     sqlite3_bind_int64(st, 4, rec.next_update);
     sqlite3_bind_int64(st, 5, rec.published_at ? rec.published_at : epoch_seconds());
     bind_text(st, 6, rec.issuer_fingerprint);
+    bind_text(st, 7, rec.issuer_key_id);
     const bool ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (!ok)
@@ -553,7 +603,8 @@ bool CaStore::record_crl(const CrlVersionRecord& rec) {
 
 std::optional<CrlVersionRecord>
 CaStore::publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                          const std::string& issuer_fingerprint) {
+                          const std::string& issuer_fingerprint,
+                          const std::string& issuer_key_id) {
     if (!build)
         return std::nullopt;
     // Serialise publishes against each other so the number allocated by
@@ -579,6 +630,7 @@ CaStore::publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t 
     rec.next_update = next_update;
     rec.published_at = epoch_seconds();
     rec.issuer_fingerprint = issuer_fingerprint;
+    rec.issuer_key_id = issuer_key_id;
     // Plain INSERT (in record_crl): a duplicate version — only reachable via a
     // cross-process publisher, not the single-server M1 model — is refused, never
     // clobbered. crl_publish_mu_ makes the same-process path collision-free.
@@ -594,7 +646,8 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "SELECT version, der, this_update, next_update, published_at, "
-                           "issuer_fingerprint FROM ca_crl_versions ORDER BY version DESC LIMIT 1;",
+                           "issuer_fingerprint, issuer_key_id FROM ca_crl_versions "
+                           "ORDER BY version DESC LIMIT 1;",
                            -1, &st, nullptr) != SQLITE_OK)
         return std::nullopt;
     std::optional<CrlVersionRecord> out;
@@ -611,6 +664,7 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
         r.next_update = sqlite3_column_int64(st, 3);
         r.published_at = sqlite3_column_int64(st, 4);
         r.issuer_fingerprint = col_text(st, 5);
+        r.issuer_key_id = col_text(st, 6);
         out = std::move(r);
     }
     sqlite3_finalize(st);

@@ -63,9 +63,9 @@ Created via `MigrationRunner` (namespace `ca_store`), opened `FULLMUTEX` + WAL +
   subordinate import, PR6).
 - `ca_issued(serial_hex PRIMARY KEY, subject, san, purpose, not_after, status,
   revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id,
-  cert_pem)`.
+  cert_pem, issuer_fingerprint, issuer_key_id)`.
 - `ca_crl_versions(version PRIMARY KEY, der, this_update, next_update,
-  published_at)`.
+  published_at, issuer_fingerprint, issuer_key_id)`.
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()`
 uses `RETURNING` for change detection — never `sqlite3_changes()` on the shared
@@ -347,8 +347,23 @@ validating *after* it. Only the issuer's cert (and the chain above it) changes.
 
 **Schema:** `ca_root.chain_pem` (migration v4) holds the parent chain above the
 issuing cert (empty in Builtin). `CaRoot.mode` records `builtin`/`subordinate`.
-Issued-cert `issuer_fingerprint` (v2) links each leaf to the root that signed it,
-so a re-key does not orphan the inventory.
+Issued-cert `issuer_fingerprint` (v2) records the issuance-time **cert** fingerprint
+as forensic metadata.
+
+**Stable CA identity (`issuer_key_id`, migration v5, #1296).** `issuer_fingerprint`
+hashes the whole issuer cert, so a subordinate re-key (same key, new cert) splits it
+into two values over one signing key — an "issued by THIS CA" query keyed on the
+*current* root fingerprint would silently orphan every leaf minted before the swap.
+`issuer_key_id` (`pki::issuer_key_id` — SHA-256 of the issuer's `subjectPublicKey`)
+depends only on the key, so it is **invariant across the re-key**. It is the correct
+key for inventory grouping: `CaStore::list_issued_by_key_id(key_id)` returns leaves
+minted both before and after an import with no rewrite (the import keeps the key, so
+the id is unchanged). Stamped at every issuance site (agent enrollment, default
+certs, CRL publish) and surfaced in `GET /api/v1/ca/issued` + the `list_issued_certs`
+MCP tool. `issuer_fingerprint` is retained as issuance-time forensic metadata; an
+empty `issuer_key_id` (pre-v5 / unpopulated rows) is the not-a-CA-identity sentinel
+and never matches the query. **Neither field is ever an admission/revocation key** —
+admission verifies by key+DN (`is_yuzu_issued`→`verify_chain`), revocation by serial.
 
 **Issued chain:** `sign_agent_csr` returns `cert_pem + chain_pem` as the
 `issued_ca_chain`, so a gateway/agent leaf receives a full path to the corporate

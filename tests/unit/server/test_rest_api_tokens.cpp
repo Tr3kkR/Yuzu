@@ -88,14 +88,22 @@ struct RestTokensHarness {
 
     RestApiV1 api;
 
-    RestTokensHarness()
-        : db_path(unique_temp_path("rest-api-tokens")),
+    /// `broken_token_db` points the ApiTokenStore at a path whose parent
+    /// directory does not exist, so sqlite3_open fails and db_ stays null —
+    /// the #347 CH-3 injection (storage down, routes still registered).
+    explicit RestTokensHarness(bool broken_token_db = false)
+        : db_path(broken_token_db
+                      ? unique_temp_path("rest-api-tokens") / "missing-dir" / "tokens.db"
+                      : unique_temp_path("rest-api-tokens")),
           device_db_path(unique_temp_path("rest-api-device-tokens")) {
         fs::remove(db_path);
         fs::remove(device_db_path);
         token_store = std::make_unique<ApiTokenStore>(db_path);
         device_token_store = std::make_unique<DeviceTokenStore>(device_db_path);
-        REQUIRE(token_store->is_open());
+        if (broken_token_db)
+            REQUIRE_FALSE(token_store->is_open());
+        else
+            REQUIRE(token_store->is_open());
         REQUIRE(device_token_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -711,4 +719,58 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5
     // explicit Retry-After hint tells them when. Closes #1046.
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Retry-After") == "5");
+}
+
+// ── #347 CH-3: storage failure surfaces as 503, never 404 ──────────────
+//
+// A token store whose DB never opened (bad data dir, perms) previously
+// collapsed into the not-found path: get_token returns nullopt and
+// revoke_token returns false when db_ is null, so the handler emitted
+// 404 "token not found" for a storage outage. The is_open() gate makes
+// the failure read as 503 "service unavailable" on every token route.
+// The message string deliberately matches every other store-down guard
+// (H-7 consolidated the 503 vocabulary so message-grep alerting matches
+// all store outages); the CH-3 signal is the 503-vs-404 status split.
+
+TEST_CASE("REST tokens: unopened token DB returns 503 on every route, never 404",
+          "[rest][token][issue347][ch3]") {
+    RestTokensHarness h(/*broken_token_db=*/true);
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    SECTION("DELETE /api/v1/tokens/{id}") {
+        auto res = h.delete_token("deadbeef");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("\"code\":503") != std::string::npos);
+        CHECK(res->body.find("not found") == std::string::npos);
+    }
+
+    SECTION("GET /api/v1/tokens does not mask the outage as an empty list") {
+        auto res = h.sink.Get("/api/v1/tokens");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("\"code\":503") != std::string::npos);
+    }
+
+    SECTION("POST /api/v1/tokens") {
+        auto res = h.sink.Post("/api/v1/tokens", R"({"name":"t","expires_at":0})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("\"code\":503") != std::string::npos);
+    }
+
+    SECTION("POST guard fires before body validation: malformed JSON is 503, not 400") {
+        auto res = h.sink.Post("/api/v1/tokens", R"({"name": broken)");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+    }
+
+    // The guard runs before any token is touched — no audit rows, no
+    // half-completed mutations to report.
+    CHECK(h.audit_log.empty());
 }

@@ -77,18 +77,28 @@ cmd = ["rebar3", "as", "test", suite]
 if suite == "eunit":
     cmd += ["--dir", "apps/yuzu_gw/test"]
 
-    # eunit_surefire writes its XML report to the literal path declared
-    # in gateway/rebar.config eunit_opts (`{dir, "_build/test/eunit"}`),
-    # which resolves relative to the rebar3 CWD = gateway_dir. That
-    # path is NOT auto-created — `eunit_surefire:write_report/2` calls
-    # `file:open` directly and crashes with `{error,enoent}` if the
-    # directory is missing. On Linux runners with a long-lived gateway
-    # checkout the dir often pre-exists from older non-REBAR_BASE_DIR
-    # runs, hiding the bug. On the Windows runner — and on any fresh
-    # checkout — REBAR_BASE_DIR redirects rebar3's own `_build` to
-    # `_build_eunit`, so `_build/test/eunit` is never created and the
-    # surefire listener crashes after every test passes (exit 1 on the
-    # gateway eunit test even with 0 actual test failures).
+    # Pre-create the eunit_surefire report dir (gateway/rebar.config
+    # eunit_opts `{dir, "_build/test/eunit"}`, resolved relative to the
+    # rebar3 CWD = gateway_dir). Belt-and-suspenders only: OTP 26+
+    # eunit_surefire:init/1 already self-creates this dir via
+    # filelib:ensure_dir + file:make_dir, so the dir's existence is not
+    # the failure mode it was once thought to be (#1403).
+    #
+    # NOTE on the `eunit_surefire:write_report ... {error,enoent}` crash
+    # seen in Windows eunit logs: that is a SEPARATE, HARMLESS artifact,
+    # not a build-breaker. With `--dir`, eunit's top-level group is named
+    # `directory "<abs path>"`; eunit_surefire:escape_suitename/1 turns
+    # the path's `/` into `:`, producing a filename like
+    # `TEST-directory_C::...:test.xml`. `:` is illegal in a Windows
+    # filename, so file:open fails with enoent on every Windows run. It
+    # does NOT affect the exit code: eunit's result comes from the
+    # eunit_tty listener, and eunit:test waits for listeners to terminate
+    # with ANY exit reason (see lib/eunit/src/eunit.erl). The surefire XML
+    # is not consumed by CI, so the broken report is moot. The actual
+    # intermittent #1403 failure was an unrelated test-isolation ETS race
+    # (yuzu_gw_test_registry now serialises registry start across modules)
+    # — its crash cancelled tests, which DID fail the build, and happened
+    # to print alongside the always-present surefire noise.
     surefire_dir = Path(gateway_dir) / "_build" / "test" / "eunit"
     surefire_dir.mkdir(parents=True, exist_ok=True)
 

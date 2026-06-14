@@ -600,6 +600,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     auto ca_fp = pki::fingerprint_sha256(*ca_cert_pem);
     if (!ca_info || !ca_fp)
         return false;
+    // #1296: STABLE key-based CA identity stamped on every issued row so an
+    // "issued by this CA" query survives a subordinate re-key. Best-effort: a
+    // derivation miss leaves the field blank (the row stays serial-addressable).
+    const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
     // Leaves are sized to the CA's exact notAfter so they never outlive the
     // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
     const pki::Validity leaf_validity{std::chrono::system_clock::now(), ca_info->not_after};
@@ -672,6 +676,8 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             rec.not_after = to_epoch(ca_info->not_after);
             rec.cert_pem = kc->cert_pem;
             rec.issued_by = "system:default-certs";
+            rec.issuer_fingerprint = *ca_fp;
+            rec.issuer_key_id = ca_key_id;
             if (!ca_store->record_issued(rec)) {
                 spdlog::error("default_certs: failed to record issued '{}' in ca.db — aborting "
                               "(the inventory must be consistent for revocation / rotation)",

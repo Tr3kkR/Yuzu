@@ -673,6 +673,42 @@ stale|false
 
 ---
 
+## Recipe: cohort benchmarking tags (DEX Performance)
+
+The `/dex` **Performance** tab compares fleet performance per **cohort** — the
+distinct values of a tag key you choose (default key: `model`). Cohorts come
+from tags, not from a central hardware-inventory column, so the comparison
+appears as soon as the fleet is tagged. This is the recipe the tab's "No tags
+on the fleet yet" placeholder refers to.
+
+Tag each device with its hardware model (free-form key, not one of the four
+structured categories):
+
+```bash
+curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "pay-web-01", "key": "model", "value": "ThinkPad T14 Gen 4"}'
+```
+
+To populate `model` fleet-wide, walk the hardware inventory and tag from it —
+the natural agentic-worker job (MCP: `query_inventory` per device → `set_tag`),
+or a short script over `GET /api/v1/agents` + the hardware plugin's `system`
+inventory, applying each device's reported model string as the tag value.
+
+Other useful cohort keys: `image` (e.g. `vanilla` vs `layered` for VDI
+image comparison), `location`, `role`. Pick any key from the tab's
+"cohort by tag key" selector. Honesty rules: cohorts under **10 reporting
+devices** show "n too small" rather than noisy percentiles, and untagged
+devices always appear as an explicit "(untagged)" residual row.
+
+> **Choosing keys for the Prometheus cohort export** (Settings → DEX alerts):
+> the exported key's tag *values* become metric labels visible to whatever
+> scrapes `/metrics`. Use non-sensitive organizational identifiers (hardware
+> model, image name) — never personnel-relevant strings. See
+> [metrics.md security considerations](user-manual/metrics.md#security-considerations).
+
+---
+
 ## Troubleshooting
 
 ### "invalid value for category" error when setting a tag

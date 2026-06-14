@@ -83,6 +83,10 @@ public:
     std::size_t cache_size() const;
 
 private:
+    // db_ is written only during construction (open + create_tables failure
+    // nulling); is_open() reads it without db_mtx_ and depends on that
+    // write-once invariant. Any future close/reopen path must take db_mtx_
+    // AND fix is_open().
     sqlite3* db_{nullptr};
     mutable std::shared_mutex db_mtx_; // protects all db_ access (G2-SEC-A2-002)
 

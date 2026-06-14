@@ -105,6 +105,8 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
         {"tcp", "monthly"},
         {"service", "hourly"},
         {"user", "daily"},
+        {"perf", "hourly"},
+        {"procperf", "hourly"},
     };
 
     for (const auto& step : steps) {

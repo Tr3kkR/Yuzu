@@ -3,7 +3,7 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8 AS builder
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS builder
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; default keeps the historical x64 build path.
@@ -15,6 +15,7 @@ ARG TRIPLET=x64-linux
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
+    bison flex \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -50,7 +51,7 @@ RUN meson setup builddir \
     && meson compile -C builddir
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libsqlite3-0 ca-certificates bash \

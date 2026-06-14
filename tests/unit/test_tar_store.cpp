@@ -9,6 +9,8 @@
 #include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
 
+#include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -445,6 +447,39 @@ TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
     CHECK(r->rows[0][0] == "1");
 }
 
+TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays authorizer-compatible",
+          "[tar][store][sandbox][procperf][pin]") {
+    // The server's /dex per-app panel dispatches this exact SQL shape
+    // (dex_routes.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
+    // procperf_hourly). No other test runs aggregates through the REAL
+    // authorizer on this table — an authorizer tightening that drops
+    // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
+    // the panel with no CI signal (governance G3 quality-engineer).
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max, "
+        "cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes) VALUES "
+        "(3600, 'Teams.exe', 120, 6, 8.4, 41.2, 2040109465, 3328599654), "
+        "(7200, 'Teams.exe', 120, 5, 4.0, 20.0, 1000000000, 2000000000)"));
+    auto r = t.db.execute_user_query(
+        "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
+        "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
+        "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "FROM procperf_hourly WHERE hour_ts >= 0 "
+        "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == "Teams.exe");
+    CHECK(r->rows[0][1] == "240");  // SUM(samples)
+    CHECK(r->rows[0][7] == "2");    // COUNT(*) hours
+    // Column names ride the schema line the server parser locates fields by.
+    REQUIRE(r->columns.size() == 8);
+    CHECK(r->columns[0] == "name");
+    CHECK(r->columns[3] == "cpu_avg");
+    CHECK(r->columns[5] == "ws_avg");
+}
+
 TEST_CASE("execute_user_query: UNION across two allowlisted tables is permitted",
           "[tar][store][sandbox][security]") {
     auto t = make_test_db();
@@ -556,4 +591,89 @@ TEST_CASE("execute_user_query: pragma_table_info table-valued function is denied
     // non-allowlisted table name, so it is denied like any other.
     CHECK_FALSE(
         t.db.execute_user_query("SELECT * FROM pragma_table_info('tar_config')").has_value());
+}
+
+// =============================================================================
+// A2: per-app perf rows + the every-open table-ensure regression
+// =============================================================================
+
+TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][store][procperf]") {
+    auto t = make_test_db();
+    std::vector<ProcPerfRow> rows;
+    for (int i = 0; i < 3; ++i) {
+        ProcPerfRow r;
+        r.ts = 2000 + i;
+        r.snapshot_id = 7;
+        r.name = "app" + std::to_string(i) + ".exe";
+        r.instances = i + 1;
+        r.cpu_pct = 10.0 * (i + 1);
+        r.ws_bytes = (100 << 20) * (i + 1);
+        rows.push_back(std::move(r));
+    }
+    REQUIRE(t.db.insert_proc_perf_samples(rows));
+    REQUIRE(t.db.insert_proc_perf_samples({})); // empty batch is a no-op success
+
+    auto q = t.db.execute_query("SELECT name, instances, cpu_pct, ws_bytes FROM procperf_live "
+                                "ORDER BY name");
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 3);
+    CHECK(q->rows[0][0] == "app0.exe");
+    CHECK(q->rows[2][1] == "3");
+}
+
+TEST_CASE("TarDatabase: insert_proc_perf_samples returns false (no crash) when the table is gone",
+          "[tar][store][procperf]") {
+    // The prepare-fail ROLLBACK path (gov QE S1): drop procperf_live out from
+    // under an open TarDatabase via the trusted exec path, then insert —
+    // sqlite3_prepare_v2 fails, the function must ROLLBACK and return false
+    // without throwing or wedging the connection.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE procperf_live").has_value());
+    ProcPerfRow r;
+    r.ts = 1;
+    r.snapshot_id = 1;
+    r.name = "x.exe";
+    r.instances = 1;
+    CHECK_FALSE(t.db.insert_proc_perf_samples({r}));
+    // The connection is still usable afterwards (no wedged transaction).
+    REQUIRE(t.db.execute_query("SELECT 1").has_value());
+}
+
+TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgrade path)",
+          "[tar][store][lifecycle]") {
+    // The A1 regression this pins: create_warehouse_tables used to run only at
+    // schema_version<2, so a table added by a NEWER release (perf tier,
+    // procperf tier) never materialised on an upgraded fleet's existing
+    // tar.db — inserts then failed every 30 s. The fix runs the idempotent
+    // IF-NOT-EXISTS DDL on EVERY open. Simulate the upgrade by dropping a
+    // "new" table from a closed v3 DB, then reopening.
+    auto tmp = yuzu::test::unique_temp_path("tar_upg_");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+    } // closed
+
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "DROP TABLE procperf_live", nullptr, nullptr, nullptr) ==
+                SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp); // must re-create the dropped table
+        REQUIRE(db.has_value());
+        ProcPerfRow r;
+        r.ts = 1;
+        r.snapshot_id = 1;
+        r.name = "x.exe";
+        r.instances = 1;
+        REQUIRE(db->insert_proc_perf_samples({r}));
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }

@@ -62,6 +62,10 @@
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
 #include "guardian_routes.hpp"
+#include "dex_alert_router.hpp"
+#include "dex_blast_radius.hpp"
+#include "dex_perf_rules.hpp"
+#include "dex_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -214,6 +218,26 @@ struct ScopedKeyZero {
     ~ScopedKeyZero() { yuzu::secure_zero(s); }
 };
 
+// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+// detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
+// Register gate — never charset-checked — and is audited verbatim. Without this,
+// an agent_id like `x via=direct` could forge the very `via=` discriminator
+// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
+// every control byte and structural delimiter (space, '=', ',') with '_'; the
+// identity is preserved verbatim in its own audit columns (principal/target_id)
+// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -265,6 +289,65 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
+                          "Windows agents (DEX enabled) reporting their DEX signal observer is not "
+                          "fully healthy (no channel armed, or a channel subscription dropped at "
+                          "runtime) — >0 means reliability telemetry is off or degraded on that "
+                          "many endpoints. (Per-channel partial-arm granularity is a follow-up; "
+                          "today this is the agent's own health flag.)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_dex_observed_total",
+                          "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
+                          "boot reports, …; sum of agent-reported counts since each agent "
+                          "started)", "gauge");
+        // D3 blast-radius detector observability (gov SRE OBS-1 / compliance S1).
+        metrics_.describe("yuzu_server_dex_blast_radius_incidents_total",
+                          "Fleet-incident alerts fired (≥min_devices distinct devices, same "
+                          "obs_type+subject, within the window)", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_fires_dropped_total",
+                          "Incident fires suppressed by the global per-minute fan-out rate cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_entries_dropped_total",
+                          "Sightings dropped because the global tracked-entry memory budget was "
+                          "exhausted", "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_evicted_total",
+                          "(obs_type,subject) pairs LRU-evicted to admit a new pair at the cap",
+                          "counter");
+        metrics_.describe("yuzu_server_dex_blast_radius_pairs_tracked",
+                          "Current count of tracked (obs_type,subject) pairs", "gauge");
+        // F2a PR3: per-cohort fleet perf gauges (exported only when the operator
+        // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
+        metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
+                          "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
+                          "cohorts of the configured export tag key, ≥10 reporting devices)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
+                          "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_disk_lat_ms",
+                          "Per-cohort disk per-IO service time ms (avg/p50/p90/max by {stat})",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_reporting",
+                          "Devices contributing perf samples per exported cohort", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cohort_clipped",
+                          "Exportable cohorts dropped by the top-50 cardinality cap this sweep "
+                          "(0 = nothing clipped; absent = export disabled)", "gauge");
+        // F1 alert-router observability (uniform yuzu_server_dex_alert_* prefix).
+        metrics_.describe("yuzu_server_dex_alert_fired_total",
+                          "Operator-routed per-signal alerts fired (notification + dex.signal "
+                          "webhook event)", "counter");
+        metrics_.describe("yuzu_server_dex_alert_delivery_failed_total",
+                          "Routed alerts whose sink (notification/webhook) threw — fired but not "
+                          "delivered; the cooldown is already armed so the alert is lost until the "
+                          "next episode", "counter");
+        metrics_.describe("yuzu_server_dex_alert_suppressed_total",
+                          "Routed sightings silenced by the per-(type,agent) cooldown", "counter");
+        metrics_.describe("yuzu_server_dex_alert_dropped_total",
+                          "Routed alerts dropped by the global per-minute fan-out cap", "counter");
+        metrics_.describe("yuzu_server_dex_alert_cooldowns_evicted_total",
+                          "Cooldown entries evicted at the capacity bound", "counter");
+        metrics_.describe("yuzu_server_dex_alert_routed_types",
+                          "Number of obs_types currently routed to alerts", "gauge");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -273,6 +356,24 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
+        // no agent reports — never a fabricated zero).
+        metrics_.describe("yuzu_fleet_perf_reporting",
+                          "Agents whose latest heartbeat carried at least ONE perf tag — the "
+                          "same any-of-three definition the /dex Performance tab's Reporting "
+                          "card uses, so the two always agree. Each per-metric gauge may cover "
+                          "a SUBSET of this population (its {stat} series carry their own n via "
+                          "the tab/REST; e.g. agents on virtual disks that don't answer "
+                          "IOCTL_DISK_PERFORMANCE omit the disk-latency tag)", "gauge");
+        metrics_.describe("yuzu_fleet_perf_cpu_pct",
+                          "Fleet device CPU busy % over each agent's last heartbeat interval, "
+                          "by {stat}: avg / nearest-rank p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_commit_pct",
+                          "Fleet commit-charge % of limit (memory pressure), by {stat}: "
+                          "avg / p50 / p90 / max", "gauge");
+        metrics_.describe("yuzu_fleet_perf_disk_lat_ms",
+                          "Fleet per-IO disk service time in ms, by {stat}: avg / p50 / p90 / max",
+                          "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -449,6 +550,15 @@ public:
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_proj_failures_total",
+                          "DEX observation projection failures. The source event is preserved "
+                          "(degrade-don't-destroy); only the derived guardian_observations read "
+                          "model row is lost. >0 means /dex is under-counting — investigate "
+                          "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_observations_reaped_total",
+                          "Cumulative DEX observation rows deleted by the retention reaper "
+                          "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
         // Process health metrics (capability 22.1)
@@ -1504,6 +1614,79 @@ public:
                 // shared path. Gateway service exists only in gateway mode.
                 if (gateway_service_)
                     gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
+
+                // D3 fleet-incident alerting (docs/dex-brd-coverage.md): N
+                // distinct devices reporting the same (obs_type, subject)
+                // inside the window → one operator notification + one
+                // webhook/offload event per cooldown. Wired before traffic
+                // (set-before-traffic contract on the detector).
+                blast_radius_detector_.set_on_incident([this](const BlastRadiusIncident& inc) {
+                    const std::string what = inc.subject.empty()
+                                                 ? inc.obs_type
+                                                 : inc.obs_type + " '" + inc.subject + "'";
+                    const std::string title = "Fleet incident: " + what + " on " +
+                                              std::to_string(inc.device_count) + " devices";
+                    const std::string message =
+                        std::to_string(inc.device_count) + " distinct devices reported " +
+                        what + " within the last " + std::to_string(inc.window_seconds / 60) +
+                        " minutes. See /dex for the drill-down.";
+                    spdlog::warn("BlastRadius: {}", title);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Same dual-sink discipline as agent.registered (HP-1/UP-6):
+                    // build the body once, guard each sink separately.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.blast_radius"},
+                                                  {"obs_type", inc.obs_type},
+                                                  {"subject", inc.subject},
+                                                  {"device_count", inc.device_count},
+                                                  {"window_seconds", inc.window_seconds}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.blast_radius", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.blast_radius", body);
+                    }
+                });
+                blast_radius_detector_.set_metrics(&metrics_);
+                agent_service_.set_blast_radius_detector(&blast_radius_detector_);
+                if (gateway_service_)
+                    gateway_service_->set_blast_radius_detector(&blast_radius_detector_);
+
+                // F1 operator-routed per-signal alerts (Settings → DEX alerts):
+                // a routed obs_type raises one notification + one `dex.signal`
+                // webhook/offload event per (type, agent) cooldown. Routes load
+                // from runtime config after the store opens (apply_dex_alert_
+                // config); default = nothing routed.
+                dex_alert_router_.set_on_alert([this](const RoutedSignalAlert& a) {
+                    const std::string what =
+                        a.subject.empty() ? a.obs_type : a.obs_type + " '" + a.subject + "'";
+                    const std::string title = "DEX alert: " + what;
+                    const std::string message = "Device " + a.agent_id + " reported " + what +
+                                                " (operator-routed signal). See /dex for the "
+                                                "drill-down.";
+                    spdlog::info("DexAlertRouter: {} on {}", what, a.agent_id);
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                    // Dual-sink discipline, same as the blast-radius incident.
+                    if ((webhook_store_ && webhook_store_->is_open()) ||
+                        (offload_target_store_ && offload_target_store_->is_open())) {
+                        nlohmann::json payload = {{"event", "dex.signal"},
+                                                  {"obs_type", a.obs_type},
+                                                  {"subject", a.subject},
+                                                  {"agent_id", a.agent_id}};
+                        const auto body = payload.dump();
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event("dex.signal", body);
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event("dex.signal", body);
+                    }
+                });
+                dex_alert_router_.set_metrics(&metrics_);
+                agent_service_.set_dex_alert_router(&dex_alert_router_);
+                if (gateway_service_)
+                    gateway_service_->set_dex_alert_router(&dex_alert_router_);
             }
         }
 
@@ -1847,12 +2030,12 @@ public:
             // exception out of a sync gRPC handler on the exposed one-way-TLS agent
             // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
             std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&)>
-                cert_signer = [this](const std::string& csr_pem,
-                                     const std::string& agent_id)
+                const std::string&, const std::string&, CertIssuanceSource)>
+                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                     CertIssuanceSource src)
                 -> std::optional<std::pair<std::string, std::string>> {
                 try {
-                    return sign_agent_csr(csr_pem, agent_id);
+                    return sign_agent_csr(csr_pem, agent_id, src);
                 } catch (const std::exception& e) {
                     spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
                                   agent_id);
@@ -2022,7 +2205,15 @@ public:
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                // G6 SRE: the sweep body is a serial budget shared with the
+                // SECURITY-relevant revocation sweep below — a stall here (e.g.
+                // a locked tags.db inside the cohort gauge publish) delays
+                // revoked-agent teardown by the same amount. Make it visible.
+                const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // F2a PR3: per-cohort fleet perf gauges — same cycle, same
+                // staleness window as the fleet families above.
+                publish_cohort_perf_gauges();
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
@@ -2170,6 +2361,12 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
+                    metrics_.gauge("yuzu_server_guardian_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->observations_reaped_total()));
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
@@ -2197,6 +2394,15 @@ public:
                                         .count();
                     metrics_.gauge("yuzu_server_uptime_seconds").set(static_cast<double>(uptime_s));
                 }
+                // G6 SRE: sweep-body duration (excludes the sleep) — the
+                // revocation sweep above shares this serial budget, so a stall
+                // (locked tags.db, slow fleet walk) is a security-relevant
+                // delay, not just stale metrics.
+                metrics_
+                    .histogram("yuzu_server_reaper_sweep_duration_seconds")
+                    .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           sweep_start)
+                                 .count());
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
@@ -2384,6 +2590,19 @@ public:
         // so no thread is inside notify_exec_tracker holding the borrowed
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
+
+        // Same contract for the blast-radius detector: both service impls
+        // borrow it by raw pointer and call observe() from the ingest path the
+        // drain above quiesced. Null before any member teardown (gov
+        // cpp-safety/architect/consistency — the detector destructs early by
+        // member-decl order, so this removes the only reliance on drain timing).
+        agent_service_.set_blast_radius_detector(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_blast_radius_detector(nullptr);
+        // F1: the alert router has the identical borrow contract.
+        agent_service_.set_dex_alert_router(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_dex_alert_router(nullptr);
 
         // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
         // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
@@ -2603,7 +2822,13 @@ private:
     /// key is loaded transiently and zeroed before return (incl. exception
     /// unwind) so the crown jewel is not resident for the process lifetime.
     std::optional<std::pair<std::string, std::string>>
-    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id) {
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id,
+                   CertIssuanceSource src) {
+        // #1290: forensic discriminator on the issuance audit — was this minted on a
+        // direct agent connection or relayed by a (potentially compromised) gateway?
+        // The exact population an incident responder scopes when bulk-revoking after
+        // a gateway compromise (the PR5 R-5 confused-deputy compensating control).
+        const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
         auto root = ca_store_->get_root();
@@ -2663,7 +2888,9 @@ private:
                                                  .action = "ca.cert.reissue_blocked",
                                                  .target_type = "AgentCertificate",
                                                  .target_id = rev.serial_hex,
-                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .detail = "reason=revoked_identity cn=" +
+                                                           detail::audit_token(agent_id) +
+                                                           " via=" + via,
                                                  .result = "denied"});
                     }
                     return std::nullopt;
@@ -2756,6 +2983,14 @@ private:
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;
+        // #1296: stamp the STABLE key-based CA identity (and the issuance-time cert
+        // fingerprint, which agent rows previously left blank) so an "issued by this
+        // CA" inventory query survives a subordinate re-key. issuer_key_id hashes the
+        // root's public key (invariant across the re-key); both are best-effort
+        // forensic metadata — a derivation miss does not block issuance.
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
         if (!ca_store_->record_issued(rec)) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
@@ -2771,7 +3006,8 @@ private:
         }
         // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
         // storms / CSR floods (the audit row below is the forensic record).
-        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}}).increment();
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}, {"via", via}})
+            .increment();
 
         if (audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
@@ -2780,7 +3016,9 @@ private:
                                      .action = "ca.cert.issued",
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
-                                     .detail = "purpose=agent cn=" + agent_id,
+                                     .detail =
+                                         "purpose=agent cn=" + detail::audit_token(agent_id) +
+                                         " via=" + via,
                                      // gov consistency: "success" (not "ok") so a
                                      // SIEM filter on ca.% AND result=success
                                      // catches issuance alongside revoke/publish.
@@ -2888,10 +3126,14 @@ private:
         // their ca_issued.issuer_fingerprint deliberately retains the issuance-time
         // (builtin) value (forensic accuracy: that cert did mint them). We do NOT
         // bulk-rewrite the inventory: issuer_fingerprint is forensic metadata, never
-        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint). A
-        // stable key-based CA identity (SubjectKeyIdentifier) is the tracked
-        // follow-up (#1296); nothing in the admission/revocation/CRL paths keys on
-        // the fingerprint, so the two-fingerprints-one-key state is safe today.
+        // an admission/filter key (see IssuedCertRecord::issuer_fingerprint).
+        //
+        // #1296 resolves the "issued by this CA" query landmine: ca_issued.issuer_key_id
+        // is the STABLE key-based identity (pki::issuer_key_id — a hash of the public
+        // key). Because THIS import keeps the key, that id is unchanged across the
+        // switch, so leaves issued before AND after share one issuer_key_id and
+        // CaStore::list_issued_by_key_id returns the whole population with NO rewrite
+        // here. (issuer_fingerprint stays split two-for-one-key, by design.)
         CaRoot updated = *root;
         updated.cert_pem = intermediate_pem;
         updated.chain_pem = parent_chain_pem;
@@ -2997,6 +3239,12 @@ private:
         rec.next_update =
             std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
                 .count();
+        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+        // cert fingerprint plus the STABLE key id (invariant across a subordinate
+        // re-key) so the CRL history is attributable to the key, not just a cert.
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
         if (!ca_store_->record_crl(rec)) {
             // B-1 (#1240): do NOT report success on a persistence failure. Returning
             // the freshly-built DER here would make the revoke handler audit
@@ -3480,6 +3728,66 @@ private:
             else if (e.key == "oidc_skip_tls_verify")
                 cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
+        // F1 DEX alerting config — both consumers accept live updates, so the
+        // same call applies at boot and from the settings POST handlers.
+        apply_dex_alert_config();
+    }
+
+    /// F1: push the persisted DEX alerting config into the alert router and
+    /// the blast-radius detector. Safe to call any time (both take their own
+    /// locks); called at boot via apply_runtime_config_overrides and from the
+    /// Settings → DEX alerts POST handlers after a write.
+    void apply_dex_alert_config() {
+        if (!runtime_config_store_ || !runtime_config_store_->is_open())
+            return;
+        dex_alert_router_.set_routes(
+            parse_routed_types(runtime_config_store_->get_value("dex_alert_routing")));
+        const auto get_int = [&](const char* key, int fallback) {
+            try {
+                const auto v = runtime_config_store_->get_value(key);
+                if (!v.empty())
+                    return std::stoi(v);
+            } catch (...) {}
+            return fallback;
+        };
+        const BlastRadiusConfig defaults{};
+        blast_radius_detector_.update_alert_shape(
+            get_int("dex_blast_min_devices", defaults.min_devices),
+            get_int("dex_blast_window_seconds", defaults.window_seconds),
+            get_int("dex_blast_cooldown_seconds", defaults.cooldown_seconds));
+        // F2a PR3: cohort metrics export key — read+validated here, consumed by
+        // the reaper-thread gauge sweep. Invalid stored values disable the
+        // export (fail closed) rather than reaching the snapshot provider.
+        {
+            std::string key = runtime_config_store_->get_value("dex_cohort_export_key");
+            if (!key.empty() && !TagStore::validate_key(key))
+                key.clear();
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_cohort_export_key_ = std::move(key);
+        }
+    }
+
+    /// F2a PR3: publish the per-cohort fleet perf gauges for the configured
+    /// export tag key. Runs on the reaper thread each sweep, right after
+    /// recompute_metrics (same cycle, same staleness window → the cohort
+    /// gauges can never disagree with the fleet families). The export logic
+    /// (clear-first absent-not-stale, floor, top-N cap + visible clipped
+    /// count, "(untagged)" residual label) lives in dex_perf_model so the
+    /// gauges are pinned by unit tests against the same cohort rows the tab
+    /// and REST render.
+    void publish_cohort_perf_gauges() {
+        std::string key;
+        DexPerfFn perf;
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            key = dex_cohort_export_key_;
+            perf = dex_perf_fn_;
+        }
+        if (key.empty() || !perf) {
+            dex_perf_clear_cohort_gauges(metrics_); // export disabled — absent
+            return;
+        }
+        dex_perf_export_cohort_gauges(metrics_, dex_perf_cohorts(perf(key)));
     }
 
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -4616,6 +4924,9 @@ private:
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
             /*metrics_registry=*/&metrics_, step_up_fn);
+        // F1: live-apply hook for the DEX alerts settings (wired before the
+        // listener starts, so no request races the set).
+        settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -7483,6 +7794,209 @@ private:
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             });
 
+        // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
+        // perf tags (validated through the SAME dex_perf_rules the Prometheus
+        // gauges use), AgentRegistry sessions (OS + agent-reported tags) and the
+        // TagStore (operator tags, ONE bulk query per render — not N point
+        // lookups). Cohort precedence mirrors evaluate_scope: agent scopable_tags
+        // first, then the tag store. Shared by the /dex Performance fragments,
+        // the /api/v1/dex/perf/* REST surface and the MCP perf tools so all
+        // three can never disagree.
+        auto dex_perf_uncached = [this](const std::string& cohort_key) -> DexPerfSnapshot {
+            DexPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            std::unordered_map<std::string, std::string> cohort_values;
+            if (tag_store_ && !cohort_key.empty()) {
+                // available_keys feed the tab's key picker and the cohorts
+                // REST response — both always pass a key. Key-less callers
+                // (the pollable fleet endpoint, the disabled gauge sweep)
+                // don't pay the extra query (grill NFR fix).
+                snap.available_keys = tag_store_->get_distinct_keys();
+                cohort_values = tag_store_->get_values_for_key(cohort_key);
+            }
+            // Same staleness the recompute_metrics sweep prunes by — the tab and
+            // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
+            // copies ONLY the perf tags (G3 performance S1 — the copy runs under
+            // the heartbeat-upsert mutex).
+            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
+            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
+            by_id.reserve(health.size());
+            for (const auto& h : health)
+                by_id[h.agent_id] = &h;
+            for (const auto& id : registry_.all_ids()) {
+                auto s = registry_.get_session(id);
+                if (!s)
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = id;
+                std::string os = s->os;
+                for (auto& c : os)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
+                // match classifies every macOS agent as Windows (G4 UP-1
+                // BLOCKING). Agents report "windows" / "darwin" / "linux"
+                // (agents/core/src/agent.cpp kAgentOs).
+                d.is_windows = os.starts_with("win");
+                if (auto it = by_id.find(id); it != by_id.end()) {
+                    const auto& tags = it->second->status_tags;
+                    auto get = [&](const char* k) -> std::string {
+                        auto t = tags.find(k);
+                        return t != tags.end() ? t->second : std::string{};
+                    };
+                    d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                    d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                    d.disk_lat_ms =
+                        detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                }
+                if (!cohort_key.empty()) {
+                    // STORE-FIRST precedence — deliberately the OPPOSITE of
+                    // evaluate_scope's agent-first order: a benchmark cohort is
+                    // an operator-declared comparison population, so a rogue
+                    // agent must not self-assign into "executive-laptops" and
+                    // drag its p90 (G4 UP-5). The store already carries honest
+                    // agents' tags via sync_agent_tags, so store-first loses
+                    // nothing; the in-memory fallback only covers a tag not yet
+                    // synced, and it is value-validated (G2 sec-L2: scopable_tags
+                    // are unvalidated at session ingest) so oversized/garbage
+                    // bytes never become a cohort label.
+                    if (auto cv = cohort_values.find(id); cv != cohort_values.end()) {
+                        d.cohort = cv->second;
+                    } else if (auto it = s->scopable_tags.find(cohort_key);
+                               it != s->scopable_tags.end() &&
+                               TagStore::validate_value(it->second)) {
+                        d.cohort = it->second;
+                    }
+                }
+                snap.devices.push_back(std::move(d));
+            }
+            // C-S1 (consistency): the fleet yuzu_fleet_perf_* gauges aggregate
+            // EVERY fresh health snapshot; an agent whose Subscribe session was
+            // reaped while its heartbeat is still <90s old must therefore also
+            // appear here, or the tab and the gauges disagree about the same
+            // sweep. Session-less devices carry values but no OS/cohort context
+            // (is_windows=false keeps them out of the Windows denominator;
+            // store-side cohort still resolves).
+            std::unordered_set<std::string> seen;
+            seen.reserve(snap.devices.size());
+            for (const auto& d : snap.devices)
+                seen.insert(d.agent_id);
+            for (const auto& h : health) {
+                if (seen.contains(h.agent_id))
+                    continue;
+                DexPerfDevice d;
+                d.agent_id = h.agent_id;
+                auto get = [&](const char* k) -> std::string {
+                    auto t = h.status_tags.find(k);
+                    return t != h.status_tags.end() ? t->second : std::string{};
+                };
+                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
+                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
+                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
+                if (!cohort_key.empty())
+                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
+                        d.cohort = cv->second;
+                snap.devices.push_back(std::move(d));
+            }
+            return snap;
+        };
+        // G3 performance S2: a 5s TTL memo keyed by cohort key. Heartbeat data
+        // changes on a ~30s cadence, so every consumer (operator clicks, agentic
+        // pollers, per-device drills, the 15s gauge sweep) can share one build
+        // per key per 5s — bounding the fleet-walk + tag-query cost no matter
+        // how hard the REST surface is polled. Consumers may therefore see a
+        // snapshot up to 5s stale; that is well inside the heartbeat cadence.
+        struct DexPerfMemo {
+            std::mutex mu;
+            struct Entry {
+                std::chrono::steady_clock::time_point at;
+                DexPerfSnapshot snap;
+            };
+            std::unordered_map<std::string, Entry> by_key;
+        };
+        auto dex_perf_memo = std::make_shared<DexPerfMemo>();
+        auto dex_perf_fn = [memo = dex_perf_memo,
+                            dex_perf_uncached](const std::string& cohort_key) -> DexPerfSnapshot {
+            constexpr auto kTtl = std::chrono::seconds{5};
+            constexpr std::size_t kMaxMemoEntries = 8; // "", default key, export key, picker keys
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lk(memo->mu);
+                if (auto it = memo->by_key.find(cohort_key);
+                    it != memo->by_key.end() && now - it->second.at < kTtl)
+                    return it->second.snap;
+            }
+            auto snap = dex_perf_uncached(cohort_key);
+            {
+                std::lock_guard lk(memo->mu);
+                if (memo->by_key.size() >= kMaxMemoEntries &&
+                    !memo->by_key.contains(cohort_key)) {
+                    auto oldest = memo->by_key.begin();
+                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
+                        if (it->second.at < oldest->second.at)
+                            oldest = it;
+                    memo->by_key.erase(oldest);
+                }
+                memo->by_key[cohort_key] = {now, snap};
+            }
+            return snap;
+        };
+        // PR3: the reaper-thread cohort gauge sweep uses the same provider.
+        {
+            std::lock_guard lk(dex_cohort_export_mu_);
+            dex_perf_fn_ = dex_perf_fn;
+        }
+
+        // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
+        // over the crash-observation projection). Read-only; NO mock data — real
+        // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
+        dex_routes_ = std::make_unique<DexRoutes>();
+        dex_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(),
+            // Cross-store fleet denominator for the DEX rates: count online agents,
+            // and of those the Windows ones (the only OS with a crash collector
+            // today — the coverage-honest crash-free denominator). Real data; an
+            // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            [this]() -> DexFleet {
+                DexFleet f;
+                const auto ids = registry_.all_ids();
+                f.total_online = static_cast<int64_t>(ids.size());
+                for (const auto& id : ids) {
+                    if (auto s = registry_.get_session(id)) {
+                        std::string os = s->os;
+                        for (auto& c : os)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        // starts_with, NOT find — "darwin" contains "win"
+                        // (G4 UP-1; pre-existing here, fixed with the sibling).
+                        if (os.starts_with("win"))
+                            ++f.windows_online;
+                    }
+                }
+                return f;
+            },
+            audit_fn,
+            // A4 device perf panel: canned tar.sql dispatch through the shared
+            // chokepoint (untracked path — empty execution_id, same posture as
+            // the dashboard TAR SQL surface).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            // F2a: the shared fleet perf snapshot provider (defined above).
+            dex_perf_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -7887,7 +8401,11 @@ private:
                 // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
                 forward_gateway_pending();
                 return sent;
-            }));
+            }),
+            // F2a: the shared fleet perf snapshot provider — the same closure
+            // the /dex Performance fragments and the MCP perf tools use, so
+            // REST, dashboard and MCP can never disagree.
+            dex_perf_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -7995,7 +8513,12 @@ private:
                     return {command_id, sent};
                 },
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
-                ca_store_.get(), [this]() { return publish_crl(); });
+                ca_store_.get(), [this]() { return publish_crl(); },
+                // ar-S1: DEX read tools (parity with /api/v1/dex/*).
+                guaranteed_state_store_.get(),
+                // F2a: the shared fleet perf snapshot provider (one closure,
+                // three surfaces — fragments, REST, MCP).
+                dex_perf_fn);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -8164,6 +8687,22 @@ private:
     yuzu::MetricsRegistry metrics_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
+    /// direct Subscribe path via agent_service_ and the gateway path via
+    /// gateway_service_). Its on_incident sink fans out to notification +
+    /// webhook + offload. Plain member (no heap): in-memory derived state only.
+    /// DECLARED BEFORE its borrowers (agent_service_ / gateway_service_ /
+    /// agent_server_) so it destructs AFTER them — the detector must outlive any
+    /// ingest thread that holds its raw pointer (gov cpp-safety/architect). stop()
+    /// also nulls the borrowed pointers after the gRPC drain, belt-and-braces.
+    BlastRadiusDetector blast_radius_detector_;
+    DexAlertRouter dex_alert_router_;
+    /// F2a PR3: cohort metrics export — written by apply_dex_alert_config
+    /// (boot + settings POST) and start_web_server (the provider closure),
+    /// read by the reaper-thread gauge sweep. One mutex guards both.
+    std::mutex dex_cohort_export_mu_;
+    std::string dex_cohort_export_key_;
+    DexPerfFn dex_perf_fn_;
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
@@ -8276,6 +8815,7 @@ private:
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
+    std::unique_ptr<DexRoutes> dex_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

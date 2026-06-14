@@ -14,6 +14,15 @@
 
 namespace yuzu::server {
 
+// Reserved sentinel rule_id marking a RULELESS DEX observation (no live rule).
+// Single server-side source of truth — `is_reserved_rule_id` (the projection +
+// census guard) and `ingest_guardian_response` (the blast-radius feed gate)
+// both reference this, so a rename can't silently desync the two paths
+// (gov architect/consistency). MUST stay equal to the agent's
+// `kObservationRuleSentinel` (agents/core .../dex_event.hpp) — different binary,
+// shared wire convention.
+inline constexpr const char* kObservationRuleId = "__observation__";
+
 // Server-side storage for Yuzu Guardian — the "Guaranteed State" system.
 // See docs/yuzu-guardian-design-v1.1.md §9.1 for the schema design.
 //
@@ -82,6 +91,11 @@ struct GuaranteedStateEventRow {
     std::string guard_category;    // "event" | "condition"
     std::string detected_value;
     std::string expected_value;
+    // Structured, machine-readable detail (JSON, keyed by event_type; route a').
+    // Companion to the human `detected_value`, not a replacement. For DEX
+    // observations (process.crashed) it carries the projectable crash facts; "" for
+    // plain drift. The DEX read model projects this into indexed columns.
+    std::string detail_json;
     std::string remediation_action;
     bool remediation_success{false};
     int64_t detection_latency_us{0};
@@ -127,6 +141,115 @@ struct GuardianAgentRuleStatus {
     std::string rule_id;
     std::string state;       // "compliant" | "drifted" | "errored"
     std::string updated_at;  // ISO-8601 of the event that set it
+};
+
+// One DEX observation projected from a ruleless signal event (the
+// guardian_observations read model). DERIVED from guaranteed_state_events: written
+// atomically with the event so it inherits the event_id dedup, reaped in lockstep.
+// Promotes the detail_json UNIFORM facts into queryable columns the DEX
+// aggregations GROUP BY. Column semantics are generic across the 103-signal
+// catalogue (docs/dex-signal-catalog.md): subject = the failing entity (app,
+// service, printer, update title, SSID…), reason = failure code, component =
+// secondary entity (faulting module, NIC…), metric = numeric payload (boot ms).
+struct GuardianObservationRow {
+    std::string event_id;          // shares the event journal dedup key
+    std::string agent_id;
+    std::string observed_at;       // ISO-8601 (= event timestamp)
+    std::string obs_type;          // = event_type, e.g. "process.crashed", "os.boot"
+    std::string subject;           // e.g. "notepad.exe", "Spooler", "HP LaserJet"
+    std::string reason;            // e.g. "0xC0000005", "0x80070643", "timeout"
+    std::string symbolic;          // e.g. "ACCESS_VIOLATION", "WIFI_DISCONNECT"
+    std::string component;         // e.g. "ntdll.dll" (faulting module)
+    double metric{0.0};            // numeric payload (boot duration ms); 0 = none
+    std::string platform;          // "windows" | "linux" | "macos"
+};
+
+// ── DEX read-model aggregations over guardian_observations ───────────────────
+// Crash-scoped aggregations keep obs_type='process.crashed' (the headline rate
+// stays a crash rate); app aggregations span crash+hang; the signal summary
+// spans the whole catalogue. Each takes an ISO-8601 `since` cutoff (empty = all
+// retained), aggregated in SQL (GROUP BY, no row materialisation). These provide
+// the NUMERATORS; the crash-free-% / per-1k-device-days RATES compose these with
+// the fleet-size DENOMINATOR from the agent registry at the route layer
+// (cross-store) — deliberately not here.
+struct DexCrashSummary {
+    int64_t total_crashes{0};
+    int64_t distinct_devices{0};   // devices impacted (crash-free numerator)
+    int64_t distinct_apps{0};
+};
+struct DexAppCrashCount {          // top unreliable apps + blast radius
+    std::string subject;           // process name
+    int64_t crashes{0};
+    int64_t hangs{0};
+    int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
+    std::string last_seen;
+};
+struct DexModuleCrashCount {       // top faulting modules (crash-scoped)
+    std::string component;         // module name
+    int64_t crashes{0};
+    int64_t distinct_apps{0};
+};
+struct DexDeviceCrashCount {       // most-affected devices (crash-scoped)
+    std::string agent_id;
+    int64_t crashes{0};
+    std::string last_seen;
+};
+struct DexOsCrashCount {           // per-OS split (coverage-normalised at the route)
+    std::string platform;
+    int64_t crashes{0};
+    int64_t distinct_devices{0};
+};
+struct DexDayCrashCount {          // crashes-per-day trend
+    std::string day;               // YYYY-MM-DD
+    int64_t crashes{0};
+};
+struct DexExceptionCount {         // top failure reasons (per-app drill-down)
+    std::string reason;            // e.g. "0xC0000005"
+    std::string symbolic;          // e.g. "ACCESS_VIOLATION"
+    int64_t crashes{0};
+};
+struct DexEntitySummary {          // per-app / per-device drill-down summary
+    int64_t crashes{0};
+    int64_t hangs{0};
+    int64_t signals{0};            // ALL observation rows for the entity (any type)
+    int64_t distinct_devices{0};
+    int64_t distinct_apps{0};
+    std::string first_seen;
+    std::string last_seen;
+};
+struct DexSignalCount {            // the whole-catalogue rollup (overview panel)
+    std::string obs_type;
+    int64_t count{0};
+    int64_t distinct_devices{0};
+    std::string last_seen;
+};
+struct DexSubjectCount {           // top subjects for ONE obs_type (signal drill-down)
+    std::string subject;
+    int64_t count{0};
+    int64_t distinct_devices{0};
+    std::string last_seen;
+};
+struct DexOsScope {                // per-OS coverage: how many types each OS collects
+    std::string platform;
+    int64_t distinct_types{0};
+    int64_t total_events{0};
+};
+struct DexDaySignal {              // one (day, obs_type) cell of the trends matrix
+    std::string day;               // YYYY-MM-DD
+    std::string obs_type;
+    int64_t count{0};
+};
+struct DexBootStats {              // boot-performance rollup (os.boot metric, ms)
+    int64_t boots{0};
+    double avg_ms{0.0};
+    double max_ms{0.0};
+    int64_t distinct_devices{0};
+};
+struct DexDeviceBoot {             // slowest-booting devices
+    std::string agent_id;
+    double avg_ms{0.0};
+    double max_ms{0.0};
+    int64_t boots{0};
 };
 
 // Hard upper bound on `GuaranteedStateEventQuery::limit`. Defence-in-depth
@@ -177,6 +300,73 @@ public:
 
     std::vector<GuaranteedStateEventRow> query_events(const GuaranteedStateEventQuery& q = {}) const;
 
+    // DEX read model — all projected observations, newest first (slice 1B). A
+    // foundation read for tests + the dashboard; the GROUP BY aggregations (top
+    // apps / modules / by-OS / blast radius) land in slice 2. Bounded by
+    // kMaxEventsLimit for the same RSS defence as query_events.
+    std::vector<GuardianObservationRow> query_observations(int limit = kMaxEventsLimit) const;
+
+    // DEX aggregations — GROUP BY over guardian_observations. `since` = ISO-8601
+    // cutoff ('' = all). `limit` clamped to kMaxEventsLimit. Rates (crash-free-%,
+    // /1k device-days) are composed with the agent-registry fleet size at the
+    // route layer, not here. Crash-scoped unless noted.
+    DexCrashSummary dex_crash_summary(const std::string& since = "") const;
+    // Spans process.crashed + process.hung (the app-reliability table).
+    std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
+    std::vector<DexModuleCrashCount> dex_top_modules(const std::string& since = "", int limit = 20) const;
+    std::vector<DexDeviceCrashCount> dex_top_devices(const std::string& since = "", int limit = 20) const;
+    std::vector<DexOsCrashCount> dex_crashes_by_os(const std::string& since = "") const;
+    std::vector<DexDayCrashCount> dex_crashes_by_day(const std::string& since = "") const;
+    // Whole-catalogue rollup: every obs_type present in the window, with count +
+    // blast radius — the overview's "all signals" panel. One GROUP BY pass.
+    std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "") const;
+    // Boot performance (os.boot, metric = ms; rows with metric<=0 excluded).
+    DexBootStats dex_boot_stats(const std::string& since = "") const;
+    std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",
+                                                 int limit = 10) const;
+
+    // Generic per-obs_type drill-down (catalogue signal-detail, View 3) — these
+    // are the dex_top_apps/_devices/_by_os/_by_day family GENERALISED over any
+    // obs_type, not crash-scoped. The "crashes" field on the reused structs holds
+    // the generic event count. `dex_os_signal_scope` is the per-OS coverage (how
+    // many distinct types each OS collects) — drives the live cross-OS captions
+    // that replace the mockups' stale "macOS 6 of 103".
+    std::vector<DexSubjectCount> dex_signal_subjects(const std::string& obs_type,
+                                                     const std::string& since = "",
+                                                     int limit = 20) const;
+    std::vector<DexOsCrashCount> dex_signal_by_os(const std::string& obs_type,
+                                                  const std::string& since = "") const;
+    std::vector<DexDeviceCrashCount> dex_signal_devices(const std::string& obs_type,
+                                                        const std::string& since = "",
+                                                        int limit = 20) const;
+    std::vector<DexDayCrashCount> dex_signal_by_day(const std::string& obs_type,
+                                                    const std::string& since = "") const;
+    std::vector<DexOsScope> dex_os_signal_scope(const std::string& since = "") const;
+    // The (day, obs_type, count) matrix — aggregated to family×day in the route
+    // for the Trends small-multiples + heatmap. One GROUP BY pass.
+    std::vector<DexDaySignal> dex_signal_day_matrix(const std::string& since = "") const;
+
+    // DEX drill-downs — single-entity scope. App summaries span crash+hang;
+    // device summary + history span ALL signal types.
+    // Per-app (process_name = the observation subject):
+    DexEntitySummary dex_app_summary(const std::string& process_name,
+                                     const std::string& since = "") const;
+    std::vector<DexModuleCrashCount> dex_app_modules(const std::string& process_name,
+                                                     const std::string& since = "",
+                                                     int limit = 20) const;
+    std::vector<DexExceptionCount> dex_app_exceptions(const std::string& process_name,
+                                                      const std::string& since = "",
+                                                      int limit = 20) const;
+    std::vector<DexDeviceCrashCount> dex_app_devices(const std::string& process_name,
+                                                     const std::string& since = "",
+                                                     int limit = 20) const;
+    // Per-device (agent_id):
+    DexEntitySummary dex_device_summary(const std::string& agent_id,
+                                        const std::string& since = "") const;
+    std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
+                                                           const std::string& since = "",
+                                                           int limit = 100) const;
+
     // ── Overview aggregations (read-only GROUP BY; no event materialisation) ──
     // Each takes an ISO-8601 `since` cutoff (empty = all retained events) and
     // aggregates in SQL — kind to RAM/CPU at fleet scale. See the result structs.
@@ -219,6 +409,14 @@ public:
     // issue a SQL `COUNT(*)` every scrape.
     uint64_t events_written_total() const noexcept { return events_written_.load(); }
     uint64_t events_reaped_total() const noexcept { return events_reaped_.load(); }
+    // DEX projection health (governance UP-1): projection failures degrade to
+    // event-only commits and are counted here so the read-model loss is
+    // alertable; the reap counter is the disposal-evidence twin of
+    // events_reaped_ for the guardian_observations table (compliance WS-E).
+    uint64_t observations_proj_failures_total() const noexcept {
+        return observations_proj_failures_.load();
+    }
+    uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -231,6 +429,8 @@ private:
 
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
+    std::atomic<uint64_t> observations_proj_failures_{0};
+    std::atomic<uint64_t> observations_reaped_{0};
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
@@ -259,6 +459,16 @@ private:
     // cannot regress a newer state. No sqlite3_changes() read (not a #1033 site).
     void upsert_rule_status_locked(const std::string& agent_id, const std::string& rule_id,
                                    const char* state, const std::string& updated_at);
+
+    // Project one ruleless DEX observation into guardian_observations. Caller MUST
+    // hold mtx_ AND have an OPEN transaction (called from insert_event / insert_events
+    // right after the event INSERT) so the projection is atomic with the event and
+    // inherits its event_id dedup — a redelivered crash fails the event PK and rolls
+    // back both, so the projection never double-counts. `detail_json` is parsed
+    // defensively (malformed → empty crash fields, never drops the observation);
+    // `ttl` is the parent event's expiry so the reaper sweeps both in lockstep.
+    std::expected<void, std::string>
+    project_observation_locked(const GuaranteedStateEventRow& row, int64_t ttl);
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

@@ -22,7 +22,7 @@
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
 # ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8 AS deps
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS deps
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; the default keeps the historical x64 build behaviour.
@@ -40,6 +40,7 @@ ARG TRIPLET=x64-linux
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
+    bison flex \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -87,7 +88,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # If you switch this base image to a minimal/distroless variant, also update
 # every compose file's healthcheck block to use a tool the new base provides
 # (busybox wget, nc, etc.). Governance Gate 7, architect SHOULD-2.
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 # /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
 # (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs
@@ -100,8 +101,15 @@ FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b
 # (The deb/rpm/systemd paths instead make /etc/yuzu itself service-owned, so the
 # server's runtime mkdir of certs/ succeeds there without this eager pre-create;
 # the container needs it because the base image's /etc/yuzu is root-owned.)
+# libpq5 replaced libsqlite3-0 in #1318 (Postgres substrate, ADR-0006/0008).
+# libsqlite3-0 was vestigial: ldd on the shipped 0.12.0 binary shows SQLite
+# is statically linked from vcpkg (only libstdc++/libm/libgcc_s/libc are
+# dynamic). libpq5 is forward-insurance for the #1320 server-side Postgres
+# wiring — ADR-0008 plans static vcpkg libpq, in which case this too is
+# belt-and-braces, but it keeps the image correct if the Windows static-link
+# canary forces a dynamic-libpq fallback.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libsqlite3-0 ca-certificates bash \
+    libssl3 libpq5 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across the server/

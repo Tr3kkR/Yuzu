@@ -148,6 +148,10 @@ int main(int argc, char* argv[]) {
                    "Update check interval in seconds (default: 21600 = 6h)")
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
+    app.add_flag("--dex-disable", cfg.dex_disable,
+                 "Disable the Guardian DEX crash recorder (collect no process-crash "
+                 "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
+        ->envname("YUZU_AGENT_DEX_DISABLE");
 
     // Windows service management
     bool install_service = false;

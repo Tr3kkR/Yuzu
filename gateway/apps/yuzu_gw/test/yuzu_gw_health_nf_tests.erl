@@ -61,8 +61,10 @@ setup() ->
                 Pid = spawn(fun() -> mock_loop() end),
                 register(Name, Pid),
                 {true, {Name, Pid, true}};
-            _Existing ->
-                {true, {Name, undefined, false}}
+            Existing ->
+                %% Record the preexisting pid so cleanup can detect a
+                %% test-made replacement under this name (see cleanup/1).
+                {true, {Name, Existing, false}}
         end
     end, MockNames),
 
@@ -103,8 +105,23 @@ cleanup({_Port, HealthPid, UpPid, MockPids}) ->
                     catch unregister(Name),
                     catch exit(CurrentPid, kill)
             end;
-        ({_Name, _Pid, false}) ->
-            ok
+        ({Name, PreexistingPid, false}) ->
+            %% We did not create this name — but readyz_503_dead_process
+            %% kills whatever holds it and re-registers a throwaway
+            %% mock_loop. If the registered pid is no longer the one we
+            %% saw at setup, that replacement is ours to kill: leaving it
+            %% leaks a call-swallowing impostor under a canonical
+            %% gen_server name into later modules (#336 family — bit
+            %% yuzu_gw_registry_tests on macOS, where eunit module order
+            %% differs and yuzu_gw_scale_tests leaks a live registry
+            %% into our setup).
+            case whereis(Name) of
+                undefined -> ok;
+                PreexistingPid -> ok;
+                ImpostorPid ->
+                    catch unregister(Name),
+                    catch exit(ImpostorPid, kill)
+            end
     end, MockPids),
     drain_exits(),
     catch meck:unload(grpcbox_client),
