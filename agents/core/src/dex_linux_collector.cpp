@@ -9,7 +9,8 @@
  * + observation builders, so a Linux server lights up the same
  * perf.cpu_sustained / perf.memory_pressure / storage.low buckets as Windows and
  * macOS with ZERO server change (the macOS-collector parity playbook). journald
- * reliability signals (OOM, unit-failure) and os.uptime are the next slices.
+ * reliability signals (unit-failure, coredump crashes, OOM-kills) ride the same
+ * poll loop via dex_linux_journal; os.uptime is a later slice.
  *
  * The pure /proc parsing lives in dex_linux_proc.{hpp,cpp} (tested off-Linux); the
  * statvfs read + the poll thread are the only Linux-only mechanism and live here
@@ -21,6 +22,7 @@
 
 #if defined(__linux__)
 
+#include "dex_linux_journal.hpp" // parse_journal_line, kMsgId* (journald → DEX)
 #include "dex_linux_proc.hpp"
 #include "dex_linux_storage.hpp" // storage_low_observation — the non-PII subject chokepoint
 #include "dex_perf_breach.hpp"   // breach_update, kCpuBreach/kMemoryBreach, *_observation
@@ -32,7 +34,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -76,6 +80,37 @@ std::optional<std::string> read_proc_file(const char* path) {
     return ss.str();
 }
 
+// RAII for a popen() pipe — pclose on every exit path (the macOS poll_oslog
+// pattern). The journalctl command is built from internal constants + the
+// journald-generated cursor, never operator input, so there is no shell-injection
+// surface.
+struct PcloseDeleter {
+    void operator()(std::FILE* f) const {
+        if (f)
+            ::pclose(f);
+    }
+};
+using PipeHandle = std::unique_ptr<std::FILE, PcloseDeleter>;
+
+PipeHandle open_pipe(const std::string& cmd) { return PipeHandle(::popen(cmd.c_str(), "r")); }
+
+// Read one newline-terminated line from a pipe into `out` (newline stripped);
+// false at EOF. Accumulates across fgets chunks so a long JSON line is not split.
+bool read_pipe_line(std::FILE* f, std::string& out) {
+    out.clear();
+    char buf[16384];
+    while (std::fgets(buf, sizeof(buf), f)) {
+        out += buf;
+        if (!out.empty() && out.back() == '\n') {
+            out.pop_back();
+            if (!out.empty() && out.back() == '\r')
+                out.pop_back();
+            return true;
+        }
+    }
+    return !out.empty(); // a final line with no trailing newline
+}
+
 /// The Linux DEX observer: a single owned poll thread (the WinStatePoller
 /// lifetime — stop() joins it, the sink is set before the thread starts and
 /// cleared after the join, so no callback can outlive the object). All signals
@@ -92,7 +127,7 @@ public:
         on_error_ = std::move(on_error); // fired at runtime if /proc becomes unreadable (HIGH-3)
         stopping_ = false;
         thread_ = std::thread([this] { run(); });
-        spdlog::info("dex_observer(linux): armed — /proc perf + storage poll");
+        spdlog::info("dex_observer(linux): armed — /proc perf + storage + journald poll");
         return true;
     }
 
@@ -118,10 +153,12 @@ private:
             const std::int64_t now = steady_now();
             last_perf_poll_ = now - win::kPerfSampleIntervalSeconds + kFirstPollDelaySeconds;
             last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
+            last_journald_poll_ = now - kJournaldIntervalSeconds + kFirstPollDelaySeconds;
         }
         for (;;) {
-            const std::int64_t next = std::min(last_perf_poll_ + win::kPerfSampleIntervalSeconds,
-                                               last_disk_poll_ + kDiskIntervalSeconds);
+            const std::int64_t next = std::min({last_perf_poll_ + win::kPerfSampleIntervalSeconds,
+                                                last_disk_poll_ + kDiskIntervalSeconds,
+                                                last_journald_poll_ + kJournaldIntervalSeconds});
             const auto wait_s =
                 std::chrono::seconds(std::max(next - steady_now(), std::int64_t{1}));
             {
@@ -144,6 +181,10 @@ private:
                 if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
                     last_disk_poll_ = now;
                     poll_disks();
+                }
+                if (now - last_journald_poll_ >= kJournaldIntervalSeconds) {
+                    last_journald_poll_ = now;
+                    poll_journald();
                 }
             } catch (const std::exception& e) {
                 spdlog::warn("dex_observer(linux): poll iteration failed, continuing: {}",
@@ -253,6 +294,66 @@ private:
                       [&](const auto& kv) { return !current.contains(kv.first); });
     }
 
+    // Poll the systemd journal for new reliability events. The first poll baselines
+    // the cursor at the journal tail (no history replay, and no events from the
+    // first interval after arm); then each poll reads strictly after it (journalctl
+    // --after-cursor is exclusive → no boundary de-dup). MESSAGE_ID matching yields
+    // one canonical entry per failure; the `+ _TRANSPORT=kernel` group carries the
+    // OOM line (no stable MESSAGE_ID) and is parsed-and-mostly-dropped. No libsystemd:
+    // journalctl is a runtime shell-out, and if it is absent (non-systemd host) popen
+    // fails and the source quietly no-ops. The cursor advances only after a clean
+    // read, so a throw mid-loop re-polls the same window next tick.
+    void poll_journald() {
+        if (journal_cursor_.empty()) {
+            if (const PipeHandle p = open_pipe("journalctl -o json -n 1 --no-pager 2>/dev/null")) {
+                std::string line;
+                while (read_pipe_line(p.get(), line))
+                    if (auto c = lnx::parse_journal_line(line).cursor; !c.empty())
+                        journal_cursor_ = std::move(c);
+            }
+            return; // baselined (or journal unreadable) — emit nothing this tick
+        }
+        if (journal_cursor_.find('\'') != std::string::npos) {
+            journal_cursor_.clear(); // defensive: a cursor never contains a quote — re-baseline
+            return;
+        }
+        const std::string cmd = "journalctl --after-cursor='" + journal_cursor_ +
+                                "' -o json --no-pager MESSAGE_ID=" +
+                                std::string(lnx::kMsgIdCoredump) +
+                                " MESSAGE_ID=" + std::string(lnx::kMsgIdUnitFailed) +
+                                " MESSAGE_ID=" + std::string(lnx::kMsgIdUnitResult) +
+                                " + _TRANSPORT=kernel 2>/dev/null";
+        const PipeHandle pipe = open_pipe(cmd);
+        if (!pipe) {
+            spdlog::warn("dex_observer(linux): popen(journalctl) failed — journald poll skipped");
+            return;
+        }
+        std::string newest = journal_cursor_;
+        std::string line;
+        while (read_pipe_line(pipe.get(), line)) {
+            lnx::JournalLine jl = lnx::parse_journal_line(line);
+            if (!jl.cursor.empty())
+                newest = std::move(jl.cursor); // journalctl is chronological → last wins
+            if (jl.obs)
+                emit_journal(std::move(*jl.obs));
+        }
+        journal_cursor_ = std::move(newest);
+    }
+
+    // Journald-sourced emit with a per-(obs_type, subject) debounce: a flapping unit
+    // (Restart= loop) or a crash-looping process collapses to one observation per
+    // window instead of flooding the wire. The /proc sources are latch-bounded and
+    // skip this.
+    void emit_journal(SignalObservation obs) {
+        const std::string key = obs.obs_type + "|" + obs.subject;
+        const std::int64_t now = now_unix();
+        if (const auto it = journal_dedup_.find(key);
+            it != journal_dedup_.end() && now - it->second < kJournaldDebounceSeconds)
+            return; // within the debounce window — collapse
+        journal_dedup_[key] = now;
+        emit(std::move(obs));
+    }
+
     // Stamp platform + delivery time centrally (an empty platform would vanish from
     // the by-OS panel; "linux" is the render token, matching dex_routes os_label).
     void emit(SignalObservation obs) {
@@ -268,7 +369,9 @@ private:
     }
 
     static constexpr std::int64_t kFirstPollDelaySeconds = 60;
-    static constexpr std::int64_t kDiskIntervalSeconds = 600; // 10 min (the WinStatePoller cadence)
+    static constexpr std::int64_t kDiskIntervalSeconds = 600;     // 10 min (the WinStatePoller cadence)
+    static constexpr std::int64_t kJournaldIntervalSeconds = 60;  // reliability events want low latency
+    static constexpr std::int64_t kJournaldDebounceSeconds = 300; // collapse a flapping unit/process
     static constexpr int kProcFailDisarmThreshold = 3; // consecutive /proc/stat misses before disarm
 
     std::mutex mu_;
@@ -279,10 +382,13 @@ private:
     std::function<void()> on_error_; // disarms dex_health_ after persistent /proc failure (HIGH-3)
     std::int64_t last_perf_poll_ = 0;
     std::int64_t last_disk_poll_ = 0;
+    std::int64_t last_journald_poll_ = 0;
     int proc_stat_fail_streak_ = 0;                          // consecutive /proc/stat read misses
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
     win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
     std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
+    std::string journal_cursor_;                              // "" until baselined at the journal tail
+    std::unordered_map<std::string, std::int64_t> journal_dedup_; // (type|subject) → last journald emit
 };
 
 } // namespace

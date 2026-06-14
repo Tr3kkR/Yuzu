@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linux server DEX: reliability signals from the systemd journal.** The Linux
+  DEX collector now reads the journal on a slow cadence (`journalctl --after-cursor
+  -o json`, cursor-checkpointed) and emits, on the **existing** obs_types,
+  `service.crashed` (a unit failed — the systemd "Failed with result" / unit-failed
+  journal messages),
+  `process.crashed` (a `systemd-coredump` entry — `SD_MESSAGE_COREDUMP`; coverage
+  depends on systemd-coredump being the active core handler), and `memory.exhausted`
+  (the kernel OOM-killer). Only safe fields leave the device — process comm, unit
+  name, signal/result code, never the raw message — and a flapping unit/process is
+  collapsed by a per-`(type, subject)` debounce. No new dependency: `journalctl` is
+  a runtime shell-out (no libsystemd), the source no-ops on non-systemd hosts, and
+  the agent account already has `systemd-journal`/`adm` read access. Reusing the
+  existing obs_types means a Linux server lights up the same `/dex` buckets as
+  Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
+
 - **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
   agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
   into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
