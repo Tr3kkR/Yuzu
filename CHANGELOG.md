@@ -30,10 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing obs_types means a Linux server lights up the same `/dex` buckets as
   Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
 
-- **Network quality dashboard (`/network`).** A new top-level page surfaces
-  fleet-wide TCP network quality measured continuously on each endpoint from
-  kernel counters (no packet capture, no flow export) — a **device / local-link
-  health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+- **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
+  under DEX (the Network tab in the DEX sub-nav, also reachable directly at
+  `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
+  network quality measured continuously on each endpoint from kernel counters (no
+  packet capture, no flow export) — a **device / local-link health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
   rate**, and device throughput. The retransmit rate is ΔΣretransmits /
   ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
   the lifetime ratio — empirically the lifetime ratio is diluted to noise while
