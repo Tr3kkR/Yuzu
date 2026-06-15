@@ -36,6 +36,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
+#include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 
 #ifdef _WIN32
@@ -53,6 +54,8 @@ __declspec(allocate(".CRT$XCB"))
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -631,7 +634,8 @@ public:
         // 1c-bis. Fleet-wide DEX signal observer (Guardian DEX, multi-signal).
         // RULELESS observations — records every catalogued reliability signal
         // (crash, hang, service failure, bugcheck, boot duration, …; see
-        // dex_signal_catalog.cpp), independent of any rule. No-op off Windows.
+        // dex_signal_catalog.cpp), independent of any rule. Windows/macOS/Linux each
+        // have a real observer; no-op only on a platform without one.
         // Armed pre-network; emit_guardian_event() self-guards on the Subscribe
         // stream being up, so signals before first connect are dropped (like
         // guard events pre-sink; durable buffering is A3).
@@ -1454,7 +1458,11 @@ public:
                         // device-utilization tags (deriving a rate needs two
                         // readings; lambda-local so a reconnect re-baselines and
                         // the first heartbeat of a session ships no stale rate).
+#if defined(_WIN32)
                         win::PerfBreachCounters hb_prev_perf;
+#elif defined(__linux__)
+                        lnx::CpuJiffies hb_prev_cpu_lnx; // A4 Linux heartbeat CPU% delta baseline
+#endif
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1497,13 +1505,14 @@ public:
                             if (guardian_)
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
-#if defined(_WIN32)
-                            // DEX signal observer (Windows only — no-op elsewhere). Both tags
-                            // are omitted when --dex-disable opted the agent out, so the server
-                            // rollups reflect genuine state, not opt-outs or non-Windows agents.
-                            // The agent has no /metrics endpoint; these heartbeat tags are the
-                            // ONLY path that makes a silently-deaf observer and the fleet signal
-                            // count observable (see AgentHealthStore::recompute_metrics).
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+                            // DEX signal observer (every platform with a real observer —
+                            // Windows / Linux / macOS; no-op platforms have none). Both tags are
+                            // omitted when --dex-disable opted the agent out, so the server rollups
+                            // reflect genuine state, not opt-outs. The agent has no /metrics
+                            // endpoint; these heartbeat tags are the ONLY path that makes a
+                            // silently-deaf observer and the fleet signal count observable (see
+                            // AgentHealthStore::recompute_metrics).
                             if (!cfg_.dex_disable) {
                                 const bool healthy =
                                     dex_health_ &&
@@ -1526,9 +1535,10 @@ public:
                             // sample -> tags omitted; the server simply doesn't
                             // count this agent that cycle). Gated like the DEX
                             // observer: --dex-disable means no DEX telemetry of
-                            // any kind. Off-Windows the read is valid=false
-                            // until those collectors land, so no tags ship.
+                            // any kind. Windows and Linux each read their own
+                            // counters here; macOS / other ship no perf tags yet.
                             if (!cfg_.dex_disable) {
+#if defined(_WIN32)
                                 const auto cur = win::read_perf_breach_counters();
                                 const auto ps = win::derive_breach_sample(hb_prev_perf, cur);
                                 hb_prev_perf = cur;
@@ -1545,6 +1555,52 @@ public:
                                         tags["yuzu.perf_disk_lat_ms"] =
                                             std::format("{:.2f}", ps.disk_lat_ms);
                                 }
+#elif defined(__linux__)
+                                // Linux: read /proc here independently (mirrors the Windows
+                                // path — the heartbeat does its own read, separate from the A3
+                                // breach collector). CPU% needs a delta vs the prior heartbeat;
+                                // commit% is instantaneous. The first heartbeat (or an unreadable
+                                // /proc) only baselines, so the tag is omitted that cycle. No
+                                // disk-latency metric on Linux yet — that perf source is a later
+                                // slice.
+                                const auto read_proc =
+                                    [](const char* p) -> std::optional<std::string> {
+                                    std::ifstream f(p);
+                                    if (!f.is_open())
+                                        return std::nullopt;
+                                    const std::istreambuf_iterator<char> begin(f), end;
+                                    std::string s(begin, end);
+                                    return f.bad() ? std::nullopt : std::optional<std::string>(s);
+                                };
+                                // A throw here (bad_alloc reading /proc, std::format)
+                                // must not unwind out of the heartbeat thread — that
+                                // would stop heartbeats and read as the agent going
+                                // offline. Swallow; the tag is just omitted this cycle.
+                                try {
+                                    if (const auto st = read_proc("/proc/stat")) {
+                                        const lnx::CpuJiffies cur = lnx::parse_proc_stat(*st);
+                                        if (const auto pct =
+                                                lnx::cpu_busy_pct(hb_prev_cpu_lnx, cur))
+                                            tags["yuzu.perf_cpu_pct"] =
+                                                std::format("{:.1f}", *pct);
+                                        hb_prev_cpu_lnx = cur;
+                                    }
+                                    // Gate commit% the SAME way the collector gates
+                                    // perf.memory_pressure: under vm.overcommit_memory=1
+                                    // ("always") CommitLimit is advisory and commit% reads
+                                    // ~100% on healthy overcommit hosts — omit the tag so the
+                                    // fleet gauge stays consistent with the breach signal
+                                    // (shared lnx::overcommit_is_always, fjarvis review).
+                                    const auto oc = read_proc("/proc/sys/vm/overcommit_memory");
+                                    if (!(oc && lnx::overcommit_is_always(*oc)))
+                                        if (const auto mi = read_proc("/proc/meminfo"))
+                                            if (const auto pct = lnx::parse_commit_pct(*mi))
+                                                tags["yuzu.perf_commit_pct"] =
+                                                    std::format("{:.1f}", *pct);
+                                } catch (...) {
+                                    // omit perf tags this heartbeat
+                                }
+#endif
                             }
 
                             // PR 10: attach pushed fleet snapshot if the
