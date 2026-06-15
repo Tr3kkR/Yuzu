@@ -15,7 +15,7 @@ ARG TRIPLET=x64-linux
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex \
+    bison flex libsystemd-dev \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -54,7 +54,7 @@ RUN meson setup builddir \
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libsqlite3-0 ca-certificates bash \
+    libssl3 libsqlite3-0 libsystemd0 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu-agent \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across server/

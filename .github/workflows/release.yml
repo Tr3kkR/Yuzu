@@ -80,7 +80,14 @@ jobs:
           done
           if [ -n "$MISSING" ]; then
             echo "::error::Missing tools on self-hosted runner:$MISSING"
-            echo "Install with: sudo apt-get install -y ccache rpm bison flex"
+            echo "Install with: sudo apt-get install -y ccache rpm bison flex libsystemd-dev"
+            exit 1
+          fi
+          # libsystemd-dev (sd-bus) — the Linux Guardian systemd service guard links it;
+          # without the .pc file `meson setup` fails the agent configure. Checked via
+          # pkg-config rather than a command since it ships no binary.
+          if ! pkg-config --exists libsystemd; then
+            echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on self-hosted runner — sudo apt-get install -y libsystemd-dev"
             exit 1
           fi
 

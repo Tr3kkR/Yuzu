@@ -21,6 +21,7 @@
  */
 
 #include "tar_collectors.hpp"
+#include "tar_proc_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_perf.hpp"
@@ -37,13 +38,16 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -315,6 +319,92 @@ public:
             R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})");
         ctx.register_trigger("tar.rollup", "interval", rollup_config);
 
+        // Gap-free process events via ETW (Windows). On success, collect_fast
+        // drains it instead of polling; on failure / off-Windows it stays
+        // inactive and the poll handles processes (no silent loss).
+        proc_etw_ = std::make_unique<yuzu::tar::ProcEtwCollector>();
+        // Boundary for boot backfill: events before this instant came from the
+        // pre-session boot window; the live session owns everything from here on.
+        const auto t_live = now_epoch_seconds();
+        etw_active_ = proc_etw_->start();
+        if (etw_active_) {
+            spdlog::info("TAR: ETW Kernel-Process collector active (process poll superseded)");
+
+            // Boot-window backfill: replay the AutoLogger .etl (configured at
+            // install time WITH a FlushTimer so it's continuously written to
+            // disk, and started by the kernel early at boot) for process events
+            // with ts < t_live — the window before our live session existed.
+            // Read directly from the live file; no session stop / no elevation
+            // (the narrow agent account only needs read access).
+            //
+            // Gated on the `process` source toggle: an operator who disables
+            // process collection must not have boot events inserted on the next
+            // restart (the AutoLogger is a system-level config the agent can't
+            // turn off, but the agent will not STORE what the toggle forbids).
+            //
+            // Per-boot dedup keyed on the BOOT INSTANT (boot_time_unix), not the
+            // earliest event in the .etl: the AutoLogger file is circular, so its
+            // earliest event shifts as the buffer wraps — a min-ts key would
+            // drift and a late restart would re-insert already-captured events as
+            // user-empty rows. The boot instant is stable across same-boot
+            // restarts and distinct between boots, so dedup is wrap-immune.
+            //
+            // Boot events are names-only with NO user: the processes are dead by
+            // replay time (no token to query), and the Kernel-Process start event
+            // itself carries only SessionID + integrity label, not the owning
+            // user. Precise boot-window user attribution would require adding the
+            // Security-Auditing 4688 provider to the AutoLogger — deferred.
+            if (source_enabled(*db_, "process")) {
+                const auto boot_key = std::to_string(yuzu::tar::boot_time_unix());
+                if (db_->get_config("last_backfill_boot_ts", "") == boot_key) {
+                    spdlog::info("TAR: boot-backfill already done this boot (agent restart) — skipped");
+                } else {
+                    const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
+                    std::error_code ec;
+                    if (!std::filesystem::exists(etl, ec)) {
+                        // Normal on any install without the boot AutoLogger — e.g.
+                        // a minimal install that omits the `advanced` component, or
+                        // a fresh install not yet rebooted. Logged, never silent.
+                        spdlog::info("TAR: no boot AutoLogger trace at {} — boot-window "
+                                     "backfill skipped",
+                                     etl);
+                    } else {
+                        auto boot_evs = yuzu::tar::backfill_proc_events_from_etl(etl, t_live);
+                        const auto snap = next_snapshot_id();
+                        std::vector<yuzu::tar::ProcessEvent> typed;
+                        typed.reserve(boot_evs.size());
+                        for (auto& e : boot_evs) {
+                            yuzu::tar::ProcessEvent pe;
+                            pe.ts = e.ts_unix;
+                            pe.snapshot_id = snap;
+                            pe.action = e.is_start ? "started" : "stopped";
+                            pe.pid = e.pid;
+                            pe.ppid = e.ppid;
+                            pe.name = e.image_name;
+                            pe.user = e.user; // empty for boot-backfill (see above)
+                            typed.push_back(std::move(pe));
+                        }
+                        if (typed.empty()) {
+                            spdlog::info("TAR: boot AutoLogger trace had no pre-session process events");
+                            db_->set_config("last_backfill_boot_ts", boot_key);
+                        } else if (db_->insert_process_events(typed)) {
+                            db_->set_config("last_backfill_boot_ts", boot_key);
+                            spdlog::info("TAR: boot-backfilled {} process events from the ETW AutoLogger",
+                                         typed.size());
+                        } else {
+                            // Leave the key unset so the next restart retries.
+                            spdlog::warn("TAR: boot-backfill insert failed (continuing; "
+                                         "will retry on restart)");
+                        }
+                    }
+                }
+            } else {
+                spdlog::info("TAR: process source disabled — ETW boot-backfill skipped");
+            }
+        } else {
+            spdlog::info("TAR: ETW process collector inactive — using snapshot-diff poll");
+        }
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
         return {};
@@ -325,6 +415,18 @@ public:
         ctx.unregister_trigger("tar.slow");
         ctx.unregister_trigger("tar.perf");
         ctx.unregister_trigger("tar.rollup");
+        // Take collect_mu_ around the collector teardown: a collect_fast tick may
+        // still be draining proc_etw_ (reads impl_ via drain()/running()), and
+        // stop() resets impl_. The host quiesces the trigger engine before
+        // shutdown, but the lock makes the ordering safe regardless. The ETW
+        // worker (on_event) never takes collect_mu_, so joining it here cannot
+        // deadlock.
+        {
+            std::lock_guard lock(collect_mu_);
+            if (proc_etw_) {
+                proc_etw_->stop(); // closes the ETW session + joins the consumer thread
+            }
+        }
         db_.reset();
         spdlog::info("TAR plugin shut down");
     }
@@ -371,6 +473,26 @@ private:
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
 
+    // Gap-free process start/stop via ETW (Windows). When the session starts,
+    // etw_active_ is true and collect_fast DRAINS this instead of polling; if it
+    // fails to start (or off-Windows, where start() is a no-op), etw_active_
+    // stays false and collect_fast falls back to the snapshot-diff poll — so a
+    // process source is always present. Drained only under collect_mu_.
+    std::unique_ptr<yuzu::tar::ProcEtwCollector> proc_etw_;
+    // Atomic: written under collect_mu_ (init + self-heal in collect_fast) but
+    // also read WITHOUT the lock by the `status` action (do_status), which runs
+    // on a different command thread — a plain bool there would be a data race.
+    std::atomic<bool> etw_active_{false};
+    // Events drained from the ETW ring but not yet persisted because a prior
+    // insert failed (DB locked/full); retried on the next collect_fast tick so a
+    // transient failure does not lose the batch (UP-2). Guarded by collect_mu_;
+    // bounded so a persistently failing DB cannot grow memory without limit.
+    std::vector<yuzu::tar::ProcEvent> pending_etw_evs_;
+    static constexpr std::size_t kPendingEtwCap = 100000;
+    // High-water mark of ProcEventRing::dropped() already logged, so the overflow
+    // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
+    std::uint64_t last_logged_dropped_{0};
+
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
     int collect_fast_impl(yuzu::CommandContext& ctx) {
@@ -384,36 +506,145 @@ private:
         // Per-source enable gate (issue #59): if disabled, skip both the
         // diff and the state save so that re-enabling later starts from a
         // clean baseline rather than diffing against a frozen snapshot.
-        if (source_enabled(*db_, "process")) {
-            auto current = yuzu::agent::enumerate_processes();
-
-            // Stabilization exclusions: drop processes whose name matches any
-            // exclusion pattern. The patterns reuse the same glob semantics
-            // as redaction (case-insensitive substring with optional '*' on
-            // either side stripped). Excluded processes never enter the
-            // diff, so their birth/death events are silently dropped — the
-            // documented forensic-completeness trade-off.
-            if (!stab_excl.empty()) {
-                std::erase_if(current, [&](const auto& p) {
-                    return yuzu::tar::should_redact(p.name, stab_excl);
-                });
-            }
-
-            auto prev_json = db_->get_state("process");
-            auto previous = json_to_processes(prev_json);
-
-            auto typed =
-                yuzu::tar::compute_process_events(previous, current, ts, snap_id, redaction);
-            if (!typed.empty()) {
-                if (!db_->insert_process_events(typed)) {
-                    spdlog::error("TAR: failed to insert process events, skipping state save");
-                    ctx.write_output("error|process insert failed");
-                    return 1;
+        const bool process_enabled = source_enabled(*db_, "process");
+        // Forensic-pause contract: the ETW collector owns a live session and keeps
+        // filling its ring even while the `process` source is disabled. Unlike the
+        // poll (which simply doesn't enumerate), the buffered events SURVIVE — so on
+        // the first drain after re-enable they would be persisted into process_live,
+        // capturing exactly the paused window the toggle forbids ("the agent will not
+        // STORE what the toggle forbids", as already enforced for boot-backfill).
+        // Drain-and-DISCARD each disabled tick so nothing from the paused window is
+        // ever stored. (Keeps the session warm — no stop/re-arm gap; the kernel
+        // session keeps running, events are captured-then-dropped, never inserted.)
+        if (etw_active_ && !process_enabled) {
+            proc_etw_->drain();       // flush + discard; never inserted
+            pending_etw_evs_.clear(); // and drop any pre-disable insert-retry backlog
+        }
+        if (process_enabled) {
+            if (etw_active_) {
+                // Windows: gap-free ETW stream supersedes the snapshot-diff poll.
+                // Same process_live schema + 'started'/'stopped' so rollups and
+                // the $Process_* query surface are unchanged. Names-only (no
+                // cmdline — ETW event 1 carries none, and that matches the
+                // works-council posture); user resolved from the SID at drain.
+                auto evs = proc_etw_->drain();
+                // Prepend events held over from a prior failed insert. ETW has no
+                // re-diff self-heal like the poll, so a transient insert failure
+                // (DB locked/full) must not silently drop the drained batch
+                // (UP-2). Bounded below by kPendingEtwCap.
+                if (!pending_etw_evs_.empty()) {
+                    evs.insert(evs.begin(), std::make_move_iterator(pending_etw_evs_.begin()),
+                               std::make_move_iterator(pending_etw_evs_.end()));
+                    pending_etw_evs_.clear();
                 }
-                total_events += static_cast<int>(typed.size());
-            }
+                std::vector<yuzu::tar::ProcessEvent> typed;
+                typed.reserve(evs.size());
+                for (auto& e : evs) {
+                    // Stabilization exclusions apply here too (parity with the poll).
+                    if (!stab_excl.empty() && yuzu::tar::should_redact(e.image_name, stab_excl)) {
+                        continue;
+                    }
+                    yuzu::tar::ProcessEvent pe;
+                    pe.ts = e.ts_unix;
+                    pe.snapshot_id = snap_id;
+                    pe.action = e.is_start ? "started" : "stopped";
+                    pe.pid = e.pid;
+                    pe.ppid = e.ppid;
+                    pe.name = e.image_name;
+                    pe.user = e.user;
+                    typed.push_back(std::move(pe));
+                }
+                if (!typed.empty()) {
+                    if (!db_->insert_process_events(typed)) {
+                        spdlog::error("TAR: ETW process insert failed — re-queuing {} events "
+                                      "for the next tick",
+                                      evs.size());
+                        // Retain the drained events (pre-redaction source) and
+                        // retry next tick; bound the backlog so a persistently
+                        // failing DB cannot grow memory without limit (drops the
+                        // oldest, mirroring the ring's overflow posture).
+                        pending_etw_evs_ = std::move(evs);
+                        if (pending_etw_evs_.size() > kPendingEtwCap) {
+                            const auto excess = pending_etw_evs_.size() - kPendingEtwCap;
+                            pending_etw_evs_.erase(
+                                pending_etw_evs_.begin(),
+                                pending_etw_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                        }
+                        ctx.write_output("error|process insert failed");
+                        return 1;
+                    }
+                    total_events += static_cast<int>(typed.size());
+                }
+                // No state save — ETW is a continuous stream, not a snapshot.
 
-            db_->set_state("process", processes_to_json(current).dump());
+                // Ring-overflow visibility: dropped() is cumulative, so warn only
+                // on the delta since the last drain (else it spams every tick for
+                // the agent's lifetime after a single burst). Also surfaced via
+                // the `status` action (process_etw_dropped).
+                if (auto d = proc_etw_->dropped(); d > last_logged_dropped_) {
+                    spdlog::warn("TAR: ETW process ring overflow — {} dropped (+{} since last drain)",
+                                 d, d - last_logged_dropped_);
+                    last_logged_dropped_ = d;
+                }
+
+                // Self-heal: if the ETW session died (ProcessTrace returned —
+                // another tool stopped it, buffer loss, quota), running() is
+                // false. The batch above is already persisted; fall back to the
+                // snapshot-diff poll so the process source does not go silently
+                // blind (UP-1). `status` then reports process_capture_method=polling.
+                if (!proc_etw_->running()) {
+                    spdlog::warn("TAR: ETW process session ended — falling back to "
+                                 "snapshot-diff poll");
+                    proc_etw_->stop();
+                    etw_active_ = false;
+                    // Prime the poll's process baseline with the CURRENT process
+                    // set, WITHOUT emitting events. Otherwise the first poll tick
+                    // would diff every running process against an empty snapshot
+                    // and emit a spurious 'started' for each — double-counting the
+                    // processes ETW already recorded as started. Seeding the
+                    // baseline here makes the first real diff capture only changes
+                    // since the fallback. (Mirrors the poll branch's enumerate +
+                    // stabilization-exclusion filter, minus the diff/insert.)
+                    auto current = yuzu::agent::enumerate_processes();
+                    if (!stab_excl.empty()) {
+                        std::erase_if(current, [&](const auto& p) {
+                            return yuzu::tar::should_redact(p.name, stab_excl);
+                        });
+                    }
+                    db_->set_state("process", processes_to_json(current).dump());
+                }
+            } else {
+                // Non-Windows (or ETW unavailable): snapshot-diff poll.
+                auto current = yuzu::agent::enumerate_processes();
+
+                // Stabilization exclusions: drop processes whose name matches any
+                // exclusion pattern. The patterns reuse the same glob semantics
+                // as redaction (case-insensitive substring with optional '*' on
+                // either side stripped). Excluded processes never enter the
+                // diff, so their birth/death events are silently dropped — the
+                // documented forensic-completeness trade-off.
+                if (!stab_excl.empty()) {
+                    std::erase_if(current, [&](const auto& p) {
+                        return yuzu::tar::should_redact(p.name, stab_excl);
+                    });
+                }
+
+                auto prev_json = db_->get_state("process");
+                auto previous = json_to_processes(prev_json);
+
+                auto typed =
+                    yuzu::tar::compute_process_events(previous, current, ts, snap_id, redaction);
+                if (!typed.empty()) {
+                    if (!db_->insert_process_events(typed)) {
+                        spdlog::error("TAR: failed to insert process events, skipping state save");
+                        ctx.write_output("error|process insert failed");
+                        return 1;
+                    }
+                    total_events += static_cast<int>(typed.size());
+                }
+
+                db_->set_state("process", processes_to_json(current).dump());
+            }
         }
 
         // Network diff
@@ -656,6 +887,21 @@ private:
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+
+#ifdef _WIN32
+        // ETW process collector health (Windows). capture_method reflects the
+        // live path: "etw" while the session runs, "polling" if ETW never started
+        // or self-healed to the poll after a session death. dropped is the
+        // cumulative ring-overflow count (NFR visibility — there is no agent
+        // /metrics endpoint; this action is the operator/agentic surface).
+        ctx.write_output(
+            std::format("config|process_capture_method|{}", etw_active_ ? "etw" : "polling"));
+        if (proc_etw_) {
+            // dropped() reads the ring's own atomic (independent of the session
+            // lifecycle) so it is safe without collect_mu_.
+            ctx.write_output(std::format("config|process_etw_dropped|{}", proc_etw_->dropped()));
+        }
+#endif
         return 0;
     }
 

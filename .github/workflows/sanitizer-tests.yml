@@ -83,6 +83,13 @@ jobs:
                   exit 1
               fi
           done
+          # libsystemd-dev (sd-bus) is required to configure the agent — the Linux
+          # Guardian systemd service guard links it. Fail loudly so the runner can be
+          # provisioned rather than hitting an opaque meson configure error.
+          if ! pkg-config --exists libsystemd; then
+              echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on yuzu-wsl2-linux runner — sudo apt-get install -y libsystemd-dev"
+              exit 1
+          fi
           meson --version
           gcc-13 --version | head -1
           ccache --version | head -1
@@ -215,6 +222,13 @@ jobs:
                   exit 1
               fi
           done
+          # libsystemd-dev (sd-bus) is required to configure the agent — the Linux
+          # Guardian systemd service guard links it. Fail loudly so the runner can be
+          # provisioned rather than hitting an opaque meson configure error.
+          if ! pkg-config --exists libsystemd; then
+              echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on yuzu-wsl2-linux runner — sudo apt-get install -y libsystemd-dev"
+              exit 1
+          fi
           meson --version
           gcc-13 --version | head -1
           ccache --version | head -1

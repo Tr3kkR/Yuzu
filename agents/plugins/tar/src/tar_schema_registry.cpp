@@ -27,9 +27,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .name = "process",
             .dollar_name = "Process",
             .os_support = {
-                {"windows", OsSupportStatus::kSupported,           "toolhelp32",
-                 "CreateToolhelp32Snapshot — full pid/ppid/name/cmdline; "
-                 "cmdline retrieval requires PROCESS_QUERY_LIMITED_INFORMATION."},
+                {"windows", OsSupportStatus::kSupported,           "etw",
+                 "ETW Microsoft-Windows-Kernel-Process (gap-free start/stop, "
+                 "names-only, owning user resolved from the SID at start) is the "
+                 "primary feeder; CreateToolhelp32Snapshot poll is the fallback "
+                 "if the ETW session cannot start. No command line is captured."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
@@ -41,7 +43,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {
                     .suffix = "live",
                     .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
+                    // Raised 5k→100k for the gap-free ETW stream on Windows (the
+                    // poll produced far fewer rows). ~100k × ~150 B ≈ ~15 MB
+                    // bounded; the hourly/daily/monthly count rollups carry the
+                    // long tail. Non-Windows poll simply never fills it.
+                    .retention_default = 100000,
                     .columns = {
                         {"ts",          "INTEGER"},
                         {"snapshot_id", "INTEGER"},

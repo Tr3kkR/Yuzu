@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y \
     gcc-13 g++-13 \
     # Autotools (required by vcpkg ports: c-ares, grpc) + bison/flex (libpq)
     autoconf automake libtool bison flex \
+    # sd-bus headers for the Linux Guardian systemd service guard (agent build)
+    libsystemd-dev \
     # OpenSSL build deps
     perl linux-libc-dev \
     # Utilities

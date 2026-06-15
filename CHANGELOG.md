@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
+  `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
+  ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
+  (which the poll misses entirely) are captured — with exact timestamps and exit
+  codes. Same `process_live` schema and `$Process_*` query surface and the same
+  `started`/`stopped` rollups — but the Windows `cmdline` column is now **empty**
+  (see Breaking Changes). Events are **names-only** (no command
+  line); the owning user is resolved from the process SID at start (best-effort,
+  empty for processes that exit faster than the ~1 s buffer flush — the same
+  limit the poll had). The poll remains the feeder on Linux/macOS and the Windows
+  fallback if the ETW session cannot start. The **boot window** (processes that
+  start *and* exit before the agent's live session opens) is backfilled from a
+  boot **AutoLogger** — a circular, FlushTimer-enabled Kernel-Process `.etl`
+  configured by `install-agent-user.ps1` (admin, install-time) and started by the
+  kernel early each boot; the agent reads it directly at startup for events
+  before its live session began (no session stop / no elevation — read access
+  only), de-duplicated per boot. Boot-window events are names-only with no user
+  (the start event carries only SessionID + integrity label; precise attribution
+  would need the Security-Auditing 4688 provider). `process_live` raw cap raised
+  5k→100k for the higher event rate; disk stays bounded (count rollups carry the
+  long tail). `install-agent-user.ps1` is now UTF-8-BOM-encoded so Windows
+  PowerShell 5.1 parses it (it has non-ASCII characters). Disabling the
+  `process` source drains-and-discards the live ETW ring each cycle, so a paused
+  window is never persisted on re-enable (forensic-pause contract); the
+  boot-backfill replay is memory-bounded and drops corrupt-timestamp / torn
+  records.
+- **Boot process-capture AutoLogger wired into the Windows installer (#1425).**
+  The production InnoSetup installer (`deploy/packaging/windows/yuzu-agent.iss`)
+  now configures the `YuzuProcBoot` boot AutoLogger at install time — scoped to
+  the `advanced` plugin component that ships `tar.dll` — and tears it down on
+  uninstall: it removes the boot config, **stops the running trace session**, and
+  deletes `procboot.etl`. Stopping the session is load-bearing: `Remove-AutologgerConfig`
+  removes only the boot-start config and leaves a session started by an earlier
+  boot running until the next reboot, holding one of the scarce (~64) system ETW
+  session slots. The same stop-before-delete teardown was applied to
+  `install-agent-user.ps1`'s `Remove-ProcBootAutologger` so the script and
+  installer recipes stay in sync. The installer also locks the agent data dir
+  `{commonappdata}\Yuzu` (and `{app}\logs`) to `admins-full system-full`: the
+  prior `service-full` keyword is not a valid InnoSetup permission group and was
+  silently ignored, leaving the directory — which now holds the boot trace
+  `procboot.etl` (boot-process names reveal which security/EDR tools are present)
+  — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
+
 ### Changed
 
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
@@ -63,6 +108,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was plaintext + unauthenticated). To run the old insecure posture, pass
   `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
   "Secure-by-default deployment".
+- **Windows TAR process events no longer carry a command line (`cmdline` is
+  empty).** With the Windows `process` source moving from the snapshot-diff poll
+  to the ETW Kernel-Process feeder (see Added), process rows on Windows are
+  names-only — the ETW start event carries no command line. Any dashboard, SIEM
+  export, `tar.sql` query, or Guardian rule that read `cmdline` from
+  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
+  (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not reversible by
+  configuration; `process_enabled=false` disables Windows process capture
+  entirely (ETW and poll) if required. Command-line redaction patterns
+  consequently have no effect on Windows process rows (there is nothing to
+  redact). The boot-window AutoLogger backfill is configured by the production
+  InnoSetup installer (scoped to the `advanced` component) and by the developer
+  install script (`install-agent-user.ps1`); it takes effect on the next reboot
+  after install. See `docs/user-manual/tar.md`
+  "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
@@ -148,6 +209,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian: Linux systemd service guard (observe-only).** The
+  `service-status-change` Guardian Spark now arms on Linux hosts with systemd,
+  watching each unit's `ActiveState` over sd-bus (`Subscribe` + `PropertiesChanged`
+  match + a bounded reconcile backstop) and emitting `drift.detected` events with
+  `platform=linux`, matching the Windows SCM guard's event shape — both service
+  guards are silent on the compliant edge (neither emits `guard.compliant`).
+  systemd's richer `ActiveState` collapses onto the published
+  `{running, stopped}` tokens with no schema change. **Observe-only in this
+  release:** drift is detected and reported but not remediated — enforcement
+  (mask/stop) is gated behind a forthcoming, governance-reviewed change, and an
+  `enforcement_mode: enforce` rule on a Linux agent degrades to observe without
+  error. Non-systemd Linux hosts (no system D-Bus) degrade gracefully: the guard
+  does not arm and the rule reports unarmed rather than compliant. The watch
+  reconnects automatically after a `systemctl daemon-reexec` / dbus restart.
+  **Build/runtime dependency on Linux agents:** `libsystemd` — build `libsystemd-dev`
+  (`systemd-devel` on RHEL/Fedora), runtime `libsystemd.so.0` (`libsystemd0` /
+  `systemd-libs`). The default build (`-Dsystemd_guard=enabled`) **requires** it so the
+  shipped agent always offers the guard — a build that has lost libsystemd fails loudly
+  rather than silently shipping a guard-less agent; the shipped `Dockerfile.agent`,
+  `Dockerfile.agent.chisel`, and the asan/tsan images install it and keep that default.
+  Pass `-Dsystemd_guard=auto` (use if present) or `disabled` to build the guard as a
+  no-op stub on musl/Alpine/non-systemd/minimal images that lack libsystemd.
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
   Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
   default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
