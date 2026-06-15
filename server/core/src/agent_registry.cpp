@@ -10,6 +10,7 @@
 
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
+#include "network_perf_rules.hpp"
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
 #include "tag_store.hpp"
@@ -1233,6 +1234,31 @@ AgentHealthStore::perf_snapshot(std::chrono::seconds staleness) const {
     return out;
 }
 
+std::vector<AgentHealthSnapshot>
+AgentHealthStore::net_snapshot(std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<AgentHealthSnapshot> out;
+    out.reserve(snapshots_.size());
+    for (const auto& [id, snap] : snapshots_) {
+        if ((now - snap.last_seen) > staleness)
+            continue; // same staleness contract recompute_metrics prunes by
+        AgentHealthSnapshot s;
+        s.agent_id = snap.agent_id;
+        s.last_seen = snap.last_seen;
+        // Network facts + the perf tags the co-occurrence pressure check reads
+        // (same minimal-copy-under-mutex discipline as perf_snapshot).
+        for (const char* k : {kNetTagRttP50Ms, kNetTagRetransPct, kNetTagThroughputBps,
+                              kNetTagDegraded, kPerfTagCpuPct, kPerfTagCommitPct,
+                              kPerfTagDiskLatMs}) {
+            if (auto it = snap.status_tags.find(k); it != snap.status_tags.end())
+                s.status_tags.emplace(it->first, it->second);
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);
@@ -1251,6 +1277,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
     metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
     metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
+    // Network families (slice 3) — same absent-not-zero rule as perf.
+    metrics.clear_gauge_family("yuzu_fleet_net_rtt_ms");
+    metrics.clear_gauge_family("yuzu_fleet_net_retrans_pct");
+    metrics.clear_gauge_family("yuzu_fleet_net_throughput_bps");
+    // Cleared so it goes ABSENT when no agent reports the (retired) net_degraded
+    // tag — a permanent flatline-0 reads as "0 degraded = healthy", the exact
+    // absent-as-zero anti-pattern this rollup forbids (gov happy-path/sre/UP-8).
+    metrics.clear_gauge_family("yuzu_fleet_net_degraded");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1266,6 +1300,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // three metrics — the same reports_any definition DexPerfFleetNow uses,
     // so the gauge and the Performance tab's Reporting card agree.
     int perf_reporting = 0;
+    // Network heartbeat facts (slice 3) — same shared validators as the
+    // /network read model so the gauges and the dashboard never disagree.
+    std::vector<double> net_rtt, net_retrans, net_tput;
+    int net_reporting = 0;
+    int net_degraded = 0;
+    int net_degraded_reporting = 0; // agents that reported the net_degraded tag at all
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1331,6 +1371,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (perf_reported_any)
             ++perf_reporting;
+
+        // Network facts — validators shared with network_perf_model.cpp.
+        bool net_reported_any = false;
+        if (auto v = parse_net_rtt_ms(get(kNetTagRttP50Ms))) {
+            net_rtt.push_back(*v);
+            net_reported_any = true;
+        }
+        if (auto v = parse_net_retrans_pct(get(kNetTagRetransPct))) {
+            net_retrans.push_back(*v);
+            net_reported_any = true;
+        }
+        if (auto v = parse_net_throughput_bps(get(kNetTagThroughputBps))) {
+            net_tput.push_back(*v);
+            net_reported_any = true;
+        }
+        if (net_reported_any) {
+            ++net_reporting;
+            // Count degraded only for devices that reported a metric (a forged
+            // net_degraded=1 with no valid metric must not exceed the reporting
+            // denominator — UP-9). `net_degraded_reporting` tracks whether ANY
+            // agent emitted the tag at all, so the gauge can go absent (not 0)
+            // when none do — which is now the steady state (the tag is retired;
+            // only old agents mid-rolling-upgrade still emit it).
+            if (auto d = parse_net_degraded(get(kNetTagDegraded))) {
+                ++net_degraded_reporting;
+                if (*d)
+                    ++net_degraded;
+            }
+        }
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1373,6 +1442,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
+
+    // Network rollup (slice 3): the {stat} distributions; families cleared above
+    // → absent, never a fake zero. `net_retrans_reporting` is the retransmit-rate
+    // population (a subset of net_reporting — a device can report RTT while its
+    // RetransWindow is still warming), so an SRE can tell "healthy, low loss"
+    // from "collection broken/absent" (gov sre). `net_degraded` is emitted ONLY
+    // when some agent reported the (retired) tag — otherwise absent, not 0.
+    metrics.gauge("yuzu_fleet_net_reporting").set(static_cast<double>(net_reporting));
+    metrics.gauge("yuzu_fleet_net_retrans_reporting")
+        .set(static_cast<double>(net_retrans.size()));
+    if (net_degraded_reporting > 0)
+        metrics.gauge("yuzu_fleet_net_degraded").set(static_cast<double>(net_degraded));
+    set_stats("yuzu_fleet_net_rtt_ms", net_rtt);
+    set_stats("yuzu_fleet_net_retrans_pct", net_retrans);
+    set_stats("yuzu_fleet_net_throughput_bps", net_tput);
 }
 
 } // namespace yuzu::server::detail

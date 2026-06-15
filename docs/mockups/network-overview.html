@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — Network fleet overview (N1)</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile). The dedicated /network dashboard,
+  Overview tab. This is NOT an NPM-tool clone: the leapfrog is that network
+  quality sits in the same edge warehouse as device perf + process/service
+  events, so we answer "is it the network, the device, or the app" by
+  CORRELATION — something a network-only tool (appliance/SPAN/NetFlow)
+  structurally cannot do, because it has no process/CPU/disk telemetry.
+
+  DESIGN PRINCIPLE baked in: the EDGE SHIPS FACTS, NEVER A VERDICT.
+   - v1 = the deterministic EVIDENCE surface + measured CO-OCCURRENCE counts.
+   - The causal verdict ("it's the network") is an OVERLAY (post-v1): a
+     contained deterministic rule for Guardian/fleet + an agentic overlay for
+     deep-dive. This page deliberately shows NO blame label.
+
+  WHAT'S ON THE WIRE (thin, fixed-cardinality heartbeat facts — NOT per-app):
+     yuzu.net_rtt_p50_ms, yuzu.net_retrans_pct, yuzu.net_throughput_bps,
+     yuzu.net_degraded (bool). These + the existing yuzu.perf_* tags feed the
+     fleet-now cards and the co-occurrence panel. Per-app / per-destination
+     detail stays in the device warehouse, reached on the Devices drill via an
+     Execute-gated canned tar.sql (ADR-0004 federated model).
+
+  EFFICIENCY ("more efficiently"): per-app attribution is FREE — the TAR
+  network collector already maps socket->PID->process every pass, so RTT/loss
+  "by app" falls out of a join we already do. No packet capture, no central
+  flow pipeline; quality is computed at the edge from kernel counters the OS
+  already maintains (Linux TCP_INFO; Windows ETW/ESTATS).
+
+  HONESTY: Linux reports the full per-connection tier (netlink TCP_INFO);
+  Windows v1 may be COARSER (retransmit/loss + connect events; smoothed RTT
+  pending the ESTATS-vs-ETW spike). Absent != zero. Co-occurrence is COUNTED,
+  never attributed.
+  Fake data loosely consistent with the DEX mockups (690 online).
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#243553; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --white:#fff; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff; --slate:#6f86a6;
+    --net:#00bceb; --dev:#ffcc00; --app:#c98bff;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:1.4rem;margin:0;color:var(--white);font-weight:700}
+  .sub{color:var(--muted);font-size:.78rem;margin-top:.3rem}
+  a{color:var(--accent);text-decoration:none;cursor:pointer}
+
+  .subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border);padding-bottom:.7rem;margin-bottom:1rem;flex-wrap:wrap}
+  .subnav .brand{font-size:.72rem;font-weight:700;color:var(--white);margin-right:.5rem;letter-spacing:.02em}
+  .subnav a{font-size:.78rem;color:var(--muted);border:1px solid transparent;border-radius:.35rem;padding:.22rem .6rem}
+  .subnav a.on{color:var(--white);border-color:var(--accent)}
+  .subnav .sp{margin-left:auto;font-size:.7rem;color:var(--muted)}
+
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.4rem 0 .55rem}
+
+  .mcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.7rem}
+  .mcard{background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:.85rem 1rem;cursor:pointer}
+  .mcard:hover{border-color:var(--accent)}
+  .mcard .mn{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .mcard .big{font-size:1.8rem;font-weight:700;color:var(--white);line-height:1.15}
+  .mcard .big small{font-size:.85rem;color:var(--muted);font-weight:400}
+  .mcard .stats{display:flex;gap:.9rem;margin-top:.5rem}
+  .mcard .stats div{font-size:.62rem;color:var(--muted)}
+  .mcard .stats b{display:block;font-size:.85rem;color:var(--fg);font-weight:600}
+  .mcard .drill{font-size:.58rem;color:var(--slate);margin-top:.45rem}
+  .mcard:hover .drill{color:var(--accent)}
+  .mcard.pop .big{color:var(--lightblue)}
+
+  /* co-occurrence panel */
+  .cooc{background:var(--surface);border:1px solid var(--border);border-radius:.55rem;padding:1rem 1.1rem}
+  .cooc .lead{font-size:.9rem;color:var(--white)}
+  .cooc .lead b{color:var(--net);font-weight:700}
+  .crow{display:grid;grid-template-columns:240px 1fr 60px;gap:.7rem;align-items:center;margin:.55rem 0;font-size:.72rem;cursor:pointer;border-radius:.3rem}
+  .crow:hover .cl{color:var(--accent)}
+  .crow .cl{color:var(--fg)}
+  .crow .cl i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:.45rem;vertical-align:0}
+  .bar{height:13px;border-radius:4px;background:var(--surface2);overflow:hidden}
+  .bar i{display:block;height:100%}
+  .crow .cv{text-align:right;font-variant-numeric:tabular-nums;color:var(--fg);font-weight:600}
+  .legendk{display:flex;gap:1.1rem;font-size:.6rem;color:var(--muted);margin-top:.6rem;flex-wrap:wrap}
+  .legendk i{display:inline-block;width:11px;height:9px;border-radius:2px;margin-right:.25rem;vertical-align:-1px}
+
+  table{width:100%;border-collapse:collapse;font-size:.74rem}
+  th{font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--border)}
+  td{padding:.42rem .5rem;border-bottom:1px solid var(--surface2)}
+  td.coh{color:var(--white);font-weight:600}
+  td.num{font-variant-numeric:tabular-nums}
+  tbody tr.click{cursor:pointer}
+  tbody tr.click:hover td{background:rgba(0,188,235,.05)}
+  tbody tr.click:hover td.coh{color:var(--accent)}
+  .flag{font-size:.78rem;font-weight:700}
+  .flag.dev{color:var(--dev)} .flag.app{color:var(--app)} .flag.no{color:var(--slate)}
+  .os{font-size:.56rem;border:1px solid var(--border);border-radius:.3rem;padding:.02rem .3rem;color:var(--muted);margin-left:.35rem}
+
+  .caveat{font-size:.68rem;color:var(--yellow);background:rgba(255,204,0,.07);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .6rem;margin:.55rem 0}
+  .info{font-size:.68rem;color:var(--lightblue);background:rgba(165,214,255,.06);border:1px solid rgba(165,214,255,.22);border-radius:.4rem;padding:.4rem .6rem;margin:.55rem 0}
+  .note{margin-top:1.4rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .note b{color:var(--lightblue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="subnav">
+    <span class="brand">Network</span>
+    <a class="on">Overview</a>
+    <a href="network-device.html">Devices</a>
+    <span class="sp">live &middot; last heartbeat cycle</span>
+  </div>
+
+  <h1>Network quality &mdash; fleet</h1>
+  <div class="sub">Continuous per-connection quality measured on each endpoint from kernel counters
+    (no packet capture, no flow export), rolled up across the fleet. The headline isn&rsquo;t a chart of
+    latency &mdash; it&rsquo;s <b style="color:var(--lightblue)">where the pain is</b>: because network quality
+    lives in the same on-device warehouse as CPU/disk and process/service events, we can show whether a
+    slow app co-occurs with a <b style="color:var(--dev)">device</b> or <b style="color:var(--app)">app</b>
+    problem. A network-only tool can&rsquo;t &mdash; it never sees the device.</div>
+
+  <!-- ───── Fleet now ───── -->
+  <div class="sech">Fleet now (last heartbeat cycle)</div>
+  <div class="mcards">
+    <div class="mcard">
+      <div class="mn">Round-trip time</div>
+      <div class="big">38<small> ms p50</small></div>
+      <div class="stats"><div><b>96 ms</b>p90</div><div><b>612 ms</b>max</div><div><b>142</b>full-RTT devices</div></div>
+      <div class="drill">&rarr; worst devices by RTT</div>
+    </div>
+    <div class="mcard">
+      <div class="mn">TCP retransmission</div>
+      <div class="big">0.4<small> % p50</small></div>
+      <div class="stats"><div><b>2.1%</b>p90</div><div><b>17.3%</b>max</div><div><b>684</b>reporting</div></div>
+      <div class="drill">&rarr; worst devices by retransmit</div>
+    </div>
+    <div class="mcard">
+      <div class="mn">Throughput (device)</div>
+      <div class="big">3.1<small> MB/s p50</small></div>
+      <div class="stats"><div><b>14 MB/s</b>p90</div><div><b>118 MB/s</b>max</div><div><b>684</b>reporting</div></div>
+      <div class="drill">&rarr; busiest devices</div>
+    </div>
+    <div class="mcard pop">
+      <div class="mn">Reporting</div>
+      <div class="big">684</div>
+      <div class="stats"><div><b>of 690</b>online</div><div><b>6</b>not yet reporting</div></div>
+      <div class="drill">&rarr; devices not reporting network</div>
+    </div>
+  </div>
+  <div class="caveat"><b>Platform asymmetry (by design).</b> <b>Linux</b> (142 devices) reports the full
+    per-connection tier &mdash; smoothed RTT, retransmits, loss &mdash; from netlink <code>TCP_INFO</code>, no
+    extra privilege. <b>Windows</b> (542) reports retransmit/loss + connect events today; smoothed per-connection
+    RTT is pending the ESTATS-vs-ETW spike, so Windows RTT is coarser or absent &mdash; <b>absent, never
+    averaged in as zero</b>. The &ldquo;full-RTT devices&rdquo; figure on the RTT card is the honest denominator
+    for that metric.</div>
+
+  <!-- ───── Co-occurrence (THE headline) ───── -->
+  <div class="sech">Where the pain is &mdash; co-occurrence (measured, not blamed)</div>
+  <div class="cooc">
+    <div class="lead"><b>84</b> devices currently show <b>degraded network quality</b>. Of those, here is what
+      <i>else</i> is happening on the same box, right now:</div>
+    <div style="margin-top:.7rem">
+      <div class="crow">
+        <span class="cl"><i style="background:var(--net)"></i>network-degraded only</span>
+        <div class="bar"><i style="width:56%;background:var(--net)"></i></div>
+        <span class="cv">47</span>
+      </div>
+      <div class="crow">
+        <span class="cl"><i style="background:var(--dev)"></i>&hellip; also under <b style="color:var(--dev)">device</b> perf pressure (CPU/mem/disk)</span>
+        <div class="bar"><i style="width:37%;background:var(--dev)"></i></div>
+        <span class="cv">31</span>
+      </div>
+      <div class="crow">
+        <span class="cl"><i style="background:var(--app)"></i>&hellip; also showing <b style="color:var(--app)">app</b> instability (crash/hang/restart)</span>
+        <div class="bar"><i style="width:14%;background:var(--app)"></i></div>
+        <span class="cv">12</span>
+      </div>
+    </div>
+    <div class="legendk">
+      <span><i style="background:var(--net)"></i>network signal: RTT / retransmit / loss</span>
+      <span><i style="background:var(--dev)"></i>device signal: yuzu.perf_* (CPU / commit / disk latency)</span>
+      <span><i style="background:var(--app)"></i>app signal: DEX crash / hang co-timed in the warehouse</span>
+      <span style="margin-left:auto;color:var(--slate)">click a band &rarr; that device list</span>
+    </div>
+  </div>
+  <div class="info"><b>This is counting, not blaming.</b> &ldquo;Also under device pressure&rdquo; means the two
+    facts <i>co-occur on the same box at the same time</i> &mdash; it is not a verdict that the device <i>caused</i>
+    the slowness (memory pressure can <i>look</i> like a network fault). The causal verdict
+    (<i>weighted most-likely cause</i>) is a deliberate <b>overlay</b>: a contained deterministic rule for
+    automation, and an agentic colleague for deep-dive. v1 ships the evidence; the overlay names the cause.</div>
+
+  <!-- ───── Drill: worst devices by RTT, with the co-occurring facts inline ───── -->
+  <div class="sech">Drill: worst devices by current RTT
+    <span style="color:var(--slate)">(opens from the RTT card &mdash; the device &amp; app flags are the co-occurring facts, shown so the correlation is visible at a glance)</span></div>
+  <table>
+    <thead><tr><th>#</th><th>Device</th><th>Cohort (site)</th><th>RTT p50</th><th>Retransmit</th><th>Throughput</th><th>Device pressure</th><th>App instability</th></tr></thead>
+    <tbody>
+      <tr class="click"><td class="num">1</td><td class="coh">LNX-BLR-0421<span class="os">linux</span></td><td>Bangalore</td><td class="num">612 ms</td><td class="num">9.4%</td><td class="num">0.2 MB/s</td><td class="flag no">&mdash;</td><td class="flag no">&mdash;</td></tr>
+      <tr class="click"><td class="num">2</td><td class="coh">WIN-VPN-0188<span class="os">win</span></td><td>Remote/VPN</td><td class="num">418 ms</td><td class="num">6.1%</td><td class="num">0.5 MB/s</td><td class="flag no">&mdash;</td><td class="flag no">&mdash;</td></tr>
+      <tr class="click"><td class="num">3</td><td class="coh">WIN-SL5-0418<span class="os">win</span></td><td>HQ-3F</td><td class="num">—</td><td class="num">7.8%</td><td class="num">1.1 MB/s</td><td class="flag dev">device&nbsp;&#9679;</td><td class="flag no">&mdash;</td></tr>
+      <tr class="click"><td class="num">4</td><td class="coh">LNX-DUB-0094<span class="os">linux</span></td><td>Dublin</td><td class="num">204 ms</td><td class="num">3.3%</td><td class="num">2.8 MB/s</td><td class="flag no">&mdash;</td><td class="flag app">app&nbsp;&#9679;</td></tr>
+      <tr class="click"><td class="num">5</td><td class="coh">WIN-T14-0337<span class="os">win</span></td><td>HQ-1F</td><td class="num">—</td><td class="num">5.0%</td><td class="num">0.9 MB/s</td><td class="flag dev">device&nbsp;&#9679;</td><td class="flag app">app&nbsp;&#9679;</td></tr>
+    </tbody>
+  </table>
+  <div class="sub" style="font-size:.64rem;margin-top:.3rem">Each row opens the device drill &mdash; the
+    co-timed evidence timeline + the raw per-app / per-destination quality numbers. RTT shows
+    &ldquo;&mdash;&rdquo; where the device reports no smoothed RTT (Windows, pending the spike); the retransmit
+    column still localizes those. The device/app flags are <b>measured co-occurrence</b>, not a verdict.</div>
+
+  <!-- ───── Privacy ───── -->
+  <div class="sech">Collection &amp; privacy</div>
+  <div class="caveat">Per-connection destinations reveal who/what people talk to, so this is opt-in,
+    usage-class telemetry (<code>netqual_enabled</code>, off by default, separate kill-switch). At the edge:
+    corporate-infra destinations are kept; user-browsing destinations are <b>bucketed or dropped</b> before
+    anything is stored; per-app destination cardinality is <b>top-N capped</b> so a browser opening thousands
+    of sites can&rsquo;t bloat the warehouse. Raw rows never leave the device; per-device/app views are an
+    on-demand, permission-gated, audited query (<code>network.device.view</code>).</div>
+
+  <div class="note">
+    <b>v1 = the evidence surface.</b> This Overview ships: fleet-now cards (thin heartbeat facts), the
+    co-occurrence panel (counted, no verdict), and the worst-devices drill with co-occurring flags inline.
+    <b>Not on this page (deliberate):</b> any &ldquo;it&rsquo;s the network&rdquo; blame label, and any fleet-wide
+    per-app breakdown (per-app stays in the device warehouse, reached on the Devices drill &mdash; keeps the
+    heartbeat thin). <b>Ladder (named, not built):</b> network as a scope-DSL dimension
+    (<code>net.rtt_p90 &gt; 200</code>) &rarr; scope-walking (&ldquo;what do the slow-RTT devices share?&rdquo;)
+    &rarr; the verdict overlay (deterministic rule + agentic) &rarr; Guardian closed-loop.
+  </div>
+</div>
+</body>
+</html>

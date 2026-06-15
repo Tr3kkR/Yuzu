@@ -30,6 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing obs_types means a Linux server lights up the same `/dex` buckets as
   Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
 
+- **Network quality dashboard (`/network`).** A new top-level page surfaces
+  fleet-wide TCP network quality measured continuously on each endpoint from
+  kernel counters (no packet capture, no flow export) — a **device / local-link
+  health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+  rate**, and device throughput. The retransmit rate is ΔΣretransmits /
+  ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
+  the lifetime ratio — empirically the lifetime ratio is diluted to noise while
+  the interval delta cleanly recovers the real loss rate. **Measurement-first:**
+  the page ships honest evidence and does **not** yet classify a device as
+  *network-degraded* — a calibrated threshold needs real-fleet baseline data, so
+  the degraded classification and the device/app co-occurrence headline it gates
+  are a later slice (the model stays wired but unfed). **Linux** agents report
+  via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
+  throughput; **Windows and macOS emit nothing yet** (later slices — absent
+  metrics are omitted, never zeroed). Device-aggregate heartbeat tags
+  `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
+  gated by `--dex-disable`) and Prometheus gauges
+  `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
+  (`yuzu_fleet_net_retrans_reporting` is the retransmit-rate denominator;
+  `yuzu_fleet_net_degraded` is dormant/absent until the classification lands).
+  An opt-in per-connection warehouse tier (`netqual_enabled` TAR config →
+  on-device `$NetQual_Live`, bucket-only destination class, top-N capped, Linux)
+  ships as the foundation for the deferred per-destination drill; it has no
+  dashboard consumer in v1. Page permission: `GuaranteedState:Read`. See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`. Machine-readable
+  JSON siblings `GET /api/v1/network/fleet` and `GET /api/v1/network/devices`
+  (permission `GuaranteedState:Read`, listed in the OpenAPI spec) and MCP tools
+  `get_network_fleet` / `list_network_devices` mirror the dashboard data for
+  scripting and agentic access (A1 parity).
+  *Note:* `yuzu.net_retrans_pct` / `yuzu_fleet_net_retrans_pct` changed meaning
+  within the unreleased cycle (absolute lifetime ratio → interval delta) and
+  `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
+  Prometheus alerts built on the earlier 4a semantics.
+
 - **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
   agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
   into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
