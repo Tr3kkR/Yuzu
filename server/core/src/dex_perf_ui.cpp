@@ -325,6 +325,90 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
          std::to_string(kDexCohortFloor) +
          " reporting devices withhold percentiles (statistical floor); devices without the key "
          "always appear as the explicit (untagged) residual.</div>";
+
+    // ── Compare two cohorts (F2c, BRD 99/103) ── the head-to-head A-vs-B diff,
+    // the complement of the fleet-relative table above (e.g. vanilla vs layered).
+    // Needs at least two cohorts to compare.
+    if (cohorts.size() >= 2) {
+        h += "<div class=\"gp-sech\">Compare two cohorts</div>";
+        const std::string a0 = cohorts[0].cohort;
+        const std::string b0 = cohorts[1].cohort;
+        const std::string base = "/fragments/dex/perf/cohort-diff?key=" +
+                                 url_encode(snap.cohort_key) + "&amp;window=" + w;
+        // CSP-safe pickers: htmx hx-get on change; hx-include="#dex-cohort-pick"
+        // pulls BOTH selects (the id wraps them) so changing either re-fetches
+        // the comparison — the proven #id include form (cf. #filter-bar), no
+        // hx-on/eval.
+        auto picker = [&](const char* nm, const std::string& sel) {
+            std::string s = "<select name=\"" + std::string(nm) + "\" hx-get=\"" + base +
+                            "\" hx-trigger=\"change\" hx-include=\"#dex-cohort-pick\" "
+                            "hx-target=\"#dex-cohort-diff\" hx-swap=\"innerHTML\" "
+                            "style=\"background:var(--surface);color:var(--fg);border:1px solid "
+                            "var(--border);border-radius:.35rem;padding:.15rem .4rem;\">";
+            for (const auto& c : cohorts) {
+                const std::string lbl = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
+                s += "<option value=\"" + esc(c.cohort) + "\"" +
+                     (c.cohort == sel ? " selected" : "") + ">" + lbl + "</option>";
+            }
+            return s + "</select>";
+        };
+        h += "<div class=\"gp-note\" id=\"dex-cohort-pick\">A " + picker("a", a0) +
+             " &nbsp;vs&nbsp; B " + picker("b", b0) + "</div>";
+        // Auto-load the default (top-two cohorts) comparison; the pickers re-fetch on change.
+        h += "<div id=\"dex-cohort-diff\" hx-get=\"" + base + "&amp;a=" + url_encode(a0) +
+             "&amp;b=" + url_encode(b0) + "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
+    }
+    return h;
+}
+
+std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
+                                                 const std::string& cohort_a,
+                                                 const std::string& cohort_b, int /*window_days*/) {
+    const auto d = dex_perf_cohort_diff(snap, cohort_a, cohort_b);
+    auto label = [](const std::string& c) {
+        return c.empty() ? std::string("(untagged)") : esc(c);
+    };
+    // One cohort's p50 cell, honouring found / sub-floor suppression.
+    auto cell = [](bool found, bool suppressed, const std::optional<DexPerfStat>& s, bool lat) {
+        if (!found)
+            return std::string("<span class=\"gp-mute\">no reporting devices</span>");
+        if (suppressed)
+            return std::string("<span class=\"gp-mute\">n too small</span>");
+        if (!s)
+            return std::string("&mdash;");
+        return lat ? fmt_lat(s->p50) : fmt_pct(s->p50);
+    };
+    // Δ: A relative to B; same ±5% colour band as delta_pill (red = A hotter).
+    auto delta = [](const std::optional<double>& dv) {
+        if (!dv)
+            return std::string("&mdash;");
+        const char* color = *dv > 5.0 ? "var(--red)" : *dv < -5.0 ? "var(--green)" : "var(--muted)";
+        return "<span style=\"color:" + std::string(color) + ";\">" +
+               std::format("{}{:.0f}%", *dv > 0 ? "+" : "", *dv) + "</span>";
+    };
+    auto row = [&](const char* name, const std::optional<DexPerfStat>& sa,
+                   const std::optional<DexPerfStat>& sb, const std::optional<double>& dv, bool lat) {
+        return "<tr><td>" + std::string(name) + "</td><td>" +
+               cell(d.found_a, d.a.suppressed, sa, lat) + "</td><td>" +
+               cell(d.found_b, d.b.suppressed, sb, lat) + "</td><td>" + delta(dv) + "</td></tr>";
+    };
+
+    std::string h = "<table class=\"gp-table\"><thead><tr><th>Metric (p50)</th><th>" +
+                    label(cohort_a) + " (A)</th><th>" + label(cohort_b) +
+                    " (B)</th><th>&Delta; A vs B</th></tr></thead><tbody>";
+    h += row("CPU utilization", d.a.cpu, d.b.cpu, d.cpu_delta_pct, false);
+    h += row("Memory commit", d.a.commit, d.b.commit, d.commit_delta_pct, false);
+    h += row("Disk I/O latency", d.a.disk_lat, d.b.disk_lat, d.disk_lat_delta_pct, true);
+    h += "</tbody></table>";
+
+    auto pop = [&](bool found, const DexPerfCohortRow& c) {
+        return found ? std::to_string(c.devices) + " reporting" : std::string("absent");
+    };
+    h += "<div class=\"gp-note\">A = <b>" + label(cohort_a) + "</b> (" + pop(d.found_a, d.a) +
+         "), B = <b>" + label(cohort_b) + "</b> (" + pop(d.found_b, d.b) +
+         "). &Delta; is A&rsquo;s p50 relative to B&rsquo;s (B the baseline); a positive value "
+         "means A runs hotter. A metric is compared only where both cohorts clear the " +
+         std::to_string(kDexCohortFloor) + "-device floor.</div>";
     return h;
 }
 
