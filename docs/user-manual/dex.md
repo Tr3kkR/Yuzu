@@ -187,6 +187,9 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/cohorts?key=`** — the cohort benchmarking table
   (suppression and the untagged residual included in the response shape, plus
   `available_keys` for picker UIs).
+- **`GET /api/v1/dex/perf/cohort-diff?key=&a=&b=`** — the direct A-vs-B cohort
+  comparison (both cohort values required; `found_a`/`found_b`, the two cohort
+  rows, and `delta_pct` with B as the baseline — null unless both clear the floor).
 - **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
   — the one device list behind every Performance drill (worst-by-metric,
   not-reporting, cohort members).
@@ -196,10 +199,10 @@ endpoints are now-views (no window). All are gated on `GuaranteedState:Read`.
 The per-signal drill-down returns a most-affected **devices** list
 (behavioral) and is **audit-logged** (`dex.signal.view`) on every call,
 exactly like the dashboard view; the rollup, scope and perf endpoints are
-aggregates / machine-health telemetry and are not audited. The same six reads
+aggregates / machine-health telemetry and are not audited. The same seven reads
 are exposed as MCP tools (`list_dex_signals`, `get_dex_signal_scope`,
 `get_dex_signal_detail`, `get_dex_perf_fleet`, `get_dex_perf_cohorts`,
-`list_dex_perf_devices`). Full request/response shapes are in
+`get_dex_perf_cohort_diff`, `list_dex_perf_devices`). Full request/response shapes are in
 [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

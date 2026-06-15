@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable follow-up: generate the matrix from the existing machine-readable per-OS
   metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
   signal catalogue) rather than hand-maintaining it.
+- **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
+  tab's cohort benchmarking compared each cohort against the whole fleet; it now
+  also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
+  `model` X vs Y) — closing the cohort-vs-cohort half of the benchmarking gap. A
+  "Compare two cohorts" section with two cohort pickers auto-loads the top-two
+  comparison; each metric shows both cohorts' p50 plus the delta (A relative to
+  B). Pure render-time over existing heartbeat state — **zero new storage**, no
+  Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
+  `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
+  rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
+  perf across the fleet) is **not** included — per-app data is device-drill-only
+  (federated), not fleet render-time; it remains deferred. See
+  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+
 - **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
   under DEX (the Network tab in the DEX sub-nav, also reachable directly at
   `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
@@ -249,6 +263,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
 - **macOS agents are no longer counted as Windows in DEX denominators.** The
   OS check used a substring match, and "darwin" contains "win" — so on mixed
   fleets every macOS agent inflated the Windows-online denominator behind the
