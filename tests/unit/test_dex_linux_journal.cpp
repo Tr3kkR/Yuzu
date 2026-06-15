@@ -130,6 +130,22 @@ TEST_CASE("journal: kernel OOM-kill → memory.exhausted", "[guardian][dex][linu
     CHECK(jl.obs->reason == "oom-kill");
 }
 
+TEST_CASE("journal: cgroup-v2 OOM-kill → memory.exhausted (the modern systemd common case)",
+          "[guardian][dex][linux][journal]") {
+    // LIVE-CAPTURED on a cgroup-v2 host: a memory-limited service that OOMs logs THIS
+    // form, not the system-wide "Out of memory:" — the leading "Out " is lower-cased
+    // mid-sentence. On modern systemd every service is in a cgroup, so this is the
+    // common case; the earlier capital-"Out" marker missed it entirely.
+    const std::string line =
+        R"({"__CURSOR":"s=ab;i=4b;b=cd","_TRANSPORT":"kernel",)"
+        R"("MESSAGE":"Memory cgroup out of memory: Killed process 1802705 (python3) total-vm:161112kB, anon-rss:130680kB"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "memory.exhausted");
+    CHECK(jl.obs->subject == "python3"); // the comm, never the memory figures / cgroup path
+    CHECK(jl.obs->reason == "oom-kill");
+}
+
 TEST_CASE("journal: non-OOM kernel line is dropped but advances the cursor",
           "[guardian][dex][linux][journal]") {
     const std::string line =
@@ -210,20 +226,27 @@ TEST_CASE("journal: privacy — coredump ships the comm only, never the COREDUMP
 TEST_CASE("journal: privacy — OOM ships the victim comm only, never the kernel memory figures",
           "[guardian][dex][linux][journal][privacy]") {
     // The kernel OOM line carries total-vm / anon-rss / file-rss figures; only the
-    // parenthesized victim comm may leave the device — never the memory numbers or the
-    // rest of the raw kernel message.
-    const std::string line =
-        R"({"__CURSOR":"s=ab;i=12;b=cd","_TRANSPORT":"kernel",)"
-        R"("MESSAGE":"Out of memory: Killed process 4321 (mysqld) total-vm:9000000kB, anon-rss:8000000kB, file-rss:0kB"})";
-    const JournalLine jl = parse_journal_line(line);
-    REQUIRE(jl.obs.has_value());
-    CHECK(jl.obs->subject == "mysqld");
-    const std::string detail = signal_detail_json(*jl.obs);
-    for (const std::string_view leak : {"total-vm", "anon-rss", "9000000", "8000000", "file-rss"}) {
-        CHECK(jl.obs->subject.find(leak) == std::string_view::npos);
-        CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
-        CHECK(detail.find(leak) == std::string_view::npos);
-    }
+    // parenthesized victim comm may leave the device — never the memory numbers, the
+    // cgroup path, or the rest of the raw kernel message. Pinned for BOTH the
+    // system-wide and the (live-captured) cgroup-v2 message forms.
+    const auto no_leak = [](const char* message, const char* comm) {
+        const std::string line = std::string(R"({"__CURSOR":"x","_TRANSPORT":"kernel","MESSAGE":")") +
+                                 message + R"("})";
+        const JournalLine jl = parse_journal_line(line);
+        REQUIRE(jl.obs.has_value());
+        CHECK(jl.obs->subject == comm);
+        const std::string detail = signal_detail_json(*jl.obs);
+        for (const std::string_view leak :
+             {"total-vm", "anon-rss", "file-rss", "9000000", "8000000", "161112", "Memory cgroup"}) {
+            CHECK(jl.obs->subject.find(leak) == std::string_view::npos);
+            CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
+            CHECK(detail.find(leak) == std::string_view::npos);
+        }
+    };
+    no_leak("Out of memory: Killed process 4321 (mysqld) total-vm:9000000kB, anon-rss:8000000kB, file-rss:0kB",
+            "mysqld");
+    no_leak("Memory cgroup out of memory: Killed process 1802705 (python3) total-vm:161112kB, anon-rss:8000000kB",
+            "python3");
 }
 
 // ── pipe orchestration (extracted from the collector; tmpfile-driven, off-Linux) ──

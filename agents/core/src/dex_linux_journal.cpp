@@ -38,12 +38,17 @@ std::optional<int> to_int(std::string_view s) {
     return v;
 }
 
-// Kernel OOM-killer line: "Out of memory: Killed process 1234 (comm) total-vm:…".
-// Returns the killed process comm from the parentheses, or "" if `msg` is not an
-// OOM-kill line. Only the comm is taken — the rest of the kernel message (memory
-// figures) is never shipped.
+// Kernel OOM-killer line: the killed comm in parentheses, or "" if `msg` is not an
+// OOM-kill line. Two real formats must both match (live-verified on a cgroup-v2 host):
+//   system-wide:  "Out of memory: Killed process 1234 (comm) total-vm:…"
+//   cgroup limit: "Memory cgroup out of memory: Killed process 1234 (comm) total-vm:…"
+// On modern systemd every service runs in a cgroup, so the cgroup form is the COMMON
+// case — the marker is the case-sensitive substring shared by both ("of memory: Killed
+// process "), never the leading "Out " (which the cgroup form lower-cases mid-sentence).
+// Only the comm is taken — the memory figures and the cgroup path (a separate "Memory
+// cgroup stats for …" line that does NOT match this marker) are never shipped.
 std::string oom_victim_comm(std::string_view msg) {
-    constexpr std::string_view kMark = "Out of memory: Killed process ";
+    constexpr std::string_view kMark = "of memory: Killed process ";
     const auto p = msg.find(kMark);
     if (p == std::string_view::npos)
         return {};
