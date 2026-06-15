@@ -764,6 +764,7 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
         "list_definitions",  "get_definition",        "query_responses",
         "validate_scope",    "preview_scope_targets", "list_pending_approvals",
         "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail",
+        "get_dex_perf_cohort_diff", // F2c discovery pin
         "get_network_fleet", "list_network_devices"}; // N1: A2 discovery pin
     for (const auto& name : expected_names) {
         bool found = false;
@@ -1064,6 +1065,51 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(cohorts["cohorts"][0]["suppressed"] == false);
     CHECK(cohorts["cohorts"][1]["suppressed"] == true); // sub-floor: population only
     CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
+}
+
+TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    // a (12 devices, >= floor) vs b (4, sub-floor): both found; b suppressed,
+    // so no metric can be diffed (delta null).
+    auto diff = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})")
+            ->body);
+    CHECK(diff["found_a"] == true);
+    CHECK(diff["found_b"] == true);
+    CHECK(diff["a"]["cohort"] == "a");
+    CHECK(diff["a"]["suppressed"] == false);
+    CHECK(diff["b"]["suppressed"] == true);
+    CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+
+    // unknown cohort → found_b false, b null.
+    auto missing = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"zzz"}}})")
+            ->body);
+    CHECK(missing["found_b"] == false);
+    CHECK(missing["b"].is_null());
+
+    // a missing required cohort param → kInvalidParams (an empty value would be
+    // the untagged residual, so this tests presence, not emptiness).
+    auto bad = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":59,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a"}}})")
+            ->body);
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // invalid key → kInvalidParams (REST parity).
+    auto badkey = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":60,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"not a key!","a":"a","b":"b"}}})")
+            ->body);
+    REQUIRE(badkey.contains("error"));
+    CHECK(badkey["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",

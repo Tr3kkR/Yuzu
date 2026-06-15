@@ -186,6 +186,9 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/cohorts?key=`** — the cohort benchmarking table
   (suppression and the untagged residual included in the response shape, plus
   `available_keys` for picker UIs).
+- **`GET /api/v1/dex/perf/cohort-diff?key=&a=&b=`** — the direct A-vs-B cohort
+  comparison (both cohort values required; `found_a`/`found_b`, the two cohort
+  rows, and `delta_pct` with B as the baseline — null unless both clear the floor).
 - **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
   — the one device list behind every Performance drill (worst-by-metric,
   not-reporting, cohort members).

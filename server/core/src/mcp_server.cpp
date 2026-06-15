@@ -2020,8 +2020,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    const auto d = dex_perf_cohort_diff(dex_perf_fn(key), param_str(args, "a"),
-                                                        param_str(args, "b"));
+                    const auto a = param_str(args, "a");
+                    const auto b = param_str(args, "b");
+                    // Validate the cohort VALUES too (448-byte tag cap; empty = the
+                    // untagged residual, which stays valid).
+                    if (!TagStore::validate_value(a) || !TagStore::validate_value(b)) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "cohort value too long"),
+                            "application/json");
+                        return;
+                    }
+                    // NOTE: these validation errors use the plain JSON-RPC form,
+                    // matching the rest of the MCP layer (no tool emits an A4
+                    // error.data today, and the tier check is shared). Making the
+                    // MCP error surface A4-consistent is tracked in #1470.
+                    const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
                     auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                         if (!found)
                             return "null";

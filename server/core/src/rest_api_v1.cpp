@@ -5054,16 +5054,25 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const std::string key =
                      req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid tag key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid,
+                                                           "key must match [A-Za-z0-9_.:-]{1,64}"),
+                                     "application/json");
                      return;
                  }
                  // Both cohort values are required. A value of "" is the
@@ -5071,12 +5080,25 @@ void RestApiV1::register_routes(
                  // has_param, not by emptiness.
                  if (!req.has_param("a") || !req.has_param("b")) {
                      res.status = 400;
-                     res.set_content(error_json("cohort params 'a' and 'b' are required"),
+                     res.set_content(
+                         detail::error_json_a4(400, "cohort params 'a' and 'b' are required", cid,
+                                               "supply both a= and b= cohort values (an empty "
+                                               "value selects the untagged residual)"),
+                         "application/json");
+                     return;
+                 }
+                 const auto a = req.get_param_value("a");
+                 const auto b = req.get_param_value("b");
+                 // Validate the cohort VALUES too (only `key` was checked before):
+                 // the 448-byte tag-value cap. Empty stays valid (untagged residual).
+                 if (!TagStore::validate_value(a) || !TagStore::validate_value(b)) {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400, "cohort value too long", cid,
+                                                           "cohort values must be <= 448 bytes"),
                                      "application/json");
                      return;
                  }
-                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), req.get_param_value("a"),
-                                                     req.get_param_value("b"));
+                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
                  auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                      if (!found)
                          return "null";
