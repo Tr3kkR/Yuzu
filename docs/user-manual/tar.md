@@ -134,7 +134,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 
 | Source | Windows | Linux | macOS |
 |--------|---------|-------|-------|
-| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`sysctl`) — `KERN_PROC_ALL`. Cmdline empty for hardened-runtime processes the agent cannot inspect. |
+| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`sysctl`) — `KERN_PROC_ALL`. Cmdline empty for hardened-runtime processes the agent cannot inspect. |
 | **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
@@ -303,14 +303,15 @@ TAR is designed for minimal performance overhead:
 >   agent restarts (so `process_capture_method=polling` on a Windows host that
 >   should be on ETW indicates a prior session failure — restart the agent to
 >   retry ETW).
-> - **Boot-window backfill requires the boot AutoLogger**, which today is
->   configured only by the developer install path (`install-agent-user.ps1`),
->   **not yet by the production MSI/InnoSetup installer** — wiring it there is a
->   tracked follow-up. Until then, packaged installs get live ETW capture but no
->   boot-window backfill (the narrow window of processes that start *and* exit
->   before the agent's session opens), and a reboot is required for the
->   AutoLogger to take effect where it is configured. Boot-window events are
->   names-only with **no user**.
+> - **Boot-window backfill requires the boot AutoLogger**, configured by the
+>   production InnoSetup installer (scoped to the `advanced` component that ships
+>   `tar.dll`) and by the developer install path (`install-agent-user.ps1`). A
+>   **reboot is required** for the AutoLogger to take effect: on a fresh install,
+>   or when upgrading from a release that did not configure it, boot-window
+>   backfill (the narrow window of processes that start *and* exit before the
+>   agent's session opens) is absent until after the next reboot. A minimal
+>   install that omits the `advanced` component does not configure the
+>   AutoLogger. Boot-window events are names-only with **no user**.
 >
 > To disable Windows process capture entirely (ETW and poll), set
 > `process_enabled=false` via `configure`; there is no separate "disable ETW but

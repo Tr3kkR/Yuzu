@@ -59,6 +59,17 @@ void seed_boot(GuaranteedStateStore& store, const std::string& id, const std::st
                     ",\"platform\":\"windows\"}",
                 ts);
 }
+
+// Route fragments filter signals by a now()-relative window (the handler computes
+// `dex_iso_since(window_to_days)` as the cutoff), so seeds with hardcoded calendar
+// dates age out of the window and the route tests start failing once the wall
+// clock passes them — they did on 2026-06-15, when the old 2026-06-08/09 seeds
+// fell outside the default 7-day window. Anchor seed dates a few days back from
+// *now* instead. Date-only: each seed appends its own "Thh:mm:ssZ" suffix, so
+// intra-test ordering is preserved. dex_iso_since is the very helper the route
+// cutoff uses, so these can never drift from it.
+const std::string kDayA = dex_iso_since(3).substr(0, 10); // older (was 2026-06-08)
+const std::string kDayB = dex_iso_since(2).substr(0, 10); // newer (was 2026-06-09)
 } // namespace
 
 TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]") {
@@ -174,7 +185,7 @@ TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escap
         r.event_type = "network.wifi_drop";
         r.severity = "info";
         r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
-        r.timestamp = "2026-06-09T10:00:00Z";
+        r.timestamp = kDayB + "T10:00:00Z";
         REQUIRE(store.insert_event(r));
     };
     obs("a", "agent-A", "CorpNet", "windows");
@@ -208,7 +219,7 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
         r.event_type = type;
         r.severity = "info";
         r.detail_json = "{\"subject\":\"x\",\"platform\":\"" + plat + "\"}";
-        r.timestamp = "2026-06-09T10:00:00Z";
+        r.timestamp = kDayB + "T10:00:00Z";
         REQUIRE(store.insert_event(r));
     };
     obs("a", "agent-A", "process.crashed", "windows");
@@ -251,9 +262,9 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
         r.timestamp = day + "T10:00:00Z";
         REQUIRE(store.insert_event(r));
     };
-    obs("1", "w", "process.crashed", "windows", "2026-06-08");
-    obs("2", "w", "network.wifi_drop", "windows", "2026-06-09");
-    obs("3", "m", "process.crashed", "macos", "2026-06-09");
+    obs("1", "w", "process.crashed", "windows", kDayA);
+    obs("2", "w", "network.wifi_drop", "windows", kDayB);
+    obs("3", "m", "process.crashed", "macos", kDayB);
 
     DexFleet fleet;
     fleet.windows_online = 5;
@@ -294,14 +305,14 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
 
 TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
-    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
-    seed_crash(store, "e2", "WS-1", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T11:00:00Z");
-    seed_hang(store, "e3", "WS-2", "chrome.exe", "2026-06-09T09:00:00Z");
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "e2", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
+    seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T09:00:00Z");
     seed_signal(store, "e4", "WS-2", "service.crashed",
                 R"({"subject":"Spooler","reason":"7031","symbolic":"SERVICE_CRASHED","platform":"windows"})",
-                "2026-06-09T10:00:00Z");
-    seed_boot(store, "e5", "WS-1", 43210.0, "2026-06-09T08:00:00Z");
-    seed_boot(store, "e6", "WS-2", 91000.0, "2026-06-09T08:05:00Z");
+                kDayB + "T10:00:00Z");
+    seed_boot(store, "e5", "WS-1", 43210.0, kDayB + "T08:00:00Z");
+    seed_boot(store, "e6", "WS-2", 91000.0, kDayB + "T08:05:00Z");
 
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
     CHECK(html.find("Digital Employee Experience") != std::string::npos);
@@ -330,7 +341,7 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
     // (uncatalogued) fallback now surfaces on the Catalogue.
     GuaranteedStateStore store(":memory:");
     seed_signal(store, "e1", "WS-1", "future.signal_type",
-                R"({"subject":"thing","platform":"windows"})", "2026-06-09T10:00:00Z");
+                R"({"subject":"thing","platform":"windows"})", kDayB + "T10:00:00Z");
     auto html = render_dex_catalogue_fragment(&store, "", 7);
     CHECK(html.find("future.signal_type") != std::string::npos);
     CHECK(html.find(">Other") != std::string::npos);
@@ -339,7 +350,7 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
           "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
-    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     // 1 device impacted of 4 reporting Windows agents → crash-free 75.0%.
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
@@ -357,7 +368,7 @@ TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",
           "[dex][routes]") {
     // A hang is not a crash: the headline crash-free rate must stay crash-scoped.
     GuaranteedStateStore store(":memory:");
-    seed_hang(store, "e1", "WS-1", "Teams.exe", "2026-06-09T09:00:00Z");
+    seed_hang(store, "e1", "WS-1", "Teams.exe", kDayB + "T09:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
     CHECK(html.find("100.0%") != std::string::npos);    // 0 crash-impacted of 4
     CHECK(html.find("Teams.exe") != std::string::npos); // the hung app still surfaces (Hangs col)
@@ -366,7 +377,7 @@ TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",
 TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][security]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "WS-1", "<img src=x onerror=alert(1)>", "ntdll.dll", "windows",
-               "2026-06-08T10:00:00Z");
+               kDayA + "T10:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
     CHECK(html.find("<img src=x") == std::string::npos);     // raw tag must not appear
     CHECK(html.find("&lt;img src=x") != std::string::npos);  // escaped form does
@@ -375,9 +386,9 @@ TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][securi
 TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + devices",
           "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
-    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
-    seed_crash(store, "e2", "WS-2", "chrome.exe", "chrome.dll", "windows", "2026-06-09T10:00:00Z");
-    seed_hang(store, "e3", "WS-2", "chrome.exe", "2026-06-09T11:00:00Z");
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "e2", "WS-2", "chrome.exe", "chrome.dll", "windows", kDayB + "T10:00:00Z");
+    seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T11:00:00Z");
 
     auto html = render_dex_app_fragment(&store, "chrome.exe", "all");
     CHECK(html.find("chrome.exe") != std::string::npos);
@@ -401,11 +412,11 @@ TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
           "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
-               "2026-06-08T10:00:00Z");
+               kDayA + "T10:00:00Z");
     seed_signal(store, "e2", "WS-7", "service.crashed",
                 R"({"subject":"Spooler","reason":"7031","symbolic":"SERVICE_CRASHED","platform":"windows"})",
-                "2026-06-09T10:00:00Z");
-    seed_boot(store, "e3", "WS-7", 43210.0, "2026-06-09T08:00:00Z");
+                kDayB + "T10:00:00Z");
+    seed_boot(store, "e3", "WS-7", 43210.0, kDayB + "T08:00:00Z");
 
     auto html = render_dex_device_fragment(&store, "WS-7", "all");
     CHECK(html.find("Behavioral data") == std::string::npos); // banner removed (Dave 2026-06-10);
@@ -424,7 +435,7 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
           "[dex][routes][security]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "<b>evil</b>", "<img src=x>", "ntdll.dll", "windows",
-               "2026-06-08T10:00:00Z");
+               kDayA + "T10:00:00Z");
     auto html = render_dex_device_fragment(&store, "<b>evil</b>", "all");
     CHECK(html.find("<b>evil</b>") == std::string::npos);
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
@@ -432,7 +443,7 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
 
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     GuaranteedStateStore store(":memory:");
-    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", "2026-06-08T10:00:00Z");
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
@@ -638,7 +649,7 @@ TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf
     // With signals AND without - a quiet device still has perf history.
     const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
     CHECK(quiet.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
-    seed_crash(store, "e1", "WS-9", "app.exe", "m.dll", "windows", "2026-06-09T10:00:00Z");
+    seed_crash(store, "e1", "WS-9", "app.exe", "m.dll", "windows", kDayB + "T10:00:00Z");
     const auto busy = render_dex_device_fragment(&store, "WS-9", "7d");
     CHECK(busy.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
     // Click-to-load, NEVER auto-load: the route dispatches a real command and
