@@ -5,6 +5,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('iphlpapi')
   tar_deps += cxx.find_library('ws2_32')
   tar_deps += cxx.find_library('wtsapi32')
+  tar_deps += cxx.find_library('tdh')     # ETW event decoding (tar_proc_etw)
 endif
 
 shared_library(
@@ -19,6 +20,7 @@ shared_library(
     'src/tar_network_collector.cpp',
     'src/tar_perf.cpp',
     'src/tar_proc_perf.cpp',
+    'src/tar_proc_etw.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
     'src/tar_fleet_snapshot.cpp',
