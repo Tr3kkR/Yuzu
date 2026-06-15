@@ -18,9 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   honest caveats: the Windows retransmit counter is **system-wide** (no
   per-interface TCP MIB, so it includes loopback) and is **measurement-first,
   unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
-  The `/network` dashboard and `yuzu_fleet_net_*` gauges now populate on a
-  Windows-only fleet. Windows-signal validation under real loss is tracked in
-  #1465. See `docs/user-manual/network.md`.
+  The `/network` dashboard now populates on a Windows-only fleet, and Windows
+  throughput reaches the `yuzu_fleet_net_*` gauges. The net gauges carry an `os`
+  label (per-OS, never blended). The Windows **retransmit** rate is system-wide,
+  biased low, and not yet loss-validated, so it is **withheld from the
+  `yuzu_fleet_net_retrans_pct` gauge** (it still shows on the `/network` page +
+  REST, caveated) until #1465 validates it — the gauge carries loss-validated OSes
+  only (Linux today). The `os` gauge label is **allowlisted** to the values a real
+  agent emits (`windows`/`linux`/`darwin`, else `other`) so an agent-controlled tag
+  can't spray unbounded series (the same raw-tag exposure on
+  `yuzu_fleet_agents_by_arch`/`by_version` is tracked in #1472). See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
 - **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
   per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
   macOS, each row citing its in-code source of truth — so a platform gap (such as

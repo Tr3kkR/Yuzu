@@ -161,9 +161,9 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
          "delta cleanly recovers the real rate). <b>RTT</b> (Linux only today) is coarse &mdash; a "
          "device-aggregate median blended across loopback/LAN/internet connections (a rough signal, "
          "not per-flow truth; per-destination latency is a later slice). Absent is never averaged in "
-         "as zero. "
-         "Same numbers as the "
-         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges.</div>";
+         "as zero. These cards blend the fleet; the "
+         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges split the same "
+         "facts per OS (Windows and Linux retransmit rates are not comparable).</div>";
 
     // ── Measurement-first: degraded classification + co-occurrence deferred ──
     // The disproven absolute-ratio `degraded` boolean was retired; the interval
