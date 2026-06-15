@@ -30,10 +30,6 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 
-/// Shared /network sub-nav (Overview · Devices). htmx core attrs into the page
-/// mount (#guardian-detail) — CSP-safe (no hx-on).
-std::string network_subnav(const std::string& active);
-
 /// PURE: the /fragments/network/overview content — fleet-now quality cards
 /// (the same stats as the yuzu_fleet_net_* gauges, via the shared
 /// network_perf_rules) + the co-occurrence headline (network/device/app,

@@ -371,9 +371,12 @@ std::string dex_window_token(int window_days) {
     return window_days == 1 ? "24h" : window_days == 30 ? "30d" : window_days == 0 ? "all" : "7d";
 }
 
-// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends). htmx core
-// attrs into the page mount — CSP-safe (no hx-on). Health/Trends are not built
-// yet → rendered as muted "soon" placeholders until their fragments exist.
+// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends · Performance ·
+// Network). htmx core attrs into the page mount — CSP-safe (no hx-on). The Network
+// tab loads the /fragments/network/* renderers (network_ui.cpp), which render this
+// same sub-nav with "network" active — so Network sits UNDER DEX rather than as its
+// own top-level nav item. The network fragments ignore the threaded ?window= (the
+// quality view is a now-view with no window of its own).
 std::string dex_subnav(const std::string& active, int window_days) {
     const std::string w = dex_window_token(window_days);
     auto tab = [&](const char* id, const char* label, const char* frag) {
@@ -385,7 +388,8 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
            tab("health", "Health score", "/fragments/dex/health") +
            tab("trends", "Trends", "/fragments/dex/trends") +
-           tab("perf", "Performance", "/fragments/dex/perf") + "</div>";
+           tab("perf", "Performance", "/fragments/dex/perf") +
+           tab("network", "Network", "/fragments/network/overview") + "</div>";
 }
 
 // Window chips for a given fragment path (reuses the overview pattern).
