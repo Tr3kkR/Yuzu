@@ -1031,3 +1031,122 @@ TEST_CASE("cohort_diff: A==B is degenerate but safe (zero deltas)", "[dex][perf]
     CHECK(*d.commit_delta_pct == 0.0);
     CHECK(*d.disk_lat_delta_pct == 0.0);
 }
+
+// ── cohort_diff render ───────────────────────────────────────────────────────
+
+TEST_CASE("cohort_diff render: comparison table + populated delta", "[dex][perf][cohort_diff][render]") {
+    auto html = render_dex_perf_cohort_diff_fragment(diff_snap(12, 12), "a", "b", 7);
+    CHECK(html.find("a (A)") != std::string::npos); // cohort A header
+    CHECK(html.find("b (B)") != std::string::npos); // cohort B header
+    CHECK(html.find("(B)") != std::string::npos);
+    CHECK(html.find("CPU utilization") != std::string::npos);
+    CHECK(html.find("Memory commit") != std::string::npos);
+    CHECK(html.find("Disk I/O latency") != std::string::npos);
+    CHECK(html.find("-50%") != std::string::npos);       // A(20) vs B(40) → -50%
+    CHECK(html.find("12 reporting") != std::string::npos); // population in the note
+}
+
+TEST_CASE("cohort_diff render: suppressed cohort shows 'n too small', delta withheld",
+          "[dex][perf][cohort_diff][render]") {
+    auto html = render_dex_perf_cohort_diff_fragment(diff_snap(12, 3), "a", "b", 7);
+    CHECK(html.find("n too small") != std::string::npos); // B below the floor
+    CHECK(html.find("&mdash;") != std::string::npos);     // delta dash (no comparison)
+}
+
+TEST_CASE("Performance tab carries the CSP-safe 'Compare two cohorts' pickers",
+          "[dex][perf][cohort_diff][render]") {
+    auto html = render_dex_perf_fragment(diff_snap(12, 12), 7);
+    CHECK(html.find("Compare two cohorts") != std::string::npos);
+    CHECK(html.find("name=\"a\"") != std::string::npos);
+    CHECK(html.find("name=\"b\"") != std::string::npos);
+    // both selects pulled on change; auto-load div fires on load — all htmx core
+    // attrs, NO hx-on (the CSP eval path the dashboard forbids).
+    CHECK(html.find("hx-include=\"[name='a'],[name='b']\"") != std::string::npos);
+    CHECK(html.find("id=\"dex-cohort-diff\"") != std::string::npos);
+    CHECK(html.find("hx-trigger=\"load\"") != std::string::npos);
+    CHECK(html.find("hx-on") == std::string::npos);
+}
+
+// ── cohort_diff routes (dashboard fragment) ──────────────────────────────────
+
+TEST_CASE("cohort_diff route: served comparison + perm gate + degraded provider",
+          "[dex][perf][cohort_diff][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto noPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                     const std::string&) {
+        res.status = 403;
+        return false;
+    };
+    auto fleet = []() { return DexFleet{}; };
+    DexRoutes::PerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
+
+    SECTION("permitted: serves the A-vs-B comparison with a populated delta") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("-50%") != std::string::npos);
+    }
+    SECTION("denied without GuaranteedState:Read") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+    }
+    SECTION("no provider wired → honest unavailable placeholder") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {});
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+    }
+}
+
+// ── cohort_diff REST (/api/v1/dex/perf/cohort-diff) ──────────────────────────
+
+TEST_CASE("REST /dex/perf/cohort-diff: deltas, required params, missing cohort",
+          "[dex][perf][cohort_diff][rest]") {
+    DexPerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
+    RestPerfHarness h(perf);
+
+    auto res = h.sink.Get("/api/v1/dex/perf/cohort-diff?key=model&a=a&b=b");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["found_a"] == true);
+    CHECK(j["data"]["found_b"] == true);
+    CHECK(j["data"]["a"]["cohort"] == "a");
+    CHECK(j["data"]["a"]["cpu_pct"]["p50"] == 20.0);
+    CHECK(j["data"]["b"]["cpu_pct"]["p50"] == 40.0);
+    CHECK(j["data"]["delta_pct"]["cpu_pct"] == -50.0);   // A(20) vs B(40)
+    CHECK(j["data"]["delta_pct"]["commit_pct"] == -50.0); // A(50) vs B(100)
+
+    SECTION("missing a or b → 400 (a value of \"\" is the untagged residual, not 'missing')") {
+        auto bad = h.sink.Get("/api/v1/dex/perf/cohort-diff?key=model&a=a");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+    }
+    SECTION("invalid key → 400") {
+        auto bad = h.sink.Get("/api/v1/dex/perf/cohort-diff?key=not%20valid%21&a=a&b=b");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+    }
+    SECTION("a missing cohort → found_b false, b null, deltas null") {
+        auto r = h.sink.Get("/api/v1/dex/perf/cohort-diff?key=model&a=a&b=does-not-exist");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        auto jj = nlohmann::json::parse(r->body);
+        CHECK(jj["data"]["found_b"] == false);
+        CHECK(jj["data"]["b"].is_null());
+        CHECK(jj["data"]["delta_pct"]["cpu_pct"].is_null());
+    }
+}
