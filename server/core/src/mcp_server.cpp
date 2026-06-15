@@ -302,6 +302,20 @@ static const ToolDef kTools[] = {
      "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
 
+    {"get_dex_perf_cohort_diff",
+     "Direct cohort-vs-cohort performance comparison (F2c): diffs two cohorts of a tag key "
+     "head-to-head (e.g. image_type vanilla vs layered), where get_dex_perf_cohorts benchmarks "
+     "each cohort against the fleet. Both cohort values a and b are required (empty value = the "
+     "untagged residual). delta_pct is A's p50 relative to B's p50 (B the baseline), null unless "
+     "BOTH cohorts expose the metric (neither suppressed below the floor); found_a/found_b are "
+     "false when a cohort has no reporting devices. Mirrors GET /api/v1/dex/perf/cohort-diff. "
+     "Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"},)j"
+     R"j("a":{"type":"string","description":"First cohort value (empty string = untagged residual)"},)j"
+     R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
+     R"j(},"required":["a","b"]})j"},
+
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
      "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
@@ -428,6 +442,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
+    {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
     {"list_network_devices", {"GuaranteedState", "Read"}},
@@ -1924,7 +1939,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // mcp.<tool> audit (the behavioral DEX surfaces keep their
             // dedicated audit verbs).
             if (tool_name == "get_dex_perf_fleet" || tool_name == "get_dex_perf_cohorts" ||
-                tool_name == "list_dex_perf_devices") {
+                tool_name == "get_dex_perf_cohort_diff" || tool_name == "list_dex_perf_devices") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
                         error_response(id, kTierDenied, "MCP tier does not allow this operation"),
@@ -1989,6 +2004,60 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("floor", kDexCohortFloor)
                                   .raw("cohorts", rows.str())
                                   .raw("available_keys", keys.str())
+                                  .str();
+                } else if (tool_name == "get_dex_perf_cohort_diff") {
+                    const auto key = param_str(args, "key", kDexDefaultCohortKey);
+                    if (!TagStore::validate_key(key)) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid tag key"),
+                                        "application/json");
+                        return;
+                    }
+                    // Both cohort values required; "" is the untagged residual,
+                    // so test presence (contains), not non-emptiness.
+                    if (!args.contains("a") || !args.contains("b")) {
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       "cohort params 'a' and 'b' are required"),
+                                        "application/json");
+                        return;
+                    }
+                    const auto d = dex_perf_cohort_diff(dex_perf_fn(key), param_str(args, "a"),
+                                                        param_str(args, "b"));
+                    auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
+                        if (!found)
+                            return "null";
+                        JObj o;
+                        o.add("cohort", c.cohort).add("devices", c.devices).add("suppressed",
+                                                                                c.suppressed);
+                        if (!c.suppressed)
+                            o.raw("cpu_pct", stat_json(c.cpu))
+                                .raw("commit_pct", stat_json(c.commit))
+                                .raw("disk_lat_ms", stat_json(c.disk_lat));
+                        return o.str();
+                    };
+                    auto delta_obj = [&] {
+                        JObj o;
+                        if (d.cpu_delta_pct)
+                            o.add("cpu_pct", *d.cpu_delta_pct);
+                        else
+                            o.raw("cpu_pct", "null");
+                        if (d.commit_delta_pct)
+                            o.add("commit_pct", *d.commit_delta_pct);
+                        else
+                            o.raw("commit_pct", "null");
+                        if (d.disk_lat_delta_pct)
+                            o.add("disk_lat_ms", *d.disk_lat_delta_pct);
+                        else
+                            o.raw("disk_lat_ms", "null");
+                        return o.str();
+                    };
+                    payload = JObj()
+                                  .add("key", key)
+                                  .add("floor", kDexCohortFloor)
+                                  .add("found_a", d.found_a)
+                                  .add("found_b", d.found_b)
+                                  .raw("a", cohort_obj(d.found_a, d.a))
+                                  .raw("b", cohort_obj(d.found_b, d.b))
+                                  .raw("delta_pct", delta_obj())
                                   .str();
                 } else { // list_dex_perf_devices
                     const auto metric =
