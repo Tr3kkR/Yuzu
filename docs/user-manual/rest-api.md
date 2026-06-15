@@ -3476,6 +3476,8 @@ The one device list behind every Performance drill: worst devices by a metric (d
 
 The machine-readable siblings of the `/network` dashboard fragments (A1 — fleet link health must be answerable without scraping HTML). Same render-time aggregation over heartbeat network facts, same `GuaranteedState:Read` gate. **The edge ships facts, never a verdict:** these report measured RTT / retransmit / throughput and *measured co-occurrence* counts, never a causal "it's the network" attribution.
 
+> **Note — cohort parameter naming.** The network surface uses `key` for the cohort tag dimension (empty = no cohort, length-guarded), where the DEX performance surface uses `cohort_key` (validated, defaults to `model`). The difference is intentional and reflects each surface's cohort-resolution model — network cohorting is opt-in, DEX's always resolves. There is no `/api/v1/network/cohorts` endpoint (network has no per-cohort statistical aggregation); discover valid tag keys via the tag API.
+
 #### `GET /api/v1/network/fleet`
 
 Fleet network-quality now-stats — the same numbers as the `yuzu_fleet_net_*` Prometheus gauges and the `/network` Overview cards, computed at request time.

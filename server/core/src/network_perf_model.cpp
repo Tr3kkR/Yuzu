@@ -91,6 +91,18 @@ NetPerfMetric net_perf_metric_from_token(const std::string& token) {
     return NetPerfMetric::kRtt;
 }
 
+NetCoocFilter net_cooc_from_token(const std::string& token) {
+    if (token == "device")
+        return NetCoocFilter::kAlsoDevice;
+    if (token == "app")
+        return NetCoocFilter::kAlsoApp;
+    if (token == "network_only")
+        return NetCoocFilter::kNetworkOnly;
+    if (token == "degraded")
+        return NetCoocFilter::kDegradedAll;
+    return NetCoocFilter::kNone;
+}
+
 const char* net_perf_metric_token(NetPerfMetric m) {
     switch (m) {
     case NetPerfMetric::kRetrans:

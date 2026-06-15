@@ -2096,16 +2096,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto metric =
                         net_perf_metric_from_token(param_str(args, "metric", "rtt"));
                     const bool not_reporting = param_str(args, "filter") == "not_reporting";
-                    NetCoocFilter cooc = NetCoocFilter::kNone;
-                    const auto cooc_tok = param_str(args, "cooc");
-                    if (cooc_tok == "device")
-                        cooc = NetCoocFilter::kAlsoDevice;
-                    else if (cooc_tok == "app")
-                        cooc = NetCoocFilter::kAlsoApp;
-                    else if (cooc_tok == "network_only")
-                        cooc = NetCoocFilter::kNetworkOnly;
-                    else if (cooc_tok == "degraded")
-                        cooc = NetCoocFilter::kDegradedAll;
+                    const NetCoocFilter cooc = net_cooc_from_token(param_str(args, "cooc"));
                     // Cohort handling mirrors the FRAGMENT: empty `key` default,
                     // light length guard (no validate_key — empty IS valid here).
                     std::string cohort_key = param_str(args, "key");

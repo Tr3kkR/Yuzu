@@ -26,19 +26,6 @@ std::string unavailable_placeholder() {
            "This server has no network snapshot provider wired yet.</div>";
 }
 
-// Map the co-occurrence band token (from the overview drills) to a filter.
-NetCoocFilter cooc_from_token(const std::string& t) {
-    if (t == "device")
-        return NetCoocFilter::kAlsoDevice;
-    if (t == "app")
-        return NetCoocFilter::kAlsoApp;
-    if (t == "network_only")
-        return NetCoocFilter::kNetworkOnly;
-    if (t == "degraded")
-        return NetCoocFilter::kDegradedAll;
-    return NetCoocFilter::kNone;
-}
-
 } // namespace
 
 void NetworkRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
@@ -109,7 +96,7 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         const bool not_reporting =
             req.has_param("filter") && req.get_param_value("filter") == "not_reporting";
         const NetCoocFilter cooc =
-            req.has_param("cooc") ? cooc_from_token(req.get_param_value("cooc"))
+            req.has_param("cooc") ? net_cooc_from_token(req.get_param_value("cooc"))
                                   : NetCoocFilter::kNone;
         std::optional<std::string> cohort_filter;
         if (req.has_param("cohort_value"))

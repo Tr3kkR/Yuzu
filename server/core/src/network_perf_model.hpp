@@ -103,6 +103,11 @@ const char* net_perf_metric_token(NetPerfMetric m);
 /// devices). kNone = the ordinary worst-by-metric drill.
 enum class NetCoocFilter { kNone, kDegradedAll, kAlsoDevice, kAlsoApp, kNetworkOnly };
 
+/// Map a co-occurrence band token to its filter. Single source of truth shared
+/// by the fragment, the REST handler, and the MCP tool (an unrecognised token —
+/// including "" — resolves to kNone). Anything else → kNone.
+NetCoocFilter net_cooc_from_token(const std::string& token);
+
 /// One row of the devices drill. Carries the co-occurring FACTS inline
 /// (under_pressure, app_unstable) so the table shows the correlation at a
 /// glance — without asserting a cause. `fleet_pctile` is the device's

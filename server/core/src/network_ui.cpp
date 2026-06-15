@@ -190,11 +190,9 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
                                             int limit) {
     const auto rows = net_perf_device_list(snap, metric, not_reporting, cooc, cohort_filter, limit);
 
-    // Reverse of net_perf_metric_from_token — preserve the metric across the
-    // cohort picker / cohort-value drill so switching cohort keeps the column.
-    const char* metric_token = metric == NetPerfMetric::kRetrans      ? "retrans"
-                               : metric == NetPerfMetric::kThroughput ? "throughput"
-                                                                      : "rtt";
+    // The metric token preserved across the cohort picker / cohort-value drill so
+    // switching cohort keeps the column (shared with net_perf_metric_from_token).
+    const char* metric_token = net_perf_metric_token(metric);
 
     std::string title;
     if (not_reporting)

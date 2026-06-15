@@ -33,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on-device `$NetQual_Live`, bucket-only destination class, top-N capped, Linux)
   ships as the foundation for the deferred per-destination drill; it has no
   dashboard consumer in v1. Page permission: `GuaranteedState:Read`. See
-  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`. Machine-readable
+  JSON siblings `GET /api/v1/network/fleet` and `GET /api/v1/network/devices`
+  (permission `GuaranteedState:Read`, listed in the OpenAPI spec) and MCP tools
+  `get_network_fleet` / `list_network_devices` mirror the dashboard data for
+  scripting and agentic access (A1 parity).
   *Note:* `yuzu.net_retrans_pct` / `yuzu_fleet_net_retrans_pct` changed meaning
   within the unreleased cycle (absolute lifetime ratio → interval delta) and
   `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build

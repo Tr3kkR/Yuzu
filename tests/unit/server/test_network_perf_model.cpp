@@ -348,6 +348,41 @@ TEST_CASE("devices render: hostile agent_id is HTML-escaped", "[network][ui]") {
     CHECK(html.find("&lt;b&gt;") != std::string::npos); // escaped form present
 }
 
+TEST_CASE("devices render: cohort picker + drillable cohort cell (available_keys branch)",
+          "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.available_keys = {"site", "region"}; // non-empty → the picker branch renders
+    snap.cohort_key = "site";                 // the active key
+    snap.devices.push_back(dev("d1", 40.0, std::nullopt, std::nullopt, false, "linux", "site-b"));
+    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+                                                      NetCoocFilter::kNone, std::nullopt, 50);
+    // Picker present (htmx core attrs only — no hx-on), active key selected, both keys offered.
+    CHECK(html.find("<select name=\"key\"") != std::string::npos);
+    CHECK(html.find("hx-on") == std::string::npos); // CSP: never compiles a handler
+    CHECK(html.find("value=\"site\" selected") != std::string::npos);
+    CHECK(html.find(">region</option>") != std::string::npos);
+    // Cohort cell is a drill carrying cohort_value (NOT the muted no-key "—" form).
+    CHECK(html.find("cohort_value=site-b") != std::string::npos);
+
+    SECTION("requested key absent from available_keys → honest fallback option") {
+        NetPerfSnapshot s2;
+        s2.available_keys = {"region"}; // "site" is NOT among them
+        s2.cohort_key = "site";
+        s2.devices.push_back(dev("d2", 40.0, std::nullopt, std::nullopt));
+        const auto h2 = render_network_devices_fragment(s2, NetPerfMetric::kRtt, false,
+                                                        NetCoocFilter::kNone, std::nullopt, 50);
+        CHECK(h2.find("no devices tagged") != std::string::npos); // honest fallback option shown
+    }
+
+    SECTION("no cohort key chosen → cohort cell is the muted '—', not a drill") {
+        NetPerfSnapshot s3;
+        s3.devices.push_back(dev("d3", 40.0, std::nullopt, std::nullopt)); // cohort_key empty
+        const auto h3 = render_network_devices_fragment(s3, NetPerfMetric::kRtt, false,
+                                                        NetCoocFilter::kNone, std::nullopt, 50);
+        CHECK(h3.find("cohort_value=") == std::string::npos); // no drill without a key
+    }
+}
+
 TEST_CASE("device_list: kAlsoApp band filters to app-co-occurring degraded", "[network][model]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(degraded("appdev", 10.0, true));  // degraded + app, no pressure
@@ -443,6 +478,24 @@ TEST_CASE("REST /network/devices: sort, filters, validation", "[network][rest]")
     REQUIRE(j["data"].size() == 2);
     CHECK(j["data"][0]["agent_id"] == "hi-0"); // worst (highest RTT) first
     CHECK(j["data"][0]["platform"] == "linux");
+    CHECK(j["data"][0]["fleet_pctile"] == 100); // the worst RTT is the 100th percentile
+
+    SECTION("non-empty cohort_value filters to that cohort only") {
+        auto site_b = h.sink.Get("/api/v1/network/devices?key=site&cohort_value=site-b");
+        REQUIRE(site_b);
+        auto jb = nlohmann::json::parse(site_b->body);
+        CHECK(jb["data"].size() == 3); // the 3 site-b (hi-*) devices, none of the site-a
+        for (const auto& d : jb["data"])
+            CHECK(d["cohort"] == "site-b");
+    }
+    SECTION("metric=throughput sorts busiest (highest bps) first") {
+        // lo-* (site-a) carry 5.0e6 bps vs hi-* (site-b) 1.0e5 → site-a is busiest.
+        auto busy = h.sink.Get("/api/v1/network/devices?metric=throughput&limit=2");
+        REQUIRE(busy);
+        auto jt = nlohmann::json::parse(busy->body);
+        REQUIRE(jt["data"].size() == 2);
+        CHECK(jt["data"][0]["cohort"] == "site-a");
+    }
 
     SECTION("cohort key resolves the cohort column but does NOT filter") {
         auto all = h.sink.Get("/api/v1/network/devices?key=site");

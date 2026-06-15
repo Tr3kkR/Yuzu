@@ -763,7 +763,8 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
         "list_agents",       "get_agent_details",     "query_audit_log",
         "list_definitions",  "get_definition",        "query_responses",
         "validate_scope",    "preview_scope_targets", "list_pending_approvals",
-        "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail"};
+        "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail",
+        "get_network_fleet", "list_network_devices"}; // N1: A2 discovery pin
     for (const auto& name : expected_names) {
         bool found = false;
         for (const auto& tool : tools) {

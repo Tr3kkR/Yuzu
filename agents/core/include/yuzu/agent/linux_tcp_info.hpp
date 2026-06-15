@@ -96,6 +96,11 @@ static_assert(offsetof(LinuxTcpInfo, tcpi_segs_out) == 136, "tcpi_segs_out offse
 // breaks triviality fails the build, not a sanitizer at runtime.
 static_assert(std::is_trivially_copyable_v<LinuxTcpInfo>,
               "LinuxTcpInfo must stay trivially copyable for the memcpy decode");
+// offsetof (used above and at every read site) is only fully defined for a
+// standard-layout type. Pin it so a future private section / base / mixed-access
+// change fails the build rather than making every offsetof conditionally UB.
+static_assert(std::is_standard_layout_v<LinuxTcpInfo>,
+              "LinuxTcpInfo must stay standard-layout for offsetof to be defined");
 
 } // namespace yuzu::agent
 
