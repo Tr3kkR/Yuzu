@@ -49,6 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window is never persisted on re-enable (forensic-pause contract); the
   boot-backfill replay is memory-bounded and drops corrupt-timestamp / torn
   records.
+- **Boot process-capture AutoLogger wired into the Windows installer (#1425).**
+  The production InnoSetup installer (`deploy/packaging/windows/yuzu-agent.iss`)
+  now configures the `YuzuProcBoot` boot AutoLogger at install time — scoped to
+  the `advanced` plugin component that ships `tar.dll` — and tears it down on
+  uninstall: it removes the boot config, **stops the running trace session**, and
+  deletes `procboot.etl`. Stopping the session is load-bearing: `Remove-AutologgerConfig`
+  removes only the boot-start config and leaves a session started by an earlier
+  boot running until the next reboot, holding one of the scarce (~64) system ETW
+  session slots. The same stop-before-delete teardown was applied to
+  `install-agent-user.ps1`'s `Remove-ProcBootAutologger` so the script and
+  installer recipes stay in sync. The installer also locks the agent data dir
+  `{commonappdata}\Yuzu` (and `{app}\logs`) to `admins-full system-full`: the
+  prior `service-full` keyword is not a valid InnoSetup permission group and was
+  silently ignored, leaving the directory — which now holds the boot trace
+  `procboot.etl` (boot-process names reveal which security/EDR tools are present)
+  — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
 
 ### Changed
 
@@ -90,11 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; `process_enabled=false` disables Windows process capture
   entirely (ETW and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
-  redact). The boot-window AutoLogger backfill is configured only by the
-  developer install script today, **not** the production InnoSetup installer —
-  packaged Windows installs get live ETW capture but no boot-window backfill
-  until that wiring lands (tracked follow-up). See
-  `docs/user-manual/tar.md` "Upgrade note (Windows process capture → ETW)".
+  redact). The boot-window AutoLogger backfill is configured by the production
+  InnoSetup installer (scoped to the `advanced` component) and by the developer
+  install script (`install-agent-user.ps1`); it takes effect on the next reboot
+  after install. See `docs/user-manual/tar.md`
+  "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC

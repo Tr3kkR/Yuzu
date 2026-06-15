@@ -363,8 +363,8 @@ public:
                     std::error_code ec;
                     if (!std::filesystem::exists(etl, ec)) {
                         // Normal on any install without the boot AutoLogger — e.g.
-                        // the production InnoSetup installer does not configure it
-                        // yet (tracked follow-up). Logged, never silent.
+                        // a minimal install that omits the `advanced` component, or
+                        // a fresh install not yet rebooted. Logged, never silent.
                         spdlog::info("TAR: no boot AutoLogger trace at {} — boot-window "
                                      "backfill skipped",
                                      etl);
