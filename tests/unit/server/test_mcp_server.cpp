@@ -1102,6 +1102,10 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // A4 error.data on the validation failure (#1463): correlation id + remediation.
+    REQUIRE(bad["error"].contains("data"));
+    CHECK(bad["error"]["data"]["correlation_id"].is_string());
+    CHECK(bad["error"]["data"].contains("remediation"));
 
     // invalid key → kInvalidParams (REST parity).
     auto badkey = nlohmann::json::parse(

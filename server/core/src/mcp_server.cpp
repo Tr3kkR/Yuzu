@@ -4,6 +4,7 @@
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 
 #include <spdlog/spdlog.h>
 
@@ -1940,9 +1941,28 @@ McpServer::HandlerFn McpServer::build_handler(
             // dedicated audit verbs).
             if (tool_name == "get_dex_perf_fleet" || tool_name == "get_dex_perf_cohorts" ||
                 tool_name == "get_dex_perf_cohort_diff" || tool_name == "list_dex_perf_devices") {
+                // A4 error.data for the dex-perf MCP tools (#1463 gate): every
+                // error path in this block carries a correlation id + nullable
+                // retry/remediation. cohort_diff is the gated tool; its three
+                // perf siblings share these tier/provider paths, so they get it
+                // too. Backfilling the rest of the MCP layer + the dex-perf REST
+                // family is tracked in #1470.
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                auto a4_data = [&](std::int64_t retry_ms, std::string_view remediation) {
+                    JObj o;
+                    o.add("correlation_id", cid);
+                    if (retry_ms > 0)
+                        o.add("retry_after_ms", retry_ms);
+                    else
+                        o.raw("retry_after_ms", "null");
+                    o.add("remediation", remediation);
+                    return o.str();
+                };
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation",
+                                       a4_data(0, "this MCP tier lacks GuaranteedState:Read; use a "
+                                                  "higher-tier token")),
                         "application/json");
                     return;
                 }
@@ -1950,7 +1970,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!dex_perf_fn) {
                     res.set_content(
-                        error_response(id, kInternalError, "Fleet perf provider unavailable"),
+                        error_response(id, kInternalError, "Fleet perf provider unavailable",
+                                       a4_data(5000, "retry after server warmup; the fleet-perf "
+                                                     "provider initialises during startup")),
                         "application/json");
                     return;
                 }
@@ -2008,16 +2030,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 } else if (tool_name == "get_dex_perf_cohort_diff") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);
                     if (!TagStore::validate_key(key)) {
-                        res.set_content(error_response(id, kInvalidParams, "invalid tag key"),
-                                        "application/json");
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid tag key",
+                                           a4_data(0, "key must match [A-Za-z0-9_.:-]{1,64}")),
+                            "application/json");
                         return;
                     }
                     // Both cohort values required; "" is the untagged residual,
                     // so test presence (contains), not non-emptiness.
                     if (!args.contains("a") || !args.contains("b")) {
-                        res.set_content(error_response(id, kInvalidParams,
-                                                       "cohort params 'a' and 'b' are required"),
-                                        "application/json");
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "cohort params 'a' and 'b' are required",
+                                           a4_data(0, "supply both a and b cohort values (an empty "
+                                                      "value selects the untagged residual)")),
+                            "application/json");
                         return;
                     }
                     const auto a = param_str(args, "a");
@@ -2026,14 +2053,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // untagged residual, which stays valid).
                     if (!TagStore::validate_value(a) || !TagStore::validate_value(b)) {
                         res.set_content(
-                            error_response(id, kInvalidParams, "cohort value too long"),
+                            error_response(id, kInvalidParams, "cohort value too long",
+                                           a4_data(0, "cohort values must be <= 448 bytes")),
                             "application/json");
                         return;
                     }
-                    // NOTE: these validation errors use the plain JSON-RPC form,
-                    // matching the rest of the MCP layer (no tool emits an A4
-                    // error.data today, and the tier check is shared). Making the
-                    // MCP error surface A4-consistent is tracked in #1470.
                     const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
                     auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                         if (!found)
