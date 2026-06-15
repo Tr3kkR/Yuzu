@@ -7,12 +7,14 @@
 
 #include "net_quality_sampler.hpp"
 
-#include "yuzu/agent/linux_tcp_info.hpp" // ABI-pinned tcp_info (glibc-version-proof)
+#include <type_traits>
 
 // Pure helpers (median / throughput_bps / RetransWindow) are header-inline.
 
 // ── Linux implementation ─────────────────────────────────────────────────────
 #if defined(__linux__)
+
+#include "yuzu/agent/linux_tcp_info.hpp" // ABI-pinned tcp_info (glibc-version-proof)
 
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
@@ -289,13 +291,21 @@ namespace yuzu::agent::netq {
 namespace {
 
 // RAII for GetIfTable2's heap allocation — FreeMibTable on every return path.
+// Single-owner like the Linux FdGuard/FileGuard: copy/move deleted so the raw
+// pointer can never be duplicated into a double-FreeMibTable.
 struct MibIfTableGuard {
     MIB_IF_TABLE2* t{nullptr};
+    MibIfTableGuard() = default;
+    MibIfTableGuard(const MibIfTableGuard&) = delete;
+    MibIfTableGuard& operator=(const MibIfTableGuard&) = delete;
     ~MibIfTableGuard() {
         if (t)
             ::FreeMibTable(t);
     }
 };
+static_assert(!std::is_copy_constructible_v<MibIfTableGuard> &&
+                  !std::is_move_constructible_v<MibIfTableGuard>,
+              "MibIfTableGuard must be a single non-copyable, non-movable owner");
 
 } // namespace
 

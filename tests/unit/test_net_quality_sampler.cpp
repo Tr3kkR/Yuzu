@@ -95,9 +95,27 @@ TEST_CASE("RetransWindow: a clean link reads ~0 across the window", "[netq]") {
     CHECK(*w.rate_pct() == Catch::Approx(0.0)); // no false positive on a clean link
 }
 
+TEST_CASE("RetransWindow: counter decrease (DWORD wrap) clamps, never negative", "[netq]") {
+    // Windows feeds 32-bit DWORD GetTcpStatisticsEx counters; on a long-uptime busy
+    // host dwOutSegs/dwRetransSegs can wrap, so segs (and retrans) may DECREASE
+    // between readings. The interval must contribute zero, never a negative/garbage
+    // rate. (Distinct from the churn case above, where retrans drops but segs rises.)
+    RetransWindow w;
+    w.push(1000, 200000);
+    w.push(40, 8000);      // both wrapped DOWN (cur < prev) → Δretr<0 and Δsegs<0, both clamped
+    CHECK(w.rate_pct() == std::nullopt); // the only interval contributed no segments → absent
+    // A subsequent clean interval after the wrap reads correctly (post-wrap baseline).
+    w.push(50, 9000);      // +10 retr / +1000 segs → 1.0%
+    REQUIRE(w.rate_pct().has_value());
+    CHECK(*w.rate_pct() == Catch::Approx(1.0)); // wrap interval excluded, not poisoning the rate
+}
+
 // NOTE: the Windows platform reads (GetIfTable2 throughput + GetTcpStatisticsEx
 // retransmit counters) are deliberately NOT unit-tested here — like the Linux
-// netlink path, they are non-exported syscall functions verified EMPIRICALLY on a
-// live rig (the heartbeat ships yuzu.net_throughput_bps + net_retrans_pct →
-// yuzu_fleet_net_* gauges). Only the cross-platform, deterministic helpers above
-// (median / throughput_bps / RetransWindow) are unit-tested.
+// netlink path, they are non-exported syscall functions. A live rig verifies only
+// the COUNTER PLUMBING (the heartbeat ships yuzu.net_throughput_bps +
+// net_retrans_pct → yuzu_fleet_net_* gauges); it does NOT validate the Windows
+// retransmit signal's separation-under-loss — that netem validation was run on
+// Linux only and is tracked for Windows in issue #1465. Only the cross-platform,
+// deterministic helpers above (median / throughput_bps / RetransWindow) are
+// unit-tested.

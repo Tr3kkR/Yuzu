@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-interface TCP MIB, so it includes loopback) and is **measurement-first,
   unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
   The `/network` dashboard and `yuzu_fleet_net_*` gauges now populate on a
-  Windows-only fleet. See `docs/user-manual/network.md`.
+  Windows-only fleet. Windows-signal validation under real loss is tracked in
+  #1465. See `docs/user-manual/network.md`.
 - **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
   per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
   macOS, each row citing its in-code source of truth — so a platform gap (such as
@@ -41,8 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the degraded classification and the device/app co-occurrence headline it gates
   are a later slice (the model stays wired but unfed). **Linux** agents report
   via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
-  throughput; **Windows and macOS emit nothing yet** (later slices — absent
-  metrics are omitted, never zeroed). Device-aggregate heartbeat tags
+  throughput; **Windows** reports throughput + retransmit (RTT deferred — see the
+  Windows entry above); **macOS emits nothing yet** (absent metrics are omitted,
+  never zeroed). Device-aggregate heartbeat tags
   `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
   gated by `--dex-disable`) and Prometheus gauges
   `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`

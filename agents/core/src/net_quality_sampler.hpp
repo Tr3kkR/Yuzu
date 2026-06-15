@@ -124,9 +124,11 @@ struct RetransWindow {
 /// Returns invalid off Linux or on read failure.
 NetCounters read_net_counters();
 
-/// Produce the heartbeat sample: a one-shot INET_DIAG dump for rtt/retrans (no
-/// delta needed) + throughput from prev/cur counters. `prev` invalid (first
-/// heartbeat) → throughput omitted this cycle. Off Linux → all-invalid.
+/// Produce the heartbeat sample. Linux: a one-shot INET_DIAG dump for rtt/retrans
+/// + throughput from prev/cur counters. Windows: throughput from prev/cur +
+/// system-wide TCP retransmit counters (no rtt). `prev` invalid (first heartbeat)
+/// → throughput omitted this cycle. macOS/other → all-invalid. Called only from
+/// the heartbeat thread; all state is local or caller-owned (no shared state).
 NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
 
 // ── Pure helpers (header-inline so they link into tests without DLL export,
