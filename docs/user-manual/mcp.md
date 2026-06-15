@@ -279,6 +279,8 @@ for the tool to execute.
 | 29 | `get_dex_perf_fleet` | Fleet device-performance now-stats (avg/p50/p90/max + reporting population; null = nobody reported). Mirrors `GET /api/v1/dex/perf/fleet`. | `GuaranteedState:Read` |
 | 30 | `get_dex_perf_cohorts` | Fleet-relative perf percentiles per cohort of a tag key (10-device floor, untagged residual, `available_keys`). Mirrors `GET /api/v1/dex/perf/cohorts`. | `GuaranteedState:Read` |
 | 31 | `list_dex_perf_devices` | The device list behind every fleet-performance drill (worst-by-metric / not-reporting / cohort members). Machine-health telemetry. Mirrors `GET /api/v1/dex/perf/devices`. | `GuaranteedState:Read` |
+| 32 | `get_network_fleet` | Fleet network-quality now-stats (avg/p50/p90/max for RTT / retransmit / throughput + reporting populations incl. the honest RTT denominator; null = nobody reported) plus measured net/device/app co-occurrence counts. Mirrors `GET /api/v1/network/fleet`. | `GuaranteedState:Read` |
+| 33 | `list_network_devices` | The device list behind every network-quality drill (worst-by-metric / not-reporting / co-occurrence band / cohort members), with the co-occurring facts inline. Device link-health telemetry, never a verdict. Mirrors `GET /api/v1/network/devices`. | `GuaranteedState:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`

@@ -621,10 +621,7 @@ struct RestPerfHarness {
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
-                            nullptr, nullptr, {}, {}, {},
-                            // lockout_clear_fn (merge #1405): default — this perf
-                            // harness only needs dex_perf_fn, which now follows it.
-                            {}, std::move(perf));
+                            nullptr, nullptr, {}, {}, {}, std::move(perf));
     }
 };
 

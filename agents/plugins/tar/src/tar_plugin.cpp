@@ -666,6 +666,31 @@ private:
             db_->set_state("network", connections_to_json(current).dump());
         }
 
+        // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
+        // default OFF — per-connection destinations are usage-class telemetry
+        // under the works-council posture, so (like procperf) this reads the
+        // explicit "true" rather than source_enabled (which defaults a missing
+        // key to ENABLED). Co-sampled with the tcp leg above: same snap_id + ts
+        // so netqual rows join the connection events on snapshot_id. Only the
+        // privacy bucket leaves select_netqual_rows; the raw remote address is
+        // dropped there and never persisted. Empty off Linux (collector stub).
+        if (db_->get_config("netqual_enabled", "false") == "true") {
+            auto samples = yuzu::tar::collect_tcp_quality();
+            auto rows = yuzu::tar::select_netqual_rows(samples, ts, snap_id,
+                                                       yuzu::tar::kNetQualTopN);
+            if (!rows.empty()) {
+                // OPT-IN source: a netqual insert failure must NOT fail the whole
+                // collect_fast tick — the always-on tcp/process legs already
+                // committed, so returning 1 here would misreport a healthy cycle
+                // as failed (and suppress the events_recorded line the server
+                // reads for retention-pause detection). Log and skip instead.
+                if (db_->insert_netqual_samples(rows))
+                    total_events += static_cast<int>(rows.size());
+                else
+                    spdlog::error("TAR: netqual insert failed this tick (skipped)");
+            }
+        }
+
         ctx.write_output(std::format("tar|collect_fast|{}|events_recorded", total_events));
         return 0;
     }

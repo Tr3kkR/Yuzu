@@ -614,6 +614,12 @@ const std::string& openapi_spec() {
     },
     "/dex/perf/devices": {
       "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
+    },
+    "/network/fleet": {
+      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — the same numbers as the yuzu_fleet_net_* Prometheus gauges and the /network Overview cards. A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
+    },
+    "/network/devices": {
+      "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
     }
   }
 })json";
@@ -797,7 +803,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn, DexPerfFn dex_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    LockoutClearFn lockout_clear_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -806,8 +813,8 @@ void RestApiV1::register_routes(
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
-                    std::move(step_up_fn), std::move(guardian_push_fn),
-                    std::move(lockout_clear_fn), std::move(dex_perf_fn));
+                    std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
+                    std::move(net_perf_fn), std::move(lockout_clear_fn));
 }
 
 void RestApiV1::register_routes(
@@ -822,7 +829,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, LockoutClearFn lockout_clear_fn, DexPerfFn dex_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    LockoutClearFn lockout_clear_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -5172,6 +5180,132 @@ void RestApiV1::register_routes(
                          o.add("commit_pct", *r.commit_pct);
                      if (r.disk_lat_ms)
                          o.add("disk_lat_ms", *r.disk_lat_ms);
+                     if (r.fleet_pctile >= 0)
+                         o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                     arr.add(std::move(o));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
+                                 "application/json");
+             });
+
+    // ── N1: network quality read model (/api/v1/network/*) ───────────────────
+    //
+    // Machine-readable A1 parity with the /network fragments — "is the fleet's
+    // link health OK?" must be answerable without scraping HTML. Same
+    // render-time aggregation over registry heartbeat NETWORK facts the
+    // fragments use (one NetPerfFn provider, two surfaces), same
+    // GuaranteedState:Read gate. NOT audited: device-aggregate link health
+    // (RTT/retransmit/throughput — device state, not behavioral data), mirroring
+    // the DEX-perf rationale. Cohort handling mirrors the /network FRAGMENT
+    // (empty-string default = no cohort, light length guard), NOT the DEX REST's
+    // "model" default / validate_key — so the machine sibling matches the
+    // fragment it mirrors exactly.
+
+    auto net_stat_json = [](const std::optional<NetPerfStat>& s) -> std::string {
+        if (!s)
+            return "null"; // absent-not-zero: nobody reported this metric
+        return JObj()
+            .add("avg", s->avg)
+            .add("p50", s->p50)
+            .add("p90", s->p90)
+            .add("max", s->max)
+            .add("n", s->n)
+            .str();
+    };
+
+    // GET /network/fleet — fleet-now RTT / retransmit / throughput stats + the
+    // honest denominators + the measured co-occurrence counts (the same numbers
+    // the yuzu_fleet_net_* gauges carry and the /network Overview cards show).
+    sink.Get("/api/v1/network/fleet",
+             [perm_fn, net_perf_fn, net_stat_json](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!net_perf_fn) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
+                 res.set_content(
+                     ok_json(JObj()
+                                 .raw("rtt_ms", net_stat_json(now.rtt))
+                                 .raw("retrans_pct", net_stat_json(now.retrans))
+                                 .raw("throughput_bps", net_stat_json(now.throughput))
+                                 .add("reporting", now.reporting)
+                                 .add("rtt_reporting", now.rtt_reporting)
+                                 .add("online", now.online)
+                                 .raw("cooccurrence",
+                                      JObj()
+                                          .add("degraded", now.cooc.degraded)
+                                          .add("also_device", now.cooc.also_device)
+                                          .add("also_app", now.cooc.also_app)
+                                          .add("network_only", now.cooc.network_only)
+                                          .str())
+                                 .str()),
+                     "application/json");
+             });
+
+    // GET /network/devices?metric=&filter=&cooc=&key=&cohort_value=&limit= — the
+    // ONE device list behind every /network drill: worst-by-metric (default
+    // rtt), the not-reporting complement (filter=not_reporting), a co-occurrence
+    // band (cooc=device|app|network_only|degraded), or a cohort's members. Rows
+    // carry the co-occurring FACTS (under_pressure/app_unstable) and the fleet
+    // percentile — evidence shown for correlation, never a verdict.
+    sink.Get("/api/v1/network/devices",
+             [perm_fn, net_perf_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!net_perf_fn) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 const NetPerfMetric metric = net_perf_metric_from_token(
+                     req.has_param("metric") ? req.get_param_value("metric") : "rtt");
+                 const bool not_reporting = req.has_param("filter") &&
+                                            req.get_param_value("filter") == "not_reporting";
+                 const NetCoocFilter cooc =
+                     req.has_param("cooc") ? net_cooc_from_token(req.get_param_value("cooc"))
+                                           : NetCoocFilter::kNone;
+                 // Cohort handling mirrors the FRAGMENT: `key` param, empty
+                 // default (no cohort resolution), light length guard — NOT the
+                 // DEX REST's "model" default / validate_key (which would 400 on
+                 // the empty default the fragment uses).
+                 std::string cohort_key = req.has_param("key") ? req.get_param_value("key") : "";
+                 if (cohort_key.size() > 64)
+                     cohort_key.clear();
+                 std::optional<std::string> cohort_filter;
+                 if (req.has_param("cohort_value"))
+                     cohort_filter = req.get_param_value("cohort_value");
+                 int limit = 50;
+                 if (req.has_param("limit")) {
+                     int v = 0;
+                     auto s = req.get_param_value("limit");
+                     [[maybe_unused]] auto [_, ec] =
+                         std::from_chars(s.data(), s.data() + s.size(), v);
+                     if (ec != std::errc{} || v <= 0) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid limit"), "application/json");
+                         return;
+                     }
+                     limit = std::min(v, 500);
+                 }
+                 const auto rows = net_perf_device_list(net_perf_fn(cohort_key), metric,
+                                                        not_reporting, cooc, cohort_filter, limit);
+                 JArr arr;
+                 for (const auto& r : rows) {
+                     JObj o;
+                     o.add("agent_id", r.agent_id).add("platform", r.platform).add("cohort", r.cohort);
+                     if (r.rtt_ms)
+                         o.add("rtt_ms", *r.rtt_ms);
+                     if (r.retrans_pct)
+                         o.add("retrans_pct", *r.retrans_pct);
+                     if (r.throughput_bps)
+                         o.add("throughput_bps", *r.throughput_bps);
+                     o.add("net_degraded", r.net_degraded)
+                         .add("under_pressure", r.under_pressure)
+                         .add("app_unstable", r.app_unstable);
                      if (r.fleet_pctile >= 0)
                          o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
                      arr.add(std::move(o));

@@ -1,0 +1,296 @@
+/**
+ * dex_linux_collector.cpp — Linux server DEX collector (Guardian DEX).
+ *
+ * Linux servers have no event-driven OS signal bus the way Windows does
+ * (EvtSubscribe), so the whole Linux DEX observer is a slow-cadence poll loop —
+ * the dex_win_poll WinStatePoller shape, except it IS the ISignalObserver (there
+ * is no event engine for it to ride alongside). v1 (PR3, the tracer-bullet slice)
+ * reads /proc + statvfs and REUSES the existing cross-platform breach + poll-latch
+ * + observation builders, so a Linux server lights up the same
+ * perf.cpu_sustained / perf.memory_pressure / storage.low buckets as Windows and
+ * macOS with ZERO server change (the macOS-collector parity playbook). journald
+ * reliability signals (OOM, unit-failure) and os.uptime are the next slices.
+ *
+ * The pure /proc parsing lives in dex_linux_proc.{hpp,cpp} (tested off-Linux); the
+ * statvfs read + the poll thread are the only Linux-only mechanism and live here
+ * behind #if defined(__linux__) — an empty TU elsewhere, the dex_macos_collector
+ * pattern. proto-free by design (the dex_observer.hpp rationale).
+ */
+
+#include <yuzu/agent/dex_observer.hpp>
+
+#if defined(__linux__)
+
+#include "dex_linux_proc.hpp"
+#include "dex_linux_storage.hpp" // storage_low_observation — the non-PII subject chokepoint
+#include "dex_perf_breach.hpp"   // breach_update, kCpuBreach/kMemoryBreach, *_observation
+#include "dex_win_poll.hpp"      // DiskLevel, latch_should_emit
+
+#include <sys/statvfs.h>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <fstream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <spdlog/spdlog.h>
+
+namespace yuzu::agent {
+namespace {
+
+std::int64_t now_unix() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// Monotonic seconds for the poll CADENCE only — immune to wall-clock steps (NTP
+// step-back, VM snapshot-resume) that would otherwise stall the loop until the old
+// stamp is re-passed (Gate-4 UP-12). The emitted observation timestamp still uses
+// now_unix() (wall clock) — that one must reflect real time, not uptime.
+std::int64_t steady_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Read a small /proc pseudo-file whole. /proc/stat, /proc/meminfo and
+// /proc/mounts report size 0 but stream their content; they are a few KiB at most
+// and must be read in one shot (the parsers expect a complete snapshot).
+std::optional<std::string> read_proc_file(const char* path) {
+    std::ifstream f(path);
+    if (!f.is_open())
+        return std::nullopt;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    if (ss.fail() || f.bad()) // empty / errored read — treat as unreadable (review MEDIUM)
+        return std::nullopt;
+    return ss.str();
+}
+
+/// The Linux DEX observer: a single owned poll thread (the WinStatePoller
+/// lifetime — stop() joins it, the sink is set before the thread starts and
+/// cleared after the join, so no callback can outlive the object). All signals
+/// reuse the existing pure decision + observation builders, so a Linux server is
+/// observed identically to Windows/macOS in the same /dex buckets.
+class LinuxDexObserver final : public ISignalObserver {
+public:
+    ~LinuxDexObserver() override { stop(); }
+
+    bool start(SignalSink sink, std::function<void()> on_error) override {
+        if (thread_.joinable())
+            return true; // already armed (idempotent)
+        sink_ = std::move(sink);
+        on_error_ = std::move(on_error); // fired at runtime if /proc becomes unreadable (HIGH-3)
+        stopping_ = false;
+        thread_ = std::thread([this] { run(); });
+        spdlog::info("dex_observer(linux): armed — /proc perf + storage poll");
+        return true;
+    }
+
+    void stop() override {
+        {
+            std::lock_guard lk(mu_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable())
+            thread_.join();
+        sink_ = nullptr;
+        on_error_ = nullptr;
+    }
+
+    int armed_channels() const override { return thread_.joinable() ? 1 : 0; }
+
+private:
+    void run() {
+        // First poll 60 s after arm (never at-arm — arm-time work delays agent
+        // startup), then each source keeps its own cadence. Mirrors WinStatePoller.
+        {
+            const std::int64_t now = steady_now();
+            last_perf_poll_ = now - win::kPerfSampleIntervalSeconds + kFirstPollDelaySeconds;
+            last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
+        }
+        for (;;) {
+            const std::int64_t next = std::min(last_perf_poll_ + win::kPerfSampleIntervalSeconds,
+                                               last_disk_poll_ + kDiskIntervalSeconds);
+            const auto wait_s =
+                std::chrono::seconds(std::max(next - steady_now(), std::int64_t{1}));
+            {
+                std::unique_lock lk(mu_);
+                if (cv_.wait_for(lk, wait_s, [this] { return stopping_; }))
+                    return; // stop() requested
+            }
+            const std::int64_t now = steady_now();
+            // A poll must NEVER unwind out of this thread (the file invariant): an
+            // allocation failure — most likely exactly when measuring memory pressure —
+            // would otherwise std::terminate the whole agent. Catch-and-continue keeps
+            // the thread alive (so the observer is not silently dead); the next tick
+            // re-baselines. (Bounding statvfs against a hung block device is a separate,
+            // tracked follow-up — a D-state stall throws nothing to catch here.)
+            try {
+                if (now - last_perf_poll_ >= win::kPerfSampleIntervalSeconds) {
+                    last_perf_poll_ = now;
+                    poll_perf();
+                }
+                if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
+                    last_disk_poll_ = now;
+                    poll_disks();
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("dex_observer(linux): poll iteration failed, continuing: {}",
+                             e.what());
+            } catch (...) {
+                spdlog::warn("dex_observer(linux): poll iteration failed (unknown), continuing");
+            }
+        }
+    }
+
+    // Sustained CPU + commit-charge breaches via the SAME hysteresis + builders as
+    // Windows (dex_perf_breach). CPU needs two readings for the busy% delta; the
+    // first poll (and any unreadable one) only re-baselines — breach_update treats
+    // the invalid sample as a gap (the latch holds, no re-fire). Emission is
+    // bounded by the sustain/recover windows, so no rate cap is needed.
+    void poll_perf() {
+        bool cpu_valid = false;
+        double cpu_pct = 0.0;
+        if (const auto stat = read_proc_file("/proc/stat")) {
+            const lnx::CpuJiffies cur = lnx::parse_proc_stat(*stat);
+            if (const auto pct = lnx::cpu_busy_pct(prev_cpu_, cur)) {
+                cpu_pct = *pct;
+                cpu_valid = true;
+            }
+            prev_cpu_ = cur; // baseline the next interval (even if this one was invalid)
+            proc_stat_fail_streak_ = 0; // a good read clears the disarm streak
+        } else {
+            prev_cpu_ = lnx::CpuJiffies{}; // unreadable — drop the baseline
+            // Flag the observer unhealthy only after PERSISTENT failure. The Windows
+            // on_error fires on terminal subscription death; a Linux /proc/stat read miss
+            // is usually TRANSIENT (a momentary EMFILE, a brief seccomp/mount-ns blip),
+            // and the poll thread re-baselines and resumes next tick — so a single miss
+            // must NOT latch armed=0 (that produced fleet-wide false-disarm alerts, sre
+            // Gate-6). Disarm only after kProcFailDisarmThreshold consecutive misses.
+            // (on_error is one-way today; recovery-to-armed is a tracked follow-up.)
+            if (++proc_stat_fail_streak_ >= kProcFailDisarmThreshold && on_error_)
+                on_error_();
+        }
+        if (const auto avg = win::breach_update(cpu_breach_, cpu_pct, cpu_valid, win::kCpuBreach))
+            emit(win::cpu_sustained_observation(*avg));
+
+        // Commit charge vs commit limit — Linux's direct analogue of the Windows
+        // commit/limit signal, so memory_pressure_observation's "commit charge …
+        // of limit" wording is correct, not relabelled. SKIPPED under
+        // vm.overcommit_memory=1 ("always"): there CommitLimit is advisory and
+        // Committed_AS routinely exceeds it on healthy DB/Redis/HPC hosts, so the
+        // ratio would false-positive-storm (Gate-4 UP-7). A read failure leaves the
+        // signal enabled (fail-safe toward keeping it). Modes 0/2 keep it meaningful.
+        bool mem_valid = false;
+        double mem_pct = 0.0;
+        const auto oc = read_proc_file("/proc/sys/vm/overcommit_memory");
+        if (!(oc && lnx::overcommit_is_always(*oc))) {
+            if (const auto mem = read_proc_file("/proc/meminfo")) {
+                if (const auto pct = lnx::parse_commit_pct(*mem)) {
+                    mem_pct = *pct;
+                    mem_valid = true;
+                }
+            }
+        }
+        if (const auto avg =
+                win::breach_update(mem_breach_, mem_pct, mem_valid, win::kMemoryBreach))
+            emit(win::memory_pressure_observation(*avg));
+    }
+
+    // Poll-and-latch storage.low over real local filesystems, via the SAME pure
+    // decision functions as Windows. parse_storage_mounts whitelists block-backed
+    // fstypes (so no squashfs/snap "100% by design" noise and no statvfs() on a
+    // potentially-hung network mount), and a failed statvfs leaves the level
+    // invalid → low_disk_observation nullopt → the latch neither emits nor clears
+    // (UP-5: a transient read failure must not re-fire). Paths with octal-escaped
+    // characters (\040) are statvfs'd as-is and simply skipped if that fails — a
+    // rare, safe omission for v1.
+    void poll_disks() {
+        const auto mounts = read_proc_file("/proc/mounts");
+        if (!mounts)
+            return;
+        std::unordered_set<std::string> current;
+        for (const auto& m : lnx::parse_storage_mounts(*mounts)) {
+            // Latch identity is the backing DEVICE (the dedup key + the subject source),
+            // NOT the mount path: keying by path would re-fire a duplicate storage.low for
+            // the same device if it is remounted at a different path (UP-8, Gate-4).
+            current.insert(m.device);
+            win::DiskLevel level;
+            struct statvfs vfs{};
+            if (::statvfs(m.path.c_str(), &vfs) == 0 && vfs.f_blocks > 0) {
+                const std::uint64_t bs = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                level.valid = true;
+                level.total_bytes = static_cast<std::uint64_t>(vfs.f_blocks) * bs;
+                // f_bavail = blocks free to unprivileged users (the "disk is full"
+                // signal), not f_bfree which includes the root-reserved slack.
+                level.free_bytes = static_cast<std::uint64_t>(vfs.f_bavail) * bs;
+            }
+            // Single chokepoint: subject = the backing-device basename, NEVER the mount
+            // path (a path carries usernames / tenant / project names — DEX edge-privacy,
+            // dex-signal-catalog.md §"Privacy / works-council contract"). m.path is used
+            // ONLY for the local statvfs() above; it is never passed to the observation, so
+            // it cannot be emitted, serialized, or logged. The [dex][privacy] test guards
+            // this exact call.
+            const auto obs = lnx::storage_low_observation(m, level);
+            bool& reported = disk_low_reported_[m.device];
+            if (win::latch_should_emit(obs.has_value(), level.valid, reported))
+                emit(*obs);
+        }
+        // Drop latch entries for devices that have gone away, so the map stays bounded
+        // by the live device count, not every device ever seen (review MEDIUM).
+        std::erase_if(disk_low_reported_,
+                      [&](const auto& kv) { return !current.contains(kv.first); });
+    }
+
+    // Stamp platform + delivery time centrally (an empty platform would vanish from
+    // the by-OS panel; "linux" is the render token, matching dex_routes os_label).
+    void emit(SignalObservation obs) {
+        obs.platform = "linux";
+        obs.timestamp_unix = now_unix();
+        spdlog::info("dex_observer(linux): observed {} subject='{}' reason={}", obs.obs_type,
+                     obs.subject, obs.reason);
+        try {
+            sink_(obs);
+        } catch (...) {
+            // The sink does a network write — a failure must not kill the poll thread.
+        }
+    }
+
+    static constexpr std::int64_t kFirstPollDelaySeconds = 60;
+    static constexpr std::int64_t kDiskIntervalSeconds = 600; // 10 min (the WinStatePoller cadence)
+    static constexpr int kProcFailDisarmThreshold = 3; // consecutive /proc/stat misses before disarm
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
+    std::thread thread_;
+    SignalSink sink_; // set before the thread starts, cleared after join — stable in run()
+    std::function<void()> on_error_; // disarms dex_health_ after persistent /proc failure (HIGH-3)
+    std::int64_t last_perf_poll_ = 0;
+    std::int64_t last_disk_poll_ = 0;
+    int proc_stat_fail_streak_ = 0;                          // consecutive /proc/stat read misses
+    lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
+    win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
+    std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
+};
+
+} // namespace
+
+std::unique_ptr<ISignalObserver> make_linux_dex_observer() {
+    return std::make_unique<LinuxDexObserver>();
+}
+
+} // namespace yuzu::agent
+
+#endif // __linux__
