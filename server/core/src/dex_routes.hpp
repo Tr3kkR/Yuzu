@@ -225,6 +225,14 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
 /// the page is a now-view (trend charts are F2b, Postgres-gated).
 std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days);
 
+/// F2c: the A-vs-B cohort comparison result (the table the two cohort pickers
+/// on the Performance tab load into). Renders each metric's p50 for both
+/// cohorts + the delta (A relative to B, B the baseline), honouring
+/// found/suppressed; pure render over dex_perf_cohort_diff.
+std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
+                                                 const std::string& cohort_a,
+                                                 const std::string& cohort_b, int window_days);
+
 /// PURE: the /fragments/dex/perf/devices drill — the ONE device list serving
 /// every Performance-page drill (worst-by-metric / not-reporting / cohort
 /// membership). Rows link to the per-device drill-down.

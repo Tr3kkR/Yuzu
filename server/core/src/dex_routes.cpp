@@ -2092,6 +2092,29 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                         "text/html; charset=utf-8");
     });
 
+    sink.Get("/fragments/dex/perf/cohort-diff", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        std::string key = req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+        if (!valid_tag_key(key))
+            key = kDexDefaultCohortKey;
+        // Cohort values come from the picker; "" is the legitimate untagged
+        // residual, and the pure model reports found=false for an unknown one.
+        const std::string a = req.has_param("a") ? req.get_param_value("a") : "";
+        const std::string b = req.has_param("b") ? req.get_param_value("b") : "";
+        res.set_content(render_dex_perf_cohort_diff_fragment(perf_fn_(key), a, b, window_days),
+                        "text/html; charset=utf-8");
+    });
+
     sink.Get("/fragments/dex/perf/devices", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
