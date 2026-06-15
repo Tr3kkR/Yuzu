@@ -335,11 +335,13 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
         const std::string b0 = cohorts[1].cohort;
         const std::string base = "/fragments/dex/perf/cohort-diff?key=" +
                                  url_encode(snap.cohort_key) + "&amp;window=" + w;
-        // CSP-safe pickers: htmx hx-get on change; hx-include pulls BOTH selects
-        // (a + b) so changing either re-fetches the comparison — no hx-on/eval.
+        // CSP-safe pickers: htmx hx-get on change; hx-include="#dex-cohort-pick"
+        // pulls BOTH selects (the id wraps them) so changing either re-fetches
+        // the comparison — the proven #id include form (cf. #filter-bar), no
+        // hx-on/eval.
         auto picker = [&](const char* nm, const std::string& sel) {
             std::string s = "<select name=\"" + std::string(nm) + "\" hx-get=\"" + base +
-                            "\" hx-trigger=\"change\" hx-include=\"[name='a'],[name='b']\" "
+                            "\" hx-trigger=\"change\" hx-include=\"#dex-cohort-pick\" "
                             "hx-target=\"#dex-cohort-diff\" hx-swap=\"innerHTML\" "
                             "style=\"background:var(--surface);color:var(--fg);border:1px solid "
                             "var(--border);border-radius:.35rem;padding:.15rem .4rem;\">";
@@ -350,8 +352,8 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             }
             return s + "</select>";
         };
-        h += "<div class=\"gp-note\">A " + picker("a", a0) + " &nbsp;vs&nbsp; B " +
-             picker("b", b0) + "</div>";
+        h += "<div class=\"gp-note\" id=\"dex-cohort-pick\">A " + picker("a", a0) +
+             " &nbsp;vs&nbsp; B " + picker("b", b0) + "</div>";
         // Auto-load the default (top-two cohorts) comparison; the pickers re-fetch on change.
         h += "<div id=\"dex-cohort-diff\" hx-get=\"" + base + "&amp;a=" + url_encode(a0) +
              "&amp;b=" + url_encode(b0) + "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";

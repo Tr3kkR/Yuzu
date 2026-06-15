@@ -1059,9 +1059,11 @@ TEST_CASE("Performance tab carries the CSP-safe 'Compare two cohorts' pickers",
     CHECK(html.find("Compare two cohorts") != std::string::npos);
     CHECK(html.find("name=\"a\"") != std::string::npos);
     CHECK(html.find("name=\"b\"") != std::string::npos);
-    // both selects pulled on change; auto-load div fires on load — all htmx core
-    // attrs, NO hx-on (the CSP eval path the dashboard forbids).
-    CHECK(html.find("hx-include=\"[name='a'],[name='b']\"") != std::string::npos);
+    // both selects pulled on change via the proven #id include form (the id
+    // wraps both pickers); auto-load div fires on load — all htmx core attrs,
+    // NO hx-on (the CSP eval path the dashboard forbids).
+    CHECK(html.find("id=\"dex-cohort-pick\"") != std::string::npos);    // wraps both selects
+    CHECK(html.find("hx-include=\"#dex-cohort-pick\"") != std::string::npos);
     CHECK(html.find("id=\"dex-cohort-diff\"") != std::string::npos);
     CHECK(html.find("hx-trigger=\"load\"") != std::string::npos);
     CHECK(html.find("hx-on") == std::string::npos);
