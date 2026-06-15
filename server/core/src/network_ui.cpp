@@ -190,6 +190,12 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
                                             int limit) {
     const auto rows = net_perf_device_list(snap, metric, not_reporting, cooc, cohort_filter, limit);
 
+    // Reverse of net_perf_metric_from_token — preserve the metric across the
+    // cohort picker / cohort-value drill so switching cohort keeps the column.
+    const char* metric_token = metric == NetPerfMetric::kRetrans      ? "retrans"
+                               : metric == NetPerfMetric::kThroughput ? "throughput"
+                                                                      : "rtt";
+
     std::string title;
     if (not_reporting)
         title = "Devices not reporting network";
@@ -220,6 +226,33 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
          "co-occurrence</b>, shown so the correlation is visible at a glance &mdash; never a "
          "verdict.</div></div></div>";
 
+    // ── Cohort key picker ── narrows the list to one operator-chosen tag key's
+    // values (mirror dex_perf_ui). available_keys is server-resolved from the
+    // TagStore; htmx submits the select's own name=value on change, re-rendering
+    // this fragment with ?key=<chosen> (metric preserved). Only the key param is
+    // exposed here; the cohort_value filter is reached by drilling a Cohort cell.
+    if (!snap.available_keys.empty()) {
+        h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
+             "hx-get=\"/fragments/network/devices?metric=" +
+             std::string(metric_token) +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+             "border-radius:.35rem;padding:.15rem .4rem;\">";
+        h += "<option value=\"\"" + std::string(snap.cohort_key.empty() ? " selected" : "") +
+             ">(none)</option>";
+        bool key_listed = false;
+        for (const auto& k : snap.available_keys) {
+            const bool on = (k == snap.cohort_key);
+            key_listed = key_listed || on;
+            h += "<option value=\"" + esc(k) + "\"" + (on ? " selected" : "") + ">" + esc(k) +
+                 "</option>";
+        }
+        if (!key_listed && !snap.cohort_key.empty()) // requested key has no tagged devices — honest
+            h += "<option value=\"" + esc(snap.cohort_key) + "\" selected>" + esc(snap.cohort_key) +
+                 " (no devices tagged)</option>";
+        h += "</select></div>";
+    }
+
     if (rows.empty())
         return h + placeholder(not_reporting ? "Everyone is reporting" : "No devices",
                                not_reporting
@@ -237,11 +270,22 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
         const std::string flag_app =
             r.app_unstable ? "<b style=\"color:#c98bff\">app &#9679;</b>"
                            : "<span class=\"gp-mute\">&mdash;</span>";
+        // Cohort cell: "—" until a key is chosen (the dimension is undefined),
+        // then the resolved value as a drill that filters to that cohort_value.
+        std::string cohort_cell;
+        if (snap.cohort_key.empty()) {
+            cohort_cell = "<span class=\"gp-mute\">&mdash;</span>";
+        } else {
+            const std::string qs = "key=" + url_encode(snap.cohort_key) +
+                                   "&amp;cohort_value=" + url_encode(r.cohort) +
+                                   "&amp;metric=" + metric_token;
+            cohort_cell = drill("/fragments/network/devices?" + qs,
+                                r.cohort.empty() ? std::string("(untagged)") : esc(r.cohort));
+        }
         h += "<tr><td class=\"gp-mute\">" + std::to_string(i++) + "</td><td>" +
              drill("/fragments/dex/device?id=" + url_encode(r.agent_id), esc(r.agent_id)) +
-             "</td><td>" +
-             (r.cohort.empty() ? "<span class=\"gp-mute\">(untagged)</span>" : esc(r.cohort)) +
-             "</td><td>" + cell(r.rtt_ms, Unit::kMs) + "</td><td>" + cell(r.retrans_pct, Unit::kPct) +
+             "</td><td>" + cohort_cell + "</td><td>" + cell(r.rtt_ms, Unit::kMs) +
+             "</td><td>" + cell(r.retrans_pct, Unit::kPct) +
              "</td><td>" + cell(r.throughput_bps, Unit::kBps) + "</td><td>" + flag_dev + "</td><td>" +
              flag_app + "</td><td>" +
              (r.fleet_pctile >= 0 ? std::to_string(r.fleet_pctile) + "th pctile"

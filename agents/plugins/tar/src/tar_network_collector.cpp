@@ -39,9 +39,13 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/sock_diag.h>
-#include <netinet/tcp.h> // struct tcp_info
+#include <netinet/tcp.h> // TCP_ESTABLISHED (NOT struct tcp_info — see linux_tcp_info.hpp)
 #include <sys/socket.h>
 #include <sys/time.h> // struct timeval (SO_RCVTIMEO)
+// ABI-pinned tcp_info prefix — glibc 2.39's <netinet/tcp.h> lacks tcpi_segs_out
+// and we can't add <linux/tcp.h> (it re-defines struct tcp_info, clashing with
+// the <netinet/tcp.h> above that we need for TCP_ESTABLISHED).
+#include "yuzu/agent/linux_tcp_info.hpp"
 #ifndef NETLINK_SOCK_DIAG
 #define NETLINK_SOCK_DIAG 4
 #endif
@@ -468,18 +472,18 @@ void nq_collect(int fd, uint8_t family,
             }
 
             // tcp_info attribute (defensive length check + memcpy into a local;
-            // RTA_DATA is only 4-byte aligned but tcp_info needs 8 — cast would
-            // be alignment + strict-aliasing UB, memcpy moots both).
+            // RTA_DATA is only 4-byte aligned but LinuxTcpInfo needs 8 — cast
+            // would be alignment + strict-aliasing UB, memcpy moots both).
             int rtalen = static_cast<int>(h->nlmsg_len) -
                          static_cast<int>(NLMSG_LENGTH(sizeof(*diag)));
             auto* attr = reinterpret_cast<struct rtattr*>(diag + 1);
-            struct tcp_info ti{};
+            yuzu::agent::LinuxTcpInfo ti{};
             bool have_info = false;
             for (; RTA_OK(attr, rtalen); attr = RTA_NEXT(attr, rtalen)) {
                 if (attr->rta_type != INET_DIAG_INFO)
                     continue;
                 if (RTA_PAYLOAD(attr) <
-                    offsetof(struct tcp_info, tcpi_segs_out) + sizeof(uint32_t))
+                    offsetof(yuzu::agent::LinuxTcpInfo, tcpi_segs_out) + sizeof(uint32_t))
                     continue;
                 std::memcpy(&ti, RTA_DATA(attr),
                             std::min<std::size_t>(RTA_PAYLOAD(attr), sizeof ti));

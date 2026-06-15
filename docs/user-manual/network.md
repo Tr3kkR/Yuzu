@@ -25,7 +25,7 @@ Four fleet-now cards, updated each heartbeat cycle:
 |---|---|
 | Round-trip time | Median smoothed RTT across active TCP connections (p50 / p90 / max) |
 | TCP retransmission | Median device **interval** retransmit rate — ΔΣretransmits / ΔΣsegments smoothed over the last few heartbeats (loss in the recent window, **not** a lifetime average) |
-| Throughput (device) | Median device rx+tx bytes/s, non-loopback interfaces |
+| Throughput (device) | Median device rx+tx bytes/s, summed across non-loopback interfaces |
 | Reporting | Devices whose latest heartbeat carried at least one network fact |
 
 Every aggregate carries its reporting population. **RTT carries its own
@@ -36,6 +36,15 @@ from the RTT numbers, never counted as 0 ms.
 > connections are open (loopback / LAN / internet blended together), so read it
 > as a rough indicator, not per-flow truth. Actionable per-destination /
 > per-app latency is a later (warehouse-tier) slice.
+
+> **Throughput is a coarse upper bound.** It sums the byte counters of every
+> non-loopback interface. On a host with stacked interfaces (a bridge plus its
+> `veth` pairs, a VPN `tun` over a physical NIC, container bridges) a packet is
+> counted on each layer it crosses, so the figure **over-counts** — treat it as
+> an upper bound on device traffic, not a wire-accurate rate. Yuzu deliberately
+> does not filter interfaces by name (that heuristic is fragile and would wrongly
+> drop a VPN tunnel the operator cares about). Accurate per-interface / per-route
+> throughput is a later warehouse-tier slice.
 
 ### Why this is device / local-link health, not localization
 
@@ -59,8 +68,11 @@ The **co-occurrence headline** — "of the network-degraded devices, how many al
 show device-perf pressure or app instability" — is gated on that classification,
 so it lands in the same later slice. Until then the page is honest evidence, not
 a verdict. The co-occurrence model (`NetCooccurrence`) and the
-`yuzu_fleet_net_degraded` gauge stay wired but unfed (the gauge reads 0 =
-"not classified", never "0 degraded = healthy").
+`yuzu_fleet_net_degraded` gauge stay wired but unfed: `recompute_metrics` clears
+the gauge each cycle and re-emits it **only** when at least one agent reports the
+`net_degraded` tag. Because no agent emits that fact today, the gauge is
+**absent** (never emitted), not `0`. Treat absent as "not classified" — never
+read a missing gauge as "0 degraded = healthy".
 
 ## Devices tab
 

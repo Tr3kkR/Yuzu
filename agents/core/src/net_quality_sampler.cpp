@@ -5,6 +5,8 @@
 
 #include "net_quality_sampler.hpp"
 
+#include "yuzu/agent/linux_tcp_info.hpp" // ABI-pinned tcp_info (glibc-version-proof)
+
 // Pure helpers (median / throughput_bps / RetransWindow) are header-inline.
 
 // ── Linux implementation ─────────────────────────────────────────────────────
@@ -15,7 +17,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/sock_diag.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h> // struct tcp_info
+#include <netinet/tcp.h> // TCP_ESTABLISHED (NOT struct tcp_info — see linux_tcp_info.hpp)
 #include <sys/socket.h>
 #include <sys/time.h> // struct timeval (SO_RCVTIMEO)
 #include <unistd.h>
@@ -87,8 +89,20 @@ bool send_dump(int fd, uint8_t family) {
     return ::sendmsg(fd, &m, 0) > 0;
 }
 
+// Cap on retained per-connection RTTs. The retrans/segs accumulators are scalar
+// sums (no cap needed); only the RTT vector grows per-connection. We keep doubles
+// for a single device-level median, so this can be far larger than TAR's
+// kNetQualTopN=50 (which bounds persisted warehouse rows). 4096 established
+// connections is already extraordinary, and the kernel returns them in arbitrary
+// (hash) order, so a 4096-sample median stays an unbiased device aggregate while
+// bounding memory at ~32 KiB on a pathological host.
+constexpr std::size_t kMaxRttSamples = 4096;
+
 // Accumulate per-connection RTT (ms) + retransmit/segment totals from one dump.
-void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& segs) {
+// `family` is the dump we issued (echoed back in nlmsg_seq) so leftover replies
+// from the previous family's dump are discarded, not double-counted.
+void collect(int fd, uint8_t family, std::vector<double>& rtts_ms, uint64_t& retrans,
+             uint64_t& segs) {
     // alignas: the in-place nlmsghdr/inet_diag_msg/rtattr casts below require
     // NLMSG_ALIGNTO (4-byte) alignment; a bare char[] is only 1-aligned (UBSan
     // -fsanitize=alignment). tcp_info (8-aligned) is read via memcpy, not cast.
@@ -116,6 +130,17 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
                 return;
             if (h->nlmsg_type != SOCK_DIAG_BY_FAMILY)
                 continue;
+            // Full mirror of tar_network_collector.cpp's nq_collect guard:
+            //  (1) nlmsg_seq != family — discard a reply left over from the
+            //      previous family's dump (a mid-dump SO_RCVTIMEO can leave
+            //      AF_INET replies queued when we send the AF_INET6 dump on the
+            //      same socket); counting it again would double-count a conn.
+            //  (2) nlmsg_len bound — NLMSG_OK guarantees the header fits, not the
+            //      inet_diag_msg body; a truncated message would tail-over-read
+            //      `diag` and make `rtalen` negative.
+            if (h->nlmsg_seq != family ||
+                h->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg)))
+                continue;
             auto* diag = reinterpret_cast<struct inet_diag_msg*>(NLMSG_DATA(h));
             int rtalen = static_cast<int>(h->nlmsg_len) -
                          static_cast<int>(NLMSG_LENGTH(sizeof(*diag)));
@@ -124,19 +149,19 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
                 if (attr->rta_type != INET_DIAG_INFO)
                     continue;
                 // Defensive: the kernel's tcp_info may be shorter/longer than
-                // our headers'; only read the fields we need if they're present.
-                if (RTA_PAYLOAD(attr) < offsetof(struct tcp_info, tcpi_segs_out) +
+                // our pinned prefix; only read the fields we need if present.
+                if (RTA_PAYLOAD(attr) < offsetof(LinuxTcpInfo, tcpi_segs_out) +
                                             sizeof(uint32_t))
                     continue;
                 // memcpy into a local, NOT a reinterpret_cast: RTA_DATA is only
-                // 4-byte aligned but tcp_info needs 8-byte alignment (it has
-                // __u64 members), and no real tcp_info object lives in `buf`.
+                // 4-byte aligned but LinuxTcpInfo needs 8-byte alignment (it has
+                // u64 members), and no real object of that type lives in `buf`.
                 // The cast would be alignment + strict-aliasing UB; memcpy moots
-                // both. Copy at most our struct size (kernel struct may be larger).
-                struct tcp_info ti{};
+                // both. Copy at most our struct size (kernel struct is larger).
+                LinuxTcpInfo ti{};
                 std::memcpy(&ti, RTA_DATA(attr),
                             std::min<std::size_t>(RTA_PAYLOAD(attr), sizeof ti));
-                if (ti.tcpi_rtt > 0)
+                if (ti.tcpi_rtt > 0 && rtts_ms.size() < kMaxRttSamples)
                     rtts_ms.push_back(ti.tcpi_rtt / 1000.0); // tcpi_rtt is microseconds
                 retrans += ti.tcpi_total_retrans;
                 segs += ti.tcpi_segs_out;
@@ -148,6 +173,16 @@ void collect(int fd, std::vector<double>& rtts_ms, uint64_t& retrans, uint64_t& 
 } // namespace
 
 NetCounters read_net_counters() {
+    // v1 throughput is a deliberately COARSE device aggregate: the sum of every
+    // non-loopback interface's byte counters. On a host with stacked interfaces
+    // (a bridge + its veth pairs, a VPN tun over a physical NIC, container
+    // bridges) the same packet is counted on each layer it traverses, so this
+    // over-counts — it is an upper bound on device traffic, not a wire-accurate
+    // figure. We do NOT filter virtual interfaces by name: that heuristic is
+    // fragile (naming varies across distros/orchestrators) and would wrongly drop
+    // a VPN tun the operator cares about. Accurate per-interface / per-route
+    // attribution is a later warehouse slice; the thin heartbeat fact stays an
+    // honest coarse aggregate (see docs/user-manual/network.md "Throughput").
     NetCounters c;
     std::FILE* raw = std::fopen("/proc/net/dev", "re");
     if (!raw)
@@ -203,7 +238,7 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
         uint64_t retrans = 0, segs = 0;
         for (uint8_t fam : {AF_INET, AF_INET6})
             if (send_dump(raw, fam))
-                collect(raw, rtts, retrans, segs);
+                collect(raw, fam, rtts, retrans, segs);
         if (auto p50 = median(std::move(rtts))) {
             s.rtt_valid = true;
             s.rtt_p50_ms = *p50;
