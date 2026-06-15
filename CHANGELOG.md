@@ -221,6 +221,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
 - **macOS agents are no longer counted as Windows in DEX denominators.** The
   OS check used a substring match, and "darwin" contains "win" — so on mixed
   fleets every macOS agent inflated the Windows-online denominator behind the
