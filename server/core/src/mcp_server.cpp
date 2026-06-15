@@ -315,6 +315,32 @@ static const ToolDef kTools[] = {
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j"},
 
+    // ── N1: network quality read tools — parity with /api/v1/network/* ──
+    {"get_network_fleet",
+     "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
+     "(ms), the interval TCP retransmit rate (%), and device throughput (bps) — current heartbeat "
+     "cycle, the same numbers as the yuzu_fleet_net_* Prometheus gauges and the /network Overview "
+     "cards. A null metric means no device reported it (absent, never zero); rtt_reporting is the "
+     "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
+     "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
+     "/api/v1/network/fleet. Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
+
+    {"list_network_devices",
+     "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
+     "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
+     "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
+     "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
+     "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
+     R"j("cooc":{"type":"string","enum":["device","app","network_only","degraded"],"description":"co-occurrence band over net-degraded devices"},)j"
+     R"j("key":{"type":"string","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
+     R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of key (empty string = untagged residual)"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500})j"
+     R"j(}})j"},
+
     // Phase 2 write tool
     {"execute_instruction",
      "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
@@ -403,6 +429,8 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
+    {"get_network_fleet", {"GuaranteedState", "Read"}},
+    {"list_network_devices", {"GuaranteedState", "Read"}},
     // Implemented write tools
     {"set_tag", {"Tag", "Write"}},
     {"delete_tag", {"Tag", "Delete"}},
@@ -475,7 +503,7 @@ McpServer::HandlerFn McpServer::build_handler(
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn) {
+    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -2014,6 +2042,119 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── N1: network quality tools (parity with /api/v1/network/*) ──
+            // Same NetPerfFn provider the REST endpoints and /network fragments
+            // use — two surfaces, one read model. Cohort handling mirrors the
+            // FRAGMENT (empty `key` default, light length guard), NOT the DEX
+            // tools' "model"/validate_key. Aggregate + device link-health
+            // telemetry: only the generic mcp.<tool> audit.
+            if (tool_name == "get_network_fleet" || tool_name == "list_network_devices") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!net_perf_fn) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Network perf provider unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto stat_json = [](const std::optional<NetPerfStat>& s) -> std::string {
+                    if (!s)
+                        return "null"; // absent-not-zero
+                    return JObj()
+                        .add("avg", s->avg)
+                        .add("p50", s->p50)
+                        .add("p90", s->p90)
+                        .add("max", s->max)
+                        .add("n", s->n)
+                        .str();
+                };
+                std::string payload;
+                if (tool_name == "get_network_fleet") {
+                    const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
+                    payload = JObj()
+                                  .raw("rtt_ms", stat_json(now.rtt))
+                                  .raw("retrans_pct", stat_json(now.retrans))
+                                  .raw("throughput_bps", stat_json(now.throughput))
+                                  .add("reporting", now.reporting)
+                                  .add("rtt_reporting", now.rtt_reporting)
+                                  .add("online", now.online)
+                                  .raw("cooccurrence",
+                                       JObj()
+                                           .add("degraded", now.cooc.degraded)
+                                           .add("also_device", now.cooc.also_device)
+                                           .add("also_app", now.cooc.also_app)
+                                           .add("network_only", now.cooc.network_only)
+                                           .str())
+                                  .str();
+                } else { // list_network_devices
+                    const auto metric =
+                        net_perf_metric_from_token(param_str(args, "metric", "rtt"));
+                    const bool not_reporting = param_str(args, "filter") == "not_reporting";
+                    NetCoocFilter cooc = NetCoocFilter::kNone;
+                    const auto cooc_tok = param_str(args, "cooc");
+                    if (cooc_tok == "device")
+                        cooc = NetCoocFilter::kAlsoDevice;
+                    else if (cooc_tok == "app")
+                        cooc = NetCoocFilter::kAlsoApp;
+                    else if (cooc_tok == "network_only")
+                        cooc = NetCoocFilter::kNetworkOnly;
+                    else if (cooc_tok == "degraded")
+                        cooc = NetCoocFilter::kDegradedAll;
+                    // Cohort handling mirrors the FRAGMENT: empty `key` default,
+                    // light length guard (no validate_key — empty IS valid here).
+                    std::string cohort_key = param_str(args, "key");
+                    if (cohort_key.size() > 64)
+                        cohort_key.clear();
+                    std::optional<std::string> cohort_filter;
+                    if (args.contains("cohort_value") && args["cohort_value"].is_string())
+                        cohort_filter = args["cohort_value"].get<std::string>();
+                    // Parity with the REST sibling: invalid on limit <= 0.
+                    const int raw_limit = param_int32(args, "limit", 50);
+                    if (raw_limit <= 0) {
+                        res.set_content(error_response(id, kInvalidParams, "invalid limit"),
+                                        "application/json");
+                        return;
+                    }
+                    const int limit = (std::min)(raw_limit, 500);
+                    JArr arr;
+                    for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
+                                                              not_reporting, cooc, cohort_filter,
+                                                              limit)) {
+                        JObj o;
+                        o.add("agent_id", r.agent_id)
+                            .add("platform", r.platform)
+                            .add("cohort", r.cohort);
+                        if (r.rtt_ms)
+                            o.add("rtt_ms", *r.rtt_ms);
+                        if (r.retrans_pct)
+                            o.add("retrans_pct", *r.retrans_pct);
+                        if (r.throughput_bps)
+                            o.add("throughput_bps", *r.throughput_bps);
+                        o.add("net_degraded", r.net_degraded)
+                            .add("under_pressure", r.under_pressure)
+                            .add("app_unstable", r.app_unstable);
+                        if (r.fleet_pctile >= 0)
+                            o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                        arr.add(o);
+                    }
+                    payload = arr.str();
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── execute_instruction ───────────────────────────────────────
             // Tier check handled by generic C8 block above (kToolSecurity).
             if (tool_name == "execute_instruction") {
@@ -2381,7 +2522,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn) {
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -2389,7 +2530,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
                            mcp_disabled, std::move(dispatch_fn), ca_store,
                            std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn)));
+                           std::move(dex_perf_fn), std::move(net_perf_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

@@ -563,6 +563,11 @@ struct McpTestServer {
     /// be exercised. Default empty keeps existing tests on the unavailable path.
     yuzu::server::DexPerfFn dex_perf_fn_for_test{};
 
+    /// N1: optionally wire a network-quality snapshot provider so the network
+    /// tools (get_network_fleet / list_network_devices) can be exercised.
+    /// Default empty keeps existing tests on the unavailable path.
+    yuzu::server::NetPerfFn net_perf_fn_for_test{};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
@@ -669,7 +674,8 @@ private:
                 return std::vector<std::uint8_t>{0x30, 0x03, 0x01, 0x02}; // fake DER
             },
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
-            /*dex_perf_fn=*/dex_perf_fn_for_test);
+            /*dex_perf_fn=*/dex_perf_fn_for_test,
+            /*net_perf_fn=*/net_perf_fn_for_test);
     }
 };
 
@@ -1102,6 +1108,64 @@ TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
     ts.start("readonly");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":56,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)",
+          "[mcp][integration][network]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        auto mk = [](const std::string& id, double rtt, const std::string& cohort) {
+            yuzu::server::NetPerfDevice d;
+            d.agent_id = id;
+            d.platform = "linux";
+            d.rtt_ms = rtt;
+            d.cohort = cohort;
+            return d;
+        };
+        snap.devices.push_back(mk("hi-0", 500.0, "site-a")); // worst
+        snap.devices.push_back(mk("hi-1", 499.0, "site-a"));
+        snap.devices.push_back(mk("lo-0", 20.0, "site-b"));
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":60,"params":{"name":"get_network_fleet","arguments":{}}})")
+            ->body);
+    CHECK(fleet["rtt_ms"]["n"] == 3);
+    CHECK(fleet["reporting"] == 3);
+    CHECK(fleet["online"] == 3);
+    REQUIRE(fleet.contains("cooccurrence"));
+    CHECK(fleet["cooccurrence"]["degraded"] == 0);
+
+    auto devices = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":61,"params":{"name":"list_network_devices","arguments":{"metric":"rtt","limit":2}}})")
+            ->body);
+    REQUIRE(devices.size() == 2);
+    CHECK(devices[0]["agent_id"] == "hi-0"); // worst (highest RTT) first
+    CHECK(devices[0]["platform"] == "linux");
+
+    // REST parity: the sibling 400s on limit<=0 — MCP must not clamp to 1.
+    auto bad = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"list_network_devices","arguments":{"limit":0}}})")
+            ->body);
+    REQUIRE(bad.contains("error"));
+    CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP network: tools report unavailable when no provider is wired",
+          "[mcp][integration][network]") {
+    McpTestServer ts; // net_perf_fn_for_test stays empty
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":63,"params":{"name":"get_network_fleet","arguments":{}}})");
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);

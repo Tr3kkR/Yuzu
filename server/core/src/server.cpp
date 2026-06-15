@@ -8467,7 +8467,11 @@ private:
             // F2a: the shared fleet perf snapshot provider — the same closure
             // the /dex Performance fragments and the MCP perf tools use, so
             // REST, dashboard and MCP can never disagree.
-            dex_perf_fn);
+            dex_perf_fn,
+            // N1: the shared network-quality snapshot provider — the same closure
+            // the /network fragments use, so the /api/v1/network/* siblings and
+            // MCP tools can never disagree with the dashboard.
+            net_perf_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -8580,7 +8584,9 @@ private:
                 guaranteed_state_store_.get(),
                 // F2a: the shared fleet perf snapshot provider (one closure,
                 // three surfaces — fragments, REST, MCP).
-                dex_perf_fn);
+                dex_perf_fn,
+                // N1: the shared network-quality provider (fragments + REST + MCP).
+                net_perf_fn);
         }
 
         // -- Listen -----------------------------------------------------------

@@ -3472,6 +3472,27 @@ The one device list behind every Performance drill: worst devices by a metric (d
 
 ---
 
+### Network
+
+The machine-readable siblings of the `/network` dashboard fragments (A1 — fleet link health must be answerable without scraping HTML). Same render-time aggregation over heartbeat network facts, same `GuaranteedState:Read` gate. **The edge ships facts, never a verdict:** these report measured RTT / retransmit / throughput and *measured co-occurrence* counts, never a causal "it's the network" attribution.
+
+#### `GET /api/v1/network/fleet`
+
+Fleet network-quality now-stats — the same numbers as the `yuzu_fleet_net_*` Prometheus gauges and the `/network` Overview cards, computed at request time.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** an object `{rtt_ms, retrans_pct, throughput_bps, reporting, rtt_reporting, online, cooccurrence}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `rtt_reporting` is the **honest RTT denominator** (smoothed RTT is Linux-only today, so it is smaller than `reporting`); `online` is the total snapshot population. `cooccurrence` is `{degraded, also_device, also_app, network_only}` — counts of net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause; dormant until the degraded classification lands). Not audited.
+
+#### `GET /api/v1/network/devices`
+
+The one device list behind every network-quality drill: worst devices by a metric (default), the not-reporting complement, a co-occurrence band, or one cohort's members.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `metric` (`rtt` / `retrans` / `throughput`, default `rtt`); `filter=not_reporting` (devices with no network sample this cycle); `cooc` (`device` / `app` / `network_only` / `degraded` — a co-occurrence band over net-degraded devices); `key` (cohort tag key — resolves the per-device cohort value; does not filter by itself); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?}`, worst-first by the sort metric (`under_pressure` / `app_unstable` are the co-occurring facts shown inline for correlation, never a verdict; `fleet_pctile` is the device's nearest-rank position, omitted when it did not report the metric). `400` on an invalid `limit`. Device-aggregate link health (device state, not behavioral data) — not audited.
+
+---
+
 ### Patch Management
 
 **`GET /api/patches`** — Query missing/installed patches.

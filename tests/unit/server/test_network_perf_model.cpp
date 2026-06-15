@@ -14,9 +14,13 @@
 #include "network_perf_model.hpp"
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
+#include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/server/auth.hpp>
+
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <optional>
 #include <string>
@@ -353,4 +357,134 @@ TEST_CASE("device_list: kAlsoApp band filters to app-co-occurring degraded", "[n
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].agent_id == "appdev");
     CHECK(rows[0].app_unstable);
+}
+
+// ── REST surface (/api/v1/network/*) ─────────────────────────────────────────
+
+namespace {
+
+/// Registers RestApiV1 with every dep nulled except the network-perf provider —
+/// the /network endpoints depend on nothing else. net_perf_fn is the LAST
+/// register_routes param (just after dex_perf_fn), so dex is passed {} here.
+struct RestNetHarness {
+    yuzu::server::test::TestRouteSink sink;
+    RestApiV1 api;
+    bool grant_perms{true};
+
+    explicit RestNetHarness(NetPerfFn perf) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            return auth::Session{};
+        };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            if (grant_perms)
+                return true;
+            res.status = 403;
+            return false;
+        };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) -> bool {
+            return true;
+        };
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
+                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
+                            nullptr, nullptr, {}, {}, {}, {}, std::move(perf));
+    }
+};
+
+/// Two cohorts, distinct descending RTT so worst-first is deterministic.
+NetPerfSnapshot net_two(int n_lo, int n_hi) {
+    NetPerfSnapshot snap;
+    for (int i = 0; i < n_lo; ++i)
+        snap.devices.push_back(
+            dev("lo-" + std::to_string(i), 20.0 + i, 0.5, 5.0e6, false, "linux", "site-a"));
+    for (int i = 0; i < n_hi; ++i)
+        snap.devices.push_back(
+            dev("hi-" + std::to_string(i), 500.0 - i, 8.0, 1.0e5, false, "linux", "site-b"));
+    return snap;
+}
+
+} // namespace
+
+TEST_CASE("REST /network/fleet: stats + denominators + co-occurrence, absent is null",
+          "[network][rest]") {
+    NetPerfFn perf = [](const std::string&) {
+        NetPerfSnapshot snap;
+        snap.devices.push_back(dev("w1", 10.0, std::nullopt, std::nullopt));
+        snap.devices.push_back(dev("w2", 30.0, std::nullopt, std::nullopt));
+        snap.devices.push_back(dev("w3", std::nullopt, std::nullopt, std::nullopt));
+        return snap;
+    };
+    RestNetHarness h(perf);
+    auto res = h.sink.Get("/api/v1/network/fleet");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["rtt_ms"]["n"] == 2);
+    CHECK(j["data"]["rtt_ms"]["avg"] == 20.0);
+    CHECK(j["data"]["rtt_ms"]["max"] == 30.0);
+    CHECK(j["data"]["retrans_pct"].is_null()); // nobody reported — null, never 0
+    CHECK(j["data"]["reporting"] == 2);
+    CHECK(j["data"]["rtt_reporting"] == 2); // the honest RTT denominator
+    CHECK(j["data"]["online"] == 3);
+    REQUIRE(j["data"].contains("cooccurrence"));
+    CHECK(j["data"]["cooccurrence"]["degraded"] == 0);
+}
+
+TEST_CASE("REST /network/devices: sort, filters, validation", "[network][rest]") {
+    RestNetHarness h([](const std::string&) { return net_two(3, 3); });
+
+    auto res = h.sink.Get("/api/v1/network/devices?metric=rtt&limit=2");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].size() == 2);
+    CHECK(j["data"][0]["agent_id"] == "hi-0"); // worst (highest RTT) first
+    CHECK(j["data"][0]["platform"] == "linux");
+
+    SECTION("cohort key resolves the cohort column but does NOT filter") {
+        auto all = h.sink.Get("/api/v1/network/devices?key=site");
+        REQUIRE(all);
+        auto ja = nlohmann::json::parse(all->body);
+        CHECK(ja["data"].size() == 6); // both cohorts present — no implicit filter
+    }
+    SECTION("empty cohort_value present = the untagged residual filter") {
+        auto none = h.sink.Get("/api/v1/network/devices?key=site&cohort_value=");
+        REQUIRE(none);
+        auto jn = nlohmann::json::parse(none->body);
+        CHECK(jn["data"].empty()); // net_two has no untagged devices
+    }
+    SECTION("invalid limit → 400") {
+        auto bad = h.sink.Get("/api/v1/network/devices?limit=0");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+    }
+    SECTION("perm denied → 403") {
+        h.grant_perms = false;
+        auto denied = h.sink.Get("/api/v1/network/fleet");
+        REQUIRE(denied);
+        CHECK(denied->status == 403);
+    }
+}
+
+TEST_CASE("REST /network/*: no provider wired → 503", "[network][rest]") {
+    RestNetHarness h({});
+    for (const char* path : {"/api/v1/network/fleet", "/api/v1/network/devices"}) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+}
+
+TEST_CASE("OpenAPI spec lists the network endpoints (A2 discovery), stays valid JSON",
+          "[network][rest][discovery][a2]") {
+    RestNetHarness h({});
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE_NOTHROW(nlohmann::json::parse(res->body)); // whole doc stays valid JSON
+    CHECK(res->body.find(R"("/network/fleet":)") != std::string::npos);
+    CHECK(res->body.find(R"("/network/devices":)") != std::string::npos);
 }
