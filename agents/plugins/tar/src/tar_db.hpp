@@ -112,6 +112,45 @@ struct ProcPerfRow {
     int64_t ws_bytes{0};
 };
 
+/// One netqual_live row — per-connection TCP quality sample for the /network
+/// warehouse tier (BRD Workstream E). Linux-first via netlink INET_DIAG
+/// TCP_INFO, joined to the connection's owning process. One row per
+/// (tick, connection); co-sampled with the `tcp` source so it shares the
+/// snapshot_id and joins to process/perf on `ts`.
+///
+/// SIGNAL DISCIPLINE — `lost` is the CURRENT-loss gauge (tcpi_lost: segments
+/// lost and not yet recovered AT SAMPLE TIME) and is the only field that moves
+/// with current network conditions, so it is the degraded driver. `retrans`
+/// and `segs_out` are LIFETIME-CUMULATIVE context only: a fresh loss burst
+/// barely moves their ratio (diluted by all the historical clean segments),
+/// which is exactly why the earlier device-aggregate retransmit signal was
+/// empirically disproven — do NOT rebuild a "current loss" signal from their
+/// ratio. Per-tick degraded = fraction of a device's rows with current loss,
+/// computed server-side as a query (a later slice), never a heartbeat boolean.
+///
+/// PRIVACY — only `remote_bucket` (a coarse destination CLASS: loopback /
+/// private / public / unknown — see remote_bucket() in tar_netqual.hpp) leaves
+/// the connection's destination on the row; the raw remote address / hostname is
+/// NOT stored in this tier. Collection is gated by its own opt-in toggle and a
+/// per-tick top-N cap (collector slice).
+struct NetQualRow {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string proto;         // tcp, tcp6
+    std::string remote_bucket; // destination class: loopback/private/public/unknown (never a raw IP)
+    std::string process_name;  // owning process image name only
+    int64_t rtt_us{0};         // smoothed RTT (tcpi_rtt), microseconds
+    int64_t rtt_var_us{0};     // RTT variance / jitter (tcpi_rttvar), microseconds
+    int64_t lost{0};           // CURRENT lost segments (tcpi_lost) — instantaneous degraded driver
+    int64_t retrans{0};        // lifetime retransmits (tcpi_total_retrans) — context only
+    int64_t segs_out{0};       // lifetime segments out (tcpi_segs_out) — context / denominator
+    int64_t ca_state{0};       // tcpi_ca_state: 0=Open 1=Disorder 2=CWR 3=Recovery 4=Loss — a
+                               // "struggling right now" gauge that HOLDS across a whole recovery
+                               // episode (unlike tcpi_lost, which is gone within an RTT), so it
+                               // survives a coarse poll cadence better. Captured to compare
+                               // degraded-signal candidates before committing 4b.3's query.
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -192,6 +231,7 @@ public:
     bool insert_user_events(const std::vector<UserEvent>& events);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
+    bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
 
     /**
      * Return one row per unique (proto, local_addr, local_port, remote_addr,

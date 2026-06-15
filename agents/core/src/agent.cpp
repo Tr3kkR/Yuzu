@@ -38,6 +38,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
+#include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -1463,6 +1464,16 @@ public:
 #elif defined(__linux__)
                         lnx::CpuJiffies hb_prev_cpu_lnx; // A4 Linux heartbeat CPU% delta baseline
 #endif
+                        // Slice 4a: previous interface byte counters for the
+                        // heartbeat network throughput delta (same re-baseline
+                        // semantics as hb_prev_perf).
+                        netq::NetCounters hb_prev_net;
+                        // 4b.3: rolling window of raw cumulative Σretrans/Σsegs
+                        // readings — the device retransmit RATE is the interval
+                        // delta over this window, not a single sample's absolute
+                        // ratio. Lambda-local so a reconnect re-baselines (a new
+                        // session ships no rate until it has ≥2 readings again).
+                        netq::RetransWindow hb_net_retrans_window;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -1601,6 +1612,48 @@ public:
                                     // omit perf tags this heartbeat
                                 }
 #endif
+                            }
+
+                            // Slice 4a: device network-quality facts (Linux
+                            // netlink TCP_INFO + /proc/net/dev throughput) — the
+                            // ONLY channel for the fleet net gauges + /network
+                            // Overview, same as the perf tags above. Gated like
+                            // perf; this is aggregate device telemetry with NO
+                            // per-destination data (that warehouse tier + its
+                            // own opt-in are a later slice). Off Linux the sample
+                            // is all-invalid, so no tags ship (absent, not zero).
+                            if (!cfg_.dex_disable) {
+                                const auto net_cur = netq::read_net_counters();
+                                const auto ns =
+                                    netq::sample_net_quality(hb_prev_net, net_cur);
+                                hb_prev_net = net_cur;
+                                // TAG-KEY PIN: these literals MUST match
+                                // network_perf_rules.hpp kNetTag* (the server
+                                // parses by those constants) — a drift = silent
+                                // zero-reporting; pinned by static_assert in
+                                // tests/unit/server/test_network_perf_model.cpp.
+                                if (ns.rtt_valid)
+                                    tags["yuzu.net_rtt_p50_ms"] =
+                                        std::format("{:.1f}", ns.rtt_p50_ms);
+                                // Interval retransmit RATE (ΔΣretr/ΔΣsegs over a
+                                // short window), NOT the absolute lifetime ratio
+                                // (which is diluted to noise). Push this cycle's
+                                // raw device sums, then ship the windowed delta
+                                // once there are ≥2 readings (absent on the first
+                                // of a session — never a fabricated 0).
+                                // MEASUREMENT-FIRST: no `net_degraded` verdict —
+                                // a hard threshold needs real-fleet baseline
+                                // calibration (a later slice), so it is retired
+                                // here rather than shipped loopback-calibrated.
+                                if (ns.retrans_valid)
+                                    hb_net_retrans_window.push(ns.retrans_total,
+                                                               ns.segs_out_total);
+                                if (auto rp = hb_net_retrans_window.rate_pct())
+                                    tags["yuzu.net_retrans_pct"] =
+                                        std::format("{:.2f}", *rp);
+                                if (ns.throughput_valid)
+                                    tags["yuzu.net_throughput_bps"] =
+                                        std::format("{:.0f}", ns.throughput_bps);
                             }
 
                             // PR 10: attach pushed fleet snapshot if the

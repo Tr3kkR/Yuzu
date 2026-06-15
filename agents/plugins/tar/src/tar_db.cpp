@@ -921,6 +921,65 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
     return true;
 }
 
+bool TarDatabase::insert_netqual_samples(const std::vector<NetQualRow>& rows) {
+    std::lock_guard lock(mu_);
+    if (!db_ || rows.empty())
+        return rows.empty();
+
+    // <= top-N connections per tick (collector cap) — one transaction per tick.
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_netqual_samples BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO netqual_live
+            (ts, snapshot_id, proto, remote_bucket, process_name,
+             rtt_us, rtt_var_us, lost, retrans, segs_out, ca_state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_netqual_samples prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& r : rows) {
+        sqlite3_bind_int64(stmt.get(), 1, r.ts);
+        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, r.proto.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, r.remote_bucket.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 5, r.process_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 6, r.rtt_us);
+        sqlite3_bind_int64(stmt.get(), 7, r.rtt_var_us);
+        sqlite3_bind_int64(stmt.get(), 8, r.lost);
+        sqlite3_bind_int64(stmt.get(), 9, r.retrans);
+        sqlite3_bind_int64(stmt.get(), 10, r.segs_out);
+        sqlite3_bind_int64(stmt.get(), 11, r.ca_state);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_netqual_samples step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_netqual_samples COMMIT: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    sqlite3_free(err_msg);
+    return true;
+}
+
 // ── Generic SQL execution ───────────────────────────────────────────────────
 
 std::expected<QueryResult, std::string> TarDatabase::execute_query(const std::string& sql,
