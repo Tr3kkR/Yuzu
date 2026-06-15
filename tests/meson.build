@@ -120,6 +120,7 @@ agent_test_exe = executable(
     'unit/test_dex_win_poll.cpp',
     'unit/test_dex_perf_breach.cpp',
     'unit/test_net_quality_sampler.cpp',
+    'unit/test_dex_linux_proc.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
