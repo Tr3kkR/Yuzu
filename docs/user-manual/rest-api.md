@@ -1505,10 +1505,65 @@ Query audit events.
 }
 ```
 
+#### `GET /api/v1/audit/auth-sample`
+
+Pseudo-random **sample** of authentication-surface audit events over an optional
+time window — for SOC 2 **CC7.2** sampled-evidence export (auditor pulls a
+representative sample of auth activity rather than the full log). Scoped to the
+`auth.`, `mfa.`, and `session.` action prefixes (logins, MFA, session
+revocation, lockout, admin-gate denials, etc.). Rows are returned in random
+order so a bounded `limit` is a sample across the window, not just the latest N.
+
+> **Sampling caveat (read before using as formal evidence).** The sample is
+> drawn from at most the **10000 most-recent** matching events in the window.
+> When the window holds more than that, the sample is **recency-biased** — it is
+> a uniform sample of the newest 10000 events, *not* of the full window. The
+> response `sampling` object reports this: `candidates_considered` (pool size the
+> sample was drawn from), `scan_cap` (10000), and `recency_capped` (`true` when
+> the pool hit the cap). For a uniform sample of a high-volume period, narrow the
+> `from`/`to` window so it holds ≤ 10000 events. Samples are also
+> **non-reproducible** (no seed) — re-running yields a different draw; the audited
+> `audit.auth_sample.exported` row is the chain-of-custody record of what was pulled.
+
+**Permission:** `AuditLog:Read` — note this is deliberately *not* admin-only, so
+a dedicated read-only auditor role can pull evidence without full admin
+(separation of duties).
+
+The export is itself audited as `audit.auth_sample.exported` (who pulled which
+window, and how many rows) so evidence access stays on the audit chain.
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded) |
+| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded) |
+| `limit` | integer | No | Sample size (default 100, max 1000) |
+
+```bash
+curl -s -G \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "from=1717200000" \
+  --data-urlencode "to=1719792000" \
+  --data-urlencode "limit=50" \
+  "https://yuzu.example.com/api/v1/audit/auth-sample" | jq .
+```
+
+**Responses:** `200` sampled list — **same envelope and event field set as
+`GET /api/v1/audit`** (`timestamp`, `principal`, `action`, `result`,
+`target_type`, `target_id`, `detail`); the sample deliberately does **not**
+widen what `AuditLog:Read` discloses (no `session_id` / `source_ip`). The
+envelope additionally carries a `sampling` object (`candidates_considered`,
+`scan_cap`, `recency_capped`). `400` if `from`/`to` are not non-negative
+digits, `from > to`, or `limit` is non-integer; `503` if the audit store is
+unavailable. If the export's own audit row fails to persist, the response
+carries a `Sec-Audit-Failed: true` header (the export still returns).
+
 **Audit action names:**
 
 | Action | Description |
 |---|---|
+| `audit.auth_sample.exported` | Auth evidence sample pulled via `GET /api/v1/audit/auth-sample`. `target_type=AuditLog`, `target_id=auth-sample`; `detail` carries `from=<epoch-or-0> to=<epoch-or-0> limit=<N> returned=<N>`. `result=success`. |
 | `management_group.create` | Group created |
 | `management_group.update` | Group updated (rename, re-parent, membership type change) |
 | `management_group.delete` | Group deleted |

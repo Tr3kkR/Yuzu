@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sampled authentication-log evidence export (SOC 2 CC7.2).** New
+  `GET /api/v1/audit/auth-sample?from=&to=&limit=` returns a pseudo-random
+  sample of authentication-surface audit events (action prefixes `auth.`,
+  `mfa.`, `session.`) over an optional epoch-seconds window — a representative
+  sample for auditor evidence rather than the latest-N. Gated on `AuditLog:Read`
+  (not admin-only, so a read-only auditor role can pull evidence without full
+  admin — separation of duties), and the export is itself audited as
+  `audit.auth_sample.exported`. Backed by two new `AuditQuery` knobs
+  (`action_prefixes` OR-group filter + `random_sample` ordering); discoverable
+  in the OpenAPI spec (A2). Closes the P0 auth gap "sampled auth-log evidence
+  export".
 - **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
   `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
   ETW session instead of the 60 s snapshot-diff poll, so short-lived processes

@@ -199,6 +199,7 @@ if build_server
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
       'unit/server/test_audit_store.cpp',
+      'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
