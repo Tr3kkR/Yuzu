@@ -3,7 +3,10 @@
 #include <nlohmann/json.hpp>
 
 #include <charconv>
+#include <cstdio>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace yuzu::agent::lnx {
 
@@ -136,6 +139,73 @@ JournalLine parse_journal_line(std::string_view line) {
     }
 
     return out;
+}
+
+bool read_pipe_line(std::FILE* f, std::string& out) {
+    out.clear();
+    char buf[16384];
+    while (std::fgets(buf, sizeof(buf), f)) {
+        out += buf;
+        if (!out.empty() && out.back() == '\n') {
+            out.pop_back();
+            if (!out.empty() && out.back() == '\r')
+                out.pop_back();
+            return true;
+        }
+    }
+    return !out.empty(); // a final line with no trailing newline
+}
+
+std::string journald_baseline_query() {
+    // `timeout` (coreutils) bounds a wedged journalctl so the baseline read cannot
+    // hang the poll thread; on a host without `timeout` the shell reports not-found
+    // and the source simply no-ops this tick (cursor stays empty, retried next poll).
+    return "timeout 30 journalctl -o json -n 1 --no-pager 2>/dev/null";
+}
+
+std::optional<std::string> build_journald_after_cursor_query(std::string_view cursor) {
+    if (cursor.find('\'') != std::string_view::npos)
+        return std::nullopt; // a real __CURSOR never contains a quote → signal re-baseline
+    std::string cmd;
+    cmd.reserve(256);
+    cmd += "timeout 30 journalctl --after-cursor='";
+    cmd.append(cursor); // the ONLY external input, confined to this single-quoted slot
+    cmd += "' -o json --no-pager MESSAGE_ID=";
+    cmd.append(kMsgIdCoredump);
+    cmd += " MESSAGE_ID=";
+    cmd.append(kMsgIdUnitFailed);
+    cmd += " MESSAGE_ID=";
+    cmd.append(kMsgIdUnitResult);
+    cmd += " + _TRANSPORT=kernel 2>/dev/null";
+    return cmd;
+}
+
+std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor) {
+    std::vector<SignalObservation> out;
+    std::string newest = cursor;
+    std::string line;
+    while (read_pipe_line(pipe, line)) {
+        JournalLine jl = parse_journal_line(line);
+        if (!jl.cursor.empty())
+            newest = std::move(jl.cursor); // chronological → last non-empty wins
+        if (jl.obs)
+            out.push_back(std::move(*jl.obs));
+    }
+    cursor = std::move(newest);
+    return out;
+}
+
+bool JournalDebounce::should_emit(const std::string& obs_type, const std::string& subject,
+                                  std::int64_t now_mono) {
+    const std::string key = obs_type + "|" + subject;
+    if (const auto it = seen_.find(key); it != seen_.end() && now_mono - it->second < window_)
+        return false; // within the debounce window — collapse
+    seen_[key] = now_mono;
+    return true;
+}
+
+void JournalDebounce::evict_stale(std::int64_t now_mono) {
+    std::erase_if(seen_, [&](const auto& kv) { return now_mono - kv.second >= window_; });
 }
 
 } // namespace yuzu::agent::lnx

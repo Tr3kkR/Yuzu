@@ -95,23 +95,6 @@ using PipeHandle = std::unique_ptr<std::FILE, PcloseDeleter>;
 
 PipeHandle open_pipe(const std::string& cmd) { return PipeHandle(::popen(cmd.c_str(), "r")); }
 
-// Read one newline-terminated line from a pipe into `out` (newline stripped);
-// false at EOF. Accumulates across fgets chunks so a long JSON line is not split.
-bool read_pipe_line(std::FILE* f, std::string& out) {
-    out.clear();
-    char buf[16384];
-    while (std::fgets(buf, sizeof(buf), f)) {
-        out += buf;
-        if (!out.empty() && out.back() == '\n') {
-            out.pop_back();
-            if (!out.empty() && out.back() == '\r')
-                out.pop_back();
-            return true;
-        }
-    }
-    return !out.empty(); // a final line with no trailing newline
-}
-
 /// The Linux DEX observer: a single owned poll thread (the WinStatePoller
 /// lifetime — stop() joins it, the sink is set before the thread starts and
 /// cleared after the join, so no callback can outlive the object). All signals
@@ -312,69 +295,41 @@ private:
     // baselines) and the source quietly no-ops. The cursor advances only after a clean
     // read, so a throw mid-loop re-polls the same window next tick.
     void poll_journald() {
-        // Evict debounce entries older than the window FIRST, every cycle: a stamp past
-        // the window can no longer suppress anything, so it is pure bloat. This is the
-        // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_ —
-        // journal events are transient (no live set to diff against), so the bound is
-        // time, not a current-set intersection. Keeps journal_dedup_ sized by the
-        // trailing-window event count, NOT daemon uptime (sre/consistency Gate-4/6).
-        const std::int64_t mono = steady_now();
-        std::erase_if(journal_dedup_,
-                      [&](const auto& kv) { return mono - kv.second >= kJournaldDebounceSeconds; });
+        // Evict debounce entries older than the window FIRST, every cycle (the
+        // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_):
+        // a stamp past the window can no longer suppress, so it is pure bloat. One
+        // MONOTONIC reading drives both eviction and the debounce — the window is a
+        // timer, immune to wall-clock steps. (The EMITTED observation's timestamp_unix,
+        // in emit(), stays wall-clock — that one is a real time, not a timer.)
+        const std::int64_t now = steady_now();
+        journal_debounce_.evict_stale(now);
+
         if (journal_cursor_.empty()) {
-            if (const PipeHandle p = open_pipe("journalctl -o json -n 1 --no-pager 2>/dev/null")) {
-                std::string line;
-                while (read_pipe_line(p.get(), line))
-                    if (auto c = lnx::parse_journal_line(line).cursor; !c.empty())
-                        journal_cursor_ = std::move(c);
-            }
-            return; // baselined (or journal unreadable) — emit nothing this tick
-        }
-        if (journal_cursor_.find('\'') != std::string::npos) {
-            journal_cursor_.clear(); // defensive: a cursor never contains a quote — re-baseline
+            // First poll: seed the cursor at the journal tail and emit NOTHING (no
+            // history replay). drain advances journal_cursor_; its observations are
+            // deliberately DISCARDED so a crash/OOM that happens to be the tail entry
+            // is not re-reported as a fresh event at arm.
+            if (const PipeHandle p = open_pipe(lnx::journald_baseline_query()))
+                (void)lnx::drain_journal_pipe(p.get(), journal_cursor_);
             return;
         }
-        const std::string cmd = "journalctl --after-cursor='" + journal_cursor_ +
-                                "' -o json --no-pager MESSAGE_ID=" +
-                                std::string(lnx::kMsgIdCoredump) +
-                                " MESSAGE_ID=" + std::string(lnx::kMsgIdUnitFailed) +
-                                " MESSAGE_ID=" + std::string(lnx::kMsgIdUnitResult) +
-                                " + _TRANSPORT=kernel 2>/dev/null";
-        const PipeHandle pipe = open_pipe(cmd);
+
+        const auto cmd = lnx::build_journald_after_cursor_query(journal_cursor_);
+        if (!cmd) {
+            journal_cursor_.clear(); // cursor held a quote (never happens for a real
+            return;                  // __CURSOR) — drop it and re-baseline next tick
+        }
+        const PipeHandle pipe = open_pipe(*cmd);
         if (!pipe) {
             spdlog::warn("dex_observer(linux): popen(journalctl) failed — journald poll skipped");
             return;
         }
-        std::string newest = journal_cursor_;
-        std::string line;
-        while (read_pipe_line(pipe.get(), line)) {
-            lnx::JournalLine jl = lnx::parse_journal_line(line);
-            if (!jl.cursor.empty())
-                newest = std::move(jl.cursor); // journalctl is chronological → last wins
-            if (jl.obs)
-                emit_journal(std::move(*jl.obs));
-        }
-        journal_cursor_ = std::move(newest);
-    }
-
-    // Journald-sourced emit with a per-(obs_type, subject) debounce: a flapping unit
-    // (Restart= loop) or a crash-looping process collapses to one observation per
-    // window instead of flooding the wire. The /proc sources are latch-bounded and
-    // skip this.
-    void emit_journal(SignalObservation obs) {
-        const std::string key = obs.obs_type + "|" + obs.subject;
-        // steady_now(): the debounce is a TIMER, not an emitted timestamp. now_unix()
-        // here let a backward wall-clock step (NTP correction, VM snapshot-resume) make
-        // (now - stamp) negative → < window → a real re-failure silently suppressed for
-        // the step's duration (sre Gate-6). Monotonic time cannot step back. The emitted
-        // observation's timestamp_unix (in emit()) stays wall-clock — that one is a real
-        // time, not a timer.
-        const std::int64_t now = steady_now();
-        if (const auto it = journal_dedup_.find(key);
-            it != journal_dedup_.end() && now - it->second < kJournaldDebounceSeconds)
-            return; // within the debounce window — collapse
-        journal_dedup_[key] = now;
-        emit(std::move(obs));
+        // drain advances journal_cursor_ to the newest entry it reads; a throw or short
+        // read leaves it at the last good line, so the same window is re-polled. The
+        // debounce collapses a flapping unit/process to one observation per window.
+        for (auto& obs : lnx::drain_journal_pipe(pipe.get(), journal_cursor_))
+            if (journal_debounce_.should_emit(obs.obs_type, obs.subject, now))
+                emit(std::move(obs));
     }
 
     // os.uptime_report — the cross-platform uptime/reboot heartbeat (the Windows
@@ -430,7 +385,7 @@ private:
     win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
     std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
     std::string journal_cursor_;                              // "" until baselined at the journal tail
-    std::unordered_map<std::string, std::int64_t> journal_dedup_; // (type|subject) → last journald emit
+    lnx::JournalDebounce journal_debounce_{kJournaldDebounceSeconds}; // per-(type,subject) flap collapse
 };
 
 } // namespace

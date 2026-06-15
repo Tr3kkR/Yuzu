@@ -12,12 +12,51 @@
 
 #include "dex_event.hpp" // signal_detail_json — prove no path / memory-figure PII reaches the wire payload
 
+#include "test_helpers.hpp" // yuzu::test::unique_temp_path — portable temp file
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <vector>
 
 using namespace yuzu::agent::lnx;
+
+namespace {
+// A real temp file seeded with `content` and rewound for reading — the portable
+// stand-in for the journalctl popen() stream, so the pipe-read + drain
+// orchestration runs on EVERY platform without journalctl. std::tmpfile() is NOT
+// portable here: on MSVC it opens at the C:\ drive root and fails without write
+// access there, and these [journal] cases also run on the Windows CI leg. RAII —
+// the backing file is closed + removed on destruction.
+class TempPipe {
+public:
+    explicit TempPipe(std::string_view content)
+        : path_(yuzu::test::unique_temp_path("dex-journal-pipe-")) {
+        f_ = std::fopen(path_.string().c_str(), "w+b");
+        if (f_ && !content.empty()) {
+            std::fwrite(content.data(), 1, content.size(), f_);
+            std::rewind(f_);
+        }
+    }
+    ~TempPipe() {
+        if (f_)
+            std::fclose(f_);
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    TempPipe(const TempPipe&) = delete;
+    TempPipe& operator=(const TempPipe&) = delete;
+    std::FILE* get() const { return f_; }
+
+private:
+    std::filesystem::path path_;
+    std::FILE* f_ = nullptr;
+};
+} // namespace
 
 TEST_CASE("journal: coredump → process.crashed", "[guardian][dex][linux][journal]") {
     const std::string line =
@@ -185,4 +224,142 @@ TEST_CASE("journal: privacy — OOM ships the victim comm only, never the kernel
         CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
         CHECK(detail.find(leak) == std::string_view::npos);
     }
+}
+
+// ── pipe orchestration (extracted from the collector; tmpfile-driven, off-Linux) ──
+
+TEST_CASE("read_pipe_line: strips the trailing newline and a preceding CR",
+          "[guardian][dex][linux][journal][pipe]") {
+    TempPipe tp{"alpha\r\nbeta\ngamma"};
+    REQUIRE(tp.get());
+    std::string line;
+    REQUIRE(read_pipe_line(tp.get(), line));
+    CHECK(line == "alpha"); // \r\n both stripped
+    REQUIRE(read_pipe_line(tp.get(), line));
+    CHECK(line == "beta");
+    REQUIRE(read_pipe_line(tp.get(), line)); // final line, no trailing newline
+    CHECK(line == "gamma");
+    CHECK_FALSE(read_pipe_line(tp.get(), line)); // clean EOF
+}
+
+TEST_CASE("read_pipe_line: accumulates a line longer than the fgets buffer",
+          "[guardian][dex][linux][journal][pipe]") {
+    const std::string big(40000, 'x'); // > the 16 KiB internal buffer → multiple fgets chunks
+    TempPipe tp{big + "\n"};
+    REQUIRE(tp.get());
+    std::string line;
+    REQUIRE(read_pipe_line(tp.get(), line));
+    CHECK(line == big);
+    CHECK_FALSE(read_pipe_line(tp.get(), line));
+}
+
+TEST_CASE("read_pipe_line: an empty stream returns false and clears out",
+          "[guardian][dex][linux][journal][pipe]") {
+    TempPipe tp{""};
+    REQUIRE(tp.get());
+    std::string line = "stale";
+    CHECK_FALSE(read_pipe_line(tp.get(), line));
+    CHECK(line.empty()); // cleared even on the false path
+}
+
+TEST_CASE("build_journald_after_cursor_query: well-formed cursor → bounded, filtered query",
+          "[guardian][dex][linux][journal][query]") {
+    const auto cmd = build_journald_after_cursor_query("s=ab;i=1;b=cd");
+    REQUIRE(cmd.has_value());
+    CHECK(cmd->find("timeout ") != std::string::npos);                       // wedge-bounded
+    CHECK(cmd->find("--after-cursor='s=ab;i=1;b=cd'") != std::string::npos); // cursor only in the quoted slot
+    CHECK(cmd->find(std::string(kMsgIdCoredump)) != std::string::npos);
+    CHECK(cmd->find(std::string(kMsgIdUnitFailed)) != std::string::npos);
+    CHECK(cmd->find(std::string(kMsgIdUnitResult)) != std::string::npos);
+    CHECK(cmd->find("_TRANSPORT=kernel") != std::string::npos);
+}
+
+TEST_CASE("build_journald_after_cursor_query: a cursor with a single quote → nullopt (injection guard)",
+          "[guardian][dex][linux][journal][query]") {
+    // A real __CURSOR never contains a single quote; one that does could break out of
+    // the single-quoted shell slot, so the builder refuses and signals re-baseline.
+    CHECK_FALSE(build_journald_after_cursor_query("s=ab';rm -rf /;'").has_value());
+    CHECK_FALSE(build_journald_after_cursor_query("'").has_value());
+}
+
+TEST_CASE("journald_baseline_query: tails one entry, wedge-bounded",
+          "[guardian][dex][linux][journal][query]") {
+    const std::string q = journald_baseline_query();
+    CHECK(q.find("timeout ") != std::string::npos);
+    CHECK(q.find("-n 1") != std::string::npos);
+    CHECK(q.find("-o json") != std::string::npos);
+}
+
+TEST_CASE("drain_journal_pipe: classifies a stream and advances the cursor to the last entry",
+          "[guardian][dex][linux][journal][drain]") {
+    // coredump (→ obs), a non-OOM kernel line (no obs, advances cursor), unit failure
+    // (→ obs). drain returns the 2 observations; the cursor advances to the newest.
+    const std::string stream =
+        R"({"__CURSOR":"c1","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","COREDUMP_COMM":"nginx","COREDUMP_SIGNAL":"11"})"
+        "\n"
+        R"({"__CURSOR":"c2","_TRANSPORT":"kernel","MESSAGE":"usb 1-1: new device"})"
+        "\n"
+        R"({"__CURSOR":"c3","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","UNIT":"db.service","UNIT_RESULT":"exit-code"})"
+        "\n";
+    TempPipe tp{stream};
+    REQUIRE(tp.get());
+    std::string cursor = "c0";
+    const auto obs = drain_journal_pipe(tp.get(), cursor);
+    REQUIRE(obs.size() == 2);
+    CHECK(obs[0].obs_type == "process.crashed");
+    CHECK(obs[0].subject == "nginx");
+    CHECK(obs[1].obs_type == "service.crashed");
+    CHECK(obs[1].subject == "db.service");
+    CHECK(cursor == "c3"); // advanced past the non-obs kernel line to the newest entry
+}
+
+TEST_CASE("drain_journal_pipe: an empty pipe yields no obs and leaves the cursor untouched",
+          "[guardian][dex][linux][journal][drain]") {
+    TempPipe tp{""};
+    REQUIRE(tp.get());
+    std::string cursor = "keep-me";
+    const auto obs = drain_journal_pipe(tp.get(), cursor);
+    CHECK(obs.empty());
+    CHECK(cursor == "keep-me");
+}
+
+TEST_CASE("drain_journal_pipe: a malformed tail line does not advance the cursor",
+          "[guardian][dex][linux][journal][drain]") {
+    // The good line advances the cursor; the malformed tail has no __CURSOR, so the
+    // cursor stops at the last good entry and that window is re-read next poll.
+    const std::string stream =
+        R"({"__CURSOR":"good","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c","UNIT":"x.service","UNIT_RESULT":"exit-code"})"
+        "\n"
+        "this is not json\n";
+    TempPipe tp{stream};
+    REQUIRE(tp.get());
+    std::string cursor = "start";
+    const auto obs = drain_journal_pipe(tp.get(), cursor);
+    REQUIRE(obs.size() == 1);
+    CHECK(cursor == "good"); // not advanced past by the malformed line
+}
+
+TEST_CASE("JournalDebounce: collapses within the window, re-emits after it",
+          "[guardian][dex][linux][journal][debounce]") {
+    JournalDebounce d{300};
+    CHECK(d.should_emit("service.crashed", "db.service", 1000));       // first → emit
+    CHECK_FALSE(d.should_emit("service.crashed", "db.service", 1100)); // +100s, within → collapse
+    CHECK_FALSE(d.should_emit("service.crashed", "db.service", 1299)); // still within
+    CHECK(d.should_emit("service.crashed", "db.service", 1300));       // window elapsed → emit
+    // a different (type, subject) is independent
+    CHECK(d.should_emit("process.crashed", "db.service", 1100));
+    CHECK(d.should_emit("service.crashed", "web.service", 1100));
+}
+
+TEST_CASE("JournalDebounce: evict_stale drops entries past the window, keeps fresh ones",
+          "[guardian][dex][linux][journal][debounce]") {
+    JournalDebounce d{300};
+    d.should_emit("service.crashed", "old.service", 1000);
+    d.should_emit("service.crashed", "new.service", 1250);
+    CHECK(d.size() == 2);
+    d.evict_stale(1300); // old: 1300-1000=300 >= window → evicted; new: 50 < window → kept
+    CHECK(d.size() == 1);
+    // the evicted key no longer suppresses — a fresh emit at the same time succeeds
+    CHECK(d.should_emit("service.crashed", "old.service", 1300));
+    CHECK(d.size() == 2);
 }

@@ -29,9 +29,13 @@
 #include <yuzu/plugin.h>                     // YUZU_EXPORT
 #include <yuzu/agent/dex_signal_catalog.hpp> // SignalObservation
 
+#include <cstdint>
+#include <cstdio> // std::FILE — read_pipe_line / drain_journal_pipe operate on the popen() stream
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace yuzu::agent::lnx {
 
@@ -62,5 +66,61 @@ YUZU_EXPORT JournalLine parse_journal_line(std::string_view json_line);
 /// PURE: best-effort signal name for a `COREDUMP_SIGNAL` number ("11" → "SIGSEGV");
 /// "signal N" when unmapped. Exposed for tests.
 YUZU_EXPORT std::string crash_signal_name(int signo);
+
+// ── journald pipe orchestration (pure / tmpfile-testable on every platform) ──────
+// These move the journald read loop out of the Linux-only collector so the cursor
+// advance, command construction, and debounce are unit-tested directly rather than
+// only via the live pipeline. The collector keeps just the popen() + poll thread.
+
+/// PURE: read one newline-terminated line from `f` into `out` (trailing `\n` and a
+/// preceding `\r` stripped). false at clean EOF; a final line with no trailing
+/// newline still returns true. Accumulates across `fgets` chunks so a long JSON line
+/// is not split. Operates on any `FILE*` → tmpfile-testable without journalctl.
+YUZU_EXPORT bool read_pipe_line(std::FILE* f, std::string& out);
+
+/// PURE: the journalctl command for the FIRST (baseline) poll — tail one entry so
+/// the cursor can be seeded at the journal head without replaying history. Wrapped in
+/// `timeout` so a wedged journalctl cannot hang the baseline read.
+YUZU_EXPORT std::string journald_baseline_query();
+
+/// PURE: the steady-state journalctl command reading strictly AFTER `cursor`
+/// (`--after-cursor` is exclusive), filtered to the reliability MESSAGE_IDs plus the
+/// kernel transport (the OOM line has no stable id). Wrapped in `timeout`. Returns
+/// nullopt when `cursor` contains a single quote — a real `__CURSOR` never does, so
+/// this is the injection guard AND the "re-baseline" signal; the caller MUST clear
+/// the cursor on nullopt. `cursor` is the only external input and sits only inside
+/// the single-quoted shell slot.
+YUZU_EXPORT std::optional<std::string> build_journald_after_cursor_query(std::string_view cursor);
+
+/// PURE: read every line from an open journalctl pipe, classify each, advance
+/// `cursor` to the newest `__CURSOR` seen (journalctl is chronological → last
+/// non-empty wins), and return the observations to emit (classification ONLY — the
+/// caller applies the debounce). A line with no `__CURSOR` (malformed tail) does not
+/// advance the cursor, so the same window is re-read next poll. Pure over the `FILE*`
+/// → tmpfile-testable.
+YUZU_EXPORT std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor);
+
+/// Per-(obs_type, subject) debounce with age eviction, so a flapping unit / crash
+/// loop collapses to one observation per window instead of flooding the wire.
+/// Timestamps are MONOTONIC (the caller passes steady_now()): the window is a timer,
+/// immune to wall-clock steps. The map is bounded by the trailing-window event count,
+/// not daemon uptime, because evict_stale() drops entries older than the window.
+class YUZU_EXPORT JournalDebounce {
+public:
+    explicit JournalDebounce(std::int64_t window_seconds) : window_(window_seconds) {}
+
+    /// true (and records the stamp) when (obs_type, subject) is outside the window;
+    /// false (collapse) when a prior emit is still within it.
+    bool should_emit(const std::string& obs_type, const std::string& subject, std::int64_t now_mono);
+
+    /// Drop entries whose last emit is >= window old — they can no longer suppress.
+    void evict_stale(std::int64_t now_mono);
+
+    std::size_t size() const { return seen_.size(); } ///< for tests / bound assertions
+
+private:
+    std::int64_t window_;
+    std::unordered_map<std::string, std::int64_t> seen_;
+};
 
 } // namespace yuzu::agent::lnx
