@@ -23,10 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (federated), not fleet render-time; it remains deferred. See
   `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
 
-- **Network quality dashboard (`/network`).** A new top-level page surfaces
-  fleet-wide TCP network quality measured continuously on each endpoint from
-  kernel counters (no packet capture, no flow export) — a **device / local-link
-  health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+- **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
+  under DEX (the Network tab in the DEX sub-nav, also reachable directly at
+  `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
+  network quality measured continuously on each endpoint from kernel counters (no
+  packet capture, no flow export) — a **device / local-link health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
   rate**, and device throughput. The retransmit rate is ΔΣretransmits /
   ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
   the lifetime ratio — empirically the lifetime ratio is diluted to noise while
@@ -234,6 +235,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
 - **macOS agents are no longer counted as Windows in DEX denominators.** The
   OS check used a substring match, and "darwin" contains "win" — so on mixed
   fleets every macOS agent inflated the Windows-online denominator behind the

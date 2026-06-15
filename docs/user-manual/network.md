@@ -13,9 +13,10 @@ or app problem — something a network-only tool cannot do.
 
 ## Access
 
-Navigate to **Network** in the top navigation bar, or go to `/network` directly.
-Permission required: **`GuaranteedState:Read`** (the same permission that gates
-the Guardian and DEX read surfaces).
+Network is a **sub-view of DEX**, not a standalone top-level nav item: open
+**DEX** in the top navigation bar and choose the **Network** tab, or go to
+`/network` directly. Permission required: **`GuaranteedState:Read`** (the same
+permission that gates the Guardian and DEX read surfaces).
 
 ## Overview tab
 

@@ -11,12 +11,14 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The five views
+## The six views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into four deep pages. A shared sub-nav switches between **Overview ·
-Catalogue · Health score · Trends · Performance**; the window selector (below)
-applies to the signal views (Performance is a now-view — see below).
+links* into five deep pages. A shared sub-nav switches between **Overview ·
+Catalogue · Health score · Trends · Performance · Network**; the window selector
+(below) applies to the signal views (Performance and Network are now-views — see
+below). The Network view also has its own URL, `/network`, but it is a DEX
+sub-view, not a standalone top-level nav item.
 
 ### Overview (the hub)
 
@@ -104,6 +106,19 @@ server-side series store).
   metric; the Reporting card opens the devices *not* reporting; each cohort
   row opens that cohort's device list — and every device row opens the
   per-device drill-down.
+
+### Network
+
+The fleet's TCP **network quality**, measured on each endpoint from kernel
+counters (no packet capture, no flow export). A **now-view** like Performance:
+fleet-now cards for round-trip time, the interval retransmit rate, and device
+throughput — each with its own reporting population — plus a worst-devices
+drill. It is **device / local-link health**, not localization: a bad local link
+(Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
+destination or app is affected is a later per-destination slice. Linux agents
+report today; Windows and macOS collectors are later slices. Full detail,
+platform coverage, and the privacy model are on the
+[Network quality dashboard](network.md) page.
 
 **Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
 Drill-downs opened from a panel inherit the window you were viewing, so the
