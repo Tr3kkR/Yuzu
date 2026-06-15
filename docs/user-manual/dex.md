@@ -89,9 +89,8 @@ server-side series store).
 - **Fleet now cards** — CPU utilization, memory commit and disk I/O latency,
   each showing avg / p50 / p90 / max plus the **Reporting** population card
   (the honest denominator: an average over 12 devices is never silently
-  presented as fleet-wide truth). Perf telemetry is collected by **Windows
-  agents only** today; other platforms are absent from these numbers, not
-  zero.
+  presented as fleet-wide truth). Perf telemetry is collected by **Windows and
+  Linux agents** today; macOS is absent from these numbers, not zero.
 - **Cohort benchmarking** — fleet-relative percentiles per **cohort**: the
   distinct values of an operator-chosen **tag key** (default `model`; pick any
   key from the selector — e.g. an `image` key compares a vanilla VDI image

@@ -634,7 +634,8 @@ public:
         // 1c-bis. Fleet-wide DEX signal observer (Guardian DEX, multi-signal).
         // RULELESS observations — records every catalogued reliability signal
         // (crash, hang, service failure, bugcheck, boot duration, …; see
-        // dex_signal_catalog.cpp), independent of any rule. No-op off Windows.
+        // dex_signal_catalog.cpp), independent of any rule. Windows/macOS/Linux each
+        // have a real observer; no-op only on a platform without one.
         // Armed pre-network; emit_guardian_event() self-guards on the Subscribe
         // stream being up, so signals before first connect are dropped (like
         // guard events pre-sink; durable buffering is A3).
@@ -1584,10 +1585,18 @@ public:
                                                 std::format("{:.1f}", *pct);
                                         hb_prev_cpu_lnx = cur;
                                     }
-                                    if (const auto mi = read_proc("/proc/meminfo"))
-                                        if (const auto pct = lnx::parse_commit_pct(*mi))
-                                            tags["yuzu.perf_commit_pct"] =
-                                                std::format("{:.1f}", *pct);
+                                    // Gate commit% the SAME way the collector gates
+                                    // perf.memory_pressure: under vm.overcommit_memory=1
+                                    // ("always") CommitLimit is advisory and commit% reads
+                                    // ~100% on healthy overcommit hosts — omit the tag so the
+                                    // fleet gauge stays consistent with the breach signal
+                                    // (shared lnx::overcommit_is_always, fjarvis review).
+                                    const auto oc = read_proc("/proc/sys/vm/overcommit_memory");
+                                    if (!(oc && lnx::overcommit_is_always(*oc)))
+                                        if (const auto mi = read_proc("/proc/meminfo"))
+                                            if (const auto pct = lnx::parse_commit_pct(*mi))
+                                                tags["yuzu.perf_commit_pct"] =
+                                                    std::format("{:.1f}", *pct);
                                 } catch (...) {
                                     // omit perf tags this heartbeat
                                 }

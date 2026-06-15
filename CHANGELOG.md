@@ -419,9 +419,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   experience headings unprivileged; the Security heading (XProtect/Gatekeeper) is
   not yet shipped. Privacy is minimised at the edge (faulting-image basenames
   only, never raw log message bodies; per-type rate caps; non-finite metric
-  guards). Obeys the same `--dex-disable` kill switch as Windows. Linux endpoints
-  still report no DEX signals. Source mapping + the Endpoint-Security entitlement
-  roadmap: `docs/dex-signal-catalog.md`.
+  guards). Obeys the same `--dex-disable` kill switch as Windows. Source mapping +
+  the Endpoint-Security entitlement roadmap: `docs/dex-signal-catalog.md`.
 - **DEX dashboard (`/dex`) — a hub plus three deep pages.** The read-only fleet-
   reliability lens over the Guardian observation catalogue is structured as a
   **hub** (measured crash-free-device % and crashes/1k-device-days, honest "—"
