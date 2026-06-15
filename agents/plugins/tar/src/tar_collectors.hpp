@@ -19,6 +19,7 @@
  */
 
 #include "tar_db.hpp"
+#include "tar_netqual.hpp" // TcpQualitySample (returned by collect_tcp_quality)
 
 #include <yuzu/agent/process_enum.hpp>
 
@@ -65,6 +66,19 @@ struct UserSession {
 
 /** Enumerate active network connections on the current host. */
 std::vector<NetConnection> enumerate_connections();
+
+/**
+ * Sample per-connection TCP quality (RTT + jitter + current loss + lifetime
+ * retrans/segs context) for the netqual warehouse tier. Linux: netlink
+ * SOCK_DIAG / INET_DIAG TCP_INFO over ESTABLISHED connections, owning process
+ * resolved via the socket inode. Empty off Linux (Windows / macOS are kPlanned
+ * — see the `netqual` source in the schema registry).
+ *
+ * Returns RAW remote addresses; the caller MUST pass the result through
+ * select_netqual_rows (which buckets the address away) before persisting —
+ * raw destinations never reach the warehouse.
+ */
+std::vector<TcpQualitySample> collect_tcp_quality();
 
 /** Enumerate installed system services on the current host. */
 std::vector<ServiceInfo> enumerate_services();

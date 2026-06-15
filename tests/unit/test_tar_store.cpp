@@ -6,6 +6,7 @@
  */
 
 #include "tar_db.hpp"
+#include "tar_netqual.hpp"
 #include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
 
@@ -619,6 +620,150 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
     REQUIRE(q->rows.size() == 3);
     CHECK(q->rows[0][0] == "app0.exe");
     CHECK(q->rows[2][1] == "3");
+}
+
+TEST_CASE("TarDatabase: insert_netqual_samples batch round-trips", "[tar][store][netqual]") {
+    auto t = make_test_db();
+    std::vector<NetQualRow> rows;
+    for (int i = 0; i < 3; ++i) {
+        NetQualRow r;
+        r.ts = 3000 + i;
+        r.snapshot_id = 9;
+        r.proto = "tcp";
+        r.remote_bucket = (i == 0) ? "private" : "public"; // real remote_bucket() classes
+        r.process_name = "app" + std::to_string(i);
+        r.rtt_us = 1000 * (i + 1);
+        r.rtt_var_us = 100 * (i + 1);
+        r.lost = i; // row 0 = no current loss, rows 1/2 = current loss
+        r.retrans = 5 * i;
+        r.segs_out = 1000 * (i + 1);
+        r.ca_state = (i == 2) ? 4 : 0; // app2 in TCP_CA_Loss
+        rows.push_back(std::move(r));
+    }
+    REQUIRE(t.db.insert_netqual_samples(rows));
+    REQUIRE(t.db.insert_netqual_samples({})); // empty batch is a no-op success
+
+    auto q = t.db.execute_query(
+        "SELECT proto, remote_bucket, process_name, rtt_us, lost, segs_out, ca_state "
+        "FROM netqual_live ORDER BY process_name");
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 3);
+    CHECK(q->rows[0][1] == "private");  // app0 destination class
+    CHECK(q->rows[0][4] == "0");        // app0 current loss
+    CHECK(q->rows[0][6] == "0");        // app0 ca_state = Open
+    CHECK(q->rows[2][1] == "public");   // app2 destination class
+    CHECK(q->rows[2][4] == "2");        // app2 current loss
+    CHECK(q->rows[2][6] == "4");        // app2 ca_state = Loss
+
+    // The degraded-as-query shape (a later server slice): fraction of a
+    // snapshot's connections with CURRENT loss. Pin it here so the column
+    // semantics stay query-able from the live tier.
+    auto frac = t.db.execute_query(
+        "SELECT SUM(CASE WHEN lost > 0 THEN 1 ELSE 0 END), COUNT(*) "
+        "FROM netqual_live WHERE snapshot_id = 9");
+    REQUIRE(frac.has_value());
+    REQUIRE(frac->rows.size() == 1);
+    CHECK(frac->rows[0][0] == "2"); // 2 of 3 connections currently losing
+    CHECK(frac->rows[0][1] == "3");
+}
+
+TEST_CASE("netqual: remote_bucket classifies destinations into privacy-safe classes",
+          "[tar][netqual][privacy]") {
+    using yuzu::tar::remote_bucket;
+    // Loopback.
+    CHECK(remote_bucket("127.0.0.1") == "loopback");
+    CHECK(remote_bucket("127.5.6.7") == "loopback");
+    CHECK(remote_bucket("::1") == "loopback");
+    // RFC1918 + link-local => private.
+    CHECK(remote_bucket("10.0.0.5") == "private");
+    CHECK(remote_bucket("192.168.1.20") == "private");
+    CHECK(remote_bucket("169.254.10.10") == "private");
+    CHECK(remote_bucket("172.16.0.1") == "private");
+    CHECK(remote_bucket("172.31.255.254") == "private");
+    CHECK(remote_bucket("fe80::1") == "private"); // link-local v6
+    CHECK(remote_bucket("fd00::abcd") == "private"); // unique-local v6
+    // 172.32 is OUT of the private /12 — public.
+    CHECK(remote_bucket("172.32.0.1") == "public");
+    CHECK(remote_bucket("172.15.0.1") == "public");
+    CHECK(remote_bucket("8.8.8.8") == "public");
+    CHECK(remote_bucket("2001:4860:4860::8888") == "public");
+    // CGNAT 100.64.0.0/10 (RFC6598 shared space) => private; just-outside => public.
+    CHECK(remote_bucket("100.64.0.1") == "private");
+    CHECK(remote_bucket("100.127.255.254") == "private");
+    CHECK(remote_bucket("100.63.255.1") == "public");
+    CHECK(remote_bucket("100.128.0.1") == "public");
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) classified by the embedded v4.
+    CHECK(remote_bucket("::ffff:10.0.0.5") == "private");
+    CHECK(remote_bucket("::ffff:127.0.0.1") == "loopback");
+    CHECK(remote_bucket("::ffff:8.8.8.8") == "public");
+    // Unknown / wildcard.
+    CHECK(remote_bucket("") == "unknown");
+    CHECK(remote_bucket("*") == "unknown");
+}
+
+TEST_CASE("netqual: select_netqual_rows drops the raw address and keeps degraded-first under cap",
+          "[tar][netqual][privacy]") {
+    using yuzu::tar::NetQualRow;
+    using yuzu::tar::select_netqual_rows;
+    using yuzu::tar::TcpQualitySample;
+
+    std::vector<TcpQualitySample> samples;
+    // Idle, very active, public destination — would dominate a by-activity cap.
+    samples.push_back({"tcp", "8.8.8.8", "chrome", 5000, 100, 0, 0, 100000});
+    // Losing connection, low activity, private destination — must be KEPT.
+    samples.push_back({"tcp", "10.0.0.9", "vpnclient", 20000, 500, 7, 30, 200});
+    // Idle, low activity — the one that should be dropped under cap=2.
+    samples.push_back({"tcp", "192.168.1.5", "ssh", 8000, 200, 0, 0, 50});
+
+    auto rows = select_netqual_rows(samples, /*ts=*/111, /*snapshot_id=*/222, /*cap=*/2);
+    REQUIRE(rows.size() == 2);
+
+    // Degraded-first: the losing connection ranks ahead of the idle high-activity one.
+    CHECK(rows[0].process_name == "vpnclient");
+    CHECK(rows[0].lost == 7);
+    CHECK(rows[0].remote_bucket == "private");
+    CHECK(rows[1].process_name == "chrome");
+    CHECK(rows[1].lost == 0);
+    CHECK(rows[1].remote_bucket == "public");
+
+    // Privacy: NO row carries a raw address — only the coarse bucket. NetQualRow
+    // has no remote_addr field at all, so this is structural; assert the bucket
+    // is one of the known classes and never an IP literal.
+    for (const auto& r : rows) {
+        CHECK((r.remote_bucket == "loopback" || r.remote_bucket == "private" ||
+               r.remote_bucket == "public" || r.remote_bucket == "unknown"));
+        CHECK(r.remote_bucket.find('.') == std::string::npos);
+        CHECK(r.ts == 111);
+        CHECK(r.snapshot_id == 222);
+    }
+}
+
+TEST_CASE("netqual: select_netqual_rows with cap=0 keeps everything", "[tar][netqual]") {
+    using yuzu::tar::select_netqual_rows;
+    using yuzu::tar::TcpQualitySample;
+    std::vector<TcpQualitySample> samples(5);
+    for (auto& s : samples) {
+        s.proto = "tcp";
+        s.remote_addr = "8.8.8.8";
+    }
+    auto rows = select_netqual_rows(samples, 1, 1, /*cap=*/0);
+    CHECK(rows.size() == 5);
+}
+
+TEST_CASE("TarDatabase: insert_netqual_samples returns false (no crash) when the table is gone",
+          "[tar][store][netqual]") {
+    // Mirrors the procperf prepare-fail ROLLBACK path: drop netqual_live out
+    // from under an open TarDatabase, then insert — prepare fails, the function
+    // must ROLLBACK and return false without wedging the connection.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE netqual_live").has_value());
+    NetQualRow r;
+    r.ts = 1;
+    r.snapshot_id = 1;
+    r.proto = "tcp";
+    r.process_name = "x";
+    CHECK_FALSE(t.db.insert_netqual_samples({r}));
+    REQUIRE(t.db.execute_query("SELECT 1").has_value());
 }
 
 TEST_CASE("TarDatabase: insert_proc_perf_samples returns false (no crash) when the table is gone",

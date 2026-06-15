@@ -343,6 +343,13 @@ public:
     /// minimum (G3 performance S1). Do NOT call on a hot path.
     std::vector<AgentHealthSnapshot> perf_snapshot(std::chrono::seconds staleness) const;
 
+    /// Like perf_snapshot, but copies the NETWORK heartbeat facts
+    /// (network_perf_rules.hpp kNetTag* keys) PLUS the perf tags the
+    /// co-occurrence pressure check reads — the minimum the /network read model
+    /// needs. Same staleness contract as recompute_metrics (pass the same value
+    /// so the dashboard and the yuzu_fleet_net_* gauges see the same population).
+    std::vector<AgentHealthSnapshot> net_snapshot(std::chrono::seconds staleness) const;
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
