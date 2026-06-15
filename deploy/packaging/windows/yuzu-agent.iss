@@ -121,8 +121,8 @@ Source: "{#BuildDir}\agents\plugins\chargen\chargen.dll"; DestDir: "{app}\plugin
 Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 [Dirs]
-Name: "{app}\logs"; Permissions: service-full
-Name: "{commonappdata}\Yuzu"; Permissions: service-full
+Name: "{app}\logs"; Permissions: admins-full system-full
+Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 
 [Run]
 ; Register and start the service after install

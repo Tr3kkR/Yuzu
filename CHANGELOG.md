@@ -45,7 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boot running until the next reboot, holding one of the scarce (~64) system ETW
   session slots. The same stop-before-delete teardown was applied to
   `install-agent-user.ps1`'s `Remove-ProcBootAutologger` so the script and
-  installer recipes stay in sync.
+  installer recipes stay in sync. The installer also locks the agent data dir
+  `{commonappdata}\Yuzu` (and `{app}\logs`) to `admins-full system-full`: the
+  prior `service-full` keyword is not a valid InnoSetup permission group and was
+  silently ignored, leaving the directory — which now holds the boot trace
+  `procboot.etl` (boot-process names reveal which security/EDR tools are present)
+  — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
 
 ### Changed
 
