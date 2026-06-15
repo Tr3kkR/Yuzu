@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing obs_types means a Linux server lights up the same `/dex` buckets as
   Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
 
+- **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
+  tab's cohort benchmarking compared each cohort against the whole fleet; it now
+  also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
+  `model` X vs Y) — closing the cohort-vs-cohort half of the benchmarking gap. A
+  "Compare two cohorts" section with two cohort pickers auto-loads the top-two
+  comparison; each metric shows both cohorts' p50 plus the delta (A relative to
+  B). Pure render-time over existing heartbeat state — **zero new storage**, no
+  Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
+  `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
+  rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
+  perf across the fleet) is **not** included — per-app data is device-drill-only
+  (federated), not fleet render-time; it remains deferred. See
+  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+
 - **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
   under DEX (the Network tab in the DEX sub-nav, also reachable directly at
   `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
