@@ -307,10 +307,20 @@ private:
     // --after-cursor is exclusive → no boundary de-dup). MESSAGE_ID matching yields
     // one canonical entry per failure; the `+ _TRANSPORT=kernel` group carries the
     // OOM line (no stable MESSAGE_ID) and is parsed-and-mostly-dropped. No libsystemd:
-    // journalctl is a runtime shell-out, and if it is absent (non-systemd host) popen
-    // fails and the source quietly no-ops. The cursor advances only after a clean
+    // journalctl is a runtime shell-out; on a non-systemd host the shell-out simply
+    // yields no output (popen still succeeds via /bin/sh, so the cursor never
+    // baselines) and the source quietly no-ops. The cursor advances only after a clean
     // read, so a throw mid-loop re-polls the same window next tick.
     void poll_journald() {
+        // Evict debounce entries older than the window FIRST, every cycle: a stamp past
+        // the window can no longer suppress anything, so it is pure bloat. This is the
+        // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_ —
+        // journal events are transient (no live set to diff against), so the bound is
+        // time, not a current-set intersection. Keeps journal_dedup_ sized by the
+        // trailing-window event count, NOT daemon uptime (sre/consistency Gate-4/6).
+        const std::int64_t mono = steady_now();
+        std::erase_if(journal_dedup_,
+                      [&](const auto& kv) { return mono - kv.second >= kJournaldDebounceSeconds; });
         if (journal_cursor_.empty()) {
             if (const PipeHandle p = open_pipe("journalctl -o json -n 1 --no-pager 2>/dev/null")) {
                 std::string line;
@@ -353,7 +363,13 @@ private:
     // skip this.
     void emit_journal(SignalObservation obs) {
         const std::string key = obs.obs_type + "|" + obs.subject;
-        const std::int64_t now = now_unix();
+        // steady_now(): the debounce is a TIMER, not an emitted timestamp. now_unix()
+        // here let a backward wall-clock step (NTP correction, VM snapshot-resume) make
+        // (now - stamp) negative → < window → a real re-failure silently suppressed for
+        // the step's duration (sre Gate-6). Monotonic time cannot step back. The emitted
+        // observation's timestamp_unix (in emit()) stays wall-clock — that one is a real
+        // time, not a timer.
+        const std::int64_t now = steady_now();
         if (const auto it = journal_dedup_.find(key);
             it != journal_dedup_.end() && now - it->second < kJournaldDebounceSeconds)
             return; // within the debounce window — collapse

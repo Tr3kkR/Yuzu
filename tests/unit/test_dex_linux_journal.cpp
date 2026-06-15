@@ -10,7 +10,12 @@
 
 #include "dex_linux_journal.hpp"
 
+#include "dex_event.hpp" // signal_detail_json — prove no path / memory-figure PII reaches the wire payload
+
 #include <catch2/catch_test_macros.hpp>
+
+#include <string>
+#include <string_view>
 
 using namespace yuzu::agent::lnx;
 
@@ -112,6 +117,10 @@ TEST_CASE("journal: malformed JSON yields no cursor, no obs (never throws)",
     CHECK_FALSE(parse_journal_line("").obs.has_value());
     // a JSON array (not an object) is also rejected
     CHECK_FALSE(parse_journal_line("[1,2,3]").obs.has_value());
+    // a well-formed object whose __CURSOR is a NON-string (array) yields no cursor —
+    // jstr() takes a field only when it is a plain string, so structured / binary
+    // journal values are never shipped.
+    CHECK(parse_journal_line(R"({"__CURSOR":["a"],"MESSAGE_ID":"x"})").cursor.empty());
 }
 
 TEST_CASE("crash_signal_name maps the core-generating signals",
@@ -121,4 +130,59 @@ TEST_CASE("crash_signal_name maps the core-generating signals",
     CHECK(crash_signal_name(7) == "SIGBUS");
     CHECK(crash_signal_name(8) == "SIGFPE");
     CHECK(crash_signal_name(99) == "signal 99"); // unmapped → numeric fallback
+}
+
+TEST_CASE("journal: coredump without COREDUMP_SIGNAL emits with an empty reason",
+          "[guardian][dex][linux][journal]") {
+    // A coredump entry that carries no COREDUMP_SIGNAL is still a crash — emit it with
+    // an empty reason and a sentence that omits the "(signal …)" suffix.
+    const std::string line =
+        R"({"__CURSOR":"s=ab;i=10;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"("COREDUMP_COMM":"worker"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "process.crashed");
+    CHECK(jl.obs->subject == "worker");
+    CHECK(jl.obs->reason.empty());
+    CHECK(jl.obs->sentence == "worker crashed"); // no signal suffix
+}
+
+TEST_CASE("journal: privacy — coredump ships the comm only, never the COREDUMP_EXE path",
+          "[guardian][dex][linux][journal][privacy]") {
+    // A real coredump entry carries COREDUMP_EXE — a full binary path that can embed a
+    // user / tenant / project directory. Only the comm may leave the device; the path
+    // must not appear in ANY emitted surface (subject, sentence, or detail_json wire
+    // payload). This is the [dex][privacy] pin the macOS / storage collectors carry.
+    const std::string line =
+        R"({"__CURSOR":"s=ab;i=11;b=cd","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
+        R"("COREDUMP_COMM":"acmeapp","COREDUMP_SIGNAL":"6",)"
+        R"("COREDUMP_EXE":"/home/alice/acme-secret/acmeapp"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->subject == "acmeapp"); // the comm, never the path
+    const std::string detail = signal_detail_json(*jl.obs);
+    for (const std::string_view leak : {"alice", "acme-secret", "/home", "secret"}) {
+        CHECK(jl.obs->subject.find(leak) == std::string_view::npos);
+        CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
+        CHECK(detail.find(leak) == std::string_view::npos);
+    }
+}
+
+TEST_CASE("journal: privacy — OOM ships the victim comm only, never the kernel memory figures",
+          "[guardian][dex][linux][journal][privacy]") {
+    // The kernel OOM line carries total-vm / anon-rss / file-rss figures; only the
+    // parenthesized victim comm may leave the device — never the memory numbers or the
+    // rest of the raw kernel message.
+    const std::string line =
+        R"({"__CURSOR":"s=ab;i=12;b=cd","_TRANSPORT":"kernel",)"
+        R"("MESSAGE":"Out of memory: Killed process 4321 (mysqld) total-vm:9000000kB, anon-rss:8000000kB, file-rss:0kB"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->subject == "mysqld");
+    const std::string detail = signal_detail_json(*jl.obs);
+    for (const std::string_view leak : {"total-vm", "anon-rss", "9000000", "8000000", "file-rss"}) {
+        CHECK(jl.obs->subject.find(leak) == std::string_view::npos);
+        CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
+        CHECK(detail.find(leak) == std::string_view::npos);
+    }
 }

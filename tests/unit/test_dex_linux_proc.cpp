@@ -233,4 +233,7 @@ TEST_CASE("parse_proc_uptime: rejects malformed / non-finite / negative",
     CHECK_FALSE(parse_proc_uptime("not-a-number\n").has_value());
     CHECK_FALSE(parse_proc_uptime("-5.0 1.0\n").has_value()); // negative
     CHECK_FALSE(parse_proc_uptime("inf 1.0\n").has_value());  // non-finite
+    CHECK_FALSE(parse_proc_uptime("1e300 1.0\n").has_value()); // finite-but-huge → guards int64 cast
+    // A large-but-plausible uptime (~31 years, well under the 1e12 s ceiling) is kept.
+    CHECK(parse_proc_uptime("999999999.0 1.0\n").has_value());
 }
