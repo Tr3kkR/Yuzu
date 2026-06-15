@@ -9,9 +9,14 @@
  * each line through the PURE classifier here. journald reliability events map onto
  * EXISTING obs_types, so a Linux server lights up the same `/dex` buckets as
  * Windows/macOS with ZERO server change:
- *   - systemd unit entered failed state (MESSAGE_ID SD_MESSAGE_UNIT_FAILED) → service.crashed
- *   - systemd-coredump entry           (MESSAGE_ID SD_MESSAGE_COREDUMP)     → process.crashed
- *   - kernel OOM-killer                 (_TRANSPORT=kernel + the OOM text)  → memory.exhausted
+ *   - systemd unit failed     (MESSAGE_ID "Failed with result", live carrier;     → service.crashed
+ *                              SD_MESSAGE_UNIT_FAILED also matched, defensive)
+ *   - systemd-coredump entry  (MESSAGE_ID SD_MESSAGE_COREDUMP)                     → process.crashed
+ *   - kernel OOM-killer       (_TRANSPORT=kernel + the OOM text)                   → memory.exhausted
+ *
+ * A unit failure is service.crashed whether it died at runtime or failed to start —
+ * the two are indistinguishable by MESSAGE_ID (see parse_journal_line for why the
+ * service.start_failed split is not done).
  *
  * journalctl shell-out, not sd-journal, deliberately: no libsystemd build dep (the
  * collector stays buildable on musl/Alpine like the PR3 /proc source), no coupling
@@ -42,11 +47,13 @@ namespace yuzu::agent::lnx {
 // Stable systemd journal MESSAGE_IDs (from <systemd/sd-messages.h>) the collector
 // filters the journal on and the classifier keys off.
 inline constexpr std::string_view kMsgIdCoredump = "fc2e22bc6ee647b6b90729ab34a250b1"; // SD_MESSAGE_COREDUMP
-inline constexpr std::string_view kMsgIdUnitFailed =
-    "be02cf6855d2428ba40df7e9d022f03d"; // SD_MESSAGE_UNIT_FAILED (unit entered failed state)
-// The "<unit>: Failed with result 'X'." message — what a simple service failure
-// actually logs (carries UNIT + UNIT_RESULT); confirmed against a live specimen, and
-// the case SD_MESSAGE_UNIT_FAILED alone misses. Both are matched for service.crashed.
+// SD_MESSAGE_UNIT_FAILED. Matched DEFENSIVELY: it did not fire in any tested
+// crash/start-fail case on systemd 259 (kMsgIdUnitResult carried them all), but it
+// is kept for paths not exercised (oneshot, start-limit-hit, dependency failure).
+inline constexpr std::string_view kMsgIdUnitFailed = "be02cf6855d2428ba40df7e9d022f03d";
+// The "<unit>: Failed with result 'X'." message — the LIVE carrier: what a unit
+// failure actually logs (carries UNIT + UNIT_RESULT), for both a runtime death and a
+// start failure. Both ids are matched for service.crashed.
 inline constexpr std::string_view kMsgIdUnitResult = "d9b373ed55a64feb8242e02dbe79a49c";
 
 /// One classified `journalctl -o json` line: its `__CURSOR` (the poll checkpoint —

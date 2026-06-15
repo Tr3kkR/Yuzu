@@ -146,6 +146,22 @@ TEST_CASE("journal: cgroup-v2 OOM-kill → memory.exhausted (the modern systemd 
     CHECK(jl.obs->reason == "oom-kill");
 }
 
+TEST_CASE("journal: OOM victim comm containing ')' is taken whole (rfind, not find)",
+          "[guardian][dex][linux][journal]") {
+    // A process comm can itself contain ')'. The kernel wraps the WHOLE comm in one
+    // "(…)" — so a comm "ba)sh" renders as "(ba)sh)". The closer is the LAST ')' in the
+    // line (the stats tail has none), so rfind takes the full comm; find('(') + find(')')
+    // would truncate it to "ba".
+    const std::string line =
+        R"({"__CURSOR":"s=ab;i=4c;b=cd","_TRANSPORT":"kernel",)"
+        R"("MESSAGE":"Out of memory: Killed process 777 (ba)sh) total-vm:512kB, anon-rss:64kB"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "memory.exhausted");
+    CHECK(jl.obs->subject == "ba)sh"); // whole comm, not "ba"
+    CHECK(jl.obs->reason == "oom-kill");
+}
+
 TEST_CASE("journal: non-OOM kernel line is dropped but advances the cursor",
           "[guardian][dex][linux][journal]") {
     const std::string line =

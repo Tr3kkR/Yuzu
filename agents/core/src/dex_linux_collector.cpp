@@ -29,7 +29,10 @@
 #include "dex_perf_breach.hpp"    // breach_update, kCpuBreach/kMemoryBreach, *_observation
 #include "dex_win_poll.hpp"       // DiskLevel, latch_should_emit
 
+#include <yuzu/agent/dex_rate_limiter.hpp> // DexRateLimiter — per-obs_type hourly emit cap
+
 #include <sys/statvfs.h>
+#include <sys/wait.h> // WIFEXITED / WEXITSTATUS — journalctl exit status drives cursor re-baseline
 
 #include <algorithm>
 #include <chrono>
@@ -45,6 +48,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility> // std::exchange (Pipe move/close)
 
 #include <spdlog/spdlog.h>
 
@@ -84,16 +88,43 @@ std::optional<std::string> read_proc_file(const char* path) {
 // RAII for a popen() pipe — pclose on every exit path (the macOS poll_oslog
 // pattern). The journalctl command is built from internal constants + the
 // journald-generated cursor, never operator input, so there is no shell-injection
-// surface.
-struct PcloseDeleter {
-    void operator()(std::FILE* f) const {
-        if (f)
-            ::pclose(f);
-    }
-};
-using PipeHandle = std::unique_ptr<std::FILE, PcloseDeleter>;
+// surface. close() exposes the command's exit status so the caller can tell a
+// successful read (exit 0, including a quiet poll with no new entries) from a
+// journalctl that could NOT seek the cursor (non-zero) and must re-baseline.
+class Pipe {
+public:
+    explicit Pipe(std::FILE* f) noexcept : f_(f) {}
+    ~Pipe() { close(); }
+    Pipe(const Pipe&) = delete;
+    Pipe& operator=(const Pipe&) = delete;
+    Pipe(Pipe&& o) noexcept : f_(std::exchange(o.f_, nullptr)) {}
+    Pipe& operator=(Pipe&&) = delete;
 
-PipeHandle open_pipe(const std::string& cmd) { return PipeHandle(::popen(cmd.c_str(), "r")); }
+    explicit operator bool() const noexcept { return f_ != nullptr; }
+    std::FILE* get() const noexcept { return f_; }
+
+    // Close the pipe and return the command's exit status: WEXITSTATUS on a normal
+    // exit, 128+signal if it was killed (so a `timeout`-killed wedge reads non-zero),
+    // -1 if already closed / pclose itself failed. Idempotent — the destructor calls
+    // it again harmlessly.
+    int close() noexcept {
+        if (!f_)
+            return -1;
+        const int rc = ::pclose(std::exchange(f_, nullptr));
+        if (rc == -1)
+            return -1;
+        if (WIFEXITED(rc))
+            return WEXITSTATUS(rc);
+        if (WIFSIGNALED(rc))
+            return 128 + WTERMSIG(rc);
+        return rc ? 1 : 0;
+    }
+
+private:
+    std::FILE* f_ = nullptr;
+};
+
+Pipe open_pipe(const std::string& cmd) { return Pipe(::popen(cmd.c_str(), "r")); }
 
 /// The Linux DEX observer: a single owned poll thread (the WinStatePoller
 /// lifetime — stop() joins it, the sink is set before the thread starts and
@@ -139,6 +170,22 @@ private:
             last_disk_poll_ = now - kDiskIntervalSeconds + kFirstPollDelaySeconds;
             last_journald_poll_ = now - kJournaldIntervalSeconds + kFirstPollDelaySeconds;
             last_uptime_poll_ = now - kUptimeIntervalSeconds + kFirstPollDelaySeconds;
+        }
+        // Seed the journald cursor at arm — on THIS poll thread, so it does NOT delay
+        // agent startup (start() has already returned), unlike the perf/disk/uptime
+        // sources whose first poll is deferred 60 s. Seeding here closes the gap where
+        // a reliability event in the first journald interval after arm (e.g. a service
+        // that crashes right after boot) would otherwise be skipped to the +60 s tail.
+        // poll_journald()'s empty-cursor branch is the retry path if this finds no
+        // journal (non-systemd host / transient miss). The drain classifier is
+        // exception-free in practice, but its string/vector growth could in principle
+        // throw, and this pre-loop seed sits OUTSIDE the for-loop's per-iteration guard
+        // — so it carries its own try/catch (the no-unwind invariant is structural,
+        // from the guards, not from any nothrow guarantee).
+        try {
+            seed_journal_cursor();
+        } catch (...) {
+            spdlog::warn("dex_observer(linux): initial journald cursor seed failed, continuing");
         }
         for (;;) {
             const std::int64_t next = std::min({last_perf_poll_ + win::kPerfSampleIntervalSeconds,
@@ -284,16 +331,31 @@ private:
                       [&](const auto& kv) { return !current.contains(kv.first); });
     }
 
-    // Poll the systemd journal for new reliability events. The first poll baselines
-    // the cursor at the journal tail (no history replay, and no events from the
-    // first interval after arm); then each poll reads strictly after it (journalctl
-    // --after-cursor is exclusive → no boundary de-dup). MESSAGE_ID matching yields
-    // one canonical entry per failure; the `+ _TRANSPORT=kernel` group carries the
+    // Seed the journald cursor at the journal tail and emit NOTHING (no history
+    // replay). drain advances journal_cursor_; its observations are deliberately
+    // DISCARDED so a crash/OOM that happens to be the tail entry is not re-reported
+    // as a fresh event at arm. Called once at run() start (closing the at-arm gap)
+    // and as poll_journald()'s retry path when the cursor is still empty (non-systemd
+    // host: the shell-out yields no output, the cursor never seeds, the source quietly
+    // no-ops). Both callers are exception-guarded (run()'s pre-loop try and the
+    // for-loop's per-iteration try), so a drain allocation failure cannot unwind the
+    // poll thread — this method itself makes no nothrow promise.
+    void seed_journal_cursor() {
+        if (const Pipe p = open_pipe(lnx::journald_baseline_query()))
+            (void)lnx::drain_journal_pipe(p.get(), journal_cursor_);
+    }
+
+    // Poll the systemd journal for new reliability events. The cursor is seeded at the
+    // journal tail at arm (seed_journal_cursor); each poll then reads strictly after it
+    // (journalctl --after-cursor is exclusive → no boundary de-dup). MESSAGE_ID matching
+    // yields one canonical entry per failure; the `+ _TRANSPORT=kernel` group carries the
     // OOM line (no stable MESSAGE_ID) and is parsed-and-mostly-dropped. No libsystemd:
-    // journalctl is a runtime shell-out; on a non-systemd host the shell-out simply
-    // yields no output (popen still succeeds via /bin/sh, so the cursor never
-    // baselines) and the source quietly no-ops. The cursor advances only after a clean
-    // read, so a throw mid-loop re-polls the same window next tick.
+    // journalctl is a runtime shell-out. The cursor advances only after a clean read, so a
+    // throw mid-loop re-polls the same window next tick; and if journalctl exits non-zero
+    // (the cursor rotated out of the journal, or a `timeout`-killed wedge), the cursor is
+    // dropped and re-baselined — without that, a stale cursor would silently never match
+    // again (permanent silence). A quiet poll with no new entries exits 0, so it keeps its
+    // cursor.
     void poll_journald() {
         // Evict debounce entries older than the window FIRST, every cycle (the
         // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_):
@@ -305,12 +367,7 @@ private:
         journal_debounce_.evict_stale(now);
 
         if (journal_cursor_.empty()) {
-            // First poll: seed the cursor at the journal tail and emit NOTHING (no
-            // history replay). drain advances journal_cursor_; its observations are
-            // deliberately DISCARDED so a crash/OOM that happens to be the tail entry
-            // is not re-reported as a fresh event at arm.
-            if (const PipeHandle p = open_pipe(lnx::journald_baseline_query()))
-                (void)lnx::drain_journal_pipe(p.get(), journal_cursor_);
+            seed_journal_cursor(); // arm-time seed missed (non-systemd / transient) — retry
             return;
         }
 
@@ -319,7 +376,7 @@ private:
             journal_cursor_.clear(); // cursor held a quote (never happens for a real
             return;                  // __CURSOR) — drop it and re-baseline next tick
         }
-        const PipeHandle pipe = open_pipe(*cmd);
+        Pipe pipe = open_pipe(*cmd);
         if (!pipe) {
             spdlog::warn("dex_observer(linux): popen(journalctl) failed — journald poll skipped");
             return;
@@ -327,9 +384,20 @@ private:
         // drain advances journal_cursor_ to the newest entry it reads; a throw or short
         // read leaves it at the last good line, so the same window is re-polled. The
         // debounce collapses a flapping unit/process to one observation per window.
-        for (auto& obs : lnx::drain_journal_pipe(pipe.get(), journal_cursor_))
+        auto observations = lnx::drain_journal_pipe(pipe.get(), journal_cursor_);
+        const int rc = pipe.close(); // exit status AFTER draining stdout to EOF
+        // Emit whatever was read FIRST (a timeout mid-read still yields real events),
+        // then re-baseline on a non-zero exit so a cursor the journal rotated past does
+        // not wedge the source in permanent silence.
+        for (auto& obs : observations)
             if (journal_debounce_.should_emit(obs.obs_type, obs.subject, now))
                 emit(std::move(obs));
+        if (rc != 0) {
+            spdlog::warn(
+                "dex_observer(linux): journalctl exited {} — dropping journald cursor to re-baseline",
+                rc);
+            journal_cursor_.clear();
+        }
     }
 
     // os.uptime_report — the cross-platform uptime/reboot heartbeat (the Windows
@@ -350,10 +418,22 @@ private:
     }
 
     // Stamp platform + delivery time centrally (an empty platform would vanish from
-    // the by-OS panel; "linux" is the render token, matching dex_routes os_label).
+    // the by-OS panel; "linux" is the render token, matching dex_routes os_label),
+    // then enforce the per-obs_type hourly cap before the sink — a crash-looping
+    // process or flapping unit (which the debounce only collapses to one-per-window,
+    // not one-per-hour) must not flood the wire (be kind to the network, the parity
+    // of the Windows/macOS collectors which both cap). The cap keys off the catalogue
+    // (process.crashed=120, memory.exhausted=12, os.uptime_report=4, …; 60 default).
+    // Bucketed on the wall-clock timestamp just stamped above, matching macOS.
     void emit(SignalObservation obs) {
         obs.platform = "linux";
         obs.timestamp_unix = now_unix();
+        const RateDecision decision = rate_limiter_.check(obs.obs_type, obs.timestamp_unix);
+        if (decision == RateDecision::DropAndWarn)
+            spdlog::warn("dex_observer(linux): {}/hour cap reached for {} — dropping until next hour",
+                         dex_obs_cap_per_hour(obs.obs_type), obs.obs_type);
+        if (decision != RateDecision::Emit)
+            return; // over cap this hour — drop
         spdlog::info("dex_observer(linux): observed {} subject='{}' reason={}", obs.obs_type,
                      obs.subject, obs.reason);
         try {
@@ -386,6 +466,7 @@ private:
     std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
     std::string journal_cursor_;                              // "" until baselined at the journal tail
     lnx::JournalDebounce journal_debounce_{kJournaldDebounceSeconds}; // per-(type,subject) flap collapse
+    DexRateLimiter rate_limiter_;                             // per-obs_type hourly emit cap (all sources)
 };
 
 } // namespace

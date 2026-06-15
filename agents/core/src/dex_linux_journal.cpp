@@ -55,7 +55,11 @@ std::string oom_victim_comm(std::string_view msg) {
     const auto lp = msg.find('(', p);
     if (lp == std::string_view::npos)
         return {};
-    const auto rp = msg.find(')', lp);
+    // A comm can itself contain ')', and the kernel wraps the WHOLE comm in one
+    // "(…)" immediately followed by the un-parenthesised memory stats ("total-vm:…"),
+    // so the comm's closer is the LAST ')' in the line — rfind, not find, or a comm
+    // like "(ba)sh" truncates to "ba". (The stats tail carries no parentheses.)
+    const auto rp = msg.rfind(')');
     if (rp == std::string_view::npos || rp <= lp + 1)
         return {};
     return std::string(msg.substr(lp + 1, rp - lp - 1));
@@ -107,11 +111,22 @@ JournalLine parse_journal_line(std::string_view line) {
         return out;
     }
 
-    // ── systemd unit entered failed state → service.crashed ──────────────────
-    // Covers both a running service dying and a start that failed (both end in the
-    // failed state, one canonical UNIT_FAILED entry each). UNIT_RESULT (exit-code /
-    // signal / core-dump / timeout / oom-kill) is the reason when present; absent →
-    // empty reason (still a valid observation).
+    // ── systemd unit failed → service.crashed ───────────────────────────────
+    // EMPIRICAL (systemd 259, live capture): the "<unit>: Failed with result 'X'."
+    // entry (kMsgIdUnitResult / d9b373ed) is the carrier — it fires for BOTH a
+    // running service that dies AND a service that fails to start (bad ExecStart,
+    // bad WorkingDirectory). SD_MESSAGE_UNIT_FAILED (be02) did NOT appear in any
+    // tested crash/start-fail case, but it is kept in the match as defensive cover
+    // for paths not exercised (oneshot units, start-limit-hit, dependency failure).
+    //
+    // Both map to service.crashed — NOT split into service.crashed vs
+    // service.start_failed — because the two are indistinguishable by MESSAGE_ID
+    // (d9b3 carries both), and the only start-fail discriminator (the "Failed at
+    // step EXEC/CHDIR" SPAWN_FAILED entry) is a SEPARATE record that co-occurs with
+    // d9b3, so mapping it too would emit two observations for one failure. Splitting
+    // would need cross-entry correlation, which this stateless one-entry-per-failure
+    // classifier deliberately avoids. UNIT_RESULT (exit-code / signal / core-dump /
+    // timeout / oom-kill) is the reason when present; absent → empty reason.
     if (mid == kMsgIdUnitFailed || mid == kMsgIdUnitResult) {
         const std::string unit = jstr(j, "UNIT");
         if (unit.empty())
