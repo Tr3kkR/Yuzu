@@ -151,13 +151,17 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
     h += "</div>";
     h += "<div class=\"gp-note\"><b>Linux</b> reports these from netlink "
          "<span style=\"font-family:var(--mono)\">TCP_INFO</span> + "
-         "<span style=\"font-family:var(--mono)\">/proc/net/dev</span>; <b>Windows and macOS emit "
-         "nothing yet</b> (their collectors are later slices), so this reflects the Linux fleet. "
+         "<span style=\"font-family:var(--mono)\">/proc/net/dev</span>. <b>Windows</b> reports "
+         "throughput (<span style=\"font-family:var(--mono)\">GetIfTable2</span>) + an interval "
+         "retransmit rate (<span style=\"font-family:var(--mono)\">GetTcpStatisticsEx</span> &mdash; "
+         "system-wide, so it includes loopback and is not yet loss-validated) but <b>not RTT yet</b> "
+         "(per-connection RTT needs ESTATS, a later slice). <b>macOS emits nothing yet.</b> "
          "<b>Retransmission</b> is an interval rate &mdash; &Delta;retransmits / &Delta;segments "
          "smoothed over the last few heartbeats (the lifetime ratio is diluted to noise; the interval "
-         "delta cleanly recovers the real rate). <b>RTT is coarse</b> &mdash; a device-aggregate "
-         "median blended across loopback/LAN/internet connections (a rough signal, not per-flow "
-         "truth; per-destination latency is a later slice). Absent is never averaged in as zero. "
+         "delta cleanly recovers the real rate). <b>RTT</b> (Linux only today) is coarse &mdash; a "
+         "device-aggregate median blended across loopback/LAN/internet connections (a rough signal, "
+         "not per-flow truth; per-destination latency is a later slice). Absent is never averaged in "
+         "as zero. "
          "Same numbers as the "
          "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges.</div>";
 

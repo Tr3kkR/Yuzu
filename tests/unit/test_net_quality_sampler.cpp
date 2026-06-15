@@ -94,3 +94,10 @@ TEST_CASE("RetransWindow: a clean link reads ~0 across the window", "[netq]") {
     REQUIRE(w.rate_pct().has_value());
     CHECK(*w.rate_pct() == Catch::Approx(0.0)); // no false positive on a clean link
 }
+
+// NOTE: the Windows platform reads (GetIfTable2 throughput + GetTcpStatisticsEx
+// retransmit counters) are deliberately NOT unit-tested here — like the Linux
+// netlink path, they are non-exported syscall functions verified EMPIRICALLY on a
+// live rig (the heartbeat ships yuzu.net_throughput_bps + net_retrans_pct →
+// yuzu_fleet_net_* gauges). Only the cross-platform, deterministic helpers above
+// (median / throughput_bps / RetransWindow) are unit-tested.

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Windows network-quality collection.** The agent now emits network facts on
+  Windows, not only Linux: device throughput via `GetIfTable2` and a system-wide
+  interval retransmit rate via `GetTcpStatisticsEx` (fed through the same
+  `RetransWindow` ΔΣretrans/ΔΣsegs model as Linux). RTT stays unimplemented on
+  Windows — per-connection smoothed RTT needs ESTATS
+  (`GetPerTcpConnectionEStats`: enable + admin + overhead), a deferred slice. Two
+  honest caveats: the Windows retransmit counter is **system-wide** (no
+  per-interface TCP MIB, so it includes loopback) and is **measurement-first,
+  unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
+  The `/network` dashboard and `yuzu_fleet_net_*` gauges now populate on a
+  Windows-only fleet. See `docs/user-manual/network.md`.
+- **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
+  per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
+  macOS, each row citing its in-code source of truth — so a platform gap (such as
+  the previously Linux-only network collector) is visible in one place. Flags the
+  durable follow-up: generate the matrix from the existing machine-readable per-OS
+  metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
+  signal catalogue) rather than hand-maintaining it.
 - **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
   under DEX (the Network tab in the DEX sub-nav, also reachable directly at
   `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP

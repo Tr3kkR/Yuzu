@@ -85,15 +85,23 @@ device/app facts flagged inline. Each row links to the device drill-down.
 
 | Platform | RTT | Retransmit | Throughput |
 |---|---|---|---|
-| Linux | Full — netlink `INET_DIAG` per-connection `TCP_INFO` | Yes | Yes (`/proc/net/dev`) |
-| Windows | Not yet | Not yet | Not yet |
+| Linux | Full — netlink `INET_DIAG` per-connection `TCP_INFO` | Yes — per-connection sum | Yes (`/proc/net/dev`) |
+| Windows | **Not yet** (needs ESTATS) | Yes — `GetTcpStatisticsEx` (system-wide; see caveat) | Yes (`GetIfTable2`) |
 | macOS | Not yet | Not yet | Not yet |
 
-**Today only Linux agents emit network facts.** Windows and macOS agents emit
-*nothing* yet — their collectors are later slices (the Windows ESTATS-vs-ETW
-mechanism is a spike) — so the dashboard currently reflects the Linux fleet.
-Absent metrics are always omitted from rollups; a device that does not report a
-metric is excluded from that metric's denominator, never counted as zero.
+**Linux and Windows agents emit network facts; macOS does not yet.** Windows
+reports device throughput (`GetIfTable2`) and an interval retransmit rate
+(`GetTcpStatisticsEx`) but **not RTT** — per-connection smoothed RTT needs ESTATS
+(`GetPerTcpConnectionEStats`: per-connection enable + admin + overhead), a
+deferred slice. **Two caveats on the Windows retransmit rate:** (1) the counter
+is **system-wide** — Windows exposes no per-interface TCP retransmit MIB, so it
+*includes loopback* and cannot be scoped to real interfaces; (2) it is
+**measurement-first, unvalidated on Windows** — the interval-delta signal's
+separation-under-loss was validated under `netem` on Linux only, and on a
+loopback-dominated host (e.g. a single-box UAT rig) it dilutes toward ~0. macOS
+agents emit *nothing* yet (a later slice). Absent metrics are always omitted from
+rollups; a device that does not report a metric is excluded from that metric's
+denominator, never counted as zero.
 
 ## Collection & privacy
 
