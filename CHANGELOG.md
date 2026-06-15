@@ -38,6 +38,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within the unreleased cycle (absolute lifetime ratio → interval delta) and
   `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
   Prometheus alerts built on the earlier 4a semantics.
+- **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
+  `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
+  ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
+  (which the poll misses entirely) are captured — with exact timestamps and exit
+  codes. Same `process_live` schema and `$Process_*` query surface and the same
+  `started`/`stopped` rollups — but the Windows `cmdline` column is now **empty**
+  (see Breaking Changes). Events are **names-only** (no command
+  line); the owning user is resolved from the process SID at start (best-effort,
+  empty for processes that exit faster than the ~1 s buffer flush — the same
+  limit the poll had). The poll remains the feeder on Linux/macOS and the Windows
+  fallback if the ETW session cannot start. The **boot window** (processes that
+  start *and* exit before the agent's live session opens) is backfilled from a
+  boot **AutoLogger** — a circular, FlushTimer-enabled Kernel-Process `.etl`
+  configured by `install-agent-user.ps1` (admin, install-time) and started by the
+  kernel early each boot; the agent reads it directly at startup for events
+  before its live session began (no session stop / no elevation — read access
+  only), de-duplicated per boot. Boot-window events are names-only with no user
+  (the start event carries only SessionID + integrity label; precise attribution
+  would need the Security-Auditing 4688 provider). `process_live` raw cap raised
+  5k→100k for the higher event rate; disk stays bounded (count rollups carry the
+  long tail). `install-agent-user.ps1` is now UTF-8-BOM-encoded so Windows
+  PowerShell 5.1 parses it (it has non-ASCII characters). Disabling the
+  `process` source drains-and-discards the live ETW ring each cycle, so a paused
+  window is never persisted on re-enable (forensic-pause contract); the
+  boot-backfill replay is memory-bounded and drops corrupt-timestamp / torn
+  records.
 
 ### Changed
 
@@ -68,6 +94,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Windows TAR process events no longer carry a command line (`cmdline` is
+  empty).** With the Windows `process` source moving from the snapshot-diff poll
+  to the ETW Kernel-Process feeder (see Added), process rows on Windows are
+  names-only — the ETW start event carries no command line. Any dashboard, SIEM
+  export, `tar.sql` query, or Guardian rule that read `cmdline` from
+  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
+  (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not reversible by
+  configuration; `process_enabled=false` disables Windows process capture
+  entirely (ETW and poll) if required. Command-line redaction patterns
+  consequently have no effect on Windows process rows (there is nothing to
+  redact). The boot-window AutoLogger backfill is configured only by the
+  developer install script today, **not** the production InnoSetup installer —
+  packaged Windows installs get live ETW capture but no boot-window backfill
+  until that wiring lands (tracked follow-up). See
+  `docs/user-manual/tar.md` "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
@@ -153,6 +195,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian: Linux systemd service guard (observe-only).** The
+  `service-status-change` Guardian Spark now arms on Linux hosts with systemd,
+  watching each unit's `ActiveState` over sd-bus (`Subscribe` + `PropertiesChanged`
+  match + a bounded reconcile backstop) and emitting `drift.detected` events with
+  `platform=linux`, matching the Windows SCM guard's event shape — both service
+  guards are silent on the compliant edge (neither emits `guard.compliant`).
+  systemd's richer `ActiveState` collapses onto the published
+  `{running, stopped}` tokens with no schema change. **Observe-only in this
+  release:** drift is detected and reported but not remediated — enforcement
+  (mask/stop) is gated behind a forthcoming, governance-reviewed change, and an
+  `enforcement_mode: enforce` rule on a Linux agent degrades to observe without
+  error. Non-systemd Linux hosts (no system D-Bus) degrade gracefully: the guard
+  does not arm and the rule reports unarmed rather than compliant. The watch
+  reconnects automatically after a `systemctl daemon-reexec` / dbus restart.
+  **Build/runtime dependency on Linux agents:** `libsystemd` — build `libsystemd-dev`
+  (`systemd-devel` on RHEL/Fedora), runtime `libsystemd.so.0` (`libsystemd0` /
+  `systemd-libs`). The default build (`-Dsystemd_guard=enabled`) **requires** it so the
+  shipped agent always offers the guard — a build that has lost libsystemd fails loudly
+  rather than silently shipping a guard-less agent; the shipped `Dockerfile.agent`,
+  `Dockerfile.agent.chisel`, and the asan/tsan images install it and keep that default.
+  Pass `-Dsystemd_guard=auto` (use if present) or `disabled` to build the guard as a
+  no-op stub on musl/Alpine/non-systemd/minimal images that lack libsystemd.
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
   Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
   default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
@@ -1097,7 +1161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other store-down guard so message-grep alerting stays unified. The
   identical-404 anti-enumeration response for not-found vs not-owner is
   unchanged. Mid-request I/O errors on a connection that opened successfully
-  are tracked as #1383.
+  are tracked as #1383. *Integration note:* automation that treated `404` from
+  these endpoints as "token not found" must now also handle `503` as a distinct
+  storage-failure signal. (The same store-availability gate is still missing on
+  the device-token routes and dashboard token create/revoke — tracked as #1382.)
 - **SSE channel GC no longer aborts the server (#1198).** `gc_terminal_channels()`
   destroyed each collected execution channel — and the `std::mutex` inside it —
   while a `lock_guard` still owned that mutex: the channel map held the only
@@ -1109,6 +1176,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention window triggered the bad path on the next publish-driven GC sweep.
   Fixed by pinning each victim with an extra `shared_ptr` and deferring
   destruction until all per-channel locks are released.
+- **MCP prompt arguments are now framed as untrusted data (security, #656).**
+  `prompts/get` previously interpolated caller-supplied string arguments
+  (`agent_id`, `policy_id`, `principal`) directly into the generated prompt
+  text, so a hostile agent hostname, policy id, or principal name could inject
+  instructions the AI assistant would act on. Each string argument is now
+  JSON-escaped and wrapped in `BEGIN_UNTRUSTED_MCP_ARGUMENT` /
+  `END_UNTRUSTED_MCP_ARGUMENT` sentinels with an explicit data-only directive;
+  the escaping keeps the value on one line so the end sentinel cannot be forged.
+  These markers are part of the `prompts/get` response shape — clients that
+  display prompt text will see them (see `docs/user-manual/mcp.md` →
+  Prompt-injection hardening).
 - **Agents enrolling *through the gateway* now receive a per-agent client
   certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
   per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the
