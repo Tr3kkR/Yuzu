@@ -1,5 +1,7 @@
 #include "dex_linux_journal.hpp"
 
+#include "dex_linux_kmsg.hpp" // classify_kernel_message — all _TRANSPORT=kernel free-text markers
+
 #include <nlohmann/json.hpp>
 
 #include <charconv>
@@ -36,33 +38,6 @@ std::optional<int> to_int(std::string_view s) {
     if (ec != std::errc{} || p != end)
         return std::nullopt;
     return v;
-}
-
-// Kernel OOM-killer line: the killed comm in parentheses, or "" if `msg` is not an
-// OOM-kill line. Two real formats must both match (live-verified on a cgroup-v2 host):
-//   system-wide:  "Out of memory: Killed process 1234 (comm) total-vm:…"
-//   cgroup limit: "Memory cgroup out of memory: Killed process 1234 (comm) total-vm:…"
-// On modern systemd every service runs in a cgroup, so the cgroup form is the COMMON
-// case — the marker is the case-sensitive substring shared by both ("of memory: Killed
-// process "), never the leading "Out " (which the cgroup form lower-cases mid-sentence).
-// Only the comm is taken — the memory figures and the cgroup path (a separate "Memory
-// cgroup stats for …" line that does NOT match this marker) are never shipped.
-std::string oom_victim_comm(std::string_view msg) {
-    constexpr std::string_view kMark = "of memory: Killed process ";
-    const auto p = msg.find(kMark);
-    if (p == std::string_view::npos)
-        return {};
-    const auto lp = msg.find('(', p);
-    if (lp == std::string_view::npos)
-        return {};
-    // A comm can itself contain ')', and the kernel wraps the WHOLE comm in one
-    // "(…)" immediately followed by the un-parenthesised memory stats ("total-vm:…"),
-    // so the comm's closer is the LAST ')' in the line — rfind, not find, or a comm
-    // like "(ba)sh" truncates to "ba". (The stats tail carries no parentheses.)
-    const auto rp = msg.rfind(')');
-    if (rp == std::string_view::npos || rp <= lp + 1)
-        return {};
-    return std::string(msg.substr(lp + 1, rp - lp - 1));
 }
 
 } // namespace
@@ -131,31 +106,58 @@ JournalLine parse_journal_line(std::string_view line) {
         const std::string unit = jstr(j, "UNIT");
         if (unit.empty())
             return out;
+        const std::string result = jstr(j, "UNIT_RESULT");
         SignalObservation o;
-        o.obs_type = "service.crashed";
         o.subject = unit;
         o.kind = "unit";
-        o.reason = jstr(j, "UNIT_RESULT");
-        o.sentence =
-            unit + " failed" + (o.reason.empty() ? std::string{} : " (result: " + o.reason + ")");
+        o.reason = result;
+        // A WatchdogSec timeout (UNIT_RESULT="watchdog", live-verified) means the
+        // service stopped pinging the watchdog and systemd killed it — that is a HANG,
+        // not an ordinary crash, so it routes to service.hung. Every other result
+        // (exit-code / signal / core-dump / timeout / oom-kill) stays service.crashed.
+        // ONE entry, routed by result — no double-emit, no new MESSAGE_ID, no query change.
+        if (result == "watchdog") {
+            o.obs_type = "service.hung";
+            o.kind = "hang";
+            o.sentence = unit + " hung (watchdog timeout)";
+        } else {
+            o.obs_type = "service.crashed";
+            o.sentence =
+                unit + " failed" + (result.empty() ? std::string{} : " (result: " + result + ")");
+        }
         out.obs = std::move(o);
         return out;
     }
 
-    // ── kernel OOM-killer → memory.exhausted ─────────────────────────────────
-    // No stable MESSAGE_ID (it is a kernel ring-buffer message), so identify by the
-    // kernel transport + the OOM text; only the killed comm is taken.
+    // ── kernel ring-buffer line → free-text marker classification ────────────
+    // Kernel messages carry no stable MESSAGE_ID, so every _TRANSPORT=kernel line is
+    // classified by anchored substring markers in dex_linux_kmsg (OOM-killer, fatal
+    // panic, MCE, disk/fs errors, journal recovery, hung-task). A line matching no
+    // marker advances the cursor with no observation.
     if (jstr(j, "_TRANSPORT") == "kernel") {
-        const std::string victim = oom_victim_comm(jstr(j, "MESSAGE"));
-        if (!victim.empty()) {
+        out.obs = classify_kernel_message(jstr(j, "MESSAGE"));
+        return out;
+    }
+
+    // ── chronyd clock-unsynchronised → os.time_unsynced ──────────────────────
+    // chrony logs free text (no MESSAGE_ID); the query fetches SYSLOG_IDENTIFIER=chronyd
+    // and we classify ONLY the genuine "clock is not synchronised" markers
+    // (live-captured: "Can't synchronise: no selectable sources"; plus chrony's
+    // large-step message). The frequent "Source … online/offline" lines produce NO
+    // observation — the cursor still advances. The raw MESSAGE can carry NTP source IPs,
+    // so it is NEVER shipped — a fixed sentence + subject "clock" only.
+    if (jstr(j, "SYSLOG_IDENTIFIER") == "chronyd") {
+        const std::string m = jstr(j, "MESSAGE");
+        if (m.find("Can't synchronise: no selectable sources") != std::string::npos ||
+            m.find("System clock wrong by") != std::string::npos) {
             SignalObservation o;
-            o.obs_type = "memory.exhausted";
-            o.subject = victim;
-            o.reason = "oom-kill";
-            o.sentence = "Out of memory: kernel killed " + victim;
+            o.obs_type = "os.time_unsynced";
+            o.subject = "clock";
+            o.reason = "unsynced";
+            o.sentence = "System clock not synchronised";
             out.obs = std::move(o);
         }
-        return out; // a non-OOM kernel line: cursor advances, no observation
+        return out;
     }
 
     return out;
@@ -196,7 +198,11 @@ std::optional<std::string> build_journald_after_cursor_query(std::string_view cu
     cmd.append(kMsgIdUnitFailed);
     cmd += " MESSAGE_ID=";
     cmd.append(kMsgIdUnitResult);
-    cmd += " + _TRANSPORT=kernel 2>/dev/null";
+    // `+` is journalctl's OR: (the reliability MESSAGE_IDs) OR (all kernel-transport
+    // lines, classified in dex_linux_kmsg) OR (all chronyd lines, of which only the
+    // clock-unsynchronised markers map to an observation). chronyd is a low-volume
+    // daemon, so the extra fetch is negligible (be kind to the endpoint).
+    cmd += " + _TRANSPORT=kernel + SYSLOG_IDENTIFIER=chronyd 2>/dev/null";
     return cmd;
 }
 

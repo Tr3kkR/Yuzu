@@ -116,6 +116,36 @@ YUZU_EXPORT std::string device_label(std::string_view device);
 /// signal enabled — fail-safe toward keeping the signal, not suppressing it).
 YUZU_EXPORT bool overcommit_is_always(std::string_view proc_overcommit_memory);
 
+/// Aggregate completed-I/O count + busy time over the real WHOLE disks, from
+/// /proc/diskstats. The Linux analogue of the Windows IOCTL_DISK_PERFORMANCE
+/// disk-latency counters: `time_ms` is read-time + write-time (already in ms,
+/// fields 7 + 11), `ios` is reads-completed + writes-completed (fields 4 + 8).
+struct DiskIoTotals {
+    bool valid{false};
+    std::uint64_t ios{0};     ///< reads + writes completed, summed over whole disks
+    std::uint64_t time_ms{0}; ///< ms spent reading + writing, summed
+};
+
+/// PURE: true iff `name` is a real WHOLE physical disk worth a latency reading —
+/// sd*/vd*/xvd*/hd* (a trailing letter, not a partition digit), nvmeXnY (no `p`
+/// partition suffix), mmcblkN (no `p`). Excludes partitions (would double-count
+/// against their parent), loop/ram/zram/sr/fd pseudo devices, and dm-*/md*/nbd*
+/// aggregates (their stats roll up their members → double-count). Exposed for tests.
+YUZU_EXPORT bool is_whole_disk(std::string_view name);
+
+/// PURE: sum the completed-I/O and busy-time counters over the whole disks in
+/// /proc/diskstats. valid=false only if no whole disk parsed (so a malformed file
+/// re-baselines rather than reading a healthy 0 — the cpu_busy_pct contract).
+YUZU_EXPORT DiskIoTotals parse_diskstats(std::string_view proc_diskstats);
+
+/// PURE: average service time (ms per completed I/O) over the interval between two
+/// readings — the iostat `await` shape. nullopt when either reading is invalid or a
+/// counter regressed (reboot / disk hotplug). An interval with ZERO completed I/Os
+/// derives 0.0 — an idle disk is healthy, not slow (the Windows disk-latency
+/// contract). Feeds win::breach_update with win::kDiskLatBreach (same 25 ms
+/// threshold + hysteresis as Windows), so a slow Linux disk renders identically.
+YUZU_EXPORT std::optional<double> disk_await_ms(const DiskIoTotals& prev, const DiskIoTotals& cur);
+
 /// PURE: uptime in seconds from /proc/uptime (its first token). nullopt when the
 /// content has no leading number, or it is non-finite/negative/implausibly large
 /// (≥ 1e12 s — the caller casts to int64, so an out-of-range value would be UB on the

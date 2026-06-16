@@ -270,6 +270,63 @@ bool overcommit_is_always(std::string_view s) {
     return s.substr(start, i - start) == "1";
 }
 
+bool is_whole_disk(std::string_view name) {
+    // Pseudo / aggregate / removable-optical devices and software-RAID/LVM/crypt
+    // mappers are never a real physical disk for a latency reading (md/dm/nbd roll
+    // their members' I/O up → double-count; loop/ram/zram/sr/fd are not disks).
+    for (const std::string_view pfx : {"loop", "ram", "zram", "sr", "fd", "dm-", "md", "nbd"})
+        if (name.starts_with(pfx))
+            return false;
+    // nvme: whole disk is nvmeXnY; a partition is nvmeXnYpZ (has a 'p').
+    if (name.starts_with("nvme"))
+        return name.find('n') != std::string_view::npos && name.find('p') == std::string_view::npos;
+    // mmcblk: whole disk mmcblkN; partition mmcblkNpM (has a 'p').
+    if (name.starts_with("mmcblk"))
+        return name.find('p') == std::string_view::npos;
+    // sd/vd/xvd/hd: a whole disk ends in a LETTER ("sda"); a partition ends in a
+    // DIGIT ("sda1").
+    for (const std::string_view pfx : {"sd", "vd", "xvd", "hd"})
+        if (name.starts_with(pfx))
+            return !name.empty() && !(name.back() >= '0' && name.back() <= '9');
+    return false; // unknown device kind — exclude, never count an unexpected source
+}
+
+DiskIoTotals parse_diskstats(std::string_view proc_diskstats) {
+    DiskIoTotals out;
+    for_each_line(proc_diskstats, [&](std::string_view line) {
+        // Fields: major minor name reads_completed reads_merged sectors_read
+        // ms_reading writes_completed writes_merged sectors_written ms_writing …
+        std::array<std::string_view, 11> f{};
+        int n = 0;
+        for_each_token(line, [&](std::string_view tok) {
+            if (n < 11)
+                f[static_cast<std::size_t>(n)] = tok;
+            ++n;
+        });
+        if (n < 11 || !is_whole_disk(f[2]))
+            return;
+        const auto reads = to_u64(f[3]), ms_read = to_u64(f[6]);
+        const auto writes = to_u64(f[7]), ms_write = to_u64(f[10]);
+        if (!reads || !ms_read || !writes || !ms_write)
+            return; // a malformed row is skipped, never poisons the aggregate
+        out.ios += *reads + *writes;
+        out.time_ms += *ms_read + *ms_write;
+        out.valid = true; // at least one whole disk parsed
+    });
+    return out;
+}
+
+std::optional<double> disk_await_ms(const DiskIoTotals& prev, const DiskIoTotals& cur) {
+    if (!prev.valid || !cur.valid)
+        return std::nullopt;
+    if (cur.ios < prev.ios || cur.time_ms < prev.time_ms)
+        return std::nullopt; // counter regression (reboot / hotplug) — re-baseline
+    const std::uint64_t dios = cur.ios - prev.ios;
+    if (dios == 0)
+        return 0.0; // no I/O this interval — an idle disk is healthy, not slow
+    return static_cast<double>(cur.time_ms - prev.time_ms) / static_cast<double>(dios);
+}
+
 std::optional<double> parse_proc_uptime(std::string_view proc_uptime) {
     // /proc/uptime: "<uptime_seconds> <idle_seconds>" — take the first token.
     // strtod needs a NUL-terminated buffer and is exception-free (unlike stod); a
