@@ -286,6 +286,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

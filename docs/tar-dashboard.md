@@ -91,6 +91,8 @@ The source of truth is the agent's `tar_config` table — the `<source>_enabled`
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.
 
+**Tri-state enabled values + dedup (#560/#558/#561).** The `<source>_enabled` value is read as a tri-state: `true` → dropped (collecting normally); `false` → normal paused row; **any other value** (`errored` from a corrupt/tampered agent DB, or garbage) → a **value-error badge** row showing the reported value (it is NOT silently dropped — that would hide a paused/broken source). A disabled source with `paused_at == 0` (a pre-v0.12.0 agent) renders a **"schema older than server" badge** and sorts as the oldest (top), instead of a bare `—` sunk to the bottom. Both value-error and unknown-`paused_at` rows float to the top. Before parsing, responses are **deduplicated to the most-recent per agent by the server-stamped `received_at_ms`** (never the agent-claimed `timestamp`, which a compromised agent could backdate to hide its state) — bounding render cost to O(agents × sources) against a response-spam DoS. The complementary store-side per-`(command_id, agent_id)` cap is a tracked follow-up.
+
 This avoids a new persistent server-side mirror, which would have to be reconciled with agent state on every config change. The trade-off is a 5-15s page-load cost on a large fleet; mitigated by:
 - Scope-restricted queries (the operator usually narrows first via a result set)
 - Manual **Refresh** button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
