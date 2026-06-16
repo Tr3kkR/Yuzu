@@ -23,6 +23,9 @@ This wizard walks you through a step-by-step configuration and generates a produ
 | Port conflicts detected | Wizard warns about common conflicts |
 | Hardcoded passwords | All credentials configurable, with production warnings |
 | No `.env` separation | Generated `.env` file separates config from compose |
+| TLS was all-or-files | Three-way TLS mode: **Default certs** (server auto-generates a per-install CA + leaf certs on first boot — encrypted-by-default, no files), **Operator certs** (`--cert`/`--key` + optional `--ca-cert`, bind-mounted from `./certs`), or **Plaintext** (`--no-tls --no-https`, dev only) |
+| Default certs not persisted | Default mode mounts a volume at `/etc/yuzu/certs` so the auto-generated CA survives a recreate — otherwise every `down && up` mints a fresh CA and breaks enrolled-agent trust |
+| Gateway hostname not in cert SANs | When the gateway is enabled, `--cert-san dns:gateway` is injected automatically so agents dialing the gateway by name pass hostname validation (PKI PR5b gateway-edge requirement); operators can add their own server hostname/IP too |
 
 ## Usage
 

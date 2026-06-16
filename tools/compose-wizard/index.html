@@ -96,20 +96,85 @@
         </div>
 
         <div class="field">
-          <label>
-            <input type="checkbox" id="enable-tls"> Enable TLS
-          </label>
-          <small>⚠️ TLS requires cert/key paths and is not recommended for local testing.</small>
+          <label for="tls-mode">TLS / Certificates</label>
+          <select id="tls-mode">
+            <option value="default" selected>Default certs — server auto-generates a per-install CA + certs on first boot (recommended)</option>
+            <option value="operator">Operator certs — supply your own PEM cert/key (optional CA for mTLS)</option>
+            <option value="plaintext">Plaintext — disable TLS/HTTPS (local dev only)</option>
+          </select>
+          <small>As of v0.12 the server is encrypted-by-default: leave this on <em>Default certs</em> and it mints a per-install CA + leaf certs on first boot — no files needed.</small>
         </div>
 
-        <div class="field tls-field" style="display:none">
-          <label for="tls-cert">Certificate Path</label>
-          <input type="text" id="tls-cert" placeholder="/path/to/cert.pem">
-        </div>
-        <div class="field tls-field" style="display:none">
-          <label for="tls-key">Key Path</label>
-          <input type="text" id="tls-key" placeholder="/path/to/key.pem">
-        </div>
+        <!-- ── Default certs (server auto-generates) ───────────────────────── -->
+        <fieldset class="tls-group" id="tls-default-fields">
+          <legend>Default Certificates</legend>
+
+          <div class="callout info">
+            The server generates a per-install CA and the https/agent/gateway leaf
+            certs on first boot (<code>ensure_default_certs</code>). Nothing to supply.
+            The cert directory is persisted (see below) so the CA survives a
+            <code>docker compose down &amp;&amp; up</code> — otherwise every recreate
+            mints a fresh CA and breaks already-enrolled agents' trust.
+          </div>
+
+          <div class="field">
+            <label for="cert-san">Extra Subject Alternative Names (<code>--cert-san</code>)</label>
+            <input type="text" id="cert-san" placeholder="dns:yuzu.example.com, ip:203.0.113.10">
+            <small>
+              Comma-separated. Added to the auto-generated leaves so they validate
+              for the name/IP agents actually dial. Forms: <code>dns:&lt;name&gt;</code>,
+              <code>ip:&lt;addr&gt;</code>, or a bare value (auto-classified).
+              <strong>When the gateway is enabled, <code>dns:gateway</code> is added
+              automatically</strong> — add your public server hostname/IP here too if
+              agents reach the server directly.
+            </small>
+          </div>
+
+          <div class="field">
+            <label>
+              <input type="checkbox" id="persist-certs" checked> Persist generated certs across recreates
+            </label>
+            <small>Mounts a volume at <code>/etc/yuzu/certs</code> (the default cert dir). Strongly recommended — without it the CA is regenerated on every container recreate.</small>
+          </div>
+        </fieldset>
+
+        <!-- ── Operator-supplied certs ─────────────────────────────────────── -->
+        <fieldset class="tls-group" id="tls-operator-fields" style="display:none">
+          <legend>Operator Certificates</legend>
+
+          <div class="callout warning">
+            <strong>Mount your PEM material into the container.</strong> The paths below
+            are <em>container</em> paths; the wizard bind-mounts a host <code>./certs</code>
+            directory read-only at <code>/etc/yuzu/certs</code>. Put your files there, or
+            edit the mount in the generated compose.
+          </div>
+
+          <div class="field">
+            <label for="tls-cert">Certificate Path</label>
+            <input type="text" id="tls-cert" value="/etc/yuzu/certs/server.pem" placeholder="/etc/yuzu/certs/server.pem">
+          </div>
+          <div class="field">
+            <label for="tls-key">Key Path</label>
+            <input type="text" id="tls-key" value="/etc/yuzu/certs/server.key" placeholder="/etc/yuzu/certs/server.key">
+          </div>
+          <div class="field">
+            <label for="tls-ca-cert">CA Certificate Path (optional — enables mTLS agent verification)</label>
+            <input type="text" id="tls-ca-cert" placeholder="/etc/yuzu/certs/ca.pem">
+            <small>Leave blank to serve TLS without verifying agent client certs.</small>
+          </div>
+        </fieldset>
+
+        <!-- ── Plaintext (insecure) ────────────────────────────────────────── -->
+        <fieldset class="tls-group" id="tls-plaintext-fields" style="display:none">
+          <legend>Plaintext (insecure)</legend>
+
+          <div class="callout warning">
+            <strong>⚠️ Development only.</strong> Emits <code>--no-tls --no-https</code>,
+            overriding the secure-by-default behaviour. The agent↔server channel is
+            unencrypted — <strong>never internet-expose port 50051</strong> in this mode
+            (command fan-out = fleet-RCE risk).
+          </div>
+        </fieldset>
 
         <div class="actions">
           <button onclick="goStep(1)" class="btn">← Back</button>

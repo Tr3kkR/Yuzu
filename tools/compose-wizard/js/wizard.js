@@ -28,8 +28,11 @@ document.querySelectorAll('.step').forEach(btn => {
 });
 
 // Toggle visibility for optional sections
-document.getElementById('enable-tls').addEventListener('change', e => {
-  document.querySelectorAll('.tls-field').forEach(f => f.style.display = e.target.checked ? '' : 'none');
+document.getElementById('tls-mode').addEventListener('change', e => {
+  const mode = e.target.value;
+  document.getElementById('tls-default-fields').style.display = mode === 'default' ? '' : 'none';
+  document.getElementById('tls-operator-fields').style.display = mode === 'operator' ? '' : 'none';
+  document.getElementById('tls-plaintext-fields').style.display = mode === 'plaintext' ? '' : 'none';
 });
 
 document.getElementById('pg-mode').addEventListener('change', e => {
@@ -59,6 +62,12 @@ document.getElementById('include-gateway').addEventListener('change', e => {
 function val(id) { return document.getElementById(id).value.trim(); }
 function num(id) { return parseInt(document.getElementById(id).value) || 0; }
 function chk(id) { return document.getElementById(id).checked; }
+
+function tlsModeLabel(mode) {
+  if (mode === 'operator') return '🔐 Operator certs';
+  if (mode === 'plaintext') return '⚠️ Plaintext (insecure)';
+  return '✅ Default certs (auto-generated)';
+}
 
 // Fill a field with a cryptographically-random 24-byte hex secret. Used for
 // the Postgres credentials so operators can avoid weak / shared passwords —
@@ -153,7 +162,7 @@ function buildReview() {
     ['Admin User', val('admin-user')],
     ['Dashboard Port', num('dashboard-port')],
     ['Agent gRPC Port', num('grpc-port')],
-    ['TLS', chk('enable-tls') ? '✅ Enabled' : '❌ Disabled'],
+    ['TLS', tlsModeLabel(val('tls-mode'))],
     ['PostgreSQL', pgBundled ? '✅ Bundled container' : '🔗 External / managed'],
     ['ClickHouse', chk('include-clickhouse') ? '✅ Included' : '❌ Skipped'],
     ['Prometheus', chk('include-prometheus') ? '✅ Included' : '❌ Skipped'],
@@ -181,6 +190,18 @@ function buildReview() {
     }
   } else if (!val('pg-dsn')) {
     warnings.push('⚠️ External Postgres selected but no DSN supplied — the server will have no database to talk to.');
+  }
+
+  // TLS sanity checks
+  const tlsMode = val('tls-mode');
+  if (tlsMode === 'operator') {
+    if (!val('tls-cert') || !val('tls-key')) {
+      warnings.push('⚠️ Operator certs selected but the cert and/or key path is blank — supply both, or switch to Default certs.');
+    }
+  } else if (tlsMode === 'plaintext') {
+    warnings.push('⚠️ Plaintext TLS mode: the agent↔server channel is unencrypted (--no-tls --no-https). Dev only — do not internet-expose port 50051.');
+  } else if (tlsMode === 'default' && !chk('persist-certs')) {
+    warnings.push('ℹ️ Default certs without persistence: the per-install CA will be regenerated on every container recreate, breaking already-enrolled agents. Enable "Persist generated certs".');
   }
   const warnEl = document.getElementById('port-warnings');
   if (warnings.length) {
