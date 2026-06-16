@@ -79,22 +79,6 @@ function genSecret(id) {
     Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ── Admin password hash ──
-// Yuzu uses: username:password:salt in a specific format
-// Format: user:pass:salt_hash where salt_hash = sha256(username + ":" + password + ":" + salt)
-// The compose file uses a pre-computed hash. We'll note that users need to generate one.
-function computeAdminHash(user, pass) {
-  // The default in the original compose is:
-  // admin:admin:ab3585560da45a7b7da0a220c922dd72:25e957743ebefd48d938b30cdd117ef4487897da209e0e8883dd473363dceb8a
-  // This is user:salt:md5_of_salt:sha256_of_salt_pass
-  // For simplicity, we'll use a random salt and compute the hashes
-  // NOTE: In production, users should generate this via yuzu-server CLI
-  const salt = 'auto' + Math.random().toString(36).slice(2, 10);
-  // We can't do SHA-256 synchronously in browser without SubtleCrypto (async)
-  // So we'll provide a placeholder and a note
-  return `${user}:${pass}:${salt}:RUN_yuzu-server_hash_command`;
-}
-
 // ── Port conflict detection ──
 const COMMON_PORTS = {
   80: 'HTTP',

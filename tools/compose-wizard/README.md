@@ -26,6 +26,12 @@ This wizard walks you through a step-by-step configuration and generates a produ
 | TLS was all-or-files | Three-way TLS mode: **Default certs** (server auto-generates a per-install CA + leaf certs on first boot — encrypted-by-default, no files), **Operator certs** (`--cert`/`--key` + optional `--ca-cert`, bind-mounted from `./certs`), or **Plaintext** (`--no-tls --no-https`, dev only) |
 | Default certs not persisted | Default mode mounts a volume at `/etc/yuzu/certs` so the auto-generated CA survives a recreate — otherwise every `down && up` mints a fresh CA and breaks enrolled-agent trust |
 | Gateway hostname not in cert SANs | When the gateway is enabled, `--cert-san dns:gateway` is injected automatically so agents dialing the gateway by name pass hostname validation (PKI PR5b gateway-edge requirement); operators can add their own server hostname/IP too |
+| Gateway crash-loop on default cookie (#1483) | A unique `YUZU_GW_COOKIE` is generated into `.env` and referenced by the gateway service, so it doesn't fail-closed on the insecure default Erlang distribution cookie |
+| HTTPS served on 8443, wizard used 8080 (#1484) | In TLS modes the dashboard/API is published and health-checked on container port **8443** (8080 is the HTTP→HTTPS redirect); plaintext stays on 8080 |
+| Gateway↔server plaintext vs strict-mTLS upstream (#1485) | Default-certs + gateway now emits the secure topology: shared `/etc/yuzu/certs` volume, `--cert-group yuzu-pki`, `dns:server` SAN, and a `{https,...}` gateway sys.config (mutual-TLS upstream, one-way agent listener, strict-mTLS mgmt) — modelled on `deploy/docker/reference-gateway-sys.config`. Operator + gateway is blocked with guidance (interim) |
+| Gateway healthcheck used bash `/dev/tcp` (#1486) | The gateway image ships no bash/curl, so the probe always failed. Removed; the gateway now gates on `depends_on: server: service_healthy` instead |
+| Server healthcheck used `curl` (#1487) | The server image ships no curl. Replaced with a bash `/dev/tcp` TCP-connect probe on the real serving port (8443/8080), matching `docker-compose.uat.yml` |
+| Admin `admin:admin` hash didn't validate (#1488) | The admin credential row is now derived in-browser via SubtleCrypto **PBKDF2-HMAC-SHA256, 100k iters** for the password you enter — matching the server KDF, so login actually works (the old row put the password in the role field and shipped a stale hash) |
 
 ## Usage
 
