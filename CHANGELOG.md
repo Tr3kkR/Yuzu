@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+  populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
+  (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
+  code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
+  cached by file+mtime) and the loaded-image directory scrubbed of user-profile
+  prefixes before storage. Opt-in (`module_enabled`, default off; enabling takes
+  effect on the next collection tick — no restart). Signing uses the local
+  Authenticode chain **without online CRL/OCSP revocation checking** (no per-load
+  network I/O), so a revoked driver may read as `signed`; authoritative
+  revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
+  risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
+  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
+  Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
+  `docs/tar-module-loads.md`.
+- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
+  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  image-load activity (module name + directory + code-signing verdict) — the
+  DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
+  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
+  opt-in (`module_enabled`, default off). The process-stream ring is promoted to
+  a reusable `EventRing<T>` template (no behaviour change for the `process`
+  source), and `run_aggregation` is now data-driven over the capture-source
+  registry so a newly-registered source's rollups can no longer be silently
+  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
+- **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
+  The TAR `process` source on macOS now feeds from the Endpoint Security
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl
+  poll), reaching Windows-ETW parity: short-lived processes the poll missed are
+  captured, with accurate timestamps, ppid, image name, and owning user from the
+  audit token (names-only — no command line). Requires a **full Xcode SDK** build
+  (the Command Line Tools SDK omits `EndpointSecurity.framework`), the
+  `com.apple.developer.endpoint-security.client` entitlement, and root; the agent
+  automatically **falls back to the sysctl poll** when any of these is absent, and
+  **self-heals** to the poll if the ES client goes silent for an extended period
+  (a NOTIFY-only client has no liveness API — the idle threshold is deliberately
+  long to avoid abandoning a healthy stream on a quiet host). The active path is
+  reported by `tar.status` as `process_capture_method` (`endpoint_security` or
+  `polling`), alongside two drop counters — `process_stream_dropped` (userspace
+  ring overflow) and `process_stream_kernel_dropped` (Endpoint Security `seq_num`
+  gaps). The ES handler is `noexcept` and drops malformed / zero-pid / zero-ts
+  events, mirroring the ETW peer. **Boot gap:** processes that start *and* exit
+  before the agent opens its ES session are not captured — macOS has no
+  AutoLogger-equivalent backfill. **Fork gap:** the stream subscribes
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` only, so a fork-without-exec child is invisible until
+  it exits (`NOTIFY_FORK` capture deferred, #1455). Both collectors now share a
+  cross-platform `ProcStreamCollector` interface. See `docs/user-manual/tar.md` and
+  `docs/darwin-compat.md`. **Not yet active in shipped builds:** the Apple
+  entitlement and the codesign/notarization release pipeline are pending
+  (#1455), so current macOS agents transparently use the **sysctl poll** until
+  that lands — confirm the live path per device via `process_capture_method` in
+  `tar.status` (`endpoint_security` = streaming, `polling` = fallback).
+
 - **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
   collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
   `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
@@ -167,6 +222,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
+  `process_stream_kernel_dropped` added.** The Windows-specific
+  `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
+  meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
+  both platforms. A new `process_stream_kernel_dropped` key reports
+  **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
+  macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
+  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
+  `process_etw_dropped` will find no value after upgrade — update it to
+  `process_stream_dropped`.
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
   server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
   Postgres substrate move and generated a server with no database to talk to.
@@ -199,11 +264,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
   names-only — the ETW start event carries no command line. Any dashboard, SIEM
   export, `tar.sql` query, or Guardian rule that read `cmdline` from
-  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
-  (the poll still captures command lines). This is intentional
-  (works-council / data-minimization posture) and not reversible by
-  configuration; `process_enabled=false` disables Windows process capture
-  entirely (ETW and poll) if required. Command-line redaction patterns
+  `$Process_*` on Windows now sees an empty string. **macOS process rows are now
+  names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
+  Added): the stream carries no command line, and the poll fallback (a Command Line
+  Tools SDK build, or a host without the ES entitlement/root) now blanks the
+  `proc_pidpath` image path it previously placed in `cmdline`. **Linux is
+  unaffected** (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not
+  reversible by configuration; `process_enabled=false` disables process capture
+  entirely (stream and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
   redact). The boot-window AutoLogger backfill is configured by the production
   InnoSetup installer (scoped to the `advanced` component) and by the developer
