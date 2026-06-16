@@ -31,14 +31,33 @@ async function generate() {
     return;
   }
 
-  // #1485: the secure gateway↔server upstream (mutual TLS + shared cert volume +
-  // --cert-group) is only emitted for default-certs, where the server mints the
-  // gateway leaf the wizard can wire. With operator certs we don't know the
-  // gateway-leaf layout, so rather than generate a gateway that can't reach the
-  // server, block and point at the worked reference. Plaintext+gateway stays
-  // plaintext (it works — the server isn't mTLS).
-  if (gateway && tlsMode === 'operator') {
-    alert('Gateway + operator certs is not wired by the wizard yet: the gateway needs its own client leaf from your CA to reach the server\'s mutual-TLS upstream. Use Default certs (auto-generated, fully wired) or Plaintext for the gateway, or follow deploy/docker/docker-compose.reference-gateway.yml.');
+  // H2: with operator certs the server requires a CA (require_client_cert =
+  // !using_default_agent_certs = true) and refuses to start without one unless
+  // --insecure-skip-client-verify + YUZU_ALLOW_INSECURE_TLS=1 are set. Don't emit
+  // a non-booting server — require the CA path.
+  if (tlsMode === 'operator' && !val('tls-ca-cert')) {
+    alert('Operator certs: the CA certificate path is required — the server refuses to start with operator certs and no CA (mTLS client verification is mandatory). Supply it, or run the server with --insecure-skip-client-verify + YUZU_ALLOW_INSECURE_TLS=1 yourself.');
+    return;
+  }
+
+  // C1/N2: the secure gateway↔server topology (mutual-TLS upstream, --cert-group
+  // cert sharing, TLS mgmt listener) depends on server features that live in the
+  // PKI go-live PR (#1314) and are NOT on the current images — emitting them
+  // produces a stack that crash-loops at argv parse (--cert-group) or fails command
+  // forwarding (server dials the mgmt port plaintext). Until that ships, the gateway
+  // is only generated for Plaintext mode. (Tracked: re-enable once #1314 lands.)
+  if (gateway && tlsMode !== 'plaintext') {
+    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. For a secure gateway today, follow deploy/docker/docker-compose.reference.yml + gateway/config/sys.config.prod.');
+    return;
+  }
+
+  // N1: cert-san values are interpolated into the server command list; an unescaped
+  // quote+newline payload could break out and inject standalone flags (e.g.
+  // --no-tls → silent plaintext). Validate each token to DNS/IP shape before use.
+  const sanCheck = validateCertSans(val('cert-san'));
+  if (sanCheck.bad.length) {
+    alert('Invalid --cert-san value(s): ' + sanCheck.bad.join(', ') +
+          '\nUse only DNS names / IPs, optionally prefixed dns:/ip: (letters, digits, dot, hyphen, colon). No quotes, spaces, or control characters.');
     return;
   }
 
@@ -179,21 +198,30 @@ YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
 YUZU_GW_COOKIE=${c.gwCookie}` : ''}`;
 }
 
-// Build the effective --cert-san set for the auto-generated default certs:
-// the operator's comma-separated entries plus dns:gateway when the gateway is
-// enabled (agents dial the gateway by that service name, so its leaf must carry
-// the SAN or hostname validation fails — PKI PR5b gateway-edge requirement).
-function effectiveCertSans(c) {
-  const sans = [];
-  if (c.gateway) sans.push('dns:gateway');
-  // Secure gateway upstream: the gateway dials the `server` service by name over
-  // mutual TLS, so the server leaf must carry dns:server for SNI verification.
-  if (c.gateway && c.tlsMode === 'default') sans.push('dns:server');
-  for (const raw of (c.certSans || '').split(',')) {
-    const s = raw.trim();
-    if (s && !sans.includes(s)) sans.push(s);
+// N1: validate operator-supplied --cert-san tokens to DNS/IP shape so they can't
+// break out of the YAML scalar / argv list and inject standalone flags. Returns
+// { sans: [valid, deduped], bad: [rejected] }. The server's parse_extra_sans does
+// the authoritative parse; this only stops the pre-server YAML breakout.
+function validateCertSans(raw) {
+  const sans = [], bad = [];
+  for (const piece of (raw || '').split(',')) {
+    const s = piece.trim();
+    if (!s) continue;
+    const m = /^(?:(?:dns|ip):)?(.+)$/i.exec(s);
+    const value = m ? m[1] : s;
+    // DNS-label / IPv4 / IPv6 characters only; reject flag-like leading '-'.
+    const ok = /^[A-Za-z0-9._:-]+$/.test(value) && !value.startsWith('-');
+    if (ok) { if (!sans.includes(s)) sans.push(s); }
+    else bad.push(s);
   }
-  return sans;
+  return { sans, bad };
+}
+
+// Effective (validated) --cert-san set for the auto-generated default certs.
+// Gateway service names aren't added — gateway + TLS isn't generated yet (the
+// secure gateway topology is #1314; see the C1/N2 guard in generate()).
+function effectiveCertSans(c) {
+  return validateCertSans(c.certSans || '').sans;
 }
 
 function generateCompose(c) {
@@ -203,14 +231,10 @@ function generateCompose(c) {
   const tls = c.tlsMode !== 'plaintext';
   const webScheme = tls ? 'https' : 'http';
   const webContainerPort = tls ? 8443 : 8080;
-  // #1485: full secure gateway topology (mutual-TLS upstream + shared certs) is
-  // emitted only for default-certs + gateway.
-  const secureGateway = c.gateway && c.tlsMode === 'default';
-  // A NAMED cert volume is required to share /etc/yuzu/certs with the gateway
-  // (anonymous volumes can't be shared), and also when the operator opted to
-  // persist certs with named volumes. secureGateway forces it regardless.
-  const certVolNamed = c.tlsMode === 'default'
-    && (secureGateway || (c.persistCerts && c.persistentVolumes));
+  // Named cert volume: default mode + persist-certs + named-volumes enabled.
+  // (Gateway + TLS isn't generated — see the C1/N2 guard — so there's no
+  // cross-container cert sharing to force a named volume.)
+  const certVolNamed = c.tlsMode === 'default' && c.persistCerts && c.persistentVolumes;
 
   let y = `## Yuzu Stack — Generated by Yuzu Compose Wizard
 ##
@@ -221,12 +245,11 @@ function generateCompose(c) {
 ##   docker compose logs -f
 ##   docker compose down -v    # ⚠️ -v removes data volumes!
 ##
-${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS configuration relies on the
-##    server auto-generating a per-install CA + leaf certs on first boot, serving
-##    HTTPS on 8443${secureGateway ? `, sharing certs via --cert-group, and a strict
-##    mutual-TLS gateway upstream` : ``} — behaviour that ships in the PKI go-live
-##    release (PR #1314) and later. Pin YUZU_VERSION to a release that includes it;
-##    against older images use Plaintext mode. (Plaintext works on any image.)
+${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
+##    auto-generating a per-install CA + leaf certs on first boot and serving HTTPS
+##    on 8443 — behaviour from the secure-by-default release (v0.13.0+, tracked by
+##    the 'latest' tag). Older images (incl. 0.12.0) don't support it; use Plaintext
+##    mode there. (Plaintext works on any image.)
 ##
 ` : ``}## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
 ${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / ${c.grafanaPass})` : ''}
@@ -282,76 +305,27 @@ ${c.tlsMode === 'plaintext'
     y += `              {backpressure_threshold, 1000},\n`;
     y += `              {hash_ring_vnodes, 256}\n`;
     y += `          ]},\n`;
-    if (secureGateway) {
-      // #1485: grpcbox reads its OWN TLS config (the YUZU_GW_TLS_* env is
-      // advisory only, #1291). Mirrors deploy/docker/reference-gateway-sys.config:
-      //  - upstream to `server` is MUTUAL TLS (the server's gateway-upstream
-      //    listener requires a client cert when default certs are active);
-      //  - the agent listener (:50051) is ONE-WAY TLS so an unenrolled agent can
-      //    still bootstrap (no client cert yet) over an encrypted hop;
-      //  - the mgmt listener (:50063) is STRICT mTLS (the patched grpcbox
-      //    defaults verify_peer + fail_if_no_peer_cert when omitted).
-      // Cert paths are the server-generated defaults in the shared cert volume,
-      // readable by the gateway via the --cert-group yuzu-pki group share.
-      y += `          {grpcbox, [\n`;
-      y += `              {client, #{channels => [\n`;
-      y += `                  {default_channel, [{https, "server", ${c.gwUpstreamPort}, [\n`;
-      y += `                      {cacertfile, "/etc/yuzu/certs/default-ca.pem"},\n`;
-      y += `                      {certfile,   "/etc/yuzu/certs/default-gateway.pem"},\n`;
-      y += `                      {keyfile,    "/etc/yuzu/certs/default-gateway.key"},\n`;
-      y += `                      {verify, verify_peer},\n`;
-      y += `                      {depth, 2},\n`;
-      y += `                      {versions, ['tlsv1.2']},\n`;
-      y += `                      {ciphers, ["ECDHE-ECDSA-AES256-GCM-SHA384",\n`;
-      y += `                                 "ECDHE-ECDSA-AES128-GCM-SHA256",\n`;
-      y += `                                 "ECDHE-ECDSA-CHACHA20-POLY1305"]}\n`;
-      y += `                  ]}], #{}}\n`;
-      y += `              ]}},\n`;
-      y += `              {servers, [\n`;
-      y += `                  #{grpc_opts => #{\n`;
-      y += `                      service_protos => [agent_pb],\n`;
-      y += `                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}\n`;
-      y += `                  },\n`;
-      y += `                  listen_opts => #{port => 50051, ip => {0,0,0,0}},\n`;
-      y += `                  transport_opts => #{ssl => true,\n`;
-      y += `                                      certfile   => "/etc/yuzu/certs/default-gateway.pem",\n`;
-      y += `                                      keyfile    => "/etc/yuzu/certs/default-gateway.key",\n`;
-      y += `                                      cacertfile => "/etc/yuzu/certs/default-ca.pem",\n`;
-      y += `                                      verify => verify_none,\n`;
-      y += `                                      fail_if_no_peer_cert => false}},\n`;
-      y += `                  #{grpc_opts => #{\n`;
-      y += `                      service_protos => [management_pb],\n`;
-      y += `                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}\n`;
-      y += `                  },\n`;
-      y += `                  listen_opts => #{port => 50063, ip => {0,0,0,0}},\n`;
-      y += `                  transport_opts => #{ssl => true,\n`;
-      y += `                                      certfile   => "/etc/yuzu/certs/default-gateway.pem",\n`;
-      y += `                                      keyfile    => "/etc/yuzu/certs/default-gateway.key",\n`;
-      y += `                                      cacertfile => "/etc/yuzu/certs/default-ca.pem"}}\n`;
-      y += `              ]}\n`;
-      y += `          ]},\n`;
-    } else {
-      // Plaintext gateway (plaintext TLS mode): the server's upstream is not mTLS,
-      // so the gateway dials it over plain HTTP/2 and the listeners are plaintext.
-      // ⚠️ Do NOT internet-expose :50051 in this mode (command fan-out = fleet RCE).
-      y += `          {grpcbox, [\n`;
-      y += `              {client, #{channels => [\n`;
-      y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
-      y += `              ]}},\n`;
-      y += `              {servers, [\n`;
-      y += `                  #{grpc_opts => #{\n`;
-      y += `                      service_protos => [agent_pb],\n`;
-      y += `                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}\n`;
-      y += `                  },\n`;
-      y += `                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},\n`;
-      y += `                  #{grpc_opts => #{\n`;
-      y += `                      service_protos => [management_pb],\n`;
-      y += `                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}\n`;
-      y += `                  },\n`;
-      y += `                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}\n`;
-      y += `              ]}\n`;
-      y += `          ]},\n`;
-    }
+    // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
+    // so this path is only reached in plaintext mode — the gateway dials the server
+    // over plain HTTP/2 and its listeners are plaintext.
+    // ⚠️ Do NOT internet-expose :50051 in this mode (command fan-out = fleet RCE).
+    y += `          {grpcbox, [\n`;
+    y += `              {client, #{channels => [\n`;
+    y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
+    y += `              ]}},\n`;
+    y += `              {servers, [\n`;
+    y += `                  #{grpc_opts => #{\n`;
+    y += `                      service_protos => [agent_pb],\n`;
+    y += `                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}\n`;
+    y += `                  },\n`;
+    y += `                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},\n`;
+    y += `                  #{grpc_opts => #{\n`;
+    y += `                      service_protos => [management_pb],\n`;
+    y += `                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}\n`;
+    y += `                  },\n`;
+    y += `                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}\n`;
+    y += `              ]}\n`;
+    y += `          ]},\n`;
     y += `          {kernel, [\n`;
     y += `              {connect_all, false},\n`;
     y += `              {net_ticktime, 30},\n`;
@@ -554,13 +528,6 @@ ${c.tlsMode === 'plaintext'
         y += `      - "${s}"\n`;
       }
     }
-    if (secureGateway) {
-      // #1485: chgrp the shared cert dir (0750) + gateway leaf key (0640) to the
-      // fixed gid-2000 yuzu-pki group baked into all images, so the gateway (a
-      // different uid) can read default-gateway.key. Server/CA/HTTPS keys stay 0600.
-      y += `      - "--cert-group"\n`;
-      y += `      - "yuzu-pki"\n`;
-    }
   }
   y += `      - "--web-address"\n`;
   y += `      - "0.0.0.0"\n`;
@@ -613,13 +580,12 @@ ${c.tlsMode === 'plaintext'
   // bind-mount the host PEM material read-only.
   if (c.tlsMode === 'default') {
     if (certVolNamed) {
-      // Named volume: persists the CA across recreates AND (for secureGateway) is
-      // shared read-only into the gateway so it can read default-gateway.key.
+      // Named volume: persists the auto-generated CA across recreates.
       y += `      - server-certs:/etc/yuzu/certs\n`;
     } else if (c.persistCerts) {
       y += `      - /etc/yuzu/certs\n`;
     }
-    // else: persist off, no gateway → certs live in the container layer (ephemeral).
+    // else: persist off → certs live in the container layer (ephemeral).
   } else if (c.tlsMode === 'operator') {
     y += `      # Put server.pem / server.key (and ca.pem for mTLS) in ./certs.\n`;
     y += `      - ./certs:/etc/yuzu/certs:ro\n`;
@@ -702,23 +668,23 @@ ${c.tlsMode === 'plaintext'
     y += `      - "${c.gwMetricsPort}:9568"     # Prometheus metrics\n`;
     y += `    environment:\n`;
     // #1483: a real distribution cookie from .env (the gateway fail-closes on the
-    // insecure default). YUZU_GW_TLS_ENABLED is advisory only (#1291) — the actual
-    // TLS posture lives in the grpcbox block of the mounted sys.config.
+    // insecure default). YUZU_GW_TLS_ENABLED is advisory only (#1291); the gateway
+    // here is plaintext (gateway + TLS isn't generated — see the C1/N2 guard).
     y += `      - YUZU_GW_COOKIE=\${YUZU_GW_COOKIE}\n`;
-    y += `      - YUZU_GW_TLS_ENABLED=${secureGateway || c.gwTls ? 'true' : 'false'}\n`;
+    y += `      - YUZU_GW_TLS_ENABLED=false\n`;
     y += `    configs:\n`;
     y += `      - source: gateway-sys-config\n`;
     y += `        target: /opt/yuzu_gw/releases/0.2.0/sys.config\n`;
-    if (secureGateway) {
-      // #1485: read-only share of the server-generated CA + gateway leaf (the
-      // server's --cert-group yuzu-pki made default-gateway.key group-readable).
-      y += `    volumes:\n`;
-      y += `      - server-certs:/etc/yuzu/certs:ro\n`;
-    }
-    // #1486: the gateway image ships no bash/curl, so the old `echo > /dev/tcp`
-    // CMD-SHELL probe always failed (permanently "unhealthy"). The reference
-    // compose omits a gateway healthcheck; gate startup on the server being healthy
-    // instead so the gateway's upstream is reachable when it boots.
+    // #1486: probe /healthz with busybox wget (the gateway image ships busybox,
+    // which provides `wget --spider`; it has NO bash/curl, so the old
+    // `echo > /dev/tcp` CMD-SHELL probe always failed). Matches docker-compose.uat.yml.
+    y += `    healthcheck:\n`;
+    y += `      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]\n`;
+    y += `      interval: 10s\n`;
+    y += `      timeout: 5s\n`;
+    y += `      retries: 5\n`;
+    y += `      start_period: 10s\n`;
+    // Gate the gateway on the server being healthy so its upstream is reachable.
     y += `    depends_on:\n`;
     y += `      server:\n`;
     y += `        condition: service_healthy\n`;
@@ -737,7 +703,9 @@ ${c.tlsMode === 'plaintext'
     y += `      - source: prometheus-config\n`;
     y += `        target: /etc/prometheus/prometheus.yml\n`;
     y += `    volumes:\n`;
-    y += `      - prometheus-data:/prometheus\n`;
+    // M1: only a NAMED volume when named volumes are enabled; otherwise anonymous,
+    // so the top-level volumes: block (which only declares names) stays consistent.
+    y += c.persistentVolumes ? `      - prometheus-data:/prometheus\n` : `      - /prometheus\n`;
     y += `    depends_on:\n`;
     y += `      - server\n`;
     if (c.gateway) y += `      - gateway\n`;
@@ -768,7 +736,7 @@ ${c.tlsMode === 'plaintext'
     y += `      - source: grafana-dashboard-analytics\n`;
     y += `        target: /var/lib/grafana/dashboards/yuzu-analytics-dashboard.json\n`;
     y += `    volumes:\n`;
-    y += `      - grafana-data:/var/lib/grafana\n`;
+    y += c.persistentVolumes ? `      - grafana-data:/var/lib/grafana\n` : `      - /var/lib/grafana\n`;
     y += `    depends_on:\n`;
     y += `      - prometheus\n`;
   }
@@ -791,7 +759,7 @@ ${c.tlsMode === 'plaintext'
     y += `      - source: clickhouse-init\n`;
     y += `        target: /docker-entrypoint-initdb.d/init.sql\n`;
     y += `    volumes:\n`;
-    y += `      - clickhouse-data:/var/lib/clickhouse\n`;
+    y += c.persistentVolumes ? `      - clickhouse-data:/var/lib/clickhouse\n` : `      - /var/lib/clickhouse\n`;
     y += `    ulimits:\n`;
     y += `      nofile:\n`;
     y += `        soft: 262144\n`;
@@ -803,12 +771,11 @@ ${c.tlsMode === 'plaintext'
     y += `      retries: 5\n`;
   }
 
-  // Volumes — declared whenever any named volume is referenced. certVolNamed can
-  // be true even with named volumes off (secureGateway forces a shareable cert
-  // volume), so it's declared independently or compose errors on an undefined volume.
-  if (c.persistentVolumes || certVolNamed) {
+  // Volumes — only named volumes are declared here; services use anonymous volumes
+  // when named volumes are off (M1), so every name referenced above is declared.
+  if (c.persistentVolumes) {
     y += `\nvolumes:\n`;
-    if (c.persistentVolumes) y += `  server-data:\n`;
+    y += `  server-data:\n`;
     if (certVolNamed) y += `  server-certs:\n`;
     if (c.persistentVolumes && c.pgBundled) y += `  postgres-data:\n`;
     if (c.persistentVolumes && c.prometheus) y += `  prometheus-data:\n`;

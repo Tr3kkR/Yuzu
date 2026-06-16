@@ -182,10 +182,17 @@ function buildReview() {
     if (!val('tls-cert') || !val('tls-key')) {
       warnings.push('⚠️ Operator certs selected but the cert and/or key path is blank — supply both, or switch to Default certs.');
     }
+    if (!val('tls-ca-cert')) {
+      warnings.push('⚠️ Operator certs need a CA path — the server refuses to start with operator certs and no CA (mandatory mTLS client verification).');
+    }
   } else if (tlsMode === 'plaintext') {
     warnings.push('⚠️ Plaintext TLS mode: the agent↔server channel is unencrypted (--no-tls --no-https). Dev only — do not internet-expose port 50051.');
   } else if (tlsMode === 'default' && !chk('persist-certs')) {
     warnings.push('ℹ️ Default certs without persistence: the per-install CA will be regenerated on every container recreate, breaking already-enrolled agents. Enable "Persist generated certs".');
+  }
+  // Gateway + TLS is not generated yet (secure gateway topology is #1314).
+  if (chk('include-gateway') && tlsMode !== 'plaintext') {
+    warnings.push('⛔ Gateway + ' + tlsMode + ' certs can\'t be generated yet (secure gateway wiring is in flight, #1314). Pick Plaintext for the gateway, or disable the gateway for a TLS server-only stack.');
   }
   const warnEl = document.getElementById('port-warnings');
   if (warnings.length) {

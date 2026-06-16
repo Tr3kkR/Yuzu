@@ -57,8 +57,8 @@
 
         <div class="field">
           <label for="yuzu-version">Yuzu Version</label>
-          <input type="text" id="yuzu-version" value="0.12.0" placeholder="0.12.0">
-          <small>The container image tag. Use <code>latest</code> for bleeding edge.</small>
+          <input type="text" id="yuzu-version" value="latest" placeholder="latest">
+          <small>The container image tag. <code>latest</code> tracks the secure-by-default builds (Default-certs needs them). Pin a specific release once one shipping default-certs is published.</small>
         </div>
 
         <div class="field">
@@ -102,7 +102,7 @@
             <option value="operator">Operator certs — supply your own PEM cert/key (optional CA for mTLS)</option>
             <option value="plaintext">Plaintext — disable TLS/HTTPS (local dev only)</option>
           </select>
-          <small>As of v0.12 the server is encrypted-by-default: leave this on <em>Default certs</em> and it mints a per-install CA + leaf certs on first boot — no files needed.</small>
+          <small>From the secure-by-default release (v0.13.0+, tracked by the <code>latest</code> tag): leave this on <em>Default certs</em> and the server mints a per-install CA + leaf certs on first boot — no files needed. Older images (incl. 0.12.0) don't support this; use <em>Plaintext</em> there.</small>
         </div>
 
         <!-- ── Default certs (server auto-generates) ───────────────────────── -->
@@ -123,10 +123,9 @@
             <small>
               Comma-separated. Added to the auto-generated leaves so they validate
               for the name/IP agents actually dial. Forms: <code>dns:&lt;name&gt;</code>,
-              <code>ip:&lt;addr&gt;</code>, or a bare value (auto-classified).
-              <strong>When the gateway is enabled, <code>dns:gateway</code> is added
-              automatically</strong> — add your public server hostname/IP here too if
-              agents reach the server directly.
+              <code>ip:&lt;addr&gt;</code>, or a bare value (auto-classified). Add your
+              public server hostname/IP here if agents reach the server directly.
+              Only DNS/IP characters are allowed (validated before generation).
             </small>
           </div>
 
@@ -158,9 +157,9 @@
             <input type="text" id="tls-key" value="/etc/yuzu/certs/server.key" placeholder="/etc/yuzu/certs/server.key">
           </div>
           <div class="field">
-            <label for="tls-ca-cert">CA Certificate Path (optional — enables mTLS agent verification)</label>
-            <input type="text" id="tls-ca-cert" placeholder="/etc/yuzu/certs/ca.pem">
-            <small>Leave blank to serve TLS without verifying agent client certs.</small>
+            <label for="tls-ca-cert">CA Certificate Path (<strong>required</strong> — verifies agent/gateway client certs)</label>
+            <input type="text" id="tls-ca-cert" value="/etc/yuzu/certs/ca.pem" placeholder="/etc/yuzu/certs/ca.pem">
+            <small>The server <strong>refuses to start</strong> with operator certs and no CA (mTLS client verification is mandatory). To deliberately disable client-cert verification you must run the server with <code>--insecure-skip-client-verify</code> + <code>YUZU_ALLOW_INSECURE_TLS=1</code> yourself.</small>
           </div>
         </fieldset>
 
@@ -356,9 +355,19 @@
           The Yuzu Gateway (Erlang/OTP) provides agent connection pooling, circuit breaking, and hash-ring routing. It sits between agents and the Yuzu server.
         </div>
 
+        <div class="callout warning">
+          <strong>TLS + gateway isn't generated yet.</strong> The secure gateway↔server
+          topology (mutual-TLS upstream, shared certs) depends on server features still
+          in flight (PKI go-live, #1314) — the wizard would otherwise emit a stack that
+          can't boot. With the gateway enabled you must pick <em>Plaintext</em> on the
+          Core step (and keep <code>:50051</code> off the public internet). For a secure
+          gateway today, follow <code>deploy/docker/docker-compose.reference.yml</code> +
+          <code>gateway/config/sys.config.prod</code>.
+        </div>
+
         <div class="field">
           <label>
-            <input type="checkbox" id="include-gateway" checked> Include Yuzu Gateway
+            <input type="checkbox" id="include-gateway"> Include Yuzu Gateway
           </label>
         </div>
 
