@@ -334,8 +334,10 @@ static const ToolDef kTools[] = {
     {"get_network_fleet",
      "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
      "(ms), the interval TCP retransmit rate (%), and device throughput (bps) — current heartbeat "
-     "cycle, the same numbers as the yuzu_fleet_net_* Prometheus gauges and the /network Overview "
-     "cards. A null metric means no device reported it (absent, never zero); rtt_reporting is the "
+     "cycle. These are OS-blended fleet stats over the same per-device heartbeat facts as the "
+     "per-OS yuzu_fleet_net_* Prometheus gauges (a gauge series, split by os, differs from this "
+     "blended number on a mixed fleet) and the /network Overview cards. A null metric means no "
+     "device reported it (absent, never zero); rtt_reporting is the "
      "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
      "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
      "/api/v1/network/fleet. Requires GuaranteedState:Read.",

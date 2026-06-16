@@ -24,7 +24,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
 | [Guaranteed State (Guardian)](guaranteed-state.md) | Real-time policy enforcement with agent-side guards, events, and remediation (control plane + agent skeleton shipped in v0.12; Windows enforcement lands in Guardian PR 3) |
 | [DEX (Digital Employee Experience)](dex.md) | Read-only fleet-reliability dashboard over the Guardian event store — crash-free rates, 103-signal catalogue, per-app/per-device drill-downs (Windows, macOS, and Linux collectors; Linux covers Performance + storage on headless servers) |
-| [Network Quality](network.md) | Continuous fleet TCP network quality — RTT, retransmit, throughput, and co-occurrence with device/app signals (Linux per-connection tier today) |
+| [Network Quality](network.md) | Continuous fleet TCP network quality — RTT, retransmit, and throughput (evidence-first; device/app co-occurrence is a later slice). Linux reports all three; Windows reports throughput + retransmit (RTT deferred). A DEX sub-view |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
 | [Server Administration](server-admin.md) | Configuration, TLS, user management, first-run setup, and backup |
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |

@@ -116,7 +116,8 @@ throughput — each with its own reporting population — plus a worst-devices
 drill. It is **device / local-link health**, not localization: a bad local link
 (Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
 destination or app is affected is a later per-destination slice. Linux agents
-report today; Windows and macOS collectors are later slices. Full detail,
+report all three metrics; Windows reports throughput and retransmit rate (RTT
+deferred — needs ESTATS); macOS is a later slice. Full detail,
 platform coverage, and the privacy model are on the
 [Network quality dashboard](network.md) page.
 

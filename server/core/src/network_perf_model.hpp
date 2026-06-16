@@ -6,7 +6,10 @@
 /// server-resolved app-instability flag. Computed at request time over
 /// registry/store state — ZERO new storage. Validation and percentile ranking
 /// come from network_perf_rules.hpp (which reuses dex_perf_rules.hpp), shared
-/// with the Prometheus rollup so the cards and the gauges can never disagree.
+/// with the Prometheus rollup so a device is parsed identically for both. NOTE:
+/// these cards are OS-blended (one fleet distribution); the yuzu_fleet_net_*
+/// gauges are split per `os`, so on a mixed fleet an aggregate here differs from
+/// any single gauge series by design (Win + Linux rates are not comparable).
 ///
 /// THE EDGE SHIPS FACTS; this model COUNTS co-occurrence (network ∩ device ∩
 /// app) but NEVER attributes a cause. The causal verdict ("it's the network")
@@ -80,8 +83,9 @@ struct NetCooccurrence {
     int64_t network_only{0}; ///< … and neither (network signal stands alone)
 };
 
-/// Fleet-now: the same numbers the yuzu_fleet_net_* gauges carry, plus the
-/// honest denominators and the co-occurrence headline.
+/// Fleet-now: an OS-blended rollup over the same per-device facts the per-OS
+/// yuzu_fleet_net_* gauges carry, plus the honest denominators and the
+/// co-occurrence headline.
 struct NetPerfFleetNow {
     std::optional<NetPerfStat> rtt;
     std::optional<NetPerfStat> retrans;

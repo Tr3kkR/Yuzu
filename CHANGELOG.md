@@ -30,6 +30,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing obs_types means a Linux server lights up the same `/dex` buckets as
   Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
 
+- **Windows network-quality collection.** The agent now emits network facts on
+  Windows, not only Linux: device throughput via `GetIfTable2` and a system-wide
+  interval retransmit rate via `GetTcpStatisticsEx` (fed through the same
+  `RetransWindow` ΔΣretrans/ΔΣsegs model as Linux). RTT stays unimplemented on
+  Windows — per-connection smoothed RTT needs ESTATS
+  (`GetPerTcpConnectionEStats`: enable + admin + overhead), a deferred slice. Two
+  honest caveats: the Windows retransmit counter is **system-wide** (no
+  per-interface TCP MIB, so it includes loopback) and is **measurement-first,
+  unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
+  The `/network` dashboard now populates on a Windows-only fleet, and Windows
+  throughput reaches the `yuzu_fleet_net_*` gauges. The net gauges carry an `os`
+  label (per-OS, never blended). The Windows **retransmit** rate is system-wide,
+  biased low, and not yet loss-validated, so it is **withheld from the
+  `yuzu_fleet_net_retrans_pct` gauge** (it still shows on the `/network` page +
+  REST, caveated) until #1465 validates it — the gauge carries loss-validated OSes
+  only (Linux today). The `os` gauge label is **allowlisted** to the values a real
+  agent emits (`windows`/`linux`/`darwin`, else `other`) so an agent-controlled tag
+  can't spray unbounded series (the same raw-tag exposure on
+  `yuzu_fleet_agents_by_arch`/`by_version` is tracked in #1472). See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
+- **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
+  per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
+  macOS, each row citing its in-code source of truth — so a platform gap (such as
+  the previously Linux-only network collector) is visible in one place. Flags the
+  durable follow-up: generate the matrix from the existing machine-readable per-OS
+  metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
+  signal catalogue) rather than hand-maintaining it.
+
 - **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
   tab's cohort benchmarking compared each cohort against the whole fleet; it now
   also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
@@ -58,8 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the degraded classification and the device/app co-occurrence headline it gates
   are a later slice (the model stays wired but unfed). **Linux** agents report
   via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
-  throughput; **Windows and macOS emit nothing yet** (later slices — absent
-  metrics are omitted, never zeroed). Device-aggregate heartbeat tags
+  throughput; **Windows** reports throughput + retransmit (RTT deferred — see the
+  Windows entry above); **macOS emits nothing yet** (absent metrics are omitted,
+  never zeroed). Device-aggregate heartbeat tags
   `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
   gated by `--dex-disable`) and Prometheus gauges
   `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
