@@ -1,16 +1,20 @@
 /// @file net_quality_sampler.cpp
-/// See net_quality_sampler.hpp. Linux implementation reads per-connection
-/// TCP_INFO via netlink SOCK_DIAG/INET_DIAG (proven to match `ss -ti`) and
-/// device throughput from /proc/net/dev; other platforms return all-invalid.
+/// See net_quality_sampler.hpp. Linux reads per-connection TCP_INFO via netlink
+/// SOCK_DIAG/INET_DIAG (proven to match `ss -ti`) + device throughput from
+/// /proc/net/dev. Windows reads device throughput via GetIfTable2 and a
+/// system-wide TCP retransmit rate via GetTcpStatisticsEx (RTT deferred — needs
+/// ESTATS). macOS + other platforms return all-invalid.
 
 #include "net_quality_sampler.hpp"
 
-#include "yuzu/agent/linux_tcp_info.hpp" // ABI-pinned tcp_info (glibc-version-proof)
+#include <type_traits>
 
 // Pure helpers (median / throughput_bps / RetransWindow) are header-inline.
 
 // ── Linux implementation ─────────────────────────────────────────────────────
 #if defined(__linux__)
+
+#include "yuzu/agent/linux_tcp_info.hpp" // ABI-pinned tcp_info (glibc-version-proof)
 
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
@@ -264,7 +268,119 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
 
 } // namespace yuzu::agent::netq
 
-#else // ── non-Linux: all-invalid (Windows spike / macOS later) ───────────────
+// ── Windows implementation ───────────────────────────────────────────────────
+#elif defined(_WIN32)
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// clang-format off
+#include <winsock2.h> // must precede windows.h; netioapi.h needs its typedefs + AF_INET*
+#include <windows.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h> // GetTcpStatisticsEx / MIB_TCPSTATS
+#include <netioapi.h> // GetIfTable2 / MIB_IF_TABLE2 / FreeMibTable (64-bit octets)
+// clang-format on
+#pragma comment(lib, "iphlpapi.lib") // GetTcpStatisticsEx / GetIfTable2 / FreeMibTable
+
+namespace yuzu::agent::netq {
+
+namespace {
+
+// RAII for GetIfTable2's heap allocation — FreeMibTable on every return path.
+// Single-owner like the Linux FdGuard/FileGuard: copy/move deleted so the raw
+// pointer can never be duplicated into a double-FreeMibTable.
+struct MibIfTableGuard {
+    MIB_IF_TABLE2* t{nullptr};
+    MibIfTableGuard() = default;
+    MibIfTableGuard(const MibIfTableGuard&) = delete;
+    MibIfTableGuard& operator=(const MibIfTableGuard&) = delete;
+    ~MibIfTableGuard() {
+        if (t)
+            ::FreeMibTable(t);
+    }
+};
+static_assert(!std::is_copy_constructible_v<MibIfTableGuard> &&
+                  !std::is_move_constructible_v<MibIfTableGuard>,
+              "MibIfTableGuard must be a single non-copyable, non-movable owner");
+
+} // namespace
+
+NetCounters read_net_counters() {
+    // Coarse device aggregate: the sum of every non-loopback interface's 64-bit
+    // octet counters (mirrors the Linux /proc/net/dev path and tar_perf.cpp's
+    // read_network). Same over-counting caveat as Linux for stacked interfaces —
+    // an upper bound, not wire-accurate (docs/user-manual/network.md "Throughput").
+    NetCounters c;
+    MibIfTableGuard g;
+    if (::GetIfTable2(&g.t) != NO_ERROR || !g.t)
+        return c; // invalid
+    uint64_t rx_total = 0, tx_total = 0;
+    for (ULONG i = 0; i < g.t->NumEntries; ++i) {
+        const MIB_IF_ROW2& row = g.t->Table[i];
+        if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue; // loopback is not "the network" and dwarfs real traffic
+        rx_total += row.InOctets;  // 64-bit — no wrap concern
+        tx_total += row.OutOctets;
+    }
+    c.valid = true;
+    c.rx_bytes = rx_total;
+    c.tx_bytes = tx_total;
+    c.at = std::chrono::steady_clock::now();
+    return c;
+}
+
+NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur) {
+    NetQualitySample s;
+
+    // Retransmit COUNTERS from the system-wide TCP MIB (GetTcpStatisticsEx),
+    // summed over IPv4 + IPv6. Device-wide, since-boot cumulative counts; the
+    // agent differences them across heartbeats (RetransWindow) for the interval
+    // rate. NOT a ratio here.
+    //
+    // DIFFERENT POPULATION FROM LINUX — UNVALIDATED ON WINDOWS. Unlike the Linux
+    // per-connection INET_DIAG sum, this MIB is the whole stack and CANNOT be
+    // scoped by interface, so it INCLUDES loopback segments. The interval-delta
+    // rate was validated under netem loss on Linux; the Windows counter is a
+    // measurement-first signal whose separation-under-loss has NOT been
+    // independently validated, and on a loopback-dominated host (e.g. a single-box
+    // UAT rig) it dilutes toward ~0. Treat as a measurement, never a verdict.
+    uint64_t retrans = 0, segs = 0;
+    bool any = false;
+    for (int fam : {AF_INET, AF_INET6}) {
+        MIB_TCPSTATS st{};
+        if (::GetTcpStatisticsEx(&st, fam) == NO_ERROR) {
+            // dwRetransSegs / dwOutSegs are DWORD since-boot; a 32-bit wrap on a
+            // long-running busy host gives cur<prev for that interval, which the
+            // RetransWindow clamps to a zero contribution (never negative loss).
+            retrans += st.dwRetransSegs;
+            segs += st.dwOutSegs;
+            any = true;
+        }
+    }
+    if (any && segs > 0) {
+        s.retrans_valid = true;
+        s.retrans_total = retrans;
+        s.segs_out_total = segs;
+    }
+    // RTT omitted on Windows in v1: per-connection smoothed RTT needs ESTATS
+    // (GetPerTcpConnectionEStats — enable per connection + admin + overhead), a
+    // deferred slice. rtt_valid stays false → the tag is absent, never 0.
+
+    // Throughput from the interface-counter delta (the pure helper).
+    if (auto bps = throughput_bps(prev, cur)) {
+        s.throughput_valid = true;
+        s.throughput_bps = *bps;
+    }
+    return s;
+}
+
+} // namespace yuzu::agent::netq
+
+#else // ── other platforms: all-invalid (macOS later) ─────────────────────────
 
 namespace yuzu::agent::netq {
 

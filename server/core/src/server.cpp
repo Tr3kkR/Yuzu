@@ -378,31 +378,37 @@ public:
                           "gauge");
         // Network rollup (slice 3; heartbeat net facts, absent when no agent
         // reports — never a fabricated zero). Same shared validators as the
-        // /network read model, so these gauges and the dashboard always agree.
+        // /network read model (per-device parity); the gauges are split per `os`
+        // while the page is OS-blended, so a mixed-fleet aggregate differs by
+        // design (Windows + Linux retransmit rates are not comparable).
         metrics_.describe("yuzu_fleet_net_reporting",
-                          "Agents whose latest heartbeat carried at least ONE network fact — the "
-                          "same any-of definition the /network Overview's Reporting card uses",
-                          "gauge");
+                          "Agents (per `os`) whose latest heartbeat carried at least ONE network "
+                          "fact — the same any-of definition the /network Overview's Reporting card "
+                          "uses", "gauge");
         metrics_.describe("yuzu_fleet_net_retrans_reporting",
-                          "Agents that reported an interval retransmit RATE this cycle (a subset of "
-                          "net_reporting — a device can report RTT while its retransmit window is "
-                          "still warming). Use as the denominator for net_retrans_pct so a low rate "
-                          "can be told apart from a collection outage", "gauge");
+                          "Agents (per `os`) that contributed an interval retransmit RATE to the "
+                          "gauge this cycle (a subset of net_reporting{os}). Denominator for "
+                          "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) — a "
+                          "Windows device reports a retransmit fact but it is withheld from the "
+                          "gauge (#1465), so Windows is absent here", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
-                          "DORMANT (measurement-first): absent unless an agent still emits the "
-                          "retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
+                          "DORMANT (measurement-first), per `os`: absent unless an agent still emits "
+                          "the retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
                           "classification needs real-fleet baseline calibration (a later slice) — "
                           "treat ABSENT as 'not classified', never 0 as 'healthy'", "gauge");
         metrics_.describe("yuzu_fleet_net_rtt_ms",
-                          "Fleet smoothed round-trip time in ms, by {stat}: avg / p50 / p90 / max "
-                          "(its population is the devices that report RTT — Linux today)", "gauge");
-        metrics_.describe("yuzu_fleet_net_retrans_pct",
-                          "Fleet TCP retransmit rate %, by {stat}: avg / p50 / p90 / max. INTERVAL "
-                          "rate (interval delta of retransmits / segments over recent heartbeats), "
-                          "not the lifetime ratio. Population: yuzu_fleet_net_retrans_reporting",
+                          "Fleet smoothed round-trip time in ms, by {stat,os}: avg / p50 / p90 / max "
+                          "(reported by Linux only today, so os=\"linux\" is the only series)",
                           "gauge");
+        metrics_.describe("yuzu_fleet_net_retrans_pct",
+                          "Fleet TCP retransmit rate %, by {stat,os}: avg / p50 / p90 / max. INTERVAL "
+                          "rate (interval delta of retransmits / segments over recent heartbeats), "
+                          "not the lifetime ratio. Loss-validated OSes only: Linux (netem-validated). "
+                          "The Windows rate is system-wide (loopback-inclusive, biased low, "
+                          "unvalidated #1465) and is WITHHELD here — it shows on the /network page + "
+                          "REST until validated. Never alert on a cross-OS aggregate", "gauge");
         metrics_.describe("yuzu_fleet_net_throughput_bps",
-                          "Fleet device network throughput in bytes/s, by {stat}: avg / p50 / p90 "
+                          "Fleet device network throughput in bytes/s, by {stat,os}: avg / p50 / p90 "
                           "/ max", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
