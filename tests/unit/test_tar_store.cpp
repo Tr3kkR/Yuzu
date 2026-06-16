@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -817,6 +818,86 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
         REQUIRE(db->insert_proc_perf_samples({r}));
     }
 
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+// ── #559: corrupt-DB quarantine on open ────────────────────────────────────
+
+TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    auto tmp = yuzu::test::unique_temp_path("tar_corrupt_");
+
+    // 1. Create a real DB and persist a deliberately-paused source. This is the
+    //    forensic-preservation state a corrupt read must NOT silently undo.
+    {
+        auto opened = TarDatabase::open(tmp);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        REQUIRE(db.create_warehouse_tables());
+        db.set_config("process_enabled", "false");
+        CHECK(db.get_config("process_enabled", "true") == "false");
+    } // connection closed; WAL checkpointed into the main file on close
+
+    // 2. Corrupt it: drop any WAL/SHM sidecars and clobber the whole file with
+    //    non-SQLite bytes so PRAGMA integrity_check fails deterministically.
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{tmp.string() + suffix}, ec);
+    }
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db for #559";
+    }
+
+    // 3. Re-open: must succeed with a FRESH database (not refuse, not trust the
+    //    garbage), and quarantine the corrupt file aside for forensic review.
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    TarDatabase db2 = std::move(*reopened);
+    REQUIRE(db2.create_warehouse_tables());
+
+    // Fresh DB → the paused config is gone; the default "true" comes from a
+    // CLEAN database, not a silent read-failure default over corrupt bytes.
+    CHECK(db2.get_config("process_enabled", "true") == "true");
+
+    // A timestamped quarantine sidecar exists next to the original path.
+    bool found_quarantine = false;
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) {
+            found_quarantine = true;
+            std::error_code ec;
+            fs::remove(entry.path(), ec); // tidy up the quarantine artifact
+        }
+    }
+    CHECK(found_quarantine);
+}
+
+TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    // The happy path: integrity_ok returns true, so a previously-written DB is
+    // re-opened in place with its data intact and NO `.corrupt-*` sidecar minted
+    // (guards against an integrity_ok that wrongly fails every open).
+    auto tmp = yuzu::test::unique_temp_path("tar_valid_");
+    {
+        auto opened = TarDatabase::open(tmp);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        db.set_config("process_enabled", "false");
+    }
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    TarDatabase db = std::move(*reopened);
+    // Data survived — NOT reset to the default.
+    CHECK(db.get_config("process_enabled", "true") == "false");
+    // No quarantine sidecar was created for a healthy DB.
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path()))
+        CHECK(entry.path().filename().string().rfind(prefix, 0) != 0);
     std::error_code ec;
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);

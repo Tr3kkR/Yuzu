@@ -59,4 +59,26 @@ void apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view new_value,
                                       int64_t now_epoch);
 
+/**
+ * Map a capture-source name to the `set_state`/`get_state` collector key its
+ * diff path uses, or "" for sources that keep no diff-state.
+ *
+ * NOTE the `tcp` source persists its snapshot under "network", NOT "tcp" — this
+ * mapping MUST stay in sync with collect_fast_impl's set_state() calls. The
+ * scalar samplers (`perf`, `procperf`, `netqual`) keep no snapshot diff and map
+ * to "". Used when disabling a source to clear the right state row so a later
+ * re-enable diffs against a clean baseline (#538).
+ */
+[[nodiscard]] std::string_view diff_state_key_for_source(std::string_view source);
+
+/**
+ * Canonicalise a stored `<source>_enabled` value to a strict tri-state for the
+ * `status` surface (#560). do_configure only ever persists "true"/"false", so
+ * any other stored value indicates the row was mutated outside the plugin
+ * (corruption, disk tampering, downgrade/upgrade) and is reported as the
+ * explicit "errored" sentinel — never coerced/guessed — so the dashboard can
+ * render a value-error badge instead of silently omitting the source.
+ */
+[[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
+
 } // namespace yuzu::tar
