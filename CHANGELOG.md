@@ -286,6 +286,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Agent no longer crashes or crash-loops on permanent registration rejection
+  or clean shutdown with the TAR plugin loaded (#1434, #1420).** Three
+  `this`-capturing worker threads spawned by `AgentImpl::Run()` — the TAR
+  snapshot pump, the per-connection heartbeat, and the OTA updater — were not
+  joined on the early-`return` exit paths, and the snapshot pump was joined only
+  *after* `plugins_.clear()` on the normal shutdown path. A permanent
+  registration rejection (exhausted or expired enrollment token) left the pump
+  thread running against freed `AgentImpl` state — a use-after-free / SIGSEGV
+  crash loop on the released agent (#1434); on a clean shutdown the pump could
+  dispatch `tar.fleet_snapshot` into a plugin that `plugins_.clear()` had already
+  torn down, aborting on a clean exit path (#1420). A single
+  `quiesce_run_workers()` chokepoint now joins all three threads on every exit
+  path (early returns, exceptions, and normal shutdown), ordered before plugin
+  teardown. `Updater::stop()` additionally cancels its in-flight OTA RPC so a
+  stalled download cannot hang the shutdown join.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory
