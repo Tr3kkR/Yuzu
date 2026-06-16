@@ -296,24 +296,47 @@ std::string render_device_live_value(const std::string& label, const std::string
            esc(label) + "</div></div></div>";
 }
 
-std::string render_device_live_processes(const std::vector<std::pair<int, std::string>>& procs) {
+std::string render_device_live_processes(const std::vector<LiveProcess>& procs) {
     if (procs.empty())
         return "<div class=\"gp-note\">No processes returned.</div>";
-    std::string h = "<div class=\"gp-note\" style=\"margin-top:0\"><b>" +
-                    std::to_string(procs.size()) + "</b> running processes (live).</div>";
+    auto lc = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::size_t n = procs.size();
+    const std::size_t preview = n < 10 ? n : 10;
+
+    std::string h = "<div class=\"gp-note\" style=\"margin-top:0\"><b>" + std::to_string(n) +
+                    "</b> running processes (live) &middot; SHA-256 of the on-disk image.</div>";
+    // Search the full (in-DOM) list; collapse to the first 10 when the box is empty.
+    h += "<div class=\"gp-filters\"><input class=\"gp-search\" type=\"text\" "
+         "placeholder=\"Search name, PID, or hash\xE2\x80\xA6\" oninput=\"gpSearchTopN(this)\" "
+         "data-gpf=\"liveproc\" data-gplimit=\"10\" style=\"min-width:240px\">"
+         "<span class=\"gp-mute\" data-gpcount=\"liveproc\" style=\"font-size:.68rem\">Showing " +
+         std::to_string(preview) + " of " + std::to_string(n) + "</span></div>";
     h += "<table class=\"gp-table\"><thead><tr><th class=\"gp-num\">PID</th><th>Process</th>"
-         "</tr></thead><tbody>";
-    std::size_t shown = 0;
-    for (const auto& [pid, name] : procs) {
-        if (shown++ >= 50)
-            break;
-        h += "<tr><td class=\"gp-num\">" + std::to_string(pid) + "</td><td class=\"name\">" +
-             esc(name) + "</td></tr>";
+         "<th>SHA-256</th></tr></thead><tbody>";
+    std::size_t i = 0;
+    for (const auto& p : procs) {
+        const std::string search = lc(p.name + " " + std::to_string(p.pid) + " " + p.sha256 + " " +
+                                      p.path);
+        const std::string hidden = (i++ >= preview) ? " style=\"display:none\"" : "";
+        h += "<tr data-gpf=\"liveproc\" data-gpname=\"" + esc(search) + "\"" + hidden + ">";
+        h += "<td class=\"gp-num\">" + std::to_string(p.pid) + "</td>";
+        h += "<td><div class=\"name\">" + esc(p.name) + "</div>";
+        if (!p.path.empty())
+            h += "<div class=\"gp-mute\" style=\"font-family:var(--mono);font-size:.62rem;"
+                 "overflow-wrap:anywhere\">" +
+                 esc(p.path) + "</div>";
+        h += "</td>";
+        if (!p.sha256.empty())
+            h += "<td><code style=\"font-family:var(--mono);font-size:.66rem\" title=\"" +
+                 esc(p.sha256) + "\">" + esc(p.sha256.substr(0, 16)) + "\xE2\x80\xA6</code></td>";
+        else
+            h += "<td class=\"gp-mute\">&mdash;</td>";
+        h += "</tr>";
     }
     h += "</tbody></table>";
-    if (procs.size() > 50)
-        h += "<div class=\"gp-note\">Showing first 50 of " + std::to_string(procs.size()) +
-             ".</div>";
     return h;
 }
 

@@ -103,16 +103,28 @@ TEST_CASE("device live value: value tile; empty -> dash", "[device][ui]") {
     CHECK(render_device_live_value("Uptime", "").find("&mdash;") != std::string::npos);
 }
 
-TEST_CASE("device live processes: PID/name table, empty + cap", "[device][ui]") {
-    std::vector<std::pair<int, std::string>> procs{{1234, "chrome.exe"}, {5678, "code.exe"}};
+TEST_CASE("device live processes: hash table, search, first-10 preview", "[device][ui]") {
+    std::vector<LiveProcess> procs{
+        {1234, "chrome.exe",
+         "abcdef0123456789aabbccddeeff00112233445566778899aabbccddeeff0011", "C:\\chrome.exe"},
+        {5678, "code.exe", "", ""}}; // unresolved hash/path
     const auto html = render_device_live_processes(procs);
     CHECK(html.find("1234") != std::string::npos);
     CHECK(html.find("chrome.exe") != std::string::npos);
     CHECK(html.find("running processes") != std::string::npos);
+    CHECK(html.find("SHA-256") != std::string::npos);                       // column header
+    CHECK(html.find("abcdef0123456789\xE2\x80\xA6") != std::string::npos);  // truncated hash + …
+    CHECK(html.find("title=\"abcdef0123456789aabb") != std::string::npos);  // full hash in title
+    CHECK(html.find("C:\\chrome.exe") != std::string::npos);                // path shown
+    CHECK(html.find("&mdash;") != std::string::npos);                       // missing hash -> dash
+    CHECK(html.find("gpSearchTopN") != std::string::npos);                  // searchable
+    CHECK(html.find("data-gplimit=\"10\"") != std::string::npos);
     CHECK(render_device_live_processes({}).find("No processes returned") != std::string::npos);
-    // > 50 -> capped with a note
-    std::vector<std::pair<int, std::string>> many;
-    for (int i = 0; i < 60; ++i)
-        many.emplace_back(i, "p" + std::to_string(i));
-    CHECK(render_device_live_processes(many).find("Showing first 50") != std::string::npos);
+    // first-10 preview: rows beyond 10 render into the DOM but are hidden.
+    std::vector<LiveProcess> many;
+    for (int i = 0; i < 15; ++i)
+        many.push_back({i, "p" + std::to_string(i), "", ""});
+    const auto big = render_device_live_processes(many);
+    CHECK(big.find("display:none") != std::string::npos);     // rows 11+ hidden
+    CHECK(big.find("Showing 10 of 15") != std::string::npos); // preview counter
 }

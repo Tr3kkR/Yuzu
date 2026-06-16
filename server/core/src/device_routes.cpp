@@ -74,7 +74,7 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
     if (kind == "uptime")
         return LiveKind{"os_info", "uptime", "Uptime", "device.live.uptime"};
     if (kind == "processes")
-        return LiveKind{"processes", "list", "Running processes", "device.live.processes"};
+        return LiveKind{"processes", "list_hashed", "Running processes", "device.live.processes"};
     return std::nullopt;
 }
 
@@ -98,15 +98,28 @@ std::string render_live_result(const LiveKind& lk, const std::string& output) {
         return render_device_live_value(lk.label, value);
     }
     if (lk.plugin == "processes") {
-        std::vector<std::pair<int, std::string>> procs;
+        std::vector<LiveProcess> procs;
         for (const auto& l : lines) {
-            if (!l.starts_with("proc|")) continue; // proc|pid|name
-            const auto first = l.find('|');
-            const auto second = l.find('|', first + 1);
-            if (second == std::string::npos) continue;
-            int pid = 0;
-            try { pid = std::stoi(l.substr(first + 1, second - first - 1)); } catch (...) { pid = 0; }
-            procs.emplace_back(pid, l.substr(second + 1));
+            if (!l.starts_with("proc|")) continue; // proc|pid|name|sha256|path
+            const auto a = l.find('|');            // after "proc"
+            const auto b = l.find('|', a + 1);     // after pid
+            if (b == std::string::npos) continue;
+            const auto c = l.find('|', b + 1);     // after name
+            LiveProcess lp;
+            try { lp.pid = std::stoi(l.substr(a + 1, b - a - 1)); } catch (...) { lp.pid = 0; }
+            if (c == std::string::npos) {
+                lp.name = l.substr(b + 1); // tolerate the old proc|pid|name shape
+            } else {
+                lp.name = l.substr(b + 1, c - b - 1);
+                const auto d = l.find('|', c + 1); // after sha256 (path may contain none)
+                if (d == std::string::npos) {
+                    lp.sha256 = l.substr(c + 1);
+                } else {
+                    lp.sha256 = l.substr(c + 1, d - c - 1);
+                    lp.path = l.substr(d + 1);
+                }
+            }
+            procs.push_back(std::move(lp));
         }
         return render_device_live_processes(procs);
     }

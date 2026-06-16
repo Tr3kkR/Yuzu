@@ -96,12 +96,12 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         // Usage vs machine-health audit split (works-council posture).
         CHECK(h.audited == "device.live.uptime|success|a-1");
     }
-    SECTION("processes -> processes/list, audited as device.live.processes") {
+    SECTION("processes -> processes/list_hashed, audited as device.live.processes") {
         LiveHarness h;
         auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=processes");
         REQUIRE(r);
         CHECK(h.seen_plugin == "processes");
-        CHECK(h.seen_action == "list");
+        CHECK(h.seen_action == "list_hashed"); // hashed variant carries the SHA-256
         CHECK(h.audited == "device.live.processes|success|a-1");
     }
     SECTION("offline device (sent=0): honest note, no polling, no auto-fire") {
@@ -145,15 +145,23 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
         CHECK(r->body.find("Uptime") != std::string::npos);
         CHECK(r->body.find("hx-trigger") == std::string::npos); // resolved, no re-poll
     }
-    SECTION("processes output -> PID/name table") {
+    SECTION("processes output -> PID/name/hash table (proc|pid|name|sha256|path)") {
         LiveHarness h;
-        h.fake_rows = {{"a-1", 0, "proc|0|[System Process]\nproc|4|System\nproc|123|sh", ""}};
+        h.fake_rows = {{"a-1", 0,
+                        "proc|0|[System Process]||\n"
+                        "proc|4|System||\n"
+                        "proc|123|sh|"
+                        "deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|"
+                        "/bin/sh",
+                        ""}};
         auto r = h.sink.Get(
             "/fragments/device/live/result?command_id=processes-test&agent_id=a-1&kind=processes&n=1");
         REQUIRE(r);
         CHECK(r->body.find("running processes") != std::string::npos);
         CHECK(r->body.find("[System Process]") != std::string::npos);
         CHECK(r->body.find("123") != std::string::npos);
+        CHECK(r->body.find("deadbeefcafe0000") != std::string::npos); // truncated hash rendered
+        CHECK(r->body.find("/bin/sh") != std::string::npos);          // path rendered
     }
     SECTION("pending (no rows yet) -> re-poll with n+1") {
         LiveHarness h; // fake_rows empty

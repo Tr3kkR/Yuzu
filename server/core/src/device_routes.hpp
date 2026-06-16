@@ -106,8 +106,19 @@ std::string render_device_guardian_lens(const std::string& agent_id,
 /// Live = queried on the agent NOW (no 30s heartbeat wait).
 std::string render_device_live_shell(const std::string& agent_id);
 
-/// PURE: render the live `processes/list` result (proc|pid|name → table).
-std::string render_device_live_processes(const std::vector<std::pair<int, std::string>>& procs);
+/// One live process row: PID + name + the SHA-256 of its on-disk image + the
+/// resolved executable path (hash/path empty when unresolved).
+struct LiveProcess {
+    int pid = 0;
+    std::string name;
+    std::string sha256; ///< lowercase hex; "" if unresolved / too large / gone
+    std::string path;   ///< resolved exe path; "" if unresolved
+};
+
+/// PURE: render the live `processes/list_hashed` result — a PID/name/SHA-256
+/// table. The full list renders into the DOM but only the first 10 rows show;
+/// a search box (gpSearchTopN) filters by name/PID/hash/path and expands matches.
+std::string render_device_live_processes(const std::vector<LiveProcess>& procs);
 
 /// PURE: render a simple key/value live result (e.g. os_info/uptime) as a tile.
 std::string render_device_live_value(const std::string& label, const std::string& value);
