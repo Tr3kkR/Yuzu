@@ -68,6 +68,7 @@
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
+#include "device_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -8065,6 +8066,35 @@ private:
         network_routes_ = std::make_unique<NetworkRoutes>();
         network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
 
+        // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
+        // page; Device-info lens). SLICE 1: sourced from the live registry (the
+        // CONNECTED agents) → identity + tags, online=true. Offline/enrolled
+        // devices, the DEX/Guardian lenses, and the live pull land in later slices.
+        // Auth-only, matching the current agent-list posture.
+        auto devices_fn = [this]() -> std::vector<DeviceRow> {
+            std::vector<DeviceRow> out;
+            auto arr = registry_.to_json_obj();
+            out.reserve(arr.size());
+            for (const auto& a : arr) {
+                DeviceRow d;
+                d.agent_id = a.value("agent_id", "");
+                d.hostname = a.value("hostname", "");
+                d.os = a.value("os", "");
+                d.arch = a.value("arch", "");
+                d.agent_version = a.value("agent_version", "");
+                d.online = true; // the registry holds connected sessions
+                d.last_seen = "now";
+                if (auto s = registry_.get_session(d.agent_id)) {
+                    for (const auto& [k, v] : s->scopable_tags)
+                        d.tags.push_back(v.empty() ? k : (k + "=" + v));
+                }
+                out.push_back(std::move(d));
+            }
+            return out;
+        };
+        device_routes_ = std::make_unique<DeviceRoutes>();
+        device_routes_->register_routes(*web_server_, auth_fn, perm_fn, devices_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -8891,6 +8921,7 @@ private:
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
+    std::unique_ptr<DeviceRoutes> device_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
