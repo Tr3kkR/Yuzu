@@ -30,13 +30,16 @@
 
 #include <httplib.h>
 
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
 
 class HttpRouteSink;
+class GuaranteedStateStore;
 
 /// One row of the fleet device list / the identity of one device. SLICE 1 carries
 /// only what the thin AgentInfo + registry session provide for real; richer CI /
@@ -79,6 +82,22 @@ std::string render_device_page(const DeviceRow& d);
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
                                            const std::string& message);
 
+/// One guard's compliance state on a device (Guardian lens row).
+struct DeviceGuardRow {
+    std::string name;       ///< the Guard's human name
+    std::string state;      ///< "compliant" | "drifted" | "errored"
+    std::string updated_at; ///< ISO of the evaluation that set it
+};
+
+/// PURE: the DEX lens for one device — the per-device score + its signal summary
+/// (obs_type → count, already fetched) + a link to the full /dex device drill.
+std::string render_device_dex_lens(const std::string& agent_id, int score,
+                                    const std::vector<std::pair<std::string, std::int64_t>>& signals);
+
+/// PURE: the Guardian lens for one device — compliance summary + per-guard state.
+std::string render_device_guardian_lens(const std::string& agent_id,
+                                        const std::vector<DeviceGuardRow>& guards);
+
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
 
@@ -96,16 +115,22 @@ public:
     /// "unavailable" placeholder.
     using DevicesFn = std::function<std::vector<DeviceRow>()>;
 
-    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn);
+    /// `store` (borrowed, may be null) backs the DEX + Guardian lenses (per-device
+    /// score / signal summary / guard compliance). Null → those lenses degrade to a
+    /// placeholder.
+    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+                         const GuaranteedStateStore* store);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
-    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn);
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+                         const GuaranteedStateStore* store);
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;
+    const GuaranteedStateStore* store_ = nullptr;
 };
 
 } // namespace yuzu::server

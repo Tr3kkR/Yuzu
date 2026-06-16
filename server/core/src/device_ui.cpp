@@ -15,10 +15,13 @@
 
 #include "device_routes.hpp"
 
+#include "dex_routes.hpp" // dex_signal_label for the DEX lens
 #include "web_utils.hpp"
 
 #include <cctype>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -84,6 +87,16 @@ std::string score_badge(int score) {
     return "<span style=\"display:inline-block;min-width:1.7rem;text-align:center;font-weight:700;"
            "font-size:.68rem;border-radius:.3rem;padding:.05rem .4rem;color:#06121f;background:" +
            std::string(color) + "\">" + std::to_string(score) + "</span>";
+}
+
+// Guardian compliance-state badge: compliant=green, drifted=amber, errored=red.
+std::string guard_state_badge(const std::string& state) {
+    const char* color = state == "compliant" ? "#4ed27e"
+                        : state == "errored"  ? "#ff5765"
+                                              : "#ffcc00"; // drifted / anything else
+    return "<span style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem .4rem;"
+           "color:#06121f;background:" +
+           std::string(color) + "\">" + esc(state.empty() ? "unknown" : state) + "</span>";
 }
 
 std::string ci_group(const std::string& title, const std::string& rows) {
@@ -224,6 +237,66 @@ std::string render_device_lens_placeholder(const std::string& active, const std:
                                            const std::string& message) {
     return device_lens_tabs(active, agent_id) +
            "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>" + esc(message) + "</div>";
+}
+
+std::string render_device_dex_lens(const std::string& agent_id, int score,
+                                   const std::vector<std::pair<std::string, std::int64_t>>& signals) {
+    std::string h = device_lens_tabs("dex", agent_id);
+    h += "<div class=\"gp-tiles\"><div class=\"gp-tile\">";
+    if (score < 0)
+        h += "<div class=\"n\">&mdash;</div>";
+    else
+        h += "<div class=\"n " + std::string(score >= 90 ? "good" : "warn") + "\">" +
+             std::to_string(score) + "</div>";
+    h += "<div class=\"l\">DEX experience</div><div class=\"sx\">last 7 days</div></div></div>";
+    if (signals.empty()) {
+        h += "<div class=\"gp-placeholder\"><b>No DEX signals</b>Nothing fired on this device in "
+             "the window &mdash; experience is clean.</div>";
+    } else {
+        h += "<div class=\"gp-sech\">Signals (this device, 7d)</div>";
+        h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Type</th>"
+             "<th class=\"gp-num\">Events</th></tr></thead><tbody>";
+        for (const auto& [obs, count] : signals)
+            h += "<tr><td>" + dex_signal_label(obs) +
+                 "</td><td class=\"gp-mute\" style=\"font-family:Consolas,monospace;font-size:.7rem\">" +
+                 esc(obs) + "</td><td class=\"gp-num\">" + std::to_string(count) + "</td></tr>";
+        h += "</tbody></table>";
+    }
+    h += "<div class=\"gp-note\"><button class=\"gp-btn\" hx-get=\"/fragments/dex/device?id=" +
+         url_encode(agent_id) +
+         "\" hx-target=\"#device-lens\" hx-swap=\"innerHTML\">Load full DEX history</button> "
+         "<span class=\"gp-mute\">crash detail, OS split, on-device perf</span></div>";
+    return h;
+}
+
+std::string render_device_guardian_lens(const std::string& agent_id,
+                                        const std::vector<DeviceGuardRow>& guards) {
+    std::string h = device_lens_tabs("guardian", agent_id);
+    if (guards.empty()) {
+        h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
+             "evaluated on this device yet.</div>";
+        return h;
+    }
+    int compliant = 0;
+    for (const auto& g : guards)
+        if (g.state == "compliant")
+            ++compliant;
+    const int pct = static_cast<int>(100.0 * compliant / static_cast<double>(guards.size()) + 0.5);
+    h += "<div class=\"gp-tiles\"><div class=\"gp-tile\"><div class=\"n " +
+         std::string(pct >= 100 ? "good" : "warn") + "\">" + std::to_string(pct) +
+         "%</div><div class=\"l\">Compliant</div><div class=\"sx\">" + std::to_string(compliant) +
+         " of " + std::to_string(guards.size()) + " guards</div></div></div>";
+    h += "<div class=\"gp-sech\">Guards on this device</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th>Guard</th><th>State</th><th>Last evaluated</th>"
+         "</tr></thead><tbody>";
+    for (const auto& g : guards)
+        h += "<tr><td class=\"name\">" + esc(g.name) + "</td><td>" + guard_state_badge(g.state) +
+             "</td><td class=\"gp-mute\">" + esc(g.updated_at) + "</td></tr>";
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">Per-guard state from "
+         "<span style=\"font-family:Consolas,monospace\">guardian_agent_rule_status</span>. "
+         "Baseline grouping + a live re-evaluate are follow-ups.</div>";
+    return h;
 }
 
 std::string render_device_page(const DeviceRow& d) {

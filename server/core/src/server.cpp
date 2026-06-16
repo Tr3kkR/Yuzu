@@ -8105,7 +8105,8 @@ private:
             return out;
         };
         device_routes_ = std::make_unique<DeviceRoutes>();
-        device_routes_->register_routes(*web_server_, auth_fn, perm_fn, devices_fn);
+        device_routes_->register_routes(*web_server_, auth_fn, perm_fn, devices_fn,
+                                        guaranteed_state_store_.get());
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)

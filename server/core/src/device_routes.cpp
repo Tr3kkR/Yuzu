@@ -7,11 +7,15 @@
 
 #include "device_routes.hpp"
 
+#include "dex_routes.hpp"             // dex_device_score, dex_iso_since
+#include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,16 +58,17 @@ bool matches(const DeviceRow& d, const std::string& q) {
 } // namespace
 
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn) {
+                                   DevicesFn devices_fn, const GuaranteedStateStore* store) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn));
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn), store);
 }
 
 void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn) {
+                                   DevicesFn devices_fn, const GuaranteedStateStore* store) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
+    store_ = store;
 
     // -- /devices page shell (auth-only static chrome) --
     sink.Get("/devices", [this](const httplib::Request& req, httplib::Response& res) {
@@ -163,25 +168,47 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                         "text/html; charset=utf-8");
     });
 
-    // -- DEX / Guardian lenses: placeholders until their slices land --
+    // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        res.set_content(render_device_lens_placeholder(
-                            "dex", id,
-                            "The DEX experience lens (reusing the device signal drill + a "
-                            "per-device score) lands with the per-device-scoring decision."),
-                        "text/html; charset=utf-8");
+        if (!store_) {
+            res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::string since = dex_iso_since(7);
+        const int score = dex_device_score(store_, id, since);
+        std::vector<std::pair<std::string, std::int64_t>> sigs;
+        for (const auto& s : store_->dex_device_signal_summary(id, since))
+            sigs.emplace_back(s.obs_type, s.count);
+        res.set_content(render_device_dex_lens(id, score, sigs), "text/html; charset=utf-8");
     });
+    // -- Guardian lens: per-guard compliance state for this device --
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        res.set_content(render_device_lens_placeholder(
-                            "guardian", id,
-                            "The Guardian compliance lens (baselines + per-guard state from "
-                            "guardian_agent_rule_status) lands next."),
-                        "text/html; charset=utf-8");
+        if (!store_) {
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        std::unordered_map<std::string, std::string> rule_names;
+        for (const auto& r : store_->list_rules())
+            rule_names[r.rule_id] = r.name;
+        std::vector<DeviceGuardRow> guards;
+        for (const auto& st : store_->agent_rule_statuses()) { // all; filter to this agent
+            if (st.agent_id != id)
+                continue;
+            DeviceGuardRow g;
+            auto it = rule_names.find(st.rule_id);
+            g.name = (it != rule_names.end() && !it->second.empty()) ? it->second : st.rule_id;
+            g.state = st.state;
+            g.updated_at = st.updated_at;
+            guards.push_back(std::move(g));
+        }
+        res.set_content(render_device_guardian_lens(id, guards), "text/html; charset=utf-8");
     });
 }
 
