@@ -609,11 +609,14 @@ const std::string& openapi_spec() {
     "/dex/perf/cohorts": {
       "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
     },
+    "/dex/perf/cohort-diff": {
+      "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
+    },
     "/dex/perf/devices": {
       "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
     },
     "/network/fleet": {
-      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — the same numbers as the yuzu_fleet_net_* Prometheus gauges and the /network Overview cards. A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
     },
     "/network/devices": {
       "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
@@ -5038,6 +5041,107 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // GET /dex/perf/cohort-diff?key=&a=&b= — F2c (BRD 99/103): the direct
+    // A-vs-B cohort comparison (e.g. image_type vanilla vs layered, or model X
+    // vs Y). F2a benchmarks each cohort against the FLEET; this diffs two
+    // cohorts head-to-head. delta_pct is A's p50 relative to B's p50 (B the
+    // baseline), present only when BOTH cohorts expose the metric (neither
+    // suppressed below the floor). Aggregate — NOT audited. (The fleet-per-app
+    // half of the BRD F2c residual, row 100, is deferred: per-app data is
+    // device-drill-only, not fleet render-time — see dex_perf_model.hpp.)
+    sink.Get("/api/v1/dex/perf/cohort-diff",
+             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!dex_perf_fn) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
+                     return;
+                 }
+                 const std::string key =
+                     req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+                 if (!TagStore::validate_key(key)) {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid,
+                                                           "key must match [A-Za-z0-9_.:-]{1,64}"),
+                                     "application/json");
+                     return;
+                 }
+                 // Both cohort values are required. A value of "" is the
+                 // legitimate untagged residual, so "missing" must be tested by
+                 // has_param, not by emptiness.
+                 if (!req.has_param("a") || !req.has_param("b")) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "cohort params 'a' and 'b' are required", cid,
+                                               "supply both a= and b= cohort values (an empty "
+                                               "value selects the untagged residual)"),
+                         "application/json");
+                     return;
+                 }
+                 const auto a = req.get_param_value("a");
+                 const auto b = req.get_param_value("b");
+                 // Validate the cohort VALUES too (only `key` was checked before):
+                 // the 448-byte tag-value cap. Empty stays valid (untagged residual).
+                 if (!TagStore::validate_value(a) || !TagStore::validate_value(b)) {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400, "cohort value too long", cid,
+                                                           "cohort values must be <= 448 bytes"),
+                                     "application/json");
+                     return;
+                 }
+                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                 auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
+                     if (!found)
+                         return "null";
+                     JObj o;
+                     o.add("cohort", c.cohort).add("devices", c.devices).add("suppressed",
+                                                                             c.suppressed);
+                     if (!c.suppressed)
+                         o.raw("cpu_pct", perf_stat_json(c.cpu))
+                             .raw("commit_pct", perf_stat_json(c.commit))
+                             .raw("disk_lat_ms", perf_stat_json(c.disk_lat));
+                     return o.str();
+                 };
+                 // delta_pct.<metric> is a number when present, JSON null when
+                 // absent — built via JObj so the double formatting matches the
+                 // stats above (and avoids a std::format dependency here).
+                 auto delta_obj = [&] {
+                     JObj o;
+                     if (d.cpu_delta_pct)
+                         o.add("cpu_pct", *d.cpu_delta_pct);
+                     else
+                         o.raw("cpu_pct", "null");
+                     if (d.commit_delta_pct)
+                         o.add("commit_pct", *d.commit_delta_pct);
+                     else
+                         o.raw("commit_pct", "null");
+                     if (d.disk_lat_delta_pct)
+                         o.add("disk_lat_ms", *d.disk_lat_delta_pct);
+                     else
+                         o.raw("disk_lat_ms", "null");
+                     return o.str();
+                 };
+                 res.set_content(ok_json(JObj()
+                                             .add("key", key)
+                                             .add("floor", kDexCohortFloor)
+                                             .add("found_a", d.found_a)
+                                             .add("found_b", d.found_b)
+                                             .raw("a", cohort_obj(d.found_a, d.a))
+                                             .raw("b", cohort_obj(d.found_b, d.b))
+                                             .raw("delta_pct", delta_obj())
+                                             .str()),
+                                 "application/json");
+             });
+
     // GET /dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=&limit= —
     // the ONE device list behind every Performance drill: worst-by-metric
     // (default), the not-reporting complement (filter=not_reporting), or a
@@ -5129,8 +5233,9 @@ void RestApiV1::register_routes(
     };
 
     // GET /network/fleet — fleet-now RTT / retransmit / throughput stats + the
-    // honest denominators + the measured co-occurrence counts (the same numbers
-    // the yuzu_fleet_net_* gauges carry and the /network Overview cards show).
+    // honest denominators + the measured co-occurrence counts. OS-blended over the
+    // same per-device facts the per-OS yuzu_fleet_net_* gauges carry (a gauge
+    // series, split by os, differs from this blended number on a mixed fleet).
     sink.Get("/api/v1/network/fleet",
              [perm_fn, net_perf_fn, net_stat_json](const httplib::Request& req,
                                                    httplib::Response& res) {

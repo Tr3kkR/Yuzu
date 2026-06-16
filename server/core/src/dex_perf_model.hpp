@@ -102,6 +102,38 @@ struct DexPerfCohortRow {
 /// descending; the untagged residual (if any) always last.
 std::vector<DexPerfCohortRow> dex_perf_cohorts(const DexPerfSnapshot& snap);
 
+/// One cohort-vs-cohort comparison (F2c, BRD rows 99/103). F2a benchmarks each
+/// cohort against the FLEET; this is the direct A-vs-B diff (e.g. image_type
+/// vanilla vs layered, or model X vs Y). Reuses dex_perf_cohorts so the diff
+/// and the cohort table share ONE aggregation path and cannot disagree.
+/// `found_*` is false when that cohort has no reporting devices in the
+/// snapshot; `a`/`b` carry the full cohort row (population, suppression, stats).
+/// Each `*_delta_pct` is A's p50 RELATIVE to B's p50 (B is the baseline,
+/// mirroring delta_pill's cohort-vs-reference convention; positive = A higher
+/// than B, i.e. worse for cpu/commit/latency) — present only when BOTH cohorts
+/// expose that metric (neither suppressed below kDexCohortFloor, both reported
+/// it). The fleet-per-app benchmark half of the BRD F2c residual (row 100) is
+/// NOT here: per-app data is device-drill-only (federated), not on the
+/// heartbeat, so a fleet-wide per-app view is not render-time and is deferred.
+struct DexPerfCohortDiff {
+    std::string cohort_a;
+    std::string cohort_b;
+    bool found_a{false};
+    bool found_b{false};
+    DexPerfCohortRow a;
+    DexPerfCohortRow b;
+    std::optional<double> cpu_delta_pct;
+    std::optional<double> commit_delta_pct;
+    std::optional<double> disk_lat_delta_pct;
+};
+
+/// PURE: compare two cohorts of the snapshot's cohort_key. `cohort_a`/`cohort_b`
+/// are resolved tag values ("" = the untagged residual, a legitimate cohort to
+/// diff). A == B yields equal rows and zero deltas (degenerate but harmless).
+DexPerfCohortDiff dex_perf_cohort_diff(const DexPerfSnapshot& snap,
+                                       const std::string& cohort_a,
+                                       const std::string& cohort_b);
+
 /// One row of the devices drill (worst-by-metric / cohort membership /
 /// not-reporting). `fleet_pctile` is the device's PERCENTILE RANK (share of
 /// reported values ≤ v, via detail::percentile_rank — the inverse of the

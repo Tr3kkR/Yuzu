@@ -3462,6 +3462,14 @@ Fleet-relative performance percentiles per **cohort** — the distinct values of
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`).
 - **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (10) reporting devices carry `suppressed: true` with their population and **no stats**; devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
 
+#### `GET /api/v1/dex/perf/cohort-diff`
+
+The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf across the fleet — is not here: per-app data is device-drill-only, not fleet render-time.)*
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`); `a`, `b` — the two cohort values to compare (**both required**; an empty value is the untagged residual).
+- **Response:** `{key, floor, found_a, found_b, a, b, delta_pct}`. `found_a`/`found_b` are `false` when a cohort has no reporting devices (its side is `null`). `a`/`b` are cohort rows `{cohort, devices, suppressed}` plus per-metric stats when not suppressed. `delta_pct` is `{cpu_pct, commit_pct, disk_lat_ms}` where each is A's p50 relative to B's p50 (B the baseline; positive = A higher), or `null` unless **both** cohorts expose that metric (neither suppressed below the 10-device floor). `400` on an invalid key or missing `a`/`b`. Not audited.
+
 #### `GET /api/v1/dex/perf/devices`
 
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.

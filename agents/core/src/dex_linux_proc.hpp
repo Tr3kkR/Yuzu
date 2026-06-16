@@ -116,4 +116,11 @@ YUZU_EXPORT std::string device_label(std::string_view device);
 /// signal enabled — fail-safe toward keeping the signal, not suppressing it).
 YUZU_EXPORT bool overcommit_is_always(std::string_view proc_overcommit_memory);
 
+/// PURE: uptime in seconds from /proc/uptime (its first token). nullopt when the
+/// content has no leading number, or it is non-finite/negative/implausibly large
+/// (≥ 1e12 s — the caller casts to int64, so an out-of-range value would be UB on the
+/// cast). Uses strtod (not from_chars<double>, which is missing on some libc++) —
+/// exception-free.
+YUZU_EXPORT std::optional<double> parse_proc_uptime(std::string_view proc_uptime);
+
 } // namespace yuzu::agent::lnx
