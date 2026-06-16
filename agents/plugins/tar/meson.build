@@ -6,7 +6,9 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('iphlpapi')
   tar_deps += cxx.find_library('ws2_32')
   tar_deps += cxx.find_library('wtsapi32')
-  tar_deps += cxx.find_library('tdh')     # ETW event decoding (tar_proc_etw)
+  tar_deps += cxx.find_library('tdh')      # ETW event decoding (tar_proc_etw, tar_module_etw)
+  tar_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (tar_module_etw)
+  tar_deps += cxx.find_library('crypt32')  # CryptQueryObject — signer extraction (tar_module_etw)
 elif host_machine.system() == 'darwin'
   # Endpoint Security process stream (tar_proc_es). The ES framework ships only
   # with the FULL Xcode SDK, not the Command Line Tools SDK, so detect it: where
@@ -43,6 +45,7 @@ shared_library(
     'src/tar_proc_stream.cpp',
     'src/tar_proc_etw.cpp',
     'src/tar_proc_es.cpp',
+    'src/tar_module_etw.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
     'src/tar_fleet_snapshot.cpp',

@@ -112,6 +112,26 @@ struct ProcPerfRow {
     int64_t ws_bytes{0};
 };
 
+/// One module_live row (M2 — image/DLL/driver load capture). `action` and
+/// `signed_state` hold the warehouse tokens (module_action_token /
+/// module_signed_token from tar_module_stream.hpp); `module_dir` is already
+/// redacted of any user-profile prefix by the collector (redact_module_dir).
+/// `module_name` is the loaded image basename only (names-only posture; the
+/// directory is the deliberate, narrow exception — the search-order-hijack
+/// signal). `signer` is the code-signing publisher / team id, "" if unknown.
+struct ModuleRow {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action;       // loaded / unloaded / seed / blocked
+    uint32_t pid{0};
+    std::string process_name;
+    std::string module_name;
+    std::string module_dir;
+    std::string signed_state; // signed / unsigned / invalid / revoked / unknown
+    std::string signer;
+    bool is_kernel{false};
+};
+
 /// One netqual_live row — per-connection TCP quality sample for the /network
 /// warehouse tier (BRD Workstream E). Linux-first via netlink INET_DIAG
 /// TCP_INFO, joined to the connection's owning process. One row per
@@ -232,6 +252,7 @@ public:
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
+    bool insert_module_events(const std::vector<ModuleRow>& rows);
 
     /**
      * Return one row per unique (proto, local_addr, local_port, remote_addr,

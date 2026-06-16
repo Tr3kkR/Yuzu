@@ -31,9 +31,13 @@
 
 #include "tar_proc_stream.hpp" // EventRing<T>
 
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace yuzu::tar {
@@ -100,6 +104,97 @@ struct ModuleEvent {
     std::string signer;                                          ///< publisher (Win) / team id (macOS); "" otherwise
     bool is_kernel{false};                                       ///< driver (Win) / kext (macOS) / kmod (Linux)
 };
+
+/// Scrub a user-profile prefix out of a module directory before it is stored —
+/// the privacy edge-drop the M1 governance made BLOCKING for the collectors. A
+/// loaded image under `C:\Users\<name>`, `C:\Documents and Settings\<name>`,
+/// `/home/<name>`, or `/Users/<name>` would otherwise persist a username.
+/// Replaces the segment immediately after a case-insensitive `Users` /
+/// `Documents and Settings` / `home` path segment with `<redacted>`, preserving
+/// the original separators (handles `\`, `/`, and the `\Device\HarddiskVolumeN\…`
+/// NT form). Non-profile paths (System32, /usr/lib, …) pass through unchanged.
+/// Known gaps (documented, deferred): 8.3 short names and redirected/roaming
+/// profile roots are not recognised — cross-reference `$Process_Live` for those.
+/// Pure + cross-platform: every module collector (ETW/ES/auditd) calls it, and
+/// it is exercised by the unit tests on every platform.
+inline std::string redact_module_dir(const std::string& dir) {
+    auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+    // Collect [start,end) spans of each non-separator path segment.
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    for (std::size_t i = 0, n = dir.size(); i < n;) {
+        while (i < n && is_sep(dir[i]))
+            ++i;
+        std::size_t start = i;
+        while (i < n && !is_sep(dir[i]))
+            ++i;
+        if (i > start)
+            spans.emplace_back(start, i);
+    }
+    for (std::size_t k = 0; k + 1 < spans.size(); ++k) {
+        std::string seg = dir.substr(spans[k].first, spans[k].second - spans[k].first);
+        for (auto& c : seg)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (seg == "users" || seg == "home" || seg == "documents and settings") {
+            // Replace the NEXT segment (the username) with the redaction marker;
+            // everything else — including separators — is kept verbatim.
+            return dir.substr(0, spans[k + 1].first) + "<redacted>" +
+                   dir.substr(spans[k + 1].second);
+        }
+    }
+    return dir;
+}
+
+/// A module load that must be kept at FULL fidelity in `module_live` regardless
+/// of volume: unsigned / invalid / revoked signatures, kernel driver/kext/kmod
+/// loads, and OS-blocked loads. These are the rare, high-signal forensic events.
+inline bool module_is_risky(const ModuleEvent& e) {
+    return e.is_kernel || e.action == ModuleAction::kBlocked ||
+           e.signed_state == ModuleSignedState::kUnsigned ||
+           e.signed_state == ModuleSignedState::kInvalid ||
+           e.signed_state == ModuleSignedState::kRevoked;
+}
+
+/// Minimal §5 edge risk-filter (docs/tar-module-loads.md) — bounds `module_live`
+/// at the write edge so a module-load storm can't flood it. Keeps EVERY risky
+/// load (module_is_risky); for normally-signed loads, dedups within the drain
+/// batch by (process, module_name, module_dir, signer, signed_state) — module_dir
+/// is in the key so the same-named DLL loaded from two directories (the
+/// search-order-hijack signal: a `version.dll` in an app dir vs System32) is NOT
+/// collapsed — and caps the number of DISTINCT signed loads kept per drain. The
+/// 100k row-count retention
+/// on `module_live` is the deterministic backstop behind this; the full
+/// first-seen-per-window-then-count refinement is deferred to M7. Pure +
+/// cross-platform (collector-agnostic), applied plugin-side between drain and
+/// insert — parity with the process stabilization-exclusion / proc-perf top-N.
+inline std::vector<ModuleEvent> apply_module_risk_filter(std::vector<ModuleEvent> events,
+                                                         std::size_t max_signed = 4096) {
+    std::vector<ModuleEvent> out;
+    out.reserve(events.size());
+    std::unordered_set<std::string> seen_signed;
+    std::size_t signed_kept = 0;
+    for (auto& e : events) {
+        if (module_is_risky(e)) {
+            out.push_back(std::move(e));
+            continue;
+        }
+        std::string key = e.process_name;
+        key += '\x1f';
+        key += e.module_name;
+        key += '\x1f';
+        key += e.module_dir; // keep same-named DLLs from different dirs distinct
+        key += '\x1f';
+        key += e.signer;
+        key += '\x1f';
+        key += module_signed_token(e.signed_state);
+        if (!seen_signed.insert(std::move(key)).second)
+            continue; // duplicate normally-signed load already kept this drain
+        if (signed_kept >= max_signed)
+            continue; // per-drain cap on distinct signed loads (the hard bound)
+        ++signed_kept;
+        out.push_back(std::move(e));
+    }
+    return out;
+}
 
 /// The module/image-load ring — `EventRing<ModuleEvent>`, the same bounded
 /// push→pull backpressure bridge the process ring uses (tar_proc_stream.hpp).
