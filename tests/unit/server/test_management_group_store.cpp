@@ -265,6 +265,77 @@ TEST_CASE("ManagementGroupStore: group role assignments", "[mgmt][roles]") {
     CHECK(roles2.empty());
 }
 
+TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture (#1453)",
+          "[mgmt][roles][rbac]") {
+    TempDb tmp;
+    ManagementGroupStore store(tmp.path);
+
+    // Group A with two enrolled agents; Group B with a third. NO
+    // management_group_roles rows — the fresh-install / RBAC-disabled state that
+    // hid every agent from the legacy-admin superuser in #1453.
+    ManagementGroup ga;
+    ga.name = "Group A";
+    ga.membership_type = "static";
+    auto gid_a = store.create_group(ga);
+    REQUIRE(gid_a.has_value());
+    ManagementGroup gb;
+    gb.name = "Group B";
+    gb.membership_type = "static";
+    auto gid_b = store.create_group(gb);
+    REQUIRE(gid_b.has_value());
+    store.add_member(*gid_a, "agent-001");
+    store.add_member(*gid_a, "agent-002");
+    store.add_member(*gid_b, "agent-003");
+
+    SECTION("probe unset → fail-closed role-scoped join (empty without a role)") {
+        // No probe wired and no role for admin → strict, pre-#1453 behavior.
+        CHECK(store.get_visible_agents("admin").empty());
+    }
+
+    SECTION("RBAC enabled → role-scoped join, strict subset (no cross-group leak)") {
+        store.set_rbac_enabled_probe([] { return true; });
+        // admin has no role → still sees nothing; the fallback must NOT widen
+        // visibility while RBAC is on.
+        CHECK(store.get_visible_agents("admin").empty());
+        GroupRoleAssignment a;
+        a.group_id = *gid_a;
+        a.principal_type = "user";
+        a.principal_id = "admin";
+        a.role_name = "ITServiceOwner";
+        REQUIRE(store.assign_role(a).has_value());
+        auto visible = store.get_visible_agents("admin");
+        // Sees Group A's two agents and NOT Group B's agent-003 — the core
+        // security property the role-scoped join must preserve under RBAC-on.
+        CHECK(visible.size() == 2);
+        CHECK(std::find(visible.begin(), visible.end(), "agent-003") == visible.end());
+    }
+
+    SECTION("RBAC disabled → full enrolled set regardless of role rows") {
+        store.set_rbac_enabled_probe([] { return false; });
+        auto visible = store.get_visible_agents("admin");
+        // admin has NO role row, yet sees every enrolled agent across all groups.
+        REQUIRE(visible.size() == 3);
+        CHECK(std::find(visible.begin(), visible.end(), "agent-003") != visible.end());
+        // Route-level auth still gates access; this store method returns the
+        // full set for any username under the RBAC-off legacy-superuser posture.
+        CHECK(store.get_visible_agents("nobody").size() == 3);
+    }
+
+    SECTION("RBAC disabled → DISTINCT dedups an agent that is in multiple groups") {
+        store.add_member(*gid_b, "agent-001"); // agent-001 now in A and B
+        store.set_rbac_enabled_probe([] { return false; });
+        // Still 3 DISTINCT agents, not 4 — all_member_agents() must dedup.
+        CHECK(store.get_visible_agents("admin").size() == 3);
+    }
+
+    SECTION("RBAC disabled → an empty fleet yields an empty set") {
+        TempDb empty_tmp;
+        ManagementGroupStore empty_store(empty_tmp.path);
+        empty_store.set_rbac_enabled_probe([] { return false; });
+        CHECK(empty_store.get_visible_agents("admin").empty());
+    }
+}
+
 TEST_CASE("ManagementGroupStore: find_group_by_name", "[mgmt][crud]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);

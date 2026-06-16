@@ -286,6 +286,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR fleet scan now shows all agents when RBAC is disabled (#1453, #1454).**
+  With RBAC enforcement globally off (the default posture), no per-user
+  management-group role assignments exist, so operators with full admin access
+  saw "no agents in scope" when running a TAR fleet scan — and had no in-product
+  way to recover (granting the first group role itself required holding one).
+  Device visibility now correctly returns the full enrolled set under
+  RBAC-disabled, across the dashboard agent list, `/api/agents`, and the TAR
+  fleet scan. When RBAC is **enabled**, the exact role-scoped behaviour is
+  preserved unchanged. The UAT rig additionally seeds an admin root-group role so
+  the environment is also correct if RBAC is later turned on.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory
