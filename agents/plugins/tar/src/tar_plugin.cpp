@@ -213,9 +213,13 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
     }
 }
 
-// Per-source enable/disable (issue #59). Default = enabled.
+// Per-source enable/disable (issue #59). The default for a source with no
+// config row yet comes from CaptureSourceDef::default_enabled (true for
+// always-on sources, false for opt-in module/procperf/netqual), so a fresh
+// agent agrees with tar.status / retention / the paused_at transition.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
-    return db.get_config(std::format("{}_enabled", source), "true") != "false";
+    const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
+    return db.get_config(std::format("{}_enabled", source), def) != "false";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
@@ -900,7 +904,11 @@ private:
         // from the per-source `*_live` table; an empty table reports 0 / 0.
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
-            auto enabled_val = db_->get_config(enabled_key, "true");
+            // Default to the source's declared default (false for opt-in
+            // module/procperf/netqual) so a fresh agent does not misreport an
+            // opt-in source as enabled.
+            auto enabled_val =
+                db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);

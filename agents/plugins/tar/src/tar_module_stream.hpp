@@ -31,9 +31,12 @@
 
 #include "tar_proc_stream.hpp" // EventRing<T>
 
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::tar {
@@ -69,7 +72,12 @@ constexpr std::string_view module_action_token(ModuleAction a) noexcept {
     case ModuleAction::kSeed:     return "seed";
     case ModuleAction::kBlocked:  return "blocked";
     }
-    return "loaded";
+    // Unreachable: all four enumerators are handled above and -Wswitch flags any
+    // new one. The fallback is a non-matching sentinel ("invalid") so an
+    // out-of-range cast can never be silently counted as a real "loaded" event
+    // by a rollup `action = '...'` predicate; the trailing return is retained so
+    // MSVC does not warn (C4715) on the out-of-range path.
+    return "invalid";
 }
 
 /// Stable warehouse token for the `module_live.signed_state` column.
@@ -101,6 +109,47 @@ struct ModuleEvent {
     bool is_kernel{false};                                       ///< driver (Win) / kext (macOS) / kmod (Linux)
 };
 
+/// Scrub a user-profile prefix out of a module directory before it is stored —
+/// the privacy edge-drop the M1 governance made BLOCKING for the collectors. A
+/// loaded image under `C:\Users\<name>`, `C:\Documents and Settings\<name>`,
+/// `/home/<name>`, or `/Users/<name>` would otherwise persist a username.
+/// Replaces the segment immediately after a case-insensitive `Users` /
+/// `Documents and Settings` / `home` path segment with `<redacted>`, preserving
+/// the original separators (handles `\`, `/`, and the `\Device\HarddiskVolumeN\…`
+/// NT form). Non-profile paths (System32, /usr/lib, …) pass through unchanged.
+/// Known gaps (documented, deferred): 8.3 short names and redirected/roaming
+/// profile roots are not recognised — cross-reference `$Process_Live` for those.
+/// Pure + cross-platform: every module collector (ETW/ES/auditd) calls it at
+/// drain (the ImageStreamCollector::drain() contract), and it is exercised by
+/// the unit tests on every platform. This is the shared post-drain sanitiser
+/// that makes redaction structurally hard to forget across future collectors.
+inline std::string redact_module_dir(const std::string& dir) {
+    auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+    // Collect [start,end) spans of each non-separator path segment.
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    for (std::size_t i = 0, n = dir.size(); i < n;) {
+        while (i < n && is_sep(dir[i]))
+            ++i;
+        std::size_t start = i;
+        while (i < n && !is_sep(dir[i]))
+            ++i;
+        if (i > start)
+            spans.emplace_back(start, i);
+    }
+    for (std::size_t k = 0; k + 1 < spans.size(); ++k) {
+        std::string seg = dir.substr(spans[k].first, spans[k].second - spans[k].first);
+        for (auto& c : seg)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (seg == "users" || seg == "home" || seg == "documents and settings") {
+            // Replace the NEXT segment (the username) with the redaction marker;
+            // everything else — including separators — is kept verbatim.
+            return dir.substr(0, spans[k + 1].first) + "<redacted>" +
+                   dir.substr(spans[k + 1].second);
+        }
+    }
+    return dir;
+}
+
 /// The module/image-load ring — `EventRing<ModuleEvent>`, the same bounded
 /// push→pull backpressure bridge the process ring uses (tar_proc_stream.hpp).
 using ModuleEventRing = EventRing<ModuleEvent>;
@@ -131,10 +180,26 @@ public:
     /// Stop streaming and release the underlying session/client. Safe if not started.
     virtual void stop() = 0;
     virtual bool running() const noexcept = 0;
-    /// Move buffered events out for the batched tar.db write.
+    /// Move buffered events out for the batched tar.db write. The concrete
+    /// collector MUST apply `redact_module_dir()` to every event's `module_dir`
+    /// before the rows are inserted (the privacy edge-drop the M1 governance
+    /// made BLOCKING for collectors — docs/tar-module-loads.md §13); a raw
+    /// `module_dir` can embed a username. Resolving `process_name`/`signer` and
+    /// the signing verdict also happens here, off the kernel-serial callback.
     virtual std::vector<ModuleEvent> drain() = 0;
     /// Events dropped due to ring overflow since construction.
     virtual std::uint64_t dropped() const noexcept = 0;
+    /// Events the source's kernel/provider dropped BEFORE they reached userspace
+    /// (e.g. an Endpoint Security `seq_num` gap), distinct from dropped() which
+    /// counts the userspace ring overflow. Default 0 for sources with no
+    /// kernel-side sequence to inspect. (Sibling of ProcStreamCollector — keep
+    /// the contract in lockstep so a concrete collector can override either.)
+    virtual std::uint64_t kernel_dropped() const noexcept { return 0; }
+    /// True when the collector still reports running() but has gone silent long
+    /// enough to be presumed dead — for a source with no liveness API (the macOS
+    /// Endpoint Security client). The plugin falls back to the poll when this
+    /// trips. Default false for sources whose running() already flips on death.
+    virtual bool stalled() const noexcept { return false; }
     /// Stable token for the `module_capture_method` status field
     /// ("etw" / "endpoint_security" / "auditd").
     virtual const char* method_name() const noexcept = 0;

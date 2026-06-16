@@ -13,7 +13,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace yuzu::tar;
 
@@ -126,4 +130,112 @@ TEST_CASE("module capture methods are pre-stageable while kPlanned", "[tar][modu
     CHECK(has("etw"));
     CHECK(has("auditd"));
     CHECK(has("endpoint_security"));
+}
+
+// ── redact_module_dir (the governance-BLOCKING privacy scrub, review S9) ────
+// The shared post-drain sanitiser every collector applies to module_dir before
+// insert. Pure + cross-platform, so it is exercised on every host (the live
+// collectors are not). Backported into M1 from the M2 collector so the
+// structural enforcement lands with the contract.
+
+TEST_CASE("redact_module_dir scrubs the user-profile segment", "[tar][module][redact]") {
+    CHECK(redact_module_dir(R"(C:\Users\alice\AppData\Local)") ==
+          R"(C:\Users\<redacted>\AppData\Local)");
+    CHECK(redact_module_dir("/home/bob/.config") == "/home/<redacted>/.config");
+    CHECK(redact_module_dir("/Users/carol/Library") == "/Users/<redacted>/Library");
+    CHECK(redact_module_dir(R"(\Device\HarddiskVolume3\Users\dave\app)") ==
+          R"(\Device\HarddiskVolume3\Users\<redacted>\app)");
+}
+
+TEST_CASE("redact_module_dir leaves non-profile paths unchanged", "[tar][module][redact]") {
+    CHECK(redact_module_dir(R"(C:\Windows\System32)") == R"(C:\Windows\System32)");
+    CHECK(redact_module_dir("/usr/lib/x86_64-linux-gnu") == "/usr/lib/x86_64-linux-gnu");
+    CHECK(redact_module_dir("").empty());
+    // "Users"/"home" with no following segment → nothing to scrub.
+    CHECK(redact_module_dir(R"(C:\Users)") == R"(C:\Users)");
+    CHECK(redact_module_dir("/home") == "/home");
+}
+
+TEST_CASE("redact_module_dir is case-insensitive on the profile root", "[tar][module][redact]") {
+    CHECK(redact_module_dir(R"(C:\USERS\alice\x)") == R"(C:\USERS\<redacted>\x)");
+    CHECK(redact_module_dir("/HOME/bob/.config") == "/HOME/<redacted>/.config");
+}
+
+TEST_CASE("redact_module_dir scrubs the legacy 'Documents and Settings' root",
+          "[tar][module][redact]") {
+    CHECK(redact_module_dir(R"(C:\Documents and Settings\carol\Local Settings)") ==
+          R"(C:\Documents and Settings\<redacted>\Local Settings)");
+    CHECK(redact_module_dir(R"(C:\DOCUMENTS AND SETTINGS\dave\App)") ==
+          R"(C:\DOCUMENTS AND SETTINGS\<redacted>\App)");
+}
+
+// ── EventRing::drain() exception-safety post-condition (review S2) ───────────
+
+TEST_CASE("EventRing<ModuleEvent> retains capacity across drain", "[tar][module]") {
+    // The S2 fix swaps in a freshly cap_-reserved buffer at every drain, so the
+    // ring's capacity must never shrink below cap_ — otherwise the next push()
+    // (in production, the kernel-serial ETW/ES callback) could reallocate, and a
+    // bad_alloc across that C frame is UB. This pins the no-shrink post-condition
+    // (the actual bad_alloc path can't be injected portably, but the invariant
+    // it protects is observable as capacity()).
+    ModuleEventRing ring(8);
+    REQUIRE(ring.capacity() == 8);
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < 5; ++i)
+            CHECK(ring.push(ModuleEvent{}));
+        auto out = ring.drain();
+        CHECK(out.size() == 5);
+        CHECK(ring.capacity() == 8); // never shrinks
+    }
+}
+
+TEST_CASE("EventRing<ModuleEvent> is safe under concurrent push/drain",
+          "[tar][module][concurrency]") {
+    // Exercises the push/drain mutual exclusion and the drain() reserve-outside-
+    // lock change under contention (the ProcEvent ring shares the same template,
+    // fed by the kernel-serial ETW/ES callbacks). Conservation: every push that
+    // returns true is eventually drained exactly once; every push that returns
+    // false is counted as a drop. Run under TSan (nightly) this also asserts the
+    // ring is data-race-free. Capacity is deliberately small so overflow drops
+    // are exercised too.
+    constexpr int kProducers = 4;
+    constexpr int kPerProducer = 2000;
+    ModuleEventRing ring(64);
+
+    std::atomic<std::uint64_t> accepted{0};
+    std::atomic<bool> producers_done{false};
+    std::atomic<std::uint64_t> drained{0};
+
+    std::vector<std::thread> producers;
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&ring, &accepted] {
+            for (int i = 0; i < kPerProducer; ++i) {
+                if (ring.push(ModuleEvent{}))
+                    accepted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::thread consumer([&ring, &drained, &producers_done] {
+        for (;;) {
+            auto batch = ring.drain();
+            drained.fetch_add(batch.size(), std::memory_order_relaxed);
+            if (producers_done.load(std::memory_order_acquire) && batch.empty()) {
+                // One final drain to catch anything pushed between the last drain
+                // and the producers_done flag becoming visible.
+                drained.fetch_add(ring.drain().size(), std::memory_order_relaxed);
+                return;
+            }
+        }
+    });
+
+    for (auto& t : producers)
+        t.join();
+    producers_done.store(true, std::memory_order_release);
+    consumer.join();
+
+    const std::uint64_t total = kProducers * kPerProducer;
+    CHECK(accepted.load() + ring.dropped() == total);     // every push accounted for
+    CHECK(drained.load() == accepted.load());             // every accepted event drained once
+    CHECK(ring.capacity() == 64);                         // capacity intact after the storm
 }

@@ -190,6 +190,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_stream.cpp',
+    '../agents/plugins/tar/src/tar_module_stream.cpp',
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',

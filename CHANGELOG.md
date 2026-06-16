@@ -340,6 +340,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
+  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
+  on `tar.status` because every source defaulted its enabled flag to `true`.
+  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
+  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
+  transition from a single source of truth — so status, retention, and the
+  retention-paused list all agree the source starts disabled (and the first
+  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
+  an agent that never set these keys now reports `<source>_enabled|false` on
+  `tar.status` where it previously reported `true`; **no data collection
+  changes** (collection was already gated off), so this only affects automation
+  that parses `tar.status` to inventory active sources.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

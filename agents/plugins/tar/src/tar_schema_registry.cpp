@@ -357,6 +357,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "procperf",
             .dollar_name = "ProcPerf",
+            // Opt-in (works-council posture): a fresh agent reports it disabled
+            // on tar.status, matching the explicit "false" collection gate.
+            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,  "ntsysinfo",
                  "One NtQuerySystemInformation(SystemProcessInformation) "
@@ -411,6 +414,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "netqual",
             .dollar_name = "NetQual",
+            // Opt-in (usage-class per-connection telemetry): disabled on a fresh
+            // agent, matching the explicit "false" collection gate.
+            .default_enabled = false,
             .os_support = {
                 {"linux",   OsSupportStatus::kSupported, "inetdiag",
                  "netlink SOCK_DIAG / INET_DIAG TCP_INFO dump (the interface "
@@ -463,6 +469,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "module",
             .dollar_name = "Module",
+            // Opt-in (~100× process volume; ships disabled until an operator
+            // turns it on). default_enabled=false is what discharges the M1 §13
+            // condition that module_enabled must NOT read as true before a
+            // collector exists — it makes tar.status, retention, and the
+            // paused_at transition all agree the source starts disabled.
+            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kPlanned, "etw",
                  "Microsoft-Windows-Kernel-Process image-load events (image "
@@ -606,6 +618,14 @@ const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();
 }
 
+bool source_default_enabled(std::string_view source_name) {
+    for (const auto& src : build_sources()) {
+        if (src.name == source_name)
+            return src.default_enabled;
+    }
+    return true; // unknown source → the always-on default
+}
+
 std::vector<std::string> accepted_capture_methods(std::string_view source_name) {
     std::vector<std::string> methods;
     for (const auto& src : build_sources()) {
@@ -661,6 +681,12 @@ std::string generate_warehouse_ddl() {
             if (g.suffix == "live" && src.name == "module") {
                 ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(module_name);\n",
                                    table_name);
+                // The canonical "unsigned image loaded in the last 24h" query
+                // filters signed_state; index it so that scan stays cheap once a
+                // collector populates module_live.
+                ddl << std::format(
+                    "CREATE INDEX IF NOT EXISTS idx_{0}_signed_state ON {0}(signed_state);\n",
+                    table_name);
             }
 
             ddl << "\n";

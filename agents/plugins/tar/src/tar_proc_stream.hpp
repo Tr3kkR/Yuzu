@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -90,14 +91,31 @@ public:
 
     /// Move all buffered events out for batched persistence; leaves the ring empty.
     std::vector<T> drain() {
+        // The exception-safety argument below relies on the two vector swaps
+        // under the lock being noexcept; assert it so a future T or allocator
+        // that breaks nothrow-swap is caught at compile time, not at runtime in
+        // the kernel-serial callback.
+        static_assert(std::is_nothrow_swappable_v<std::vector<T>>,
+                      "EventRing::drain() needs noexcept vector swap for its "
+                      "no-throw-under-lock invariant");
+        // Allocate the replacement buffer (the only throwing op) BEFORE taking
+        // the lock and before mutating buf_. A swap() leaves buf_ at zero
+        // capacity, so re-reserving buf_ *under the lock* would, on a bad_alloc,
+        // leave buf_ permanently at zero capacity — and the next push() (which
+        // runs in the kernel-serial ETW/ES callback) would then reallocate, and
+        // a bad_alloc escaping across that C frame is undefined behaviour. By
+        // reserving `fresh` here, a throw happens before the lock with buf_
+        // untouched (still at cap_ from the ctor / previous drain), so the
+        // no-reallocation-in-the-handler invariant survives EVERY drain. Under
+        // the lock only the two noexcept vector swaps run.
+        std::vector<T> fresh;
+        fresh.reserve(cap_);
         std::vector<T> out;
-        std::lock_guard<std::mutex> lk(mu_);
-        out.swap(buf_);
-        // swap() leaves buf_ with zero capacity; re-reserve so the next push() under
-        // the lock cannot reallocate. The no-reallocation-in-the-handler invariant
-        // the ctor establishes (a realloc could throw std::bad_alloc across the
-        // ETW/ES C frame) must survive every drain, not just the first.
-        buf_.reserve(cap_);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            out.swap(buf_);   // out = the drained events (old buf_, cap_ capacity)
+            buf_.swap(fresh); // buf_ = the freshly-reserved empty buffer (noexcept)
+        }
         return out;
     }
 

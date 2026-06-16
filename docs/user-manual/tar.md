@@ -100,6 +100,7 @@ Use the `configure` action to adjust TAR behavior.
 | `perf_enabled` | `true` / `false` | `true` | Toggle the device performance sampler on this host |
 | `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
+| `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). Set to `0` to disable the perf trigger entirely. |
 | `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
 | `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
@@ -140,6 +141,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
 | **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
 | **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
+| **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
 
 Status values:
 
@@ -211,8 +213,18 @@ config|user_enabled|true
 config|user_paused_at|0
 config|user_live_rows|97
 config|user_oldest_ts|1710900100
+config|module_enabled|false
+config|module_paused_at|0
+config|module_live_rows|0
+config|module_oldest_ts|0
 config|network_capture_method|polling
 ```
+
+A block is emitted for every capture source. The opt-in sources report
+`<source>_enabled|false` on a fresh agent — `module` (shown above),
+`procperf`, and `netqual` are off by default and must be enabled explicitly via
+`configure` (see the configuration table above). `module_live_rows` stays `0`
+until a collector for the host's OS ships.
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines; the dashboard renders `—` in their absence.
 
@@ -275,6 +287,14 @@ TAR is designed for minimal performance overhead:
 > because it is usage-class data subject to works-council/DPA review (see
 > `docs/enterprise-readiness-soc2-first-customer.md`). To enable it, set
 > `procperf_enabled=true` via the `configure` action (fleet-wide or per-device).
+> The same applies to `netqual_enabled` (per-connection TCP quality, Linux) and
+> `module_enabled` (image-load capture) — both ship **off by default**. On
+> upgrade to this release `tar.status` now correctly reports these opt-in
+> sources as `<source>_enabled|false` on an agent that has never set them (a
+> previous release misreported them as `true` even though nothing was being
+> collected); if you parse `tar.status` to inventory active sources, expect
+> `module_enabled`, `procperf_enabled`, and `netqual_enabled` to read `false`
+> unless you have explicitly opted in. No data collection changes on upgrade.
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
@@ -344,7 +364,7 @@ TAR includes a typed data warehouse that replaces the legacy flat `tar_events` t
 
 ### Warehouse tables
 
-Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent translates to real SQLite table names at execution time. There are six capture sources, each with multiple granularity tiers:
+Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent translates to real SQLite table names at execution time. Each capture source has multiple granularity tiers:
 
 | Source | Live | Hourly | Daily | Monthly |
 |--------|:----:|:------:|:-----:|:-------:|
@@ -354,6 +374,9 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **User** | `$User_Live` (5000 rows) | -- | `$User_Daily` (31d) | -- |
 | **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
+| **Module** | `$Module_Live` (100000 rows) | `$Module_Hourly` (24h) | `$Module_Daily` (31d) | `$Module_Monthly` (12mo) |
+
+The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 
 - **Live** tables hold the most recent raw events with a row cap (oldest rows are evicted): **5000 rows** for TCP / Service / User, and **100000 rows for `$Process_Live`** — raised because the Windows ETW feeder is event-driven (every start/stop, including short-lived processes) and fills a 5000-row window far faster than the old 60-second poll did, so a larger raw window keeps a meaningful history before rows roll up into the hourly/daily/monthly count tiers. **Exception: `$Perf_Live` and `$ProcPerf_Live` are time-based (7 days), not row-capped** — a fixed-cadence sampler keeps a *time window*, so raising `perf_interval_seconds` must not shrink the history it covers.
 - **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours (perf/procperf hourly: 31 days).

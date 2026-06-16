@@ -121,7 +121,13 @@ void apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view new_value,
                                       int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
-    std::string prev = db.get_config(enabled_key, "true");
+    // Default `prev` to the source's declared default so the first-ever set on a
+    // fresh DB is only a transition when it differs from that default. For an
+    // opt-in source (module/procperf/netqual, default false) the first
+    // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
+    // does not write a spurious paused_at.
+    const char* prev_def = source_default_enabled(source) ? "true" : "false";
+    std::string prev = db.get_config(enabled_key, prev_def);
     db.set_config(enabled_key, std::string{new_value});
 
     auto paused_at_key = std::format("{}_paused_at", source);
@@ -143,7 +149,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
         auto enabled_key = std::format("{}_enabled", src.name);
-        if (db.get_config(enabled_key, "true") == "false")
+        if (db.get_config(enabled_key, src.default_enabled ? "true" : "false") == "false")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);
