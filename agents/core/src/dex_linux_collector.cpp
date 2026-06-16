@@ -324,7 +324,7 @@ private:
         // (vCPU hotplug, SMT toggle), where the sum drops then jumps and fabricates a
         // throttle on the re-online edge (Gate-4 UP-5 / Gate-8). Comparing per-core and
         // counting ONLY cores present in BOTH samples makes hotplug invisible.
-        std::unordered_map<std::string, std::uint64_t> cur;
+        lnx::ThrottleCounts cur;
         std::error_code ec;
         const std::filesystem::path cpus{"/sys/devices/system/cpu"};
         for (std::filesystem::directory_iterator it{cpus, ec}, end; !ec && it != end;
@@ -344,18 +344,12 @@ private:
         if (cur.empty())
             return; // no thermal_throttle interface — leave prev untouched, never emit
         if (!prev_throttle_counts_.empty()) {
-            // Throttling iff SOME core present in both samples incremented. A core that
-            // appeared (re-online: not in prev) or disappeared (offline: not in cur) is
-            // never compared, so hotplug cannot fire a spurious throttle. Re-arms (the
-            // latch clears) only when no common core increments — bounded one-per-episode.
-            bool throttling = false;
-            for (const auto& [cpu, count] : cur) {
-                const auto it = prev_throttle_counts_.find(cpu);
-                if (it != prev_throttle_counts_.end() && count > it->second) {
-                    throttling = true;
-                    break;
-                }
-            }
+            // Throttling iff SOME core present in both samples incremented (pure +
+            // unit-tested in dex_linux_sysfs). A core that appeared (re-online) or
+            // disappeared (offline) is never compared, so hotplug cannot fire a spurious
+            // throttle. The latch re-arms only when no common core increments — bounded
+            // to one observation per throttling episode.
+            const bool throttling = lnx::throttle_increased(prev_throttle_counts_, cur);
             if (win::latch_should_emit(throttling, /*valid=*/true, throttle_reported_)) {
                 SignalObservation o;
                 o.obs_type = "hw.cpu_throttled";
@@ -546,7 +540,7 @@ private:
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
     lnx::DiskIoTotals prev_disk_;                            // valid=false until the first diskstats read
     win::BreachState cpu_breach_, mem_breach_, disk_lat_breach_; // sustained-breach latches
-    std::unordered_map<std::string, std::uint64_t> prev_throttle_counts_; // per-core core_throttle_count
+    lnx::ThrottleCounts prev_throttle_counts_;             // per-core core_throttle_count, prior snapshot
     bool throttle_reported_ = false;                        // hw.cpu_throttled poll-and-latch
     std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
     std::string journal_cursor_;                              // "" until baselined at the journal tail

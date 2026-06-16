@@ -26,4 +26,13 @@ std::optional<std::uint64_t> parse_throttle_count(std::string_view s) {
     return v;
 }
 
+bool throttle_increased(const ThrottleCounts& prev, const ThrottleCounts& cur) {
+    for (const auto& [cpu, count] : cur) {
+        const auto it = prev.find(cpu);
+        if (it != prev.end() && count > it->second)
+            return true; // a core present in both samples throttled this interval
+    }
+    return false;
+}
+
 } // namespace yuzu::agent::lnx
