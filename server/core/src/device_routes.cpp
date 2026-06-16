@@ -382,9 +382,12 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         if (req.has_param("n")) {
             try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
         }
+        // Hoist the responses into a named local: pointers below must outlive the
+        // loop, so iterating the temporary directly would dangle (use-after-free).
+        const auto rows = responses_fn_(command_id);
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* failed = nullptr;
-        for (const auto& r : responses_fn_(command_id)) {
+        for (const auto& r : rows) {
             if (r.agent_id != id) continue; // another agent's rows are never rendered here
             if (!r.output.empty()) with_output = &r;
             else if (r.status >= 2) failed = &r; // FAILURE / TIMEOUT / REJECTED terminal frame
