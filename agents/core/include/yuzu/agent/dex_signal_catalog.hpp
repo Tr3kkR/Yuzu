@@ -57,7 +57,7 @@ struct SignalObservation {
     std::string component;      ///< secondary entity (module/NIC/MAC), or ""
     double metric{0.0};         ///< numeric payload (boot ms); 0 = none
     std::uint32_t pid{0};       ///< process id where meaningful (crash/hang), else 0
-    std::string kind;           ///< "exception" | "hang" | "" — crash-family detail
+    std::string kind;           ///< "exception" | "hang" | "signal" | "unit" | "" — crash/failure-family detail
     std::string sentence;       ///< human-readable detected_value line
     std::int64_t timestamp_unix{0}; ///< epoch seconds, 0 = unknown (server stamps)
     std::string platform;       ///< "windows" | "linux" | "macos"

@@ -87,11 +87,13 @@ TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catal
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    // The Windows AGENT catalogue contract: exactly 103 obs_types. The SERVER's
-    // display catalogue (dex_signal_groups(), pinned at 104 by test_dex_routes.cpp)
-    // is intentionally one larger — it adds the macOS-only `storage.low`, which the
-    // Windows agent never emits. The two counts therefore differ by the macOS-only
-    // set BY DESIGN; each side's drift-net still bites for its own additions.
+    // The Windows AGENT event catalogue contract: exactly 103 obs_types. The
+    // SERVER's display catalogue (dex_signal_groups(), pinned at 107 by
+    // test_dex_routes.cpp) is intentionally larger — it adds the POLL-sourced
+    // types that never enter this EvtSubscribe catalogue: `storage.low`
+    // (macOS df poll + Windows state poll) and the three A3 `perf.*` breach
+    // types (dex_perf_breach via the state poller). The two counts therefore
+    // differ BY DESIGN; each side's drift-net still bites for its own additions.
     CHECK(types.size() == std::size(kAllObsTypes)); // 103 Windows signals
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
@@ -1128,9 +1130,17 @@ TEST_CASE("make_dex_observer is never null", "[crash][factory]") {
     bool fired = false;
     (void)obs->start([&](const SignalObservation&) { fired = true; });
     obs->stop();
+#elif defined(__linux__)
+    // The Linux collector slice (PR3) has landed: make_dex_observer() returns the
+    // /proc poll collector, no longer a no-op. start() always arms on Linux (/proc
+    // is always present), so exercise the start()/stop() lifecycle to confirm the
+    // poll thread spins up and joins cleanly. The /proc parsers are covered by the
+    // [proc] suite.
+    bool fired = false;
+    CHECK(obs->start([&](const SignalObservation&) { fired = true; }));
+    obs->stop();
 #elif !defined(_WIN32)
-    // On Linux the engine is still a no-op until that collector slice lands
-    // (gated behind broader Guardian Linux work).
+    // Other non-Windows platforms remain a no-op until a collector slice lands.
     bool fired = false;
     CHECK_FALSE(obs->start([&](const SignalObservation&) { fired = true; }));
     obs->stop();

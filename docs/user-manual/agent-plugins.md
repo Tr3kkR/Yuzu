@@ -746,6 +746,21 @@ Plugins for Windows-specific system management: registry operations and WMI quer
 
 ---
 
+### rdp_control
+
+| | |
+|---|---|
+| **Version** | v0.1.0 |
+| **Platforms** | W |
+| **Description** | Enable, disable, and report the Remote Desktop (RDP) posture of a Windows endpoint. Manages three gates: the `fDenyTSConnections` value under `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`, the built-in Remote Desktop firewall rule group (addressed locale-independently via `@FirewallAPI.dll,-28752` through `INetFwPolicy2`), and the `TermService` start state. Built for change-gated remote access — an ITSM system enables RDP for an approved change window and disables it afterward. **Prerequisite:** the agent service account must be a member of the local `Administrators` group — *not* the default install, and **not** granted by `scripts/install-agent-user.ps1` (which only adds Event Log / Performance groups). Grant it out of band via GPO Restricted Groups / Intune, or `Add-LocalGroupMember Administrators 'NT SERVICE\YuzuAgent'`, and verify with `Get-LocalGroupMember Administrators`. A non-elevated agent returns `reg_status\|error:5` on every `set_state`. **Dispatch gate:** only `Execution:Execute` is enforced on every path; the definition's role-gated approval and `executeRoles` apply solely on `POST /api/instructions/{id}/execute`, not on raw `/api/command` or MCP dispatch — restrict `Execution:Execute`/MCP token scope and keep a Guardian `fDenyTSConnections=1` backstop. |
+
+| Action | Description |
+|---|---|
+| `set_state` | Enable or disable RDP. Parameter: `state` (`enable` or `disable`). Enable sets `fDenyTSConnections=0`, enables the firewall rule group, and starts `TermService`. Disable sets `fDenyTSConnections=1` and disables the firewall rule group (the service is left running; the registry and firewall gates block new connections). Emits per-step columns `reg_status`, `firewall_status`, `service_status`, and an `overall` verdict; `overall=ok` only when every step succeeded — callers should retry until `overall=ok`, especially on disable. `service_status=running` is reported only after polling the SCM to a confirmed `SERVICE_RUNNING` (not at start-dispatch); `firewall_status=error:group_not_found` if the built-in Remote Desktop group is absent (never a silent no-op). Disable blocks *new* connections only; it does not terminate an already-established session. Gated by `Execution:Execute` on raw dispatch (see the Description's dispatch-gate note; the definition advertises role-gated approval, enforced only on the governed instruction-execute path). |
+| `status` | Read the current RDP posture. Returns `deny_ts_connections` (registry value), `firewall_group` (rule-group enabled state), `term_service` (service state), and a derived `rdp` verdict: `on` only when all three gates are readable and open; `unknown` when any gate could not be read (e.g. a non-elevated agent); `off` when all gates are readable but at least one is closed. A non-zero exit code also signals an unreadable gate — verify a state change by the exit code and per-gate rows, not the `rdp` summary alone. |
+
+---
+
 ## Stub Plugins (Planned)
 
 The following plugins are defined in the roadmap but not yet implemented. They are listed here for planning purposes.

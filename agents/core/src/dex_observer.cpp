@@ -425,6 +425,10 @@ namespace yuzu::agent {
 // Defined in dex_macos_collector.cpp — keeps the kqueue/sysctl mechanism out of
 // this TU (and the Windows winevt.h engine out of that one).
 std::unique_ptr<ISignalObserver> make_macos_dex_observer();
+#elif defined(__linux__)
+// Defined in dex_linux_collector.cpp — keeps the /proc poll + statvfs mechanism
+// out of this TU (same rationale as the macOS fork).
+std::unique_ptr<ISignalObserver> make_linux_dex_observer();
 #endif
 
 std::unique_ptr<ISignalObserver> make_dex_observer() {
@@ -432,6 +436,8 @@ std::unique_ptr<ISignalObserver> make_dex_observer() {
     return std::make_unique<WindowsDexObserver>();
 #elif defined(__APPLE__)
     return make_macos_dex_observer();
+#elif defined(__linux__)
+    return make_linux_dex_observer();
 #else
     return std::make_unique<NoopDexObserver>();
 #endif

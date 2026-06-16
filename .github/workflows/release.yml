@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -80,7 +80,14 @@ jobs:
           done
           if [ -n "$MISSING" ]; then
             echo "::error::Missing tools on self-hosted runner:$MISSING"
-            echo "Install with: sudo apt-get install -y ccache rpm bison flex"
+            echo "Install with: sudo apt-get install -y ccache rpm bison flex libsystemd-dev"
+            exit 1
+          fi
+          # libsystemd-dev (sd-bus) — the Linux Guardian systemd service guard links it;
+          # without the .pc file `meson setup` fails the agent configure. Checked via
+          # pkg-config rather than a command since it ships no binary.
+          if ! pkg-config --exists libsystemd; then
+            echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on self-hosted runner — sudo apt-get install -y libsystemd-dev"
             exit 1
           fi
 
@@ -279,7 +286,7 @@ jobs:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
@@ -452,7 +459,7 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -745,7 +752,7 @@ jobs:
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -1091,7 +1098,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1273,7 +1280,7 @@ jobs:
       attestations: write    # actions/attest-build-provenance
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1479,7 +1486,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.agent.chisel
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           clean: false
@@ -1672,7 +1679,7 @@ jobs:
       id-token: write        # cosign keyless + Sigstore OIDC
       attestations: write    # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           persist-credentials: false
@@ -1804,7 +1811,7 @@ jobs:
       id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 

@@ -123,6 +123,20 @@ Before upgrading any component:
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
 - [ ] Plan a maintenance window (upgrades take < 5 minutes per component)
+- [ ] **Review new opt-in telemetry:** this release adds DEX per-application
+  performance sampling (`procperf`), a new usage-class data category. It is
+  **off by default** (no action needed to keep it off) — but if you intend to
+  enable it for an EU workforce, treat it as a works-council co-determination
+  trigger. See the *DEX per-application sampling* upgrade note in
+  [Server Administration](server-admin.md#upgrade-notes).
+- [ ] **New network telemetry on Windows:** this release makes **Windows** agents
+  emit device-aggregate network facts (throughput + interval retransmit rate) on
+  the heartbeat, automatically on agent upgrade — gated by the existing
+  `--dex-disable` / `YUZU_AGENT_DEX_DISABLE` flag (no separate opt-in). These
+  carry no per-user or per-application identity (lighter than `procperf`), but the
+  project treats the *capability to observe* as the works-council co-determination
+  trigger, so EU deployments should note the new Windows coverage as they did for
+  the DEX signals. See [Network Quality](network.md) → Collection & privacy.
 
 ## Upgrading the Server
 
