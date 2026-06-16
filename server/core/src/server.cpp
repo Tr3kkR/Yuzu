@@ -7905,7 +7905,6 @@ private:
                 DexFleet f;
                 const auto ids = registry_.all_ids();
                 f.total_online = static_cast<int64_t>(ids.size());
-                f.connected_agent_ids = ids; // Overview scores each (window-respecting)
                 for (const auto& id : ids) {
                     if (auto s = registry_.get_session(id)) {
                         std::string os = s->os;
@@ -7921,6 +7920,13 @@ private:
                                                      f.connected_os.end(), os) ==
                                                f.connected_os.end())
                             f.connected_os.push_back(os);
+                        // Normalized (id, os) for the Overview score distribution +
+                        // the segment breakdown.
+                        const std::string nos = os.starts_with("win")            ? "windows"
+                                                : os.starts_with("lin")          ? "linux"
+                                                : (os == "darwin" || os == "macos") ? "macos"
+                                                                                    : os;
+                        f.connected_agents.emplace_back(id, nos);
                     }
                 }
                 return f;

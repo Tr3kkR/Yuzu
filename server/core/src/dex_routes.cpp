@@ -1364,11 +1364,28 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // pays this cost. ──
     {
         std::vector<int> ds;
-        ds.reserve(fleet.connected_agent_ids.size());
-        for (const auto& id : fleet.connected_agent_ids) {
+        ds.reserve(fleet.connected_agents.size());
+        // Per-segment (os) accumulation for the breakdown (small N — linear).
+        std::vector<std::string> seg_os;
+        std::vector<int> seg_n;
+        std::vector<long long> seg_sum;
+        auto seg_idx = [&](const std::string& o) -> std::size_t {
+            for (std::size_t i = 0; i < seg_os.size(); ++i)
+                if (seg_os[i] == o)
+                    return i;
+            seg_os.push_back(o);
+            seg_n.push_back(0);
+            seg_sum.push_back(0);
+            return seg_os.size() - 1;
+        };
+        for (const auto& [id, os] : fleet.connected_agents) {
             const int s = dex_device_score(store, id, since);
-            if (s >= 0)
-                ds.push_back(s);
+            if (s < 0)
+                continue;
+            ds.push_back(s);
+            const std::size_t i = seg_idx(os.empty() ? std::string("unknown") : os);
+            ++seg_n[i];
+            seg_sum[i] += s;
         }
         int great = 0, fair = 0, poor = 0;
         for (int s : ds) {
@@ -1454,6 +1471,37 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                  "<b style=\"color:#ff5765\">" + num(poor) + " poor</b>. Score = the device's own "
                  "weighted signal deductions; the Device/App/Network tiles are the same composite, "
                  "partitioned. (Fleet-scale → heartbeat rollup.)</div>";
+        }
+
+        // Experience by segment (OS today; mgmt-group / site grouping is a follow-up).
+        // Aggregate-first + drill: a segment tile opens the device list filtered to it
+        // (Fleet → segment → device — the 400k-safe path; never per-device cells here).
+        if (!seg_os.empty()) {
+            auto oslbl = [](const std::string& o) -> std::string {
+                return o == "windows" ? "Windows"
+                       : o == "linux" ? "Linux"
+                       : o == "macos" ? "macOS"
+                                      : (o.empty() ? std::string("Unknown") : o);
+            };
+            h += "<div class=\"gp-sech\">Experience by segment <span class=\"gp-mute\" "
+                 "style=\"font-weight:400;text-transform:none\">&middot; by OS &middot; click to "
+                 "drill</span></div><div class=\"gp-fgrid\">";
+            for (std::size_t i = 0; i < seg_os.size(); ++i) {
+                const int avg =
+                    seg_n[i] > 0
+                        ? static_cast<int>(static_cast<double>(seg_sum[i]) / seg_n[i] + 0.5)
+                        : -1;
+                const char* ft = avg < 0 ? "" : (avg >= 90 ? "ok" : (avg >= 75 ? "warn" : "bad"));
+                h += "<a class=\"gp-fcard\" hx-get=\"/fragments/devices/list?os=" +
+                     url_encode(seg_os[i]) +
+                     "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
+                h += "<div class=\"fn\">" + oslbl(seg_os[i]) + "<span class=\"cnt\">" +
+                     num(seg_n[i]) + " device(s)</span></div>";
+                h += "<div class=\"fev " + std::string(ft) + "\">" +
+                     (avg < 0 ? std::string("&mdash;") : std::to_string(avg)) + "</div>";
+                h += "<div class=\"fmeta\">avg experience &middot; drill &rarr;</div></a>";
+            }
+            h += "</div>";
         }
     }
 
