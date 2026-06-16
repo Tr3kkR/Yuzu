@@ -360,3 +360,26 @@ TEST_CASE("TAR diff: unicode username in process events", "[tar][diff][process][
     // The unicode username should be preserved in the JSON
     CHECK(events[0].detail_json.find("\xc3\xa9\x6d\x69\x6c\x65") != std::string::npos);
 }
+
+// ── #541: should_redact is case-insensitive SUBSTRING, not real glob ────────
+
+TEST_CASE("TAR should_redact: case-insensitive substring, not glob", "[tar][diff][redact][issue541]") {
+    // Plain substring containment, case-insensitive.
+    CHECK(should_redact("PASSWORD=hunter2", {"password"}));
+    CHECK(should_redact("api --Token=abc", {"token"}));
+    CHECK_FALSE(should_redact("nothing here", {"secret"}));
+
+    // Leading/trailing '*' are stripped to the core substring (a readability
+    // affordance), then matched as substring.
+    CHECK(should_redact("my secret value", {"*secret*"}));
+    CHECK(should_redact("prefix-token", {"*token"}));
+
+    // '?' and '[abc]' are LITERALS, not glob metacharacters.
+    CHECK(should_redact("run with ?flag", {"?flag"}));      // literal '?'
+    CHECK_FALSE(should_redact("run with xflag", {"?flag"})); // '?' is NOT "any char"
+    CHECK(should_redact("path [abc] here", {"[abc]"}));      // literal bracket
+    CHECK_FALSE(should_redact("path a here", {"[abc]"}));    // not a char class
+
+    // A pattern that strips to an empty core matches nothing (no-op).
+    CHECK_FALSE(should_redact("anything", {"*"}));
+}

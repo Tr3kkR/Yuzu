@@ -10,10 +10,48 @@
 
 #include "tar_db.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::tar {
+
+// ── configure-time pattern-array validation caps (#541) ───────────────────────
+//
+// `redaction_patterns` and `process_stabilization_exclusions` feed should_redact,
+// which is O(patterns × cmdline_length) per process per fast-collect cycle, so an
+// unbounded array or pathologically-long element degrades the collector. The
+// min-core-length floor guards a separate footgun: a 1–2 char bare substring
+// (e.g. "a") matches almost every process name, silently dropping 70-90% of
+// process events with no warning.
+inline constexpr std::size_t kMaxPatternArrayElements = 256;
+inline constexpr std::size_t kMaxPatternLength = 256;
+inline constexpr std::size_t kMinExclusionCoreLength = 3;
+
+// Validate a single configure pattern. Returns an error message (suitable for
+// the `error|...` configure response) or std::nullopt if valid. Always enforces
+// the per-element length cap. When `require_min_core_len` is set (process
+// stabilization exclusions), a bare substring with no `*` wildcard shorter than
+// kMinExclusionCoreLength is rejected — the operator must lengthen it or signal
+// explicit wildcard intent with `*`. The empty/ is_string checks are done by the
+// caller during JSON parsing.
+[[nodiscard]] std::optional<std::string>
+validate_config_pattern(std::string_view pattern, bool require_min_core_len);
+
+// Parse a stored pattern-array config value (redaction_patterns /
+// process_stabilization_exclusions) into a bounded, sanitised vector. This is
+// the RUNTIME defence (#541): configure caps the array at write time, but the
+// collect loop re-reads the stored value every fast cycle, so a value written
+// before the cap existed — or mutated outside the plugin — must still be bounded
+// here. Drops non-string, empty, and over-long (> kMaxPatternLength) elements and
+// truncates to kMaxPatternArrayElements. Returns std::nullopt only when the
+// stored text is not a JSON array (the caller then applies its own default);
+// a valid-but-empty array yields an empty vector (explicit "no patterns").
+[[nodiscard]] std::optional<std::vector<std::string>>
+parse_pattern_config(std::string_view json_text);
 
 /**
  * Run all pending aggregations for all sources.

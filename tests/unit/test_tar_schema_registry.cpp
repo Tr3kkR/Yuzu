@@ -88,16 +88,23 @@ TEST_CASE("TAR schema: kPlanned methods stay in the accept-list",
     // status is kPlanned must appear in accepted_capture_methods so a
     // configure call with that value succeeds (and the plugin separately
     // emits a `warn|...` line that the implementation isn't yet wired).
+    int planned_rows_checked = 0;
     for (const auto& src : capture_sources()) {
         auto accepted = accepted_capture_methods(src.name);
         for (const auto& os : src.os_support) {
             if (os.status == OsSupportStatus::kPlanned) {
+                ++planned_rows_checked;
                 INFO("source=" << src.name << " planned method=" << os.capture_method);
                 CHECK(std::find(accepted.begin(), accepted.end(),
                                 std::string{os.capture_method}) != accepted.end());
             }
         }
     }
+    // #544 — guard against silent vacuity: with zero kPlanned rows the loop runs
+    // no assertions and the pre-staging contract goes untested (the original bug
+    // — the test "passed" while checking nothing). Require at least one so this
+    // fails loudly if the kPlanned methods are ever removed.
+    REQUIRE(planned_rows_checked > 0);
 }
 
 TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
@@ -130,4 +137,47 @@ TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
             }
         }
     }
+}
+
+// ── #540: per-OS capture-method accept-list ────────────────────────────────
+
+TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",
+          "[tar][schema][issue59]") {
+    // The OS-blind union accepts every method across all platforms — which is
+    // exactly the #540 bug: a Linux agent could store the Windows-only
+    // 'iphlpapi'. The per-OS accessor must NOT leak another OS's methods.
+    auto unioned = accepted_capture_methods("tcp");
+    auto contains = [](const std::vector<std::string>& v, const std::string& s) {
+        return std::find(v.begin(), v.end(), s) != v.end();
+    };
+
+    // The union (the buggy validation surface) contains all platforms' methods.
+    CHECK(contains(unioned, "iphlpapi"));    // windows
+    CHECK(contains(unioned, "procfs"));      // linux
+    CHECK(contains(unioned, "proc_pidfdinfo")); // macos
+
+    auto linux_ok = accepted_capture_methods_for_os("tcp", "linux");
+    CHECK(contains(linux_ok, "procfs"));
+    CHECK_FALSE(contains(linux_ok, "iphlpapi"));      // Windows-only — must be rejected on Linux
+    CHECK_FALSE(contains(linux_ok, "proc_pidfdinfo")); // macOS-only
+
+    auto win_ok = accepted_capture_methods_for_os("tcp", "windows");
+    CHECK(contains(win_ok, "iphlpapi"));
+    CHECK_FALSE(contains(win_ok, "procfs"));
+
+    auto mac_ok = accepted_capture_methods_for_os("tcp", "macos");
+    CHECK(contains(mac_ok, "proc_pidfdinfo"));
+    CHECK_FALSE(contains(mac_ok, "iphlpapi"));
+
+    // An unknown OS yields an empty accept-list (everything rejected, fail-safe).
+    CHECK(accepted_capture_methods_for_os("tcp", "plan9").empty());
+}
+
+TEST_CASE("TAR schema: current_platform_os is one of the supported triplet",
+          "[tar][schema][issue59]") {
+    auto os = current_platform_os();
+    CHECK((os == "windows" || os == "linux" || os == "macos"));
+    // And the running platform's tcp accept-list is non-empty (every supported
+    // OS has at least a polling-equivalent capture method).
+    CHECK_FALSE(accepted_capture_methods_for_os("tcp", os).empty());
 }

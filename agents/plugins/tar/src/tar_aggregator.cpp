@@ -9,12 +9,16 @@
 #include "tar_aggregator.hpp"
 #include "tar_schema_registry.hpp"
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu::tar {
 
@@ -131,6 +135,62 @@ void apply_source_enabled_transition(TarDatabase& db,
     } else if (new_value == "true" && prev == "false") {
         db.set_config(paused_at_key, "0");
     }
+}
+
+std::optional<std::string> validate_config_pattern(std::string_view pattern,
+                                                   bool require_min_core_len) {
+    if (pattern.size() > kMaxPatternLength) {
+        return std::format("pattern exceeds the {}-character limit", kMaxPatternLength);
+    }
+    if (require_min_core_len) {
+        // The floor applies to the EFFECTIVE match core. should_redact strips
+        // only leading/trailing '*' and treats an interior '*' as a literal, so
+        // "*a*" matches the 1-char substring "a" — bypassing the floor on the
+        // raw length would re-open the silent-drop footgun (#541 / gov UP-2).
+        // Strip the same way and measure the core.
+        std::string_view core = pattern;
+        while (!core.empty() && core.front() == '*')
+            core.remove_prefix(1);
+        while (!core.empty() && core.back() == '*')
+            core.remove_suffix(1);
+        if (core.size() < kMinExclusionCoreLength) {
+            return std::format("exclusion pattern '{}' has an effective substring shorter than {} "
+                               "characters and would match almost every process — use a longer "
+                               "substring (leading/trailing '*' do not count)",
+                               pattern, kMinExclusionCoreLength);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<std::string>> parse_pattern_config(std::string_view json_text) {
+    // Runtime defense-in-depth (#541 / gov UP-1): the configure path caps the
+    // array at write time, but load_*/collect read whatever is stored every fast
+    // cycle. A value written before the cap existed, or mutated outside the
+    // plugin, must still be bounded here so it can't degrade the per-process
+    // redaction scan. Parse, drop non-string / empty / over-long elements, and
+    // truncate to the element cap. Returns nullopt only when the stored value is
+    // not a JSON array at all (caller falls back to its own default).
+    nlohmann::json arr;
+    try {
+        arr = nlohmann::json::parse(json_text);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (!arr.is_array())
+        return std::nullopt;
+    std::vector<std::string> patterns;
+    for (const auto& elem : arr) {
+        if (patterns.size() >= kMaxPatternArrayElements)
+            break; // element cap — ignore the overflow tail
+        if (!elem.is_string())
+            continue;
+        auto s = elem.get<std::string>();
+        if (s.empty() || s.size() > kMaxPatternLength)
+            continue; // skip empty / over-long elements rather than failing
+        patterns.push_back(std::move(s));
+    }
+    return patterns;
 }
 
 void run_retention(TarDatabase& db, int64_t now_epoch) {

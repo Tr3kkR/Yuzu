@@ -13,7 +13,7 @@
  *   - "State change" = same key, different status field (services only)
  *
  * Command-line redaction: Before storing process events, cmdline is checked
- * against configurable glob patterns (default: *password*, *secret*, *token*,
+ * against configurable case-insensitive substring patterns (default: *password*, *secret*, *token*,
  * *api_key*, *credential*). Matching cmdlines are replaced with
  * "[REDACTED by TAR]".
  */
@@ -94,7 +94,7 @@ std::vector<UserSession> enumerate_users();
  * stripped (e.g. "*password*" matches any cmdline containing "password").
  *
  * @param cmdline   The command line to check.
- * @param patterns  List of glob-like patterns (e.g. {"*password*", "*secret*"}).
+ * @param patterns  Case-insensitive substring patterns (e.g. {"*password*", "*secret*"}; leading/trailing `*` are stripped, the rest is a literal substring).
  * @return true if the cmdline should be redacted.
  */
 bool should_redact(const std::string& cmdline, const std::vector<std::string>& patterns);
