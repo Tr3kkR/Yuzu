@@ -121,21 +121,27 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                                           const std::string& since, int window_days,
                                           const DexFleet& fleet, const std::string& os_filter);
 
-/// Catalogue View 2 — one family's signals (visibility contract: every catalogued
-/// type, quiet ones muted). `group_name` is allowlisted against dex_signal_groups().
-/// `os_filter` (the Catalogue's OS lens) is carried so the back-link returns to the
-/// filtered grid — the filter persists across the drill.
+/// Catalogue View 2 — one family's signals. COVERAGE-first, like the grid: every
+/// catalogued type is shown, marked MONITORED (a connected platform in scope
+/// collects it — lit even at zero events) or NOT COLLECTED (no platform in view
+/// emits it — dimmed, never read as "healthy"). `group_name` is allowlisted
+/// against dex_signal_groups(); `fleet.connected_os` is the "all" coverage scope;
+/// `os_filter` ("all"|"windows"|"linux"|"macos") is the OS lens — shown as in-view
+/// chips so it both persists across the drill AND is changeable in place.
 std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
                                                 const std::string& since, int window_days,
                                                 const std::string& group_name,
+                                                const DexFleet& fleet,
                                                 const std::string& os_filter = "all");
 
 /// Catalogue View 3 — one signal type's drill-down (subjects, OS split, devices,
 /// trend), over the generic per-obs_type read-model. `obs_type` is SQL-bound +
 /// HTML-escaped; cross-OS captions are derived live (no stale coverage counts).
+/// `os_filter` is carried only to restore the family grid's OS lens on the back-link.
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
-                                                 const std::string& obs_type);
+                                                 const std::string& obs_type,
+                                                 const std::string& os_filter = "all");
 
 /// Health score — the derived/SECONDARY composite (score = 100 − Σ weighted
 /// per-family deductions; every deduction traces to a measured rate). `weighting`

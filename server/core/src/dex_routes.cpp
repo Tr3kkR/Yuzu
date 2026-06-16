@@ -648,6 +648,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
                                                 const std::string& since, int window_days,
                                                 const std::string& group_name,
+                                                const DexFleet& fleet,
                                                 const std::string& os_filter) {
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
@@ -669,6 +670,62 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
                 return &s;
         return nullptr;
     };
+
+    // -- Coverage scope (mirrors the grid: a type is MONITORED when an in-scope
+    // connected platform collects it — not merely when it fired). This is the
+    // same fix the grid carries, applied one level down so the tiles are honest. --
+    auto norm = [](std::string o) -> std::string {
+        for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (o.starts_with("win")) return "windows";
+        if (o == "darwin" || o == "macos") return "macos";
+        if (o.starts_with("lin")) return "linux";
+        return o;
+    };
+    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
+                             os_filter == "macos")
+                                ? os_filter
+                                : "all";
+    std::vector<std::string> scope;
+    if (osf == "all") {
+        for (const auto& o : fleet.connected_os) {
+            auto n = norm(o);
+            if (std::find(scope.begin(), scope.end(), n) == scope.end())
+                scope.push_back(n);
+        }
+    } else {
+        scope.push_back(osf);
+    }
+    auto in_scope = [&](const std::string& p) {
+        return std::find(scope.begin(), scope.end(), p) != scope.end();
+    };
+    auto monitored = [&](const char* t) {
+        for (const auto& p : dex_obs_platforms(t))
+            if (in_scope(p))
+                return true;
+        return false;
+    };
+    // In-scope platforms that collect this type — muted detail next to the pill.
+    auto coverage_label = [&](const char* t) -> std::string {
+        std::vector<std::string> ps;
+        for (const auto& p : dex_obs_platforms(t))
+            if (in_scope(p))
+                ps.push_back(p);
+        std::sort(ps.begin(), ps.end());
+        std::string out;
+        for (const auto& p : ps) {
+            if (!out.empty()) out += ", ";
+            out += (p == "windows" ? "Windows"
+                    : p == "linux" ? "Linux"
+                    : p == "macos" ? "macOS"
+                                   : p);
+        }
+        return out;
+    };
+    int mon = 0;
+    for (const char* t : grp->types)
+        if (monitored(t))
+            ++mon;
+
     auto tile = [](const char* cls, const std::string& n, const std::string& label,
                    const std::string& sx) {
         std::string t = "<div class=\"gp-tile\"><div class=\"n " + std::string(cls) + "\">" + n +
@@ -678,61 +735,94 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         return t + "</div>";
     };
 
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
     std::string h;
     // Back-link carries the OS lens so the grid restores it (filter persists on drill).
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w + "&os=" + osf +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; All families</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(group_name) +
-         "</h1></div><div class=\"gp-sub\">" + num(r.total) + " catalogued signal types &middot; " +
-         num(r.active) + " active in this window.</div></div></div>";
+         "</h1></div><div class=\"gp-sub\"><b>" + num(mon) + "</b> of " +
+         num(static_cast<int64_t>(grp->types.size())) + " types <b>monitored</b> " +
+         (osf == "all" ? "across your connected platforms" : "on " + osf) + " &middot; " +
+         num(r.active) + " active in this window. Monitored types light even when quiet; types no "
+         "connected platform collects read as <i>not collected</i> &mdash; never as healthy."
+         "</div></div></div>";
 
+    // OS filter chips — same lens as the grid, re-targeting THIS family so the
+    // filter both persists AND is changeable in place.
+    {
+        auto chip = [&](const char* val, const char* label) {
+            const std::string on = (osf == val) ? " on" : "";
+            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/catalogue/group?name=" +
+                   url_encode(group_name) + "&window=" + w + "&os=" + val +
+                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">OS</span>" +
+             chip("all", "All connected") + chip("windows", "Windows") + chip("linux", "Linux") +
+             chip("macos", "macOS") + "</div>";
+    }
+
+    // Coverage + activity tiles. Health score = this family's slice of the fleet
+    // composite (same formula as the grid card), shown when something is monitored.
     h += "<div class=\"gp-tiles\">";
+    double score = -1.0;
+    if (mon > 0 && fleet.windows_online > 0)
+        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, fleet.windows_online),
+                           0.0, 100.0);
+    if (score >= 0)
+        h += tile(score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"),
+                  std::to_string(static_cast<int>(score + 0.5)), "Health score",
+                  "100 &minus; deduction");
+    h += tile("info", num(mon) + " of " + num(static_cast<int64_t>(grp->types.size())), "Monitored",
+              osf == "all" ? "on your fleet" : "on " + osf);
     h += tile(r.benign ? "ok" : (r.events > 0 ? "warn" : ""), num(r.events),
               r.benign ? "Reports (window)" : "Events (window)", "");
     h += tile("", num(r.devices), "Devices affected", "");
-    h += tile("info", num(r.active), "Active signals", "of " + num(r.total) + " monitored");
-    if (r.benign)
-        h += tile("ok", "benign", "Family character", "durations, not failures");
-    else if (r.top && r.top->count > 0)
-        h += tile("warn", dex_signal_label(r.top->obs_type), "Top signal",
-                  num(r.top->count) + " events");
     h += "</div>";
 
     h += "<div class=\"gp-sech\">Signals in this family</div>";
-    h += "<div class=\"gp-note\">Every catalogued type is listed &mdash; quiet (real-zero) rows are "
-         "muted, not hidden. Devices is the blast radius (distinct devices).</div>";
-    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Type</th>"
+    h += "<div class=\"gp-note\">Every catalogued type is listed. <b>Monitored</b> rows are watched "
+         "by a connected platform (lit even at zero events); <b>not collected</b> rows have no "
+         "platform in view that emits them. Devices is the blast radius (distinct devices).</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Coverage</th>"
          "<th class=\"gp-num\">Events</th><th class=\"gp-num\">Devices</th><th>Last seen</th>"
          "</tr></thead><tbody>";
-    auto row = [&](const char* t, const DexSignalCount* c) {
-        // Every row drills into the per-signal-type view (View 3) — even quiet
-        // types (their drill honestly reads "no events").
+    auto row = [&](const char* t, const DexSignalCount* c, bool mon_t) {
+        // Every row drills into the per-signal-type view (View 3), carrying the OS
+        // lens so View3's back-link restores the filtered family.
         const std::string drill = " hx-get=\"/fragments/dex/catalogue/signal?type=" +
-                                  url_encode(t) + "&window=" + w +
-                                  "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                                  "style=\"cursor:pointer\"";
-        if (c && c->count > 0)
-            h += "<tr" + drill + "><td>" + dex_signal_label(t) +
-                 "</td><td class=\"gp-mute\" style=\"font-family:var(--mono)\">" + esc(t) +
-                 "</td><td class=\"gp-num\">" + num(c->count) + "</td><td class=\"gp-num\">" +
-                 num(c->distinct_devices) + "</td><td class=\"gp-mute\">" + esc(c->last_seen) +
-                 "</td></tr>";
+                                  url_encode(t) + "&window=" + w + "&os=" + osf +
+                                  "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\"";
+        const std::string cov =
+            mon_t ? "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">" +
+                        esc(coverage_label(t)) + "</span>"
+                  : "<span class=\"gp-pill draft\">not collected" +
+                        std::string(osf == "all" ? "" : " on " + osf) + "</span>";
+        if (mon_t && c && c->count > 0)
+            h += "<tr" + drill + " style=\"cursor:pointer\"><td>" + dex_signal_label(t) +
+                 "</td><td>" + cov + "</td><td class=\"gp-num\">" + num(c->count) +
+                 "</td><td class=\"gp-num\">" + num(c->distinct_devices) +
+                 "</td><td class=\"gp-mute\">" + esc(c->last_seen) + "</td></tr>";
+        else if (mon_t)
+            h += "<tr class=\"gp-mute\"" + drill + " style=\"cursor:pointer\"><td>" +
+                 dex_signal_label(t) + "</td><td>" + cov +
+                 "</td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
+                 "<td>watched</td></tr>";
         else
-            h += "<tr class=\"gp-mute\"" + drill + "><td>" + dex_signal_label(t) +
-                 "</td><td style=\"font-family:var(--mono)\">" + esc(t) +
-                 "</td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td><td>&mdash;</td></tr>";
+            h += "<tr class=\"gp-mute\"" + drill + " style=\"cursor:pointer;opacity:.5\"><td>" +
+                 dex_signal_label(t) + "</td><td>" + cov +
+                 "</td><td class=\"gp-num\">&mdash;</td><td class=\"gp-num\">&mdash;</td>"
+                 "<td>&mdash;</td></tr>";
     };
-    for (const char* t : grp->types) // active first (visibility contract keeps all)
-        if (const auto* c = find_sig(t); c && c->count > 0)
-            row(t, c);
+    // Coverage-first reading order: fired (monitored, events>0), then watched
+    // (monitored, quiet), then not-collected last.
     for (const char* t : grp->types)
-        if (const auto* c = find_sig(t); !c || c->count == 0)
-            row(t, c);
+        if (monitored(t)) { const auto* c = find_sig(t); if (c && c->count > 0) row(t, c, true); }
+    for (const char* t : grp->types)
+        if (monitored(t)) { const auto* c = find_sig(t); if (!c || c->count == 0) row(t, c, true); }
+    for (const char* t : grp->types)
+        if (!monitored(t)) row(t, find_sig(t), false);
     h += "</tbody></table>";
     return h;
 }
@@ -744,12 +834,17 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
 // "macOS 6 of 103").
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
-                                                 const std::string& obs_type) {
+                                                 const std::string& obs_type,
+                                                 const std::string& os_filter) {
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     if (obs_type.empty())
         return placeholder("No signal selected", "Pick a signal type from a family.");
     const std::string w = dex_window_token(window_days);
+    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
+                             os_filter == "macos")
+                                ? os_filter
+                                : "all";
 
     const char* family = nullptr;
     for (const auto& g : dex_signal_groups()) {
@@ -787,11 +882,11 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     std::string h;
     if (family)
         h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue/group?name=" +
-             url_encode(family) + "&window=" + w +
+             url_encode(family) + "&window=" + w + "&os=" + osf +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; " + esc(family) +
              "</a>";
     else
-        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w +
+        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w + "&os=" + osf +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; Catalogue</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + dex_signal_label(obs_type) +
@@ -2295,8 +2390,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string name =
                      req.has_param("name") ? req.get_param_value("name") : "";
                  const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
+                 const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
                  res.set_content(
-                     render_dex_catalogue_group_fragment(store_, since, window_days, name, os),
+                     render_dex_catalogue_group_fragment(store_, since, window_days, name, fleet, os),
                      "text/html; charset=utf-8");
              });
     sink.Get("/fragments/dex/catalogue/signal",
@@ -2308,6 +2404,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string since = iso_days_ago(window_days);
                  const std::string type =
                      req.has_param("type") ? req.get_param_value("type") : "";
+                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
                  // The per-signal view lists the most-affected DEVICES for this
                  // obs_type — individual-identifying behavioral data. Audit each
                  // open, mirroring /fragments/dex/device, so the "audit-logged on
@@ -2317,7 +2414,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
                                "DEX per-signal most-affected devices");
                  res.set_content(
-                     render_dex_catalogue_signal_fragment(store_, since, window_days, type),
+                     render_dex_catalogue_signal_fragment(store_, since, window_days, type, os),
                      "text/html; charset=utf-8");
              });
 

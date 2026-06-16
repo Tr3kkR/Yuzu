@@ -91,11 +91,14 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
     // Raw family names (literal '&') match dex_signal_groups(); a wrong name
     // would render "Unknown family" and its labels would go missing below.
     std::string html;
+    // All three platforms connected → every catalogued type is MONITORED
+    // (coverage-first), so quiet types render as watched real-zero rows.
+    const DexFleet all_os{1, 1, {"windows", "linux", "darwin"}};
     for (const char* family :
          {"App reliability", "Boot, start-up & shutdown", "Service health", "System stability",
           "Hardware & storage", "Performance", "File system", "Network", "Identity & logon",
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
-        html += render_dex_catalogue_group_fragment(&store, "", 7, family);
+        html += render_dex_catalogue_group_fragment(&store, "", 7, family, all_os);
 
     // All 107 labels.
     for (const char* label :
@@ -166,17 +169,26 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
           "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network");
-    CHECK(net.find("Wi-Fi disconnect") != std::string::npos);  // friendly label
-    CHECK(net.find("network.wifi_drop") != std::string::npos); // obs_type
+    // Windows connected → the Windows-collected Network types are MONITORED.
+    const DexFleet win{1, 1, {"windows"}};
+    const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network", win);
+    CHECK(net.find("Wi-Fi disconnect") != std::string::npos); // friendly label
+    CHECK(net.find("monitored") != std::string::npos);        // coverage-first pill
+    CHECK(net.find("Windows") != std::string::npos);          // coverage detail
     CHECK(net.find("&larr; All families") != std::string::npos);
+    // OS chips are present IN the family view so the filter is changeable in place.
+    CHECK(net.find("/fragments/dex/catalogue/group?name=Network&window=7d&os=windows") !=
+          std::string::npos);
     // unknown family → placeholder; the reflected name is HTML-escaped (no XSS)
-    const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>");
+    const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>", win);
     CHECK(bad.find("Unknown family") != std::string::npos);
     CHECK(bad.find("<script>") == std::string::npos);
     // OS filter persists: the back-link to the grid carries the lens.
-    const auto lin = render_dex_catalogue_group_fragment(&store, "", 7, "Network", "linux");
+    const DexFleet lin_fleet{0, 0, {"linux"}};
+    const auto lin = render_dex_catalogue_group_fragment(&store, "", 7, "Network", lin_fleet, "linux");
     CHECK(lin.find("/fragments/dex/catalogue?window=7d&os=linux") != std::string::npos);
+    // Coverage-first: a Windows-only type reads "not collected" under the Linux lens.
+    CHECK(lin.find("not collected") != std::string::npos);
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",
