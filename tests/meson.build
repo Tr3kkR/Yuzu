@@ -244,6 +244,7 @@ if build_server
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_device_ui.cpp',
+      'unit/server/test_device_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
