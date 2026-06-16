@@ -286,6 +286,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
+  (a) `network_capture_method` was validated against the OS-blind union of every
+  platform's capture methods, so a Linux agent would accept and store the
+  Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
+  polling — now validated against the running host's OS accept-list via the new
+  `accepted_capture_methods_for_os` (#540). (b) `process_stabilization_exclusions`
+  and `redaction_patterns` had no element-count or length caps (an oversized array
+  degrades the per-process redaction scan), and an over-short exclusion substring
+  (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
+  256 chars, a bare exclusion substring shorter than 3 chars is rejected unless
+  bracketed with `*`, the loaders skip non-string elements instead of discarding
+  the whole set, and the stale "glob" comments are corrected to "case-insensitive
+  substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
+  pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
+  (#544).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

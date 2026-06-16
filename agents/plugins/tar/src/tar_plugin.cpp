@@ -196,19 +196,19 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
+    static const std::vector<std::string> kDefaults = {"*password*", "*secret*", "*token*",
+                                                       "*api_key*", "*credential*"};
     auto stored = db.get_config("redaction_patterns");
     if (stored.empty())
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    }
+        return kDefaults;
+    // #541 — bound + sanitise at load: configure caps the array at write time,
+    // but this runs every fast-collect cycle, so a value written before the cap
+    // or mutated outside the plugin must still be clamped here. parse_pattern_config
+    // drops non-string/empty/over-long elements and truncates to the element cap;
+    // a non-array stored value (nullopt) falls back to the safe built-in set.
+    if (auto v = yuzu::tar::parse_pattern_config(stored))
+        return std::move(*v);
+    return kDefaults;
 }
 
 // Per-source enable/disable (issue #59). Default = enabled.
@@ -221,16 +221,11 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     auto stored = db.get_config("process_stabilization_exclusions");
     if (stored.empty())
         return {};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {};
-    }
+    // #541 — bound + sanitise at load (see load_redaction_patterns). A non-array
+    // stored value yields no exclusions (the safe default — nothing dropped).
+    if (auto v = yuzu::tar::parse_pattern_config(stored))
+        return std::move(*v);
+    return {};
 }
 
 } // namespace
@@ -618,9 +613,9 @@ private:
                 auto current = yuzu::agent::enumerate_processes();
 
                 // Stabilization exclusions: drop processes whose name matches any
-                // exclusion pattern. The patterns reuse the same glob semantics
-                // as redaction (case-insensitive substring with optional '*' on
-                // either side stripped). Excluded processes never enter the
+                // exclusion pattern. The patterns reuse the same matching as
+                // redaction (case-insensitive substring with optional '*' on
+                // either side stripped — NOT real glob). Excluded processes never enter the
                 // diff, so their birth/death events are silently dropped — the
                 // documented forensic-completeness trade-off.
                 if (!stab_excl.empty()) {
@@ -1325,10 +1320,21 @@ private:
                     ctx.write_output("error|redaction_patterns must be a JSON array of strings");
                     return 1;
                 }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(std::format("error|redaction_patterns exceeds the {}-element "
+                                                 "limit",
+                                                 yuzu::tar::kMaxPatternArrayElements));
+                    return 1;
+                }
                 for (const auto& elem : arr) {
                     if (!elem.is_string() || elem.get<std::string>().empty()) {
                         ctx.write_output(
                             "error|redaction_patterns must contain only non-empty strings");
+                        return 1;
+                    }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/false)) {
+                        ctx.write_output(std::format("error|redaction_patterns: {}", *err));
                         return 1;
                     }
                 }
@@ -1396,7 +1402,14 @@ private:
             // rejected — the round trip would be broken (governance C-1 /
             // QA Finding 2).
             if (method != "polling") {
-                auto accepted = yuzu::tar::accepted_capture_methods("tcp");
+                // #540 — validate against THIS host's OS accept-list, not the
+                // OS-blind union. The union would let a Linux agent store
+                // 'iphlpapi' (a Windows-only API) or a Windows agent store
+                // 'procfs'; the value would be persisted and surfaced in status
+                // even though the per-OS collector never honours it.
+                auto accepted =
+                    yuzu::tar::accepted_capture_methods_for_os("tcp",
+                                                               yuzu::tar::current_platform_os());
                 if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
                     std::string list = "polling";
                     for (const auto& m2 : accepted) {
@@ -1404,7 +1417,8 @@ private:
                         list += m2;
                     }
                     ctx.write_output(std::format(
-                        "error|network_capture_method '{}' is not accepted (must be one of: {})",
+                        "error|network_capture_method '{}' is not accepted on this OS "
+                        "(must be one of: {})",
                         method, list));
                     return 1;
                 }
@@ -1422,12 +1436,13 @@ private:
         }
 
         // ── Process stabilization exclusions (issue #59) ─────────────────────
-        // List of process-name glob patterns whose churn should be excluded
-        // from process events. Useful for noisy short-lived helpers (CI
-        // runners, IDE indexers, telemetry agents) that produce thousands
-        // of birth/death rows per minute and dwarf the actual process
-        // activity an operator wants to see. Trade-off: forensic completeness
-        // is reduced — anything matching these patterns is invisible to TAR.
+        // List of process-name patterns (case-insensitive substring, NOT real
+        // glob — see should_redact) whose churn should be excluded from process
+        // events. Useful for noisy short-lived helpers (CI runners, IDE indexers,
+        // telemetry agents) that produce thousands of birth/death rows per minute
+        // and dwarf the actual process activity an operator wants to see.
+        // Trade-off: forensic completeness is reduced — anything matching these
+        // patterns is invisible to TAR.
         if (auto exc = params.get("process_stabilization_exclusions"); !exc.empty()) {
             try {
                 auto arr = json::parse(std::string{exc});
@@ -1435,10 +1450,23 @@ private:
                     ctx.write_output("error|process_stabilization_exclusions must be a JSON array");
                     return 1;
                 }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(
+                        std::format("error|process_stabilization_exclusions exceeds the {}-element "
+                                    "limit",
+                                    yuzu::tar::kMaxPatternArrayElements));
+                    return 1;
+                }
                 for (const auto& elem : arr) {
                     if (!elem.is_string() || elem.get<std::string>().empty()) {
                         ctx.write_output("error|process_stabilization_exclusions must contain only "
                                          "non-empty strings");
+                        return 1;
+                    }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/true)) {
+                        ctx.write_output(
+                            std::format("error|process_stabilization_exclusions: {}", *err));
                         return 1;
                     }
                 }

@@ -525,6 +525,38 @@ std::vector<std::string> accepted_capture_methods(std::string_view source_name) 
     return methods;
 }
 
+std::string_view current_platform_os() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "";
+#endif
+}
+
+std::vector<std::string> accepted_capture_methods_for_os(std::string_view source_name,
+                                                         std::string_view os) {
+    std::vector<std::string> methods;
+    for (const auto& src : build_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& sup : src.os_support) {
+            if (sup.os != os)
+                continue;
+            if (sup.status == OsSupportStatus::kUnsupported)
+                continue;
+            std::string m{sup.capture_method};
+            if (std::find(methods.begin(), methods.end(), m) == methods.end())
+                methods.push_back(std::move(m));
+        }
+    }
+    std::sort(methods.begin(), methods.end());
+    return methods;
+}
+
 std::string generate_warehouse_ddl() {
     std::ostringstream ddl;
     for (const auto& src : build_sources()) {

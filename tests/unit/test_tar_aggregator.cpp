@@ -248,3 +248,69 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     CHECK(tcp_remaining > 0);                       // enabled, partially aged
     CHECK(tcp_remaining < 48);
 }
+
+// ── #541: configure-time pattern validation ────────────────────────────────
+
+TEST_CASE("TAR validate_config_pattern enforces the length cap", "[tar][configure][issue541]") {
+    const std::string ok(yuzu::tar::kMaxPatternLength, 'a');
+    const std::string too_long(yuzu::tar::kMaxPatternLength + 1, 'a');
+    CHECK_FALSE(yuzu::tar::validate_config_pattern(ok, /*require_min_core_len=*/false).has_value());
+    CHECK(yuzu::tar::validate_config_pattern(too_long, false).has_value());
+    CHECK(yuzu::tar::validate_config_pattern(too_long, true).has_value());
+}
+
+TEST_CASE("TAR validate_config_pattern enforces the min core length on the STRIPPED core",
+          "[tar][configure][issue541]") {
+    // require_min_core_len=true (process_stabilization_exclusions): the floor is
+    // measured on the EFFECTIVE substring after stripping leading/trailing '*'.
+    CHECK(yuzu::tar::validate_config_pattern("a", true).has_value());
+    CHECK(yuzu::tar::validate_config_pattern("ab", true).has_value());
+    CHECK_FALSE(yuzu::tar::validate_config_pattern("abc", true).has_value());
+    // `*` does NOT bypass the floor — "*a*" strips to core "a" and would still
+    // match almost every process (gov UP-2 / security MEDIUM-1).
+    CHECK(yuzu::tar::validate_config_pattern("*a*", true).has_value());
+    CHECK(yuzu::tar::validate_config_pattern("a*", true).has_value());
+    CHECK(yuzu::tar::validate_config_pattern("*", true).has_value());   // core empty
+    CHECK(yuzu::tar::validate_config_pattern("**", true).has_value());  // core empty
+    // A long-enough core with wildcards is fine.
+    CHECK_FALSE(yuzu::tar::validate_config_pattern("*abc*", true).has_value());
+    CHECK_FALSE(yuzu::tar::validate_config_pattern("chrome-helper", true).has_value());
+
+    // require_min_core_len=false (redaction_patterns): short patterns allowed —
+    // a short redaction substring over-redacts, it does not silently drop events.
+    CHECK_FALSE(yuzu::tar::validate_config_pattern("a", false).has_value());
+    CHECK_FALSE(yuzu::tar::validate_config_pattern("*a*", false).has_value());
+}
+
+TEST_CASE("TAR parse_pattern_config clamps + sanitises at load (#541 UP-1)",
+          "[tar][configure][issue541]") {
+    using yuzu::tar::parse_pattern_config;
+
+    // A non-array stored value → nullopt (caller falls back to its default).
+    CHECK_FALSE(parse_pattern_config("not json").has_value());
+    CHECK_FALSE(parse_pattern_config("\"a string\"").has_value());
+    CHECK_FALSE(parse_pattern_config("{\"k\":1}").has_value());
+
+    // Valid empty array → empty vector (explicit "no patterns", not the default).
+    auto empty = parse_pattern_config("[]");
+    REQUIRE(empty.has_value());
+    CHECK(empty->empty());
+
+    // Non-string / empty / over-long elements are dropped; valid ones kept.
+    std::string over_long(yuzu::tar::kMaxPatternLength + 1, 'x');
+    auto mixed = parse_pattern_config(
+        std::format("[123, \"keep1\", \"\", \"{}\", true, \"keep2\"]", over_long));
+    REQUIRE(mixed.has_value());
+    REQUIRE(mixed->size() == 2);
+    CHECK((*mixed)[0] == "keep1");
+    CHECK((*mixed)[1] == "keep2");
+
+    // Element-count cap: an array of 300 valid strings truncates to the cap.
+    std::string big = "[";
+    for (int i = 0; i < 300; ++i)
+        big += (i ? ",\"pat" : "\"pat") + std::to_string(i) + "\"";
+    big += "]";
+    auto clamped = parse_pattern_config(big);
+    REQUIRE(clamped.has_value());
+    CHECK(clamped->size() == yuzu::tar::kMaxPatternArrayElements);
+}
