@@ -123,9 +123,12 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
 /// Catalogue View 2 — one family's signals (visibility contract: every catalogued
 /// type, quiet ones muted). `group_name` is allowlisted against dex_signal_groups().
+/// `os_filter` (the Catalogue's OS lens) is carried so the back-link returns to the
+/// filtered grid — the filter persists across the drill.
 std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
                                                 const std::string& since, int window_days,
-                                                const std::string& group_name);
+                                                const std::string& group_name,
+                                                const std::string& os_filter = "all");
 
 /// Catalogue View 3 — one signal type's drill-down (subjects, OS split, devices,
 /// trend), over the generic per-obs_type read-model. `obs_type` is SQL-bound +

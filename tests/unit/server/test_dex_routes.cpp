@@ -174,6 +174,9 @@ TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
     const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>");
     CHECK(bad.find("Unknown family") != std::string::npos);
     CHECK(bad.find("<script>") == std::string::npos);
+    // OS filter persists: the back-link to the grid carries the lens.
+    const auto lin = render_dex_catalogue_group_fragment(&store, "", 7, "Network", "linux");
+    CHECK(lin.find("/fragments/dex/catalogue?window=7d&os=linux") != std::string::npos);
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",

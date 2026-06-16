@@ -125,9 +125,15 @@ std::size_t dex_catalogued_type_count() {
 // collect the subsets below. THIN explicit map (the one bit of new grouping) — keep
 // in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
 std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
-    static const char* const kLinux[] = {"perf.cpu_sustained", "perf.memory_pressure",
-                                          "storage.low", "os.uptime_report", "process.crashed",
-                                          "service.crashed", "memory.exhausted"};
+    static const char* const kLinux[] = {
+        // /proc + /sys + statvfs polls (dex_linux_proc / dex_linux_sysfs / dex_linux_storage)
+        "perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high", "hw.cpu_throttled",
+        "storage.low", "os.uptime_report",
+        // systemd-structured journal (dex_linux_journal)
+        "process.crashed", "service.crashed", "service.hung", "os.time_unsynced",
+        // kernel ring-buffer journal markers (dex_linux_kmsg)
+        "memory.exhausted", "os.bugcheck", "os.dirty_shutdown", "disk.error", "fs.corruption",
+        "hw.error", "process.hung"};
     static const char* const kMac[] = {
         "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
         "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",
@@ -569,7 +575,8 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
              "\" hx-get=\"/fragments/dex/catalogue/group?name=" + url_encode(g.name) +
-             "&window=" + w + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
+             "&window=" + w + "&os=" + osf +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
         h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
              num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
         if (score < 0)
@@ -640,7 +647,8 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 // dex_signal_groups(); unknown names render an escaped placeholder.
 std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
                                                 const std::string& since, int window_days,
-                                                const std::string& group_name) {
+                                                const std::string& group_name,
+                                                const std::string& os_filter) {
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     const DexSignalGroup* grp = nullptr;
@@ -670,8 +678,13 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         return t + "</div>";
     };
 
+    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
+                             os_filter == "macos")
+                                ? os_filter
+                                : "all";
     std::string h;
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w +
+    // Back-link carries the OS lens so the grid restores it (filter persists on drill).
+    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w + "&os=" + osf +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; All families</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(group_name) +
@@ -2281,8 +2294,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string since = iso_days_ago(window_days);
                  const std::string name =
                      req.has_param("name") ? req.get_param_value("name") : "";
+                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
                  res.set_content(
-                     render_dex_catalogue_group_fragment(store_, since, window_days, name),
+                     render_dex_catalogue_group_fragment(store_, since, window_days, name, os),
                      "text/html; charset=utf-8");
              });
     sink.Get("/fragments/dex/catalogue/signal",
