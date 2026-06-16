@@ -121,20 +121,41 @@ Source: "{#BuildDir}\agents\plugins\chargen\chargen.dll"; DestDir: "{app}\plugin
 Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 [Dirs]
-Name: "{app}\logs"; Permissions: service-full
-Name: "{commonappdata}\Yuzu"; Permissions: service-full
+Name: "{app}\logs"; Permissions: admins-full system-full
+Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 
 [Run]
 ; Register and start the service after install
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg: "Registering Yuzu Agent service..."; Flags: runhidden waituntilterminated
 Filename: "sc.exe"; Parameters: "config YuzuAgent binPath= ""{app}\bin\yuzu-agent.exe"" --server {code:GetServerAddress} --data-dir ""{commonappdata}\Yuzu"" --plugin-dir ""{app}\plugins"" --log-file ""{app}\logs\yuzu-agent.log"" {code:GetExtraArgs}"; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated shellexec
 Filename: "sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated shellexec; Check: ShouldStartService
+; Configure the boot-window ETW AutoLogger so the kernel captures process
+; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
+; at startup to backfill processes that started AND exited before its live ETW
+; session opened. Takes effect on the NEXT boot. Scoped to plugins\advanced (the
+; component that ships tar.dll) — pointless without the consumer. Best-effort:
+; -ErrorAction SilentlyContinue + trailing `exit 0` keep a failure here from
+; aborting the install (live capture is unaffected). Leads with
+; Remove-AutologgerConfig so an upgrade-over-install refreshes a changed recipe
+; (New-AutologgerConfig will not overwrite an existing config). RECIPE MIRRORS
+; scripts/install-agent-user.ps1 New-ProcBootAutologger — keep in sync (LogFileMode
+; 0x2 = circular, 16 MB cap, System clock for FILETIME decode, FlushTimer 1 so the
+; boot window reaches disk before the agent replays, keyword 0x10 = start/stop).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
 Filename: "sc.exe"; Parameters: "stop YuzuAgent"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 ; Small delay to let service stop
 Filename: "cmd.exe"; Parameters: "/c timeout /t 3 /nobreak >nul"; Flags: runhidden waituntilterminated; RunOnceId: "WaitStop"
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+; Tear down the boot AutoLogger + its .etl on uninstall. Remove-AutologgerConfig
+; drops only the boot-start config — it does NOT stop a session already running
+; from a prior boot, so Stop-EtwTraceSession is needed or uninstall leaves the
+; YuzuProcBoot session live until the next reboot, holding a scarce system ETW
+; session slot and still writing the 16 MB circular .etl. Unconditional (harmless
+; no-op if never configured). Mirror of
+; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

@@ -846,9 +846,12 @@ function Test-Install {
 # from the SAME directory it writes `tar.db` to (NOT a `state` subdirectory).
 # Driven by the -DataDir parameter (default C:\ProgramData\Yuzu = the production
 # service data dir). Override -DataDir when the agent runs with a different
-# --data-dir, or the backfill silently finds no file. (Wiring the AutoLogger into
-# the production MSI/InnoSetup installer — which would pass -DataDir — is a
-# tracked follow-up.)
+# --data-dir, or the backfill silently finds no file. The production InnoSetup
+# installer (deploy/packaging/windows/yuzu-agent.iss) carries a SECOND copy of
+# this recipe inline in its [Run]/[UninstallRun] sections (it can't shell out to
+# this script — that would also run the account/ACL setup and collide with the
+# installer's own --install-service). If the recipe changes here (LogFileMode,
+# FlushTimer, keyword, GUID, clock), update the .iss too — they must stay in sync.
 # `-ClockType System` is load-bearing: the agent decodes the file's timestamps as
 # FILETIME. Best-effort by design — a failure here loses only boot-backfill, not
 # the live capture, so it WARNS rather than aborting the install.
@@ -884,6 +887,8 @@ function New-ProcBootAutologger {
     }
 }
 
+# Mirror of yuzu-agent.iss [UninstallRun] (RunOnceId RemoveProcBootAutologger) —
+# keep the teardown sequence (remove-config -> stop-session -> delete-.etl) in sync.
 function Remove-ProcBootAutologger {
     if (-not $Script:Effective) {
         Write-Host "[dry-run] Remove-AutologgerConfig $AutologgerName"
@@ -892,6 +897,15 @@ function Remove-ProcBootAutologger {
     if (Get-Command Remove-AutologgerConfig -ErrorAction SilentlyContinue) {
         Write-Step "removing boot AutoLogger '$AutologgerName'"
         Remove-AutologgerConfig -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
+    }
+    # Remove-AutologgerConfig drops only the boot-start *config* — it does NOT stop a
+    # session already running from a prior boot. Stop it explicitly, or uninstall
+    # leaves the YuzuProcBoot session live until the next reboot, holding one of the
+    # scarce (~64) system ETW session slots and still writing procboot.etl. (Verified
+    # on Win11: the file itself deletes fine while the session is open — the leftover
+    # is the running session, not an undeletable file.)
+    if (Get-Command Stop-EtwTraceSession -ErrorAction SilentlyContinue) {
+        Stop-EtwTraceSession -Name $AutologgerName -ErrorAction SilentlyContinue | Out-Null
     }
     if (Test-Path $ProcBootEtl) {
         Remove-Item $ProcBootEtl -Force -ErrorAction SilentlyContinue

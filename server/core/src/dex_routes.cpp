@@ -371,9 +371,12 @@ std::string dex_window_token(int window_days) {
     return window_days == 1 ? "24h" : window_days == 30 ? "30d" : window_days == 0 ? "all" : "7d";
 }
 
-// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends). htmx core
-// attrs into the page mount — CSP-safe (no hx-on). Health/Trends are not built
-// yet → rendered as muted "soon" placeholders until their fragments exist.
+// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends · Performance ·
+// Network). htmx core attrs into the page mount — CSP-safe (no hx-on). The Network
+// tab loads the /fragments/network/* renderers (network_ui.cpp), which render this
+// same sub-nav with "network" active — so Network sits UNDER DEX rather than as its
+// own top-level nav item. The network fragments ignore the threaded ?window= (the
+// quality view is a now-view with no window of its own).
 std::string dex_subnav(const std::string& active, int window_days) {
     const std::string w = dex_window_token(window_days);
     auto tab = [&](const char* id, const char* label, const char* frag) {
@@ -385,7 +388,8 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
            tab("health", "Health score", "/fragments/dex/health") +
            tab("trends", "Trends", "/fragments/dex/trends") +
-           tab("perf", "Performance", "/fragments/dex/perf") + "</div>";
+           tab("perf", "Performance", "/fragments/dex/perf") +
+           tab("network", "Network", "/fragments/network/overview") + "</div>";
 }
 
 // Window chips for a given fragment path (reuses the overview pattern).
@@ -2089,6 +2093,29 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!valid_tag_key(key))
             key = kDexDefaultCohortKey;
         res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
+                        "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/dex/perf/cohort-diff", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        if (!perf_fn_) {
+            res.set_content(placeholder("Fleet performance unavailable",
+                                        "This server has no perf snapshot provider wired."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        std::string key = req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+        if (!valid_tag_key(key))
+            key = kDexDefaultCohortKey;
+        // Cohort values come from the picker; "" is the legitimate untagged
+        // residual, and the pure model reports found=false for an unknown one.
+        const std::string a = req.has_param("a") ? req.get_param_value("a") : "";
+        const std::string b = req.has_param("b") ? req.get_param_value("b") : "";
+        res.set_content(render_dex_perf_cohort_diff_fragment(perf_fn_(key), a, b, window_days),
                         "text/html; charset=utf-8");
     });
 

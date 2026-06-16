@@ -9,6 +9,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
+  collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
+  `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
+  macOS boottime equivalent), reusing the same observation builder for an identical
+  shape across OSes. Unprivileged, reused obs_type → no server change.
+
+- **Linux server DEX: reliability signals from the systemd journal.** The Linux
+  DEX collector now reads the journal on a slow cadence (`journalctl --after-cursor
+  -o json`, cursor-checkpointed) and emits, on the **existing** obs_types,
+  `service.crashed` (a unit failed — the systemd "Failed with result" / unit-failed
+  journal messages),
+  `process.crashed` (a `systemd-coredump` entry — `SD_MESSAGE_COREDUMP`; coverage
+  depends on systemd-coredump being the active core handler), and `memory.exhausted`
+  (the kernel OOM-killer). Only safe fields leave the device — process comm, unit
+  name, signal/result code, never the raw message — and a flapping unit/process is
+  collapsed by a per-`(type, subject)` debounce. No new dependency: `journalctl` is
+  a runtime shell-out (no libsystemd), the source no-ops on non-systemd hosts, and
+  the agent account already has `systemd-journal`/`adm` read access. Reusing the
+  existing obs_types means a Linux server lights up the same `/dex` buckets as
+  Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
+
+- **Windows network-quality collection.** The agent now emits network facts on
+  Windows, not only Linux: device throughput via `GetIfTable2` and a system-wide
+  interval retransmit rate via `GetTcpStatisticsEx` (fed through the same
+  `RetransWindow` ΔΣretrans/ΔΣsegs model as Linux). RTT stays unimplemented on
+  Windows — per-connection smoothed RTT needs ESTATS
+  (`GetPerTcpConnectionEStats`: enable + admin + overhead), a deferred slice. Two
+  honest caveats: the Windows retransmit counter is **system-wide** (no
+  per-interface TCP MIB, so it includes loopback) and is **measurement-first,
+  unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
+  The `/network` dashboard now populates on a Windows-only fleet, and Windows
+  throughput reaches the `yuzu_fleet_net_*` gauges. The net gauges carry an `os`
+  label (per-OS, never blended). The Windows **retransmit** rate is system-wide,
+  biased low, and not yet loss-validated, so it is **withheld from the
+  `yuzu_fleet_net_retrans_pct` gauge** (it still shows on the `/network` page +
+  REST, caveated) until #1465 validates it — the gauge carries loss-validated OSes
+  only (Linux today). The `os` gauge label is **allowlisted** to the values a real
+  agent emits (`windows`/`linux`/`darwin`, else `other`) so an agent-controlled tag
+  can't spray unbounded series (the same raw-tag exposure on
+  `yuzu_fleet_agents_by_arch`/`by_version` is tracked in #1472). See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
+- **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
+  per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
+  macOS, each row citing its in-code source of truth — so a platform gap (such as
+  the previously Linux-only network collector) is visible in one place. Flags the
+  durable follow-up: generate the matrix from the existing machine-readable per-OS
+  metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
+  signal catalogue) rather than hand-maintaining it.
+
+- **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
+  tab's cohort benchmarking compared each cohort against the whole fleet; it now
+  also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
+  `model` X vs Y) — closing the cohort-vs-cohort half of the benchmarking gap. A
+  "Compare two cohorts" section with two cohort pickers auto-loads the top-two
+  comparison; each metric shows both cohorts' p50 plus the delta (A relative to
+  B). Pure render-time over existing heartbeat state — **zero new storage**, no
+  Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
+  `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
+  rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
+  perf across the fleet) is **not** included — per-app data is device-drill-only
+  (federated), not fleet render-time; it remains deferred. See
+  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+
+- **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
+  under DEX (the Network tab in the DEX sub-nav, also reachable directly at
+  `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
+  network quality measured continuously on each endpoint from kernel counters (no
+  packet capture, no flow export) — a **device / local-link health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+  rate**, and device throughput. The retransmit rate is ΔΣretransmits /
+  ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
+  the lifetime ratio — empirically the lifetime ratio is diluted to noise while
+  the interval delta cleanly recovers the real loss rate. **Measurement-first:**
+  the page ships honest evidence and does **not** yet classify a device as
+  *network-degraded* — a calibrated threshold needs real-fleet baseline data, so
+  the degraded classification and the device/app co-occurrence headline it gates
+  are a later slice (the model stays wired but unfed). **Linux** agents report
+  via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
+  throughput; **Windows** reports throughput + retransmit (RTT deferred — see the
+  Windows entry above); **macOS emits nothing yet** (absent metrics are omitted,
+  never zeroed). Device-aggregate heartbeat tags
+  `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
+  gated by `--dex-disable`) and Prometheus gauges
+  `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
+  (`yuzu_fleet_net_retrans_reporting` is the retransmit-rate denominator;
+  `yuzu_fleet_net_degraded` is dormant/absent until the classification lands).
+  An opt-in per-connection warehouse tier (`netqual_enabled` TAR config →
+  on-device `$NetQual_Live`, bucket-only destination class, top-N capped, Linux)
+  ships as the foundation for the deferred per-destination drill; it has no
+  dashboard consumer in v1. Page permission: `GuaranteedState:Read`. See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`. Machine-readable
+  JSON siblings `GET /api/v1/network/fleet` and `GET /api/v1/network/devices`
+  (permission `GuaranteedState:Read`, listed in the OpenAPI spec) and MCP tools
+  `get_network_fleet` / `list_network_devices` mirror the dashboard data for
+  scripting and agentic access (A1 parity).
+  *Note:* `yuzu.net_retrans_pct` / `yuzu_fleet_net_retrans_pct` changed meaning
+  within the unreleased cycle (absolute lifetime ratio → interval delta) and
+  `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
+  Prometheus alerts built on the earlier 4a semantics.
+
+- **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
+  agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
+  into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
+  `statvfs` reads — reusing the same obs_types, `detail_json` shape and thresholds as
+  Windows/macOS, so they render in the same `/dex` display groups with zero server or
+  dashboard change. Linux CPU% and commit% also feed the perf heartbeat tags
+  (`yuzu.perf_*`). Observe-only; controlled by the existing `--dex-disable` /
+  `YUZU_AGENT_DEX_DISABLE` flag. **Edge-privacy:** `storage.low` subjects are the
+  backing-device identifier (e.g. `sda1`, or the ZFS pool) — never the mount path,
+  which can carry usernames/tenant names; pinned by `[dex][privacy]` regression tests.
+  **Upgrade note:** Linux agents begin emitting this telemetry on upgrade with no
+  operator action (EU works-council co-determination triggers on the *capability* to
+  observe); `--dex-disable` suppresses it fleet-wide.
+
 - **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
   `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
   ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
@@ -35,6 +148,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window is never persisted on re-enable (forensic-pause contract); the
   boot-backfill replay is memory-bounded and drops corrupt-timestamp / torn
   records.
+- **Boot process-capture AutoLogger wired into the Windows installer (#1425).**
+  The production InnoSetup installer (`deploy/packaging/windows/yuzu-agent.iss`)
+  now configures the `YuzuProcBoot` boot AutoLogger at install time — scoped to
+  the `advanced` plugin component that ships `tar.dll` — and tears it down on
+  uninstall: it removes the boot config, **stops the running trace session**, and
+  deletes `procboot.etl`. Stopping the session is load-bearing: `Remove-AutologgerConfig`
+  removes only the boot-start config and leaves a session started by an earlier
+  boot running until the next reboot, holding one of the scarce (~64) system ETW
+  session slots. The same stop-before-delete teardown was applied to
+  `install-agent-user.ps1`'s `Remove-ProcBootAutologger` so the script and
+  installer recipes stay in sync. The installer also locks the agent data dir
+  `{commonappdata}\Yuzu` (and `{app}\logs`) to `admins-full system-full`: the
+  prior `service-full` keyword is not a valid InnoSetup permission group and was
+  silently ignored, leaving the directory — which now holds the boot trace
+  `procboot.etl` (boot-process names reveal which security/EDR tools are present)
+  — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
 
 ### Changed
 
@@ -76,11 +205,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration; `process_enabled=false` disables Windows process capture
   entirely (ETW and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
-  redact). The boot-window AutoLogger backfill is configured only by the
-  developer install script today, **not** the production InnoSetup installer —
-  packaged Windows installs get live ETW capture but no boot-window backfill
-  until that wiring lands (tracked follow-up). See
-  `docs/user-manual/tar.md` "Upgrade note (Windows process capture → ETW)".
+  redact). The boot-window AutoLogger backfill is configured by the production
+  InnoSetup installer (scoped to the `advanced` component) and by the developer
+  install script (`install-agent-user.ps1`); it takes effect on the next reboot
+  after install. See `docs/user-manual/tar.md`
+  "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
   install is encrypted and serves the HTTPS dashboard + agent/management gRPC
@@ -157,6 +286,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
 - **macOS agents are no longer counted as Windows in DEX denominators.** The
   OS check used a substring match, and "darwin" contains "win" — so on mixed
   fleets every macOS agent inflated the Windows-online denominator behind the
@@ -180,11 +315,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Non-systemd Linux hosts (no system D-Bus) degrade gracefully: the guard
   does not arm and the rule reports unarmed rather than compliant. The watch
   reconnects automatically after a `systemctl daemon-reexec` / dbus restart.
-  **New runtime dependency on Linux agents:** `libsystemd.so.0` (package
-  `libsystemd0` on Debian/Ubuntu, `systemd-libs` on RHEL/Fedora). Systemd hosts
-  already have it; container and minimal Linux deployments must add `libsystemd0`
-  (runtime) and `libsystemd-dev` (build) — the shipped `Dockerfile.agent`,
-  `Dockerfile.agent.chisel`, and the asan/tsan images are updated accordingly.
+  **Build/runtime dependency on Linux agents:** `libsystemd` — build `libsystemd-dev`
+  (`systemd-devel` on RHEL/Fedora), runtime `libsystemd.so.0` (`libsystemd0` /
+  `systemd-libs`). The default build (`-Dsystemd_guard=enabled`) **requires** it so the
+  shipped agent always offers the guard — a build that has lost libsystemd fails loudly
+  rather than silently shipping a guard-less agent; the shipped `Dockerfile.agent`,
+  `Dockerfile.agent.chisel`, and the asan/tsan images install it and keep that default.
+  Pass `-Dsystemd_guard=auto` (use if present) or `disabled` to build the guard as a
+  no-op stub on musl/Alpine/non-systemd/minimal images that lack libsystemd.
 - **DEX: per-cohort performance gauges for Prometheus/Grafana (opt-in).**
   Settings → DEX alerts gains a **cohort export tag key**: when set (empty by
   default), `/metrics` publishes `yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,
@@ -402,9 +540,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   experience headings unprivileged; the Security heading (XProtect/Gatekeeper) is
   not yet shipped. Privacy is minimised at the edge (faulting-image basenames
   only, never raw log message bodies; per-type rate caps; non-finite metric
-  guards). Obeys the same `--dex-disable` kill switch as Windows. Linux endpoints
-  still report no DEX signals. Source mapping + the Endpoint-Security entitlement
-  roadmap: `docs/dex-signal-catalog.md`.
+  guards). Obeys the same `--dex-disable` kill switch as Windows. Source mapping +
+  the Endpoint-Security entitlement roadmap: `docs/dex-signal-catalog.md`.
 - **DEX dashboard (`/dex`) — a hub plus three deep pages.** The read-only fleet-
   reliability lens over the Guardian observation catalogue is structured as a
   **hub** (measured crash-free-device % and crashes/1k-device-days, honest "—"

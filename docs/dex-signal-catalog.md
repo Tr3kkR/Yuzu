@@ -14,14 +14,16 @@ whatever types exist, and unknown types render with a raw-label fallback under
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not). The server display
 catalogue totals **107** entries: the 103 Windows event-catalogue types **+
-`storage.low`** (one display entry, now emitted by BOTH platforms from two
-sources — the macOS IOKit poll and the Windows state poll, see those sections
-below; it began macOS-only) **+ the three A3 `perf.*` sustained-breach types**
-(`perf.cpu_sustained`, `perf.memory_pressure`, `perf.disk_latency_high` — the
-"Performance" display family, Windows state poll, see below).
+`storage.low`** (one display entry, now emitted by all three platforms from
+separate sources — the macOS IOKit poll, the Windows state poll, and the Linux
+`/proc`+`statvfs` collector, see those sections below; it began macOS-only) **+
+the three A3 `perf.*` sustained-breach types** (`perf.cpu_sustained`,
+`perf.memory_pressure`, `perf.disk_latency_high` — the "Performance" display
+family, Windows state poll + the Linux `/proc` poll for cpu_sustained &
+memory_pressure; disk_latency_high stays Windows-only, see below).
 The Windows *event* catalogue stays 103; the state-poll signals (`storage.low`,
 battery via `hw.error`, the `perf.*` breaches) ride alongside it without
-catalogue entries, exactly like the macOS poll mechanisms.
+catalogue entries, exactly like the macOS and Linux poll mechanisms.
 
 Channels that do not exist on a given SKU fail to arm individually and are
 logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
@@ -220,7 +222,9 @@ the impure shell, mirroring the macOS pure-parser/impure-engine split.
 
 Extractors drop user content **at the edge, before anything leaves the
 device**: DNS queried names, print document names/owners, profile usernames,
-image paths. What is never extracted can never be exfiltrated or mis-scoped.
+image paths; on Linux, `storage.low` emits the backing-device identifier (`sda1`,
+or the ZFS pool), never the mount path. What is never extracted can never be
+exfiltrated or mis-scoped.
 This is the data-minimisation half of the co-determination posture (see memory
 `project-telemetry-privacy-works-council`); the per-device drill-down is
 additionally permission-gated and audit-logged server-side. Remaining product
@@ -347,6 +351,71 @@ identically under Hardware without a server change. A dedicated
 `hw.battery_degraded` obs_type + label remains a future polish (needs a
 `dex_signal_groups()` + drift-net edit).
 
+## Linux collector (shipped — `dex_linux_collector.cpp`, `dex_linux_proc.cpp`, `dex_linux_storage.cpp`, `dex_linux_journal.cpp`)
+
+A drop-in `ISignalObserver` behind `make_dex_observer()` (`__linux__` branch), targeting
+**headless Linux servers** with three privilege-light mechanisms (no elevated access):
+
+1. a **periodic `/proc` poll** (`dex_linux_proc.cpp`): `/proc/stat` busy% and `/proc/meminfo`
+   commit% feed `perf.cpu_sustained` and `perf.memory_pressure` on the SAME sustained-breach
+   hysteresis + thresholds as the Windows state poll (reused `dex_perf_breach`); `/proc/uptime`
+   feeds the hourly `os.uptime_report` reboot/uptime heartbeat (the same cross-platform
+   `uptime_observation` builder macOS/Windows use);
+2. a **`statvfs` storage poll** (`dex_linux_storage.cpp`): `storage.low` (>=90% used or <5 GiB
+   free) over real local block-backed filesystems (ext*/xfs/btrfs/zfs/f2fs; pseudo, read-only
+   and network fstypes excluded);
+3. a **journald reader** (`dex_linux_journal.cpp`): a slow-cadence `journalctl --after-cursor -o
+   json` poll (cursor-checkpointed, no libsystemd) classifies journal entries onto EXISTING
+   obs_types — `service.crashed` (a unit failed: the "Failed with result" / unit-failed messages),
+   `process.crashed` (a `systemd-coredump` entry — coverage depends on systemd-coredump being the
+   active core handler), and `memory.exhausted` (the kernel OOM-killer). A per-`(type, subject)`
+   debounce collapses a flapping unit/process; the dedup map is age-evicted each poll so it stays
+   bounded by the trailing window, not daemon uptime.
+
+It reuses the existing obs_type strings, uniform `detail_json` keys and wire mapping, so the
+signals render in the same `/dex` display groups with **zero server or dashboard change**,
+`platform="linux"` driving the by-OS panel. Disk-latency (`perf.disk_latency_high`) is not yet
+emitted on Linux.
+
+**Coverage is Performance + Hardware/storage + App/Service reliability + Boot/uptime.**
+Workstation-only headings (battery, Wi-Fi, display/WM, GUI app dialogs, .NET) are **N/A on a
+headless server**, not gaps — score against the server-applicable denominator.
+
+**`storage.low` subject is the backing-device identifier, NEVER the mount path** — a mount path
+carries usernames / tenant / project names (`/home/alice/...`), which must not leave the device
+(§Privacy). For a `/dev/*` device that is the basename (`sda1`, `vg0-root`); for a ZFS dataset
+(whose `/proc/mounts` source is the dataset path, leaf = per-user) it is the **pool** (`tank`,
+`rpool`), never the leaf. Pinned by `[dex][privacy]` tests that call the same
+`storage_low_observation` chokepoint the collector calls (subject / sentence / `detail_json`
+asserted free of any path component).
+
+**journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
+`COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`
+ships the OOM **victim comm**, never the kernel memory figures (total-vm / anon-rss / file-rss) or
+the rest of the raw `MESSAGE`; `service.crashed` ships the unit name + `UNIT_RESULT` code only.
+Pinned by `[dex][linux][journal][privacy]` tests asserting subject / sentence / `detail_json` are
+free of the EXE path and the memory figures.
+
+**Deployment notes:** `storage.low` uses a fixed 5 GiB-free floor, so small cloud/VM root volumes
+can read as low until thresholds are operator-configurable (F1). Inside an **unmodified
+container** `/proc` reflects the *host*, so the collector targets host/VM deployment. `statvfs`
+excludes network *fstypes*, but a hung local block device (iSCSI/NBD/failing disk) can still stall
+the poll — a bounded statvfs is a tracked follow-up. The journald source **no-ops on a non-systemd
+host** (the `journalctl` shell-out yields nothing); `process.crashed` specifically requires
+**systemd-coredump** as the active core handler — on a host using `apport` (the Ubuntu default)
+coredumps are not journaled, so that signal stays silent until the core handler is changed (this is
+host configuration, not a Yuzu setting).
+
+| Heading | obs_type | Linux source | Status |
+|---|---|---|---|
+| Performance | `perf.cpu_sustained` | `/proc/stat` busy% >=90% sustained | live |
+| Performance | `perf.memory_pressure` | `/proc/meminfo` commit% >=90% | live |
+| Hardware & storage | `storage.low` | `statvfs` >=90% used; subject = device/pool | live |
+| Boot / uptime | `os.uptime_report` | `/proc/uptime` (hourly scalar) | live |
+| App / service reliability | `service.crashed` | journald unit-failed / "Failed with result" | live |
+| App / service reliability | `process.crashed` | journald `systemd-coredump` (where active handler) | live |
+| System stability | `memory.exhausted` | journald kernel OOM-killer | live |
+
 ## macOS: what more is possible with ESF / Network Extension / other entitlements
 
 The unprivileged collector above covers ~10 of 11 headings. Acquiring privileges
@@ -396,8 +465,8 @@ per-flow network + complete process/file telemetry; they do **not** add headings
 and are **not required** for the ~10/11 unprivileged coverage. The one hard ceiling
 is clean per-app APM (MetricKit), which no entitlement crosses.
 
-Linux: journald-based collectors (coredumpctl, systemd unit failures, OOM
-killer) follow the same catalogue pattern.
+Linux: the journald reliability signals (systemd unit failures, `systemd-coredump`
+crashes, the OOM-killer) are **shipped** — see the Linux collector section above.
 
 ## Wire + read-model invariants
 

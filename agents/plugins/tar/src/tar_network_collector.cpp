@@ -31,6 +31,24 @@
 #include <fstream>
 #include <sstream>
 #include <unistd.h>
+// netqual (per-connection TCP_INFO via netlink SOCK_DIAG / INET_DIAG).
+#include <algorithm>
+#include <cerrno> // errno / EINTR in the recvmsg retry loop
+#include <cstddef> // offsetof
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/tcp.h> // TCP_ESTABLISHED (NOT struct tcp_info — see linux_tcp_info.hpp)
+#include <sys/socket.h>
+#include <sys/time.h> // struct timeval (SO_RCVTIMEO)
+// ABI-pinned tcp_info prefix — glibc 2.39's <netinet/tcp.h> lacks tcpi_segs_out
+// and we can't add <linux/tcp.h> (it re-defines struct tcp_info, clashing with
+// the <netinet/tcp.h> above that we need for TCP_ESTABLISHED).
+#include "yuzu/agent/linux_tcp_info.hpp"
+#ifndef NETLINK_SOCK_DIAG
+#define NETLINK_SOCK_DIAG 4
+#endif
 #elif defined(__APPLE__)
 #include <arpa/inet.h>
 #include <libproc.h>
@@ -344,6 +362,171 @@ std::vector<NetConnection> enumerate_connections() {
     return result;
 }
 
+// ── netqual: per-connection TCP_INFO via netlink INET_DIAG ────────────────────
+// Mirrors the proven netlink mechanics in agents/core/src/net_quality_sampler.cpp
+// (the same interface `ss -ti` uses — no packet capture, no CAP_NET_ADMIN), but
+// extracts the per-connection 4-tuple + socket inode (→ owning process) rather
+// than rolling up to a device aggregate. Bounded by SO_RCVTIMEO so a stalled
+// dump degrades to a partial sample, never a hung collector.
+namespace {
+
+/// RAII owner for the netlink socket fd (no leak on any return).
+struct NetlinkFd {
+    int fd{-1};
+    explicit NetlinkFd(int f) : fd(f) {}
+    ~NetlinkFd() {
+        if (fd >= 0)
+            ::close(fd);
+    }
+    NetlinkFd(const NetlinkFd&) = delete;
+    NetlinkFd& operator=(const NetlinkFd&) = delete;
+};
+
+bool nq_send_dump(int fd, uint8_t family) {
+    struct {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 req;
+    } msg{};
+    msg.nlh.nlmsg_len = sizeof(msg);
+    msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    msg.nlh.nlmsg_seq = family;
+    msg.req.sdiag_family = family;
+    msg.req.sdiag_protocol = IPPROTO_TCP;
+    msg.req.idiag_states = (1u << TCP_ESTABLISHED); // only conns with a live RTT
+    msg.req.idiag_ext = (1u << (INET_DIAG_INFO - 1));
+    struct sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+    struct iovec iov{&msg, sizeof(msg)};
+    struct msghdr m{};
+    m.msg_name = &sa;
+    m.msg_namelen = sizeof(sa);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    return ::sendmsg(fd, &m, 0) > 0;
+}
+
+/// Owning-process image name from the socket inode's pid. /proc/[pid]/comm is
+/// the image name only (kernel-truncated to 15 chars) — matches the procperf
+/// "names only" privacy posture, never a command line.
+std::string nq_read_comm(uint32_t pid) {
+    if (pid == 0)
+        return {};
+    std::ifstream f(std::format("/proc/{}/comm", pid));
+    std::string name;
+    std::getline(f, name);
+    return name;
+}
+
+void nq_collect(int fd, uint8_t family,
+                const std::unordered_map<uint64_t, uint32_t>& inode_pid,
+                std::vector<TcpQualitySample>& out) {
+    // alignas: the in-place nlmsghdr/inet_diag_msg/rtattr casts require
+    // NLMSG_ALIGNTO alignment; tcp_info (8-aligned) is read via memcpy, not cast.
+    alignas(NLMSG_ALIGNTO) char buf[16384];
+    for (;;) {
+        struct sockaddr_nl sa{};
+        struct iovec iov{buf, sizeof(buf)};
+        struct msghdr m{};
+        m.msg_name = &sa;
+        m.msg_namelen = sizeof(sa);
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd, &m, 0);
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0)
+            return; // EAGAIN (SO_RCVTIMEO) or DONE — bounded, never wedged
+        for (auto* h = reinterpret_cast<struct nlmsghdr*>(buf); NLMSG_OK(h, n);
+             h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR)
+                return;
+            if (h->nlmsg_type != SOCK_DIAG_BY_FAMILY)
+                continue;
+            // Defence-in-depth: NLMSG_OK only guarantees the header fits, not the
+            // inet_diag_msg body — a truncated/malformed message would tail-over-
+            // read `diag` and make `rtalen` negative. Also discard any message left
+            // over from the previous family's dump (a mid-dump SO_RCVTIMEO can leave
+            // AF_INET replies queued when we send the AF_INET6 dump on the same
+            // socket — they'd be misparsed as the wrong family).
+            if (h->nlmsg_seq != family ||
+                h->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg)))
+                continue;
+            auto* diag = reinterpret_cast<struct inet_diag_msg*>(NLMSG_DATA(h));
+
+            // Remote address (the connection's peer). inet_ntop is canonical, so
+            // this matches the /proc-derived strings elsewhere.
+            char ab[INET6_ADDRSTRLEN]{};
+            std::string remote;
+            if (family == AF_INET) {
+                struct in_addr a{};
+                std::memcpy(&a, &diag->id.idiag_dst[0], sizeof(a));
+                if (inet_ntop(AF_INET, &a, ab, sizeof(ab)))
+                    remote = ab;
+            } else {
+                struct in6_addr a6{};
+                std::memcpy(&a6, diag->id.idiag_dst, sizeof(a6));
+                if (inet_ntop(AF_INET6, &a6, ab, sizeof(ab)))
+                    remote = ab;
+            }
+
+            // tcp_info attribute (defensive length check + memcpy into a local;
+            // RTA_DATA is only 4-byte aligned but LinuxTcpInfo needs 8 — cast
+            // would be alignment + strict-aliasing UB, memcpy moots both).
+            int rtalen = static_cast<int>(h->nlmsg_len) -
+                         static_cast<int>(NLMSG_LENGTH(sizeof(*diag)));
+            auto* attr = reinterpret_cast<struct rtattr*>(diag + 1);
+            yuzu::agent::LinuxTcpInfo ti{};
+            bool have_info = false;
+            for (; RTA_OK(attr, rtalen); attr = RTA_NEXT(attr, rtalen)) {
+                if (attr->rta_type != INET_DIAG_INFO)
+                    continue;
+                if (RTA_PAYLOAD(attr) <
+                    offsetof(yuzu::agent::LinuxTcpInfo, tcpi_segs_out) + sizeof(uint32_t))
+                    continue;
+                std::memcpy(&ti, RTA_DATA(attr),
+                            std::min<std::size_t>(RTA_PAYLOAD(attr), sizeof ti));
+                have_info = true;
+            }
+            if (!have_info)
+                continue;
+
+            TcpQualitySample s;
+            s.proto = (family == AF_INET) ? "tcp" : "tcp6";
+            s.remote_addr = std::move(remote);
+            uint32_t pid = 0;
+            if (auto it = inode_pid.find(diag->idiag_inode); it != inode_pid.end())
+                pid = it->second;
+            s.process_name = nq_read_comm(pid);
+            s.rtt_us = ti.tcpi_rtt;
+            s.rtt_var_us = ti.tcpi_rttvar;
+            s.lost = ti.tcpi_lost;                 // instantaneous lost segments — gone within an RTT
+            s.retrans = ti.tcpi_total_retrans;     // lifetime — context only
+            s.segs_out = ti.tcpi_segs_out;         // lifetime — context / denominator
+            s.ca_state = ti.tcpi_ca_state;         // 0=Open..4=Loss — holds across a recovery episode
+            out.push_back(std::move(s));
+        }
+    }
+}
+
+} // namespace
+
+std::vector<TcpQualitySample> collect_tcp_quality() {
+    std::vector<TcpQualitySample> out;
+    int raw = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    if (raw < 0)
+        return out;
+    NetlinkFd guard(raw);
+    struct timeval tv{2, 0}; // 2 s — bound the recvmsg wait
+    ::setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    auto inode_pid = build_inode_to_pid_map(); // inode → owning pid
+    for (uint8_t fam : {AF_INET, AF_INET6})
+        if (nq_send_dump(raw, fam))
+            nq_collect(raw, fam, inode_pid, out);
+    return out;
+}
+
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
 
@@ -483,6 +666,10 @@ std::vector<NetConnection> enumerate_connections() {
     resolve_hostnames(result);
     return result;
 }
+
+// netqual per-connection quality is Linux-only for now (macOS: nstat /
+// PRIVATE_TCP_INFO is kPlanned — see the netqual schema source).
+std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
 
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
@@ -668,9 +855,16 @@ std::vector<NetConnection> enumerate_connections() {
     return result;
 }
 
+// netqual per-connection quality is Linux-only for now (Windows: ESTATS /
+// Microsoft-Windows-TCPIP ETW is kPlanned — see the netqual schema source).
+std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
+
 #else
 // Unsupported platform
 std::vector<NetConnection> enumerate_connections() {
+    return {};
+}
+std::vector<TcpQualitySample> collect_tcp_quality() {
     return {};
 }
 #endif

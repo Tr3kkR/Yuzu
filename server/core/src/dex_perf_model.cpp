@@ -140,6 +140,44 @@ std::vector<DexPerfCohortRow> dex_perf_cohorts(const DexPerfSnapshot& snap) {
     return rows;
 }
 
+namespace {
+/// A's p50 relative to B's p50, as a percentage (B is the baseline). Absent when
+/// either side lacks the stat or B's p50 is ~0 — mirrors delta_pill's guard so
+/// the diff number and the pill agree.
+std::optional<double> p50_delta_pct(const std::optional<DexPerfStat>& a,
+                                    const std::optional<DexPerfStat>& b) {
+    if (!a || !b || b->p50 < 1e-9)
+        return std::nullopt;
+    return (a->p50 - b->p50) / b->p50 * 100.0;
+}
+} // namespace
+
+DexPerfCohortDiff dex_perf_cohort_diff(const DexPerfSnapshot& snap, const std::string& cohort_a,
+                                       const std::string& cohort_b) {
+    DexPerfCohortDiff d;
+    d.cohort_a = cohort_a;
+    d.cohort_b = cohort_b;
+    // Reuse the single cohort aggregation so the diff and the cohort table can
+    // never disagree; select the two requested cohort values from its output.
+    // (A == B sets both to the same row via the first match — zero deltas.)
+    for (const auto& r : dex_perf_cohorts(snap)) {
+        if (!d.found_a && r.cohort == cohort_a) {
+            d.a = r;
+            d.found_a = true;
+        }
+        if (!d.found_b && r.cohort == cohort_b) {
+            d.b = r;
+            d.found_b = true;
+        }
+    }
+    if (d.found_a && d.found_b) {
+        d.cpu_delta_pct = p50_delta_pct(d.a.cpu, d.b.cpu);
+        d.commit_delta_pct = p50_delta_pct(d.a.commit, d.b.commit);
+        d.disk_lat_delta_pct = p50_delta_pct(d.a.disk_lat, d.b.disk_lat);
+    }
+    return d;
+}
+
 void dex_perf_clear_cohort_gauges(yuzu::MetricsRegistry& metrics) {
     metrics.clear_gauge_family("yuzu_fleet_perf_cohort_cpu_pct");
     metrics.clear_gauge_family("yuzu_fleet_perf_cohort_commit_pct");

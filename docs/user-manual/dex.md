@@ -11,12 +11,14 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The five views
+## The six views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into four deep pages. A shared sub-nav switches between **Overview ·
-Catalogue · Health score · Trends · Performance**; the window selector (below)
-applies to the signal views (Performance is a now-view — see below).
+links* into five deep pages. A shared sub-nav switches between **Overview ·
+Catalogue · Health score · Trends · Performance · Network**; the window selector
+(below) applies to the signal views (Performance and Network are now-views — see
+below). The Network view also has its own URL, `/network`, but it is a DEX
+sub-view, not a standalone top-level nav item.
 
 ### Overview (the hub)
 
@@ -89,9 +91,8 @@ server-side series store).
 - **Fleet now cards** — CPU utilization, memory commit and disk I/O latency,
   each showing avg / p50 / p90 / max plus the **Reporting** population card
   (the honest denominator: an average over 12 devices is never silently
-  presented as fleet-wide truth). Perf telemetry is collected by **Windows
-  agents only** today; other platforms are absent from these numbers, not
-  zero.
+  presented as fleet-wide truth). Perf telemetry is collected by **Windows and
+  Linux agents** today; macOS is absent from these numbers, not zero.
 - **Cohort benchmarking** — fleet-relative percentiles per **cohort**: the
   distinct values of an operator-chosen **tag key** (default `model`; pick any
   key from the selector — e.g. an `image` key compares a vanilla VDI image
@@ -105,6 +106,20 @@ server-side series store).
   metric; the Reporting card opens the devices *not* reporting; each cohort
   row opens that cohort's device list — and every device row opens the
   per-device drill-down.
+
+### Network
+
+The fleet's TCP **network quality**, measured on each endpoint from kernel
+counters (no packet capture, no flow export). A **now-view** like Performance:
+fleet-now cards for round-trip time, the interval retransmit rate, and device
+throughput — each with its own reporting population — plus a worst-devices
+drill. It is **device / local-link health**, not localization: a bad local link
+(Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
+destination or app is affected is a later per-destination slice. Linux agents
+report all three metrics; Windows reports throughput and retransmit rate (RTT
+deferred — needs ESTATS); macOS is a later slice. Full detail,
+platform coverage, and the privacy model are on the
+[Network quality dashboard](network.md) page.
 
 **Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
 Drill-downs opened from a panel inherit the window you were viewing, so the
@@ -172,6 +187,9 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/cohorts?key=`** — the cohort benchmarking table
   (suppression and the untagged residual included in the response shape, plus
   `available_keys` for picker UIs).
+- **`GET /api/v1/dex/perf/cohort-diff?key=&a=&b=`** — the direct A-vs-B cohort
+  comparison (both cohort values required; `found_a`/`found_b`, the two cohort
+  rows, and `delta_pct` with B as the baseline — null unless both clear the floor).
 - **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
   — the one device list behind every Performance drill (worst-by-metric,
   not-reporting, cohort members).
@@ -181,10 +199,10 @@ endpoints are now-views (no window). All are gated on `GuaranteedState:Read`.
 The per-signal drill-down returns a most-affected **devices** list
 (behavioral) and is **audit-logged** (`dex.signal.view`) on every call,
 exactly like the dashboard view; the rollup, scope and perf endpoints are
-aggregates / machine-health telemetry and are not audited. The same six reads
+aggregates / machine-health telemetry and are not audited. The same seven reads
 are exposed as MCP tools (`list_dex_signals`, `get_dex_signal_scope`,
 `get_dex_signal_detail`, `get_dex_perf_fleet`, `get_dex_perf_cohorts`,
-`list_dex_perf_devices`). Full request/response shapes are in
+`get_dex_perf_cohort_diff`, `list_dex_perf_devices`). Full request/response shapes are in
 [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 
@@ -208,8 +226,13 @@ F1 follow-up, same as the blast-radius detector's). A
 collector that reuses the same OS-neutral signal types and covers roughly ten
 of the eleven experience headings (crashes and hangs, resource pressure,
 service failures, boot/resume reports, storage pressure, battery health, and
-more). **Linux** endpoints report no DEX signals yet — a collector is a
-planned follow-up. Because the by-OS and cross-OS views
+more). A **Linux** server collector ships too (`/proc` CPU + memory-commit pressure and
+`statvfs` storage), reusing the same signal types, so Linux servers appear in the
+Performance and Hardware/storage views; workstation-only headings (battery, Wi-Fi,
+display, GUI) are **N/A on headless servers**, not gaps. `storage.low` uses a fixed
+5 GiB-free floor (small cloud/VM root volumes can read as low until the F1
+configurable thresholds land), and inside an unmodified container `/proc` reflects
+the *host*, so the collector targets host/VM deployment. Because the by-OS and cross-OS views
 label each OS with its live *signal scope*, a fleet running a narrower collector
 reads as **less observed**, never as healthier; the rates are read *within* an
 OS, never across. The exact macOS source mapping — and what additional fidelity
