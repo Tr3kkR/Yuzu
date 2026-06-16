@@ -221,7 +221,14 @@ function generateCompose(c) {
 ##   docker compose logs -f
 ##   docker compose down -v    # ⚠️ -v removes data volumes!
 ##
-## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
+${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS configuration relies on the
+##    server auto-generating a per-install CA + leaf certs on first boot, serving
+##    HTTPS on 8443${secureGateway ? `, sharing certs via --cert-group, and a strict
+##    mutual-TLS gateway upstream` : ``} — behaviour that ships in the PKI go-live
+##    release (PR #1314) and later. Pin YUZU_VERSION to a release that includes it;
+##    against older images use Plaintext mode. (Plaintext works on any image.)
+##
+` : ``}## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
 ${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / ${c.grafanaPass})` : ''}
 ${c.prometheus ? `## Prometheus:  http://localhost:${c.promPort}` : ''}
 ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser} / ${c.chPass})` : ''}
