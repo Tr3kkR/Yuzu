@@ -76,6 +76,16 @@ std::string device_lens_tabs(const std::string& active, const std::string& agent
            tab("guardian", "Guardian", "/fragments/device/guardian") + "</div>";
 }
 
+// A toned DEX-score badge (green/amber/red by band); "—" when n/a (-1).
+std::string score_badge(int score) {
+    if (score < 0)
+        return "<span class=\"gp-mute\">&mdash;</span>";
+    const char* color = score >= 90 ? "#4ed27e" : (score >= 75 ? "#ffcc00" : "#ff5765");
+    return "<span style=\"display:inline-block;min-width:1.7rem;text-align:center;font-weight:700;"
+           "font-size:.68rem;border-radius:.3rem;padding:.05rem .4rem;color:#06121f;background:" +
+           std::string(color) + "\">" + std::to_string(score) + "</span>";
+}
+
 std::string ci_group(const std::string& title, const std::string& rows) {
     return "<div class=\"gp-tile\" style=\"min-width:240px;text-align:left\">"
            "<div class=\"l\" style=\"color:#a5d6ff;margin-bottom:.3rem\">" +
@@ -146,7 +156,7 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
         return h;
     }
 
-    h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th>Status</th><th>OS</th>"
+    h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th>Status</th><th>DEX</th><th>OS</th>"
          "<th>Version</th><th>Last seen</th></tr></thead><tbody>";
     for (const auto& d : rows) {
         const std::string label = d.hostname.empty() ? d.agent_id : d.hostname;
@@ -160,6 +170,7 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
              "\" style=\"font-weight:600;color:#fff\">" + esc(label) +
              "</a><div class=\"gp-mute\" style=\"font-size:.66rem\">" + tagline + "</div></td>";
         h += "<td>" + status_cell(d.online) + "</td>";
+        h += "<td>" + score_badge(d.dex_score) + "</td>";
         h += "<td class=\"gp-mute\">" + os_label(d.os) + "/" + esc(d.arch) + "</td>";
         h += "<td class=\"gp-mute\">" + (d.agent_version.empty() ? std::string("&mdash;")
                                                                  : esc(d.agent_version)) +
@@ -220,7 +231,8 @@ std::string render_device_page(const DeviceRow& d) {
     std::string h = "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>";
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(label) +
          "</h1></div><div class=\"gp-sub\">" + os_label(d.os) + "/" + esc(d.arch) + " &middot; " +
-         status_cell(d.online) + "</div></div>";
+         status_cell(d.online) + " &middot; DEX experience " + score_badge(d.dex_score) +
+         "</div></div>";
     // Cross-cutting live-info action — previewed but disabled until the live-pull
     // slice (it's privacy-gated: per-category toggle + individual-view kill switch,
     // not just Execute+PII+audit).

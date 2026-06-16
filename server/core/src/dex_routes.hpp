@@ -99,6 +99,14 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
 /// collectors (a schema↔catalogue cross-check test guards drift — H2/G9 style).
 std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 
+/// Per-device DEX experience score (0–100) — the per-device projection of the
+/// canonical severity-weighted composite (100 − Σ family deductions over the
+/// device's OWN observations; benign families don't deduct, events gently scaled).
+/// Cheap server-side read (dex_device_signal_summary); returns -1 when `store` is
+/// null. The fleet-scale path (heartbeat rollup) is a follow-up.
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since);
+
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
 /// "all"|"windows"|"linux"|"macos") collects one of its types — not merely when a

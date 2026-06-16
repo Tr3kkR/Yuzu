@@ -51,6 +51,7 @@ struct DeviceRow {
     std::vector<std::string> tags;
     bool online = false;          ///< has a live Subscribe stream right now
     std::string last_seen;        ///< human-ish ("now", "12m ago") or ISO; "" if unknown
+    int dex_score = -1;           ///< per-device DEX experience score 0–100; -1 = n/a
 };
 
 /// PURE: the `/fragments/devices/list` table — the fleet device list, filtered by

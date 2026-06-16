@@ -350,6 +350,25 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
     CHECK(html.find(">Other") != std::string::npos);
 }
 
+TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=-1",
+          "[dex][score]") {
+    GuaranteedStateStore store(":memory:");
+    // Null store → n/a sentinel.
+    CHECK(dex_device_score(nullptr, "WS-1", "") == -1);
+    // A device with no observations is a clean 100.
+    CHECK(dex_device_score(&store, "CLEAN-1", "") == 100);
+    // A failure signal (process.crashed = App reliability, high severity) deducts.
+    seed_signal(store, "e1", "WS-1", "process.crashed",
+                R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "WS-1", "") < 100);
+    // The score is per-device: a different device is unaffected.
+    CHECK(dex_device_score(&store, "OTHER-1", "") == 100);
+    // Benign reports (uptime) never deduct → still 100.
+    seed_signal(store, "e2", "BENIGN-1", "os.uptime_report",
+                R"({"subject":"host","platform":"windows"})", kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "BENIGN-1", "") == 100);
+}
+
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
           "[dex][routes]") {
     GuaranteedStateStore store(":memory:");

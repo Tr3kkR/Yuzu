@@ -8081,6 +8081,7 @@ private:
             std::vector<DeviceRow> out;
             auto arr = registry_.to_json_obj();
             out.reserve(arr.size());
+            const std::string dex_since = dex_iso_since(7); // 7d window for the list score
             for (const auto& a : arr) {
                 DeviceRow d;
                 d.agent_id = a.value("agent_id", "");
@@ -8090,6 +8091,10 @@ private:
                 d.agent_version = a.value("agent_version", "");
                 d.online = true; // the registry holds connected sessions
                 d.last_seen = "now";
+                // Per-device DEX score (cheap server-side; the fleet-scale path is a
+                // heartbeat rollup — see project-dex-dashboard-redesign).
+                d.dex_score =
+                    dex_device_score(guaranteed_state_store_.get(), d.agent_id, dex_since);
                 if (auto s = registry_.get_session(d.agent_id)) {
                     for (const auto& [k, v] : s->scopable_tags)
                         d.tags.push_back(v.empty() ? k : (k + "=" + v));

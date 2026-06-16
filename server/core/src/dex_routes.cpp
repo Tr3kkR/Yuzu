@@ -950,6 +950,34 @@ double dex_family_health_deduction(const DexSignalGroup& g,
     return 0.0;
 }
 
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since) {
+    if (!store)
+        return -1;
+    const auto device_signals = store->dex_device_signal_summary(agent_id, since);
+    double total = 0.0;
+    for (const auto& fw : dex_family_weights()) {
+        const DexSignalGroup* g = nullptr;
+        for (const auto& grp : dex_signal_groups())
+            if (std::string(grp.name) == fw.name) {
+                g = &grp;
+                break;
+            }
+        if (!g)
+            continue;
+        const DexFamilyRollup rr = dex_family_rollup(*g, device_signals);
+        if (rr.benign || rr.events <= 0) // benign reports (boot/uptime) never deduct
+            continue;
+        // Per-device impact: this device's events in the family, gently scaled
+        // (1 event = partial; kCap+ events = full severity). Illustrative cap,
+        // pending calibration (like the perf baseline).
+        constexpr double kCap = 5.0;
+        const double impact = std::min(1.0, static_cast<double>(rr.events) / kCap);
+        total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
+    }
+    return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
+}
+
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
 // score = 100 − Σ deductions; deduction(family) = severity points × preset
 // multiplier × measured impact rate (devices hit / reporting agents). Every
