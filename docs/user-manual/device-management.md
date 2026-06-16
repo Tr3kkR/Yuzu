@@ -225,6 +225,8 @@ The **Get live info** button (shown when the device is online) dispatches read-o
 
 Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read`; without it the panel shows an explanatory note rather than failing silently. Dispatching the process list is **usage-class behavioral telemetry** (it reveals which programs a person is running) and is individually audit-logged — see [Audit log](audit-log.md) for the works-council posture.
 
+On a host with many distinct large executables the process panel can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
+
 ### REST API
 
 **List all agents (legacy endpoint):**

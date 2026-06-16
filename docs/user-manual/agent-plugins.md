@@ -138,6 +138,7 @@ Plugins for enumerating running processes, fetching process metadata, and queryi
 | Action | Description |
 |---|---|
 | `list` | List all running processes (PID, name, user, memory, CPU). |
+| `list_hashed` | List running processes with the **SHA-256 of each on-disk executable image** (kernel-resolved path, not argv[0]; 512 MiB read cap). Returns `proc\|pid\|name\|sha256\|path`; sha256/path are empty when the path is unresolvable (kernel threads, access-denied). Usage-class behavioral telemetry — see the `device.live.processes` audit verb and the device page's **Get live info** ([device management](device-management.md)). This is the on-demand, Execute-gated, dashboard-integrated counterpart to `procfetch` (which is the scheduled-instruction fleet hash collector, SHA-1). |
 | `query` | Filter processes by name pattern. Returns matching entries. |
 
 ### procfetch

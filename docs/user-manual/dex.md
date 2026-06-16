@@ -59,7 +59,10 @@ Updates & installs, Policy & management, Printing). The Catalogue is
 0–100 **health score** (the family's slice of the fleet health composite). A
 monitored type with no events reads as **watched, nothing happened** — real
 information, not a gap; a type that **no connected platform collects** shows
-dimmed as **not collected**, never as healthy. An **OS filter** (All connected /
+dimmed as **not collected**, never as healthy. (A type is *not collected* when no
+currently-connected platform in your fleet emits it — e.g. a Linux-only signal on
+an all-Windows fleet; it lights automatically when the first eligible device
+connects, so this is a coverage fact, not a broken collector.) An **OS filter** (All connected /
 Windows / Linux / macOS) narrows coverage to one platform and **persists** when
 you open a family or drill into a type. Opening a family lists **every** type
 with its coverage (which platforms collect it) and, for the ones that fired,
