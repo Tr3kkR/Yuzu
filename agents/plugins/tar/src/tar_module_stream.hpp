@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -148,6 +149,58 @@ inline std::string redact_module_dir(const std::string& dir) {
         }
     }
     return dir;
+}
+
+/// A module load that must be kept at FULL fidelity in `module_live` regardless
+/// of volume: unsigned / invalid / revoked signatures, kernel driver/kext/kmod
+/// loads, and OS-blocked loads. These are the rare, high-signal forensic events.
+inline bool module_is_risky(const ModuleEvent& e) {
+    return e.is_kernel || e.action == ModuleAction::kBlocked ||
+           e.signed_state == ModuleSignedState::kUnsigned ||
+           e.signed_state == ModuleSignedState::kInvalid ||
+           e.signed_state == ModuleSignedState::kRevoked;
+}
+
+/// Minimal §5 edge risk-filter (docs/tar-module-loads.md) — bounds `module_live`
+/// at the write edge so a module-load storm can't flood it. Keeps EVERY risky
+/// load (module_is_risky); for normally-signed loads, dedups within the drain
+/// batch by (process, module_name, module_dir, signer, signed_state) — module_dir
+/// is in the key so the same-named DLL loaded from two directories (the
+/// search-order-hijack signal: a `version.dll` in an app dir vs System32) is NOT
+/// collapsed — and caps the number of DISTINCT signed loads kept per drain. The
+/// 100k row-count retention
+/// on `module_live` is the deterministic backstop behind this; the full
+/// first-seen-per-window-then-count refinement is deferred to M7. Pure +
+/// cross-platform (collector-agnostic), applied plugin-side between drain and
+/// insert — parity with the process stabilization-exclusion / proc-perf top-N.
+inline std::vector<ModuleEvent> apply_module_risk_filter(std::vector<ModuleEvent> events,
+                                                         std::size_t max_signed = 4096) {
+    std::vector<ModuleEvent> out;
+    out.reserve(events.size());
+    std::unordered_set<std::string> seen_signed;
+    std::size_t signed_kept = 0;
+    for (auto& e : events) {
+        if (module_is_risky(e)) {
+            out.push_back(std::move(e));
+            continue;
+        }
+        std::string key = e.process_name;
+        key += '\x1f';
+        key += e.module_name;
+        key += '\x1f';
+        key += e.module_dir; // keep same-named DLLs from different dirs distinct
+        key += '\x1f';
+        key += e.signer;
+        key += '\x1f';
+        key += module_signed_token(e.signed_state);
+        if (!seen_signed.insert(std::move(key)).second)
+            continue; // duplicate normally-signed load already kept this drain
+        if (signed_kept >= max_signed)
+            continue; // per-drain cap on distinct signed loads (the hard bound)
+        ++signed_kept;
+        out.push_back(std::move(e));
+    }
+    return out;
 }
 
 /// The module/image-load ring — `EventRing<ModuleEvent>`, the same bounded

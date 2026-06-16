@@ -152,7 +152,9 @@ tar_test_cpp_args = []
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
-  tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp ETW decode
+  tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
+  tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
+  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -181,6 +183,7 @@ tar_test_exe = executable(
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
+    'unit/test_tar_module_etw.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -193,6 +196,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_module_stream.cpp',
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
+    '../agents/plugins/tar/src/tar_module_etw.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [

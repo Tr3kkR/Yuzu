@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+  populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
+  (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
+  code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
+  cached by file+mtime) and the loaded-image directory scrubbed of user-profile
+  prefixes before storage. Opt-in (`module_enabled`, default off; enabling takes
+  effect on the next collection tick — no restart). Signing uses the local
+  Authenticode chain **without online CRL/OCSP revocation checking** (no per-load
+  network I/O), so a revoked driver may read as `signed`; authoritative
+  revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
+  risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
+  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
+  Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
+  `docs/tar-module-loads.md`.
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
   `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
