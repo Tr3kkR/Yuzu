@@ -114,10 +114,15 @@ agent_test_exe = executable(
     'unit/test_guardian_engine.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
+    'unit/test_guard_systemd.cpp',
     'unit/test_dex_signals.cpp',
     'unit/test_dex_macos.cpp',
     'unit/test_dex_win_poll.cpp',
     'unit/test_dex_perf_breach.cpp',
+    'unit/test_net_quality_sampler.cpp',
+    'unit/test_dex_linux_proc.cpp',
+    'unit/test_dex_linux_journal.cpp',
+    'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
@@ -146,6 +151,7 @@ tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sq
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
+  tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp ETW decode
 endif
 
 tar_test_exe = executable(
@@ -158,6 +164,7 @@ tar_test_exe = executable(
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
+    'unit/test_tar_proc_etw.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -166,6 +173,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_aggregator.cpp',
     '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_perf.cpp',
+    '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
@@ -234,6 +242,7 @@ if build_server
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
+      'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',

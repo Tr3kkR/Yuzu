@@ -27,9 +27,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .name = "process",
             .dollar_name = "Process",
             .os_support = {
-                {"windows", OsSupportStatus::kSupported,           "toolhelp32",
-                 "CreateToolhelp32Snapshot — full pid/ppid/name/cmdline; "
-                 "cmdline retrieval requires PROCESS_QUERY_LIMITED_INFORMATION."},
+                {"windows", OsSupportStatus::kSupported,           "etw",
+                 "ETW Microsoft-Windows-Kernel-Process (gap-free start/stop, "
+                 "names-only, owning user resolved from the SID at start) is the "
+                 "primary feeder; CreateToolhelp32Snapshot poll is the fallback "
+                 "if the ETW session cannot start. No command line is captured."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
@@ -41,7 +43,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {
                     .suffix = "live",
                     .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
+                    // Raised 5k→100k for the gap-free ETW stream on Windows (the
+                    // poll produced far fewer rows). ~100k × ~150 B ≈ ~15 MB
+                    // bounded; the hourly/daily/monthly count rollups carry the
+                    // long tail. Non-Windows poll simply never fills it.
+                    .retention_default = 100000,
                     .columns = {
                         {"ts",          "INTEGER"},
                         {"snapshot_id", "INTEGER"},
@@ -384,6 +390,57 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"cpu_max",       "REAL"},
                         {"ws_avg_bytes",  "INTEGER"},
                         {"ws_max_bytes",  "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── netqual (BRD Workstream E — per-connection TCP quality) ──────
+        // One row per (tick, ESTABLISHED connection): smoothed RTT + jitter
+        // + a CURRENT-loss gauge (tcpi_lost) + lifetime retrans/segs context,
+        // joined to the owning process. Co-sampled with the `tcp` source so it
+        // shares the snapshot_id (joins to process/perf on ts). Only a coarse
+        // destination CLASS (`remote_bucket`) is stored — never the raw remote
+        // address — and collection carries its own opt-in toggle + per-tick
+        // top-N cap (collector slice). Row-count retention bounds storage
+        // deterministically regardless of connection churn.
+        {
+            .name = "netqual",
+            .dollar_name = "NetQual",
+            .os_support = {
+                {"linux",   OsSupportStatus::kSupported, "inetdiag",
+                 "netlink SOCK_DIAG / INET_DIAG TCP_INFO dump (the interface "
+                 "`ss -ti` uses — no packet capture, no CAP_NET_ADMIN: a "
+                 "non-root agent reads system TCP_INFO), joined to the "
+                 "connection's owning process by 4-tuple."},
+                {"windows", OsSupportStatus::kPlanned,   "estats",
+                 "ESTATS (GetPerTcpConnectionEStats) for smoothed RTT, or the "
+                 "Microsoft-Windows-TCPIP ETW provider for retransmit/loss — "
+                 "the mechanism is a spike (see /network design)."},
+                {"macos",   OsSupportStatus::kPlanned,   "nstat",
+                 "per-socket tcp_connection_info via the private nstat / "
+                 "PRIVATE_TCP_INFO path."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Per-connection rows are far more numerous than the device
+                    // perf tier; the collector's per-tick top-N cap is the real
+                    // bound, this row cap is the deterministic storage backstop.
+                    .retention_default = 100000,
+                    .columns = {
+                        {"ts",            "INTEGER"},
+                        {"snapshot_id",   "INTEGER"},
+                        {"proto",         "TEXT"},
+                        {"remote_bucket", "TEXT"},
+                        {"process_name",  "TEXT"},
+                        {"rtt_us",        "INTEGER"},
+                        {"rtt_var_us",    "INTEGER"},
+                        {"lost",          "INTEGER"},
+                        {"retrans",       "INTEGER"},
+                        {"segs_out",      "INTEGER"},
+                        {"ca_state",      "INTEGER"},
                     },
                 },
             },

@@ -22,6 +22,7 @@
 #include <yuzu/agent/guard_file.hpp>
 #include <yuzu/agent/guard_registry.hpp>
 #include <yuzu/agent/guard_service.hpp>
+#include <yuzu/agent/guard_systemd.hpp> // make_service_guard (platform factory)
 #include <yuzu/agent/kv_store.hpp>
 
 #include "agent.grpc.pb.h"
@@ -446,10 +447,13 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     // agent_id, two agents drifting on the same rule in the same millisecond mint
     // an identical id (rule_id-{ms}-{seq}, seq being a per-agent counter that both
     // start at 0) → the server silently keeps one and loses the rest during a
-    // fleet-wide drift wave. The agent_id segment alone guarantees cross-agent
-    // distinctness regardless of clock skew. (The crash/observation path landing
-    // with the DEX slice uses the same {discriminator}-{agent_id}-{ms}-{seq}
-    // layout — keep them aligned when that branch merges.)
+    // fleet-wide drift wave. For any non-empty agent_id the agent_id segment
+    // guarantees cross-agent distinctness regardless of clock skew; a degenerate
+    // empty agent_id (pre-Register, before sync_with_server populates it) folds
+    // in nothing and reverts to the old per-(rule,ms,seq) collision class — the
+    // durable fix for that residual is the server-side composite key #1360. (The
+    // crash/observation path landing with the DEX slice uses the same
+    // {discriminator}-{agent_id}-{ms}-{seq} layout — keep them aligned.)
     ev.set_event_id(d.rule_id + "-" + agent_id_ + "-" + std::to_string(now_ms) + "-" +
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
@@ -629,17 +633,26 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 it->second->stop();
             guards_.erase(it);
         }
-        auto sguard = std::make_unique<ServiceGuard>(std::move(cfg), std::move(service_sink));
+        // Platform factory: Windows SCM ServiceGuard or Linux systemd
+        // SystemdServiceGuard, both IGuard. Keeps this dispatch platform-clean.
+        auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
         if (sguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(sguard));
+            // Honest mode label: the Linux systemd guard is observe-only in v1, so an
+            // enforce-authored rule observes (it logs its own downgrade too) — don't
+            // claim "enforce" on a platform that won't remediate (happy-path Q4).
+            const char* mode = enforce ? "enforce" : "audit";
+#if defined(__linux__)
+            if (enforce)
+                mode = "enforce (observe-only on Linux)";
+#endif
             spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
                          rule.rule_id(), log_service,
-                         desired == ServiceGuard::Desired::Running ? "running" : "stopped",
-                         enforce ? "enforce" : "audit");
+                         desired == ServiceGuard::Desired::Running ? "running" : "stopped", mode);
             return true;
         }
         spdlog::warn("Guardian: service guard for rule '{}' did not start "
-                     "(non-Windows or invalid service name)",
+                     "(unsupported platform / no service-control backend / invalid service name)",
                      rule.rule_id());
         return false;
     }

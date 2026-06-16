@@ -115,9 +115,10 @@ struct GuardianFixture {
         return r;
     }
 
-    // A rule that arms a ServiceGuard on Windows (service-status-change spark +
-    // service-running assertion). The service need not exist — the guard watches the
-    // SCM for it; get_status is fail-closed regardless (no self-test verdict yet).
+    // A rule that arms a service guard (service-status-change spark +
+    // service-running assertion): ServiceGuard on Windows, SystemdServiceGuard on
+    // Linux+systemd, no-op elsewhere. The service/unit need not exist — the guard
+    // watches for it; get_status is fail-closed regardless (no self-test verdict yet).
     static gpb::GuaranteedStateRule make_service_rule(const std::string& id,
                                                       const std::string& mode) {
         gpb::GuaranteedStateRule r = make_rule(id, id);
@@ -308,10 +309,11 @@ TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-c
     GuardianFixture f;
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
-    // audit mode: on Windows this arms a real ServiceGuard whose worker watches the
-    // SCM for the named service; off-Windows no guard arms. Either way the rule is
-    // persisted and status is fail-closed (no self-test verdict yet → "errored",
-    // never healthy/compliant) — the same B1/UP-1/F4 invariant as the registry case.
+    // audit mode: on Windows this arms a real ServiceGuard watching the SCM, on
+    // Linux+systemd a SystemdServiceGuard watching the unit over sd-bus, no guard
+    // off both. Either way the rule is persisted and status is fail-closed (no
+    // self-test verdict yet → "errored", never healthy/compliant) — the same
+    // B1/UP-1/F4 invariant as the registry case.
     *p.add_rules() = GuardianFixture::make_service_rule("svc-1", "audit");
     auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
     REQUIRE(dr.exit_code == 0);

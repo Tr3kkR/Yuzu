@@ -23,7 +23,7 @@ RUN CC="gcc-13" CXX="g++-13" \
 FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgcc-13-dev libstdc++6 libssl3t64 ca-certificates \
+        libgcc-13-dev libstdc++6 libssl3t64 libsystemd0 ca-certificates \
         libasan8 libubsan1 \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /sbin/nologin yuzu

@@ -6,6 +6,8 @@
  * that exercises the same MetricsRegistry output contract.
  */
 
+#include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -50,6 +52,12 @@ public:
         metrics.clear_gauge_family("yuzu_fleet_perf_cpu_pct");
         metrics.clear_gauge_family("yuzu_fleet_perf_commit_pct");
         metrics.clear_gauge_family("yuzu_fleet_perf_disk_lat_ms");
+        metrics.clear_gauge_family("yuzu_fleet_net_rtt_ms");
+        metrics.clear_gauge_family("yuzu_fleet_net_retrans_pct");
+        metrics.clear_gauge_family("yuzu_fleet_net_throughput_bps");
+        metrics.clear_gauge_family("yuzu_fleet_net_degraded");
+        metrics.clear_gauge_family("yuzu_fleet_net_reporting");
+        metrics.clear_gauge_family("yuzu_fleet_net_retrans_reporting");
 
         std::unordered_map<std::string, int> os_counts, arch_counts, version_counts;
         double total_commands = 0.0;
@@ -57,6 +65,21 @@ public:
         int dex_observer_disarmed = 0;
         double total_dex_observed = 0.0;
         std::vector<double> perf_cpu, perf_commit, perf_disk_lat;
+        // Per-OS net buckets (mirrors AgentRegistry::recompute_metrics — no blend).
+        std::unordered_map<std::string, std::vector<double>> net_rtt_os, net_retrans_os,
+            net_tput_os;
+        std::unordered_map<std::string, int> net_reporting_os, net_degraded_os,
+            net_degraded_reporting_os;
+        // Mirrors the production retransmit gauge-eligibility gate (Windows rate is
+        // unvalidated — #1465 — so withheld from the gauge; Linux is validated).
+        auto retrans_gauge_eligible = [](const std::string& os) { return os == "linux"; };
+        // Mirrors the production os-label allowlist (agent-controlled yuzu.os →
+        // bounded label, anti cardinality-injection).
+        auto normalize_os = [](const std::string& os) -> std::string {
+            if (os == "windows" || os == "linux" || os == "darwin")
+                return os;
+            return os.empty() ? "unknown" : "other";
+        };
 
         for (const auto& [id, snap] : snapshots_) {
             ++healthy_count;
@@ -68,7 +91,7 @@ public:
 
             auto os_val = get("yuzu.os");
             if (!os_val.empty())
-                os_counts[os_val]++;
+                os_counts[normalize_os(os_val)]++;
 
             auto arch_val = get("yuzu.arch");
             if (!arch_val.empty())
@@ -116,6 +139,36 @@ public:
             collect_finite(perf_cpu, "yuzu.perf_cpu_pct", 100.0, 1.0e6);
             collect_finite(perf_commit, "yuzu.perf_commit_pct", 100.0, 1.0e6);
             collect_finite(perf_disk_lat, "yuzu.perf_disk_lat_ms", 0.0, 1.0e6);
+
+            // Use the SHIPPED validators (network_perf_rules.hpp) — not a
+            // hand-rolled parallel copy — so this repro can't drift from
+            // production's forged-value posture (full-token parse, locale
+            // hardening, ceilings/clamps). Mirrors agent_registry.cpp incl. the
+            // UP-9 gate (degraded counted only for metric-reporting devices).
+            namespace rules = yuzu::server::detail;
+            const std::string net_os = normalize_os(os_val);
+            bool net_any = false;
+            if (auto v = rules::parse_net_rtt_ms(get(rules::kNetTagRttP50Ms))) {
+                net_rtt_os[net_os].push_back(*v);
+                net_any = true;
+            }
+            if (auto v = rules::parse_net_retrans_pct(get(rules::kNetTagRetransPct))) {
+                if (retrans_gauge_eligible(net_os))
+                    net_retrans_os[net_os].push_back(*v);
+                net_any = true;
+            }
+            if (auto v = rules::parse_net_throughput_bps(get(rules::kNetTagThroughputBps))) {
+                net_tput_os[net_os].push_back(*v);
+                net_any = true;
+            }
+            if (net_any) {
+                ++net_reporting_os[net_os];
+                if (auto d = rules::parse_net_degraded(get(rules::kNetTagDegraded))) {
+                    ++net_degraded_reporting_os[net_os];
+                    if (*d)
+                        ++net_degraded_os[net_os];
+                }
+            }
         }
 
         metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -159,6 +212,40 @@ public:
         set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
         set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
         set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
+
+        auto set_stats_os = [&](const char* family, const std::string& os,
+                                std::vector<double>& vals) {
+            if (vals.empty())
+                return;
+            std::sort(vals.begin(), vals.end());
+            const auto n = vals.size();
+            double sum = 0.0;
+            for (double v : vals)
+                sum += v;
+            auto rank = [&](double p) {
+                const auto idx = static_cast<std::size_t>(std::ceil(p * static_cast<double>(n)));
+                return vals[(std::min)(idx == 0 ? 0 : idx - 1, n - 1)];
+            };
+            metrics.gauge(family, {{"stat", "avg"}, {"os", os}}).set(sum / static_cast<double>(n));
+            metrics.gauge(family, {{"stat", "p50"}, {"os", os}}).set(rank(0.50));
+            metrics.gauge(family, {{"stat", "p90"}, {"os", os}}).set(rank(0.90));
+            metrics.gauge(family, {{"stat", "max"}, {"os", os}}).set(vals.back());
+        };
+        for (auto& [os, n] : net_reporting_os)
+            metrics.gauge("yuzu_fleet_net_reporting", {{"os", os}}).set(static_cast<double>(n));
+        for (auto& [os, vals] : net_retrans_os)
+            metrics.gauge("yuzu_fleet_net_retrans_reporting", {{"os", os}})
+                .set(static_cast<double>(vals.size()));
+        for (auto& [os, n] : net_degraded_reporting_os)
+            if (n > 0)
+                metrics.gauge("yuzu_fleet_net_degraded", {{"os", os}})
+                    .set(static_cast<double>(net_degraded_os[os]));
+        for (auto& [os, vals] : net_rtt_os)
+            set_stats_os("yuzu_fleet_net_rtt_ms", os, vals);
+        for (auto& [os, vals] : net_retrans_os)
+            set_stats_os("yuzu_fleet_net_retrans_pct", os, vals);
+        for (auto& [os, vals] : net_tput_os)
+            set_stats_os("yuzu_fleet_net_throughput_bps", os, vals);
     }
 
 private:
@@ -396,4 +483,85 @@ TEST_CASE("AgentHealthStore: true nearest-rank percentiles in tiny fleets",
     store.recompute_metrics(metrics, std::chrono::seconds(60));
     CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p50"}}).value() == 10.0);
     CHECK(metrics.gauge("yuzu_fleet_perf_cpu_pct", {{"stat", "p90"}}).value() == 90.0);
+}
+
+// ── network fleet rollup (slice 3) ───────────────────────────────────────────
+
+TEST_CASE("AgentHealthStore: network facts aggregate to gauges + degraded count",
+          "[health_store][network]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // a/c are Linux (RTT + retransmit + a's degraded); b is Windows (throughput +
+    // a retransmit that is WITHHELD from the gauge until validated, #1465). Per-OS,
+    // never blended; Windows throughput (a real counter) DOES reach the gauge.
+    store.upsert("a", {{"yuzu.net_rtt_p50_ms", "100.0"},
+                       {"yuzu.net_retrans_pct", "1.0"},
+                       {"yuzu.net_degraded", "1"},
+                       {"yuzu.os", "linux"}});
+    store.upsert("c", {{"yuzu.net_rtt_p50_ms", "200.0"},
+                       {"yuzu.net_retrans_pct", "3.0"},
+                       {"yuzu.os", "linux"}});
+    store.upsert("b", {{"yuzu.net_throughput_bps", "1000000"},
+                       {"yuzu.net_retrans_pct", "250"}, // withheld from the gauge (unvalidated)
+                       {"yuzu.os", "windows"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    // Reporting is per-OS (a/c via rtt+retrans; b via throughput).
+    CHECK(metrics.gauge("yuzu_fleet_net_reporting", {{"os", "linux"}}).value() == 2.0);
+    CHECK(metrics.gauge("yuzu_fleet_net_reporting", {{"os", "windows"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_net_degraded", {{"os", "linux"}}).value() == 1.0); // a
+    // Linux retransmit + RTT reach the gauge; Windows throughput reaches it.
+    CHECK(metrics.gauge("yuzu_fleet_net_rtt_ms", {{"stat", "max"}, {"os", "linux"}}).value() ==
+          200.0);
+    CHECK(metrics.gauge("yuzu_fleet_net_retrans_pct", {{"stat", "max"}, {"os", "linux"}}).value() ==
+          3.0);
+    CHECK(metrics.gauge("yuzu_fleet_net_throughput_bps", {{"stat", "max"}, {"os", "windows"}})
+              .value() == 1000000.0);
+    // The unvalidated Windows retransmit is WITHHELD — a linux retransmit series
+    // exists (format pinned) but NO windows one (it would read artificially healthy).
+    const auto text = metrics.serialize();
+    CHECK(text.find("yuzu_fleet_net_retrans_pct{stat=\"max\",os=\"linux\"}") != std::string::npos);
+    CHECK(text.find("yuzu_fleet_net_retrans_pct{stat=\"max\",os=\"windows\"}") ==
+          std::string::npos);
+}
+
+TEST_CASE("AgentHealthStore: network gauges go absent (not zero) when nobody reports",
+          "[health_store][network]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    store.upsert("a", {{"yuzu.net_rtt_p50_ms", "50.0"}, {"yuzu.os", "linux"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    REQUIRE(metrics.gauge("yuzu_fleet_net_rtt_ms", {{"stat", "avg"}, {"os", "linux"}}).value() ==
+            50.0);
+
+    // The agent stops reporting network facts — every net family must CLEAR (a
+    // stale 50 or a fabricated 0 would both be lies); no per-os series should
+    // remain, including the reporting denominator.
+    store.upsert("a", {{"yuzu.os", "linux"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+    const auto text = metrics.serialize();
+    CHECK(text.find("yuzu_fleet_net_reporting{") == std::string::npos);
+    CHECK(text.find("yuzu_fleet_net_rtt_ms{") == std::string::npos);
+}
+
+TEST_CASE("AgentHealthStore: agent-controlled os is allowlisted (anti cardinality-injection)",
+          "[health_store][network]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // `yuzu.os` is agent-controlled. A hostile/buggy agent sprays a junk value; it
+    // must collapse to "other", never create an attacker-named series (a Prometheus
+    // cardinality DoS) — across both yuzu_fleet_agents_by_os and the net families.
+    store.upsert("evil", {{"yuzu.os", "pwn-uniquely-named-series"},
+                          {"yuzu.net_throughput_bps", "1000"}});
+    store.upsert("good", {{"yuzu.os", "linux"}, {"yuzu.net_rtt_p50_ms", "10.0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds(60));
+
+    const auto text = metrics.serialize();
+    CHECK(text.find("pwn-") == std::string::npos); // the junk value never becomes a label
+    CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "other"}}).value() == 1.0);  // collapsed
+    CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "linux"}}).value() == 1.0);  // canonical kept
+    CHECK(metrics.gauge("yuzu_fleet_net_reporting", {{"os", "other"}}).value() == 1.0); // net too
 }
