@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
+  collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
+  `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
+  macOS boottime equivalent), reusing the same observation builder for an identical
+  shape across OSes. Unprivileged, reused obs_type → no server change.
+
+- **Linux server DEX: reliability signals from the systemd journal.** The Linux
+  DEX collector now reads the journal on a slow cadence (`journalctl --after-cursor
+  -o json`, cursor-checkpointed) and emits, on the **existing** obs_types,
+  `service.crashed` (a unit failed — the systemd "Failed with result" / unit-failed
+  journal messages),
+  `process.crashed` (a `systemd-coredump` entry — `SD_MESSAGE_COREDUMP`; coverage
+  depends on systemd-coredump being the active core handler), and `memory.exhausted`
+  (the kernel OOM-killer). Only safe fields leave the device — process comm, unit
+  name, signal/result code, never the raw message — and a flapping unit/process is
+  collapsed by a per-`(type, subject)` debounce. No new dependency: `journalctl` is
+  a runtime shell-out (no libsystemd), the source no-ops on non-systemd hosts, and
+  the agent account already has `systemd-journal`/`adm` read access. Reusing the
+  existing obs_types means a Linux server lights up the same `/dex` buckets as
+  Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
+
 - **Windows network-quality collection.** The agent now emits network facts on
   Windows, not only Linux: device throughput via `GetIfTable2` and a system-wide
   interval retransmit rate via `GetTcpStatisticsEx` (fed through the same
@@ -36,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable follow-up: generate the matrix from the existing machine-readable per-OS
   metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
   signal catalogue) rather than hand-maintaining it.
+
 - **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
   tab's cohort benchmarking compared each cohort against the whole fleet; it now
   also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
@@ -85,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within the unreleased cycle (absolute lifetime ratio → interval delta) and
   `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
   Prometheus alerts built on the earlier 4a semantics.
+
 - **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
   agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
   into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
