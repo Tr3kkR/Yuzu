@@ -248,3 +248,56 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     CHECK(tcp_remaining > 0);                       // enabled, partially aged
     CHECK(tcp_remaining < 48);
 }
+
+// ── #538/#560: source-lifecycle helpers ───────────────────────────────────
+
+TEST_CASE("TAR diff_state_key_for_source maps tcp→network and scalar sources→\"\"",
+          "[tar][source-lifecycle]") {
+    // The load-bearing subtlety: the `tcp` source persists its diff snapshot
+    // under the "network" collector key, NOT "tcp" — so disabling tcp must clear
+    // "network" state, not a non-existent "tcp" state (#538).
+    CHECK(diff_state_key_for_source("process") == "process");
+    CHECK(diff_state_key_for_source("tcp") == "network");
+    CHECK(diff_state_key_for_source("service") == "service");
+    CHECK(diff_state_key_for_source("user") == "user");
+    // Scalar samplers keep no snapshot diff-state → no key to clear.
+    CHECK(diff_state_key_for_source("perf").empty());
+    CHECK(diff_state_key_for_source("procperf").empty());
+    CHECK(diff_state_key_for_source("netqual").empty());
+    CHECK(diff_state_key_for_source("bogus").empty());
+}
+
+TEST_CASE("TAR canonical_source_enabled is a strict tri-state (#560)",
+          "[tar][source-lifecycle]") {
+    CHECK(canonical_source_enabled("true") == "true");
+    CHECK(canonical_source_enabled("false") == "false");
+    // Anything the plugin never writes is flagged, never coerced/guessed.
+    CHECK(canonical_source_enabled("FALSE") == "errored");
+    CHECK(canonical_source_enabled("0") == "errored");
+    CHECK(canonical_source_enabled(" false ") == "errored");
+    CHECK(canonical_source_enabled("yes") == "errored");
+    CHECK(canonical_source_enabled("") == "errored");
+}
+
+TEST_CASE("TAR disable clears the source diff-state for a clean re-enable baseline (#538)",
+          "[tar][source-lifecycle]") {
+    // Models do_configure's disable path: seed a source's diff snapshot, then
+    // apply the disable transition + clear the mapped state key. A subsequent
+    // re-enable must diff against an empty baseline (no ghost "stopped" events).
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-clear-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    db.set_state("network", R"([{"proto":"tcp"}])"); // tcp source persists as "network"
+    REQUIRE(!db.get_state("network").empty());
+
+    apply_source_enabled_transition(db, "tcp", "false", 1'735'689'600);
+    auto key = diff_state_key_for_source("tcp");
+    REQUIRE(key == "network");
+    db.set_state(std::string{key}, ""); // the clear do_configure performs under collect_mu_
+
+    CHECK(db.get_state("network").empty());            // clean baseline for re-enable
+    CHECK(db.get_config("tcp_enabled", "true") == "false");
+}

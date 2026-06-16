@@ -880,7 +880,14 @@ private:
         // from the per-source `*_live` table; an empty table reports 0 / 0.
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
-            auto enabled_val = db_->get_config(enabled_key, "true");
+            auto stored = db_->get_config(enabled_key, "true");
+            // #560 — emit a strict tri-state (true/false/errored). do_configure
+            // only ever persists "true"/"false"; any other stored value was
+            // written outside the plugin (corruption, disk tampering, a
+            // downgrade/upgrade) and is surfaced as the explicit "errored"
+            // sentinel so the dashboard renders a value-error badge instead of
+            // silently omitting the source. Never coerced/guessed.
+            auto enabled_val = yuzu::tar::canonical_source_enabled(stored);
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);
@@ -1365,7 +1372,26 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            // #538 — serialise the enable/disable transition against in-flight
+            // collection by holding collect_mu_ (which collect_fast/slow hold for
+            // their whole enumerate→diff→insert→set_state sequence). Without it a
+            // collect cycle that read source_enabled()==true just before the
+            // disable write would still commit one post-disable snapshot. On
+            // DISABLE, clear the source's diff-state under the same lock so a
+            // later re-enable diffs against a clean baseline (emitting current
+            // processes as "started") instead of a frozen pre-disable snapshot,
+            // which would fabricate "stopped" events for everything that exited
+            // during the paused window (the ghost-death bug). Idempotent and
+            // crash-safe: the state row is simply emptied.
+            {
+                std::lock_guard<std::mutex> lk(collect_mu_);
+                yuzu::tar::apply_source_enabled_transition(*db_, src.name, v,
+                                                           now_epoch_seconds());
+                if (v == "false") {
+                    if (auto sk = yuzu::tar::diff_state_key_for_source(src.name); !sk.empty())
+                        db_->set_state(std::string{sk}, "");
+                }
+            }
             ctx.write_output(std::format("config|{}|{}", key, v));
             // Echo the resulting paused_at so the operator/dashboard sees the
             // transition timestamp without an extra status round-trip. We

@@ -286,6 +286,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR source enable/disable is now race-free, corruption-resilient, and reports
+  a strict state (#538, #559, #560).** Three agent-side defects in the per-source
+  enable/disable lifecycle: (a) `configure` wrote `<source>_enabled=false` without
+  the collector mutex, so an in-flight collection cycle could commit one snapshot
+  *after* the operator disabled a source — and a later re-enable then diffed
+  against that frozen snapshot, fabricating "stopped" events for every process
+  that exited during the paused window (#538); (b) a corrupt `tar.db` was opened
+  and trusted, and since `get_config` returns the caller default on a read
+  failure, every `<source>_enabled` key read as its `true` default — silently
+  re-enabling sources an operator had paused for forensic preservation (#559);
+  (c) `status` echoed the raw stored enable value, so a garbage value (corruption,
+  tampering) was passed through instead of flagged. Fixes: `configure` now holds
+  the collector mutex across the transition and clears the source's diff-state on
+  disable (clean re-enable baseline); `TarDatabase::open` runs `PRAGMA
+  integrity_check` and quarantines a corrupt DB aside before re-initialising a
+  fresh one; `status` emits a strict tri-state (`true`/`false`/`errored`).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

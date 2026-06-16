@@ -133,6 +133,28 @@ void apply_source_enabled_transition(TarDatabase& db,
     }
 }
 
+std::string_view diff_state_key_for_source(std::string_view source) {
+    // Keep in sync with collect_fast_impl's set_state() collector keys: the
+    // `tcp` source persists under "network", not "tcp".
+    if (source == "process")
+        return "process";
+    if (source == "tcp")
+        return "network";
+    if (source == "service")
+        return "service";
+    if (source == "user")
+        return "user";
+    return {}; // perf / procperf / netqual keep no snapshot diff-state
+}
+
+std::string_view canonical_source_enabled(std::string_view stored_value) {
+    if (stored_value == "true")
+        return "true";
+    if (stored_value == "false")
+        return "false";
+    return "errored"; // anything else was written outside the plugin
+}
+
 void run_retention(TarDatabase& db, int64_t now_epoch) {
     // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
     db.execute_sql("BEGIN TRANSACTION");
