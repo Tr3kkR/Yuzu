@@ -360,3 +360,29 @@ TEST_CASE("TAR diff: unicode username in process events", "[tar][diff][process][
     // The unicode username should be preserved in the JSON
     CHECK(events[0].detail_json.find("\xc3\xa9\x6d\x69\x6c\x65") != std::string::npos);
 }
+
+// =============================================================================
+// Typed warehouse events — macOS names-only (B-heavy)
+// =============================================================================
+
+TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhere",
+          "[tar][diff][process]") {
+    // On macOS the poll path blanks cmdline (parity with the Endpoint Security
+    // stream and the works-council / data-minimization posture); Linux/Windows keep
+    // the (redacted) command line. Locks the #if defined(__APPLE__) branch in
+    // compute_process_events so the macOS names-only guarantee can't silently regress.
+    std::vector<ProcessInfo> prev; // empty previous → current process is a 'started'
+    std::vector<ProcessInfo> curr = {
+        {4242, 1, "python3", "/usr/bin/python3 --token=secret", "alice"}};
+
+    auto events = compute_process_events(prev, curr, 1000, 7, /*redaction_patterns=*/{});
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "started");
+    CHECK(events[0].pid == 4242);
+    CHECK(events[0].name == "python3");
+#if defined(__APPLE__)
+    CHECK(events[0].cmdline.empty()); // names-only on macOS — both ES stream and poll
+#else
+    CHECK(events[0].cmdline == "/usr/bin/python3 --token=secret"); // populated on Linux/Windows
+#endif
+}
