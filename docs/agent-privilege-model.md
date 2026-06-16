@@ -81,6 +81,7 @@ This table is the source of truth for what each plugin requires. When you add a 
 | `network_config.*` | default | default | default |
 | `installed_apps.*`, `msi_packages.*` | default | default | default |
 | `event_logs.*` | default | `systemd-journal` group | `Event Log Readers` group; `Security` log additionally needs `SeSecurityPrivilege` |
+| DEX journald collector (`dex_linux_journal.cpp`, built-in — not a plugin) | n/a | `systemd-journal` group (`journalctl` shell-out for crash/OOM/unit-failure signals; no elevated capability) | n/a |
 | `services.list`, `services.running` | default | default | default |
 | `certificates.list`, `certificates.details` | default | default | default |
 | `tar.*` (TAR snapshots) | default | `cap_dac_read_search` (read all `/proc/<pid>/*`) | `SeBackupPrivilege` (read regardless of DACL). **Process capture runs a real-time ETW session on `Microsoft-Windows-Kernel-Process`** — enabled by the agent account's `Performance Log Users` membership (see Group memberships above; no extra LSA privilege). Per-process user attribution uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` on still-alive processes only. See the deployment-footprint note below for the boot AutoLogger. |

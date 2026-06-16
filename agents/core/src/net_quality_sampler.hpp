@@ -10,8 +10,14 @@
 /// INET_DIAG (the same interface `ss -ti` uses — no packet capture, no
 /// elevation: a non-root agent sees system TCP_INFO), rolled up to a device
 /// p50 RTT + aggregate retransmit ratio; throughput from /proc/net/dev deltas.
-/// Off Linux the sampler returns an all-invalid sample (Windows is the
-/// ESTATS-vs-ETW spike; macOS later) so no tags ship — absent, never zero.
+/// Windows: device throughput via GetIfTable2 (non-loopback 64-bit octets) +
+/// a system-wide TCP retransmit rate via GetTcpStatisticsEx (ΔΣretrans/ΔΣsegs
+/// across heartbeats). RTT is omitted on Windows in v1 — per-connection smoothed
+/// RTT needs ESTATS (GetPerTcpConnectionEStats: enable + admin + overhead), a
+/// deferred slice. NOTE the Windows retransmit MIB is whole-stack (includes
+/// loopback) and is measurement-first UNVALIDATED on Windows (the netem
+/// separation test was Linux-only). macOS later returns an all-invalid sample,
+/// so no tags ship — absent, never zero.
 ///
 /// THE EDGE SHIPS FACTS, NEVER A VERDICT. The retransmit fact is an INTERVAL
 /// rate — ΔΣretrans / ΔΣsegs across heartbeats, smoothed over a short window —
@@ -118,9 +124,11 @@ struct RetransWindow {
 /// Returns invalid off Linux or on read failure.
 NetCounters read_net_counters();
 
-/// Produce the heartbeat sample: a one-shot INET_DIAG dump for rtt/retrans (no
-/// delta needed) + throughput from prev/cur counters. `prev` invalid (first
-/// heartbeat) → throughput omitted this cycle. Off Linux → all-invalid.
+/// Produce the heartbeat sample. Linux: a one-shot INET_DIAG dump for rtt/retrans
+/// + throughput from prev/cur counters. Windows: throughput from prev/cur +
+/// system-wide TCP retransmit counters (no rtt). `prev` invalid (first heartbeat)
+/// → throughput omitted this cycle. macOS/other → all-invalid. Called only from
+/// the heartbeat thread; all state is local or caller-owned (no shared state).
 NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
 
 // ── Pure helpers (header-inline so they link into tests without DLL export,

@@ -1285,6 +1285,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // tag — a permanent flatline-0 reads as "0 degraded = healthy", the exact
     // absent-as-zero anti-pattern this rollup forbids (gov happy-path/sre/UP-8).
     metrics.clear_gauge_family("yuzu_fleet_net_degraded");
+    // The net gauges are os-labelled (per-OS, never a cross-OS blend), so the
+    // reporting denominators must clear too — otherwise an OS that stops reporting
+    // leaves a stale {os=...} series.
+    metrics.clear_gauge_family("yuzu_fleet_net_reporting");
+    metrics.clear_gauge_family("yuzu_fleet_net_retrans_reporting");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1301,11 +1306,38 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // so the gauge and the Performance tab's Reporting card agree.
     int perf_reporting = 0;
     // Network heartbeat facts (slice 3) — same shared validators as the
-    // /network read model so the gauges and the dashboard never disagree.
-    std::vector<double> net_rtt, net_retrans, net_tput;
-    int net_reporting = 0;
-    int net_degraded = 0;
-    int net_degraded_reporting = 0; // agents that reported the net_degraded tag at all
+    // /network read model (per-device parity); the dashboard is OS-blended while
+    // these gauges are per-OS, so a mixed-fleet aggregate differs by design.
+    // Per-OS so the fleet net gauges are never a cross-OS blend: a Windows
+    // interval retransmit rate (system-wide, loopback-inclusive, biased low — see
+    // network.md/#1465) and a Linux per-connection rate must not average into one
+    // number an alert can't decompose (gov sre/consistency/UP-2). Keyed by the
+    // agent's `yuzu.os` ("unknown" if unreported), matching yuzu_fleet_agents_by_os.
+    std::unordered_map<std::string, std::vector<double>> net_rtt_os, net_retrans_os, net_tput_os;
+    std::unordered_map<std::string, int> net_reporting_os, net_degraded_os, net_degraded_reporting_os;
+    // The interval retransmit RATE is gauge-eligible only on OSes whose signal is
+    // loss-validated. Linux is validated (netem). The Windows rate is system-wide
+    // (loopback-inclusive), biased low, and UNVALIDATED (#1465) — so it is WITHHELD
+    // from the alerting gauge (it still shows on the /network page + REST, caveated)
+    // until validated. RTT is Linux-only anyway; throughput is a real counter on
+    // every OS — both stay eligible. Flip this when #1465 validates Windows.
+    // NOTE this is DATA HYGIENE (keep an honest Windows agent's biased signal out of
+    // the alerting gauge), NOT an authz control: `os` is an enrolled agent's
+    // self-reported tag, so a spoofed os="linux" is the same accepted risk as any
+    // heartbeat-sourced gauge — the trust boundary is enrollment, not this tag.
+    auto retrans_gauge_eligible = [](const std::string& os) { return os == "linux"; };
+    // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
+    // label lets a malicious/buggy agent spray unbounded {os=...} series (a
+    // Prometheus cardinality DoS). Allowlist it to the values a real agent emits
+    // (kAgentOs: windows/linux/darwin) before it becomes a label — anything else
+    // collapses to "other", empty to "unknown". Bounds cardinality to 5 values.
+    // (by_arch/by_version carry the same raw-tag exposure — broader fix incl. a
+    // registry per-family series cap tracked in #1472.)
+    auto normalize_os = [](const std::string& os) -> std::string {
+        if (os == "windows" || os == "linux" || os == "darwin")
+            return os;
+        return os.empty() ? "unknown" : "other";
+    };
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -1317,7 +1349,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
-            os_counts[os_val]++;
+            os_counts[normalize_os(os_val)]++;
 
         auto arch_val = get("yuzu.arch");
         if (!arch_val.empty())
@@ -1372,32 +1404,37 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (perf_reported_any)
             ++perf_reporting;
 
-        // Network facts — validators shared with network_perf_model.cpp.
+        // Network facts — validators shared with network_perf_model.cpp; bucketed
+        // by the agent's OS so the rollup stays per-OS (never a cross-OS blend).
+        const std::string net_os = normalize_os(os_val);
         bool net_reported_any = false;
         if (auto v = parse_net_rtt_ms(get(kNetTagRttP50Ms))) {
-            net_rtt.push_back(*v);
+            net_rtt_os[net_os].push_back(*v);
             net_reported_any = true;
         }
         if (auto v = parse_net_retrans_pct(get(kNetTagRetransPct))) {
-            net_retrans.push_back(*v);
+            // Device DID report a retransmit fact (counts toward net_reporting and
+            // shows on the page/REST), but only validated-OS rates feed the gauge.
+            if (retrans_gauge_eligible(net_os))
+                net_retrans_os[net_os].push_back(*v);
             net_reported_any = true;
         }
         if (auto v = parse_net_throughput_bps(get(kNetTagThroughputBps))) {
-            net_tput.push_back(*v);
+            net_tput_os[net_os].push_back(*v);
             net_reported_any = true;
         }
         if (net_reported_any) {
-            ++net_reporting;
+            ++net_reporting_os[net_os];
             // Count degraded only for devices that reported a metric (a forged
             // net_degraded=1 with no valid metric must not exceed the reporting
-            // denominator — UP-9). `net_degraded_reporting` tracks whether ANY
-            // agent emitted the tag at all, so the gauge can go absent (not 0)
-            // when none do — which is now the steady state (the tag is retired;
-            // only old agents mid-rolling-upgrade still emit it).
+            // denominator — UP-9). `net_degraded_reporting_os` tracks whether ANY
+            // agent of an OS emitted the tag at all, so the gauge can go absent
+            // (not 0) when none do — the steady state (the tag is retired; only old
+            // agents mid-rolling-upgrade still emit it).
             if (auto d = parse_net_degraded(get(kNetTagDegraded))) {
-                ++net_degraded_reporting;
+                ++net_degraded_reporting_os[net_os];
                 if (*d)
-                    ++net_degraded;
+                    ++net_degraded_os[net_os];
             }
         }
     }
@@ -1443,20 +1480,43 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
 
-    // Network rollup (slice 3): the {stat} distributions; families cleared above
-    // → absent, never a fake zero. `net_retrans_reporting` is the retransmit-rate
-    // population (a subset of net_reporting — a device can report RTT while its
-    // RetransWindow is still warming), so an SRE can tell "healthy, low loss"
-    // from "collection broken/absent" (gov sre). `net_degraded` is emitted ONLY
-    // when some agent reported the (retired) tag — otherwise absent, not 0.
-    metrics.gauge("yuzu_fleet_net_reporting").set(static_cast<double>(net_reporting));
-    metrics.gauge("yuzu_fleet_net_retrans_reporting")
-        .set(static_cast<double>(net_retrans.size()));
-    if (net_degraded_reporting > 0)
-        metrics.gauge("yuzu_fleet_net_degraded").set(static_cast<double>(net_degraded));
-    set_stats("yuzu_fleet_net_rtt_ms", net_rtt);
-    set_stats("yuzu_fleet_net_retrans_pct", net_retrans);
-    set_stats("yuzu_fleet_net_throughput_bps", net_tput);
+    // Network rollup: per-OS {stat,os} distributions + per-OS reporting
+    // denominators — never a cross-OS blend (gov sre/consistency/UP-2). Families
+    // cleared above → an (os,metric) nobody reported is ABSENT, never a fake zero.
+    // `net_retrans_reporting{os}` is the retransmit-rate population (a subset of
+    // net_reporting{os} — a device can report RTT while its RetransWindow warms),
+    // so an SRE can tell "healthy, low loss" from "collection broken/absent" per
+    // OS. `net_degraded{os}` is emitted ONLY when some agent of that OS reported
+    // the (retired) tag — otherwise absent, not 0.
+    auto set_stats_os = [&](const char* family, const std::string& os,
+                            std::vector<double>& vals) {
+        if (vals.empty())
+            return;
+        std::sort(vals.begin(), vals.end());
+        const auto n = vals.size();
+        double sum = 0.0;
+        for (double v : vals)
+            sum += v;
+        metrics.gauge(family, {{"stat", "avg"}, {"os", os}}).set(sum / static_cast<double>(n));
+        metrics.gauge(family, {{"stat", "p50"}, {"os", os}}).set(nearest_rank(vals, 0.50));
+        metrics.gauge(family, {{"stat", "p90"}, {"os", os}}).set(nearest_rank(vals, 0.90));
+        metrics.gauge(family, {{"stat", "max"}, {"os", os}}).set(vals.back());
+    };
+    for (auto& [os, n] : net_reporting_os)
+        metrics.gauge("yuzu_fleet_net_reporting", {{"os", os}}).set(static_cast<double>(n));
+    for (auto& [os, vals] : net_retrans_os)
+        metrics.gauge("yuzu_fleet_net_retrans_reporting", {{"os", os}})
+            .set(static_cast<double>(vals.size()));
+    for (auto& [os, n] : net_degraded_reporting_os)
+        if (n > 0)
+            metrics.gauge("yuzu_fleet_net_degraded", {{"os", os}})
+                .set(static_cast<double>(net_degraded_os[os]));
+    for (auto& [os, vals] : net_rtt_os)
+        set_stats_os("yuzu_fleet_net_rtt_ms", os, vals);
+    for (auto& [os, vals] : net_retrans_os)
+        set_stats_os("yuzu_fleet_net_retrans_pct", os, vals);
+    for (auto& [os, vals] : net_tput_os)
+        set_stats_os("yuzu_fleet_net_throughput_bps", os, vals);
 }
 
 } // namespace yuzu::server::detail

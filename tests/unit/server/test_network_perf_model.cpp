@@ -237,6 +237,12 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
 
     const auto html = render_network_overview_fragment(snap);
     CHECK(html.find("Network quality") != std::string::npos);
+    // IA: Network is a DEX sub-view — the overview renders the shared DEX sub-nav
+    // (a sibling DEX tab link is present) with the Network tab marked active,
+    // rather than a standalone network sub-nav.
+    CHECK(html.find("/fragments/dex/catalogue") != std::string::npos); // DEX sub-nav rendered
+    CHECK(html.find("class=\"on\" hx-get=\"/fragments/network/overview") !=
+          std::string::npos); // Network tab is the active one
     CHECK(html.find("Round-trip time") != std::string::npos);
     CHECK(html.find("TCP_INFO") != std::string::npos);                // Linux/Windows honesty note
     // Measurement-first (4b.3): the retransmit fact is an INTERVAL rate, and the
@@ -336,6 +342,13 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
+        // IA: Network is a DEX sub-view — the /network page shell marks DEX active
+        // in the global nav, and there is NO standalone Network top-nav link.
+        // Assert on the href (structurally stable) so a reintroduced top-nav link
+        // with any class/attribute spelling still trips this. The Network tab in
+        // the DEX sub-nav uses hx-get (not href="/network"), so this stays clean.
+        CHECK(page->body.find("class=\"nav-link active\">DEX</a>") != std::string::npos);
+        CHECK(page->body.find("href=\"/network\"") == std::string::npos);
     }
 }
 

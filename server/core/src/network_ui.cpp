@@ -22,6 +22,12 @@
 
 namespace yuzu::server {
 
+// The Network views sit UNDER DEX: they render the shared DEX sub-nav (with the
+// "network" tab active) rather than a sub-nav of their own. dex_subnav is defined
+// in dex_routes.cpp (same yuzu::server scope) — forward-declared here, the same
+// cross-TU pattern the Performance tab uses (dex_perf_ui.cpp).
+std::string dex_subnav(const std::string& active, int window_days);
+
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
@@ -98,24 +104,15 @@ std::string cell(const std::optional<double>& v, Unit u) {
 
 } // namespace
 
-// Shared /network sub-nav (declared in network_routes.hpp).
-std::string network_subnav(const std::string& active) {
-    auto tab = [&](const char* id, const char* label, const char* frag) {
-        const std::string on = (active == id) ? " class=\"on\"" : "";
-        return "<a" + on + " hx-get=\"" + frag +
-               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
-    };
-    return "<div class=\"gp-subnav\">" +
-           tab("overview", "Overview", "/fragments/network/overview") +
-           tab("devices", "Devices", "/fragments/network/devices") + "</div>";
-}
-
 std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
     const auto now = net_perf_fleet_now(snap);
 
     std::string h;
     h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
-    h += network_subnav("overview");
+    // The DEX sub-nav with "network" active (Network sits under DEX). This is a
+    // now-view with no window of its own, so the threaded window is the DEX
+    // default (7 = "7d") — it only governs which window a sibling signal tab opens.
+    h += dex_subnav("network", 7);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Network quality &mdash; fleet"
          "</h1></div><div class=\"gp-sub\">Device / <b>local-link</b> health, measured on each "
          "endpoint from kernel counters (no packet capture, no flow export) and rolled up across the "
@@ -154,15 +151,19 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
     h += "</div>";
     h += "<div class=\"gp-note\"><b>Linux</b> reports these from netlink "
          "<span style=\"font-family:var(--mono)\">TCP_INFO</span> + "
-         "<span style=\"font-family:var(--mono)\">/proc/net/dev</span>; <b>Windows and macOS emit "
-         "nothing yet</b> (their collectors are later slices), so this reflects the Linux fleet. "
+         "<span style=\"font-family:var(--mono)\">/proc/net/dev</span>. <b>Windows</b> reports "
+         "throughput (<span style=\"font-family:var(--mono)\">GetIfTable2</span>) + an interval "
+         "retransmit rate (<span style=\"font-family:var(--mono)\">GetTcpStatisticsEx</span> &mdash; "
+         "system-wide, so it includes loopback and is not yet loss-validated) but <b>not RTT yet</b> "
+         "(per-connection RTT needs ESTATS, a later slice). <b>macOS emits nothing yet.</b> "
          "<b>Retransmission</b> is an interval rate &mdash; &Delta;retransmits / &Delta;segments "
          "smoothed over the last few heartbeats (the lifetime ratio is diluted to noise; the interval "
-         "delta cleanly recovers the real rate). <b>RTT is coarse</b> &mdash; a device-aggregate "
-         "median blended across loopback/LAN/internet connections (a rough signal, not per-flow "
-         "truth; per-destination latency is a later slice). Absent is never averaged in as zero. "
-         "Same numbers as the "
-         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges.</div>";
+         "delta cleanly recovers the real rate). <b>RTT</b> (Linux only today) is coarse &mdash; a "
+         "device-aggregate median blended across loopback/LAN/internet connections (a rough signal, "
+         "not per-flow truth; per-destination latency is a later slice). Absent is never averaged in "
+         "as zero. These cards blend the fleet; the "
+         "<span style=\"font-family:var(--mono)\">yuzu_fleet_net_*</span> gauges split the same "
+         "facts per OS (Windows and Linux retransmit rates are not comparable).</div>";
 
     // ── Measurement-first: degraded classification + co-occurrence deferred ──
     // The disproven absolute-ratio `degraded` boolean was retired; the interval

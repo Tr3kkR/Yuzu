@@ -30,13 +30,10 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 
-/// Shared /network sub-nav (Overview · Devices). htmx core attrs into the page
-/// mount (#guardian-detail) — CSP-safe (no hx-on).
-std::string network_subnav(const std::string& active);
-
 /// PURE: the /fragments/network/overview content — fleet-now quality cards
-/// (the same stats as the yuzu_fleet_net_* gauges, via the shared
-/// network_perf_rules) + the co-occurrence headline (network/device/app,
+/// (an OS-blended rollup over the same per-device facts as the per-OS
+/// yuzu_fleet_net_* gauges, via the shared network_perf_rules) + the
+/// co-occurrence headline (network/device/app,
 /// counted never blamed) + the worst-devices drill. Every aggregate carries
 /// its reporting population; RTT carries its own (smaller) denominator.
 std::string render_network_overview_fragment(const NetPerfSnapshot& snap);
