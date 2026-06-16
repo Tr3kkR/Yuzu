@@ -60,6 +60,16 @@ std::string to_lower(std::string_view sv) {
     return result;
 }
 
+// The wire format is pipe-delimited, one record per line. A process name (or any
+// field) containing '|', CR, or LF would shift/split fields on the server-side
+// positional parser, so neutralise those bytes to a space before emitting.
+std::string sanitize_field(std::string s) {
+    for (char& c : s)
+        if (c == '|' || c == '\n' || c == '\r')
+            c = ' ';
+    return s;
+}
+
 #ifdef _WIN32
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
@@ -187,14 +197,26 @@ std::vector<ProcessInfo> enumerate_processes() {
 // spoofable) so its image can be hashed. Empty on failure — kernel threads,
 // PID 0/4, access-denied, or an unsupported platform all read as "no path".
 #ifdef _WIN32
+// Single-owner RAII for a process HANDLE: CloseHandle runs on every scope exit,
+// including an exception from a std::wstring/std::string allocation between
+// acquire and release (a leak the prior manual CloseHandle could skip).
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
+};
+
 std::string resolve_exe_path(unsigned long pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h)
+    HandleGuard hg(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!hg)
         return "";
     std::wstring wbuf(4096, L'\0');
     DWORD sz = static_cast<DWORD>(wbuf.size());
     std::string path;
-    if (QueryFullProcessImageNameW(h, 0, wbuf.data(), &sz) && sz > 0) {
+    if (QueryFullProcessImageNameW(hg.h, 0, wbuf.data(), &sz) && sz > 0) {
         int len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), static_cast<int>(sz), nullptr, 0,
                                       nullptr, nullptr);
         if (len > 0) {
@@ -203,8 +225,7 @@ std::string resolve_exe_path(unsigned long pid) {
                                 nullptr, nullptr);
         }
     }
-    CloseHandle(h);
-    return path;
+    return path; // ~HandleGuard closes the handle on every path
 }
 #elif defined(__linux__)
 std::string resolve_exe_path(unsigned long pid) {
@@ -272,7 +293,7 @@ private:
     int do_list(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         for (const auto& p : procs) {
-            ctx.write_output(std::format("proc|{}|{}", p.pid, p.name));
+            ctx.write_output(std::format("proc|{}|{}", p.pid, sanitize_field(p.name)));
         }
         return 0;
     }
@@ -298,7 +319,8 @@ private:
                     hash_cache.emplace(path, hash);
                 }
             }
-            ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, p.name, hash, path));
+            ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
+                                         sanitize_field(path)));
         }
         return 0;
     }

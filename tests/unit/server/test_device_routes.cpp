@@ -12,6 +12,7 @@
 /// so the bug is caught here (deterministically under ASan in nightly CI).
 
 #include "device_routes.hpp"
+#include "guaranteed_state_store.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -195,6 +196,16 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
         REQUIRE(r);
         CHECK(r->body.find("failed on the device") != std::string::npos);
     }
+    SECTION("terminal SUCCESS with empty output renders now, no false timeout (UP-1)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "", ""}}; // SUCCESS (status 1), no output
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=processes-test&agent_id=a-1&kind=processes&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("No processes returned") != std::string::npos); // empty result rendered
+        CHECK(r->body.find("hx-trigger") == std::string::npos);            // not re-polled
+        CHECK(r->body.find("timed out") == std::string::npos);             // NOT a false timeout
+    }
     SECTION("command_id whose prefix doesn't match the kind's plugin is rejected") {
         LiveHarness h;
         // kind=uptime expects os_info-; a tar- id must not be pollable here.
@@ -206,9 +217,65 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
     SECTION("timeout (attempt cap) is honest, stops polling") {
         LiveHarness h; // empty rows
         auto r = h.sink.Get(
-            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=20");
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=40");
         REQUIRE(r);
         CHECK(r->body.find("timed out") != std::string::npos);
         CHECK(r->body.find("hx-trigger") == std::string::npos);
+    }
+    SECTION("below the attempt cap keeps polling (cap raised for hash latency)") {
+        LiveHarness h; // empty rows
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=20");
+        REQUIRE(r);
+        CHECK(r->body.find("timed out") == std::string::npos); // 20 < 40 -> still polling
+        CHECK(r->body.find("&amp;n=21") != std::string::npos);
+    }
+}
+
+// The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
+// they must gate GuaranteedState:Read and audit-on-open (parity with the sibling
+// /fragments/dex/device). Governance Gate-2/3/4 BLOCKING.
+TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
+    GuaranteedStateStore store(":memory:");
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    bool allow_read = true;
+    auto perm = [&allow_read](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string& op) {
+        if (op == "Read" && !allow_read) { res.status = 403; return false; }
+        return true;
+    };
+    auto devices = []() { return std::vector<DeviceRow>{}; };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
+                            const std::string&, const std::string& tid, const std::string&) {
+        audited.push_back(a + "|" + tid);
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DeviceRoutes routes;
+    routes.register_routes(sink, okAuth, perm, devices, &store, {}, {}, audit);
+
+    SECTION("Read denied -> 403, nothing rendered, no audit") {
+        allow_read = false;
+        auto dex = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(dex);
+        CHECK(dex->status == 403);
+        auto gd = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(gd);
+        CHECK(gd->status == 403);
+        CHECK(audited.empty());
+    }
+    SECTION("Read allowed -> audited on open with the right verb") {
+        allow_read = true;
+        sink.Get("/fragments/device/dex?id=a-1");
+        sink.Get("/fragments/device/guardian?id=a-1");
+        bool saw_dex = false, saw_guardian = false;
+        for (const auto& a : audited) {
+            if (a == "dex.device.view|a-1") saw_dex = true;
+            if (a == "guardian.device.view|a-1") saw_guardian = true;
+        }
+        CHECK(saw_dex);
+        CHECK(saw_guardian);
     }
 }

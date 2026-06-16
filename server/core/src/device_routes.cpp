@@ -213,6 +213,15 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
             return (a.hostname.empty() ? a.agent_id : a.hostname) <
                    (b.hostname.empty() ? b.agent_id : b.hostname);
         });
+        // Score ONLY the rows we render (post-filter) — devices_fn_ no longer
+        // scores the fleet, so a filtered/searched list never pays for the
+        // devices it excludes. (Fleet-scale pagination of this set is a tracked
+        // follow-up; the win here is killing the score-all-then-filter waste.)
+        if (store_) {
+            const std::string since = dex_iso_since(7);
+            for (auto& d : rows)
+                d.dex_score = dex_device_score(store_, d.agent_id, since);
+        }
         res.set_content(render_devices_list_fragment(rows, req.has_param("q") ? req.get_param_value("q") : "",
                                                      os, status, online, total),
                         "text/html; charset=utf-8");
@@ -233,6 +242,10 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         auto d = find_one(id);
+        // Score ONLY this device — devices_fn_ no longer scores the fleet (a page
+        // open must not pay an N-device cost; the score badge needs just this one).
+        if (d && store_)
+            d->dex_score = dex_device_score(store_, d->agent_id, dex_iso_since(7));
         res.set_content(d ? render_device_page(*d) : render_device_not_found(id),
                         "text/html; charset=utf-8");
     });
@@ -249,13 +262,18 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
 
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        // Per-device behavioral data (PII): same gate + audit-on-open as the
+        // sibling /fragments/dex/device — GuaranteedState:Read + dex.device.view.
+        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (!store_) {
             res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable."),
                             "text/html; charset=utf-8");
             return;
         }
+        if (audit_fn_)
+            audit_fn_(req, "dex.device.view", "success", "Agent", id,
+                      "device DEX lens (per-device signal summary)");
         const std::string since = dex_iso_since(7);
         const int score = dex_device_score(store_, id, since);
         std::vector<std::pair<std::string, std::int64_t>> sigs;
@@ -266,13 +284,18 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- Guardian lens: per-guard compliance state for this device --
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        // Per-device compliance state: same Read gate as the Guardian read
+        // surface + audit-on-open (parity with the DEX lens above).
+        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (!store_) {
             res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable."),
                             "text/html; charset=utf-8");
             return;
         }
+        if (audit_fn_)
+            audit_fn_(req, "guardian.device.view", "success", "Agent", id,
+                      "device Guardian lens (per-guard compliance)");
         std::unordered_map<std::string, std::string> rule_names;
         for (const auto& r : store_->list_rules())
             rule_names[r.rule_id] = r.name;
@@ -339,6 +362,10 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                                                const httplib::Request& req,
                                                httplib::Response& res) {
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        // Read floor (parity with the DEX-perf sibling, which gates
+        // GuaranteedState:Read AND Execute); the Execute probe below is the soft,
+        // htmx-friendly note for a read-only operator.
+        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
         const auto lk = resolve_live_kind(kind);
@@ -372,6 +399,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                                                   const httplib::Request& req,
                                                   httplib::Response& res) {
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return; // Read floor (sibling parity)
         const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
         const auto lk = resolve_live_kind(kind);
         if (!lk) { res.status = 400; res.set_content("bad request", "text/plain"); return; }
@@ -391,19 +419,23 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         if (id.empty() || command_id.size() > 64 || !command_id.starts_with(lk->plugin + "-")) {
             res.status = 400; res.set_content("bad request", "text/plain"); return;
         }
+        // Poll budget: hashing every running binary (processes/list_hashed) can
+        // take longer than a warehouse query, so allow more attempts before
+        // declaring a timeout (~28s at 700ms cadence).
+        constexpr int kMaxAttempts = 40;
         int attempt = 1;
         if (req.has_param("n")) {
-            try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
+            try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 50); } catch (...) {}
         }
         // Hoist the responses into a named local: pointers below must outlive the
         // loop, so iterating the temporary directly would dangle (use-after-free).
         const auto rows = responses_fn_(command_id);
         const DexAgentResponse* with_output = nullptr;
-        const DexAgentResponse* failed = nullptr;
+        const DexAgentResponse* terminal = nullptr; // SUCCESS or any failure terminal
         for (const auto& r : rows) {
             if (r.agent_id != id) continue; // another agent's rows are never rendered here
             if (!r.output.empty()) with_output = &r;
-            else if (r.status >= 2) failed = &r; // FAILURE / TIMEOUT / REJECTED terminal frame
+            if (r.status >= 1) terminal = &r; // 1=SUCCESS, 2+=FAILURE/TIMEOUT/REJECTED
         }
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
@@ -415,11 +447,18 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                             "text/html; charset=utf-8");
             return;
         }
-        if (failed) {
-            note(res, "Query failed on the device: " + html_escape(failed->error_detail.substr(0, 200)));
+        if (terminal) {
+            // The command COMPLETED. Failure → honest note; success-with-no-output
+            // → render the empty result now (don't poll to a false timeout — UP-1).
+            if (terminal->status >= 2) {
+                note(res, "Query failed on the device: " +
+                              html_escape(terminal->error_detail.substr(0, 200)));
+                return;
+            }
+            res.set_content(render_live_result(*lk, ""), "text/html; charset=utf-8");
             return;
         }
-        if (attempt >= 20) {
+        if (attempt >= kMaxAttempts) {
             note(res, "No response from the device (timed out) &mdash; it may have gone offline. "
                       "Reload to retry.");
             return;
