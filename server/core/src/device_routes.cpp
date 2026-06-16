@@ -10,10 +10,12 @@
 #include "dex_routes.hpp"             // dex_device_score, dex_iso_since
 #include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
+#include "web_utils.hpp"              // html_escape
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -55,20 +57,84 @@ bool matches(const DeviceRow& d, const std::string& q) {
     return hay.find(q) != std::string::npos;
 }
 
+// One "Get live info" panel = one real plugin instruction dispatched at the
+// device NOW. The kind is an ALLOWLIST token (validated before it drives a
+// dispatch or reaches markup); each kind carries its own audit verb so a
+// usage-class read (what processes a person is running) stays separately
+// countable from a machine-health read (uptime) — the works-council access-audit
+// posture the DEX per-app panel established (dex_routes.cpp PR2 rationale).
+struct LiveKind {
+    std::string plugin;
+    std::string action;
+    std::string label;
+    std::string audit_action;
+};
+
+std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
+    if (kind == "uptime")
+        return LiveKind{"os_info", "uptime", "Uptime", "device.live.uptime"};
+    if (kind == "processes")
+        return LiveKind{"processes", "list", "Running processes", "device.live.processes"};
+    return std::nullopt;
+}
+
+// Parse the newline-joined plugin output (one write_output() line each, possible
+// trailing \r) into the matching live renderer. os_info/uptime -> a value tile;
+// processes/list -> a PID/name table.
+std::string render_live_result(const LiveKind& lk, const std::string& output) {
+    std::vector<std::string> lines;
+    std::size_t pos = 0;
+    while (pos < output.size()) {
+        const auto nl = output.find('\n', pos);
+        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines.push_back(std::move(line));
+    }
+    if (lk.plugin == "os_info") {
+        std::string value;
+        for (const auto& l : lines)
+            if (l.starts_with("uptime_display|")) { value = l.substr(15); break; }
+        return render_device_live_value(lk.label, value);
+    }
+    if (lk.plugin == "processes") {
+        std::vector<std::pair<int, std::string>> procs;
+        for (const auto& l : lines) {
+            if (!l.starts_with("proc|")) continue; // proc|pid|name
+            const auto first = l.find('|');
+            const auto second = l.find('|', first + 1);
+            if (second == std::string::npos) continue;
+            int pid = 0;
+            try { pid = std::stoi(l.substr(first + 1, second - first - 1)); } catch (...) { pid = 0; }
+            procs.emplace_back(pid, l.substr(second + 1));
+        }
+        return render_device_live_processes(procs);
+    }
+    return "<div class=\"gp-note\">Unsupported live result.</div>";
+}
+
 } // namespace
 
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn, const GuaranteedStateStore* store) {
+                                   DevicesFn devices_fn, const GuaranteedStateStore* store,
+                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                   AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn), store);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn), store,
+                    std::move(dispatch_fn), std::move(responses_fn), std::move(audit_fn));
 }
 
 void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn, const GuaranteedStateStore* store) {
+                                   DevicesFn devices_fn, const GuaranteedStateStore* store,
+                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                   AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
     store_ = store;
+    dispatch_fn_ = std::move(dispatch_fn);
+    responses_fn_ = std::move(responses_fn);
+    audit_fn_ = std::move(audit_fn);
 
     // -- /devices page shell (auth-only static chrome) --
     sink.Get("/devices", [this](const httplib::Request& req, httplib::Response& res) {
@@ -211,31 +277,138 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         res.set_content(render_device_guardian_lens(id, guards), "text/html; charset=utf-8");
     });
 
-    // -- Live snapshot: device state (battery/uptime/recent events, server-side from
-    // the device's observations) + an embedded live-performance dispatch. --
+    // -- "Get live info": dispatch REAL plugin instructions at the device NOW and
+    // poll the response store for the result. NOT the 30s heartbeat, NOT the
+    // warehouse — each panel runs an instruction that queries the live OS. The
+    // shell embeds one auto-loading panel per kind; each panel hx-gets .../run
+    // (which dispatches + returns a polling div) and the div polls .../result.
+    //
+    // Posture mirrors the DEX device-perf dispatch (dex_routes.cpp): auth, then
+    // an Execute PROBE against a throwaway response (htmx swallows a raw 403, so
+    // a read-only operator gets an honest in-panel note instead), then dispatch
+    // through the shared chokepoint, audited per-kind.
+    auto note = [](httplib::Response& res, const std::string& text) {
+        res.set_content("<div class=\"gp-note\">" + text + "</div>", "text/html; charset=utf-8");
+    };
+    auto can_execute = [this](const httplib::Request& req) {
+        httplib::Response probe;
+        return perm_fn_ && perm_fn_(req, probe, "Execution", "Execute");
+    };
+    auto url_enc = [](const std::string& s) {
+        static const char* kHex = "0123456789ABCDEF";
+        std::string out;
+        for (unsigned char c : s) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+                out += static_cast<char>(c);
+            else { out += '%'; out += kHex[c >> 4]; out += kHex[c & 0x0F]; }
+        }
+        return out;
+    };
+    // `kind` is already validated against the allowlist before this is called.
+    auto live_pending = [url_enc](const std::string& command_id, const std::string& agent_id,
+                                  const std::string& kind, int attempt) {
+        return "<div hx-get=\"/fragments/device/live/result?command_id=" + url_enc(command_id) +
+               "&amp;agent_id=" + url_enc(agent_id) + "&amp;kind=" + url_enc(kind) +
+               "&amp;n=" + std::to_string(attempt) +
+               "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\" class=\"gp-note\">"
+               "Waiting for the device to respond&hellip;</div>";
+    };
+
+    // Shell: a header + one auto-loading panel per live instruction.
     sink.Get("/fragments/device/live", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        if (!store_) {
-            res.set_content("<div class=\"gp-note\">Live snapshot unavailable on this server.</div>",
+        res.set_content(render_device_live_shell(id), "text/html; charset=utf-8");
+    });
+
+    // Run: validate kind (allowlist) -> Execute probe -> dispatch -> audit -> poll.
+    sink.Get("/fragments/device/live/run", [this, note, can_execute, live_pending](
+                                               const httplib::Request& req,
+                                               httplib::Response& res) {
+        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+        const auto lk = resolve_live_kind(kind);
+        if (!lk || id.empty()) { res.status = 400; res.set_content("bad request", "text/plain"); return; }
+        if (!can_execute(req)) {
+            note(res, "Live device info needs the <b>Execute</b> permission &mdash; it runs a "
+                      "read-only instruction on the device.");
+            return;
+        }
+        if (!dispatch_fn_ || !responses_fn_) {
+            note(res, "Live device query unavailable on this server.");
+            return;
+        }
+        const auto [command_id, sent] =
+            dispatch_fn_(lk->plugin, lk->action, {id}, "", {});
+        if (audit_fn_)
+            audit_fn_(req, lk->audit_action, sent > 0 ? "success" : "no_agents", "Agent", id,
+                      lk->plugin + "/" + lk->action + " -> " + std::to_string(sent) +
+                          " agent(s) command_id=" + command_id);
+        if (sent == 0) {
+            note(res, "Device offline &mdash; live info needs a connected agent.");
+            return;
+        }
+        res.set_content(live_pending(command_id, id, kind, 1), "text/html; charset=utf-8");
+    });
+
+    // Result: re-validate kind + Execute + command_id prefix + agent match, then
+    // poll the response store and render (data rides RUNNING rows, the
+    // response-store contract DexRoutes relies on).
+    sink.Get("/fragments/device/live/result", [this, note, can_execute, live_pending](
+                                                  const httplib::Request& req,
+                                                  httplib::Response& res) {
+        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+        const auto lk = resolve_live_kind(kind);
+        if (!lk) { res.status = 400; res.set_content("bad request", "text/plain"); return; }
+        if (!can_execute(req)) {
+            note(res, "Live device info needs the <b>Execute</b> permission.");
+            return;
+        }
+        if (!responses_fn_) {
+            note(res, "Live device query unavailable on this server.");
+            return;
+        }
+        const std::string command_id =
+            req.has_param("command_id") ? req.get_param_value("command_id") : "";
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        // Only THIS kind's plugin commands are pollable here, only for the named
+        // agent — narrows what a guessed/stolen command_id can read via this route.
+        if (id.empty() || command_id.size() > 64 || !command_id.starts_with(lk->plugin + "-")) {
+            res.status = 400; res.set_content("bad request", "text/plain"); return;
+        }
+        int attempt = 1;
+        if (req.has_param("n")) {
+            try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
+        }
+        const DexAgentResponse* with_output = nullptr;
+        const DexAgentResponse* failed = nullptr;
+        for (const auto& r : responses_fn_(command_id)) {
+            if (r.agent_id != id) continue; // another agent's rows are never rendered here
+            if (!r.output.empty()) with_output = &r;
+            else if (r.status >= 2) failed = &r; // FAILURE / TIMEOUT / REJECTED terminal frame
+        }
+        if (with_output) {
+            if (with_output->output.starts_with("error|")) {
+                note(res, "The device reported an error: " +
+                              html_escape(with_output->output.substr(6, 200)));
+                return;
+            }
+            res.set_content(render_live_result(*lk, with_output->output),
                             "text/html; charset=utf-8");
             return;
         }
-        const std::string since = dex_iso_since(7);
-        std::string battery, uptime;
-        std::vector<DeviceLiveEvent> events;
-        for (const auto& o : store_->dex_device_history(id, since, 30)) {
-            if (battery.empty() && o.obs_type == "hw.error" && o.subject == "battery")
-                battery = o.reason; // e.g. "capacity 76%"
-            if (uptime.empty() && o.obs_type == "os.uptime_report" && o.metric > 0) {
-                const long long s = static_cast<long long>(o.metric);
-                uptime = std::to_string(s / 86400) + "d " + std::to_string((s % 86400) / 3600) + "h";
-            }
-            if (events.size() < 8)
-                events.push_back({dex_signal_label(o.obs_type), o.subject, o.reason, o.observed_at});
+        if (failed) {
+            note(res, "Query failed on the device: " + html_escape(failed->error_detail.substr(0, 200)));
+            return;
         }
-        res.set_content(render_device_live_snapshot(id, battery, uptime, events),
-                        "text/html; charset=utf-8");
+        if (attempt >= 20) {
+            note(res, "No response from the device (timed out) &mdash; it may have gone offline. "
+                      "Reload to retry.");
+            return;
+        }
+        res.set_content(live_pending(command_id, id, kind, attempt + 1), "text/html; charset=utf-8");
     });
 }
 

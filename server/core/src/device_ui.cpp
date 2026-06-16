@@ -269,40 +269,51 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
     return h;
 }
 
-std::string render_device_live_snapshot(const std::string& agent_id, const std::string& battery,
-                                        const std::string& uptime,
-                                        const std::vector<DeviceLiveEvent>& events) {
-    std::string h;
-    h += "<div class=\"gp-sech\">Live snapshot <span class=\"gp-mute\" style=\"font-weight:400;"
-         "text-transform:none\">&middot; device state + live performance</span></div>";
-    h += "<div class=\"gp-tiles\">";
-    h += "<div class=\"gp-tile\"><div class=\"n\">" +
-         (battery.empty() ? std::string("&mdash;") : esc(battery)) +
-         "</div><div class=\"l\">Battery</div></div>";
-    h += "<div class=\"gp-tile\"><div class=\"n\">" +
-         (uptime.empty() ? std::string("&mdash;") : esc(uptime)) +
-         "</div><div class=\"l\">Uptime</div></div>";
-    h += "<div class=\"gp-tile\"><div class=\"n info\">" + std::to_string(events.size()) +
-         "</div><div class=\"l\">Recent events</div></div>";
-    h += "</div>";
-    // Live performance — auto-fires the existing dispatched perf query (the gated,
-    // audited machine-health path); its pending div self-polls into this slot.
-    h += "<div class=\"gp-sech\">Live performance</div>";
-    h += "<div hx-get=\"/fragments/dex/device/perf?agent_id=" + url_encode(agent_id) +
-         "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" class=\"gp-note\">Querying the "
-         "device&hellip;</div>";
-    if (events.empty()) {
-        h += "<div class=\"gp-note\">No recent DEX events on this device.</div>";
-        return h;
+std::string render_device_live_shell(const std::string& agent_id) {
+    const std::string e = url_encode(agent_id);
+    // Each panel auto-fires a real plugin instruction at the device (run route
+    // dispatches + polls). "Live" = queried on the OS now, not from the warehouse
+    // or the 30s heartbeat.
+    auto panel = [&](const char* kind, const char* title) {
+        return "<div class=\"gp-sech\">" + std::string(title) +
+               " <span class=\"gp-mute\" style=\"font-weight:400;text-transform:none\">&middot; "
+               "live</span></div>"
+               "<div hx-get=\"/fragments/device/live/run?id=" +
+               e + "&amp;kind=" + kind +
+               "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" class=\"gp-note\">Dispatching "
+               "instruction\xE2\x80\xA6</div>";
+    };
+    std::string h = "<div class=\"gp-note\">Live instructions dispatched to the device now "
+                    "(read-only &middot; Execute-gated &middot; audited).</div>";
+    h += panel("uptime", "Uptime");
+    h += panel("processes", "Running processes");
+    return h;
+}
+
+std::string render_device_live_value(const std::string& label, const std::string& value) {
+    return "<div class=\"gp-tiles\"><div class=\"gp-tile\"><div class=\"n\">" +
+           (value.empty() ? std::string("&mdash;") : esc(value)) + "</div><div class=\"l\">" +
+           esc(label) + "</div></div></div>";
+}
+
+std::string render_device_live_processes(const std::vector<std::pair<int, std::string>>& procs) {
+    if (procs.empty())
+        return "<div class=\"gp-note\">No processes returned.</div>";
+    std::string h = "<div class=\"gp-note\" style=\"margin-top:0\"><b>" +
+                    std::to_string(procs.size()) + "</b> running processes (live).</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th class=\"gp-num\">PID</th><th>Process</th>"
+         "</tr></thead><tbody>";
+    std::size_t shown = 0;
+    for (const auto& [pid, name] : procs) {
+        if (shown++ >= 50)
+            break;
+        h += "<tr><td class=\"gp-num\">" + std::to_string(pid) + "</td><td class=\"name\">" +
+             esc(name) + "</td></tr>";
     }
-    h += "<div class=\"gp-sech\">Recent events</div>";
-    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Subject</th><th>Detail</th>"
-         "<th>When</th></tr></thead><tbody>";
-    for (const auto& e : events)
-        h += "<tr><td class=\"name\">" + esc(e.label) + "</td><td class=\"gp-mute\">" +
-             esc(e.subject) + "</td><td class=\"gp-mute\">" + esc(e.reason) +
-             "</td><td class=\"gp-mute\">" + esc(e.when) + "</td></tr>";
     h += "</tbody></table>";
+    if (procs.size() > 50)
+        h += "<div class=\"gp-note\">Showing first 50 of " + std::to_string(procs.size()) +
+             ".</div>";
     return h;
 }
 

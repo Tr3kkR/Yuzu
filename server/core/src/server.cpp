@@ -8111,8 +8111,29 @@ private:
             return out;
         };
         device_routes_ = std::make_unique<DeviceRoutes>();
-        device_routes_->register_routes(*web_server_, auth_fn, perm_fn, devices_fn,
-                                        guaranteed_state_store_.get());
+        device_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn, guaranteed_state_store_.get(),
+            // "Get live info" dispatches real plugin instructions (os_info/uptime,
+            // processes/list) through the shared chokepoint — untracked path
+            // (empty execution_id), same posture as the DEX device-perf panel.
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)

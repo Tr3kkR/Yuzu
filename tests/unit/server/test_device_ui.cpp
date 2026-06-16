@@ -86,17 +86,33 @@ TEST_CASE("device page: live-info button enabled online, disabled offline", "[de
     CHECK(off.find("device offline") != std::string::npos);
 }
 
-TEST_CASE("device live snapshot: state tiles + events + embedded live perf", "[device][ui]") {
-    std::vector<DeviceLiveEvent> ev{
-        {"Battery health", "battery", "capacity 76%", "2026-06-16T11:01:00Z"}};
-    const auto html = render_device_live_snapshot("a-1", "capacity 76%", "2d 18h", ev);
-    CHECK(html.find("Battery") != std::string::npos);
-    CHECK(html.find("capacity 76%") != std::string::npos);
-    CHECK(html.find("2d 18h") != std::string::npos); // uptime tile
-    // embeds the existing (gated) live-perf dispatch, auto-loaded
-    CHECK(html.find("/fragments/dex/device/perf?agent_id=a-1") != std::string::npos);
-    CHECK(html.find("Recent events") != std::string::npos);
-    // empty → honest "no events" (still embeds perf)
-    CHECK(render_device_live_snapshot("a-1", "", "", {}).find("No recent DEX events") !=
-          std::string::npos);
+TEST_CASE("device live shell: one auto-loading run panel per live instruction", "[device][ui]") {
+    const auto html = render_device_live_shell("a-1");
+    // Each panel dispatches a REAL plugin instruction at the device via the run route.
+    CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=uptime") != std::string::npos);
+    CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=processes") != std::string::npos);
+    CHECK(html.find("hx-trigger=\"load\"") != std::string::npos); // fires on render, no 30s wait
+    CHECK(html.find("Uptime") != std::string::npos);
+    CHECK(html.find("Running processes") != std::string::npos);
+}
+
+TEST_CASE("device live value: value tile; empty -> dash", "[device][ui]") {
+    const auto html = render_device_live_value("Uptime", "2d 18h 4m");
+    CHECK(html.find("2d 18h 4m") != std::string::npos);
+    CHECK(html.find("Uptime") != std::string::npos);
+    CHECK(render_device_live_value("Uptime", "").find("&mdash;") != std::string::npos);
+}
+
+TEST_CASE("device live processes: PID/name table, empty + cap", "[device][ui]") {
+    std::vector<std::pair<int, std::string>> procs{{1234, "chrome.exe"}, {5678, "code.exe"}};
+    const auto html = render_device_live_processes(procs);
+    CHECK(html.find("1234") != std::string::npos);
+    CHECK(html.find("chrome.exe") != std::string::npos);
+    CHECK(html.find("running processes") != std::string::npos);
+    CHECK(render_device_live_processes({}).find("No processes returned") != std::string::npos);
+    // > 50 -> capped with a note
+    std::vector<std::pair<int, std::string>> many;
+    for (int i = 0; i < 60; ++i)
+        many.emplace_back(i, "p" + std::to_string(i));
+    CHECK(render_device_live_processes(many).find("Showing first 50") != std::string::npos);
 }

@@ -28,6 +28,8 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "dex_routes.hpp" // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+
 #include <httplib.h>
 
 #include <cstdint>
@@ -98,21 +100,17 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 std::string render_device_guardian_lens(const std::string& agent_id,
                                         const std::vector<DeviceGuardRow>& guards);
 
-/// One recent-event row in the live snapshot.
-struct DeviceLiveEvent {
-    std::string label;   ///< friendly signal label
-    std::string subject; ///< failing entity
-    std::string reason;  ///< failure detail
-    std::string when;    ///< observed_at (ISO)
-};
+/// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
+/// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which
+/// dispatches a real plugin instruction to the device and polls for the result).
+/// Live = queried on the agent NOW (no 30s heartbeat wait).
+std::string render_device_live_shell(const std::string& agent_id);
 
-/// PURE: the "Get live info" snapshot panel — device state tiles (battery / uptime /
-/// recent-event count, from the device's own observations) + recent events + an
-/// EMBEDDED live-performance load (auto-fires the existing dispatched perf query).
-/// `battery`/`uptime` are "" when unknown.
-std::string render_device_live_snapshot(const std::string& agent_id, const std::string& battery,
-                                        const std::string& uptime,
-                                        const std::vector<DeviceLiveEvent>& events);
+/// PURE: render the live `processes/list` result (proc|pid|name → table).
+std::string render_device_live_processes(const std::vector<std::pair<int, std::string>>& procs);
+
+/// PURE: render a simple key/value live result (e.g. os_info/uptime) as a tile.
+std::string render_device_live_value(const std::string& label, const std::string& value);
 
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
@@ -131,22 +129,34 @@ public:
     /// "unavailable" placeholder.
     using DevicesFn = std::function<std::vector<DeviceRow>()>;
 
-    /// `store` (borrowed, may be null) backs the DEX + Guardian lenses (per-device
-    /// score / signal summary / guard compliance). Null → those lenses degrade to a
-    /// placeholder.
+    /// The "Get live info" snapshot dispatches REAL plugin instructions to the device
+    /// (Execute-gated, audited) and polls the response store — the same shared
+    /// chokepoint + ResponseStore seam DexRoutes uses. Empty → live info unavailable.
+    using DispatchFn = DexRoutes::DispatchFn;
+    using ResponsesFn = DexRoutes::ResponsesFn;
+    using AuditFn = DexRoutes::AuditFn;
+
+    /// `store` backs the DEX/Guardian lenses; `dispatch_fn`/`responses_fn`/`audit_fn`
+    /// back the live-info instruction dispatch (all borrowed/may be empty/null →
+    /// graceful placeholder).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
-                         const GuaranteedStateStore* store);
+                         const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
+                         ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
-                         const GuaranteedStateStore* store);
+                         const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
+                         ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;
     const GuaranteedStateStore* store_ = nullptr;
+    DispatchFn dispatch_fn_;
+    ResponsesFn responses_fn_;
+    AuditFn audit_fn_;
 };
 
 } // namespace yuzu::server
