@@ -98,6 +98,22 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 std::string render_device_guardian_lens(const std::string& agent_id,
                                         const std::vector<DeviceGuardRow>& guards);
 
+/// One recent-event row in the live snapshot.
+struct DeviceLiveEvent {
+    std::string label;   ///< friendly signal label
+    std::string subject; ///< failing entity
+    std::string reason;  ///< failure detail
+    std::string when;    ///< observed_at (ISO)
+};
+
+/// PURE: the "Get live info" snapshot panel — device state tiles (battery / uptime /
+/// recent-event count, from the device's own observations) + recent events + an
+/// EMBEDDED live-performance load (auto-fires the existing dispatched perf query).
+/// `battery`/`uptime` are "" when unknown.
+std::string render_device_live_snapshot(const std::string& agent_id, const std::string& battery,
+                                        const std::string& uptime,
+                                        const std::vector<DeviceLiveEvent>& events);
+
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
 

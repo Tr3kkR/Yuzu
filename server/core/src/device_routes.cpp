@@ -210,6 +210,33 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         }
         res.set_content(render_device_guardian_lens(id, guards), "text/html; charset=utf-8");
     });
+
+    // -- Live snapshot: device state (battery/uptime/recent events, server-side from
+    // the device's observations) + an embedded live-performance dispatch. --
+    sink.Get("/fragments/device/live", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (!store_) {
+            res.set_content("<div class=\"gp-note\">Live snapshot unavailable on this server.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::string since = dex_iso_since(7);
+        std::string battery, uptime;
+        std::vector<DeviceLiveEvent> events;
+        for (const auto& o : store_->dex_device_history(id, since, 30)) {
+            if (battery.empty() && o.obs_type == "hw.error" && o.subject == "battery")
+                battery = o.reason; // e.g. "capacity 76%"
+            if (uptime.empty() && o.obs_type == "os.uptime_report" && o.metric > 0) {
+                const long long s = static_cast<long long>(o.metric);
+                uptime = std::to_string(s / 86400) + "d " + std::to_string((s % 86400) / 3600) + "h";
+            }
+            if (events.size() < 8)
+                events.push_back({dex_signal_label(o.obs_type), o.subject, o.reason, o.observed_at});
+        }
+        res.set_content(render_device_live_snapshot(id, battery, uptime, events),
+                        "text/html; charset=utf-8");
+    });
 }
 
 } // namespace yuzu::server

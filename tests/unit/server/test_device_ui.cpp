@@ -75,8 +75,8 @@ TEST_CASE("device page: live-info button enabled online, disabled offline", "[de
     d.online = true;
     const auto on = render_device_page(d);
     CHECK(on.find("Get live info") != std::string::npos);
-    // online → dispatches a live read-only query (reuses the proven, gated path)
-    CHECK(on.find("/fragments/dex/device/perf?agent_id=a-1") != std::string::npos);
+    // online → loads the live snapshot
+    CHECK(on.find("/fragments/device/live?id=a-1") != std::string::npos);
     CHECK(on.find("device-live") != std::string::npos); // result mount present
     CHECK(on.find("disabled") == std::string::npos);    // button enabled
 
@@ -84,4 +84,19 @@ TEST_CASE("device page: live-info button enabled online, disabled offline", "[de
     const auto off = render_device_page(d);
     CHECK(off.find("disabled") != std::string::npos); // offline → disabled
     CHECK(off.find("device offline") != std::string::npos);
+}
+
+TEST_CASE("device live snapshot: state tiles + events + embedded live perf", "[device][ui]") {
+    std::vector<DeviceLiveEvent> ev{
+        {"Battery health", "battery", "capacity 76%", "2026-06-16T11:01:00Z"}};
+    const auto html = render_device_live_snapshot("a-1", "capacity 76%", "2d 18h", ev);
+    CHECK(html.find("Battery") != std::string::npos);
+    CHECK(html.find("capacity 76%") != std::string::npos);
+    CHECK(html.find("2d 18h") != std::string::npos); // uptime tile
+    // embeds the existing (gated) live-perf dispatch, auto-loaded
+    CHECK(html.find("/fragments/dex/device/perf?agent_id=a-1") != std::string::npos);
+    CHECK(html.find("Recent events") != std::string::npos);
+    // empty → honest "no events" (still embeds perf)
+    CHECK(render_device_live_snapshot("a-1", "", "", {}).find("No recent DEX events") !=
+          std::string::npos);
 }

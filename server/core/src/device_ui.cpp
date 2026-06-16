@@ -269,6 +269,43 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
     return h;
 }
 
+std::string render_device_live_snapshot(const std::string& agent_id, const std::string& battery,
+                                        const std::string& uptime,
+                                        const std::vector<DeviceLiveEvent>& events) {
+    std::string h;
+    h += "<div class=\"gp-sech\">Live snapshot <span class=\"gp-mute\" style=\"font-weight:400;"
+         "text-transform:none\">&middot; device state + live performance</span></div>";
+    h += "<div class=\"gp-tiles\">";
+    h += "<div class=\"gp-tile\"><div class=\"n\">" +
+         (battery.empty() ? std::string("&mdash;") : esc(battery)) +
+         "</div><div class=\"l\">Battery</div></div>";
+    h += "<div class=\"gp-tile\"><div class=\"n\">" +
+         (uptime.empty() ? std::string("&mdash;") : esc(uptime)) +
+         "</div><div class=\"l\">Uptime</div></div>";
+    h += "<div class=\"gp-tile\"><div class=\"n info\">" + std::to_string(events.size()) +
+         "</div><div class=\"l\">Recent events</div></div>";
+    h += "</div>";
+    // Live performance — auto-fires the existing dispatched perf query (the gated,
+    // audited machine-health path); its pending div self-polls into this slot.
+    h += "<div class=\"gp-sech\">Live performance</div>";
+    h += "<div hx-get=\"/fragments/dex/device/perf?agent_id=" + url_encode(agent_id) +
+         "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" class=\"gp-note\">Querying the "
+         "device&hellip;</div>";
+    if (events.empty()) {
+        h += "<div class=\"gp-note\">No recent DEX events on this device.</div>";
+        return h;
+    }
+    h += "<div class=\"gp-sech\">Recent events</div>";
+    h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Subject</th><th>Detail</th>"
+         "<th>When</th></tr></thead><tbody>";
+    for (const auto& e : events)
+        h += "<tr><td class=\"name\">" + esc(e.label) + "</td><td class=\"gp-mute\">" +
+             esc(e.subject) + "</td><td class=\"gp-mute\">" + esc(e.reason) +
+             "</td><td class=\"gp-mute\">" + esc(e.when) + "</td></tr>";
+    h += "</tbody></table>";
+    return h;
+}
+
 std::string render_device_guardian_lens(const std::string& agent_id,
                                         const std::vector<DeviceGuardRow>& guards) {
     std::string h = device_lens_tabs("guardian", agent_id);
@@ -313,10 +350,10 @@ std::string render_device_page(const DeviceRow& d) {
     // or surveillance surface; it inherits that gating. Offline → disabled.
     if (d.online) {
         const std::string e = url_encode(d.agent_id);
-        h += "<div><button class=\"gp-btn\" hx-get=\"/fragments/dex/device/perf?agent_id=" + e +
+        h += "<div><button class=\"gp-btn\" hx-get=\"/fragments/device/live?id=" + e +
              "\" hx-target=\"#device-live\" hx-swap=\"innerHTML\">\xE2\x9A\xA1 Get live info</button>"
-             " <span class=\"gp-mute\" style=\"font-size:.66rem\">live read-only query on the "
-             "device &middot; Execute-gated &middot; audited</span></div>";
+             " <span class=\"gp-mute\" style=\"font-size:.66rem\">device state + a live read-only "
+             "query &middot; Execute-gated &middot; audited</span></div>";
     } else {
         h += "<div><button class=\"gp-btn\" disabled>\xE2\x9A\xA1 Get live info</button>"
              " <span class=\"gp-mute\" style=\"font-size:.66rem\">device offline</span></div>";
