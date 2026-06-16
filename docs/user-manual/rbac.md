@@ -13,6 +13,16 @@ Toggle RBAC via the Settings page or the server configuration file:
 enabled = true
 ```
 
+> **Before enabling RBAC in production:** ensure every operator who needs device
+> visibility has at least one management-group role assignment. With RBAC
+> **disabled**, all authenticated users see the full enrolled fleet. Turning RBAC
+> **on** immediately applies role-scoped visibility — a user without a
+> management-group role assignment will see **no agents** (including on the TAR
+> fleet scan), and the role-grant endpoints themselves require an existing group
+> role, which can be a chicken-and-egg lockout. The broadest grant is an
+> `ITServiceOwner` role on the root "All Devices" group; see
+> [`management-groups.md`](management-groups.md) for the delegation API.
+
 ## Concepts
 
 | Concept | Description |
