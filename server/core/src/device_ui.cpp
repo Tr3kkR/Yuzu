@@ -306,12 +306,23 @@ std::string render_device_page(const DeviceRow& d) {
          "</h1></div><div class=\"gp-sub\">" + os_label(d.os) + "/" + esc(d.arch) + " &middot; " +
          status_cell(d.online) + " &middot; DEX experience " + score_badge(d.dex_score) +
          "</div></div>";
-    // Cross-cutting live-info action — previewed but disabled until the live-pull
-    // slice (it's privacy-gated: per-category toggle + individual-view kill switch,
-    // not just Execute+PII+audit).
-    h += "<div><button class=\"gp-btn\" disabled title=\"Live info lands in a later slice "
-         "(privacy-gated)\">\xE2\x9A\xA1 Get live info</button></div>";
-    h += "</div>";
+    // Cross-cutting live-info action — when the device is online, dispatch a live
+    // read-only query to it and render the result. Reuses the existing, proven
+    // /fragments/dex/device/perf path (GuaranteedState:Read + Execution:Execute,
+    // audited dex.device.perf.query, machine-health $Perf query) — NO new dispatch
+    // or surveillance surface; it inherits that gating. Offline → disabled.
+    if (d.online) {
+        const std::string e = url_encode(d.agent_id);
+        h += "<div><button class=\"gp-btn\" hx-get=\"/fragments/dex/device/perf?agent_id=" + e +
+             "\" hx-target=\"#device-live\" hx-swap=\"innerHTML\">\xE2\x9A\xA1 Get live info</button>"
+             " <span class=\"gp-mute\" style=\"font-size:.66rem\">live read-only query on the "
+             "device &middot; Execute-gated &middot; audited</span></div>";
+    } else {
+        h += "<div><button class=\"gp-btn\" disabled>\xE2\x9A\xA1 Get live info</button>"
+             " <span class=\"gp-mute\" style=\"font-size:.66rem\">device offline</span></div>";
+    }
+    h += "</div>";                       // close gp-head
+    h += "<div id=\"device-live\"></div>"; // live-snapshot mount (cross-lens)
     h += "<div id=\"device-lens\">" + render_device_info_fragment(d) + "</div>";
     return h;
 }

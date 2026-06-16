@@ -66,3 +66,22 @@ TEST_CASE("device Guardian lens: compliance summary + per-guard + empty", "[devi
     CHECK(html.find("drifted") != std::string::npos);    // state badge text
     CHECK(render_device_guardian_lens("a-1", {}).find("No guards evaluated") != std::string::npos);
 }
+
+TEST_CASE("device page: live-info button enabled online, disabled offline", "[device][ui]") {
+    DeviceRow d;
+    d.agent_id = "a-1";
+    d.hostname = "WS-1";
+    d.os = "windows";
+    d.online = true;
+    const auto on = render_device_page(d);
+    CHECK(on.find("Get live info") != std::string::npos);
+    // online → dispatches a live read-only query (reuses the proven, gated path)
+    CHECK(on.find("/fragments/dex/device/perf?agent_id=a-1") != std::string::npos);
+    CHECK(on.find("device-live") != std::string::npos); // result mount present
+    CHECK(on.find("disabled") == std::string::npos);    // button enabled
+
+    d.online = false;
+    const auto off = render_device_page(d);
+    CHECK(off.find("disabled") != std::string::npos); // offline → disabled
+    CHECK(off.find("device offline") != std::string::npos);
+}
