@@ -72,7 +72,7 @@ Source: "{#BuildDir}\server\core\*.dll"; DestDir: "{app}\bin"; Flags: ignorevers
 Source: "generate-config.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Dirs]
-Name: "{app}\logs"; Permissions: service-full
+Name: "{app}\logs"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu Server"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu Server\data"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu Server\certs"; Permissions: admins-full system-full

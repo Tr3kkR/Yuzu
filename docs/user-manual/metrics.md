@@ -333,6 +333,46 @@ recipe: `max_over_time(yuzu_fleet_perf_cohort_clipped[1m])` for liveness,
 sweep cadence, scrape at ≤10 s intervals when the export is enabled. See the
 label-exposure note under Security considerations before choosing a key.
 
+## Fleet network gauges
+
+Published on every fleet-health sweep (~15 s), fed from the `yuzu.net_*`
+heartbeat tags (device-aggregate facts only — no per-destination data). A metric
+nobody reported is **absent**, never zero. **Linux and Windows agents emit
+network facts; macOS does not yet.** Windows reports throughput and an interval
+retransmit rate but not RTT (per-connection RTT needs ESTATS — a later slice), so
+`yuzu_fleet_net_rtt_ms` stays Linux-only for now (see
+[Network Quality](network.md) → Platform coverage). The same numbers feed the
+`/network` Overview cards, via the shared validators, so the gauges and the page
+cannot disagree.
+
+**Caveat — RTT is coarse.** `yuzu_fleet_net_rtt_ms` is a device-aggregate median
+across whatever TCP connections are open (loopback / LAN / internet blended), so
+treat it as a rough signal, not per-flow truth; actionable per-destination /
+per-app latency is a later warehouse-tier slice.
+
+**The `yuzu_fleet_net_*` series carry an `os` label** (`windows` / `linux` / …,
+matching `yuzu_fleet_agents_by_os`) so reporting, RTT, and throughput are split
+per OS, never blended — query and alert per OS (`sum(...)` a count for a fleet
+total). **The retransmit rate is the exception:** the Windows rate is *system-wide*,
+biased low, and not yet loss-validated (#1465), so it is **withheld from the gauge
+entirely** (it still shows on the `/network` page + REST, caveated) —
+`yuzu_fleet_net_retrans_pct` carries **only loss-validated OSes (Linux today)**.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_net_reporting{os}` | gauge | Devices **of that OS** whose latest heartbeat carried at least one network fact (the same any-of definition the `/network` Overview Reporting card uses) |
+| `yuzu_fleet_net_retrans_reporting{os}` | gauge | Devices **of that OS** that contributed an interval retransmit **rate to the gauge** this cycle — a subset of `_reporting{os}` (a device can report RTT while its retransmit window is still warming). Denominator for `_retrans_pct{stat,os}`. Only loss-validated OSes appear (Linux today); a Windows device reports a retransmit fact but it is withheld from the gauge, so Windows is absent here |
+| `yuzu_fleet_net_degraded{os}` | gauge | **Dormant (measurement-first).** Agents no longer emit the `net_degraded` fact — the old absolute-ratio threshold was empirically disproven, and a calibrated threshold needs real-fleet baseline data (a later slice). **Absent** unless some agent of that OS still emits the tag (e.g. mid rolling-upgrade) — treat absent as "not classified", never 0 as "healthy". Revived when the degraded classification lands |
+| `yuzu_fleet_net_rtt_ms{stat,os}` | gauge | Fleet smoothed RTT in ms, `stat` = `avg` / `p50` / `p90` / `max`. RTT is reported by Linux only today, so `os="linux"` is the only series present |
+| `yuzu_fleet_net_retrans_pct{stat,os}` | gauge | Fleet TCP **interval** retransmit rate %, `stat` + `os` labels. Per device this is ΔΣretransmits / ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not** the lifetime ratio. **Loss-validated OSes only:** Linux is a per-connection-sum rate (netem-validated). The Windows rate is **system-wide** (loopback-inclusive, biased low, not yet validated — see network.md and #1465) and is **withheld from this gauge** (it shows on the `/network` page + REST, caveated) until validated — so today `os="linux"` is the only series. When Windows is validated it joins as its own `os` series; never alert on a cross-OS aggregate |
+| `yuzu_fleet_net_throughput_bps{stat,os}` | gauge | Fleet device network throughput in bytes/s (rx+tx, non-loopback), `stat` + `os` labels |
+
+Network sampling shares the `--dex-disable` agent flag; disabling DEX also
+disables the network heartbeat tags. **All six `yuzu_fleet_net_*` families are
+cleared on every sweep and re-emitted per reporting OS** — a `(metric, os)`
+nobody reported is absent, never stale or a fabricated 0 (`_degraded{os}` only
+appears if an agent of that OS still emits the retired tag).
+
 ## Guardian metrics
 
 | Metric | Type | Description |

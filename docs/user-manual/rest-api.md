@@ -3517,6 +3517,14 @@ Fleet-relative performance percentiles per **cohort** — the distinct values of
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`).
 - **Response:** `{key, floor, cohorts[], available_keys[]}`. Each cohort row is `{cohort, devices, suppressed}` plus, when not suppressed, per-metric stats as in `/perf/fleet`. Cohorts under `floor` (10) reporting devices carry `suppressed: true` with their population and **no stats**; devices without the key form the explicit `cohort: ""` (untagged) residual. `available_keys` lists the fleet's tag keys for picker UIs. `400` on an invalid key. Not audited.
 
+#### `GET /api/v1/dex/perf/cohort-diff`
+
+The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf across the fleet — is not here: per-app data is device-drill-only, not fleet render-time.)*
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`); `a`, `b` — the two cohort values to compare (**both required**; an empty value is the untagged residual).
+- **Response:** `{key, floor, found_a, found_b, a, b, delta_pct}`. `found_a`/`found_b` are `false` when a cohort has no reporting devices (its side is `null`). `a`/`b` are cohort rows `{cohort, devices, suppressed}` plus per-metric stats when not suppressed. `delta_pct` is `{cpu_pct, commit_pct, disk_lat_ms}` where each is A's p50 relative to B's p50 (B the baseline; positive = A higher), or `null` unless **both** cohorts expose that metric (neither suppressed below the 10-device floor). `400` on an invalid key or missing `a`/`b`. Not audited.
+
 #### `GET /api/v1/dex/perf/devices`
 
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
@@ -3524,6 +3532,29 @@ The one device list behind every Performance drill: worst devices by a metric (d
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
+
+---
+
+### Network
+
+The machine-readable siblings of the `/network` dashboard fragments (A1 — fleet link health must be answerable without scraping HTML). Same render-time aggregation over heartbeat network facts, same `GuaranteedState:Read` gate. **The edge ships facts, never a verdict:** these report measured RTT / retransmit / throughput and *measured co-occurrence* counts, never a causal "it's the network" attribution.
+
+> **Note — cohort parameter naming.** The network surface uses `key` for the cohort tag dimension (empty = no cohort, length-guarded), where the DEX performance surface uses `cohort_key` (validated, defaults to `model`). The difference is intentional and reflects each surface's cohort-resolution model — network cohorting is opt-in, DEX's always resolves. There is no `/api/v1/network/cohorts` endpoint (network has no per-cohort statistical aggregation); discover valid tag keys via the tag API.
+
+#### `GET /api/v1/network/fleet`
+
+Fleet network-quality now-stats — the same numbers as the `yuzu_fleet_net_*` Prometheus gauges and the `/network` Overview cards, computed at request time.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** an object `{rtt_ms, retrans_pct, throughput_bps, reporting, rtt_reporting, online, cooccurrence}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `rtt_reporting` is the **honest RTT denominator** (smoothed RTT is Linux-only today, so it is smaller than `reporting`); `online` is the total snapshot population. `cooccurrence` is `{degraded, also_device, also_app, network_only}` — counts of net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause; dormant until the degraded classification lands). Not audited.
+
+#### `GET /api/v1/network/devices`
+
+The one device list behind every network-quality drill: worst devices by a metric (default), the not-reporting complement, a co-occurrence band, or one cohort's members.
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `metric` (`rtt` / `retrans` / `throughput`, default `rtt`); `filter=not_reporting` (devices with no network sample this cycle); `cooc` (`device` / `app` / `network_only` / `degraded` — a co-occurrence band over net-degraded devices); `key` (cohort tag key — resolves the per-device cohort value; does not filter by itself); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?}`, worst-first by the sort metric (`under_pressure` / `app_unstable` are the co-occurring facts shown inline for correlation, never a verdict; `fleet_pctile` is the device's nearest-rank position, omitted when it did not report the metric). `400` on an invalid `limit`. Device-aggregate link health (device state, not behavioral data) — not audited.
 
 ---
 
