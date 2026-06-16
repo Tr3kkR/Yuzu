@@ -284,6 +284,21 @@ TEST_CASE("diskstats: parse_diskstats with no whole disk is invalid (re-baseline
     CHECK_FALSE(parse_diskstats("").valid);
 }
 
+TEST_CASE("diskstats: a short row (<11 fields) is skipped, not parsed",
+          "[guardian][dex][linux][proc][diskstats]") {
+    // A truncated/garbage line must never index past the available tokens. A whole-disk
+    // row with fewer than the 11 base fields is skipped; a valid full row in the same
+    // file is still summed (the short row must not poison the aggregate).
+    const std::string ds =
+        "   8   0 sda 100\n"                                  // truncated sda → skipped
+        "   8   0 sda 100 0 2000 500 50 0 800 250 0 700 750\n" // full sda → counted
+        "   8   1 sdb garbage x y z\n";                        // non-numeric short → skipped
+    const DiskIoTotals t = parse_diskstats(ds);
+    REQUIRE(t.valid);
+    CHECK(t.ios == 150);      // only the full sda row (100 reads + 50 writes)
+    CHECK(t.time_ms == 750);  // 500 ms_read + 250 ms_write
+}
+
 TEST_CASE("diskstats: disk_await_ms is ms-per-IO over the interval",
           "[guardian][dex][linux][proc][diskstats]") {
     const DiskIoTotals prev{true, 450, 2350};

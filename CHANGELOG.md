@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   37 analogue). New pure parsers `parse_diskstats`/`disk_await_ms`/`is_whole_disk`
   (`dex_linux_proc`) and `parse_throttle_count` (new `dex_linux_sysfs.cpp`); field
   positions verified against a real box. Reused obs_types (no live-render change; the
-  per-OS coverage map gains them); Linux server DEX coverage is now 15 signals.
+  per-OS coverage map gains them); this slice adds 2 (Linux 13→15, building on the
+  kernel-reliability slice below; the systemd unit-health entry above reaches 17).
 
 - **Linux server DEX: kernel-reliability signals from the journal.** The Linux DEX
   collector's journald reader now also classifies `_TRANSPORT=kernel` ring-buffer

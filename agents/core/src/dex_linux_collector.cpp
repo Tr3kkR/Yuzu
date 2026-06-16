@@ -343,8 +343,15 @@ private:
         if (!any)
             return; // no thermal_throttle interface — leave prev untouched, never emit
         if (prev_throttle_total_) {
-            const bool throttling = total > *prev_throttle_total_;
-            if (win::latch_should_emit(throttling, /*valid=*/true, throttle_reported_)) {
+            if (total < *prev_throttle_total_) {
+                // The summed counter DROPPED — a CPU went offline (vCPU hotplug, cpufreq
+                // offlining, SMT toggle) so its per-core count left the sum. That is NOT
+                // throttling; re-baseline silently. Without this, the counter jumping back
+                // up when the core re-onlines would read as a fresh breach and fire a
+                // spurious hw.cpu_throttled (Gate-4 UP-5). Re-arm the latch on the drop.
+                throttle_reported_ = false;
+            } else if (win::latch_should_emit(total > *prev_throttle_total_, /*valid=*/true,
+                                              throttle_reported_)) {
                 SignalObservation o;
                 o.obs_type = "hw.cpu_throttled";
                 o.subject = "cpu";

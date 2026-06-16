@@ -140,13 +140,17 @@ JournalLine parse_journal_line(std::string_view line) {
     }
 
     // ── chronyd clock-unsynchronised → os.time_unsynced ──────────────────────
-    // chrony logs free text (no MESSAGE_ID); the query fetches SYSLOG_IDENTIFIER=chronyd
-    // and we classify ONLY the genuine "clock is not synchronised" markers
-    // (live-captured: "Can't synchronise: no selectable sources"; plus chrony's
-    // large-step message). The frequent "Source … online/offline" lines produce NO
-    // observation — the cursor still advances. The raw MESSAGE can carry NTP source IPs,
-    // so it is NEVER shipped — a fixed sentence + subject "clock" only.
-    if (jstr(j, "SYSLOG_IDENTIFIER") == "chronyd") {
+    // chrony logs free text (no MESSAGE_ID); we classify ONLY the genuine "clock is not
+    // synchronised" markers (live-captured: "Can't synchronise: no selectable sources";
+    // plus chrony's large-step message). The frequent "Source … online/offline" lines
+    // produce NO observation — the cursor still advances. The raw MESSAGE can carry NTP
+    // source IPs, so it is NEVER shipped — a fixed sentence + subject "clock" only.
+    //
+    // INTEGRITY: gate on `_COMM` (a journald-trusted "address" field, set from the
+    // sender's /proc/PID/comm) — NOT `SYSLOG_IDENTIFIER`, which the logging process sets
+    // freely (`logger -t chronyd …`) and could forge an os.time_unsynced signal that
+    // feeds fleet alerting. _COMM raises the bar to actually being the chronyd process.
+    if (jstr(j, "_COMM") == "chronyd") {
         const std::string m = jstr(j, "MESSAGE");
         if (m.find("Can't synchronise: no selectable sources") != std::string::npos ||
             m.find("System clock wrong by") != std::string::npos) {
@@ -199,10 +203,11 @@ std::optional<std::string> build_journald_after_cursor_query(std::string_view cu
     cmd += " MESSAGE_ID=";
     cmd.append(kMsgIdUnitResult);
     // `+` is journalctl's OR: (the reliability MESSAGE_IDs) OR (all kernel-transport
-    // lines, classified in dex_linux_kmsg) OR (all chronyd lines, of which only the
-    // clock-unsynchronised markers map to an observation). chronyd is a low-volume
-    // daemon, so the extra fetch is negligible (be kind to the endpoint).
-    cmd += " + _TRANSPORT=kernel + SYSLOG_IDENTIFIER=chronyd 2>/dev/null";
+    // lines, classified in dex_linux_kmsg) OR (chronyd's own process lines, of which only
+    // the clock-unsynchronised markers map to an observation). `_COMM=chronyd` (a
+    // journald-trusted field) — not SYSLOG_IDENTIFIER — so an unprivileged process cannot
+    // forge the source. chronyd is a low-volume daemon, so the extra fetch is negligible.
+    cmd += " + _TRANSPORT=kernel + _COMM=chronyd 2>/dev/null";
     return cmd;
 }
 

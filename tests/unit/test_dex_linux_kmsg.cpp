@@ -138,7 +138,26 @@ TEST_CASE("kmsg: kernel OOM-kill → memory.exhausted (both message forms)",
     CHECK(cg->subject == "python3");
 }
 
-// ── os.bugcheck — FATAL panic only (fixture-pinned, awaiting live-fire) ───────────
+TEST_CASE("kmsg: privacy — OOM ships the victim comm only, never the kernel memory figures",
+          "[guardian][dex][linux][kmsg][privacy]") {
+    // The OOM line carries total-vm / anon-rss / file-rss figures and the killed PID; only
+    // the parenthesised victim comm may leave the device. (The OOM classifier moved into
+    // dex_linux_kmsg this commit — pin its privacy contract here, symmetric with the fs /
+    // disk pins.) Asserts the wire payload (signal_detail_json) is free of the figures.
+    const auto obs = classify_kernel_message(
+        "Out of memory: Killed process 4321 (mysqld) total-vm:9000000kB, anon-rss:8000000kB, file-rss:0kB");
+    REQUIRE(obs.has_value());
+    CHECK(obs->subject == "mysqld");
+    const std::string detail = signal_detail_json(*obs);
+    for (const std::string_view leak :
+         {"total-vm", "anon-rss", "file-rss", "9000000", "8000000", "4321"}) {
+        CHECK(obs->subject.find(leak) == std::string_view::npos);
+        CHECK(obs->sentence.find(leak) == std::string_view::npos);
+        CHECK(detail.find(leak) == std::string_view::npos);
+    }
+}
+
+// ── os.bugcheck — FATAL panic only (fixture-pinned) ─ TODO(live-fire): panic reboots, capture a real record 
 
 TEST_CASE("kmsg: kernel panic → os.bugcheck", "[guardian][dex][linux][kmsg]") {
     const auto obs =

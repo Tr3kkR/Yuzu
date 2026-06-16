@@ -277,9 +277,10 @@ bool is_whole_disk(std::string_view name) {
     for (const std::string_view pfx : {"loop", "ram", "zram", "sr", "fd", "dm-", "md", "nbd"})
         if (name.starts_with(pfx))
             return false;
-    // nvme: whole disk is nvmeXnY; a partition is nvmeXnYpZ (has a 'p').
+    // nvme: whole disk is nvmeXnY; a partition is nvmeXnYpZ (has a 'p'). (NVMe-oF connect
+    // namespaces nvmeXcYnZ are NOT recognised — local-attached scope, see the header.)
     if (name.starts_with("nvme"))
-        return name.find('n') != std::string_view::npos && name.find('p') == std::string_view::npos;
+        return name.find('p') == std::string_view::npos;
     // mmcblk: whole disk mmcblkN; partition mmcblkNpM (has a 'p').
     if (name.starts_with("mmcblk"))
         return name.find('p') == std::string_view::npos;

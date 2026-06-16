@@ -440,6 +440,15 @@ host configuration, not a Yuzu setting). `os.time_unsynced` covers **chrony** to
 so catching it needs either a high-volume all-`systemd` fetch or a separate `--grep` pipe, and the
 **root** failure is already captured as `service.crashed`.
 
+**Status legend (Linux) — narrower than macOS.** On the Linux rows "live" means the
+**agent-emit or pure-parser was verified on a real event** (via safe error injection or a
+real watchdog timeout), NOT seen end-to-end on `/dex` — the Linux collector has **not yet
+been observed landing on `/dex`** during a live-fire (the live-fires ran the agent against
+an offline server to pass the enrollment gate, so the emit was proven but the dashboard
+arrival was not). This is deliberately narrower than the macOS "live" = end-to-end-on-`/dex`
+definition; the per-row parenthetical states the exact evidence. `fixture` rows use the
+documented kernel format string and await a real specimen.
+
 | Heading | obs_type | Linux source | Status |
 |---|---|---|---|
 | Performance | `perf.cpu_sustained` | `/proc/stat` busy% >=90% sustained | live |

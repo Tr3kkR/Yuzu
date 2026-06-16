@@ -131,6 +131,13 @@ struct DiskIoTotals {
 /// partition suffix), mmcblkN (no `p`). Excludes partitions (would double-count
 /// against their parent), loop/ram/zram/sr/fd pseudo devices, and dm-*/md*/nbd*
 /// aggregates (their stats roll up their members → double-count). Exposed for tests.
+///
+/// SCOPE: local-attached block disks only. Exotic/fabric storage — NVMe-oF connect
+/// namespaces (`nvmeXcYnZ`), DRBD (`drbdN`), bcache (`bcacheN`), and device-mapper
+/// multipath (`mpathN`, summed via member `sdX` paths) — is deliberately NOT classified
+/// here (returns false → that host's `perf.disk_latency_high` simply does not evaluate,
+/// never a false signal). Broadening to fabric storage is a tracked follow-up; the safe
+/// default is to omit an unrecognised source rather than mis-aggregate it.
 YUZU_EXPORT bool is_whole_disk(std::string_view name);
 
 /// PURE: sum the completed-I/O and busy-time counters over the whole disks in
