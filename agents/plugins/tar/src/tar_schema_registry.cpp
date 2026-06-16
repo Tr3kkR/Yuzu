@@ -34,10 +34,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "if the ETW session cannot start. No command line is captured."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
-                {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
-                 "KERN_PROC_ALL via sysctl. Cmdline requires SIP-respecting "
-                 "KERN_PROCARGS2 — empty for hardened-runtime processes that "
-                 "the agent cannot inspect."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
+                 "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
+                 "path, accurate ppid, owning user from the audit token) where the "
+                 "framework + entitlement are present (full Xcode SDK build, "
+                 "com.apple.developer.endpoint-security.client, root). Falls back to "
+                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
+                 "— no command line (works-council posture); the poll blanks the "
+                 "proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
@@ -445,6 +449,101 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── Module / image loads (M1 — docs/tar-module-loads.md) ──────────
+        // What loads INTO a process: DLL / dylib / .so + driver / kext / kmod
+        // loads, each with a signing verdict — the DLL-search-order-hijack,
+        // injection, and BYOVD surface $Process cannot answer. `module_dir` IS
+        // captured (the hijack signal is the path, not a command line — a narrow,
+        // deliberate divergence from the names-only process posture; no cmdline).
+        // M1 registers the schema queryable-empty; collectors are kPlanned until
+        // M2 (Windows ETW), M4/M5 (macOS ES), M6 (Linux auditd kmod). The high-
+        // volume edge risk-filter that really bounds module_live ships with the
+        // first collector; opt-in (module_enabled, default off) like procperf.
+        {
+            .name = "module",
+            .dollar_name = "Module",
+            .os_support = {
+                {"windows", OsSupportStatus::kPlanned, "etw",
+                 "Microsoft-Windows-Kernel-Process image-load events (image "
+                 "keyword 0x40, event ID 5) on the SAME ETW session the process "
+                 "source already runs; driver loads surface as kernel image-loads. "
+                 "CodeIntegrity/Operational (3033/3034) overlays signing verdicts. "
+                 "Signing verified out-of-band at drain (WinVerifyTrust, cached). "
+                 "Wired in M2/M3."},
+                {"linux", OsSupportStatus::kPlanned, "auditd",
+                 "Kernel-module loads via auditd init_module/finit_module (kmod "
+                 "only in v1; /proc/modules seed). Shared-object (.so) loads need "
+                 "eBPF and are deferred to a separate track. Wired in M6."},
+                {"macos", OsSupportStatus::kPlanned, "endpoint_security",
+                 "ES NOTIFY_KEXTLOAD/KEXTUNLOAD (first-class) plus user-space "
+                 "dylibs via NOTIFY_MMAP (constrained) on the SAME ES client the "
+                 "process source uses; code-signing identity (team id / cdhash) "
+                 "rides the message, so signing needs no extra call. Wired in "
+                 "M4/M5."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // The edge risk-filter (unsigned/kernel/blocked at full
+                    // fidelity; signed system modules first-seen-then-count) is
+                    // the real bound; this row cap is the deterministic backstop.
+                    .retention_default = 100000,
+                    .columns = {
+                        {"ts",            "INTEGER"},
+                        {"snapshot_id",   "INTEGER"},
+                        {"action",        "TEXT"},
+                        {"pid",           "INTEGER"},
+                        {"process_name",  "TEXT"},
+                        {"module_name",   "TEXT"},
+                        {"module_dir",    "TEXT"},
+                        {"signed_state",  "TEXT"},
+                        {"signer",        "TEXT"},
+                        {"is_kernel",     "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days
+                    .columns = {
+                        {"day_ts",       "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "monthly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 31536000, // 12 months (~365 days)
+                    .columns = {
+                        {"month_ts",     "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -557,6 +656,10 @@ std::string generate_warehouse_ddl() {
             }
             if (g.suffix == "live" && src.name == "tcp") {
                 ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_remote ON {0}(remote_addr);\n",
+                                   table_name);
+            }
+            if (g.suffix == "live" && src.name == "module") {
+                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(module_name);\n",
                                    table_name);
             }
 
@@ -734,6 +837,37 @@ SELECT (ts / 3600) * 3600, name, COUNT(*), MAX(instances),
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 3600) * 3600, name)";
+        }
+    }
+
+    // ── Module / image-load rollups (M1) — per (module, signer, sig, kernel) ──
+    // load_count counts 'loaded' events only; 'seed'/'blocked'/'unloaded' stay
+    // visible at full fidelity in module_live and are not folded into the count.
+    if (source_name == "module") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO module_hourly (hour_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel,
+       SUM(CASE WHEN action = 'loaded' THEN 1 ELSE 0 END)
+FROM module_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel)";
+        }
+        if (target_suffix == "daily") {
+            return R"(INSERT INTO module_daily (day_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel,
+       SUM(load_count)
+FROM module_hourly
+WHERE hour_ts >= ? AND hour_ts < ?
+GROUP BY (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel)";
+        }
+        if (target_suffix == "monthly") {
+            return R"(INSERT INTO module_monthly (month_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
+       module_name, signer, signed_state, is_kernel,
+       SUM(load_count)
+FROM module_daily
+WHERE day_ts >= ? AND day_ts < ?
+GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_state, is_kernel)";
         }
     }
 
