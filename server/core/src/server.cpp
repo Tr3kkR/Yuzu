@@ -7905,6 +7905,7 @@ private:
                 DexFleet f;
                 const auto ids = registry_.all_ids();
                 f.total_online = static_cast<int64_t>(ids.size());
+                f.connected_agent_ids = ids; // Overview scores each (window-respecting)
                 for (const auto& id : ids) {
                     if (auto s = registry_.get_session(id)) {
                         std::string os = s->os;

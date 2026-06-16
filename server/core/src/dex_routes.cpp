@@ -1323,9 +1323,9 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     head += dex_subnav("overview", window_days);
     head += "<div class=\"gp-head\"><div>"
             "<div class=\"gp-titleline\"><h1>Digital Employee Experience</h1></div>"
-            "<div class=\"gp-sub\">Fleet reliability from device signals (crashes, hangs, "
-            "stability, boot, network) &mdash; read-only. Measured facts, not a synthetic "
-            "score.</div></div></div>";
+            "<div class=\"gp-sub\">Fleet experience from device signals &mdash; the per-device "
+            "score distribution, the Device/App/Network breakdown, and the measured reliability "
+            "rates below. The score is a <b>derived roll-up of measured facts</b>.</div></div></div>";
     head += "<div class=\"gp-filters\">" + chip("24h", "24h") + chip("7d", "7d") +
             chip("30d", "30d") + chip("all", "All") + "</div>";
 
@@ -1356,6 +1356,107 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     };
 
     std::string h = head;
+
+    // ── Experience (reframed headline) — the per-device DEX score distribution +
+    // the family-bucket breakdown (Device/App/Network), ABOVE the measured crash
+    // rates (which demote to one section below). Per-device scores are computed
+    // here from the connected agent ids (window-respecting); only the Overview
+    // pays this cost. ──
+    {
+        std::vector<int> ds;
+        ds.reserve(fleet.connected_agent_ids.size());
+        for (const auto& id : fleet.connected_agent_ids) {
+            const int s = dex_device_score(store, id, since);
+            if (s >= 0)
+                ds.push_back(s);
+        }
+        int great = 0, fair = 0, poor = 0;
+        for (int s : ds) {
+            if (s >= 90) ++great;
+            else if (s >= 75) ++fair;
+            else ++poor;
+        }
+        int overall = -1;
+        if (!ds.empty()) {
+            std::sort(ds.begin(), ds.end());
+            overall = ds[ds.size() / 2]; // median
+        }
+        auto tone = [](int s) { return s < 0 ? "unk" : (s >= 90 ? "good" : "warn"); };
+
+        // Device/App/Network = the canonical composite, partitioned by family bucket.
+        const auto health = dex_compute_health(signals, fleet.windows_online, "default");
+        double app_ded = 0, net_ded = 0, dev_ded = 0;
+        for (const auto& d : health.deds) {
+            if (d.name == "App reliability") app_ded += d.deduction;
+            else if (d.name == "Network") net_ded += d.deduction;
+            else dev_ded += d.deduction;
+        }
+        auto bscore = [&](double ded) {
+            return health.score < 0 ? -1
+                                    : static_cast<int>(std::clamp(100.0 - ded, 0.0, 100.0) + 0.5);
+        };
+        const int dev = bscore(dev_ded), app = bscore(app_ded), net = bscore(net_ded);
+
+        // Coverage over the connected platforms (reuses the catalogue model).
+        auto norm = [](std::string o) -> std::string {
+            for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (o.starts_with("win")) return "windows";
+            if (o == "darwin" || o == "macos") return "macos";
+            if (o.starts_with("lin")) return "linux";
+            return o;
+        };
+        std::vector<std::string> cscope;
+        for (const auto& o : fleet.connected_os) {
+            auto n = norm(o);
+            if (std::find(cscope.begin(), cscope.end(), n) == cscope.end())
+                cscope.push_back(n);
+        }
+        std::size_t mon = 0;
+        for (const auto& g : dex_signal_groups())
+            for (const char* t : g.types)
+                for (const auto& p : dex_obs_platforms(t))
+                    if (std::find(cscope.begin(), cscope.end(), p) != cscope.end()) {
+                        ++mon;
+                        break;
+                    }
+
+        auto stile = [&](int s, const char* label, const std::string& sx) {
+            return tile(tone(s), s < 0 ? "&mdash;" : std::to_string(s), label, sx);
+        };
+        h += "<div class=\"gp-sech\">Experience</div>";
+        h += "<div class=\"gp-tiles\">";
+        h += stile(overall, "Overall experience",
+                   ds.empty() ? "no devices reporting"
+                              : "median of " + num(static_cast<int64_t>(ds.size())) + " devices");
+        h += stile(dev, "Device", "stability &middot; perf &middot; hardware");
+        h += stile(app, "App", "crashes &amp; hangs");
+        h += stile(net, "Network", "connectivity");
+        h += tile("info", num(static_cast<int64_t>(mon)) + "/" + num(total_types), "Coverage",
+                  cscope.empty()
+                      ? "no platforms connected"
+                      : "types monitored &middot; " +
+                            num(static_cast<int64_t>(cscope.size())) + " platform(s)");
+        h += "</div>";
+        if (!ds.empty()) {
+            auto seg = [](int n, const char* color) {
+                return n <= 0 ? std::string()
+                              : "<span style=\"flex:" + std::to_string(n) + ";background:" + color +
+                                    ";display:flex;align-items:center;justify-content:center;"
+                                    "font-size:.62rem;font-weight:700;color:#06121f\">" +
+                                    std::to_string(n) + "</span>";
+            };
+            h += "<div style=\"display:flex;height:24px;border-radius:.4rem;overflow:hidden;"
+                 "margin:.2rem 0 .4rem\">" +
+                 seg(great, "#4ed27e") + seg(fair, "#ffcc00") + seg(poor, "#ff5765") + "</div>";
+            h += "<div class=\"gp-note\" style=\"margin-top:0\">Per-device experience: "
+                 "<b style=\"color:#4ed27e\">" + num(great) + " great</b> &middot; "
+                 "<b style=\"color:#ffcc00\">" + num(fair) + " fair</b> &middot; "
+                 "<b style=\"color:#ff5765\">" + num(poor) + " poor</b>. Score = the device's own "
+                 "weighted signal deductions; the Device/App/Network tiles are the same composite, "
+                 "partitioned. (Fleet-scale → heartbeat rollup.)</div>";
+        }
+    }
+
     h += "<div class=\"gp-sech\">Reliability &mdash; measured</div>";
     h += "<div class=\"gp-tiles\">";
     // Crash-free % over reporting Windows agents (the only OS with a collector).
@@ -1394,9 +1495,9 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     h += tile("info", num(fleet.windows_online), "Agents reporting",
               num(fleet.total_online) + " online across all OS");
     h += "</div>";
-    h += "<div class=\"gp-note\">Rates are over <b>currently-reporting Windows agents</b> (the only "
-         "OS with a signal collector today); offline agents are excluded, not counted as crash-free. "
-         "macOS/Linux: collector pending.</div>";
+    h += "<div class=\"gp-note\">Crash rates are over <b>currently-reporting Windows agents</b>; "
+         "offline agents are excluded, not counted as crash-free. The Experience score above spans "
+         "all connected platforms (Linux/macOS collectors emit a subset of signals).</div>";
 
     // ── Explore cards — the hub's links into the three deep pages, with live
     // teaser figures (summarise + link; the detail lives on the deep page). ──

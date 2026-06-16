@@ -369,6 +369,20 @@ TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=
     CHECK(dex_device_score(&store, "BENIGN-1", "") == 100);
 }
 
+TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
+          "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "e1", "WS-1", "process.crashed",
+                R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
+    // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
+    DexFleet fleet{2, 2, {"windows"}, {"WS-1", "WS-2"}};
+    auto html = render_dex_overview_fragment(&store, "", 7, fleet);
+    CHECK(html.find("Experience") != std::string::npos);         // new headline section
+    CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
+    CHECK(html.find("great") != std::string::npos);              // the distribution bar
+    CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
+}
+
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
           "[dex][routes]") {
     GuaranteedStateStore store(":memory:");

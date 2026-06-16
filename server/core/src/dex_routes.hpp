@@ -52,6 +52,10 @@ struct DexFleet {
     /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
     /// lens. Empty when nothing is connected.
     std::vector<std::string> connected_os;
+    /// agent_ids of the CONNECTED agents — the Overview computes a per-device DEX
+    /// score for each (window-respecting) to build the experience distribution.
+    /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
+    std::vector<std::string> connected_agent_ids;
 };
 
 /// One display family of the server-side signal catalogue. PUBLIC since F1:
