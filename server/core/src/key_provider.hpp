@@ -124,10 +124,19 @@ public:
     /// Deterministic, non-secret key-check value for fingerprint
     /// registration (ADR-0010 §2): for an exportable key, SHA-256 of the key
     /// material (safe — full-entropy 256-bit key, no dictionary angle); a
-    /// non-exportable provider derives it on-token. std::nullopt when
-    /// `key_ref` does not resolve.
+    /// non-exportable provider derives it on-token.
+    ///
+    /// `kcv_alg` names the derivation a given KEK version was minted under
+    /// (the `kek_meta.kcv_alg` column, ADR-0010 Amendment 4). After a
+    /// FileKeyProvider → HSM/KMS swap, SHA-256-derived and token-derived
+    /// versions coexist; boot verification passes each version's recorded
+    /// algorithm so the provider compares like-for-like. A provider returns
+    /// std::nullopt when `key_ref` does not resolve OR when it cannot compute
+    /// the named algorithm (e.g. a FileKeyProvider asked for a token KCV) —
+    /// the caller turns that into a distinct, actionable boot error rather
+    /// than silently mis-verifying valid material.
     [[nodiscard]] virtual std::optional<std::array<std::uint8_t, 32>>
-    kek_check_value(std::string_view key_ref) = 0;
+    kek_check_value(std::string_view key_ref, std::string_view kcv_alg) = 0;
 
     /// Delete a retired KEK from provider storage. Best-effort; true if gone
     /// afterwards. The ONLY sanctioned caller is `SecretCodec::retire_kek`,
@@ -166,7 +175,7 @@ public:
     unwrap_dek(std::string_view key_ref, const WrappedDek& wrapped,
                std::span<const std::uint8_t> wrap_aad) override;
     [[nodiscard]] std::optional<std::array<std::uint8_t, 32>>
-    kek_check_value(std::string_view key_ref) override;
+    kek_check_value(std::string_view key_ref, std::string_view kcv_alg) override;
     bool delete_kek(std::string_view key_ref) override;
 
     /// Exposed for callers/tests that need the resolved on-disk location for a

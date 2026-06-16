@@ -15,6 +15,7 @@
 #include <limits>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 namespace yuzu::server::pg {
 
@@ -175,6 +176,43 @@ std::string rel_name(const SecretCodec::SecretColumn& c) {
     return "\"" + c.store + "\".\"" + c.table + "\"";
 }
 
+/// kek_versions referenced by stored blobs (header scan) across all registered
+/// columns but ABSENT from `known` (the kek_meta version set). Used at boot to
+/// catch a deleted kek_meta registration before the codec silently mints a
+/// fresh KEK and orphans those rows (S6; targeted availability attack).
+///
+/// A column whose table does not exist yet (SQLSTATE 42P01) is SKIPPED: at
+/// substrate init a per-store table may not be migrated, and an absent table
+/// holds no blobs. Any other SQL error → std::nullopt (caller maps to
+/// db_error). Returns the sorted, de-duplicated orphan versions (empty = none).
+std::optional<std::vector<std::uint32_t>>
+scan_orphaned_versions(PGconn* conn, const std::vector<SecretCodec::SecretColumn>& columns,
+                       const std::set<std::uint32_t>& known) {
+    std::set<std::uint32_t> orphans;
+    for (const auto& col : columns) {
+        const std::string sql = "SELECT DISTINCT substring(\"" + col.column +
+                                "\" from 2 for 4) FROM " + rel_name(col) + " WHERE \"" +
+                                col.column + "\" IS NOT NULL";
+        PgResult rows{PQexecParams(conn, sql.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)};
+        if (rows.status() != PGRES_TUPLES_OK) {
+            const char* sqlstate = PQresultErrorField(rows.get(), PG_DIAG_SQLSTATE);
+            if (sqlstate != nullptr && std::strcmp(sqlstate, "42P01") == 0)
+                continue; // undefined_table: not migrated yet, no blobs to orphan
+            return std::nullopt;
+        }
+        const int n = PQntuples(rows.get());
+        for (int i = 0; i < n; ++i) {
+            if (PQgetlength(rows.get(), i, 0) != 4)
+                continue; // shorter-than-header garbage; decrypt will report it
+            const auto v =
+                get_u32_be(reinterpret_cast<const std::uint8_t*>(PQgetvalue(rows.get(), i, 0)));
+            if (!known.contains(v))
+                orphans.insert(v);
+        }
+    }
+    return std::vector<std::uint32_t>{orphans.begin(), orphans.end()};
+}
+
 } // namespace
 
 std::string_view SecretCodec::to_string(FailureClass cls) {
@@ -197,12 +235,22 @@ std::string_view SecretCodec::to_string(InitError::Kind kind) {
         return "kek_unresolvable";
     case InitError::Kind::kek_corrupt:
         return "kek_corrupt";
+    case InitError::Kind::kek_orphaned:
+        return "kek_orphaned";
+    case InitError::Kind::unsupported_pk_type:
+        return "unsupported_pk_type";
     case InitError::Kind::provider_failure:
         return "provider_failure";
     case InitError::Kind::db_error:
         return "db_error";
     }
     return "unknown";
+}
+
+std::string_view SecretCodec::to_external_error() {
+    // One indistinguishable value for every decrypt failure — no caller can
+    // tell decrypt-failure from not-found or tamper (S5; ADR-0010 §Decision 1).
+    return "secret unavailable";
 }
 
 std::string SecretCodec::encode_bigint_pk(std::int64_t pk) {
@@ -275,27 +323,38 @@ SecretCodec::Error SecretCodec::fail(const SecretId& id, FailureClass cls,
         {"kek_version", kek_version},
         {"failure_class", to_string(cls)}};
     emit_audit("secret.decrypt_failure", detail.dump());
+    // The failure class + detail go ONLY to the server-side log (operators
+    // need them to triage). err.message stays GENERIC so a wiring PR that
+    // forwards it to a client cannot leak a tamper/existence oracle (S5;
+    // ADR-0010 §Decision 1).
+    spdlog::error("secret_codec: decrypt failure [{}] {} ({}.{}.{} kek_v{})", to_string(cls), what,
+                  id.store, id.table, id.column, kek_version);
     Error err;
     err.cls = cls;
-    err.message = std::string{to_string(cls)} + ": " + std::string{what} + " (" + id.store + "." +
-                  id.table + "." + id.column + ")";
-    spdlog::error("secret_codec: {}", err.message);
+    err.message = std::string{to_external_error()};
     return err;
 }
 
 SecretCodec::Error SecretCodec::fail_encrypt(const SecretId& id, FailureClass cls,
                                              std::string_view what) {
+    spdlog::error("secret_codec: encrypt failed [{}] {} ({}.{}.{}) — caller must abort the "
+                  "transaction",
+                  to_string(cls), what, id.store, id.table, id.column);
     Error err;
     err.cls = cls;
-    err.message = std::string{to_string(cls)} + ": " + std::string{what} + " (" + id.store + "." +
-                  id.table + "." + id.column + ")";
-    spdlog::error("secret_codec: encrypt failed — {} (caller must abort the transaction)",
-                  err.message);
+    err.message = std::string{to_external_error()};
     return err;
 }
 
 std::expected<std::vector<std::uint8_t>, SecretCodec::Error>
 SecretCodec::encrypt(const SecretId& id, std::span<const std::uint8_t> plaintext) {
+    // Bound the allocation (S12): a buggy store passing an enormous span would
+    // otherwise throw std::bad_alloc straight through this std::expected
+    // contract. Every real secret column is far under kMaxPlaintextSize.
+    if (plaintext.size() > kMaxPlaintextSize)
+        return std::unexpected{
+            fail_encrypt(id, FailureClass::crypto_failure, "plaintext exceeds maximum secret size")};
+
     std::uint32_t version = 0;
     std::string key_ref;
     {
@@ -483,7 +542,7 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
     }
 
     PgResult rows{PQexec(conn, "SELECT kek_version, encode(kcv, 'hex'),"
-                               "       (retired_at IS NOT NULL)::int"
+                               "       (retired_at IS NOT NULL)::int, kcv_alg"
                                " FROM secrets.kek_meta ORDER BY kek_version")};
     if (rows.status() != PGRES_TUPLES_OK)
         return db_err(std::string{"kek init: kek_meta read failed: "} + PQerrorMessage(conn));
@@ -492,6 +551,75 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
     std::uint32_t max_live = 0;
 
     const int n = PQntuples(rows.get());
+
+    // Snapshot the registered columns once for the boot-time scans below.
+    std::vector<SecretColumn> reg_cols;
+    {
+        std::lock_guard lock{mu_};
+        reg_cols = columns_;
+    }
+
+    // Known kek_meta version set (all rows, retired or not) for the orphan scan.
+    std::set<std::uint32_t> known_versions;
+    for (int i = 0; i < n; ++i) {
+        const auto v = parse_u32(PQgetvalue(rows.get(), i, 0));
+        if (!v)
+            return db_err("kek init: unparseable kek_version in kek_meta");
+        known_versions.insert(*v);
+    }
+
+    // S6: a stored blob referencing a kek_version ABSENT from kek_meta means a
+    // registration row was deleted (operator error or a targeted SQL-write
+    // availability attack). Treating that as first-boot and minting a fresh KEK
+    // would permanently orphan every such blob. Fail closed with a distinct
+    // token instead — runs for BOTH the n==0 and n>0 paths.
+    {
+        auto orphans = scan_orphaned_versions(conn, reg_cols, known_versions);
+        if (!orphans)
+            return db_err(std::string{"kek init: orphan-version scan failed: "} +
+                          PQerrorMessage(conn));
+        if (!orphans->empty()) {
+            std::string vs;
+            for (const auto v : *orphans)
+                vs += (vs.empty() ? "v" : ", v") + std::to_string(v);
+            return std::unexpected{InitError{
+                InitError::Kind::kek_orphaned,
+                "stored secret blobs reference KEK version(s) [" + vs +
+                    "] absent from kek_meta — a deleted registration would be silently re-minted, "
+                    "permanently orphaning those rows. Restore kek_meta AND the keys directory "
+                    "from the paired backup; do NOT let the server generate a fresh KEK"}};
+        }
+    }
+
+    // PK-type validation (the int4/SERIAL footgun): a registered pk_column
+    // whose catalog type has no canonical AAD encoding would brick rotation
+    // with a spurious tag_mismatch. Validate before any secret is written; a
+    // not-yet-migrated table/column is skipped (re-checked at the next boot).
+    for (const auto& col : reg_cols) {
+        const char* params[] = {col.store.c_str(), col.table.c_str(), col.pk_column.c_str()};
+        PgResult tr{PQexecParams(conn,
+                                 "SELECT data_type FROM information_schema.columns"
+                                 " WHERE table_schema = $1 AND table_name = $2"
+                                 "   AND column_name = $3",
+                                 3, nullptr, params, nullptr, nullptr, 0)};
+        if (tr.status() != PGRES_TUPLES_OK)
+            return db_err("kek init: pk-type lookup for " + col.store + "." + col.table + "." +
+                          col.pk_column + " failed: " + PQerrorMessage(conn));
+        if (PQntuples(tr.get()) == 0)
+            continue; // column not migrated yet — re-checked at the next boot
+        const std::string dt = PQgetvalue(tr.get(), 0, 0);
+        const bool supported =
+            dt == "bigint" || dt == "text" || dt == "character varying" || dt == "character";
+        if (!supported)
+            return std::unexpected{InitError{
+                InitError::Kind::unsupported_pk_type,
+                "secret column " + col.store + "." + col.table + "." + col.column +
+                    " has pk_column '" + col.pk_column + "' of unsupported type '" + dt +
+                    "' — only BIGINT and text types have a canonical AAD encoding (an "
+                    "int4/SERIAL/uuid/numeric pk would brick rotation with a spurious "
+                    "tag_mismatch)"}};
+    }
+
     if (n == 0) {
         // First boot. Adopt-or-generate: a crash between KEK-file write and
         // the fingerprint INSERT leaves a valid fsynced key file with no
@@ -512,7 +640,7 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
                     "kek init: KEK generation failed (CSPRNG or key storage) — refusing to "
                     "start without a secrets KEK"}};
         }
-        const auto kcv = provider_.kek_check_value(*ref);
+        const auto kcv = provider_.kek_check_value(*ref, "sha256");
         if (!kcv)
             return std::unexpected{InitError{
                 InitError::Kind::provider_failure,
@@ -521,11 +649,14 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
                     "be torn — nothing is encrypted under an unregistered KEK, so deleting that "
                     "file and restarting is safe"}};
 
+        // Record the KCV algorithm explicitly (S2): a future non-exportable
+        // provider derives KCVs differently, and boot verification dispatches
+        // on this recorded value rather than assuming SHA-256.
         const std::string kcv_hex = to_hex(std::span<const std::uint8_t>{*kcv});
         const char* values[] = {kcv_hex.c_str()};
         PgResult ins{PQexecParams(conn,
-                                  "INSERT INTO secrets.kek_meta (kek_version, kcv)"
-                                  " VALUES (1, decode($1, 'hex'))",
+                                  "INSERT INTO secrets.kek_meta (kek_version, kcv, kcv_alg)"
+                                  " VALUES (1, decode($1, 'hex'), 'sha256')",
                                   1, nullptr, values, nullptr, nullptr, 0)};
         if (!ins.ok())
             return db_err(std::string{"kek init: fingerprint INSERT failed: "} +
@@ -553,6 +684,7 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
         const bool retired = std::strcmp(PQgetvalue(rows.get(), i, 2), "1") == 0;
         if (retired)
             continue;
+        const std::string kcv_alg = PQgetvalue(rows.get(), i, 3);
 
         const std::string key_id = kek_key_id(*version);
         const auto ref = provider_.resolve_kek(key_id);
@@ -565,16 +697,22 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
                     "keys directory, or a second server instance sharing this database (one KEK "
                     "per database; see ADR-0010 §2)"}};
 
-        const auto kcv = provider_.kek_check_value(*ref);
+        // Verify against the algorithm the version was MINTED under (S2):
+        // after a provider swap, SHA-256-derived and token-derived KCVs coexist
+        // and must each be compared like-for-like. A provider that cannot
+        // compute the recorded algorithm returns nullopt → a distinct,
+        // actionable error rather than a silent mis-verification.
+        const auto kcv = provider_.kek_check_value(*ref, kcv_alg);
         const auto expected = from_hex(kcv_hex);
         if (!kcv || !expected || expected->size() != kcv->size() ||
             !std::equal(kcv->begin(), kcv->end(), expected->begin()))
             return std::unexpected{InitError{
                 InitError::Kind::kek_corrupt,
-                "KEK '" + key_id +
-                    "' resolves but its check value does not match the registered fingerprint "
-                    "(torn/corrupt key file or foreign key material — NOT row tamper). Restore "
-                    "the keys directory from the backup paired with this database"}};
+                "KEK '" + key_id + "' resolves but its check value (kcv_alg='" + kcv_alg +
+                    "') does not match the registered fingerprint — a torn/corrupt key file, "
+                    "foreign key material (NOT row tamper), or a version minted by a different "
+                    "KeyProvider that this provider cannot verify. Restore the keys directory "
+                    "from the backup paired with this database"}};
 
         refs.emplace(*version, *ref);
         max_live = std::max(max_live, *version);
@@ -646,7 +784,7 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
         if (!ref)
             return std::unexpected{"rotate: KEK generation failed for " + key_id};
     }
-    const auto kcv = provider_.kek_check_value(*ref);
+    const auto kcv = provider_.kek_check_value(*ref, "sha256");
     if (!kcv)
         return std::unexpected{
             "rotate: check-value computation failed for " + key_id +
@@ -658,8 +796,8 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
     const std::string version_str = std::to_string(next);
     const char* values[] = {version_str.c_str(), kcv_hex.c_str()};
     PgResult ins{PQexecParams(conn,
-                              "INSERT INTO secrets.kek_meta (kek_version, kcv)"
-                              " VALUES ($1::bigint, decode($2, 'hex'))"
+                              "INSERT INTO secrets.kek_meta (kek_version, kcv, kcv_alg)"
+                              " VALUES ($1::bigint, decode($2, 'hex'), 'sha256')"
                               " ON CONFLICT (kek_version) DO NOTHING",
                               2, nullptr, values, nullptr, nullptr, 0)};
     if (!ins.ok())
@@ -754,7 +892,7 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
                     continue;
                 }
                 return std::unexpected{"rewrap_all: rewrap failed for a row of " + rel_name(col) +
-                                       ": " + new_blob.error().message};
+                                       " [" + std::string{to_string(new_blob.error().cls)} + "]"};
             }
 
             // Compare-and-swap (ADR §3): a plain write would silently revert
@@ -884,12 +1022,29 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
             key_refs_.erase(it);
         }
     }
-    if (!ref.empty() && !provider_.delete_kek(ref))
-        spdlog::warn("secret_codec: retired v{} but key deletion failed — remove '{}' manually",
-                     version, kek_key_id(version));
+
+    // Destruction must be CONFIRMED before the audit event claims it (S3).
+    // A failed delete_kek (HSM outage, permissions) is an ERROR, not a
+    // warning: emitting `kek.retired` here would write false destruction
+    // evidence and tell automation to stop retrying while usable key material
+    // remains on disk. The retired_at UPDATE above is crash-safe — the version
+    // is already excluded from boot verification — so the orphaned key file is
+    // harmless until removed.
+    if (ref.empty() || !provider_.delete_kek(ref)) {
+        spdlog::error("secret_codec: v{} marked retired in kek_meta but provider key deletion "
+                      "FAILED — key material for '{}' remains; remove it manually",
+                      version, kek_key_id(version));
+        return std::unexpected{"retire: v" + std::to_string(version) +
+                               " marked retired but provider key deletion FAILED — key material "
+                               "for '" +
+                               kek_key_id(version) +
+                               "' still exists; remove it manually. The version is already "
+                               "excluded from boot verification (no kek.retired event was emitted "
+                               "— destruction is unconfirmed)"};
+    }
 
     emit_audit("kek.retired", nlohmann::json{{"kek_version", version}}.dump());
-    spdlog::info("secret_codec: retired secrets-kek-v{} (destruction recorded in kek_meta)",
+    spdlog::info("secret_codec: retired secrets-kek-v{} (key destroyed; recorded in kek_meta)",
                  version);
     return {};
 }

@@ -237,19 +237,24 @@ TEST_CASE("FileKeyProvider: kek_check_value is deterministic and key-distinct",
     REQUIRE(r1);
     REQUIRE(r2);
 
-    auto k1a = provider.kek_check_value(*r1);
-    auto k2 = provider.kek_check_value(*r2);
+    auto k1a = provider.kek_check_value(*r1, "sha256");
+    auto k2 = provider.kek_check_value(*r2, "sha256");
     REQUIRE(k1a);
     REQUIRE(k2);
     REQUIRE(*k1a != *k2);
 
     // Survives a provider restart (fresh cache, re-read from disk).
     FileKeyProvider reopened(dir.path);
-    auto k1b = reopened.kek_check_value(*r1);
+    auto k1b = reopened.kek_check_value(*r1, "sha256");
     REQUIRE(k1b);
     REQUIRE(*k1a == *k1b);
 
-    REQUIRE_FALSE(provider.kek_check_value((dir.path / "nope.key").string()));
+    REQUIRE_FALSE(provider.kek_check_value((dir.path / "nope.key").string(), "sha256"));
+
+    // An algorithm this provider cannot compute (e.g. a token-derived KCV from
+    // a future HSM/KMS provider) returns nullopt rather than mis-verifying
+    // (S2; ADR-0010 Amendment 4).
+    REQUIRE_FALSE(provider.kek_check_value(*r1, "hsm-aes-kwp"));
 }
 
 TEST_CASE("FileKeyProvider: concurrent wrap vs delete_kek never resurrects a deleted KEK",

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <random>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,6 +21,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h>
 #else
 #include <cerrno>
 #include <cstring>
@@ -45,13 +47,11 @@ void set_owner_only_file(const fs::path& p) {
     if (ec)
         spdlog::warn("key_provider: could not set 0600 on {}: {}", p.string(), ec.message());
 #ifdef _WIN32
-        // POSIX bits are advisory on Windows; the data dir is created with a
-        // restrictive ACL by the installer/service account, and the dedicated
-        // service-account model (docs/agent-privilege-model.md) keeps the key
-        // unreadable by `Everyone`. A native SetNamedSecurityInfo owner-only DACL
-        // here is the cross-platform agent's follow-up (tracked for PR2 Windows
-        // wiring); flagged in the PR1 security-review notes so it is not silently
-        // assumed done.
+        // POSIX mode bits are advisory on Windows. The real custody control is
+        // the explicit, PROTECTED owner-only DACL applied in write_file_atomic
+        // (WinOwnerOnlyDacl) to both the key directory and the key file — that
+        // is what excludes `Users`/`Everyone` (ADR-0010 §Decision 2). This
+        // fs::permissions call is left as a harmless best-effort no-op.
 #endif
 }
 
@@ -73,6 +73,171 @@ std::string random_suffix() {
     }
     return s;
 }
+
+// Read exactly `n` bytes from `p` straight into `dst`, bypassing any
+// std::ifstream/filebuf heap buffer that would retain an unzeroized transient
+// copy of the key material (S4; ADR-0010 §Decision 2 — "the zeroization rule
+// covers every KEK representation"). The write path already uses raw FDs for
+// the same reason; the KEK read path now matches. Returns true iff exactly `n`
+// bytes were read (a short or over-long file fails).
+[[nodiscard]] bool read_exact(const fs::path& p, std::uint8_t* dst, std::size_t n) {
+#ifndef _WIN32
+    const int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    std::size_t off = 0;
+    bool ok = true;
+    while (off < n) {
+        const ssize_t r = ::read(fd, dst + off, n - off);
+        if (r < 0 && errno == EINTR)
+            continue; // benign signal interruption — retry
+        if (r <= 0) { // error or premature EOF
+            ok = false;
+            break;
+        }
+        off += static_cast<std::size_t>(r);
+    }
+    (void)::close(fd);
+    return ok && off == n;
+#else
+    const HANDLE h = ::CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    std::size_t off = 0;
+    bool ok = true;
+    while (off < n) {
+        DWORD got = 0;
+        const DWORD want =
+            (n - off) > 0x0FFFFFFF ? 0x0FFFFFFF : static_cast<DWORD>(n - off);
+        if (!::ReadFile(h, dst + off, want, &got, nullptr)) {
+            ok = false;
+            break;
+        }
+        if (got == 0) { // premature EOF
+            ok = false;
+            break;
+        }
+        off += got;
+    }
+    (void)::CloseHandle(h);
+    return ok && off == n;
+#endif
+}
+
+#ifdef _WIN32
+// Owner-only, PROTECTED DACL for the secrets KEK + CA key files and their
+// directory (S1; ADR-0010 §Decision 2 — on Windows the equivalent of POSIX
+// 0600/0700 is "a restrictive DACL granting only the service account").
+//
+// The bug this fixes: CreateFileW with a null lpSecurityAttributes lets the
+// new key file INHERIT the parent directory's ambient ACL — on a default
+// install `Users`/`Everyone` may have read access to the 32-byte KEK. The fix
+// is an explicit DACL granting FILE_ALL_ACCESS to the running account (the
+// service account), SYSTEM, and the local Administrators group, and nothing to
+// Users/Everyone, marked SE_DACL_PROTECTED so broader inheritable parent ACEs
+// are NOT merged. Callers FAIL CLOSED when ok() is false — never silently fall
+// back to ambient ACLs.
+class WinOwnerOnlyDacl {
+public:
+    WinOwnerOnlyDacl() { build(); }
+    ~WinOwnerOnlyDacl() {
+        if (acl_ != nullptr)
+            ::LocalFree(acl_);
+        if (admins_ != nullptr)
+            ::FreeSid(admins_);
+        if (system_ != nullptr)
+            ::FreeSid(system_);
+        // The user SID lives inside token_user_buf_ — no separate free.
+    }
+    WinOwnerOnlyDacl(const WinOwnerOnlyDacl&) = delete;
+    WinOwnerOnlyDacl& operator=(const WinOwnerOnlyDacl&) = delete;
+
+    [[nodiscard]] bool ok() const { return ok_; }
+
+    // SECURITY_ATTRIBUTES for CreateFileW: the explicit, protected DACL gives
+    // the new file an owner-only ACL from creation (no inheritance window).
+    [[nodiscard]] SECURITY_ATTRIBUTES* sa() { return ok_ ? &sa_ : nullptr; }
+
+    // Apply the protected DACL to an existing path (directory or file).
+    [[nodiscard]] bool apply_to(const std::wstring& path) {
+        if (!ok_)
+            return false;
+        std::wstring mutable_path = path; // SetNamedSecurityInfoW takes a mutable LPWSTR
+        const DWORD rc = ::SetNamedSecurityInfoW(
+            mutable_path.data(), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, acl_,
+            nullptr);
+        return rc == ERROR_SUCCESS;
+    }
+
+private:
+    void build() {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
+            return;
+        DWORD len = 0;
+        ::GetTokenInformation(token, TokenUser, nullptr, 0, &len); // size probe
+        if (len == 0) {
+            ::CloseHandle(token);
+            return;
+        }
+        token_user_buf_.resize(len);
+        if (!::GetTokenInformation(token, TokenUser, token_user_buf_.data(), len, &len)) {
+            ::CloseHandle(token);
+            return;
+        }
+        ::CloseHandle(token);
+        PSID user_sid = reinterpret_cast<TOKEN_USER*>(token_user_buf_.data())->User.Sid;
+
+        SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+        if (!::AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0,
+                                        &system_))
+            return;
+        if (!::AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins_))
+            return;
+
+        EXPLICIT_ACCESS_W ea[3] = {};
+        const auto grant = [](EXPLICIT_ACCESS_W& e, PSID sid) {
+            e.grfAccessPermissions = FILE_ALL_ACCESS;
+            e.grfAccessMode = SET_ACCESS;
+            e.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+            e.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            e.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+            e.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+        };
+        grant(ea[0], user_sid);
+        grant(ea[1], system_);
+        grant(ea[2], admins_);
+        if (::SetEntriesInAclW(3, ea, nullptr, &acl_) != ERROR_SUCCESS) {
+            acl_ = nullptr;
+            return;
+        }
+
+        if (!::InitializeSecurityDescriptor(&sd_, SECURITY_DESCRIPTOR_REVISION))
+            return;
+        if (!::SetSecurityDescriptorDacl(&sd_, TRUE, acl_, FALSE))
+            return;
+        // PROTECTED: a new file created with this SD does NOT merge broader
+        // inheritable ACEs from the parent — the actual inheritance-gap fix.
+        if (!::SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+            return;
+        sa_.nLength = sizeof(sa_);
+        sa_.bInheritHandle = FALSE;
+        sa_.lpSecurityDescriptor = &sd_;
+        ok_ = true;
+    }
+
+    std::vector<std::uint8_t> token_user_buf_;
+    PSID system_ = nullptr;
+    PSID admins_ = nullptr;
+    PACL acl_ = nullptr;
+    SECURITY_DESCRIPTOR sd_ = {};
+    SECURITY_ATTRIBUTES sa_ = {};
+    bool ok_ = false;
+};
+#endif // _WIN32
 
 } // namespace
 
@@ -154,6 +319,26 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         spdlog::warn("key_provider: could not set 0700 on {}: {}", base_dir_.string(),
                      ec.message()); // UP-13: files are 0600, so exposure is listing-only
 
+#ifdef _WIN32
+    // POSIX mode bits are advisory on Windows; the real owner-only control is
+    // an explicit PROTECTED DACL on the directory + key file (S1; ADR-0010
+    // §Decision 2). Build it once, apply to the directory now (so the temp
+    // file does not inherit an ambient parent ACL even before its own DACL is
+    // set), and FAIL CLOSED if it cannot be built/applied — never write key
+    // material under an inherited ACL.
+    WinOwnerOnlyDacl dacl;
+    if (!dacl.ok()) {
+        spdlog::error("key_provider: could not build owner-only DACL — refusing to write key "
+                      "file (ADR-0010 §Decision 2 Windows key custody)");
+        return false;
+    }
+    if (!dacl.apply_to(base_dir_.wstring())) {
+        spdlog::error("key_provider: could not apply owner-only DACL to {} (err {}) — refusing",
+                      base_dir_.string(), ::GetLastError());
+        return false;
+    }
+#endif
+
     const fs::path tmp = base_dir_ / (std::string(key_id) + ".key.tmp." + random_suffix());
 
 #ifndef _WIN32
@@ -211,14 +396,13 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         // CREATE_NEW = the O_EXCL analogue; FlushFileBuffers = the fsync
         // analogue. Wide-char API: fs::path is wchar_t on Windows and
         // path::string() converts through the ANSI code page (garbles
-        // non-ASCII base dirs); path::c_str() is already wchar_t*. POSIX
-        // mode bits are an approximation on Windows — the data dir carries
-        // a restrictive DACL granting only the service account
-        // (docs/agent-privilege-model.md); the native owner-only DACL
-        // remains the tracked follow-up flagged in the PR1 notes. Manual
-        // CloseHandle is the same documented RAII exception as the POSIX
-        // branch (checked close feeds the durability verdict).
-        const HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        // non-ASCII base dirs); path::c_str() is already wchar_t*. The
+        // explicit owner-only PROTECTED DACL (dacl.sa()) gives the new file an
+        // owner-only ACL from creation — no inheritance window where
+        // `Users`/`Everyone` could read the key (S1; ADR-0010 §Decision 2).
+        // Manual CloseHandle is the same documented RAII exception as the
+        // POSIX branch (checked close feeds the durability verdict).
+        const HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, dacl.sa(), CREATE_NEW,
                                        FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             spdlog::error("key_provider: cannot open temp {} (err {})", tmp.string(),
@@ -249,7 +433,7 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         }
     }
 #endif
-    set_owner_only_file(tmp); // POSIX: re-assert; Windows: best-effort + ACL TODO (PR2)
+    set_owner_only_file(tmp); // POSIX: re-assert 0600; Windows: no-op (DACL set at creation)
 
     fs::rename(tmp, dest, ec); // same-directory rename is atomic on POSIX + Windows
     if (ec) {
@@ -259,6 +443,14 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
         return false;
     }
     set_owner_only_file(dest); // re-assert in case rename reset perms
+#ifdef _WIN32
+    // The temp file already carried the owner-only DACL through the rename;
+    // re-assert on the final path as belt-and-braces (warn, not fail — the
+    // material is already written with the correct ACL).
+    if (!dacl.apply_to(dest.wstring()))
+        spdlog::warn("key_provider: could not re-apply owner-only DACL to {} after rename (err {})",
+                     dest.string(), ::GetLastError());
+#endif
 
 #ifndef _WIN32
     // Make the RENAME durable, not just the file contents (governance
@@ -428,9 +620,7 @@ const SecureBuffer* FileKeyProvider::kek_for_locked(std::string_view key_ref) {
         return nullptr;
     }
     SecureBuffer kek{kKekSize};
-    std::ifstream in(p, std::ios::binary);
-    if (!in ||
-        !in.read(reinterpret_cast<char*>(kek.data()), static_cast<std::streamsize>(kek.size()))) {
+    if (!read_exact(p, kek.data(), kKekSize)) {
         spdlog::error("key_provider: cannot read KEK {}", p.string());
         return nullptr;
     }
@@ -492,7 +682,18 @@ FileKeyProvider::unwrap_dek(std::string_view key_ref, const WrappedDek& wrapped,
 }
 
 std::optional<std::array<std::uint8_t, 32>>
-FileKeyProvider::kek_check_value(std::string_view key_ref) {
+FileKeyProvider::kek_check_value(std::string_view key_ref, std::string_view kcv_alg) {
+    if (kcv_alg != "sha256") {
+        // FileKeyProvider derives KCVs as SHA-256 of the raw key material. A
+        // version minted under a different algorithm (e.g. a token-derived KCV
+        // after a FileKeyProvider → HSM/KMS swap) cannot be reproduced here —
+        // return nullopt so boot raises a distinct, actionable error instead
+        // of mis-flagging valid material as corrupt (S2; ADR-0010 Amendment 4).
+        spdlog::error("key_provider: unsupported kcv_alg '{}' for FileKeyProvider (expected "
+                      "'sha256')",
+                      std::string(kcv_alg));
+        return std::nullopt;
+    }
     std::lock_guard lock{kek_mutex_};
     const SecureBuffer* kek = kek_for_locked(key_ref);
     if (kek == nullptr)

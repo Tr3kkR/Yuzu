@@ -99,6 +99,37 @@ void set_blob_kek_version(std::vector<std::uint8_t>& blob, std::uint32_t v) {
     blob[SecretCodec::kKekVersionOffset + 3] = static_cast<std::uint8_t>(v);
 }
 
+// Delegates every KEK op to an inner FileKeyProvider but forces delete_kek to
+// fail — exercises the S3 "destruction unconfirmed" retire path (a real HSM
+// outage / permissions failure).
+class FailingDeleteProvider : public yuzu::server::KekProvider {
+public:
+    explicit FailingDeleteProvider(FileKeyProvider& inner) : inner_(inner) {}
+    std::optional<std::string> generate_kek(std::string_view id) override {
+        return inner_.generate_kek(id);
+    }
+    std::optional<std::string> resolve_kek(std::string_view id) override {
+        return inner_.resolve_kek(id);
+    }
+    std::expected<yuzu::server::WrappedDek, yuzu::server::KekError>
+    wrap_dek(std::string_view ref, std::span<const std::uint8_t, 32> dek,
+             std::span<const std::uint8_t> aad) override {
+        return inner_.wrap_dek(ref, dek, aad);
+    }
+    std::expected<yuzu::server::SecureBuffer, yuzu::server::KekError>
+    unwrap_dek(std::string_view ref, const yuzu::server::WrappedDek& w,
+               std::span<const std::uint8_t> aad) override {
+        return inner_.unwrap_dek(ref, w, aad);
+    }
+    std::optional<std::array<std::uint8_t, 32>> kek_check_value(std::string_view ref,
+                                                                std::string_view alg) override {
+        return inner_.kek_check_value(ref, alg);
+    }
+    bool delete_kek(std::string_view) override { return false; } // forced failure
+private:
+    FileKeyProvider& inner_;
+};
+
 } // namespace
 
 #ifdef YUZU_TEST_ENABLE_PG
@@ -226,6 +257,16 @@ TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][s
     REQUIRE(empty.has_value());
     REQUIRE(empty->size() == SecretCodec::kMinBlobSize);
     REQUIRE(codec.decrypt(id, *empty).has_value());
+
+    // Oversized plaintext is rejected (S12) — never allowed to throw
+    // std::bad_alloc through the std::expected error contract. The ceiling
+    // itself is accepted.
+    std::vector<std::uint8_t> over(SecretCodec::kMaxPlaintextSize + 1, 0x5A);
+    auto over_r = codec.encrypt(id, over);
+    REQUIRE_FALSE(over_r.has_value());
+    REQUIRE(over_r.error().cls == SecretCodec::FailureClass::crypto_failure);
+    std::vector<std::uint8_t> at_max(SecretCodec::kMaxPlaintextSize, 0x5A);
+    REQUIRE(codec.encrypt(id, at_max).has_value());
 }
 
 TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
@@ -312,6 +353,20 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
     SECTION("flipped data tag byte") {
         auto t = *blob;
         t[SecretCodec::kDataTagOffset] ^= 0x01;
+        auto r = codec.decrypt(id, t);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().cls == SecretCodec::FailureClass::tag_mismatch);
+    }
+    SECTION("flipped wrap tag byte (S7 — wrap-layer tamper at the codec boundary)") {
+        auto t = *blob;
+        t[SecretCodec::kWrapTagOffset] ^= 0x01;
+        auto r = codec.decrypt(id, t);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().cls == SecretCodec::FailureClass::tag_mismatch);
+    }
+    SECTION("flipped wrapped-DEK byte (S7 — wrap-layer tamper at the codec boundary)") {
+        auto t = *blob;
+        t[SecretCodec::kWrappedDekOffset] ^= 0x01;
         auto r = codec.decrypt(id, t);
         REQUIRE_FALSE(r.has_value());
         REQUIRE(r.error().cls == SecretCodec::FailureClass::tag_mismatch);
@@ -642,5 +697,107 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
     REQUIRE(hook_calls == 0);
     REQUIRE(uninitialized.decrypt_failure_counts().empty());
 }
+
+TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+
+    // Boot, register the column, encrypt + store a v1 blob.
+    {
+        SecretCodec codec(provider);
+        REQUIRE(codec.init(conn.get()).has_value());
+        create_test_table(conn.get());
+        REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+        auto blob = codec.encrypt(test_id(42), bytes_of("totp-seed"));
+        REQUIRE(blob.has_value());
+        upsert_secret(conn.get(), 42, *blob);
+    }
+
+    // Simulate a deleted registration (operator error or a targeted SQL-write
+    // attack): wipe kek_meta. The stored blob still references v1. A fresh boot
+    // must NOT treat this as first-boot and silently mint a new KEK (which
+    // would permanently orphan the row) — it must fail closed (S6).
+    REQUIRE(PgResult{PQexec(conn.get(), "DELETE FROM secrets.kek_meta")}.ok());
+
+    SecretCodec codec2(provider);
+    REQUIRE(codec2.register_secret_column({"tstore", "things", "secret", "id"}));
+    auto r = codec2.init(conn.get());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().kind == SecretCodec::InitError::Kind::kek_orphaned);
+    REQUIRE(codec2.active_kek_version() == 0); // no fresh KEK was minted
+}
+
+TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+
+    PgResult schema{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore")};
+    REQUIRE(schema.ok());
+    // INTEGER (int4) pk: its 4-byte binary width differs from the canonical
+    // 8-byte-BE AAD encoding, so rotation would brick with a spurious
+    // tag_mismatch. init() must reject it up front (the int4/SERIAL footgun).
+    PgResult table{PQexec(conn.get(), "CREATE TABLE tstore.intpk ("
+                                      "  id     INTEGER PRIMARY KEY,"
+                                      "  secret BYTEA"
+                                      ")")};
+    REQUIRE(table.ok());
+
+    SecretCodec codec(provider);
+    REQUIRE(codec.register_secret_column({"tstore", "intpk", "secret", "id"}));
+    auto r = codec.init(conn.get());
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().kind == SecretCodec::InitError::Kind::unsupported_pk_type);
+}
+
+TEST_CASE("SecretCodec: retire with failed key deletion records no false destruction",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir keys;
+    FileKeyProvider file_provider(keys.path);
+    FailingDeleteProvider provider(file_provider); // delete_kek always fails
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    std::vector<std::string> audit_verbs;
+    codec.set_audit_hook(
+        [&](std::string_view verb, const std::string&) { audit_verbs.emplace_back(verb); });
+
+    // Store a v1 blob, rotate to v2, rewrap it so v1 has zero references.
+    auto blob = codec.encrypt(test_id(42), bytes_of("seed"));
+    REQUIRE(blob.has_value());
+    upsert_secret(conn.get(), 42, *blob);
+    REQUIRE(codec.rotate_kek(conn.get()).has_value()); // rewraps the row to v2
+    REQUIRE(codec.oldest_kek_version_in_use(conn.get()).value().value() == 2);
+
+    // retire v1: the metadata UPDATE succeeds but delete_kek fails → retire
+    // must return an error and NOT emit kek.retired (no false destruction
+    // evidence — S3).
+    auto r = codec.retire_kek(conn.get(), 1);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(std::count(audit_verbs.begin(), audit_verbs.end(), "kek.retired") == 0);
+
+    // retired_at IS recorded (crash-safe: the version is excluded from boot
+    // verification, so the orphaned key file is harmless until removed).
+    PgResult meta{PQexec(conn.get(), "SELECT count(*) FROM secrets.kek_meta"
+                                     " WHERE kek_version = 1 AND retired_at IS NOT NULL")};
+    REQUIRE(meta.status() == PGRES_TUPLES_OK);
+    REQUIRE(std::string{PQgetvalue(meta.get(), 0, 0)} == "1");
+}
+
+// TODO(S10): a true concurrent-CAS race test — spawn a thread doing
+// encrypt()+upsert against a row while rewrap_all() runs, asserting
+// cas_skipped > 0 and the row ends on the concurrently-written value. Deferred:
+// needs a deterministic interleave harness to avoid flakiness on the shared
+// PG test instance. The idempotent-resume path is covered above.
+// TODO(S11): exercise the GcmResult::error → FailureClass::crypto_failure
+// decrypt path; needs an OpenSSL/EVP fault-injection seam (not yet available).
 
 #endif // YUZU_TEST_ENABLE_PG

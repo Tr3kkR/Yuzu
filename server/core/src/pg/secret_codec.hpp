@@ -58,6 +58,13 @@ public:
     static constexpr std::size_t kDataTagOffset = 77;
     static constexpr std::size_t kCiphertextOffset = 93;
     static constexpr std::size_t kMinBlobSize = kCiphertextOffset;
+
+    /// Upper bound on a single secret's plaintext (S12): a buggy store passing
+    /// an enormous span would otherwise throw std::bad_alloc straight through
+    /// the std::expected error contract at blob allocation. Every secret-
+    /// bearing column (TOTP seeds, webhook/OIDC secrets, offload creds) is far
+    /// under this; encrypt() rejects oversized input with crypto_failure.
+    static constexpr std::size_t kMaxPlaintextSize = 64 * 1024;
     // INVARIANT: the rotation/retirement header scans read kek_version at
     // its fixed offset WITHOUT checking the version byte — any future blob
     // v2 must keep kek_version at offset 1 or update those scans in the
@@ -75,12 +82,25 @@ public:
     };
     [[nodiscard]] static std::string_view to_string(FailureClass cls);
 
-    /// Codec error. `message` carries identifiers and class only — never
-    /// ciphertext, plaintext, DEK, or key bytes (ADR zeroization/audit rule).
+    /// Codec error. `cls` is the internal failure class (drives the metric +
+    /// audit). `message` is a GENERIC operator-facing string that deliberately
+    /// does NOT embed the failure class, so a wiring PR that logs or forwards
+    /// it cannot leak a decrypt-vs-not-found / tamper / existence oracle
+    /// (S5; ADR-0010 §Decision 1) — the rich class + detail goes only to the
+    /// server-side log line and the audit event. NEVER carries ciphertext,
+    /// plaintext, DEK, or key bytes.
     struct Error {
         FailureClass cls;
         std::string message;
     };
+
+    /// The single, generic string an EXTERNAL surface (a REST/MCP response, or
+    /// any log forwarded to a client) may show for ANY decrypt failure — it
+    /// collapses every FailureClass to one indistinguishable value so no
+    /// caller can build a tamper/existence oracle. Wiring PRs MUST map an
+    /// `Error` through this and never forward `Error::message`/`cls` outward
+    /// (S5; ADR-0010 §Decision 1) — the safe path is the easy path.
+    [[nodiscard]] static std::string_view to_external_error();
 
     /// Boot-verification failure taxonomy (typed so callers and tests gate
     /// on the discriminant, never on message wording — governance qe-B1).
@@ -93,6 +113,8 @@ public:
         enum class Kind {
             kek_unresolvable, ///< registered version has no key material (backup skew / wrong dir / second server)
             kek_corrupt,      ///< key material present but fingerprint mismatch (torn/corrupt/foreign file)
+            kek_orphaned,     ///< a stored blob references a kek_version absent from kek_meta (deleted registration / targeted availability attack — S6)
+            unsupported_pk_type, ///< a registered secret column's pk_column has no canonical AAD encoding (only BIGINT / text types are supported)
             provider_failure, ///< generation/check-value failure (CSPRNG, storage)
             db_error,         ///< migration/query/commit failure
         } kind;
@@ -120,9 +142,15 @@ public:
     /// A registered secret-bearing column — the rotation scan,
     /// oldest_kek_version_in_use() and retirement refusal all walk this
     /// registry. Identifiers are validated (lowercase SQL identifier rule)
-    /// at registration. No pk-type discriminator is needed: scans use
-    /// binary libpq results, whose bytes ARE the canonical AAD encoding for
-    /// every supported pk type (BIGINT → 8-byte BE, TEXT → raw bytes).
+    /// at registration. Scans use binary libpq results, whose bytes ARE the
+    /// canonical AAD encoding ONLY for the supported pk types: **BIGINT**
+    /// (→ encode_bigint_pk, 8-byte BE) and **text types** (text / varchar /
+    /// char → raw bytes). int4 / SERIAL / smallint / uuid / numeric are
+    /// UNSUPPORTED — their binary width differs from the canonical AAD
+    /// encoding, which would brick rotation with a spurious tag_mismatch.
+    /// init() validates each registered pk_column's catalog type and fails
+    /// closed (InitError::unsupported_pk_type) rather than letting that
+    /// footgun reach production (the int4/SERIAL-PK finding).
     struct SecretColumn {
         std::string store; ///< Postgres schema
         std::string table;
