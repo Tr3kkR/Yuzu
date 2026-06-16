@@ -180,6 +180,7 @@ tar_test_exe = executable(
     'unit/test_tar_proc_perf.cpp',
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
+    'unit/test_tar_module_stream.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',

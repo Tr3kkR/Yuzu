@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
+  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  image-load activity (module name + directory + code-signing verdict) — the
+  DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
+  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
+  opt-in (`module_enabled`, default off). The process-stream ring is promoted to
+  a reusable `EventRing<T>` template (no behaviour change for the `process`
+  source), and `run_aggregation` is now data-driven over the capture-source
+  registry so a newly-registered source's rollups can no longer be silently
+  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
 - **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
   The TAR `process` source on macOS now feeds from the Endpoint Security
   `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl

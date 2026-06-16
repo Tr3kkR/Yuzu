@@ -248,3 +248,45 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     CHECK(tcp_remaining > 0);                       // enabled, partially aged
     CHECK(tcp_remaining < 48);
 }
+
+// ── $Module rollup wiring (M1 hardening — governance UP-1 / architect BLOCKING) ─
+
+TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
+          "[tar][module][rollup]") {
+    // run_aggregation is now data-driven over capture_sources(); this proves the
+    // $Module hourly rollup actually executes (the old hand-maintained steps[]
+    // array omitted it, so the registered rollup SQL was dead code) AND that
+    // load_count counts only the 'loaded' action — a 'blocked' BYOVD load stays
+    // full-fidelity in module_live but is excluded from the aggregate count.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-module-rollup-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (an hour boundary)
+    auto insert_module = [&](std::string_view action) {
+        REQUIRE(db.execute_sql(std::format(
+            "INSERT INTO module_live "
+            "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
+            "signed_state,signer,is_kernel) "
+            "VALUES ({}, 1, '{}', 100, 'app.exe', 'evil.dll', 'appdir', "
+            "'unsigned', '', 0)",
+            t0, action)));
+    };
+    insert_module("loaded");
+    insert_module("loaded");
+    insert_module("loaded");
+    insert_module("blocked"); // excluded from load_count, retained in module_live
+
+    REQUIRE(row_count(db, "module_live") == 4);
+    REQUIRE(row_count(db, "module_hourly") == 0);
+
+    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
+
+    REQUIRE(row_count(db, "module_hourly") == 1);
+    auto res = db.execute_query("SELECT load_count FROM module_hourly");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(std::stoll(res->rows[0][0]) == 3); // 3 'loaded'; 'blocked' not counted
+}
