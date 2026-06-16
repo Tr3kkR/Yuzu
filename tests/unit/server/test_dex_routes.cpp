@@ -147,11 +147,14 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
 
 TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    const auto html = render_dex_catalogue_fragment(&store, "", 7);
+    // windows connected → all 107 catalogue types are monitored (coverage-first).
+    const auto html =
+        render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
-    CHECK(html.find("All 107 monitored signal types") != std::string::npos);
+    CHECK(html.find("actively monitored") != std::string::npos);
+    CHECK(html.find("of 107 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -342,7 +345,7 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
     GuaranteedStateStore store(":memory:");
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", kDayB + "T10:00:00Z");
-    auto html = render_dex_catalogue_fragment(&store, "", 7);
+    auto html = render_dex_catalogue_fragment(&store, "", 7, DexFleet{}, "all");
     CHECK(html.find("future.signal_type") != std::string::npos);
     CHECK(html.find(">Other") != std::string::npos);
 }

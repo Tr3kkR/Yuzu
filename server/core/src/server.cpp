@@ -7914,6 +7914,12 @@ private:
                         // (G4 UP-1; pre-existing here, fixed with the sibling).
                         if (os.starts_with("win"))
                             ++f.windows_online;
+                        // Distinct connected OS tokens → the Catalogue's "All
+                        // connected" coverage scope (render normalises darwin→macos).
+                        if (!os.empty() && std::find(f.connected_os.begin(),
+                                                     f.connected_os.end(), os) ==
+                                               f.connected_os.end())
+                            f.connected_os.push_back(os);
                     }
                 }
                 return f;

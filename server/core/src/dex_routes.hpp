@@ -48,6 +48,10 @@ class HttpRouteSink;
 struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
+    /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
+    /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
+    /// lens. Empty when nothing is connected.
+    std::vector<std::string> connected_os;
 };
 
 /// One display family of the server-side signal catalogue. PUBLIC since F1:
@@ -89,10 +93,20 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days,
                                          DexFleet fleet);
 
-/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue.html), each a drill
-/// into its family. Reuses dex_signal_summary + dex_signal_groups. Pure + free.
+/// Per-obs_type platform coverage: which OSes collect this signal type today
+/// (windows = the whole catalogue; linux/macos = the collector subsets). The thin
+/// explicit map the Catalogue's coverage view reads; keep in sync with the agent
+/// collectors (a schema↔catalogue cross-check test guards drift — H2/G9 style).
+std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
+
+/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
+/// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
+/// "all"|"windows"|"linux"|"macos") collects one of its types — not merely when a
+/// signal fired. Each card carries a roll-up health score (100 − the family's
+/// dex_compute_health deduction). `fleet.connected_os` is the "all" scope. Pure + free.
 std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
-                                          const std::string& since, int window_days);
+                                          const std::string& since, int window_days,
+                                          const DexFleet& fleet, const std::string& os_filter);
 
 /// Catalogue View 2 — one family's signals (visibility contract: every catalogued
 /// type, quiet ones muted). `group_name` is allowlisted against dex_signal_groups().

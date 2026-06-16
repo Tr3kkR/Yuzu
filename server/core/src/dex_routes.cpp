@@ -120,6 +120,41 @@ std::size_t dex_catalogued_type_count() {
     return n;
 }
 
+// Per-obs_type platform coverage — which OSes collect a signal type today. Windows
+// is the whole EvtSubscribe catalogue; Linux (dex_linux_*) and macOS (dex_macos_*)
+// collect the subsets below. THIN explicit map (the one bit of new grouping) — keep
+// in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
+std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
+    static const char* const kLinux[] = {"perf.cpu_sustained", "perf.memory_pressure",
+                                          "storage.low", "os.uptime_report", "process.crashed",
+                                          "service.crashed", "memory.exhausted"};
+    static const char* const kMac[] = {
+        "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
+        "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",
+        "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
+        "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
+    auto in = [&](const char* const* arr, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i)
+            if (obs_type == arr[i])
+                return true;
+        return false;
+    };
+    std::vector<std::string> out;
+    out.emplace_back("windows"); // the catalogue IS the Windows EvtSubscribe set
+    if (in(kLinux, std::size(kLinux)))
+        out.emplace_back("linux");
+    if (in(kMac, std::size(kMac)))
+        out.emplace_back("macos");
+    return out;
+}
+
+// One family's slice of the canonical health composite — the SAME formula as
+// dex_compute_health (severity × default-preset × device-impact), for one family.
+// Forward-declared here (used by the Catalogue above its definition); defined just
+// after dex_compute_health below so it shares the family-weights helpers.
+double dex_family_health_deduction(const DexSignalGroup& g,
+                                   const std::vector<DexSignalCount>& signals, int64_t N);
+
 // Friendly display label for an obs_type — the ONE place the catalogue taxonomy
 // meets the UI. Unknown types fall back to the escaped raw obs_type, so a signal
 // added agent-side renders (uglier but correct) with NO server change.
@@ -443,49 +478,121 @@ DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
 // signal. Reuses dex_signal_summary + dex_signal_groups; the per-signal drill
 // (View 3) needs a generic per-obs_type read-model and lands next.
 std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
-                                          const std::string& since, int window_days) {
+                                          const std::string& since, int window_days,
+                                          const DexFleet& fleet, const std::string& os_filter) {
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     const std::string w = dex_window_token(window_days);
     const auto signals = store->dex_signal_summary(since);
 
+    // -- Coverage scope: which platforms are in view ("all" = connected fleet) --
+    auto norm = [](std::string o) -> std::string {
+        for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (o.starts_with("win")) return "windows";
+        if (o == "darwin" || o == "macos") return "macos";
+        if (o.starts_with("lin")) return "linux";
+        return o;
+    };
+    const std::string osf = (os_filter == "windows" || os_filter == "linux" || os_filter == "macos")
+                                ? os_filter
+                                : "all";
+    std::vector<std::string> scope;
+    if (osf == "all") {
+        for (const auto& o : fleet.connected_os) {
+            auto n = norm(o);
+            if (std::find(scope.begin(), scope.end(), n) == scope.end())
+                scope.push_back(n);
+        }
+    } else {
+        scope.push_back(osf);
+    }
+    auto in_scope = [&](const std::string& p) {
+        return std::find(scope.begin(), scope.end(), p) != scope.end();
+    };
+    auto monitored = [&](const std::string& t) {
+        for (const auto& p : dex_obs_platforms(t))
+            if (in_scope(p))
+                return true;
+        return false;
+    };
+
+    // -- Per-family health score: the ONE canonical composite, projected per family
+    // (score = 100 − that family's deduction; same formula as dex_compute_health).
+    // Windows-denominated today (the existing fleet composite); a per-OS read is the
+    // shared follow-up. --
+    std::size_t total_types = dex_catalogued_type_count();
+    std::size_t mon_types = 0;
+    for (const auto& g : dex_signal_groups())
+        for (const char* t : g.types)
+            if (monitored(t))
+                ++mon_types;
+
     std::string h;
     h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Signal catalogue</h1></div>"
-         "<div class=\"gp-sub\">All " +
-         std::to_string(dex_catalogued_type_count()) + " monitored signal types, grouped into " +
-         std::to_string(dex_signal_groups().size()) +
-         " families. Click a family to see its signals. Quiet families are dimmed but never "
-         "hidden &mdash; you see everything the fleet watches for.</div></div></div>";
+         "<div class=\"gp-sub\"><b>" +
+         num(static_cast<int64_t>(mon_types)) + "</b> of " +
+         num(static_cast<int64_t>(total_types)) + " signal types <b>actively monitored</b> " +
+         (osf == "all" ? "across your connected platforms" : "on " + osf) +
+         ". A family lights when a connected platform <b>collects</b> the signal &mdash; not just "
+         "when it fired. Quiet checks read as <i>watched</i>, never <i>missing</i>.</div></div></div>";
+
+    // OS filter (Catalogue-style, shared with the device/overview surfaces).
+    {
+        auto chip = [&](const char* val, const char* label) {
+            const std::string on = (osf == val) ? " on" : "";
+            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/catalogue?window=" + w +
+                   "&os=" + val + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+                   label + "</a>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">OS</span>" +
+             chip("all", "All connected") + chip("windows", "Windows") + chip("linux", "Linux") +
+             chip("macos", "macOS") + "</div>";
+    }
     h += dex_window_chips("/fragments/dex/catalogue", window_days);
 
     h += "<div class=\"gp-fgrid\">";
     for (const auto& g : dex_signal_groups()) {
         const auto r = dex_family_rollup(g, signals);
-        const bool quiet = r.events == 0;
-        const char* tone = r.benign ? "ok" : (quiet ? "" : "warn");
-        h += "<a class=\"gp-fcard" + std::string(quiet ? " quiet" : "") +
+        int mon = 0;
+        for (const char* t : g.types)
+            if (monitored(t))
+                ++mon;
+        const bool dark = (mon == 0);
+        double score = -1.0;
+        if (!dark && fleet.windows_online > 0)
+            score = std::clamp(
+                100.0 - dex_family_health_deduction(g, signals, fleet.windows_online), 0.0, 100.0);
+        const char* tone =
+            score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
+        h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
              "\" hx-get=\"/fragments/dex/catalogue/group?name=" + url_encode(g.name) +
              "&window=" + w + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
-        h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(r.active) + " of " +
-             num(r.total) + " active</span></div>";
-        h += "<div class=\"fev " + std::string(tone) + "\">" + num(r.events) + "</div>";
-        h += "<div class=\"fmeta\">" + std::string(r.benign ? "reports" : "events") + " &middot; " +
-             num(r.devices) + " devices</div>";
-        if (r.benign)
-            h += "<div class=\"ftop\">mostly benign duration reports</div>";
-        else if (r.top && r.top->count > 0)
-            h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> leads (" +
-                 num(r.top->count) + ")</div>";
+        h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
+             num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
+        if (score < 0)
+            h += "<div class=\"fev\">&mdash;</div>";
         else
-            h += "<div class=\"ftop\">no events in this window</div>";
+            h += "<div class=\"fev " + std::string(tone) + "\">" +
+                 std::to_string(static_cast<int>(score + 0.5)) + "</div>";
+        h += "<div class=\"fmeta\">" +
+             std::string(dark ? "not collected on your fleet" : "health score") + "</div>";
+        if (dark)
+            h += "<div class=\"ftop\">no connected platform watches these</div>";
+        else if (r.events > 0 && r.top)
+            h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> &middot; " +
+                 num(r.events) + " events</div>";
+        else
+            h += "<div class=\"ftop\">monitored &middot; nothing fired</div>";
         h += "</a>";
     }
     h += "</div>";
-    h += "<div class=\"gp-note\">Counts are over reporting devices. Quiet families are real zeros "
-         "(monitored, nothing happened), not missing data &mdash; a 0 on an OS that doesn't collect "
-         "a type reads as <b>not collected</b>, never <b>healthy</b>.</div>";
+    h += "<div class=\"gp-note\">Score = the family's slice of the fleet health composite "
+         "(100 &minus; its deduction). <b>Monitored</b> = a connected platform collects the type; "
+         "dimmed = nothing in view watches it (<b>not</b> &ldquo;healthy&rdquo;). Use the OS filter "
+         "to read coverage within a platform.</div>";
 
     // Forward-compat: any obs_type a newer agent emits that isn't catalogued in a
     // family yet surfaces here under "Other" — seen on the wire, just not curated
@@ -825,6 +932,22 @@ DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, i
     }
     r.score = std::clamp(100.0 - total, 0.0, 100.0);
     return r;
+}
+
+// One family's deduction — the per-family term of dex_compute_health above, factored
+// out so the Catalogue's per-card score is provably the SAME number (default preset).
+double dex_family_health_deduction(const DexSignalGroup& g,
+                                   const std::vector<DexSignalCount>& signals, int64_t N) {
+    if (N <= 0)
+        return 0.0;
+    const DexFamilyRollup rr = dex_family_rollup(g, signals);
+    double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+    if (impact > 1.0)
+        impact = 1.0;
+    for (const auto& fw : dex_family_weights())
+        if (std::string(fw.name) == g.name)
+            return dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
+    return 0.0;
 }
 
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
@@ -1967,7 +2090,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string since = iso_days_ago(window_days);
-        res.set_content(render_dex_catalogue_fragment(store_, since, window_days),
+        const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
+        const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
+        res.set_content(render_dex_catalogue_fragment(store_, since, window_days, fleet, os),
                         "text/html; charset=utf-8");
     });
     sink.Get("/fragments/dex/catalogue/group",
