@@ -7924,6 +7924,18 @@ private:
             // and of those the Windows ones (the only OS with a crash collector
             // today — the coverage-honest crash-free denominator). Real data; an
             // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            //
+            // SCOPING NOTE (PR #1522 re-review): this provider is intentionally
+            // fleet-wide and is NOT an enumeration vector — it renders NO agent_ids.
+            // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
+            // score-distribution histogram). The device-id LISTS the re-review flagged
+            // get their ids from the per-OBSERVATION store queries (dex_top_devices /
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
+            // scoped to the caller's management groups (VisibleSetFn). So the
+            // enumeration is closed independent of this provider. True per-TENANT
+            // aggregate RATES would also need the store-side crash/signal NUMERATORS
+            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
+            // scoping the denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();
