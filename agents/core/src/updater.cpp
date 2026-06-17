@@ -59,6 +59,34 @@ namespace {
 
 namespace pb = ::yuzu::agent::v1;
 
+// RAII publisher for the in-flight OTA RPC context. Stores `&ctx` into the
+// Updater's `active_rpc_ctx_` slot for the lifetime of a blocking RPC (the
+// unary CheckForUpdate or the streaming DownloadUpdate read loop) and clears
+// the slot before `ctx` is destroyed (declared after `ctx`, so destroyed
+// first). stop() reads the slot and TryCancel()s the context, unblocking a
+// stalled OTA call so a shutdown can't hang the update-thread join (#1434
+// UP-1). The residual store/cancel/destroy window matches the long-standing
+// AgentImpl::heartbeat_ctx_ pattern; gRPC TryCancel on a completed RPC is a
+// documented no-op.
+struct ActiveRpcCtxGuard {
+    // The slot type-erases a grpc::ClientContext* as void* so the public
+    // updater.hpp need not pull in grpc headers. stop() static_casts it back to
+    // the identical static type, which the standard guarantees round-trips for
+    // any object pointer regardless of width — the real precondition (store and
+    // load the same ClientContext* type, no base-class slicing) holds by
+    // construction. The width assert is belt-and-suspenders: it documents intent
+    // and trips only on a hypothetical non-flat-pointer ABI.
+    static_assert(sizeof(void*) == sizeof(grpc::ClientContext*),
+                  "void* slot cannot round-trip a grpc::ClientContext*");
+    std::atomic<void*>& slot;
+    ActiveRpcCtxGuard(std::atomic<void*>& s, grpc::ClientContext& ctx) : slot(s) {
+        slot.store(&ctx, std::memory_order_release);
+    }
+    ~ActiveRpcCtxGuard() { slot.store(nullptr, std::memory_order_release); }
+    ActiveRpcCtxGuard(const ActiveRpcCtxGuard&) = delete;
+    ActiveRpcCtxGuard& operator=(const ActiveRpcCtxGuard&) = delete;
+};
+
 // ── SHA-256 incremental hasher ─────────────────────────────────────────────
 
 class Sha256Hasher {
@@ -278,6 +306,13 @@ Updater::Updater(UpdateConfig config, std::string agent_id, std::string current_
 
 void Updater::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
+    // Unblock an in-flight OTA RPC. The stop flag alone is only observed
+    // BETWEEN download chunks (and not at all during a stalled CheckForUpdate),
+    // so a sick-but-not-dead server that withholds a chunk would otherwise park
+    // reader->Read() / CheckForUpdate() indefinitely and hang the update-thread
+    // join during shutdown (#1434 UP-1). TryCancel aborts the blocking call.
+    if (void* p = active_rpc_ctx_.load(std::memory_order_acquire))
+        static_cast<grpc::ClientContext*>(p)->TryCancel();
 }
 
 std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
@@ -307,7 +342,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     grpc::ClientContext check_ctx;
     pb::CheckForUpdateResponse check_resp;
-    grpc::Status check_status = stub->CheckForUpdate(&check_ctx, check_req, &check_resp);
+    grpc::Status check_status;
+    {
+        // Publish check_ctx for the blocking unary call; cleared on block exit
+        // (before check_ctx is destroyed) so stop() never cancels a stale ctx.
+        ActiveRpcCtxGuard ctx_guard{active_rpc_ctx_, check_ctx};
+        check_status = stub->CheckForUpdate(&check_ctx, check_req, &check_resp);
+    }
 
     if (!check_status.ok()) {
         return std::unexpected(UpdateError{
@@ -480,6 +521,11 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     grpc::ClientContext dl_ctx;
     auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
+    // Publish dl_ctx for the whole streaming read below. Declared after dl_ctx
+    // so it is destroyed first on ANY exit from here — including every
+    // cleanup_and_fail early return inside the loop — clearing the slot before
+    // dl_ctx dies. stop() TryCancels this to abort a stalled reader->Read().
+    ActiveRpcCtxGuard dl_guard{active_rpc_ctx_, dl_ctx};
 
     // Cleanup helper: on Windows the path-based fs::remove fails with
     // ERROR_SHARING_VIOLATION while h_guard holds the file with dwShareMode=0,
