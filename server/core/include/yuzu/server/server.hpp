@@ -66,6 +66,14 @@ struct Config {
         return data_dir.empty() ? auth_config_path.parent_path() : data_dir;
     }
 
+    // PostgreSQL server storage substrate (ADR-0006/0007). libpq conninfo —
+    // keyword/value or URI form — for the shared PgPool every Postgres-backed
+    // server store uses. Wired via --postgres-dsn / YUZU_POSTGRES_DSN. The
+    // server FAILS CLOSED (ADR-0007, no SQLite fallback) when this is empty or
+    // the pool cannot reach the database: startup_failed() is set and run()
+    // returns non-zero. The agent stays SQLite; this is server-only.
+    std::string postgres_dsn;
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding

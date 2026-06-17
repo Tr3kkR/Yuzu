@@ -141,6 +141,11 @@ int main(int argc, char* argv[]) {
     app.add_option("--data-dir", cfg.data_dir,
                    "Data directory for SQLite DBs (default: same directory as config file)")
         ->envname("YUZU_DATA_DIR");
+    app.add_option("--postgres-dsn", cfg.postgres_dsn,
+                   "PostgreSQL connection string (libpq conninfo or URI) for the server "
+                   "storage substrate. REQUIRED — the server fails closed without a reachable "
+                   "database (ADR-0006/0007). The agent stays SQLite.")
+        ->envname("YUZU_POSTGRES_DSN");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");

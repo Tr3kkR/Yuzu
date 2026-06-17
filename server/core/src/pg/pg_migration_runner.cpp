@@ -1,5 +1,6 @@
 #include "pg_migration_runner.hpp"
 
+#include "pg_exec.hpp"
 #include "pg_raii.hpp"
 
 #include <spdlog/spdlog.h>
@@ -34,11 +35,11 @@ constexpr const char* kAdvisoryLockSql =
 // Startup-only, so the brief global serialization is free.
 constexpr const char* kGlobalLockSql = "SELECT pg_advisory_xact_lock(2037545589, 0)";
 
-/// One-row, one-param text query helper.
+/// One-row, one-param text query helper — the single-param case of the shared
+/// `pg::exec_params` (#1368 promoted the boilerplate into pg_exec.hpp; this is
+/// now a thin adapter so there is one PQexecParams call site, not two).
 PgResult exec_param(PGconn* conn, const char* sql, const std::string& param) {
-    const char* values[] = {param.c_str()};
-    return PgResult{
-        PQexecParams(conn, sql, 1, nullptr, values, nullptr, nullptr, /*resultFormat=*/0)};
+    return exec_params(conn, sql, std::vector<std::string>{param});
 }
 
 /// Version row lookup. Returns 0 when absent, -1 on error. `missing_table_ok`
@@ -161,6 +162,27 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
     int current = read_version(conn, store, /*missing_table_ok=*/false);
     if (current < 0)
         return false;
+
+    // Schema-drift guard (#1368 CH-11 / UP-9). Version 0 means "no migration
+    // recorded", yet a non-empty store schema means tables exist out-of-band:
+    // schema_meta was wiped or poisoned, or someone hand-created tables. Blindly
+    // running migration v1 (whose `CREATE TABLE` is not IF-NOT-EXISTS) over
+    // existing tables would either error opaquely or silently diverge. Refuse
+    // and fail the boot closed with a cause the operator can act on. A genuinely
+    // new store reaches here with the empty schema just created above, so this
+    // never false-fires on first boot. ensure_meta_and_schema already created
+    // the schema, so information_schema.tables is the authoritative check.
+    if (current == 0) {
+        PgResult drift = exec_param(
+            conn, "SELECT 1 FROM information_schema.tables WHERE table_schema = $1 LIMIT 1", store);
+        if (drift.status() == PGRES_TUPLES_OK && PQntuples(drift.get()) > 0) {
+            spdlog::error("PgMigrationRunner: store '{}' is at version 0 in schema_meta but its "
+                          "schema already contains tables — schema_meta loss/poisoning or "
+                          "out-of-band DDL. Refusing to migrate (manual reconciliation required).",
+                          store);
+            return false;
+        }
+    }
 
     bool any_applied = false;
     for (const auto& m : migrations) {
