@@ -42,12 +42,15 @@ struct LiveHarness {
         auto okAuth = [](const httplib::Request&, httplib::Response&) {
             return std::optional<auth::Session>(auth::Session{});
         };
-        // Read is always allowed; Execute is toggled by allow_execute.
-        auto perm = [this](const httplib::Request&, httplib::Response&, const std::string&,
-                           const std::string& op) {
+        auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&) { return true; };
+        // The live routes gate per-device via scoped_perm (not the unscoped perm):
+        // Read always allowed; Execute toggled by allow_execute.
+        auto scoped_perm = [this](const httplib::Request&, httplib::Response&, const std::string&,
+                                  const std::string& op, const std::string&) {
             return op == "Execute" ? allow_execute : true;
         };
-        auto devices = []() { return std::vector<DeviceRow>{}; };
+        auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
         auto dispatch = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& ids, const std::string&,
                                const std::unordered_map<std::string, std::string>&)
@@ -65,8 +68,8 @@ struct LiveHarness {
             audited = a + "|" + r + "|" + tid;
         };
         // store is unused by the live routes — pass nullptr deliberately.
-        routes.register_routes(sink, okAuth, perm, devices, /*store=*/nullptr, dispatch, responses,
-                               audit);
+        routes.register_routes(sink, okAuth, perm, scoped_perm, devices, /*store=*/nullptr, dispatch,
+                               responses, audit);
     }
 };
 
@@ -241,12 +244,15 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
         return std::optional<auth::Session>(auth::Session{});
     };
     bool allow_read = true;
-    auto perm = [&allow_read](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string& op) {
+    auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    // The lenses gate per-device via scoped_perm; Read toggled by allow_read.
+    auto scoped_perm = [&allow_read](const httplib::Request&, httplib::Response& res,
+                                     const std::string&, const std::string& op, const std::string&) {
         if (op == "Read" && !allow_read) { res.status = 403; return false; }
         return true;
     };
-    auto devices = []() { return std::vector<DeviceRow>{}; };
+    auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
                             const std::string&, const std::string& tid, const std::string&) {
@@ -254,7 +260,7 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
-    routes.register_routes(sink, okAuth, perm, devices, &store, {}, {}, audit);
+    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, &store, {}, {}, audit);
 
     SECTION("Read denied -> 403, nothing rendered, no audit") {
         allow_read = false;
@@ -277,5 +283,86 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
         }
         CHECK(saw_dex);
         CHECK(saw_guardian);
+    }
+}
+
+// SCOPE-ESCAPE regression (governance Gate-2/4 BLOCKING; both adversarial reviewers
+// found it independently). Every per-device route must refuse a device OUTSIDE the
+// caller's management scope: not listed, not openable, no per-device PII read, and
+// — the load-bearing security property — NO live command dispatched to it.
+// scoped_perm_fn_ is the chokepoint (here it denies "other-team", allows "mine");
+// the list provider is already per-operator scoped.
+TEST_CASE("device routes: out-of-scope device is not listed/openable/live-queryable",
+          "[device][routes][scope]") {
+    GuaranteedStateStore store(":memory:");
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    // Global Infrastructure:Read (the list gate) is granted.
+    auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    // Management-group scope: every op allowed EXCEPT on the out-of-scope agent.
+    auto scoped_perm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                          const std::string&, const std::string& agent_id) {
+        if (agent_id == "other-team") { res.status = 403; return false; }
+        return true;
+    };
+    // The scoped provider only ever returns the caller's visible device.
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "mine";
+        d.hostname = "mine-host";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> {
+        ++dispatched;
+        return {plugin + "-x", 1};
+    };
+    auto responses = [](const std::string&) { return std::vector<DexAgentResponse>{}; };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
+                            const std::string&, const std::string& tid, const std::string&) {
+        audited.push_back(a + "|" + tid);
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DeviceRoutes routes;
+    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, &store, dispatch, responses,
+                           audit);
+
+    SECTION("list shows only the caller's visible device") {
+        auto r = sink.Get("/fragments/devices/list");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("mine-host") != std::string::npos);
+        CHECK(r->body.find("other-team") == std::string::npos);
+    }
+    SECTION("out-of-scope device page is 403, not opened") {
+        auto r = sink.Get("/fragments/device/page?id=other-team");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+    }
+    SECTION("out-of-scope DEX lens is 403, no PII read (not audited)") {
+        auto r = sink.Get("/fragments/device/dex?id=other-team");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(audited.empty());
+    }
+    SECTION("out-of-scope live dispatch is refused — NO command sent") {
+        auto r = sink.Get("/fragments/device/live/run?id=other-team&kind=processes");
+        REQUIRE(r);
+        CHECK(dispatched == 0); // the security property: no cross-scope dispatch
+        CHECK(r->status == 403);
+    }
+    SECTION("in-scope device stays openable + live-queryable") {
+        auto pg = sink.Get("/fragments/device/page?id=mine");
+        REQUIRE(pg);
+        CHECK(pg->status == 200);
+        auto run = sink.Get("/fragments/device/live/run?id=mine&kind=uptime");
+        REQUIRE(run);
+        CHECK(dispatched == 1); // in-scope dispatch proceeds
     }
 }

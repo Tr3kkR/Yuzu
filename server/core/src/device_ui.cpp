@@ -157,12 +157,13 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
     h += chip(os_token, "windows", "Windows", url("windows", status_token));
     h += chip(os_token, "linux", "Linux", url("linux", status_token));
     h += chip(os_token, "macos", "macOS", url("macos", status_token));
-    h += "<span class=\"gp-mute\" style=\"font-size:.66rem;align-self:center;margin-left:.6rem\">"
-         "Status</span>";
-    h += chip(status_token, "all", "All", url(os_token, "all"));
-    h += chip(status_token, "online", "Online", url(os_token, "online"));
-    h += chip(status_token, "offline", "Offline", url(os_token, "offline"));
     h += "</div>";
+    // The list is sourced from the live connection registry, so every row is a
+    // currently-connected device. There is no enrolled-but-offline source yet, so we
+    // do NOT render a status/offline filter that could never match — the offline tier
+    // + real last-seen arrive with the persistent device-inventory slice.
+    h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.2rem\">"
+         "Showing currently-connected devices.</div>";
 
     if (rows.empty()) {
         h += "<div class=\"gp-placeholder\"><b>No devices match</b>Broaden the search or filters.</div>";

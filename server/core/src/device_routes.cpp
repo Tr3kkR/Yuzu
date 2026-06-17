@@ -129,20 +129,22 @@ std::string render_live_result(const LiveKind& lk, const std::string& output) {
 } // namespace
 
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn, const GuaranteedStateStore* store,
-                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
-                                   AuditFn audit_fn) {
+                                   ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
+                                   const GuaranteedStateStore* store, DispatchFn dispatch_fn,
+                                   ResponsesFn responses_fn, AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn), store,
-                    std::move(dispatch_fn), std::move(responses_fn), std::move(audit_fn));
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
+                    std::move(devices_fn), store, std::move(dispatch_fn), std::move(responses_fn),
+                    std::move(audit_fn));
 }
 
 void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                   DevicesFn devices_fn, const GuaranteedStateStore* store,
-                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
-                                   AuditFn audit_fn) {
+                                   ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
+                                   const GuaranteedStateStore* store, DispatchFn dispatch_fn,
+                                   ResponsesFn responses_fn, AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
+    scoped_perm_fn_ = std::move(scoped_perm_fn);
     devices_fn_ = std::move(devices_fn);
     store_ = store;
     dispatch_fn_ = std::move(dispatch_fn);
@@ -184,11 +186,17 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         res.set_content(page_shell("Yuzu \xE2\x80\x94 Device", frag), "text/html; charset=utf-8");
     });
 
-    // -- /fragments/devices/list (auth-only; slice 1) --
+    // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
+    // Exact /api/agents parity: the gate admits Infrastructure:Read operators and
+    // the provider (get_visible_agents_json) returns only the caller's visible
+    // devices, so an operator never enumerates devices outside their scope. --
     sink.Get("/fragments/devices/list", [this](const httplib::Request& req,
                                                httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
-        std::vector<DeviceRow> all = devices_fn_ ? devices_fn_() : std::vector<DeviceRow>{};
+        auto session = auth_fn_(req, res);
+        if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
+        std::vector<DeviceRow> all =
+            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
         const std::string q = to_lower(req.has_param("q") ? req.get_param_value("q") : "");
         std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
         std::string status = req.has_param("status") ? req.get_param_value("status") : "all";
@@ -227,11 +235,14 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                         "text/html; charset=utf-8");
     });
 
-    // Resolve one device from the live list (slice 1: scan; a get_one(id) resolver
-    // replaces this at fleet scale).
-    auto find_one = [this](const std::string& id) -> std::optional<DeviceRow> {
+    // Resolve one device from the caller's SCOPED list (slice 1: scan; a get_one(id)
+    // resolver replaces this at fleet scale). Authz is enforced by scoped_perm_fn_
+    // BEFORE this is called; scanning the per-operator-scoped provider is
+    // defence-in-depth and supplies the row to render.
+    auto find_one = [this](const std::string& id,
+                           const std::string& username) -> std::optional<DeviceRow> {
         if (!devices_fn_) return std::nullopt;
-        for (auto& d : devices_fn_())
+        for (auto& d : devices_fn_(username))
             if (d.agent_id == id) return d;
         return std::nullopt;
     };
@@ -239,9 +250,14 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/device/page (the full page body: identity + lens tabs + lens) --
     sink.Get("/fragments/device/page", [this, find_one](const httplib::Request& req,
                                                         httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        auto session = auth_fn_(req, res);
+        if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        auto d = find_one(id);
+        // Per-device scope: Infrastructure:Read for THIS device (tier + management
+        // group). 403 = outside scope; an in-scope-but-absent device falls through
+        // to the honest not-found body below.
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", id)) return;
+        auto d = find_one(id, session->username);
         // Score ONLY this device — devices_fn_ no longer scores the fleet (a page
         // open must not pay an N-device cost; the score badge needs just this one).
         if (d && store_)
@@ -253,19 +269,23 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/device/info (the Device-info lens, for tab switching) --
     sink.Get("/fragments/device/info", [this, find_one](const httplib::Request& req,
                                                         httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        auto session = auth_fn_(req, res);
+        if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        auto d = find_one(id);
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", id)) return; // per-device scope
+        auto d = find_one(id, session->username);
         res.set_content(d ? render_device_info_fragment(*d) : render_device_not_found(id),
                         "text/html; charset=utf-8");
     });
 
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
-        // Per-device behavioral data (PII): same gate + audit-on-open as the
-        // sibling /fragments/dex/device — GuaranteedState:Read + dex.device.view.
-        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // Per-device behavioral data (PII): GuaranteedState:Read SCOPED to this
+        // device (tier + management group) + audit-on-open. Stronger than the
+        // sibling /fragments/dex/device's bare Read gate — closes the cross-scope
+        // read of another team's per-device DEX summary.
+        if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
             res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable."),
                             "text/html; charset=utf-8");
@@ -284,10 +304,10 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- Guardian lens: per-guard compliance state for this device --
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
-        // Per-device compliance state: same Read gate as the Guardian read
-        // surface + audit-on-open (parity with the DEX lens above).
-        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // Per-device compliance state: GuaranteedState:Read SCOPED to this device
+        // (tier + management group) + audit-on-open (parity with the DEX lens above).
+        if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
             res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable."),
                             "text/html; charset=utf-8");
@@ -326,9 +346,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     auto note = [](httplib::Response& res, const std::string& text) {
         res.set_content("<div class=\"gp-note\">" + text + "</div>", "text/html; charset=utf-8");
     };
-    auto can_execute = [this](const httplib::Request& req) {
-        httplib::Response probe;
-        return perm_fn_ && perm_fn_(req, probe, "Execution", "Execute");
+    auto can_execute = [this](const httplib::Request& req, const std::string& id) {
+        httplib::Response probe; // throwaway: htmx swallows a raw 403, so probe -> note
+        return scoped_perm_fn_ && scoped_perm_fn_(req, probe, "Execution", "Execute", id);
     };
     auto url_enc = [](const std::string& s) {
         static const char* kHex = "0123456789ABCDEF";
@@ -352,8 +372,10 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
 
     // Shell: a header + one auto-loading panel per live instruction.
     sink.Get("/fragments/device/live", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // Per-device live surface: scoped Read floor (the run panels re-gate Read +
+        // Execute per dispatch). 403 = outside the caller's management scope.
+        if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         res.set_content(render_device_live_shell(id), "text/html; charset=utf-8");
     });
 
@@ -361,16 +383,15 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     sink.Get("/fragments/device/live/run", [this, note, can_execute, live_pending](
                                                const httplib::Request& req,
                                                httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
-        // Read floor (parity with the DEX-perf sibling, which gates
-        // GuaranteedState:Read AND Execute); the Execute probe below is the soft,
-        // htmx-friendly note for a read-only operator.
-        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+        // Per-device scoped Read floor (tier + management group for THIS device);
+        // the Execute probe below is the soft, htmx-friendly note for a read-only
+        // operator. Gate before any dispatch so an out-of-scope agent_id is refused.
+        if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         const auto lk = resolve_live_kind(kind);
         if (!lk || id.empty()) { res.status = 400; res.set_content("bad request", "text/plain"); return; }
-        if (!can_execute(req)) {
+        if (!can_execute(req, id)) {
             note(res, "Live device info needs the <b>Execute</b> permission &mdash; it runs a "
                       "read-only instruction on the device.");
             return;
@@ -398,26 +419,28 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     sink.Get("/fragments/device/live/result", [this, note, can_execute, live_pending](
                                                   const httplib::Request& req,
                                                   httplib::Response& res) {
-        if (!auth_fn_(req, res)) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
-        if (!perm_fn_(req, res, "GuaranteedState", "Read")) return; // Read floor (sibling parity)
         const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+        const std::string command_id =
+            req.has_param("command_id") ? req.get_param_value("command_id") : "";
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        // Per-device scoped Read floor — a poll must honour the same management
+        // scope as the dispatch (an out-of-scope agent_id is refused even with a
+        // guessed command_id).
+        if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         const auto lk = resolve_live_kind(kind);
         if (!lk) { res.status = 400; res.set_content("bad request", "text/plain"); return; }
-        if (!can_execute(req)) {
+        // Only THIS kind's plugin commands are pollable here, only for the named
+        // agent — narrows what a guessed/stolen command_id can read via this route.
+        if (id.empty() || command_id.size() > 64 || !command_id.starts_with(lk->plugin + "-")) {
+            res.status = 400; res.set_content("bad request", "text/plain"); return;
+        }
+        if (!can_execute(req, id)) {
             note(res, "Live device info needs the <b>Execute</b> permission.");
             return;
         }
         if (!responses_fn_) {
             note(res, "Live device query unavailable on this server.");
             return;
-        }
-        const std::string command_id =
-            req.has_param("command_id") ? req.get_param_value("command_id") : "";
-        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
-        // Only THIS kind's plugin commands are pollable here, only for the named
-        // agent — narrows what a guessed/stolen command_id can read via this route.
-        if (id.empty() || command_id.size() > 64 || !command_id.starts_with(lk->plugin + "-")) {
-            res.status = 400; res.set_content("bad request", "text/plain"); return;
         }
         // Poll budget: hashing every running binary (processes/list_hashed) can
         // take longer than a warehouse query, so allow more attempts before

@@ -204,17 +204,21 @@ These fields are used by the [Scope Engine](scope-engine.md) for device targetin
 
 ### Dashboard
 
-The **Devices** page (`/devices`) lists every enrolled agent with its hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page.
+The **Devices** page (`/devices`) lists the **currently-connected** agents that are visible to you — the same per-operator scoping as the agent list, requiring the **`Infrastructure:Read`** permission and limited to your management groups — with each one's hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page.
+
+> The list is sourced from the live connection registry, so it shows connected devices only (there is no offline/status filter). Enrolled-but-offline devices and real last-seen times arrive with the persistent device-inventory slice.
 
 #### Device page (`/device?id=`)
 
 The per-device page is the shared entity view reached from any dashboard, organised into lens tabs:
 
+Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
+
 | Tab | Contents | Gate |
 |---|---|---|
-| **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | authenticated |
-| **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down. | `GuaranteedState:Read` (audited as `dex.device.view`) |
-| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read` (audited as `guardian.device.view`) |
+| **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
+| **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down. | `GuaranteedState:Read`, scoped to the device (audited as `dex.device.view`) |
+| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
 
 #### Get live info
 
@@ -223,7 +227,7 @@ The **Get live info** button (shown when the device is online) dispatches read-o
 - **Uptime** — current system uptime (`os_info/uptime`). Audit verb `device.live.uptime`.
 - **Running processes** — the full process list with the **SHA-256 of each process's on-disk executable** (resolved from the kernel, not argv[0]; bounded at 512 MiB per image). The first 10 are previewed; the full list is searchable by name, PID, or hash. Audit verb `device.live.processes`.
 
-Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read`; without it the panel shows an explanatory note rather than failing silently. Dispatching the process list is **usage-class behavioral telemetry** (it reveals which programs a person is running) and is individually audit-logged — see [Audit log](audit-log.md) for the works-council posture.
+Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the panel shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. Dispatching the process list is **usage-class behavioral telemetry** (it reveals which programs a person is running) and is individually audit-logged — see [Audit log](audit-log.md) for the works-council posture.
 
 On a host with many distinct large executables the process panel can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
 

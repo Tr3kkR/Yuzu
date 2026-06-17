@@ -9,18 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with OS
+- **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
   filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
   page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The
-  DEX and Guardian lenses render per-device behavioral/compliance data and are gated on
-  `GuaranteedState:Read` with audit-on-open (`dex.device.view`, `guardian.device.view`). The
-  fleet list and a single page open score only the rows they render — opening one device no
-  longer scores the whole fleet.
+  fleet list requires `Infrastructure:Read` and is sourced from the same per-operator scoped
+  provider as the agent list (`get_visible_agents_json`); every per-device route — page, info,
+  the DEX/Guardian lenses, and the live pull — is scoped to the device's management group via
+  `require_scoped_permission`, so an operator cannot list, open, read, or live-query a device
+  outside their scope. The DEX and Guardian lenses render per-device behavioral/compliance data
+  with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
+  page open score only the rows they render — opening one device no longer scores the whole
+  fleet. The list shows currently-connected devices only (no offline/status filter yet).
 - **"Get live info" on the device page.** Dispatches read-only instructions to the agent on
   demand (not the 30s heartbeat): **Uptime** (`os_info/uptime`) and a **running-process list**
   (`processes/list_hashed`) showing the **SHA-256 of each process's on-disk executable**, with
-  a first-10 preview and client-side search. Requires `Execution:Execute`; each dispatch is
-  individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
+  a first-10 preview and client-side search. Requires `Execution:Execute` scoped to the
+  device's management group (a device outside your scope cannot be live-queried); each dispatch
+  is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
   usage-class read kept separately countable for works-council access audit.
 - **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
   executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux

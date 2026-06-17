@@ -7484,6 +7484,14 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+        // Per-device tier + management-group scope gate (wraps
+        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
+        // operator can only open / read / live-query a device inside their scope.
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -8080,18 +8088,19 @@ private:
         network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
-        // page; Device-info lens). SLICE 1: sourced from the live registry (the
-        // CONNECTED agents) → identity + tags, online=true. Offline/enrolled
-        // devices, the DEX/Guardian lenses, and the live pull land in later slices.
-        // Auth-only, matching the current agent-list posture.
-        // Identity-only fleet provider — deliberately does NOT score (dex_score
-        // stays -1). Scoring is per-device and happens in DeviceRoutes at the
-        // render sites (the single device on a page open; only the filtered rows
-        // on the list), so opening one device's page never pays an N-device
-        // GROUP-BY cost. (Governance Gate-3 architect finding; 400k-scale + NFR.)
-        auto devices_fn = [this]() -> std::vector<DeviceRow> {
+        // page; Device-info lens). Sourced from the live registry (the CONNECTED
+        // agents) → identity + tags, online=true. The DEX/Guardian lenses + the
+        // live pull are gated per-device by scoped_perm_fn (management-group scope).
+        // Provider is PER-OPERATOR SCOPED via get_visible_agents_json — the SAME
+        // path /api/agents uses, so a scope-limited operator never enumerates the
+        // whole fleet. Identity-only — deliberately does NOT score (dex_score stays
+        // -1); scoring is per-device in DeviceRoutes at the render sites (the single
+        // device on a page open; only the filtered rows on the list), so opening one
+        // device's page never pays an N-device GROUP-BY cost. (Governance Gate-3
+        // architect finding; 400k-scale + NFR.)
+        auto devices_fn = [this](const std::string& username) -> std::vector<DeviceRow> {
             std::vector<DeviceRow> out;
-            auto arr = registry_.to_json_obj();
+            auto arr = get_visible_agents_json(username);
             out.reserve(arr.size());
             for (const auto& a : arr) {
                 DeviceRow d;
@@ -8112,7 +8121,8 @@ private:
         };
         device_routes_ = std::make_unique<DeviceRoutes>();
         device_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, devices_fn, guaranteed_state_store_.get(),
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn,
+            guaranteed_state_store_.get(),
             // "Get live info" dispatches real plugin instructions (os_info/uptime,
             // processes/list) through the shared chokepoint — untracked path
             // (empty execution_id), same posture as the DEX device-perf panel.

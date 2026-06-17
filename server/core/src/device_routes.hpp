@@ -19,12 +19,19 @@
 /// pull (send_to + executions/SSE, privacy-gated) land in later slices. Those
 /// lens tabs render an honest "coming in a later slice" placeholder for now.
 ///
-/// AUTH (slice 1): the page shell + device list/info are auth-only, matching the
-/// CURRENT posture (the dashboard scope-picker already shows the agent list to any
-/// authed operator). A dedicated `Device:Read` RBAC securable + perm gate is a
-/// hardening follow-up; the behavioural DEX lens + the live pull gate on their own
-/// securables (and the works-council per-category toggle / individual-view kill
-/// switch) when added. `perm_fn` is threaded now so later slices can use it.
+/// AUTH: the `/devices` + `/device` page shells are auth-only chrome (they carry no
+/// fleet data — only a title + the fragment URL to load), matching the sibling
+/// `/dex` shell. The DATA-bearing routes are gated like `/api/agents`:
+///   * the fleet LIST (`/fragments/devices/list`) requires global Infrastructure:Read
+///     (`perm_fn`) and is sourced from the per-operator-SCOPED provider
+///     (`get_visible_agents_json` in server.cpp) — exact parity with `/api/agents`;
+///   * every PER-DEVICE route (page/info + the DEX/Guardian lenses + the live pull)
+///     gates on `scoped_perm_fn` = `require_scoped_permission(<securable>,<op>,id)`,
+///     the codebase's tier + management-group chokepoint, so an operator can only
+///     open / read / live-query a device inside their management scope (a global
+///     grant OR a role assigned on the device's group / an ancestor). The DEX +
+///     Guardian lenses additionally audit-on-open (behavioural PII); the live pull
+///     keeps its Execute probe (htmx-friendly note) on top of the scoped Read floor.
 
 #include <yuzu/server/auth.hpp>
 
@@ -134,11 +141,24 @@ public:
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string& securable_type, const std::string& operation)>;
 
-    /// Resolve the current fleet device list from the live registry (assembled in
-    /// server.cpp from AgentRegistry: all_ids + get_session + online + last-seen +
-    /// tags). Empty when no provider is wired → the list renders an honest
-    /// "unavailable" placeholder.
-    using DevicesFn = std::function<std::vector<DeviceRow>()>;
+    /// Per-device tier + management-group scope gate — wraps
+    /// AuthRoutes::require_scoped_permission. Returns true (leaving `res` untouched)
+    /// when the caller may perform `operation` on `securable_type` for `agent_id`
+    /// (global grant OR a role assigned on the agent's management group / an
+    /// ancestor); otherwise writes a 403 and returns false. The single chokepoint
+    /// for every per-device device-route authz decision — never hand-roll a parallel
+    /// membership scan.
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
+
+    /// Resolve the fleet device list VISIBLE to `username`, assembled in server.cpp
+    /// from the SAME per-operator scoping path as `/api/agents`
+    /// (`get_visible_agents_json`): all-when-global-Infrastructure:Read, else the
+    /// caller's management-group members. Empty when no provider is wired → the
+    /// list renders an honest "unavailable" placeholder.
+    using DevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
 
     /// The "Get live info" snapshot dispatches REAL plugin instructions to the device
     /// (Execute-gated, audited) and polls the response store — the same shared
@@ -150,19 +170,22 @@ public:
     /// `store` backs the DEX/Guardian lenses; `dispatch_fn`/`responses_fn`/`audit_fn`
     /// back the live-info instruction dispatch (all borrowed/may be empty/null →
     /// graceful placeholder).
-    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                          const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
                          ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
-    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                          const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
                          ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    ScopedPermFn scoped_perm_fn_;
     DevicesFn devices_fn_;
     const GuaranteedStateStore* store_ = nullptr;
     DispatchFn dispatch_fn_;
