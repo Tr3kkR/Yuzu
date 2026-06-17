@@ -8098,30 +8098,50 @@ private:
         // device on a page open; only the filtered rows on the list), so opening one
         // device's page never pays an N-device GROUP-BY cost. (Governance Gate-3
         // architect finding; 400k-scale + NFR.)
-        auto devices_fn = [this](const std::string& username) -> std::vector<DeviceRow> {
+        // Shared json-agent → DeviceRow identity mapping (used by both the scoped
+        // list provider and the unscoped single-device lookup).
+        auto make_device_row = [this](const nlohmann::json& a) -> DeviceRow {
+            DeviceRow d;
+            d.agent_id = a.value("agent_id", "");
+            d.hostname = a.value("hostname", "");
+            d.os = a.value("os", "");
+            d.arch = a.value("arch", "");
+            d.agent_version = a.value("agent_version", "");
+            d.online = true; // the registry holds connected sessions
+            d.last_seen = "now";
+            if (auto s = registry_.get_session(d.agent_id)) {
+                for (const auto& [k, v] : s->scopable_tags)
+                    d.tags.push_back(v.empty() ? k : (k + "=" + v));
+            }
+            return d;
+        };
+        auto devices_fn =
+            [this, make_device_row](const std::string& username) -> std::vector<DeviceRow> {
             std::vector<DeviceRow> out;
             auto arr = get_visible_agents_json(username);
             out.reserve(arr.size());
-            for (const auto& a : arr) {
-                DeviceRow d;
-                d.agent_id = a.value("agent_id", "");
-                d.hostname = a.value("hostname", "");
-                d.os = a.value("os", "");
-                d.arch = a.value("arch", "");
-                d.agent_version = a.value("agent_version", "");
-                d.online = true; // the registry holds connected sessions
-                d.last_seen = "now";
-                if (auto s = registry_.get_session(d.agent_id)) {
-                    for (const auto& [k, v] : s->scopable_tags)
-                        d.tags.push_back(v.empty() ? k : (k + "=" + v));
-                }
-                out.push_back(std::move(d));
-            }
+            for (const auto& a : arr)
+                out.push_back(make_device_row(a));
             return out;
+        };
+        // UNSCOPED single-device resolver (the `get_one(id)` the list scan was meant
+        // to become). Authz is the scoped_perm_fn gate the per-device routes run
+        // FIRST; this only fetches the identity row. It must NOT re-scope: the list
+        // filter (get_visible_agents) is a flat group-member JOIN with no ancestor
+        // walk, while require_scoped_permission IS ancestor-aware — re-scoping here
+        // would 404 a device a parent-group role legitimately authorizes.
+        auto lookup_fn =
+            [this, make_device_row](const std::string& agent_id) -> std::optional<DeviceRow> {
+            if (agent_id.empty())
+                return std::nullopt;
+            for (const auto& a : registry_.to_json_obj())
+                if (a.value("agent_id", "") == agent_id)
+                    return make_device_row(a);
+            return std::nullopt;
         };
         device_routes_ = std::make_unique<DeviceRoutes>();
         device_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn,
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
             guaranteed_state_store_.get(),
             // "Get live info" dispatches real plugin instructions (os_info/uptime,
             // processes/list_hashed) through the shared chokepoint. DELIBERATELY an

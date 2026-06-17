@@ -130,22 +130,25 @@ std::string render_live_result(const LiveKind& lk, const std::string& output) {
 
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                    ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
-                                   const GuaranteedStateStore* store, DispatchFn dispatch_fn,
-                                   ResponsesFn responses_fn, AuditFn audit_fn) {
+                                   LookupFn lookup_fn, const GuaranteedStateStore* store,
+                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                   AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
-                    std::move(devices_fn), store, std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(audit_fn));
+                    std::move(devices_fn), std::move(lookup_fn), store, std::move(dispatch_fn),
+                    std::move(responses_fn), std::move(audit_fn));
 }
 
 void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                    ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
-                                   const GuaranteedStateStore* store, DispatchFn dispatch_fn,
-                                   ResponsesFn responses_fn, AuditFn audit_fn) {
+                                   LookupFn lookup_fn, const GuaranteedStateStore* store,
+                                   DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                   AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     devices_fn_ = std::move(devices_fn);
+    lookup_fn_ = std::move(lookup_fn);
     store_ = store;
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
@@ -235,29 +238,25 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                         "text/html; charset=utf-8");
     });
 
-    // Resolve one device from the caller's SCOPED list (slice 1: scan; a get_one(id)
-    // resolver replaces this at fleet scale). Authz is enforced by scoped_perm_fn_
-    // BEFORE this is called; scanning the per-operator-scoped provider is
-    // defence-in-depth and supplies the row to render.
-    auto find_one = [this](const std::string& id,
-                           const std::string& username) -> std::optional<DeviceRow> {
-        if (!devices_fn_) return std::nullopt;
-        for (auto& d : devices_fn_(username))
-            if (d.agent_id == id) return d;
-        return std::nullopt;
+    // Resolve one device's identity row, UNSCOPED. Authz is the scoped_perm_fn_ gate
+    // each per-device route runs FIRST; this is the post-authz row fetch. It must NOT
+    // re-scope (see LookupFn doc: list scoping is non-ancestor, the gate is
+    // ancestor-aware — re-scoping here would 404 a parent-group-authorized device).
+    auto get_one = [this](const std::string& id) -> std::optional<DeviceRow> {
+        return lookup_fn_ ? lookup_fn_(id) : std::nullopt;
     };
 
     // -- /fragments/device/page (the full page body: identity + lens tabs + lens) --
-    sink.Get("/fragments/device/page", [this, find_one](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    sink.Get("/fragments/device/page", [this, get_one](const httplib::Request& req,
+                                                       httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         // Per-device scope: Infrastructure:Read for THIS device (tier + management
-        // group). 403 = outside scope; an in-scope-but-absent device falls through
-        // to the honest not-found body below.
+        // group, ancestor-aware). 403 = outside scope; an in-scope-but-absent device
+        // falls through to the honest not-found body below.
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", id)) return;
-        auto d = find_one(id, session->username);
+        auto d = get_one(id);
         // Score ONLY this device — devices_fn_ no longer scores the fleet (a page
         // open must not pay an N-device cost; the score badge needs just this one).
         if (d && store_)
@@ -267,13 +266,13 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     });
 
     // -- /fragments/device/info (the Device-info lens, for tab switching) --
-    sink.Get("/fragments/device/info", [this, find_one](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    sink.Get("/fragments/device/info", [this, get_one](const httplib::Request& req,
+                                                       httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", id)) return; // per-device scope
-        auto d = find_one(id, session->username);
+        auto d = get_one(id);
         res.set_content(d ? render_device_info_fragment(*d) : render_device_not_found(id),
                         "text/html; charset=utf-8");
     });

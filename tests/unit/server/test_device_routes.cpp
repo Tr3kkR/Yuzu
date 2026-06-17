@@ -51,6 +51,7 @@ struct LiveHarness {
             return op == "Execute" ? allow_execute : true;
         };
         auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
+        auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
         auto dispatch = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& ids, const std::string&,
                                const std::unordered_map<std::string, std::string>&)
@@ -68,8 +69,8 @@ struct LiveHarness {
             audited = a + "|" + r + "|" + tid;
         };
         // store is unused by the live routes — pass nullptr deliberately.
-        routes.register_routes(sink, okAuth, perm, scoped_perm, devices, /*store=*/nullptr, dispatch,
-                               responses, audit);
+        routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
+                               dispatch, responses, audit);
     }
 };
 
@@ -253,6 +254,7 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
         return true;
     };
     auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
+    auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
                             const std::string&, const std::string& tid, const std::string&) {
@@ -260,7 +262,7 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
-    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, &store, {}, {}, audit);
+    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, &store, {}, {}, audit);
 
     SECTION("Read denied -> 403, nothing rendered, no audit") {
         allow_read = false;
@@ -302,17 +304,31 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
                    const std::string&) { return true; };
     // Management-group scope: every op allowed EXCEPT on the out-of-scope agent.
+    // "ancestor-child" is authorized (a parent-group role grants it) but is NOT in
+    // the flat scoped LIST below — modelling the ancestor-walk divergence.
     auto scoped_perm = [](const httplib::Request&, httplib::Response& res, const std::string&,
                           const std::string&, const std::string& agent_id) {
         if (agent_id == "other-team") { res.status = 403; return false; }
         return true;
     };
-    // The scoped provider only ever returns the caller's visible device.
+    // The scoped LIST provider returns only the caller's DIRECT-group device — a flat
+    // get_visible_agents JOIN has no ancestor walk, so "ancestor-child" is absent.
     auto devices = [](const std::string&) {
         DeviceRow d;
         d.agent_id = "mine";
         d.hostname = "mine-host";
         return std::vector<DeviceRow>{d};
+    };
+    // The UNSCOPED single-device resolver returns the identity row for any connected
+    // device (authz is scoped_perm, applied first) — incl. the ancestor-authorized one.
+    auto lookup = [](const std::string& id) -> std::optional<DeviceRow> {
+        if (id == "mine" || id == "ancestor-child") {
+            DeviceRow d;
+            d.agent_id = id;
+            d.hostname = id + "-host";
+            return d;
+        }
+        return std::nullopt;
     };
     int dispatched = 0;
     auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
@@ -330,8 +346,8 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
-    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, &store, dispatch, responses,
-                           audit);
+    routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, &store, dispatch,
+                           responses, audit);
 
     SECTION("list shows only the caller's visible device") {
         auto r = sink.Get("/fragments/devices/list");
@@ -364,5 +380,18 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         auto run = sink.Get("/fragments/device/live/run?id=mine&kind=uptime");
         REQUIRE(run);
         CHECK(dispatched == 1); // in-scope dispatch proceeds
+    }
+    // Ancestor-authz regression: a device authorized by scoped_perm (e.g. via a
+    // parent-group role) but ABSENT from the flat scoped list must still open — the
+    // page row comes from the UNSCOPED lookup post-authz, not a re-scoped list scan.
+    SECTION("ancestor-authorized device opens via unscoped lookup though not in the list") {
+        auto pg = sink.Get("/fragments/device/page?id=ancestor-child");
+        REQUIRE(pg);
+        CHECK(pg->status == 200);
+        CHECK(pg->body.find("ancestor-child-host") != std::string::npos); // row rendered
+        // ...and it is NOT in the scoped list (proves list scoping is independent).
+        auto list = sink.Get("/fragments/devices/list");
+        REQUIRE(list);
+        CHECK(list->body.find("ancestor-child") == std::string::npos);
     }
 }

@@ -160,6 +160,16 @@ public:
     /// list renders an honest "unavailable" placeholder.
     using DevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
 
+    /// Resolve ONE device's identity row by agent_id, UNSCOPED (straight from the
+    /// registry — the `get_one(id)` resolver the list scan was always meant to
+    /// become). Authz is the caller's responsibility: per-device routes gate on
+    /// `scoped_perm_fn` FIRST, so this is a pure post-authz row fetch. It must NOT
+    /// re-apply list scoping — the list filter (`get_visible_agents`) is a flat
+    /// group-member JOIN with no ancestor walk, whereas `require_scoped_permission`
+    /// IS ancestor-aware; re-scoping here would wrongly 404 a device a parent-group
+    /// role legitimately authorizes. Returns nullopt for an unknown/offline agent.
+    using LookupFn = std::function<std::optional<DeviceRow>(const std::string& agent_id)>;
+
     /// The "Get live info" snapshot dispatches REAL plugin instructions to the device
     /// (Execute-gated, audited) and polls the response store — the same shared
     /// chokepoint + ResponseStore seam DexRoutes uses. Empty → live info unavailable.
@@ -171,14 +181,14 @@ public:
     /// back the live-info instruction dispatch (all borrowed/may be empty/null →
     /// graceful placeholder).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
+                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
                          const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
                          ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
+                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
                          const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
                          ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
 
@@ -187,6 +197,7 @@ private:
     PermFn perm_fn_;
     ScopedPermFn scoped_perm_fn_;
     DevicesFn devices_fn_;
+    LookupFn lookup_fn_;
     const GuaranteedStateStore* store_ = nullptr;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
