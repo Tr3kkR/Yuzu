@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -286,6 +287,27 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
 
+    /// Per-device tier + management-group scope gate (wraps
+    /// require_scoped_permission). Gates every PER-DEVICE drill (`/fragments/dex/device`
+    /// + `/perf` + `/procperf`) so an operator can only open a device inside their
+    /// management scope — the same gate the `/device` routes use. May be empty → the
+    /// per-device routes fall back to the global `perm_fn` gate (legacy posture).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
+
+    /// Resolve the set of agent_ids VISIBLE to `username`, following the SAME policy
+    /// as `/api/agents` (`get_visible_agents_json`): returns `std::nullopt` when the
+    /// caller sees the whole fleet (global Infrastructure:Read OR RBAC disabled), else
+    /// the set of agent_ids in the caller's management groups. Used to filter the
+    /// device-id-rendering lists so an out-of-scope operator can't enumerate other
+    /// teams' device ids. MUST replicate the global-read branch — a bare
+    /// `get_visible_agents` would blank an admin who is in no management group. May be
+    /// empty → no list filtering (legacy posture).
+    using VisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+
     /// Supplies the cross-store fleet denominator (avoids an AgentRegistry
     /// incomplete-type dep — same callback trick GuardianRoutes uses for agents
     /// JSON). May be empty → rates degrade to the "no data" state.
@@ -324,7 +346,8 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {});
+                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -332,11 +355,14 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {});
+                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    ScopedPermFn scoped_perm_fn_;
+    VisibleSetFn visible_set_fn_;
     GuaranteedStateStore* store_{};
     FleetFn fleet_fn_;
     AuditFn audit_fn_;

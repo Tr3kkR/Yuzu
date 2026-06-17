@@ -7492,6 +7492,21 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
+        // device drills). SAME policy as get_visible_agents_json / the /devices list:
+        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
+        // off); else the caller's management-group members. The global-read branch is
+        // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        auto visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
+                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+                    auto v = mgmt_group_store_->get_visible_agents(username);
+                    return std::set<std::string>(v.begin(), v.end());
+                }
+            }
+            return std::nullopt; // global read or RBAC disabled → sees all
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -7961,7 +7976,11 @@ private:
                 return out;
             },
             // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn);
+            dex_perf_fn,
+            // Per-device scope gate (same require_scoped_permission the /device routes
+            // use) + the visible-agent set resolver — so the per-device DEX drills are
+            // scoped and the device-id lists never enumerate out-of-scope agents.
+            scoped_perm_fn, visible_set_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).

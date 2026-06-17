@@ -2332,20 +2332,24 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(perf_fn));
+                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
+    scoped_perm_fn_ = std::move(scoped_perm_fn);
+    visible_set_fn_ = std::move(visible_set_fn);
     store_ = store;
     fleet_fn_ = std::move(fleet_fn);
     audit_fn_ = std::move(audit_fn);
@@ -2481,9 +2485,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
 
     // -- Per-device drill-down (signal history; behavioral PII → audit each open). ?id=<agent_id> --
     sink.Get("/fragments/dex/device", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
-            return;
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // Per-device scope (tier + management group), not just global Read — an
+        // operator can only drill a device inside their scope (mirrors /device; a
+        // cross-tenant read of another team's per-device DEX history was the gap).
+        if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                            : !perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
         // Canonicalise the window before it can reach markup (Gate-8 XSS chokepoint).
         const std::string w =
             window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
@@ -2604,9 +2612,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     auto note = [](httplib::Response& res, const std::string& text) {
         res.set_content("<div class=\"gp-note\">" + text + "</div>", "text/html; charset=utf-8");
     };
-    auto can_execute = [this](const httplib::Request& req) {
-        httplib::Response probe;
-        return perm_fn_(req, probe, "Execution", "Execute");
+    auto can_execute = [this](const httplib::Request& req, const std::string& id) {
+        httplib::Response probe; // throwaway: htmx swallows a raw 403, so probe -> note
+        return scoped_perm_fn_ ? scoped_perm_fn_(req, probe, "Execution", "Execute", id)
+                               : perm_fn_(req, probe, "Execution", "Execute");
     };
     auto pending_div = [](const std::string& command_id, const std::string& agent_id,
                           int attempt) {
@@ -2620,9 +2629,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/device/perf", [this, note, can_execute,
                                             pending_div](const httplib::Request& req,
                                                          httplib::Response& res) {
-        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        // Per-device scoped Read floor + Execute probe (mirrors /device live).
+        if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                            : !perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
-        if (!can_execute(req)) {
+        if (!can_execute(req, id)) {
             note(res, "Live device performance needs the <b>Execute</b> permission &mdash; "
                       "this panel runs a read-only TAR query on the device.");
             return;
@@ -2631,7 +2643,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             note(res, "Live device query unavailable on this server.");
             return;
         }
-        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         if (id.empty()) {
             res.status = 400;
             return;
@@ -2653,12 +2664,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/device/perf/result", [this, note, can_execute, pending_div](
                                                       const httplib::Request& req,
                                                       httplib::Response& res) {
-        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+        const std::string command_id =
+            req.has_param("command_id") ? req.get_param_value("command_id") : "";
+        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        // Per-device scoped Read floor + Execute probe (same scope as the dispatch;
+        // stops a principal polling another team's command_id through this route).
+        if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                            : !perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
-        // Same Execute posture as the dispatching route — the result data rides
-        // an Execute-surface command, and gating both halves stops a read-only
-        // principal polling someone else's command_id through this route.
-        if (!can_execute(req)) {
+        if (!can_execute(req, id)) {
             note(res, "Live device performance needs the <b>Execute</b> permission.");
             return;
         }
@@ -2666,9 +2680,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             note(res, "Live device query unavailable on this server.");
             return;
         }
-        const std::string command_id =
-            req.has_param("command_id") ? req.get_param_value("command_id") : "";
-        const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         // Only tar dispatches are pollable here, only for the named agent —
         // narrows what a guessed/stolen command_id can read via this route.
         if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
@@ -2735,9 +2746,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/device/procperf",
              [this, note, can_execute, procperf_pending](const httplib::Request& req,
                                                          httplib::Response& res) {
-                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 // Per-device scoped Read floor + Execute probe (mirrors /device live).
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!can_execute(req)) {
+                 if (!can_execute(req, id)) {
                      note(res, "Per-application data needs the <b>Execute</b> permission "
                                "&mdash; this panel runs a read-only TAR query on the device.");
                      return;
@@ -2746,8 +2761,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      note(res, "Live device query unavailable on this server.");
                      return;
                  }
-                 const std::string id =
-                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
                  if (id.empty()) {
                      res.status = 400;
                      return;
@@ -2774,11 +2787,16 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/device/procperf/result",
              [this, note, can_execute, procperf_pending](const httplib::Request& req,
                                                          httplib::Response& res) {
-                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                 const std::string command_id =
+                     req.has_param("command_id") ? req.get_param_value("command_id") : "";
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 // Per-device scoped Read floor + Execute probe (same scope as the
+                 // dispatch; stops polling another team's command_id through this route).
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
-                 // Same Execute posture as the dispatching route (stops a
-                 // read-only principal polling someone else's command_id).
-                 if (!can_execute(req)) {
+                 if (!can_execute(req, id)) {
                      note(res, "Per-application data needs the <b>Execute</b> permission.");
                      return;
                  }
@@ -2786,10 +2804,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      note(res, "Live device query unavailable on this server.");
                      return;
                  }
-                 const std::string command_id =
-                     req.has_param("command_id") ? req.get_param_value("command_id") : "";
-                 const std::string id =
-                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
                  if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
                      res.status = 400;
                      return;
