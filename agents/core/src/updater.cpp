@@ -69,6 +69,15 @@ namespace pb = ::yuzu::agent::v1;
 // AgentImpl::heartbeat_ctx_ pattern; gRPC TryCancel on a completed RPC is a
 // documented no-op.
 struct ActiveRpcCtxGuard {
+    // The slot type-erases a grpc::ClientContext* as void* so the public
+    // updater.hpp need not pull in grpc headers. stop() static_casts it back to
+    // the identical static type, which the standard guarantees round-trips for
+    // any object pointer regardless of width — the real precondition (store and
+    // load the same ClientContext* type, no base-class slicing) holds by
+    // construction. The width assert is belt-and-suspenders: it documents intent
+    // and trips only on a hypothetical non-flat-pointer ABI.
+    static_assert(sizeof(void*) == sizeof(grpc::ClientContext*),
+                  "void* slot cannot round-trip a grpc::ClientContext*");
     std::atomic<void*>& slot;
     ActiveRpcCtxGuard(std::atomic<void*>& s, grpc::ClientContext& ctx) : slot(s) {
         slot.store(&ctx, std::memory_order_release);
