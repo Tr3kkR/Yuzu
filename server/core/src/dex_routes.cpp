@@ -126,14 +126,18 @@ std::size_t dex_catalogued_type_count() {
 // in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
 std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
     static const char* const kLinux[] = {
-        // /proc + /sys + statvfs polls (dex_linux_proc / dex_linux_sysfs / dex_linux_storage)
-        "perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high", "hw.cpu_throttled",
-        "storage.low", "os.uptime_report",
+        // /proc + statvfs polls (dex_linux_proc / dex_linux_storage)
+        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
         // systemd-structured journal (dex_linux_journal)
-        "process.crashed", "service.crashed", "service.hung", "os.time_unsynced",
-        // kernel ring-buffer journal markers (dex_linux_kmsg)
-        "memory.exhausted", "os.bugcheck", "os.dirty_shutdown", "disk.error", "fs.corruption",
-        "hw.error", "process.hung"};
+        "process.crashed", "service.crashed", "memory.exhausted"};
+    // NOTE: the expanded Linux kernel/sysfs signals — perf.disk_latency_high,
+    // hw.cpu_throttled (dex_linux_sysfs); service.hung, os.time_unsynced
+    // (journal); os.bugcheck, os.dirty_shutdown, disk.error, fs.corruption,
+    // hw.error, process.hung (dex_linux_kmsg) — land WITH their collectors in the
+    // dex-linux-signals batch (#1523). Re-add them here in the same change that
+    // brings those collectors onto this branch, and extend the drift-net test in
+    // test_dex_routes.cpp. Until then the map must not advertise a Linux signal
+    // nothing collects, or a Linux fleet reads "monitored, quiet" as healthy.
     static const char* const kMac[] = {
         "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
         "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",

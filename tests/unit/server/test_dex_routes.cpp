@@ -15,7 +15,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <optional>
+#include <set>
 #include <string>
 
 using namespace yuzu::server;
@@ -869,4 +871,49 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(r);
         CHECK(r->body.find("unavailable") != std::string::npos);
     }
+}
+
+// ── Drift-net for the per-OS coverage map (dex_obs_platforms). The map must claim
+// a platform collects a signal type ONLY when an agent on that platform actually
+// emits it. This is the guard the comment by dex_obs_platforms promises but that
+// never existed — its absence let the Linux column advertise kernel/sysfs signals
+// whose collectors live in a separate PR (#1523), so a Linux fleet would read
+// "monitored, quiet" as healthy for signals nothing collects. The server suite
+// can't introspect the agent collectors, so the emitted set is pinned here; when
+// collectors are added or removed, update BOTH the collector and the set below in
+// the same change (that conscious edit is the point). ──
+TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
+          "[dex][coverage]") {
+    // What a Linux agent emits today: dex_linux_proc + dex_linux_storage polls and
+    // dex_linux_journal mappings. The expanded kmsg/sysfs set arrives with #1523.
+    const std::set<std::string> kLinuxEmitted = {
+        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
+        "process.crashed",    "service.crashed",      "memory.exhausted"};
+
+    auto claims = [](const std::string& obs_type, const char* os) {
+        const auto p = dex_obs_platforms(obs_type);
+        return std::find(p.begin(), p.end(), os) != p.end();
+    };
+
+    // Overclaim guard: every catalogued type the map marks "linux" must be emitted.
+    for (const auto& g : dex_signal_groups()) {
+        for (const char* t : g.types) {
+            if (claims(t, "linux")) {
+                INFO("coverage map claims Linux collects '"
+                     << t << "' but no Linux collector emits it (see dex_obs_platforms)");
+                CHECK(kLinuxEmitted.count(t) == 1);
+            }
+        }
+    }
+
+    // Underclaim guard: every emitted Linux signal is actually advertised.
+    for (const auto& t : kLinuxEmitted) {
+        INFO("emitted Linux signal '" << t << "' is missing from the coverage map");
+        CHECK(claims(t, "linux"));
+    }
+
+    // Windows is the whole EvtSubscribe catalogue — always present and first.
+    const auto win = dex_obs_platforms("process.crashed");
+    REQUIRE_FALSE(win.empty());
+    CHECK(win.front() == "windows");
 }
