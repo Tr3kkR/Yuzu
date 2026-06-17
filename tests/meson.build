@@ -122,6 +122,8 @@ agent_test_exe = executable(
     'unit/test_net_quality_sampler.cpp',
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_linux_journal.cpp',
+    'unit/test_dex_linux_kmsg.cpp',
+    'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
