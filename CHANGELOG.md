@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
+  filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
+  page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The
+  fleet list now requires `Infrastructure:Read` (parity with `/api/agents`, via the same
+  `get_visible_agents_json` provider — closing the prior any-authenticated-operator access);
+  every per-device route — page, info, the DEX/Guardian lenses, and the live pull — is
+  additionally scoped to the device's management group via `require_scoped_permission`, so an
+  operator cannot open, read, or live-query a device outside their scope. The DEX and Guardian
+  lenses render per-device behavioral/compliance data
+  with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
+  page open score only the rows they render — opening one device no longer scores the whole
+  fleet. The list shows currently-connected devices only (no offline/status filter yet). The
+  **DEX dashboard's per-device drills** the device DEX lens links to (`/fragments/dex/device`
+  + its `/perf`/`/procperf` live panels) are scoped the same way, and the DEX device-id lists
+  (overview top-devices, per-signal/per-app affected-devices, per-device perf) no longer
+  enumerate agents outside the operator's management scope. (Fleet **aggregates** — rate
+  denominators, score histograms — remain fleet-wide statistics.)
+- **"Get live info" on the device page.** Dispatches read-only instructions to the agent on
+  demand (not the 30s heartbeat): **Uptime** (`os_info/uptime`) and a **running-process list**
+  (`processes/list_hashed`) showing the **SHA-256 of each process's on-disk executable**, with
+  a first-10 preview and client-side search. Requires `Execution:Execute` scoped to the
+  device's management group (a device outside your scope cannot be live-queried); each dispatch
+  is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
+  usage-class read kept separately countable for works-council access audit.
+- **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
+  executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux
+  `/proc/<pid>/exe`, macOS `proc_pidpath`) — not the spoofable argv[0] — and the on-disk image
+  is hashed via the shared `sha256_file` (bounded at 512 MiB, deduped by path).
+- **DEX Catalogue is coverage-first.** A signal family/type now lights when a connected
+  platform **collects** it — not only when it fired — with per-family "N of M monitored", a
+  0–100 family health score, and an **OS filter** that persists across the family and per-type
+  drill-downs. Types no connected platform collects read as *not collected*, never as healthy.
+
 - **Linux server DEX: systemd unit-health signals from the journal.** The Linux DEX
   collector now emits `service.hung` (a `WatchdogSec` timeout — the existing
   unit-failed journal entry routed by `UNIT_RESULT="watchdog"`, since a watchdog kill

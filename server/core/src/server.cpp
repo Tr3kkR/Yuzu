@@ -68,6 +68,7 @@
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
+#include "device_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -7510,6 +7511,29 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+        // Per-device tier + management-group scope gate (wraps
+        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
+        // operator can only open / read / live-query a device inside their scope.
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
+        // device drills). SAME policy as get_visible_agents_json / the /devices list:
+        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
+        // off); else the caller's management-group members. The global-read branch is
+        // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        auto visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
+                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+                    auto v = mgmt_group_store_->get_visible_agents(username);
+                    return std::set<std::string>(v.begin(), v.end());
+                }
+            }
+            return std::nullopt; // global read or RBAC disabled → sees all
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -7927,6 +7951,18 @@ private:
             // and of those the Windows ones (the only OS with a crash collector
             // today — the coverage-honest crash-free denominator). Real data; an
             // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            //
+            // SCOPING NOTE (PR #1522 re-review): this provider is intentionally
+            // fleet-wide and is NOT an enumeration vector — it renders NO agent_ids.
+            // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
+            // score-distribution histogram). The device-id LISTS the re-review flagged
+            // get their ids from the per-OBSERVATION store queries (dex_top_devices /
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
+            // scoped to the caller's management groups (VisibleSetFn). So the
+            // enumeration is closed independent of this provider. True per-TENANT
+            // aggregate RATES would also need the store-side crash/signal NUMERATORS
+            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
+            // scoping the denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();
@@ -7940,6 +7976,19 @@ private:
                         // (G4 UP-1; pre-existing here, fixed with the sibling).
                         if (os.starts_with("win"))
                             ++f.windows_online;
+                        // Distinct connected OS tokens → the Catalogue's "All
+                        // connected" coverage scope (render normalises darwin→macos).
+                        if (!os.empty() && std::find(f.connected_os.begin(),
+                                                     f.connected_os.end(), os) ==
+                                               f.connected_os.end())
+                            f.connected_os.push_back(os);
+                        // Normalized (id, os) for the Overview score distribution +
+                        // the segment breakdown.
+                        const std::string nos = os.starts_with("win")            ? "windows"
+                                                : os.starts_with("lin")          ? "linux"
+                                                : (os == "darwin" || os == "macos") ? "macos"
+                                                                                    : os;
+                        f.connected_agents.emplace_back(id, nos);
                     }
                 }
                 return f;
@@ -7966,7 +8015,11 @@ private:
                 return out;
             },
             // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn);
+            dex_perf_fn,
+            // Per-device scope gate (same require_scoped_permission the /device routes
+            // use) + the visible-agent set resolver — so the per-device DEX drills are
+            // scoped and the device-id lists never enumerate out-of-scope agents.
+            scoped_perm_fn, visible_set_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -8091,6 +8144,91 @@ private:
 
         network_routes_ = std::make_unique<NetworkRoutes>();
         network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
+
+        // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
+        // page; Device-info lens). Sourced from the live registry (the CONNECTED
+        // agents) → identity + tags, online=true. The DEX/Guardian lenses + the
+        // live pull are gated per-device by scoped_perm_fn (management-group scope).
+        // Provider is PER-OPERATOR SCOPED via get_visible_agents_json — the SAME
+        // path /api/agents uses, so a scope-limited operator never enumerates the
+        // whole fleet. Identity-only — deliberately does NOT score (dex_score stays
+        // -1); scoring is per-device in DeviceRoutes at the render sites (the single
+        // device on a page open; only the filtered rows on the list), so opening one
+        // device's page never pays an N-device GROUP-BY cost. (Governance Gate-3
+        // architect finding; 400k-scale + NFR.)
+        // Shared json-agent → DeviceRow identity mapping (used by both the scoped
+        // list provider and the unscoped single-device lookup).
+        auto make_device_row = [this](const nlohmann::json& a) -> DeviceRow {
+            DeviceRow d;
+            d.agent_id = a.value("agent_id", "");
+            d.hostname = a.value("hostname", "");
+            d.os = a.value("os", "");
+            d.arch = a.value("arch", "");
+            d.agent_version = a.value("agent_version", "");
+            d.online = true; // the registry holds connected sessions
+            d.last_seen = "now";
+            if (auto s = registry_.get_session(d.agent_id)) {
+                for (const auto& [k, v] : s->scopable_tags)
+                    d.tags.push_back(v.empty() ? k : (k + "=" + v));
+            }
+            return d;
+        };
+        auto devices_fn =
+            [this, make_device_row](const std::string& username) -> std::vector<DeviceRow> {
+            std::vector<DeviceRow> out;
+            auto arr = get_visible_agents_json(username);
+            out.reserve(arr.size());
+            for (const auto& a : arr)
+                out.push_back(make_device_row(a));
+            return out;
+        };
+        // UNSCOPED single-device resolver (the `get_one(id)` the list scan was meant
+        // to become). Authz is the scoped_perm_fn gate the per-device routes run
+        // FIRST; this only fetches the identity row. It must NOT re-scope: the list
+        // filter (get_visible_agents) is a flat group-member JOIN with no ancestor
+        // walk, while require_scoped_permission IS ancestor-aware — re-scoping here
+        // would 404 a device a parent-group role legitimately authorizes.
+        auto lookup_fn =
+            [this, make_device_row](const std::string& agent_id) -> std::optional<DeviceRow> {
+            if (agent_id.empty())
+                return std::nullopt;
+            for (const auto& a : registry_.to_json_obj())
+                if (a.value("agent_id", "") == agent_id)
+                    return make_device_row(a);
+            return std::nullopt;
+        };
+        device_routes_ = std::make_unique<DeviceRoutes>();
+        device_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            guaranteed_state_store_.get(),
+            // "Get live info" dispatches real plugin instructions (os_info/uptime,
+            // processes/list_hashed) through the shared chokepoint. DELIBERATELY an
+            // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
+            // the executions drawer): the live shell auto-fires one panel per kind on
+            // every device-page open, so tracking would flood the drawer with two
+            // executions per view. This matches the already-shipped DEX device-perf
+            // panel (also execution_id="") and the compliance polchk- skip — the same
+            // high-frequency-read rationale. Agentic-first parity (a machine-readable
+            // MCP/REST equivalent + discovery) for live-info AND the DEX-perf sibling
+            // is a tracked cross-cutting follow-up, not this PR (PR #1522 review #3).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -8924,6 +9062,7 @@ private:
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
+    std::unique_ptr<DeviceRoutes> device_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

@@ -318,6 +318,8 @@ yuzu_server_core_lib = static_library(
     'src/network_perf_model.cpp',
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/device_routes.cpp',
+    'src/device_ui.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
