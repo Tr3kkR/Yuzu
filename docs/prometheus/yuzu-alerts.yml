@@ -172,3 +172,31 @@ groups:
   #         severity: warning
   #       annotations:
   #         summary: "Response store write failure rate exceeds 1%"
+
+  # ── yuzu-secrets (DISABLED until the first secret-bearing store ships) ──
+  # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per
+  # store + failure class; the wiring PR exports them as
+  # yuzu_server_secret_decrypt_failures_total. Uncomment when live.
+  #
+  # - name: yuzu-secrets
+  #   rules:
+  #     - alert: YuzuSecretDecryptKekUnresolvable
+  #       # Sustained kek_unresolvable = backup skew / wrong keys dir —
+  #       # retries will NOT self-heal; restore the paired keys directory.
+  #       expr: |
+  #         rate(yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}[5m]) > 0
+  #       for: 2m
+  #       labels:
+  #         severity: critical
+  #       annotations:
+  #         summary: "Secret decrypts failing: KEK unresolvable (backup skew?)"
+  #
+  #     - alert: YuzuSecretDecryptTamperSignal
+  #       # A single tag_mismatch is the tamper signal — investigate via the
+  #       # secret.decrypt_failure audit trail; never retry-and-ignore.
+  #       expr: |
+  #         increase(yuzu_server_secret_decrypt_failures_total{failure_class="tag_mismatch"}[1h]) > 0
+  #       labels:
+  #         severity: critical
+  #       annotations:
+  #         summary: "Secret blob failed GCM authentication (tamper signal)"

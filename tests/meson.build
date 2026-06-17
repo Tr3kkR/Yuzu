@@ -300,6 +300,7 @@ if build_server
       'unit/server/test_pg_raii.cpp',
       'unit/server/test_pg_pool.cpp',
       'unit/server/test_pg_migration_runner.cpp',
+      'unit/server/test_secret_codec.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
