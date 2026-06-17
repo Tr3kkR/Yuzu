@@ -809,6 +809,18 @@ public:
 
         // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
+            // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
+            // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
+            // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
+            // the TAR plugin through a borrowed descriptor, so it must not
+            // outlive the plugins; and leaving any of these `this`-capturing
+            // threads joinable on an early `return` out of Run() (the hard
+            // registration rejection and the PKI persist/rebuild bail-outs)
+            // aborts the process via std::terminate. This guard runs on EVERY
+            // Run() exit — early returns and exceptions included — so it is the
+            // universal backstop. The reconnect-loop final teardown repeats the
+            // pump join to order it ahead of plugins_.clear() on the normal path.
+            quiesce_run_workers();
             // Stop the trigger engine FIRST — before plugins are torn down —
             // so an in-flight interval/file/service trigger can't dispatch
             // into a plugin that's mid-shutdown. stop() joins the worker
@@ -1990,15 +2002,26 @@ public:
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
-                // PR 10: the snapshot pump is intentionally NOT joined
-                // here. It is a Run()-lifetime thread that survives
-                // reconnects, so the heartbeat thread of the next
-                // connection cycle finds a warm latest_snapshot_ and
-                // ships it immediately. The pump joins only at final
-                // shutdown, below — see the Run()-exit cleanup.
+                // PR 10: the snapshot pump is intentionally NOT joined on a
+                // transient (non-final) disconnect. It is a Run()-lifetime
+                // thread that survives reconnects, so the heartbeat thread of
+                // the next connection cycle finds a warm latest_snapshot_ and
+                // ships it immediately. The pump is joined only on FINAL
+                // shutdown — by quiesce_run_workers() in the stop_requested_
+                // branch just below (and by the Run()-exit ScopeExit backstop).
 
                 // Only shutdown plugins on final exit — keep them loaded for reconnect
                 if (stop_requested_.load(std::memory_order_acquire)) {
+                    // #1420 — the snapshot pump borrows a descriptor into
+                    // `plugins_`; join it (and the other Run() workers) BEFORE
+                    // shutting the plugins down and clearing the vector below,
+                    // otherwise an in-flight pump cycle dispatches into freed
+                    // plugin state (use-after-free / abort on a clean exit).
+                    // This call's SOLE purpose is that ordering relative to
+                    // plugins_.clear(); the Run()-exit ScopeExit is the backstop
+                    // for every early-return/exception exit, and re-invoking the
+                    // helper there is a joinable()-guarded no-op.
+                    quiesce_run_workers();
                     for (auto& handle : plugins_) {
                         if (handle.descriptor()->shutdown) {
                             auto it = per_plugin_ctx_.find(handle.descriptor()->name);
@@ -2027,14 +2050,13 @@ public:
             break; // stop_requested
         }          // end while (reconnect loop)
 
-        // PR 10: snapshot pump joined here, post reconnect loop. The
-        // pump observes `stop_requested_` (set in stop() above) and
-        // exits at the next 2 s slice boundary; joining at final
-        // shutdown means the thread is collected before Run() returns
-        // and the AgentImpl dtor sees a default-constructed thread.
-        if (snapshot_pump_thread_.joinable()) {
-            snapshot_pump_thread_.join();
-        }
+        // #1420 / #1434: the snapshot pump, heartbeat, and OTA-updater threads
+        // are quiesced and joined by quiesce_run_workers() — invoked from the
+        // final-shutdown teardown above (before plugins_.clear(), so a pump
+        // cycle can't dispatch into freed plugin state) and, as the universal
+        // backstop for every exit path including the early-return rejections,
+        // from the Run()-exit ScopeExit `cleanup`. No separate post-loop join
+        // is needed here.
     }
 
     void stop() noexcept override {
@@ -2083,6 +2105,54 @@ private:
         std::lock_guard lock(stream_write_mu_);
         if (guardian_sink_stream_)
             guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+    }
+
+    // #1420 / #1434 — single quiesce-and-join chokepoint for the three
+    // `this`-capturing worker threads Run() spawns: the Run()-lifetime snapshot
+    // pump, the per-connection heartbeat, and the OTA-updater thread. Every one
+    // of them must be stopped and joined before the agent's plugins are torn
+    // down and before AgentImpl is destroyed:
+    //   * the snapshot pump dispatches `tar.fleet_snapshot` into the TAR plugin
+    //     through a borrowed descriptor — a cycle that runs after plugin
+    //     teardown is a use-after-free (#1420);
+    //   * any Run() exit that leaves one of these threads joinable aborts the
+    //     process via std::terminate when the std::thread is destroyed (#1434,
+    //     e.g. the hard registration-rejection `return`).
+    // Invoked from EVERY Run() exit path: the Run()-exit ScopeExit `cleanup`
+    // (covers the early returns and exceptions) and the reconnect-loop final
+    // teardown (orders the pump join ahead of plugins_.clear()). Idempotent —
+    // the joinable() guards make repeat calls and the not-yet-started register
+    // loop returns (where heartbeat/updater don't exist yet) no-ops.
+    //
+    // Unblock-before-join keeps the joins bounded: the pump observes the stop
+    // flag on its ≤2 s sleep slices (worst case it finishes one in-flight local
+    // `fleet_snapshot` enumerate — no blocking I/O, so the join is bounded by a
+    // single capture, not a network wait); the heartbeat may be parked in a
+    // Heartbeat RPC and the updater in an OTA RPC, so we TryCancel the heartbeat
+    // context and stop() the updater first — `Updater::stop()` now TryCancels
+    // its in-flight OTA RPC too (#1434 UP-1), so a stalled download can't hang
+    // the join. This is a SUPERSET of what stop() unblocks (stop() additionally
+    // cancels the Subscribe stream and drains guardian_/dex_observer_, which are
+    // member-owned and joined by their own dtors — deliberately NOT joined here).
+    //
+    // TERMINAL-ONLY: this sets stop_requested_, so it must be called only on a
+    // path that is actually shutting the agent down (the Run()-exit ScopeExit,
+    // or the reconnect-loop teardown already gated on stop_requested_). Never
+    // call it on a transient-reconnect path — doing so would euthanise a healthy
+    // agent and break the across-reconnect warm-snapshot continuity (PR 10).
+    void quiesce_run_workers() noexcept {
+        stop_requested_.store(true, std::memory_order_release);
+        heartbeat_stop_.store(true, std::memory_order_release);
+        if (updater_)
+            updater_->stop();
+        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire))
+            hctx->TryCancel();
+        if (snapshot_pump_thread_.joinable())
+            snapshot_pump_thread_.join();
+        if (heartbeat_thread_.joinable())
+            heartbeat_thread_.join();
+        if (update_thread_.joinable())
+            update_thread_.join();
     }
 
     Config cfg_;

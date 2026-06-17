@@ -1911,13 +1911,37 @@ std::string DashboardRoutes::render_tar_retention_paused(
         int64_t paused_at{0};
         int64_t live_rows{-1};   // -1 = unknown (older agent)
         int64_t oldest_ts{0};
+        bool value_error{false}; // #560: <source>_enabled held a non-canonical value
+        std::string enabled_raw; // the offending value, for the value-error badge
     };
     std::vector<PausedRow> rows;
     int agents_responded = 0;
     int agents_with_no_paused_sources = 0;
     int agents_filtered_out_of_scope = 0;
 
+    // #561 — a malicious or buggy agent can spam many responses under one
+    // command_id (no (command_id, agent_id) uniqueness at the write path). Dedup
+    // to the most-recent response per agent BEFORE the per-response parse, so
+    // render work is bounded to O(visible_agents × sources), not O(responses).
+    // (The store-side per-pair cap is the complementary defence.)
+    //
+    // Recency uses ONLY `received_at_ms` — the SERVER ingest stamp, which the
+    // agent cannot forge. We deliberately do NOT fall back to the agent-claimed
+    // `timestamp`: a compromised agent could backdate it to make a stale
+    // "enabled=true" response win the dedup and hide its actually-paused/errored
+    // state (the exact thing #560 surfaces). Legacy pre-v3 rows (received_at_ms
+    // == 0) sort as oldest and lose to any stamped response — correct.
+    auto resp_recency = [](const StoredResponse& r) -> int64_t { return r.received_at_ms; };
+    std::unordered_map<std::string, const StoredResponse*> latest_by_agent;
+    latest_by_agent.reserve(responses.size());
     for (const auto& resp : responses) {
+        auto [it, inserted] = latest_by_agent.try_emplace(resp.agent_id, &resp);
+        if (!inserted && resp_recency(resp) >= resp_recency(*it->second))
+            it->second = &resp;
+    }
+
+    for (const auto& [dedup_agent_id, resp_ptr] : latest_by_agent) {
+        const StoredResponse& resp = *resp_ptr;
         // Visibility gate: drop responses from agents the operator cannot
         // see. If mgmt_group_store_ is unavailable, fail closed (drop all
         // — operator sees an empty list rather than unscoped data).
@@ -1946,13 +1970,22 @@ std::string DashboardRoutes::render_tar_retention_paused(
         for (const char* source : {"process", "tcp", "service", "user"}) {
             std::string enabled_key = std::string{source} + "_enabled";
             auto it = kv.find(enabled_key);
-            if (it == kv.end() || it->second != "false") continue;
+            if (it == kv.end()) continue;          // source not reported by this agent
+            if (it->second == "true") continue;    // collecting normally — not paused
+            // #560 — tri-state: "false" is genuinely paused; ANYTHING ELSE
+            // ("errored" from a corrupt/tampered agent DB, or a garbage value)
+            // must surface with a value-error badge, NOT be silently dropped
+            // (silent omission shows clean state for an actually-paused source).
+            const bool value_error = (it->second != "false");
 
             PausedRow row;
             row.agent_id = resp.agent_id;
             row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
                                           : resp.agent_id;
             row.source = source;
+            row.value_error = value_error;
+            if (value_error)
+                row.enabled_raw = it->second;
             if (auto p = kv.find(std::string{source} + "_paused_at");
                 p != kv.end()) {
                 try { row.paused_at = std::stoll(p->second); } catch (...) {}
@@ -2009,8 +2042,8 @@ std::string DashboardRoutes::render_tar_retention_paused(
         agents_responded,
         agents_with_no_paused_sources);
     if (agents_filtered_out_of_scope > 0) {
-        html += std::format(" &middot; <strong>{}</strong> response{} from "
-                            "out-of-scope agents dropped",
+        html += std::format(" &middot; <strong>{}</strong> out-of-scope "
+                            "agent{} dropped",
                             agents_filtered_out_of_scope,
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
@@ -2037,18 +2070,20 @@ std::string DashboardRoutes::render_tar_retention_paused(
         return html;
     }
 
-    // Sort: paused-longest-first, then by agent display name. Operators want
-    // to see the boxes that have been accumulating non-aging data the
-    // longest at the top of the list.
+    // Sort: value-error rows first (they need operator attention), then
+    // paused-longest-first, then by agent display name. #558 — an unknown
+    // paused_at (0) here means the agent reported the source disabled but never
+    // wrote a paused_at (a pre-v0.12.0 agent), i.e. it has been paused at least
+    // since that build — it is OLDER than any known-timestamp transition, not
+    // newer. The previous `0 ? INT64_MAX` sank these longest-paused sources to
+    // the BOTTOM, inverting operator intent; sort 0 as the smallest (oldest)
+    // instead so they rank at the top.
     std::sort(rows.begin(), rows.end(),
               [](const PausedRow& a, const PausedRow& b) {
-                  if (a.paused_at != b.paused_at) {
-                      // Smaller paused_at = older = first. Treat 0 as "infinity"
-                      // so unknowns sink to the bottom.
-                      auto cmp_a = a.paused_at == 0 ? INT64_MAX : a.paused_at;
-                      auto cmp_b = b.paused_at == 0 ? INT64_MAX : b.paused_at;
-                      return cmp_a < cmp_b;
-                  }
+                  if (a.value_error != b.value_error)
+                      return a.value_error; // errors float to the top
+                  if (a.paused_at != b.paused_at)
+                      return a.paused_at < b.paused_at; // smaller (incl. 0) = older = first
                   return a.agent_display < b.agent_display;
               });
 
@@ -2066,10 +2101,35 @@ std::string DashboardRoutes::render_tar_retention_paused(
     for (const auto& r : rows) {
         html += "<tr>";
         html += "<td>" + html_escape(r.agent_display) + "</td>";
-        html += "<td><span class=\"source-pill\">" +
-                html_escape(r.source) + "</span></td>";
-        html += "<td>" + format_utc(r.paused_at) + "</td>";
-        html += "<td>" + format_age(r.paused_at, now) + "</td>";
+        // #560 — a value-error source carries a badge in the source column so
+        // an operator sees that the agent reported a non-canonical enabled value
+        // (corruption / tampering / pre-tri-state agent) instead of the source
+        // being silently absent from the list.
+        if (r.value_error) {
+            html += "<td><span class=\"source-pill\">" + html_escape(r.source) +
+                    "</span> <span class=\"badge badge-danger\" title=\"agent reported "
+                    "&#39;" + html_escape(r.enabled_raw) +
+                    "&#39; for this source's enabled flag — expected true/false; check the "
+                    "agent's tar.db\">value error</span></td>";
+        } else {
+            html += "<td><span class=\"source-pill\">" + html_escape(r.source) + "</span></td>";
+        }
+        // #558 — an agent that reported the source disabled but no paused_at
+        // (paused_at == 0) is a pre-v0.12.0 agent that lacks the field. Render an
+        // explicit "schema-older-than-server" badge instead of a bare em-dash, so
+        // the operator knows the row needs the agent upgraded rather than reading
+        // "—" as "unknown / not paused".
+        if (r.value_error) {
+            html += "<td colspan=\"2\"><span style=\"color:#8b949e\">reported <code>" +
+                    html_escape(r.enabled_raw) + "</code></span></td>";
+        } else if (r.paused_at == 0) {
+            html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
+                    "predates the paused-since field (v0.12.0); upgrade the agent to record the "
+                    "transition time\">schema older than server</span></td>";
+        } else {
+            html += "<td>" + format_utc(r.paused_at) + "</td>";
+            html += "<td>" + format_age(r.paused_at, now) + "</td>";
+        }
         html += "<td style=\"text-align:right\">";
         if (r.live_rows < 0) {
             html += "<span style=\"color:#8b949e\">—</span>";
