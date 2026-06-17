@@ -3,39 +3,27 @@
  */
 
 #include "management_group_store.hpp"
+#include "rbac_store.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <sqlite3.h>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <string>
-#include <thread>
 
 using namespace yuzu::server;
 
 namespace {
 
-// Per-instance unique path so tests are safe to run under parallel
-// meson test --num-processes N. The prior hardcoded path collided
-// between concurrent test cases and between the outer constructor and
-// destructor in the injected-cycle test below.
-struct TempDb {
-    std::filesystem::path path;
-    TempDb()
-        : path(std::filesystem::temp_directory_path() /
-               ("test_mgmt_groups-" +
-                std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-                               static_cast<size_t>(std::chrono::steady_clock::now()
-                                                       .time_since_epoch()
-                                                       .count())) +
-                ".db")) {
-        std::filesystem::remove(path);
-    }
-    ~TempDb() { std::filesystem::remove(path); }
-};
+// Per-test SQLite temp file. yuzu::test::TempDbFile carries the collision-safe
+// naming (process salt + atomic counter) and -wal/-shm cleanup — never the
+// std::hash<std::thread::id> ^ steady_clock idiom CLAUDE.md bans after the
+// Windows-runner flake #473.
+using TempDb = yuzu::test::TempDbFile;
 
 } // namespace
 

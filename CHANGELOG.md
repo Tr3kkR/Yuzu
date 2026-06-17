@@ -294,8 +294,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Device visibility now correctly returns the full enrolled set under
   RBAC-disabled, across the dashboard agent list, `/api/agents`, and the TAR
   fleet scan. When RBAC is **enabled**, the exact role-scoped behaviour is
-  preserved unchanged. The UAT rig additionally seeds an admin root-group role so
-  the environment is also correct if RBAC is later turned on.
+  preserved unchanged. A missing or corrupt RBAC store fails **closed** —
+  visibility stays role-scoped (a caller without a management-group role sees
+  nothing) rather than falling back to the full fleet, so an integrity failure
+  can never widen exposure; both the `/api/agents` list and the TAR fleet scan
+  share one `rbac_enforcement_in_effect` predicate and cannot disagree (#1498).
+  The UAT rig additionally seeds an admin root-group role so the environment is
+  also correct if RBAC is later turned on.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

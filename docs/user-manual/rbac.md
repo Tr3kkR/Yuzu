@@ -23,6 +23,15 @@ enabled = true
 > `ITServiceOwner` role on the root "All Devices" group; see
 > [`management-groups.md`](management-groups.md) for the delegation API.
 
+> **RBAC store integrity (fail-closed).** If the RBAC store cannot open or
+> migrate (e.g. a corrupt `rbac.db`), the server fails **closed**: device
+> visibility falls back to the role-scoped path for every caller, so agents stop
+> appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
+> the whole fleet being exposed. A corrupt store therefore looks like "no agents
+> in scope," not a visibility leak — check the server startup log for `RbacStore`
+> errors and the `/health` store status, then restore or remove the file and
+> restart.
+
 ## Concepts
 
 | Concept | Description |
