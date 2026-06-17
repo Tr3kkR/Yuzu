@@ -1586,6 +1586,23 @@ public:
         {
             auto mgmt_db = cfg_.db_dir() / "management-groups.db";
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
+            // #1453 — make device visibility honor the RBAC-disabled posture.
+            // When RBAC is globally off there are no per-user
+            // management_group_roles rows, so get_visible_agents would return an
+            // empty set and the legacy-admin superuser would see no agents (TAR
+            // fleet scan, /api/me visible-agents). The probe lets the store
+            // return the full enrolled set in that case; when RBAC is enabled it
+            // reports true and the exact role-scoped join is preserved. Reads the
+            // live RbacStore flag at request time, so wiring order vs rbac_store_
+            // does not matter.
+            //
+            // #1498 — the predicate fails CLOSED on a missing or load-failed
+            // store (open/migration failure leaves db_ null), so a corrupt
+            // rbac.db can never widen TAR fleet-scan visibility to the whole
+            // fleet; see rbac_enforcement_in_effect (rbac_store.hpp) for the
+            // full policy and its unit tests.
+            mgmt_group_store_->set_rbac_enabled_probe(
+                [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); });
             // Ensure root "All Devices" group exists
             if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
                 auto root = mgmt_group_store_->get_group(ManagementGroupStore::kRootGroupId);
@@ -3439,8 +3456,18 @@ private:
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
-        if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-            bool global_read = rbac_store_->check_permission(username, "Infrastructure", "Read");
+        // #1498 — restrict whenever RBAC enforcement is in effect, which includes
+        // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
+        // disabled store skips filtering and returns the full fleet. Shares the
+        // rbac_enforcement_in_effect predicate with the get_visible_agents probe
+        // so /api/agents and the TAR fleet scan can never disagree.
+        if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+            // A global Infrastructure:Read grant sees the whole fleet even under
+            // RBAC-on. On a load-failed store check_permission is unavailable
+            // (is_open()==false), so this is false and visibility falls to the
+            // role-scoped join, which itself fails closed.
+            bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                               rbac_store_->check_permission(username, "Infrastructure", "Read");
             if (!global_read) {
                 auto visible = mgmt_group_store_->get_visible_agents(username);
                 std::set<std::string> visible_set(visible.begin(), visible.end());
@@ -8843,6 +8870,12 @@ private:
     std::unique_ptr<ScheduleEngine> schedule_engine_;
 
     // Phase 3: Security & RBAC
+    // ORDER IS LOAD-BEARING (#1453): rbac_store_ MUST be declared before
+    // mgmt_group_store_. The latter holds a `this`-capturing RBAC-enabled probe
+    // (set_rbac_enabled_probe) that reads rbac_store_; members destruct in
+    // reverse declaration order, so mgmt_group_store_ (and its probe) are torn
+    // down BEFORE rbac_store_, ensuring the probe can never read a freed store
+    // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;

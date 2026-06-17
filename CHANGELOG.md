@@ -286,21 +286,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Agent no longer crashes or crash-loops on permanent registration rejection
-  or clean shutdown with the TAR plugin loaded (#1434, #1420).** Three
-  `this`-capturing worker threads spawned by `AgentImpl::Run()` — the TAR
-  snapshot pump, the per-connection heartbeat, and the OTA updater — were not
-  joined on the early-`return` exit paths, and the snapshot pump was joined only
-  *after* `plugins_.clear()` on the normal shutdown path. A permanent
-  registration rejection (exhausted or expired enrollment token) left the pump
-  thread running against freed `AgentImpl` state — a use-after-free / SIGSEGV
-  crash loop on the released agent (#1434); on a clean shutdown the pump could
-  dispatch `tar.fleet_snapshot` into a plugin that `plugins_.clear()` had already
-  torn down, aborting on a clean exit path (#1420). A single
-  `quiesce_run_workers()` chokepoint now joins all three threads on every exit
-  path (early returns, exceptions, and normal shutdown), ordered before plugin
-  teardown. `Updater::stop()` additionally cancels its in-flight OTA RPC so a
-  stalled download cannot hang the shutdown join.
+- **TAR fleet scan now shows all agents when RBAC is disabled (#1453, #1454).**
+  With RBAC enforcement globally off (the default posture), no per-user
+  management-group role assignments exist, so operators with full admin access
+  saw "no agents in scope" when running a TAR fleet scan — and had no in-product
+  way to recover (granting the first group role itself required holding one).
+  Device visibility now correctly returns the full enrolled set under
+  RBAC-disabled, across the dashboard agent list, `/api/agents`, and the TAR
+  fleet scan. When RBAC is **enabled**, the exact role-scoped behaviour is
+  preserved unchanged. A missing or corrupt RBAC store fails **closed** —
+  visibility stays role-scoped (a caller without a management-group role sees
+  nothing) rather than falling back to the full fleet, so an integrity failure
+  can never widen exposure; both the `/api/agents` list and the TAR fleet scan
+  share one `rbac_enforcement_in_effect` predicate and cannot disagree (#1498).
+  The UAT rig additionally seeds an admin root-group role so the environment is
+  also correct if RBAC is later turned on.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory
