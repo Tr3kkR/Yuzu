@@ -12,11 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
   filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
   page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The
-  fleet list requires `Infrastructure:Read` and is sourced from the same per-operator scoped
-  provider as the agent list (`get_visible_agents_json`); every per-device route — page, info,
-  the DEX/Guardian lenses, and the live pull — is scoped to the device's management group via
-  `require_scoped_permission`, so an operator cannot list, open, read, or live-query a device
-  outside their scope. The DEX and Guardian lenses render per-device behavioral/compliance data
+  fleet list now requires `Infrastructure:Read` (parity with `/api/agents`, via the same
+  `get_visible_agents_json` provider — closing the prior any-authenticated-operator access);
+  every per-device route — page, info, the DEX/Guardian lenses, and the live pull — is
+  additionally scoped to the device's management group via `require_scoped_permission`, so an
+  operator cannot open, read, or live-query a device outside their scope. The DEX and Guardian
+  lenses render per-device behavioral/compliance data
   with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
   page open score only the rows they render — opening one device no longer scores the whole
   fleet. The list shows currently-connected devices only (no offline/status filter yet).

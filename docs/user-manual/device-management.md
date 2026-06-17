@@ -204,7 +204,7 @@ These fields are used by the [Scope Engine](scope-engine.md) for device targetin
 
 ### Dashboard
 
-The **Devices** page (`/devices`) lists the **currently-connected** agents that are visible to you — the same per-operator scoping as the agent list, requiring the **`Infrastructure:Read`** permission and limited to your management groups — with each one's hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page.
+The **Devices** page (`/devices`) lists the **currently-connected** agents and requires the **`Infrastructure:Read`** permission — the same gate as the agent list (`/api/agents`). It uses the same visibility provider, so an operator without `Infrastructure:Read` cannot reach it; note that, exactly like `/api/agents`, an operator who *does* hold `Infrastructure:Read` sees the whole connected fleet here (per-team **list** filtering beyond that gate is not applied today — the per-team control is enforced per device, below). Each row shows hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page.
 
 > The list is sourced from the live connection registry, so it shows connected devices only (there is no offline/status filter). Enrolled-but-offline devices and real last-seen times arrive with the persistent device-inventory slice.
 
