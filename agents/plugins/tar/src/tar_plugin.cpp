@@ -1261,7 +1261,17 @@ private:
         int slow_secs = 0;
         int days = 0;
 
-        // M13: Validate ALL parameters BEFORE writing any to the database
+        // M13 contract: validate EVERY parameter in the request in PHASE 1 and
+        // only persist them in PHASE 2 once all pass. A request that mixes a
+        // valid change with a later invalid one is therefore rejected atomically
+        // — nothing is written. (Previously the writes were interleaved with the
+        // validators, so e.g. a request carrying a valid `process_enabled=false`
+        // followed by an invalid exclusion list would persist the disable —
+        // silently turning off capture — yet return an error to the caller.)
+        // No db_->set_config / apply_source_enabled_transition call happens until
+        // the "Phase 2" block below; every path before it only reads + validates.
+
+        // ── Phase 1: validate everything (no writes) ─────────────────────────
         if (!retention.empty()) {
             try {
                 days = std::stoi(std::string{retention});
@@ -1292,33 +1302,14 @@ private:
             }
         }
 
-        // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
             return 1;
         }
 
-        // Now persist all validated values
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
-            changed = true;
-        }
-
-        if (fast_secs > 0) {
-            db_->set_config("fast_interval_seconds", std::string{fast_interval});
-            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-            changed = true;
-        }
-
-        if (slow_secs > 0) {
-            db_->set_config("slow_interval_seconds", std::string{slow_interval});
-            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-            changed = true;
-        }
-
-        if (!redaction.empty()) {
-            // Validate it's a JSON array of non-empty strings
+        // redaction_patterns — validate a JSON array of non-empty strings.
+        const bool have_redaction = !redaction.empty();
+        if (have_redaction) {
             try {
                 auto arr = json::parse(std::string{redaction});
                 if (!arr.is_array()) {
@@ -1343,9 +1334,6 @@ private:
                         return 1;
                     }
                 }
-                db_->set_config("redaction_patterns", std::string{redaction});
-                ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
-                changed = true;
             } catch (...) {
                 ctx.write_output("error|redaction_patterns must be valid JSON array");
                 return 1;
@@ -1353,19 +1341,13 @@ private:
         }
 
         // ── Per-source enable/disable (issue #59) ─────────────────────────────
-        // Operators can disable any of the four collectors on a host without
-        // editing source. Disabled collectors short-circuit in
-        // collect_fast/slow but still permit `query` against existing rows
-        // (so historical data remains readable while new captures stop).
-        //
-        // PR-A: when a transition enable→disable happens, record the wall-clock
-        // timestamp in `<source>_paused_at` so the server-side retention-paused
-        // dashboard list (#547) can render "paused since" without inferring it
-        // from the audit log. The reverse transition clears the value to "0"
-        // (we do not delete keys — a missing key would be ambiguous with "never
-        // paused"). The timestamp is operator-facing wall-clock seconds; clock
-        // skew is acceptable because the surface is "paused since approximately
-        // X" and the ground truth is the agent's view.
+        // Operators can disable any collector on a host without editing source.
+        // Disabled collectors short-circuit in collect_fast/slow but still permit
+        // `query` against existing rows. Collect the validated (source, value)
+        // toggles here; the transition is applied in Phase 2. PR-A: enable→disable
+        // records `<source>_paused_at` (wall-clock) for the retention-paused
+        // dashboard list (#547); the reverse clears it to "0".
+        std::vector<std::pair<std::string, std::string>> source_toggles;
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string key = std::format("{}_enabled", src.name);
             auto val = params.get(key);
@@ -1376,81 +1358,50 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
-            ctx.write_output(std::format("config|{}|{}", key, v));
-            // Echo the resulting paused_at so the operator/dashboard sees the
-            // transition timestamp without an extra status round-trip. We
-            // re-read it post-write rather than re-deriving the transition
-            // here — single source of truth.
-            std::string paused_at_key = std::format("{}_paused_at", src.name);
-            ctx.write_output(
-                std::format("config|{}|{}", paused_at_key, db_->get_config(paused_at_key, "0")));
-            changed = true;
+            source_toggles.emplace_back(std::string{src.name}, std::move(v));
         }
 
         // ── Network capture method surface (issue #59) ───────────────────────
         // Today only "polling" is wired. ETW (Windows) and Endpoint Security
         // (macOS) are accepted-and-stored values per the schema registry's
-        // OsSupport metadata so an operator can pre-stage the configuration,
-        // but the collector continues to use polling until the relevant
-        // implementation lands. Validation rejects unknown methods so a typo
-        // does not silently re-default to polling.
-        if (auto m = params.get("network_capture_method"); !m.empty()) {
-            std::string method{m};
-            // "polling" is a sentinel meaning "use the platform default" —
-            // the only mechanism actually wired today. It is intentionally
-            // accepted unconditionally even though no os_support row carries
-            // it as a capture_method (the per-OS rows describe the underlying
-            // platform API: iphlpapi / procfs / proc_pidfdinfo). Without this
-            // special case `tar.status` would report `polling` as the default
-            // but `tar.configure network_capture_method=polling` would be
-            // rejected — the round trip would be broken (governance C-1 /
-            // QA Finding 2).
-            if (method != "polling") {
-                // #540 — validate against THIS host's OS accept-list, not the
-                // OS-blind union. The union would let a Linux agent store
-                // 'iphlpapi' (a Windows-only API) or a Windows agent store
-                // 'procfs'; the value would be persisted and surfaced in status
-                // even though the per-OS collector never honours it.
-                auto accepted =
-                    yuzu::tar::accepted_capture_methods_for_os("tcp",
-                                                               yuzu::tar::current_platform_os());
-                if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
-                    std::string list = "polling";
-                    for (const auto& m2 : accepted) {
-                        list += ",";
-                        list += m2;
-                    }
-                    ctx.write_output(std::format(
-                        "error|network_capture_method '{}' is not accepted on this OS "
-                        "(must be one of: {})",
-                        method, list));
-                    return 1;
+        // OsSupport metadata so an operator can pre-stage the configuration, but
+        // the collector continues to use polling until the implementation lands.
+        const auto net_param = params.get("network_capture_method");
+        const bool have_net = !net_param.empty();
+        std::string net_method{net_param};
+        if (have_net && net_method != "polling") {
+            // "polling" is a sentinel meaning "use the platform default" — the
+            // only mechanism wired today — and is accepted unconditionally even
+            // though no os_support row carries it as a capture_method (governance
+            // C-1 / QA Finding 2 round-trip). #540 — validate any other value
+            // against THIS host's OS accept-list, not the OS-blind union, so a
+            // Linux agent cannot store 'iphlpapi' nor a Windows agent 'procfs'.
+            auto accepted = yuzu::tar::accepted_capture_methods_for_os(
+                "tcp", yuzu::tar::current_platform_os());
+            if (std::find(accepted.begin(), accepted.end(), net_method) == accepted.end()) {
+                std::string list = "polling";
+                for (const auto& m2 : accepted) {
+                    list += ",";
+                    list += m2;
                 }
-                // Surface that no kernel-event collector is wired yet so an
-                // operator pre-staging 'etw' / 'endpoint_security' isn't
-                // surprised that the collector keeps polling under the hood.
-                ctx.write_output(
-                    std::format("warn|network_capture_method '{}' accepted but not yet "
-                                "implemented; collector will continue polling",
-                                method));
+                ctx.write_output(std::format(
+                    "error|network_capture_method '{}' is not accepted on this OS "
+                    "(must be one of: {})",
+                    net_method, list));
+                return 1;
             }
-            db_->set_config("network_capture_method", method);
-            ctx.write_output(std::format("config|network_capture_method|{}", method));
-            changed = true;
         }
 
         // ── Process stabilization exclusions (issue #59) ─────────────────────
-        // List of process-name patterns (case-insensitive substring, NOT real
-        // glob — see should_redact) whose churn should be excluded from process
-        // events. Useful for noisy short-lived helpers (CI runners, IDE indexers,
-        // telemetry agents) that produce thousands of birth/death rows per minute
-        // and dwarf the actual process activity an operator wants to see.
-        // Trade-off: forensic completeness is reduced — anything matching these
-        // patterns is invisible to TAR.
-        if (auto exc = params.get("process_stabilization_exclusions"); !exc.empty()) {
+        // Case-insensitive substring patterns whose churn is excluded from
+        // process events (noisy short-lived helpers). Validate here; persist in
+        // Phase 2. Trade-off: anything matching is invisible to TAR, hence the
+        // require_min_core_len floor that rejects over-broad 1–2 char patterns.
+        const auto excl_param = params.get("process_stabilization_exclusions");
+        const bool have_excl = !excl_param.empty();
+        if (have_excl) {
             try {
-                auto arr = json::parse(std::string{exc});
+                auto arr = json::parse(std::string{excl_param});
                 if (!arr.is_array()) {
                     ctx.write_output("error|process_stabilization_exclusions must be a JSON array");
                     return 1;
@@ -1475,15 +1426,66 @@ private:
                         return 1;
                     }
                 }
-                db_->set_config("process_stabilization_exclusions", std::string{exc});
-                ctx.write_output(std::format("config|process_stabilization_exclusions|{}", exc));
-                changed = true;
             } catch (...) {
                 ctx.write_output("error|process_stabilization_exclusions must be valid JSON array");
                 return 1;
             }
         }
 
+        // ── Phase 2: persist (every parameter above is already validated) ────
+        if (days > 0) {
+            db_->set_config("retention_days", std::string{retention});
+            ctx.write_output(std::format("config|retention_days|{}", retention));
+            changed = true;
+        }
+        if (fast_secs > 0) {
+            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
+            changed = true;
+        }
+        if (slow_secs > 0) {
+            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
+            changed = true;
+        }
+        if (have_redaction) {
+            db_->set_config("redaction_patterns", std::string{redaction});
+            ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
+            changed = true;
+        }
+        for (const auto& [src_name, v] : source_toggles) {
+            yuzu::tar::apply_source_enabled_transition(*db_, src_name, v, now_epoch_seconds());
+            ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Echo the resulting paused_at so the dashboard sees the transition
+            // timestamp without an extra status round-trip — single source of
+            // truth (re-read, not re-derived).
+            std::string paused_at_key = std::format("{}_paused_at", src_name);
+            ctx.write_output(
+                std::format("config|{}|{}", paused_at_key, db_->get_config(paused_at_key, "0")));
+            changed = true;
+        }
+        if (have_net) {
+            if (net_method != "polling") {
+                // Surface that no kernel-event collector is wired yet so an
+                // operator pre-staging 'etw' / 'endpoint_security' isn't
+                // surprised the collector keeps polling under the hood.
+                ctx.write_output(
+                    std::format("warn|network_capture_method '{}' accepted but not yet "
+                                "implemented; collector will continue polling",
+                                net_method));
+            }
+            db_->set_config("network_capture_method", net_method);
+            ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+            changed = true;
+        }
+        if (have_excl) {
+            db_->set_config("process_stabilization_exclusions", std::string{excl_param});
+            ctx.write_output(std::format("config|process_stabilization_exclusions|{}", excl_param));
+            changed = true;
+        }
+
+        // Phase 1 returns early on any invalid parameter, so reaching here with
+        // nothing changed means the request carried no recognised parameter.
         if (!changed) {
             ctx.write_output("error|no valid configuration parameters provided");
             return 1;
