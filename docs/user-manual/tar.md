@@ -242,7 +242,7 @@ The first frame surfaces every device × source pair where the collector has bee
 - Viewing the page and the retention-paused list requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
 - **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
-- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle).
+- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle). When RBAC is **disabled** (the default), "your scope" is the full enrolled fleet; when RBAC is **enabled**, scope is determined by your management-group role assignments.
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 

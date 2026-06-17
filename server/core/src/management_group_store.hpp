@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <shared_mutex>
@@ -82,7 +83,35 @@ public:
     std::vector<GroupRoleAssignment> get_group_roles(const std::string& group_id) const;
 
     /// Which agents can a user see based on group-scoped role assignments?
+    ///
+    /// PRECONDITION: the caller must have already authenticated the session.
+    /// This method performs NO authentication and, when RBAC is not actively
+    /// enforced (below), returns the full enrolled set for ANY username — the
+    /// route-layer session/permission check is the access boundary.
+    ///
+    /// When RBAC enforcement is globally DISABLED (the default posture, and the
+    /// UAT rig), no per-user `management_group_roles` rows exist, so the
+    /// role-scoped inner join would return an empty set and hide every agent
+    /// from the legacy-admin superuser — even though it has full effective
+    /// access everywhere else (#1453). In that case this returns the full
+    /// enrolled set instead (every agent is auto-added to the root "All
+    /// Devices" group at enrollment). The branch is gated on the injected
+    /// `rbac_enabled_probe_`: when the probe reports RBAC ENABLED the exact
+    /// role-scoped semantics are preserved unchanged, so the fallback can never
+    /// widen visibility WHILE RBAC IS ON. When the probe is UNSET it also fails
+    /// CLOSED (role-scoped join only). The widened set is returned only when the
+    /// probe affirmatively reports RBAC off — which, consistent with the rest of
+    /// the dashboard (`check_permission`, `/api/me`), is the same posture under
+    /// which every authenticated user is a legacy superuser. (How a *failed*
+    /// RbacStore load should be treated — legacy-open vs fail-closed — is a
+    /// system-wide question tracked separately, not specific to visibility.)
     std::vector<std::string> get_visible_agents(const std::string& username) const;
+
+    /// Inject a predicate reporting whether RBAC enforcement is globally
+    /// enabled, wired once at startup from `RbacStore::is_rbac_enabled()`
+    /// (before the web server accepts requests). If never set,
+    /// `get_visible_agents` fails CLOSED — role-scoped inner join only.
+    void set_rbac_enabled_probe(std::function<bool()> probe);
 
     // ── Counting (for metrics / UI) ───────────────────────────────────────
     size_t count_groups() const;
@@ -95,9 +124,19 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    // Reports whether RBAC enforcement is globally enabled (see
+    // set_rbac_enabled_probe). Read by get_visible_agents to choose between the
+    // role-scoped inner join (RBAC on / probe unset) and the full enrolled set
+    // (RBAC off). Set once at startup before any request, so the unsynchronised
+    // read in get_visible_agents races nothing.
+    std::function<bool()> rbac_enabled_probe_;
 
     void create_tables();
     std::string generate_id() const;
+    // Full enrolled set: every agent that is a member of any management group.
+    // Every agent is auto-added to the root group at enrollment, so this is the
+    // RBAC-disabled "visible to the legacy-admin superuser" set (#1453).
+    std::vector<std::string> all_member_agents() const;
 };
 
 } // namespace yuzu::server
