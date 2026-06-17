@@ -214,7 +214,7 @@ config|user_oldest_ts|1710900100
 config|network_capture_method|polling
 ```
 
-The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines; the dashboard renders `—` in their absence.
+The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ## TAR dashboard page
 
@@ -225,6 +225,11 @@ The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the *
 The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
 
 **Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+
+**Row states.** Beyond a normal paused row (with a timestamp), the table surfaces two conditions and floats both to the top of the list so they aren't missed:
+
+- **"schema older than server" badge** — the agent reported the source disabled but sent no `paused_at` timestamp, i.e. it is a pre-v0.12.0 agent that lacks the field. The row sorts as the oldest entry. **Action:** upgrade the agent so it records the transition time.
+- **"value error" badge** — the agent reported a `<source>_enabled` value other than `true`/`false` (e.g. `errored`, or garbage from a corrupt or tampered `tar.db`); the reported value is shown. Previously such a source was silently omitted, hiding a paused/broken collector. **Action:** re-configure the source (`tar.configure <source>_enabled=true`) or inspect the agent's `tar.db`; if tampering is suspected, treat the device as potentially compromised.
 
 **Workflow:**
 
@@ -237,7 +242,7 @@ The first frame surfaces every device × source pair where the collector has bee
 - Viewing the page and the retention-paused list requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
 - **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
-- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle).
+- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle). When RBAC is **disabled** (the default), "your scope" is the full enrolled fleet; when RBAC is **enabled**, scope is determined by your management-group role assignments.
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 

@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
+  filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
+  page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The
+  fleet list now requires `Infrastructure:Read` (parity with `/api/agents`, via the same
+  `get_visible_agents_json` provider — closing the prior any-authenticated-operator access);
+  every per-device route — page, info, the DEX/Guardian lenses, and the live pull — is
+  additionally scoped to the device's management group via `require_scoped_permission`, so an
+  operator cannot open, read, or live-query a device outside their scope. The DEX and Guardian
+  lenses render per-device behavioral/compliance data
+  with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
+  page open score only the rows they render — opening one device no longer scores the whole
+  fleet. The list shows currently-connected devices only (no offline/status filter yet). The
+  **DEX dashboard's per-device drills** the device DEX lens links to (`/fragments/dex/device`
+  + its `/perf`/`/procperf` live panels) are scoped the same way, and the DEX device-id lists
+  (overview top-devices, per-signal/per-app affected-devices, per-device perf) no longer
+  enumerate agents outside the operator's management scope. (Fleet **aggregates** — rate
+  denominators, score histograms — remain fleet-wide statistics.)
+- **"Get live info" on the device page.** Dispatches read-only instructions to the agent on
+  demand (not the 30s heartbeat): **Uptime** (`os_info/uptime`) and a **running-process list**
+  (`processes/list_hashed`) showing the **SHA-256 of each process's on-disk executable**, with
+  a first-10 preview and client-side search. Requires `Execution:Execute` scoped to the
+  device's management group (a device outside your scope cannot be live-queried); each dispatch
+  is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
+  usage-class read kept separately countable for works-council access audit.
+- **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
+  executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux
+  `/proc/<pid>/exe`, macOS `proc_pidpath`) — not the spoofable argv[0] — and the on-disk image
+  is hashed via the shared `sha256_file` (bounded at 512 MiB, deduped by path).
+- **DEX Catalogue is coverage-first.** A signal family/type now lights when a connected
+  platform **collects** it — not only when it fired — with per-family "N of M monitored", a
+  0–100 family health score, and an **OS filter** that persists across the family and per-type
+  drill-downs. Types no connected platform collects read as *not collected*, never as healthy.
+
+- **Linux server DEX: systemd unit-health signals from the journal.** The Linux DEX
+  collector now emits `service.hung` (a `WatchdogSec` timeout — the existing
+  unit-failed journal entry routed by `UNIT_RESULT="watchdog"`, since a watchdog kill
+  is a hang, not a crash; one entry, no double-emit) and `os.time_unsynced` (chrony's
+  "Can't synchronise: no selectable sources" / large-step markers, via a low-volume
+  `SYSLOG_IDENTIFIER=chronyd` query clause; the raw message, which carries NTP source
+  IPs, is never shipped). `service.hung` is verified through the agent's emit on a real
+  watchdog timeout. Reused obs_types need no live-render change; the per-OS coverage map
+  `dex_obs_platforms` (`dex_routes.cpp`) gains the new Linux types. Linux DEX coverage is now 17 signals.
+  (`service.dependency_failed` is deferred — no `MESSAGE_ID`, and the root failure is
+  already captured as `service.crashed`.)
+
+- **Linux server DEX: `/proc` + `/sys` performance/hardware state polls.** The Linux
+  DEX collector now also emits `perf.disk_latency_high` (per-I/O service time / iostat
+  `await` over the whole physical disks, from `/proc/diskstats` — completing the
+  Windows cpu/mem/disk perf trio on Linux, same `dex_perf_breach` hysteresis + 25 ms
+  threshold) and `hw.cpu_throttled` (a poll-and-latch on the `/sys`
+  `core_throttle_count` thermal-throttle counters, the Windows Kernel-Processor-Power
+  37 analogue). New pure parsers `parse_diskstats`/`disk_await_ms`/`is_whole_disk`
+  (`dex_linux_proc`) and `parse_throttle_count` (new `dex_linux_sysfs.cpp`); field
+  positions verified against a real box. Reused obs_types (no live-render change; the
+  per-OS coverage map gains them); this slice adds 2 (Linux 13→15, building on the
+  kernel-reliability slice below; the systemd unit-health entry above reaches 17).
+
+- **Linux server DEX: kernel-reliability signals from the journal.** The Linux DEX
+  collector's journald reader now also classifies `_TRANSPORT=kernel` ring-buffer
+  lines (free text, no `MESSAGE_ID`) via anchored substring markers in a new pure
+  `dex_linux_kmsg.cpp`, emitting on **existing** obs_types (no live-render change; the
+  per-OS coverage map gains them):
+  `os.bugcheck` (a fatal `Kernel panic - not syncing` only — survivable Oops/
+  soft-lockup deliberately not mapped, to keep the BSOD-equivalent rate honest),
+  `os.dirty_shutdown` (ext4/xfs journal-recovery at mount = the prior shutdown was
+  unclean), `disk.error` (block-layer / buffer I/O error, subject = backing device),
+  `fs.corruption` (ext4/xfs/btrfs metadata error, subject = device), `hw.error`
+  (machine-check / `[Hardware Error]`), and `process.hung` (the hung-task watchdog).
+  Markers for `disk.error`, `fs.corruption` and `os.dirty_shutdown` are pinned to
+  records live-captured on a real systemd-259 box via safe error injection (and
+  `disk.error` verified through the agent's emit on a real injected error); panic, MCE and
+  hung-task use the documented kernel format strings. Only infra-safe fields leave
+  the device (device / comm / short reason) — the raw kernel `MESSAGE` is never
+  shipped (`[dex][linux][kmsg][privacy]` pins). Linux server DEX coverage grows from
+  7 to 13 reused signals, all in the same `/dex` display groups.
+
 - **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
   collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
   `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
@@ -286,6 +362,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

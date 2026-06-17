@@ -158,6 +158,13 @@ private:
     mutable std::mutex tar_scan_mu_;
     std::unordered_map<std::string, TarScanState> tar_scans_by_user_;
     static constexpr std::size_t kTarScanStateCap = 256;
+
+    // Unit-test seam (#562): render_tar_retention_paused and its inputs
+    // (response_store_, mgmt_group_store_, tar_scans_by_user_) are private, and
+    // exercising the XSS-escaping / dedup / sort logic without standing up an
+    // HTTP server needs to wire them directly. Test-only; grants no runtime
+    // surface. See tests/unit/server/test_dashboard_tar_retention.cpp.
+    friend struct DashboardTarRetentionTestAccess;
 };
 
 } // namespace yuzu::server

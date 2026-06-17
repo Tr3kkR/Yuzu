@@ -119,6 +119,75 @@ TEST_CASE("journal: 'Failed with result' (the real failure message) → service.
     CHECK(jl.obs->reason == "exit-code");
 }
 
+TEST_CASE("journal: watchdog timeout → service.hung (routed by UNIT_RESULT, same entry)",
+          "[guardian][dex][linux][journal]") {
+    // LIVE-CAPTURED: a WatchdogSec timeout logs the SAME d9b373ed entry as a crash but
+    // with UNIT_RESULT="watchdog" — the service stopped responding, so it routes to
+    // service.hung, not service.crashed. One entry, no double-emit.
+    const std::string line =
+        R"({"__CURSOR":"x","MESSAGE_ID":"d9b373ed55a64feb8242e02dbe79a49c",)"
+        R"("UNIT":"yz-wd.service","UNIT_RESULT":"watchdog"})";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "service.hung");
+    CHECK(jl.obs->subject == "yz-wd.service");
+    CHECK(jl.obs->reason == "watchdog");
+    CHECK(jl.obs->kind == "hang");
+}
+
+TEST_CASE("journal: chronyd 'no selectable sources' → os.time_unsynced (gated on trusted _COMM)",
+          "[guardian][dex][linux][journal]") {
+    // LIVE-CAPTURED chrony format. Gated on `_COMM` (journald-trusted) — NOT
+    // SYSLOG_IDENTIFIER (forgeable). Custom raw-string delimiter R"j(...)j": the message
+    // contains ")" which would otherwise close a plain R"(...)" early.
+    const std::string line =
+        R"j({"__CURSOR":"x","_COMM":"chronyd","_TRANSPORT":"stdout","MESSAGE":"Can't synchronise: no selectable sources (5 unreachable sources)"})j";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "os.time_unsynced");
+    CHECK(jl.obs->subject == "clock");
+}
+
+TEST_CASE("journal: privacy — os.time_unsynced ships a fixed sentence, never the raw chrony line",
+          "[guardian][dex][linux][journal][privacy]") {
+    // The raw chrony MESSAGE can carry NTP source IPs and other detail; only the fixed
+    // subject "clock" + sentence may leave the device. Prove signal_detail_json (the wire
+    // payload) is free of any message content even when an IP is embedded in the marker.
+    const std::string line =
+        R"j({"__CURSOR":"x","_COMM":"chronyd","MESSAGE":"System clock wrong by 1.5 seconds (source 203.0.113.7)"})j";
+    const JournalLine jl = parse_journal_line(line);
+    REQUIRE(jl.obs.has_value());
+    CHECK(jl.obs->obs_type == "os.time_unsynced");
+    const std::string detail = signal_detail_json(*jl.obs);
+    for (const std::string_view leak : {"203.0.113.7", "1.5 seconds", "source", "wrong by"}) {
+        CHECK(jl.obs->subject.find(leak) == std::string_view::npos);
+        CHECK(jl.obs->sentence.find(leak) == std::string_view::npos);
+        CHECK(detail.find(leak) == std::string_view::npos);
+    }
+}
+
+TEST_CASE("journal: a forged SYSLOG_IDENTIFIER=chronyd does NOT fire os.time_unsynced",
+          "[guardian][dex][linux][journal]") {
+    // An unprivileged process can set SYSLOG_IDENTIFIER freely (`logger -t chronyd …`),
+    // but not the trusted _COMM. A forged line with the right MESSAGE but no _COMM=chronyd
+    // must produce no observation (integrity — Gate-4 UP-3).
+    const std::string line =
+        R"j({"__CURSOR":"x","SYSLOG_IDENTIFIER":"chronyd","_COMM":"logger","MESSAGE":"Can't synchronise: no selectable sources"})j";
+    const JournalLine jl = parse_journal_line(line);
+    CHECK_FALSE(jl.obs.has_value());
+}
+
+TEST_CASE("journal: chronyd source online/offline flap is NOT a sync loss",
+          "[guardian][dex][linux][journal]") {
+    // The frequent, noisy chrony lines (which carry source IPs) must produce NO
+    // observation — the cursor still advances past them.
+    const std::string line =
+        R"({"__CURSOR":"adv","_COMM":"chronyd","MESSAGE":"Source 185.125.190.121 offline"})";
+    const JournalLine jl = parse_journal_line(line);
+    CHECK(jl.cursor == "adv");
+    CHECK_FALSE(jl.obs.has_value());
+}
+
 TEST_CASE("journal: kernel OOM-kill → memory.exhausted", "[guardian][dex][linux][journal]") {
     const std::string line =
         R"({"__CURSOR":"s=ab;i=4;b=cd","_TRANSPORT":"kernel",)"
@@ -311,6 +380,7 @@ TEST_CASE("build_journald_after_cursor_query: well-formed cursor → bounded, fi
     CHECK(cmd->find(std::string(kMsgIdUnitFailed)) != std::string::npos);
     CHECK(cmd->find(std::string(kMsgIdUnitResult)) != std::string::npos);
     CHECK(cmd->find("_TRANSPORT=kernel") != std::string::npos);
+    CHECK(cmd->find("_COMM=chronyd") != std::string::npos); // os.time_unsynced source (trusted field)
 }
 
 TEST_CASE("build_journald_after_cursor_query: a cursor with a single quote → nullopt (injection guard)",

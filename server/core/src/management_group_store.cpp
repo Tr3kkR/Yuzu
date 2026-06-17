@@ -629,6 +629,14 @@ ManagementGroupStore::get_visible_agents(const std::string& username) const {
     std::vector<std::string> result;
     if (!db_)
         return result;
+    // #1453 — when RBAC enforcement is globally OFF, no per-user
+    // `management_group_roles` rows exist, so the role-scoped join below returns
+    // nothing and hides every agent from the legacy-admin superuser. Fall back
+    // to the full enrolled set in that case ONLY. When the probe is unset, or
+    // reports RBAC enabled, the role-scoped semantics below are preserved
+    // exactly — the fallback can never widen visibility while RBAC is on.
+    if (rbac_enabled_probe_ && !rbac_enabled_probe_())
+        return all_member_agents();
     // Find all groups where the user has any role assignment, then return their members
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
@@ -638,6 +646,26 @@ ManagementGroupStore::get_visible_agents(const std::string& username) const {
                            -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW)
+        result.emplace_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
+    sqlite3_finalize(s);
+    return result;
+}
+
+void ManagementGroupStore::set_rbac_enabled_probe(std::function<bool()> probe) {
+    rbac_enabled_probe_ = std::move(probe);
+}
+
+std::vector<std::string> ManagementGroupStore::all_member_agents() const {
+    std::vector<std::string> result;
+    if (!db_)
+        return result;
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT DISTINCT agent_id FROM management_group_members "
+                           "ORDER BY agent_id;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return result;
     while (sqlite3_step(s) == SQLITE_ROW)
         result.emplace_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
     sqlite3_finalize(s);
