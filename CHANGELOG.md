@@ -20,7 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lenses render per-device behavioral/compliance data
   with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
   page open score only the rows they render — opening one device no longer scores the whole
-  fleet. The list shows currently-connected devices only (no offline/status filter yet).
+  fleet. The list shows currently-connected devices only (no offline/status filter yet). The
+  **DEX dashboard's per-device drills** the device DEX lens links to (`/fragments/dex/device`
+  + its `/perf`/`/procperf` live panels) are scoped the same way, and the DEX device-id lists
+  (overview top-devices, per-signal/per-app affected-devices, per-device perf) no longer
+  enumerate agents outside the operator's management scope. (Fleet **aggregates** — rate
+  denominators, score histograms — remain fleet-wide statistics.)
 - **"Get live info" on the device page.** Dispatches read-only instructions to the agent on
   demand (not the 30s heartbeat): **Uptime** (`os_info/uptime`) and a **running-process list**
   (`processes/list_hashed`) showing the **SHA-256 of each process's on-disk executable**, with

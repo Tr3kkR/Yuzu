@@ -841,7 +841,8 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
                                                  const std::string& obs_type,
-                                                 const std::string& os_filter) {
+                                                 const std::string& os_filter,
+                                                 const std::set<std::string>* visible) {
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     if (obs_type.empty())
@@ -979,9 +980,12 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     } else {
         h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th class=\"gp-num\">Events</th>"
              "<th>Last seen</th></tr></thead><tbody>";
-        for (const auto& d : devices)
+        for (const auto& d : devices) {
+            if (visible && !visible->count(d.agent_id))
+                continue; // out-of-scope device — don't enumerate its id to this operator
             h += "<tr><td>" + esc(d.agent_id) + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
+        }
         h += "</tbody></table>";
     }
     return h;
@@ -1429,8 +1433,8 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
 }
 
 std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
-                                         const std::string& since, int window_days,
-                                         DexFleet fleet) {
+                                         const std::string& since, int window_days, DexFleet fleet,
+                                         const std::set<std::string>* visible) {
     if (!store)
         return placeholder("Reliability data unavailable",
                            "The signal observation store is not open.");
@@ -1816,6 +1820,8 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th class=\"gp-num\">Crashes</th>"
              "<th>Last seen</th></tr></thead><tbody>";
         for (const auto& d : devices) {
+            if (visible && !visible->count(d.agent_id))
+                continue; // out-of-scope device — don't enumerate its id to this operator
             const std::string label = drill_link("/fragments/dex/device",
                                                  "id=" + url_encode(d.agent_id) + "&window=" + cur,
                                                  esc(d.agent_id));
@@ -1884,7 +1890,8 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
 }
 
 std::string render_dex_app_fragment(const GuaranteedStateStore* store,
-                                    const std::string& process_name, const std::string& window) {
+                                    const std::string& process_name, const std::string& window,
+                                    const std::set<std::string>* visible) {
     // Window-scoped to match the overview row that linked here (C-S1/UP-11): the
     // token (e.g. "7d") resolves to the same `since` cutoff the overview used.
     const std::string since = iso_days_ago(window_to_days(window));
@@ -1946,6 +1953,8 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
         h += "<table class=\"gp-table\"><thead><tr><th>Device</th><th class=\"gp-num\">Crashes</th>"
              "<th>Last seen</th></tr></thead><tbody>";
         for (const auto& d : devs) {
+            if (visible && !visible->count(d.agent_id))
+                continue; // out-of-scope device — don't enumerate its id to this operator
             const std::string label =
                 drill_link("/fragments/dex/device",
                            "id=" + url_encode(d.agent_id) + "&window=" + window, esc(d.agent_id));
@@ -2357,6 +2366,23 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     responses_fn_ = std::move(responses_fn);
     perf_fn_ = std::move(perf_fn);
 
+    // Resolve the visible-agent set for filtering device-id-rendering lists so an
+    // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
+    // filter (visible_set_fn unwired, unauthenticated, or the caller sees the whole
+    // fleet — global Infrastructure:Read / RBAC off). The renderers take a pointer:
+    // nullptr = no filter. Holds the optional in the caller; the pointer must not
+    // outlive it.
+    auto resolve_visible =
+        [this](const httplib::Request& req) -> std::optional<std::set<std::string>> {
+        if (!visible_set_fn_)
+            return std::nullopt;
+        httplib::Response throwaway;
+        auto sess = auth_fn_(req, throwaway);
+        if (!sess)
+            return std::nullopt;
+        return visible_set_fn_(sess->username);
+    };
+
     // -- Page shell (auth-only static chrome; the fragment it loads gates on Read) --
     sink.Get("/dex", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_(req, res);
@@ -2382,14 +2408,17 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Overview fragment (gates on GuaranteedState:Read, like the Guardian reads) --
-    sink.Get("/fragments/dex/overview", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/dex/overview", [this, resolve_visible](const httplib::Request& req,
+                                                                httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
         const int window_days = window_to_days(w);
         const std::string since = iso_days_ago(window_days);
         const DexFleet fleet = fleet_fn_ ? fleet_fn_() : DexFleet{};
-        res.set_content(render_dex_overview_fragment(store_, since, window_days, fleet),
+        const auto vis = resolve_visible(req); // scope the top-devices list to the caller
+        res.set_content(render_dex_overview_fragment(store_, since, window_days, fleet,
+                                                     vis ? &*vis : nullptr),
                         "text/html; charset=utf-8");
     });
 
@@ -2421,7 +2450,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      "text/html; charset=utf-8");
              });
     sink.Get("/fragments/dex/catalogue/signal",
-             [this](const httplib::Request& req, httplib::Response& res) {
+             [this, resolve_visible](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
                  const int window_days =
@@ -2438,8 +2467,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  if (audit_fn_)
                      audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
                                "DEX per-signal most-affected devices");
+                 const auto vis = resolve_visible(req); // scope the most-affected-devices list
                  res.set_content(
-                     render_dex_catalogue_signal_fragment(store_, since, window_days, type, os),
+                     render_dex_catalogue_signal_fragment(store_, since, window_days, type, os,
+                                                          vis ? &*vis : nullptr),
                      "text/html; charset=utf-8");
              });
 
@@ -2471,7 +2502,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Per-app drill-down (blast radius). ?name=<process_name> --
-    sink.Get("/fragments/dex/app", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/dex/app", [this, resolve_visible](const httplib::Request& req,
+                                                           httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
@@ -2480,7 +2512,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string w =
             window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
                                                                 : "7d"));
-        res.set_content(render_dex_app_fragment(store_, name, w), "text/html; charset=utf-8");
+        const auto vis = resolve_visible(req); // scope the affected-devices list
+        res.set_content(render_dex_app_fragment(store_, name, w, vis ? &*vis : nullptr),
+                        "text/html; charset=utf-8");
     });
 
     // -- Per-device drill-down (signal history; behavioral PII → audit each open). ?id=<agent_id> --
@@ -2561,8 +2595,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                         "text/html; charset=utf-8");
     });
 
-    sink.Get("/fragments/dex/perf/devices", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
+    sink.Get("/fragments/dex/perf/devices", [this, resolve_visible](const httplib::Request& req,
+                                                                    httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const int window_days =
@@ -2596,9 +2630,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 limit = std::clamp(std::stoi(req.get_param_value("limit")), 1, 500);
             } catch (...) {}
         }
+        const auto vis = resolve_visible(req); // scope the per-device perf list
         res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
                                                          not_reporting, cohort_filter, limit,
-                                                         window_days),
+                                                         window_days, vis ? &*vis : nullptr),
                         "text/html; charset=utf-8");
     });
 

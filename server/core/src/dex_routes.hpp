@@ -96,8 +96,8 @@ std::string dex_iso_since(int days);
 /// ill-defined). `fleet` supplies the cross-store denominator. `store` may be null
 /// (renders the no-data placeholder). Pure + free so it is unit-testable directly.
 std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
-                                         const std::string& since, int window_days,
-                                         DexFleet fleet);
+                                         const std::string& since, int window_days, DexFleet fleet,
+                                         const std::set<std::string>* visible = nullptr);
 
 /// Per-obs_type platform coverage: which OSes collect this signal type today
 /// (windows = the whole catalogue; linux/macos = the collector subsets). The thin
@@ -142,7 +142,8 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
                                                  const std::string& obs_type,
-                                                 const std::string& os_filter = "all");
+                                                 const std::string& os_filter = "all",
+                                                 const std::set<std::string>* visible = nullptr);
 
 /// Health score — the derived/SECONDARY composite (score = 100 − Σ weighted
 /// per-family deductions; every deduction traces to a measured rate). `weighting`
@@ -164,7 +165,8 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
 /// linked here — counts match (governance C-S1/UP-11). Pure + free so it is
 /// unit-testable directly against a seeded store.
 std::string render_dex_app_fragment(const GuaranteedStateStore* store,
-                                    const std::string& process_name, const std::string& window);
+                                    const std::string& process_name, const std::string& window,
+                                    const std::set<std::string>* visible = nullptr);
 
 /// Per-device drill-down fragment for `agent_id` — the unified multi-signal
 /// history (closes the deferred UP-4: friendly labelled rows, not raw
@@ -276,7 +278,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
 std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
                                              bool not_reporting,
                                              const std::optional<std::string>& cohort_filter,
-                                             int limit, int window_days);
+                                             int limit, int window_days,
+                                             const std::set<std::string>* visible = nullptr);
 
 /// DEX routes — /dex (page shell) + /fragments/dex/overview (HTMX fragment).
 class DexRoutes {

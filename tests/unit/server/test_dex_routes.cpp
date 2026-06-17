@@ -602,6 +602,55 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(audited.empty());
     }
 
+    // Re-review blocker: the per-device DEX surface must be management-scoped (mirror
+    // the /device routes) — an operator can't drill another team's device, and the
+    // device-id lists must not enumerate out-of-scope agents.
+    SECTION("per-device DEX surface is scoped: drill 403 + lists drop out-of-scope ids") {
+        seed_crash(store, "e9", "WS-OTHER", "chrome.exe", "ntdll.dll", "windows",
+                   kDayA + "T12:00:00Z");
+        // Scoped gate: deny the per-device drill for the out-of-scope agent.
+        auto scopedPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                             const std::string&, const std::string& id) {
+            if (id == "WS-OTHER") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        // Visible set: only WS-1 is in the caller's scope (the lists must drop WS-OTHER).
+        auto visibleSet = [](const std::string&) -> std::optional<std::set<std::string>> {
+            return std::set<std::string>{"WS-1"};
+        };
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm,
+                               visibleSet);
+
+        // (1) The per-device drill is scoped: out-of-scope → 403, in-scope still opens.
+        auto other = sink.Get("/fragments/dex/device?id=WS-OTHER");
+        REQUIRE(other);
+        CHECK(other->status == 403);
+        auto mine = sink.Get("/fragments/dex/device?id=WS-1");
+        REQUIRE(mine);
+        CHECK(mine->status == 200);
+
+        // (2) The device-id lists drop the out-of-scope agent (no enumeration), while
+        //     still showing the in-scope one.
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->body.find("WS-1") != std::string::npos);
+        CHECK(sig->body.find("WS-OTHER") == std::string::npos);
+
+        auto app = sink.Get("/fragments/dex/app?name=chrome.exe");
+        REQUIRE(app);
+        CHECK(app->body.find("WS-OTHER") == std::string::npos);
+
+        auto ov = sink.Get("/fragments/dex/overview?window=7d");
+        REQUIRE(ov);
+        CHECK(ov->body.find("WS-OTHER") == std::string::npos);
+    }
+
     SECTION("hostile ?window= is canonicalised, never reflected into markup (Gate-8 XSS)") {
         // The raw window param flows into hx-get="…" attributes in drill-down
         // links; the route MUST canonicalise it to one of the four fixed tokens
