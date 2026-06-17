@@ -286,21 +286,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **TAR fleet scan now shows all agents when RBAC is disabled (#1453, #1454).**
-  With RBAC enforcement globally off (the default posture), no per-user
-  management-group role assignments exist, so operators with full admin access
-  saw "no agents in scope" when running a TAR fleet scan — and had no in-product
-  way to recover (granting the first group role itself required holding one).
-  Device visibility now correctly returns the full enrolled set under
-  RBAC-disabled, across the dashboard agent list, `/api/agents`, and the TAR
-  fleet scan. When RBAC is **enabled**, the exact role-scoped behaviour is
-  preserved unchanged. A missing or corrupt RBAC store fails **closed** —
-  visibility stays role-scoped (a caller without a management-group role sees
-  nothing) rather than falling back to the full fleet, so an integrity failure
-  can never widen exposure; both the `/api/agents` list and the TAR fleet scan
-  share one `rbac_enforcement_in_effect` predicate and cannot disagree (#1498).
-  The UAT rig additionally seeds an admin root-group role so the environment is
-  also correct if RBAC is later turned on.
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory
