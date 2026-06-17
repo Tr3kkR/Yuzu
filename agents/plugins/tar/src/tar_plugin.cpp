@@ -913,6 +913,13 @@ private:
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
 
+        // Mechanism actually in force. Only polling is wired today regardless of
+        // the configured method (kPlanned methods like etw / endpoint_security are
+        // accepted for pre-staging but not collected), so status can never
+        // misrepresent the active capture mechanism to a forensic analyst (#1528).
+        ctx.write_output(std::format("config|network_capture_method_effective|{}",
+                                     yuzu::tar::effective_network_capture_method(net_method)));
+
 #ifdef _WIN32
         // ETW process collector health (Windows). capture_method reflects the
         // live path: "etw" while the session runs, "polling" if ETW never started
