@@ -19,6 +19,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h> // geteuid — the unmovable-quarantine test is POSIX-only
+#endif
+
 namespace fs = std::filesystem;
 using namespace yuzu::tar;
 
@@ -903,3 +907,67 @@ TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserve
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
+
+#ifndef _WIN32
+TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primary)",
+          "[tar][store][lifecycle][corruption]") {
+    // The PRIMARY #559 safety property: when a corrupt tar.db CANNOT be moved
+    // aside (read-only mount, locked file, permissions), open() must REFUSE
+    // (std::unexpected) rather than re-open-and-trust the still-corrupt file —
+    // doing so would serve the "true" get_config default for every
+    // <source>_enabled key and silently re-enable an operator-paused source.
+    // POSIX-only: modelled with a read-only parent dir so the quarantine rename
+    // fails. (Windows reparse/rename behaviour is a separate, static-reviewed
+    // path with no CI here.)
+    if (::geteuid() == 0) {
+        SKIP("root bypasses directory permissions; cannot make the rename fail");
+    }
+
+    auto dir = yuzu::test::unique_temp_path("tar_unmovable_");
+    REQUIRE(fs::create_directory(dir));
+    // RAII: re-add write perms and remove the dir even if an assertion throws,
+    // so a read-only temp dir never leaks onto a CI box that reuses workspaces.
+    struct DirGuard {
+        fs::path dir;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::permissions(dir, fs::perms::owner_all, fs::perm_options::add, ec);
+            fs::remove_all(dir, ec);
+        }
+    } dir_guard{dir};
+    const auto db_path = dir / "tar.db";
+
+    // 1. Create a valid DB with a deliberately-paused source, then corrupt it.
+    {
+        auto opened = TarDatabase::open(db_path);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        REQUIRE(db.create_warehouse_tables());
+        db.set_config("process_enabled", "false");
+    }
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db_path.string() + suffix}, ec);
+    }
+    {
+        std::ofstream f(db_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "not a valid sqlite database -- corrupt + unmovable (#559)";
+    }
+
+    // 2. Strip write permission from the parent dir so the .corrupt-<epoch>
+    //    rename inside it fails → quarantine returns nullopt → fail closed.
+    std::error_code perm_ec;
+    fs::permissions(dir,
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, perm_ec);
+    REQUIRE_FALSE(perm_ec);
+
+    // 3. open() must REFUSE — not silently re-init a fresh DB over the corruption.
+    auto reopened = TarDatabase::open(db_path);
+    CHECK_FALSE(reopened.has_value());
+    if (!reopened.has_value())
+        CHECK(reopened.error().find("corrupt and unmovable") != std::string::npos);
+    // dir_guard restores perms + removes the dir.
+}
+#endif // _WIN32

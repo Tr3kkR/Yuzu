@@ -301,7 +301,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the collector mutex across the transition and clears the source's diff-state on
   disable (clean re-enable baseline); `TarDatabase::open` runs `PRAGMA
   integrity_check` and quarantines a corrupt DB aside before re-initialising a
-  fresh one; `status` emits a strict tri-state (`true`/`false`/`errored`).
+  fresh one; `status` emits a strict tri-state (`true`/`false`/`errored`). The
+  collect-time gate (`source_enabled`) and `run_retention` now gate on that same
+  canonical tri-state, so a corrupt or tampered `<source>_enabled` value fails
+  **closed** — collection stops *and* the source's rows are preserved (not
+  pruned) — instead of the prior bare `!= "false"` that treated any non-`false`
+  value as enabled and let retention delete the paused window.
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory

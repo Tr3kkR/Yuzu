@@ -137,6 +137,19 @@ state stores. If a customer asks for "delete tar data on uninstall",
 that is a deployment-tooling change (MSI custom action), not a TAR
 plugin change.
 
+> **Collect gate and retention share `canonical_source_enabled`.** Both
+> `source_enabled()` (`tar_plugin.cpp`) and `run_retention()`
+> (`tar_aggregator.cpp`) decide a source's state via
+> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> literal `"true"` to non-enabled (`"false"` → disabled, anything else →
+> `"errored"`). This is load-bearing: a value the plugin never writes fails
+> **closed** — collection stops *and* retention preserves the rows — instead of
+> a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
+> let retention delete the paused window (#560). When adding a new always-on
+> capture source, gate collection on `source_enabled(*db_, "<name>")` and do
+> **not** add a parallel `== "false"` retention check — `run_retention` already
+> covers every registered source through the same canonical gate.
+
 ---
 
 ## 5. Startup detection / restart caveat

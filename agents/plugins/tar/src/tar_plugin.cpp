@@ -212,8 +212,17 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
 }
 
 // Per-source enable/disable (issue #59). Default = enabled.
+//
+// #560/#1434 — gate on the canonical tri-state, not `!= "false"`. A value the
+// plugin never writes ("maybe", "1", "", a bit-flip) maps to "errored", which
+// is NOT "true", so collection STOPS (fail closed). The bare `!= "false"`
+// treated every such value as enabled, so a source an operator paused for
+// forensics whose `_enabled` value was corrupted or tampered kept collecting —
+// and disagreed with the tri-state `status` reports. run_retention() shares the
+// same canonical gate so an "errored" source's rows are preserved, not pruned.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
-    return db.get_config(std::format("{}_enabled", source), "true") != "false";
+    return yuzu::tar::canonical_source_enabled(
+               db.get_config(std::format("{}_enabled", source), "true")) == "true";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
