@@ -834,8 +834,10 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
 // DEX Catalogue — View 3: one signal type's drill-down (subjects, OS split,
 // most-affected devices, activity trend). Consumes the generic per-obs_type
 // read-model. `obs_type` is bound into SQL (injection-safe) and HTML-escaped in
-// markup. Coverage captions are DERIVED LIVE from dex_signal_by_os (no stale
-// "macOS 6 of 103").
+// markup. The "Collected on" caption is COVERAGE — it comes from dex_obs_platforms
+// (the authoritative per-OS map), NOT from observed events: a quiet-but-monitored
+// signal must still show its real platforms. The dex_signal_by_os split drives the
+// event counts only.
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
                                                  const std::string& obs_type,
@@ -867,13 +869,29 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     const auto by_day = store->dex_signal_by_day(obs_type, since);
 
     int64_t events = 0, devs = 0;
-    bool on_mac = false;
     for (const auto& o : by_os) {
         events += o.crashes; // generic event count
         devs += o.distinct_devices;
-        if (o.platform.find("mac") != std::string::npos)
-            on_mac = true;
     }
+    // "Collected on" = which platforms have a collector for this signal type, from
+    // the authoritative coverage map (not observed events). This is the signal's
+    // full cross-OS coverage; the os filter scopes the event lists, not which
+    // platforms can collect the type.
+    auto os_disp = [](const std::string& p) -> std::string {
+        if (p == "windows") return "Windows";
+        if (p == "macos") return "macOS";
+        if (p == "linux") return "Linux";
+        return p;
+    };
+    const auto coverage = dex_obs_platforms(obs_type);
+    std::string collected_on;
+    for (const auto& p : coverage)
+        collected_on += (collected_on.empty() ? "" : " + ") + os_disp(p);
+    if (collected_on.empty())
+        collected_on = "&mdash;";
+    const char* coverage_sx = coverage.size() > 1   ? "cross-OS signal"
+                              : coverage.size() == 1 ? "single-platform signal"
+                                                     : "no collector for this type";
     auto tile = [](const char* cls, const std::string& n, const std::string& label,
                    const std::string& sx) {
         std::string t = "<div class=\"gp-tile\"><div class=\"n " + std::string(cls) + "\">" + n +
@@ -901,8 +919,7 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     h += "<div class=\"gp-tiles\">";
     h += tile(events > 40 ? "bad" : (events > 0 ? "warn" : ""), num(events), "Events (window)", "");
     h += tile("", num(devs), "Devices affected", "");
-    h += tile("info", on_mac ? "Windows + macOS" : "Windows only", "Collected on",
-              on_mac ? "cross-OS signal" : "no macOS collector for this type");
+    h += tile("info", collected_on, "Collected on", coverage_sx);
     h += "</div>";
 
     if (!by_day.empty()) {

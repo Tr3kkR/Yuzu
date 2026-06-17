@@ -552,6 +552,23 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(audited == "dex.signal.view|ObsType|process.crashed");
     }
 
+    SECTION("signal drill-down 'Collected on' reflects the coverage map, incl. Linux") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        // process.crashed is collected on all three platforms; the caption is derived
+        // from dex_obs_platforms (coverage), not observed events, so it must name
+        // Linux and never regress to the old event-derived "Windows only". The
+        // " + "-joined form is unique to the coverage caption (the by_os table can't
+        // produce it), so this can't pass on incidental seeded Linux rows.
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->body.find("Collected on") != std::string::npos);
+        CHECK(sig->body.find("Windows + Linux + macOS") != std::string::npos);
+        CHECK(sig->body.find("Windows only") == std::string::npos);
+    }
+
     SECTION("unauthenticated shell redirects to /login") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
