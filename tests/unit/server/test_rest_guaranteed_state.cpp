@@ -20,6 +20,7 @@
  */
 
 #include "guaranteed_state_store.hpp"
+#include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
@@ -60,6 +61,14 @@ struct RestGsHarness {
     fs::path db_path;
     std::unique_ptr<GuaranteedStateStore> store;
 
+    // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
+    // endpoint polls; the dispatch stub returns a deterministic command_id so a test
+    // can pre-insert the matching response row. live_sent toggles the offline path.
+    fs::path resp_db_path;
+    std::unique_ptr<ResponseStore> resp_store;
+    int live_sent{1};
+    std::string last_live_plugin, last_live_action;
+
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
 
@@ -82,6 +91,22 @@ struct RestGsHarness {
         store = std::make_unique<GuaranteedStateStore>(db_path, /*retention_days=*/0,
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
+
+        resp_db_path = unique_temp_path("rest-gs-resp");
+        fs::remove(resp_db_path);
+        resp_store = std::make_unique<ResponseStore>(resp_db_path, /*retention_days=*/0);
+
+        // Deterministic dispatch stub: command_id = "<plugin>-live" so a test can
+        // pre-insert the matching response row; live_sent toggles offline (0).
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>&, const std::string&,
+                   const std::unordered_map<std::string, std::string>&,
+                   const std::string&) -> std::pair<std::string, int> {
+            last_live_plugin = plugin;
+            last_live_action = action;
+            return {plugin + "-live", live_sent};
+        };
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -128,7 +153,7 @@ struct RestGsHarness {
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
-                            /*response_store=*/nullptr,
+                            resp_store.get(),
                             /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
@@ -146,7 +171,7 @@ struct RestGsHarness {
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
-                            /*command_dispatch_fn=*/{},
+                            command_dispatch_fn,
                             /*step_up_fn=*/{},
                             /*guardian_push_fn=*/{},
                             /*dex_perf_fn=*/{},
@@ -160,6 +185,10 @@ struct RestGsHarness {
         // sqlite WAL/SHM siblings
         fs::remove(db_path.string() + "-wal");
         fs::remove(db_path.string() + "-shm");
+        resp_store.reset();
+        fs::remove(resp_db_path);
+        fs::remove(resp_db_path.string() + "-wal");
+        fs::remove(resp_db_path.string() + "-shm");
     }
 
     // Seed one ruleless DEX observation (the __observation__ projection the DEX
@@ -735,6 +764,92 @@ TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty()); // the scope gate runs BEFORE any audit emission
+}
+
+TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, audited",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // Pre-insert the agent's response for the deterministic command_id the stub mints.
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 0; // RUNNING row carries the output
+    r.output = "uptime_seconds|181740\nuptime_display|2d 2h 29m";
+    h.resp_store->store(r);
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.last_live_plugin == "os_info");
+    CHECK(h.last_live_action == "uptime");
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["kind"].get<std::string>() == "uptime");
+    CHECK(j["data"]["uptime_display"].get<std::string>() == "2d 2h 29m");
+    CHECK(j["data"]["uptime_seconds"].get<int64_t>() == 181740);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.uptime" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|path rows",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = 0;
+    r.output =
+        "proc|0|[System Process]||\n"
+        "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh";
+    h.resp_store->store(r);
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=processes");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.last_live_action == "list_hashed"); // the hashed variant
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["processes"].is_array());
+    REQUIRE(j["data"]["processes"].size() == 2);
+    const auto& sh = j["data"]["processes"][1];
+    CHECK(sh["pid"].get<int64_t>() == 123);
+    CHECK(sh["name"].get<std::string>() == "sh");
+    CHECK(sh["sha256"].get<std::string>().rfind("deadbeefcafe0000", 0) == 0);
+    CHECK(sh["path"].get<std::string>() == "/bin/sh");
+}
+
+TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited no_agents",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    h.live_sent = 0; // dispatch reaches no connected agent
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.uptime" && a.result == "no_agents")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=bogus");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.last_live_plugin.empty()); // never dispatched
+}
+
+TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
+          "[rest][dex][device][live][scope]") {
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-9/live?kind=uptime");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty()); // gate denied before any dispatch
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {

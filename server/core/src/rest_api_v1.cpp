@@ -24,6 +24,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -188,6 +189,76 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .raw("pagination", pag)
         .raw("meta", R"({"api_version":"v1"})")
         .str();
+}
+
+// Parse a live plugin output (newline-joined write_output() lines, possible trailing
+// \r) into the JSON `data` object for GET /dex/devices/{id}/live. The agent
+// sanitizes '|'/CR/LF out of every field, so splitting on '|' is safe. Mirrors the
+// field extraction in device_routes.cpp render_live_result (which is tested), but
+// emits JSON instead of HTML.
+std::string live_result_json(const std::string& kind, const std::string& output) {
+    std::vector<std::string> lines;
+    std::size_t pos = 0;
+    while (pos < output.size()) {
+        const auto nl = output.find('\n', pos);
+        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!line.empty())
+            lines.push_back(std::move(line));
+    }
+    if (kind == "uptime") {
+        JObj o;
+        o.add("kind", "uptime");
+        for (const auto& l : lines) {
+            const auto bar = l.find('|');
+            if (bar == std::string::npos)
+                continue;
+            const auto k = l.substr(0, bar);
+            const auto v = l.substr(bar + 1);
+            if (k == "uptime_display")
+                o.add("uptime_display", v);
+            else if (k == "uptime_seconds") {
+                try {
+                    o.add("uptime_seconds", static_cast<int64_t>(std::stoll(v)));
+                } catch (...) {
+                }
+            }
+        }
+        return o.str();
+    }
+    // processes: proc|pid|name|sha256|path (tolerate the shorter proc|pid|name form)
+    JArr procs;
+    for (const auto& l : lines) {
+        if (l.rfind("proc|", 0) != 0)
+            continue;
+        const auto a = l.find('|');        // after "proc"
+        const auto b = l.find('|', a + 1); // after pid
+        if (b == std::string::npos)
+            continue;
+        const auto c = l.find('|', b + 1); // after name
+        int64_t pid = 0;
+        try {
+            pid = std::stoll(l.substr(a + 1, b - a - 1));
+        } catch (...) {
+        }
+        std::string name, sha256, path;
+        if (c == std::string::npos) {
+            name = l.substr(b + 1);
+        } else {
+            name = l.substr(b + 1, c - b - 1);
+            const auto e = l.find('|', c + 1); // after sha256
+            if (e == std::string::npos) {
+                sha256 = l.substr(c + 1);
+            } else {
+                sha256 = l.substr(c + 1, e - c - 1);
+                path = l.substr(e + 1);
+            }
+        }
+        procs.add(JObj().add("pid", pid).add("name", name).add("sha256", sha256).add("path", path));
+    }
+    return JObj().add("kind", "processes").raw("processes", procs.str()).str();
 }
 
 // A4 / event-envelope helpers move to `yuzu::server::detail` below —
@@ -605,6 +676,9 @@ const std::string& openapi_spec() {
     },
     "/dex/devices/{id}": {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/devices/{id}/live": {
+      "get": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. Dispatches a read-only plugin instruction to the device NOW (not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). Audited per kind (device.live.uptime / device.live.processes). A slow device returns 504 and an offline device 503, both with retry_after_ms.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
     },
     "/dex/perf/fleet": {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
@@ -4875,6 +4949,124 @@ void RestApiV1::register_routes(
                             .raw("signals", signals.str())
                             .str();
             res.set_content(ok_json(data), "application/json");
+        });
+
+    // GET /dex/devices/{id}/live?kind=uptime|processes — live device read. Dispatches
+    // a real read-only plugin instruction NOW and returns the result as JSON. The
+    // machine-readable equivalent of the dashboard "Get live info" panel, which has
+    // NO other REST path (raw plugin actions are not dispatchable via /api/v1, and no
+    // InstructionDefinition wraps processes/list_hashed). Scoped Read + Execute.
+    // SYNCHRONOUS bounded poll: this handler blocks up to ~20s waiting for the agent;
+    // a slow/offline device returns 504/503 with retry_after_ms. POINTER-FREE poll —
+    // each iteration copies the fields it needs out of the freshly queried vector, so
+    // no pointer outlives the loop (the device-routes UAF class, avoided by design).
+    sink.Get(
+        R"(/api/v1/dex/devices/([^/]+)/live)",
+        [perm_fn, scoped_perm_fn, response_store, command_dispatch_fn, audit_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            const std::string agent_id = req.matches[1].str();
+            const auto cid = detail::make_correlation_id();
+            const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+            std::string plugin, action, audit_action;
+            if (kind == "uptime") {
+                plugin = "os_info";
+                action = "uptime";
+                audit_action = "device.live.uptime";
+            } else if (kind == "processes") {
+                plugin = "processes";
+                action = "list_hashed";
+                audit_action = "device.live.processes";
+            }
+            // Per-device scoped Read floor + Execute (gate before validate/dispatch).
+            const auto gate = [&](const char* sec, const char* op) {
+                return scoped_perm_fn ? scoped_perm_fn(req, res, sec, op, agent_id)
+                                      : perm_fn(req, res, sec, op);
+            };
+            if (!gate("GuaranteedState", "Read"))
+                return;
+            if (!gate("Execution", "Execute"))
+                return;
+            if (plugin.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "unknown kind (expected uptime|processes)", cid),
+                    "application/json");
+                return;
+            }
+            if (!command_dispatch_fn || !response_store) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "live device query unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const auto [command_id, sent] =
+                command_dispatch_fn(plugin, action, {agent_id}, "", {}, /*execution_id=*/"");
+            // Usage-class read (processes) stays separately auditable from machine-health
+            // (uptime) — parity with the dashboard live panel's per-kind audit split.
+            if (audit_fn)
+                audit_fn(req, audit_action, sent > 0 ? "success" : "no_agents", "Agent", agent_id,
+                         "REST live " + plugin + "/" + action + " command_id=" + command_id);
+            if (sent == 0) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "device offline — live info needs a connected agent", cid,
+                                    5000, ""),
+                                "application/json");
+                return;
+            }
+            // Bounded synchronous poll (~20s; processes/list_hashed hashes each on-disk
+            // image, so allow generous time before a 504).
+            constexpr int kMaxPolls = 40;
+            constexpr auto kInterval = std::chrono::milliseconds(500);
+            for (int i = 0; i < kMaxPolls; ++i) {
+                if (i > 0)
+                    std::this_thread::sleep_for(kInterval); // query first; back off only on miss
+                std::string output, error_detail;
+                int terminal = -1;
+                bool have_output = false;
+                for (const auto& r : response_store->query(command_id)) {
+                    if (r.agent_id != agent_id)
+                        continue; // never render another agent's row
+                    if (!r.output.empty()) {
+                        output = r.output;
+                        have_output = true;
+                    }
+                    if (r.status >= 1) {
+                        terminal = r.status;
+                        error_detail = r.error_detail;
+                    }
+                }
+                if (have_output) {
+                    if (output.rfind("error|", 0) == 0) {
+                        res.status = 502;
+                        res.set_content(detail::error_json_a4(
+                                            502, "device reported an error: " + output.substr(6, 200),
+                                            cid),
+                                        "application/json");
+                        return;
+                    }
+                    res.set_content(ok_json(live_result_json(kind, output)), "application/json");
+                    return;
+                }
+                if (terminal >= 2) {
+                    res.status = 502;
+                    res.set_content(
+                        detail::error_json_a4(502, "device query failed: " + error_detail.substr(0, 200),
+                                              cid),
+                        "application/json");
+                    return;
+                }
+                if (terminal == 1) {
+                    // success terminal, no output → empty result (not a false timeout)
+                    res.set_content(ok_json(live_result_json(kind, "")), "application/json");
+                    return;
+                }
+            }
+            res.status = 504;
+            res.set_content(
+                detail::error_json_a4(504, "device did not respond in time", cid, 3000,
+                                      "retry the request"),
+                "application/json");
         });
 
     // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
