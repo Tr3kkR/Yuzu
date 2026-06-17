@@ -314,3 +314,32 @@ TEST_CASE("TAR parse_pattern_config clamps + sanitises at load (#541 UP-1)",
     REQUIRE(clamped.has_value());
     CHECK(clamped->size() == yuzu::tar::kMaxPatternArrayElements);
 }
+
+TEST_CASE("TAR parse_pattern_config enforces the min-core floor on the LOAD path (#541)",
+          "[tar][configure][issue541]") {
+    // The REQUIRED gap: load_stabilization_exclusions re-parses the stored value
+    // every fast cycle, so the ≥3-char effective-core floor must be enforced HERE
+    // (require_min_core_len=true), not only at configure. Otherwise a sub-floor
+    // value persisted before the floor existed (a no-tamper upgrade) or written
+    // out of band reaches should_redact and silently drops most process events.
+    using yuzu::tar::parse_pattern_config;
+
+    // Exclusions loader (floor ON): "a" and "*a*" (core "a") drop, "abc" kept.
+    auto excl = parse_pattern_config(R"(["a","*a*","abc"])", /*require_min_core_len=*/true);
+    REQUIRE(excl.has_value());
+    REQUIRE(excl->size() == 1);
+    CHECK((*excl)[0] == "abc");
+
+    // Mixed: only cores ≥3 chars survive; '*' does not buy a pass.
+    auto mixed = parse_pattern_config(R"(["ab","*x*","chrome-helper","*abc*"])", true);
+    REQUIRE(mixed.has_value());
+    REQUIRE(mixed->size() == 2);
+    CHECK((*mixed)[0] == "chrome-helper");
+    CHECK((*mixed)[1] == "*abc*");
+
+    // Redaction loader (floor OFF, the default): short cores are KEPT — a short
+    // redaction substring over-redacts a command line, it never drops an event.
+    auto redact = parse_pattern_config(R"(["a","*a*","abc"])");
+    REQUIRE(redact.has_value());
+    CHECK(redact->size() == 3);
+}

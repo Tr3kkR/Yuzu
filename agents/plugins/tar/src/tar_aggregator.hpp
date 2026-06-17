@@ -50,8 +50,17 @@ validate_config_pattern(std::string_view pattern, bool require_min_core_len);
 // truncates to kMaxPatternArrayElements. Returns std::nullopt only when the
 // stored text is not a JSON array (the caller then applies its own default);
 // a valid-but-empty array yields an empty vector (explicit "no patterns").
+//
+// When `require_min_core_len` is set (the exclusions loader), an element whose
+// effective match core — after stripping leading/trailing `*` — is shorter than
+// kMinExclusionCoreLength is ALSO dropped, matching the configure-time floor in
+// validate_config_pattern. This closes the load-path gap (#541): a sub-floor
+// value persisted before the floor existed (a no-tamper upgrade) or written out
+// of band would otherwise reach should_redact and silently suppress most process
+// events. The redaction loader leaves it false — a short redaction core merely
+// over-redacts a command line, it does not drop events.
 [[nodiscard]] std::optional<std::vector<std::string>>
-parse_pattern_config(std::string_view json_text);
+parse_pattern_config(std::string_view json_text, bool require_min_core_len = false);
 
 /**
  * Run all pending aggregations for all sources.

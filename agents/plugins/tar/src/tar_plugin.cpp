@@ -221,9 +221,14 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     auto stored = db.get_config("process_stabilization_exclusions");
     if (stored.empty())
         return {};
-    // #541 — bound + sanitise at load (see load_redaction_patterns). A non-array
-    // stored value yields no exclusions (the safe default — nothing dropped).
-    if (auto v = yuzu::tar::parse_pattern_config(stored))
+    // #541 — bound + sanitise at load (see load_redaction_patterns), AND enforce
+    // the ≥3-char effective-core floor here (require_min_core_len=true): unlike
+    // redaction, a sub-floor exclusion like ["a"] or ["*a*"] silently drops every
+    // process whose name contains that core, so a value persisted before the
+    // floor existed (no-tamper upgrade) or tampered out of band must be filtered
+    // on this hot path, not just rejected at configure. A non-array stored value
+    // yields no exclusions (the safe default — nothing dropped).
+    if (auto v = yuzu::tar::parse_pattern_config(stored, /*require_min_core_len=*/true))
         return std::move(*v);
     return {};
 }

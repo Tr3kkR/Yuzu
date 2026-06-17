@@ -137,33 +137,38 @@ void apply_source_enabled_transition(TarDatabase& db,
     }
 }
 
+namespace {
+// The effective match core of a pattern: should_redact strips only leading and
+// trailing '*' and treats an interior '*' as a literal, so "*a*" matches the
+// 1-char substring "a". The min-core floor (#541 / gov UP-2) must measure this
+// stripped core, not the raw length, or it is trivially bypassed. Shared by
+// validate_config_pattern (configure path) and parse_pattern_config (load path)
+// so both enforce an identical floor.
+std::string_view stripped_core(std::string_view pattern) {
+    while (!pattern.empty() && pattern.front() == '*')
+        pattern.remove_prefix(1);
+    while (!pattern.empty() && pattern.back() == '*')
+        pattern.remove_suffix(1);
+    return pattern;
+}
+} // namespace
+
 std::optional<std::string> validate_config_pattern(std::string_view pattern,
                                                    bool require_min_core_len) {
     if (pattern.size() > kMaxPatternLength) {
         return std::format("pattern exceeds the {}-character limit", kMaxPatternLength);
     }
-    if (require_min_core_len) {
-        // The floor applies to the EFFECTIVE match core. should_redact strips
-        // only leading/trailing '*' and treats an interior '*' as a literal, so
-        // "*a*" matches the 1-char substring "a" — bypassing the floor on the
-        // raw length would re-open the silent-drop footgun (#541 / gov UP-2).
-        // Strip the same way and measure the core.
-        std::string_view core = pattern;
-        while (!core.empty() && core.front() == '*')
-            core.remove_prefix(1);
-        while (!core.empty() && core.back() == '*')
-            core.remove_suffix(1);
-        if (core.size() < kMinExclusionCoreLength) {
-            return std::format("exclusion pattern '{}' has an effective substring shorter than {} "
-                               "characters and would match almost every process — use a longer "
-                               "substring (leading/trailing '*' do not count)",
-                               pattern, kMinExclusionCoreLength);
-        }
+    if (require_min_core_len && stripped_core(pattern).size() < kMinExclusionCoreLength) {
+        return std::format("exclusion pattern '{}' has an effective substring shorter than {} "
+                           "characters and would match almost every process — use a longer "
+                           "substring (leading/trailing '*' do not count)",
+                           pattern, kMinExclusionCoreLength);
     }
     return std::nullopt;
 }
 
-std::optional<std::vector<std::string>> parse_pattern_config(std::string_view json_text) {
+std::optional<std::vector<std::string>> parse_pattern_config(std::string_view json_text,
+                                                             bool require_min_core_len) {
     // Runtime defense-in-depth (#541 / gov UP-1): the configure path caps the
     // array at write time, but load_*/collect read whatever is stored every fast
     // cycle. A value written before the cap existed, or mutated outside the
@@ -188,6 +193,13 @@ std::optional<std::vector<std::string>> parse_pattern_config(std::string_view js
         auto s = elem.get<std::string>();
         if (s.empty() || s.size() > kMaxPatternLength)
             continue; // skip empty / over-long elements rather than failing
+        // #541 load-path floor: drop a sub-floor exclusion the same way configure
+        // rejects it, so a value persisted before the floor existed (no-tamper
+        // upgrade) or written out of band can't reach should_redact and silently
+        // suppress most process events. Off for redaction patterns (a short core
+        // only over-redacts a command line; it never drops an event).
+        if (require_min_core_len && stripped_core(s).size() < kMinExclusionCoreLength)
+            continue;
         patterns.push_back(std::move(s));
     }
     return patterns;

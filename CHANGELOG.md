@@ -295,10 +295,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `redaction_patterns` had no element-count or length caps (an oversized array
   degrades the per-process redaction scan), and an over-short exclusion substring
   (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
-  256 chars, a bare exclusion substring shorter than 3 chars is rejected unless
-  bracketed with `*`, the loaders skip non-string elements instead of discarding
-  the whole set, and the stale "glob" comments are corrected to "case-insensitive
-  substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
+  256 chars, and an exclusion whose EFFECTIVE substring (after stripping
+  leading/trailing `*`) is shorter than 3 chars is rejected at configure **and
+  dropped on the load path** — `*` does not buy a pass (`*a*` strips to core
+  `a`), and the load-path floor matters because the loader re-parses the stored
+  value every fast cycle, so a sub-floor value persisted before the floor existed
+  (a no-tamper upgrade) or written out of band would otherwise reach the redaction
+  scan and suppress events. The loaders skip non-string elements instead of
+  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
+  discovery metadata is synced (substring not glob, OS-aware method rejection,
+  the 256/256/3 limits), and the stale "glob" comments are corrected to
+  "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
   pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
   (#544).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`

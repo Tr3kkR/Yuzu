@@ -170,7 +170,7 @@ Default redaction patterns:
 ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]
 ```
 
-Patterns use case-insensitive substring matching. The `*` characters at the start and end indicate substring semantics (e.g., `*password*` matches any command line containing "password" in any case).
+Patterns use case-insensitive substring matching. Leading and trailing `*` are **optional** — they are stripped before matching, so the effective match is always a bare substring (`*password*`, `password*`, and `password` all match any command line containing "password" in any case). Interior `?` and `[abc]` are treated as literals, not glob metacharacters.
 
 To customize:
 
