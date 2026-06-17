@@ -167,6 +167,18 @@ TEST_CASE("risk-filter routes signed kUnloaded through dedup", "[tar][module][fi
     CHECK(out.size() == 1);
 }
 
+TEST_CASE("risk-filter keeps a signed load and its unload distinct", "[tar][module][filter]") {
+    // The action is in the dedup key: a `loaded` and an `unloaded` of the SAME
+    // (proc, module, dir, signer, state) tuple must NOT collapse, or unload
+    // visibility in module_live is erased (the M2 review finding).
+    auto loaded = make_signed("app.exe", "k.dll", "MS"); // action defaults to kLoaded
+    auto unloaded = make_signed("app.exe", "k.dll", "MS");
+    unloaded.action = ModuleAction::kUnloaded;
+    std::vector<ModuleEvent> in{loaded, unloaded};
+    auto out = apply_module_risk_filter(std::move(in));
+    CHECK(out.size() == 2); // action in the key keeps load/unload as separate rows
+}
+
 TEST_CASE("risk-filter caps distinct signed loads per drain", "[tar][module][filter]") {
     std::vector<ModuleEvent> in;
     for (int i = 0; i < 20; ++i)
