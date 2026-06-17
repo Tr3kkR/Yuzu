@@ -603,6 +603,9 @@ const std::string& openapi_spec() {
     "/dex/signals/{obs_type}": {
       "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
     },
+    "/dex/devices/{id}": {
+      "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
+    },
     "/dex/perf/fleet": {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
     },
@@ -803,7 +806,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    ScopedPermFn scoped_perm_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -813,7 +817,7 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn));
+                    std::move(net_perf_fn), std::move(scoped_perm_fn));
 }
 
 void RestApiV1::register_routes(
@@ -828,7 +832,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    ScopedPermFn scoped_perm_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -4825,6 +4830,52 @@ void RestApiV1::register_routes(
         res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
                         "application/json");
     });
+
+    // GET /dex/devices/{id} — per-device DEX read model: the experience score +
+    // this device's signal summary (obs_type → count). The machine-readable
+    // equivalent of the dashboard device DEX lens (agentic-first A1/A2). Per-device
+    // SCOPED (require_scoped_permission when wired; else the global perm_fn gate,
+    // parity with the rest of the per-device /api/v1 surface) + audit-on-open, the
+    // same posture as /fragments/device/dex.
+    sink.Get(
+        R"(/api/v1/dex/devices/([^/]+))",
+        [perm_fn, scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+            const std::string agent_id = req.matches[1].str();
+            const auto cid = detail::make_correlation_id();
+            const bool ok = scoped_perm_fn
+                                ? scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id)
+                                : perm_fn(req, res, "GuaranteedState", "Read");
+            if (!ok)
+                return; // the gate wrote its own 401/403
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (audit_fn)
+                audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
+                         "REST per-device DEX read model");
+            const std::string window =
+                req.has_param("window") ? req.get_param_value("window") : "7d";
+            const std::string since = dex_iso_since(dex_window_to_days(window));
+            const int score = dex_device_score(guaranteed_state_store, agent_id, since);
+            JArr signals;
+            for (const auto& s : guaranteed_state_store->dex_device_signal_summary(agent_id, since))
+                signals.add(JObj()
+                                .add("obs_type", s.obs_type)
+                                .add("count", s.count)
+                                .add("distinct_devices", s.distinct_devices)
+                                .add("last_seen", s.last_seen));
+            auto data = JObj()
+                            .add("agent_id", agent_id)
+                            .add("window", window)
+                            .add("score", score)
+                            .raw("signals", signals.str())
+                            .str();
+            res.set_content(ok_json(data), "application/json");
+        });
 
     // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
     // platform reports, and total events). Aggregate; not audited.

@@ -68,6 +68,10 @@ struct RestGsHarness {
     // preserving every other test's behaviour).
     bool grant_perms{true};
 
+    // When non-empty, the scoped per-device gate denies (403) this agent_id — lets a
+    // test prove the per-device scope is enforced on /api/v1/dex/devices/{id}.
+    std::string deny_scoped_agent;
+
     std::vector<AuditRecord> audit_log;
 
     RestApiV1 api;
@@ -99,6 +103,18 @@ struct RestGsHarness {
             return false;
         };
 
+        // Per-device scope gate (require_scoped_permission stand-in): grants unless
+        // grant_perms is off OR the agent matches deny_scoped_agent.
+        auto scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+            if (!grant_perms || (!deny_scoped_agent.empty() && agent_id == deny_scoped_agent)) {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
@@ -125,7 +141,17 @@ struct RestGsHarness {
                             /*product_pack_store=*/nullptr,
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
-                            /*license_store=*/nullptr, store.get());
+                            /*license_store=*/nullptr, store.get(),
+                            /*metrics_registry=*/nullptr,
+                            /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr,
+                            /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{},
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{},
+                            scoped_perm_fn);
     }
 
     ~RestGsHarness() {
@@ -652,6 +678,63 @@ TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audite
     CHECK(saw_boot);
     // Fleet aggregate — no individual-identifying access, so no audit.
     CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device's signals, audited",
+          "[rest][dex][device]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z"); // other device
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    REQUIRE(j["data"]["signals"].is_array());
+    bool saw_crashed = false, saw_other = false;
+    int64_t crashed_count = -1;
+    for (const auto& s : j["data"]["signals"]) {
+        if (s["obs_type"].get<std::string>() == "process.crashed") {
+            saw_crashed = true;
+            crashed_count = s["count"].get<int64_t>();
+        }
+        if (s["obs_type"].get<std::string>() == "os.boot")
+            saw_other = true; // belongs to WS-2
+    }
+    CHECK(saw_crashed);
+    CHECK(crashed_count == 2);
+    CHECK_FALSE(saw_other); // WS-2's signal must not leak into WS-1's per-device summary
+    // Per-device behavioral read → audited dex.device.view (parity with the lens).
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
+          "[rest][dex][device][a2]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2 discovery: the per-device DEX endpoint is enumerable from the live server.
+    REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
+    // And the embedded spec remains valid JSON after the insertion.
+    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+}
+
+TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no audit",
+          "[rest][dex][device][scope]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-9", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.deny_scoped_agent = "WS-9"; // the per-device scope gate denies this agent
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-9?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty()); // the scope gate runs BEFORE any audit emission
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {

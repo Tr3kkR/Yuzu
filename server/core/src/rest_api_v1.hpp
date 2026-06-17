@@ -70,6 +70,17 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    /// Per-device tier + management-group scope gate — wraps
+    /// AuthRoutes::require_scoped_permission (global grant OR a role on the agent's
+    /// management group / an ancestor). Used by the per-device agentic-first
+    /// endpoints so a REST worker is held to the SAME per-device scope as the
+    /// dashboard device lenses. Optional: when unset, per-device routes fall back
+    /// to the global `perm_fn` gate (parity with the rest of the per-device
+    /// `/api/v1` surface, which is global-gated today).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -168,7 +179,8 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        ScopedPermFn scoped_perm_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -195,7 +207,8 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        ScopedPermFn scoped_perm_fn = {});
 };
 
 } // namespace yuzu::server
