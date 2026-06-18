@@ -274,7 +274,10 @@ private:
     std::chrono::milliseconds backoff_cap_{5000};
     std::size_t connect_failures_{0};
     std::chrono::steady_clock::time_point connect_blocked_until_{};
-    std::minstd_rand jitter_rng_{0x79757a75u}; ///< "yuzu"; jitter only, not crypto
+    /// Backoff jitter only (not crypto). Seeded from random_device so a fleet
+    /// of instances started together decorrelate their reconnect jitter — a
+    /// fixed seed gives every instance the identical sequence (gov fjarvis L1).
+    std::minstd_rand jitter_rng_{std::random_device{}()};
 };
 
 } // namespace yuzu::server::pg

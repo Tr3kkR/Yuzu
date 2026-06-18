@@ -25,6 +25,13 @@ namespace {
 // serialize on each other. That is benign — transaction-scoped locks
 // release on commit/abort/disconnect, so the worst case is brief
 // serialization, never deadlock or cross-database corruption.
+//
+// Collision bound (gov fjarvis L3): hashtext() yields a 32-bit signed int, so
+// two DISTINCT store names can collide on the second lock key. The only effect
+// is brief over-serialization (the two stores' migration txns can't run
+// concurrently); the per-store version is still re-read under the lock, so
+// correctness is unaffected. Across ~27 stores the birthday probability is
+// negligible. A collision can never corrupt or mis-apply a migration.
 constexpr const char* kAdvisoryLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext($1::text))";
 
@@ -214,7 +221,11 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
 
         // Transaction-local search_path so the migration's unqualified DDL
         // lands in the store's schema and nothing leaks onto the pooled
-        // connection after COMMIT/ROLLBACK.
+        // connection after COMMIT/ROLLBACK. `store` is interpolated (libpq has
+        // no parameter binding for identifiers), which is injection-safe ONLY
+        // because run() rejected anything but [a-z_][a-z0-9_]{0,62} via
+        // valid_store_name() before reaching here (gov fjarvis L4); double-
+        // quoted as defence in depth.
         if (!exec_ok(conn, "SET LOCAL search_path TO \"" + store + "\", public", "SET search_path",
                      store))
             return false;

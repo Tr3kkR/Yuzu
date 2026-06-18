@@ -125,9 +125,15 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             PGconn* c = idle_.front();
             idle_.pop_front();
             ++leased_;
+            // Take ownership in the RAII Lease BEFORE the observer can run: if
+            // observe_wait() throws, `lease` destructs and returns `c` to the
+            // pool (decrementing leased_) instead of leaking it and wedging the
+            // destructor's leased_==0 wait (gov fjarvis S1). The Observer
+            // contract is SHOULD-NOT-throw, but that is weaker than noexcept.
+            Lease lease{this, c};
             lk.unlock();
             observe_wait();
-            return Lease{this, c};
+            return lease;
         }
         // Deadline gate: never START a connect (or another wait) past the
         // caller's deadline. An idle connection at/past the deadline is
@@ -186,9 +192,12 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             connect_blocked_until_ = {};
             ++open_;
             ++leased_;
+            // RAII owner before the (SHOULD-not-throw) observer — see the
+            // idle-hit path above (gov fjarvis S1).
+            Lease lease{this, c};
             lk.unlock();
             observe_wait();
-            return Lease{this, c};
+            return lease;
         }
         // waiters_ keeps the destructor from tearing the pool down while we
         // are still inside the wait (it spins on waiters_ == 0).

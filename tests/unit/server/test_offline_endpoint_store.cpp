@@ -6,15 +6,20 @@
 
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <string>
 
 using yuzu::server::OfflineEndpoint;
 using yuzu::server::OfflineEndpointStore;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -84,4 +89,29 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         auto rows = store.query_stale_within(std::chrono::hours(1));
         CHECK(find(rows, "") == nullptr);
     }
+}
+
+// gov fjarvis B1: a reachable database whose schema migration FAILS must leave
+// the store !is_open() — which the server wires to startup_failed_ (fail
+// closed, not serve-degraded). Force the failure by pre-seeding a table in the
+// store's schema with no schema_meta row: the migration runner's schema-drift
+// guard refuses (version 0 but tables exist), so run() returns false.
+TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][offline]") {
+    YUZU_REQUIRE_PG_DB(db);
+
+    // Pre-seed: create the endpoint_state schema + a conflicting table, but no
+    // public.schema_meta row for the store — the drift guard will refuse.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA endpoint_state")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE endpoint_state.endpoints (bogus int)")};
+        REQUIRE(t.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ = true
 }

@@ -698,6 +698,10 @@ public:
         metrics_.describe("yuzu_viz_oversize_response_total",
                           "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
                           "counter");
+        metrics_.describe("yuzu_viz_offline_hosts_total",
+                          "Stale-flagged offline hosts merged into /viz/fleet from the durable "
+                          "OfflineEndpointStore (hosts that aged out of the in-memory snapshot)",
+                          "counter");
         metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
                           "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
         metrics_.describe("yuzu_viz_refill_oversize_drops_total",
@@ -970,14 +974,22 @@ public:
 
         // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
         // so offline hosts render stale-flagged on /viz/fleet. Only built when
-        // the substrate is good — a failed probe above already set
-        // startup_failed_, and run() refuses to serve, so we skip the store
-        // (its migration would hit the same unreachable database).
+        // the substrate probe above succeeded (an unreachable database already
+        // set startup_failed_ and run() refuses to serve). FAIL CLOSED on a
+        // migration/open failure too (ADR-0007 + the ADR-0008 per-store
+        // migration invariant): a reachable database whose schema migration
+        // fails — schema conflict, missing CREATE privilege, advisory-lock
+        // contention — must NOT serve degraded. This is the template every
+        // future Postgres-backed store inherits, so the contract is uniform:
+        // a Postgres-backed store that cannot open is a fatal startup error.
         if (pg_pool_ && !startup_failed_) {
             offline_endpoint_store_ = std::make_unique<OfflineEndpointStore>(*pg_pool_);
-            if (!offline_endpoint_store_->is_open())
-                spdlog::warn("[PG] offline-endpoint store unavailable; offline hosts will not "
-                             "be stale-flagged on /viz/fleet (live topology unaffected)");
+            if (!offline_endpoint_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
+                              "failed (database reachable but the endpoint_state schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            }
         }
 
         // Initialize response store
@@ -9184,7 +9196,11 @@ private:
     // — not atomic by design; do NOT read/write it from another thread without
     // converting to std::atomic first (gov L1).
     std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
-    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // atomic so a future background-thread read can never be UB; today it is
+    // written/read only on the main thread (ctor → run() → main()), so the
+    // default seq_cst on the implicit load/store is free on this cold path
+    // (gov fjarvis L2).
+    std::atomic<bool> startup_failed_{false}; // run() refused to start — main() exits non-zero
     // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
     // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
     std::string agent_ca_cert_pem_;

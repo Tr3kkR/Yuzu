@@ -127,6 +127,29 @@ TEST_CASE("PgPool acquire-wait observer fires on a successful checkout", "[pg][h
     CHECK_FALSE(pool.connect_breaker_open());
 }
 
+// gov fjarvis S1: a throwing acquire-wait observer must NOT leak the connection
+// or wedge leased_. The Lease is constructed before observe_wait() runs, so the
+// throw unwinds through the lease's dtor (returning the conn, decrementing
+// leased_); the exception propagates but the pool stays consistent and its
+// destructor does not hang.
+TEST_CASE("PgPool: throwing acquire-wait observer does not leak the lease", "[pg][hardening]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool::Options opts;
+    opts.conninfo = db.dsn();
+    opts.size = 2;
+    opts.observer.on_acquire_wait_seconds = [](double) {
+        throw std::runtime_error("observer boom");
+    };
+    PgPool pool{std::move(opts)};
+    REQUIRE(pool.valid());
+
+    CHECK_THROWS_AS(pool.acquire(), std::runtime_error); // propagates, no swallow
+    CHECK(pool.in_use() == 0);                           // lease returned — no leak
+    CHECK(pool.open() == 1);                             // conn pooled, reusable
+    // Reaching the end (pool dtor at scope exit) without hanging proves
+    // leased_ returned to 0.
+}
+
 // CH-9: the pool destructor must wait for an outstanding lease and then
 // complete — never deadlock when the destroyer does NOT itself hold a lease.
 TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][chaos]") {
