@@ -393,11 +393,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented "re-enabling starts from a clean baseline" contract. The disable
   transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
   mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
-  rebuilds from scratch. The source→baseline-key mapping (note `tcp`'s baseline lives
-  under `"network"`) is centralised in `diff_state_key()`, used by both the collectors
-  and the disable path so it cannot drift. (`perf`/`procperf` keep an in-memory
-  baseline — out of scope; their re-enable delta is a rate-average over the gap, not a
-  ghost-event spike.)
+  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
+  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
+  disable is refused (the source stays enabled and `configure` returns an error)
+  rather than leaving a disabled source with a stale baseline. The
+  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
+  centralised in `diff_state_key()`, used by both the collectors and the disable path
+  so it cannot drift. **Operator-visible change:** the first collection cycle after a
+  re-enable emits a `started` event for every entity currently running/open (an
+  expected one-time rebaseline), not ghost `stopped` events. (`perf`/`procperf` keep
+  an in-memory baseline — out of scope; their re-enable delta is a rate-average over
+  the gap, not a ghost-event spike.)
 - **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
   The `/tar` retention-paused list had three defects: (a) a source whose
   `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered

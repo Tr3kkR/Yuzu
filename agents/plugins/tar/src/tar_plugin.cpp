@@ -1373,6 +1373,7 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
+            bool transition_ok;
             {
                 // #538: collect_fast/slow hold collect_mu_ for their whole
                 // enumerate→diff→set_state cycle. Taking it here makes the
@@ -1383,7 +1384,18 @@ private:
                 // "stopped" events on re-enable. No deadlock: do_configure runs
                 // without collect_mu_ held and the helper re-acquires nothing.
                 std::lock_guard lock(collect_mu_);
-                yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+                transition_ok =
+                    yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            }
+            if (!transition_ok) {
+                // #538/UP-1: a disable that could not clear the baseline leaves
+                // the source ENABLED (fail-safe). Report it so the operator can
+                // retry rather than believing the source was stopped.
+                ctx.write_output(std::format(
+                    "error|{} disable failed: could not clear collection baseline "
+                    "(database busy); source left enabled",
+                    key));
+                return 1;
             }
             ctx.write_output(std::format("config|{}|{}", key, v));
             // Echo the resulting paused_at so the operator/dashboard sees the

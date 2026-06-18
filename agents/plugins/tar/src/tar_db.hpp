@@ -200,8 +200,12 @@ public:
 
     /**
      * Store the last-known state JSON for a collector.
+     * @return true on success; false if the write failed (e.g. SQLITE_BUSY /
+     *         disk full / prepare error). Callers that must not proceed on a
+     *         failed write (the #538 disable baseline-clear) check this;
+     *         best-effort collector writes may ignore it.
      */
-    void set_state(const std::string& collector, const std::string& json);
+    bool set_state(const std::string& collector, const std::string& json);
 
     // ── Config management ────────────────────────────────────────────────────
 

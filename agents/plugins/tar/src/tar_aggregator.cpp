@@ -117,28 +117,42 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
-void apply_source_enabled_transition(TarDatabase& db,
+bool apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view source,
                                       std::string_view new_value,
                                       int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
     std::string prev = db.get_config(enabled_key, "true");
-    db.set_config(enabled_key, std::string{new_value});
-
     auto paused_at_key = std::format("{}_paused_at", source);
+
     if (new_value == "false" && prev != "false") {
+        // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
+        // `_enabled` flag only if the clear actually persisted. `set_state` can
+        // fail silently (SQLITE_BUSY / disk full); if we flipped the flag first
+        // and the clear then failed, we'd have a DISABLED source with a STALE
+        // baseline — and a later re-enable would emit exactly the ghost "stopped"
+        // events this fix exists to prevent, while the operator saw success.
+        // Clearing first makes the disable fail-safe: a failed clear leaves the
+        // source ENABLED (its baseline still valid, collection continues) and we
+        // report failure so the operator can retry. No-op for sources without a
+        // snapshot-diff baseline (perf/procperf/netqual). The caller serialises
+        // this whole call against the collectors via collect_mu_ (see do_configure).
+        if (auto key = diff_state_key(source); !key.empty()) {
+            if (!db.set_state(std::string{key}, ""))
+                return false; // baseline NOT cleared → do not disable
+        }
+        db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
-        // #538: clear the diff baseline so a later re-enable starts from a clean
-        // snapshot rather than diffing against the frozen pre-pause state — which
-        // would emit ghost "stopped" events for entities that exited during the
-        // pause. No-op for sources without a snapshot-diff baseline
-        // (perf/procperf/netqual). The caller serialises this against the
-        // collectors via collect_mu_ (see do_configure).
-        if (auto key = diff_state_key(source); !key.empty())
-            db.set_state(std::string{key}, "");
-    } else if (new_value == "true" && prev == "false") {
+        return true;
+    }
+
+    // All other transitions (idempotent set, disable→enable, first-ever set):
+    // no baseline clear, so the flag write cannot leave inconsistent state.
+    db.set_config(enabled_key, std::string{new_value});
+    if (new_value == "true" && prev == "false") {
         db.set_config(paused_at_key, "0");
     }
+    return true;
 }
 
 std::string_view diff_state_key(std::string_view source) {
