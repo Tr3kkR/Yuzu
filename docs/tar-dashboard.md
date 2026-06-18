@@ -14,7 +14,7 @@ The Timeline Activity Record (TAR) plugin is one of the **highest-leverage opera
 The page is also the home for two new affordances that did not have anywhere to live:
 
 1. **Retention-paused source list** — the operator-facing view of `<source>_enabled=false` per device, born from issue #539. Without it, an operator who disabled `process_enabled` on a device for forensic preservation has no aggregate view of which boxes are accumulating non-aging data.
-2. **Process tree viewer** — reconstructed from `process_live` plus a seed snapshot taken at agent install / first start (see §6). Forensic timeline of every process born under a parent, walked back to PID 1.
+2. **Process tree viewer** — reconstructed per-host from that host's local TAR warehouse (`$Process_Live` + `$TCP_Live`) only, with no seed (as-built; see §5). Forensic timeline of every process born under a parent over a chosen window, with an honest "no-seed" completeness caveat (Windows is names-only).
 
 The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the TAR SQL frame is the canonical iterative-narrowing tool, and result-set chips on this page are the operator's reasoning chain made visible.
 
