@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR process tree viewer** (`/tar`, Frame 3). Reconstructs a **per-host** process
+  tree entirely from that host's **local TAR warehouse** (`$Process_Live` +
+  `$TCP_Live`, via the read-only `tar.sql` action) — no seed, no server-side mirror,
+  no live process probe. Pick a connected host, choose a timescale (**On boot · On
+  agent install · Last minute · Last 10m · Last hour · Last day**, or a custom
+  From/To UTC range; point-in-time = From == To), and read a two-column view: a
+  scrollable tree on the left and a **sticky detail panel** on the right (path, user,
+  start time, connections, anomaly evidence on row click). Rows show running/exited
+  state and an **inline network summary** of remote `IP:port` endpoints (public egress
+  highlighted); 4+ identical-name siblings collapse into one expandable `name ×N` row
+  (e.g. `svchost.exe ×106`). Client-side **All / Running / Exited** + **Anomalies
+  only** + text filters (matching name / PID / remote IP) apply instantly. The sole
+  anomaly heuristic flags **suspicious parent→child spawns** (an office app or browser
+  launching a shell/LOLBin), computed server-side and name-based so it works on the
+  Windows names-only ETW feeder. Viewing requires `Infrastructure:Read`; reconstruction
+  dispatches a live query so it additionally requires `Execution:Execute` + the device's
+  management scope, and emits a `tar.process_tree.read` audit event. **Windows is
+  names-only** (no per-process path/command line; populated on Linux/macOS), and the
+  reconstruction has an honest no-seed completeness limit — both stated in-page. REST/MCP
+  parity is a tracked follow-up. (`docs/tar-dashboard.md` §5, `docs/user-manual/tar.md`.)
 - **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
   filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
   page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The

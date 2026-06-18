@@ -248,6 +248,28 @@ The first frame surfaces every device × source pair where the collector has bee
 
 **Audit trail:** Every Scan emits a `tar.status.scan` audit event. Every Re-enable emits `tar.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation` or `agent_not_connected` — on rejected attempts). See `docs/user-manual/audit-log.md` for the full schema.
 
+### Process tree viewer
+
+The third frame on the `/tar` page reconstructs a **per-host process tree** entirely from that host's local TAR warehouse (`$Process_Live` + `$TCP_Live`) — no extra data is collected, and no other host is involved.
+
+**Workflow:**
+
+1. **Pick a live host** from the dropdown (only connected agents in your scope are listed). Selecting one reconstructs the default **Last 10m** window.
+2. **Choose a timescale** — the preset chips **On boot · On agent install · Last minute · Last 10m · Last hour · Last day**, or type a **custom From/To (UTC)** range and click **Apply**. Setting From == To gives a true point-in-time tree.
+3. **Read the tree.** Each row shows a running/exited dot, PID, name, owning user, and — when the process has connections — an inline network summary of remote `IP:port` endpoints (public/internet egress is highlighted). Dozens of identical-name siblings (e.g. `svchost.exe`) collapse into one `name ×N` row you can expand.
+4. **Click any process** to open the **detail panel on the right**: path, command line, user, start time, full connection list, and any anomaly evidence.
+5. **Filter** with the toolbar: **All / Running / Exited**, an **Anomalies only** toggle, and a text box that matches name, PID, or remote IP. Filters combine and apply instantly (no reload).
+
+**What "anomalies" means here:** the viewer flags **suspicious parent→child spawns** — a common-document or browser application (Word, Excel, Outlook, Chrome, Edge, …) launching a shell or LOLBin (`powershell.exe`, `cmd.exe`, `mshta.exe`, `rundll32.exe`, …). This is computed on the server from the TAR data; it is heuristic, name-based, and deliberately conservative.
+
+**Honest limitations:**
+
+- **No seed.** The tree is replayed from the retained `$Process_Live` events only. A process whose `started` event has aged out of the live-tier cap (or that started before the oldest retained row) may not appear; the banner states the observation window.
+- **`On boot` / `On agent install` are proxies.** TAR stores no boot or install timestamp, so these anchors are derived from the retained events (install ≈ oldest retained row; boot ≈ the most recent root-process start).
+- **Windows is names-only.** On Windows the process feeder is ETW (Kernel-Process), which captures image **names only** — so per-process **path and command line are blank** on Windows (they are populated on Linux/macOS). Loaded libraries/DLLs are not captured by TAR on any platform.
+
+**Permissions:** viewing the frame requires `Infrastructure:Read`. Reconstructing a tree dispatches a read-only `tar.sql` to the device, so it additionally requires `Execution:Execute` and the device must be inside your management scope. Every reconstruction emits a `tar.process_tree.read` audit event (`device_id`, `preset`, `from`, `to`, `nodes`, `anomalies`).
+
 ## Forcing an immediate snapshot
 
 The `snapshot` action triggers an immediate full collection of all four categories, useful before a maintenance window or at the start of an investigation:

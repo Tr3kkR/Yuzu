@@ -1,6 +1,6 @@
 # TAR Dashboard — Operator Page Design
 
-**Status:** Design (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; purge action and persistence deferred. See `docs/roadmap.md` Phase 15.)
+**Status:** Design + partial ship (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; purge action and persistence deferred. **PR-H shipped 2026-06-18: process tree viewer, as-built §5 — local-TAR-data-only.** See `docs/roadmap.md` Phase 15.)
 **Audience:** Server engineers, dashboard UI engineers, TAR plugin maintainers
 **Owners:** `architect` (page architecture), `plugin-developer` (TAR action surface), `security-guardian` (SQL execution surface), `docs-writer` (DSL + REST docs)
 **Related:** `docs/scope-walking-design.md` (the cross-cutting result-set primitive this page consumes), `docs/yuzu-guardian-design-v1.1.md` (the agent tamper-resistance pillar that the process tree viewer's data quality depends on), `agents/plugins/tar/` (the data plane).
@@ -151,7 +151,115 @@ The frame body is largely the existing `/fragments/tar-sql` route (`server/core/
 
 No changes to the `tar.sql` agent action; the change is purely server-side scope resolution + result-set persistence.
 
-## 5. PR-H — Process tree viewer
+## 5. PR-H — Process tree viewer (**as-built**)
+
+> **Deviation from the original seed-based design below (kept for history).** What
+> shipped reconstructs the tree from **the agent's existing local TAR warehouse
+> only** (`$Process_Live` + `$TCP_Live`, queried via the read-only `tar.sql`
+> action) — there is **no agent-side seed action, no `action='seed'` rows, no
+> `__checkpoint__` rows, and no `/api/v1/tar/process-tree` REST surface**. This was
+> a deliberate scope choice (local-TAR-data-only); the consequence is an honest
+> completeness limit (see "Honesty" below). Modules: server engine
+> `server/core/src/tar_process_tree.{hpp,cpp}` (pure, unit-tested), routes
+> `server/core/src/tar_tree_routes.{hpp,cpp}`, page `tar_page_ui.cpp` Frame 3.
+
+### 5.1 Reconstruction model (as-built)
+
+- The viewer dispatches two canned, **read-only** `tar.sql` queries to ONE selected
+  live host — `SELECT … FROM $Process_Live` and `… FROM $TCP_Live` — through the
+  same dispatch-and-poll seam the device-page "Get live info" uses (untracked
+  dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
+  runs them on its read-only authorizer connection (#760/#631).
+- The agent forbids recursive CTEs, so the tree is reconstructed **server-side in
+  C++** from the flat event rows: per-pid alive-intervals are built from the
+  `started`/`stopped` stream, incarnations whose lifetime overlaps the chosen window
+  `[from, to]` are kept (PID-reuse-safe — each lifetime is its own node), and each is
+  linked to the parent incarnation that owned its `ppid` when it started. Orphans
+  (parent not present / `ppid` 0 / start event aged out) become roots. Cycle- and
+  50k-node-cap guarded.
+- **Timescale controls.** Preset chips — **On boot · On agent install · Last minute
+  · Last 10m · Last hour · Last day** — plus a **custom From/To (UTC)** box.
+  Point-in-time is the `from == to` case. `to` is the upper bound (running-vs-exited
+  is decided at `to`); the SQL fetch lower bound stays oldest-retained so a
+  long-running process started before the window still appears. **`On boot` and
+  `On agent install` are TAR-derived proxies** (TAR has no boot/install-time column):
+  install = `MIN(ts)` over retained rows; boot = the most-recent start of a root
+  process (`ppid==0`), falling back to install.
+
+**Honesty in framing.** Banner reads e.g. `Window <from> → <to> · observed since
+<oldest-retained> · 411 nodes (281 running / 130 exited) · 0 flagged`, with a note
+that — because there is **no seed** — a process whose `started` event has aged out of
+the 100k `$Process_Live` cap (or that predates the oldest retained row) may not
+appear, and that the boot/install anchors are proxies. On **Windows the feeder is
+ETW (names-only)** so per-process path and command line are blank (stated inline);
+they are populated on Linux/macOS.
+
+### 5.2 Filtering, grouping, network (client-side display)
+
+Reconstruction always returns the **full** tree; display filtering is client-side
+(instant, no re-dispatch — each row carries `data-state`/`data-anom`):
+
+- **State filter** — All / Running / Exited chips.
+- **Anomalies only** — toggle (the sole heuristic is a **suspicious parent→child**
+  name-pair denylist, e.g. an office app or browser spawning a shell/LOLBin; flagged
+  server-side, name-based so it works on Windows).
+- **Text filter** — matches name / PID / **remote IP**.
+- All three combine, reveal+expand the ancestor branches of matches, and are
+  re-applied after every tree swap (`htmx:afterSettle`).
+- **Same-name grouping** — 4+ identical-name siblings collapse into one
+  `name ×N (R running · E exited)` row (e.g. `svchost.exe ×106`), expandable to the
+  individual PIDs (each still drill-able). Filters auto-expand groups with matches.
+- **Inline network** — each row shows its `$TCP_Live` connections joined by pid:
+  a count + remote `IP:port` endpoints (public/routable egress highlighted amber;
+  listeners shown as `:port listen`). Full connection table is in the detail panel.
+
+### 5.3 Layout & detail panel
+
+Two-column: a scrollable tree on the left and a **sticky, always-visible detail
+panel on the right** (stacks below on narrow viewports). Clicking any process row
+hx-gets `/fragments/tar/process-tree/detail` into the right panel — name, PID, parent
+PID, user, running/exited + start time, path + command line (blank-with-note on
+Windows), the process's connections, and anomaly evidence. The detail renders from a
+**server-side reconstruction cache** (bounded LRU, 180 s TTL, keyed by an unguessable
+token) so row clicks need no further agent round-trip.
+
+### 5.4 Routes
+
+| Route | Purpose |
+|---|---|
+| `GET /fragments/tar/process-tree` | Frame body: host picker (operator-scoped) + timescale + filter bar + tree/detail targets |
+| `GET /fragments/tar/process-tree/run?device=&preset=&from=&to=` | Resolve window, dispatch the two `tar.sql`, return the polling fragment |
+| `GET /fragments/tar/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, reconstruct, cache, render the tree |
+| `GET /fragments/tar/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope) |
+
+### 5.5 Permissions & audit
+
+- Viewing the frame: `Infrastructure:Read`.
+- **Reconstructing dispatches a live `tar.sql`**, so `run`/`result` also require
+  `Execution:Execute` **and** the per-device management scope
+  (`require_scoped_permission`) — same posture as the TAR SQL frame and the device
+  live-info probe. (This tightens the original "`Infrastructure:Read` to view"
+  framing, which assumed a stored, non-dispatching tree.)
+- `detail` re-checks `Infrastructure:Read` scoped to the cached device, so a leaked
+  cache token can't cross management scope.
+- `$Process_Live.cmdline` is already redaction-applied at capture by the agent, so no
+  server-side re-redaction is needed; all agent-controlled fields are HTML-escaped.
+- Audit on every reconstruction: `action: tar.process_tree.read, detail:
+  {device_id, preset, from, to, nodes, anomalies}`.
+
+### 5.6 Deferred
+
+- **Agentic-first REST/MCP parity** (`GET /api/v1/tar/process-tree/{id}` + an MCP
+  tool) — deferred to a tracked follow-up, mirroring the precedent set for the
+  device live-info seam (also dashboard-only at first).
+- **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
+  would need a new collector (ETW `Image`/`Load`) or a live modules probe.
+- **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
+  if the no-seed completeness limit proves insufficient in the field.
+
+---
+
+<details><summary>Original seed-based design (superseded — kept for history)</summary>
 
 ### 5.1 Reconstruction model
 
@@ -162,45 +270,9 @@ Per the architectural direction set in the parent conversation:
 - From the seed onward, regular `collect_fast` cycles emit `action='started'` / `action='stopped'` events. These are appended to `process_live` and are the canonical mutation stream for the tree.
 - At render time, the server queries `process_live` for one device's full history (or a time-bounded slice), replays the seed + events, and produces a tree JSON.
 
-**Honesty in framing.** The tree shows "as observed since `<seed_ts>`" — usually the agent install timestamp. Parents that died before the seed cannot be recovered; their orphan children appear reparented to PID 1 (Linux) / `launchd` (macOS) / `System` (Windows) just as they would be in a live `ps`. The dashboard renders the seed timestamp prominently:
+The dashboard rendered the seed timestamp prominently (`Tree as observed since … (agent install)`). Time slicing was via `?as_of=<ts>`. Mitigations for replay cost were a per-device LRU cache (5-min TTL), 24 h `__checkpoint__` rows, and a 50K-node render cap. A `GET /api/v1/tar/process-tree/{device_id}` JSON surface was planned alongside the fragment, and the renderer was to apply the TAR redaction patterns before serialisation.
 
-```
-Tree as observed since 2026-04-12 09:14 UTC (agent install)
-1,402 processes seen · 89 currently running
-```
-
-### 5.2 Idempotency of `tar.process_tree`
-
-The action is invoked:
-- **Automatically** on every agent start (idempotent — re-running just appends a fresh `seed` row set, marked with the new start's snapshot ID; the dashboard always uses the most recent seed when reconstructing).
-- **On demand** via the dashboard "Re-seed" button, useful when the operator suspects the process_live event stream has drifted (e.g., long network partition, rollup race).
-
-### 5.3 Wire surface
-
-`tar.process_tree` action emits one `process|seed|<pid>|<ppid>|<name>|<user>|<start_ts>|<cmdline>` line per running PID at invocation time. Server-side parser writes them as a single batch into `process_live` via the typed insert path.
-
-### 5.4 Renderer
-
-Two server-side paths:
-
-- `GET /api/v1/tar/process-tree/{device_id}` returns `{seed_ts, observation_window_seconds, tree: { pid: 1, children: [ ... ] }}` — the reconstructed tree.
-- `GET /fragments/tar/process-tree?device=...` returns HTMX-friendly nested `<details>`/`<summary>` markup — no graph library required for v1.
-
-Time slicing (`?as_of=<ts>` query param) replays events only up to `as_of` — used for "show me the tree at the moment of incident X." Default is "now."
-
-### 5.5 Performance and memory
-
-Seed size on a typical Windows server: 200-400 PIDs. Linux server: 200-1,500 PIDs. macOS desktop: 300-600 PIDs. Event volume per device per day: 10K-200K (a noisy CI box can do 500K+).
-
-The reconstruction is O(events_in_window) per device. For a 30-day window on a 200K-events/day box, that's 6M events — too slow to replay at every page load. Mitigations:
-
-- Server-side per-device LRU cache of the most recent reconstruction (5-min TTL).
-- Time-bucketed checkpoints in `process_live` — a periodic background task writes a `__checkpoint__` row with the live tree state every 24h, so a query for "now" only replays since the most recent checkpoint.
-- Hard limit on the rendered tree: 50K nodes, then truncate with "Tree exceeds render limit; narrow with `?as_of` or `?root_pid`."
-
-### 5.6 Permissions
-
-`Infrastructure:Read` to view. The tree exposes per-process cmdline which can carry secrets (passwords on the command line, API tokens in env vars rendered into cmdline). The renderer applies the **same redaction patterns** the TAR plugin already uses (`agents/plugins/tar/src/tar_plugin.cpp` `load_redaction_patterns`) before serialisation. Audit row on every fetch: `action: tar.process_tree.read, detail_json: {device_id, as_of, node_count}`.
+</details>
 
 ## 6. Permissions matrix
 
@@ -252,7 +324,7 @@ Audit actions: `tar.status.scan` (operator-triggered Scan fleet — emitted by P
 | PR-E | DSL `fromResultSet:` (`scope-walking-design.md` PR-E) | Pending |
 | PR-F | Reference IR walkthrough integration test (`scope-walking-design.md` PR-F) | Pending |
 | PR-G | Operational hardening (live re-eval, GC, metrics) | Pending |
-| PR-H | Process tree viewer (this doc §5) | Pending — waits on agent service-install hardening readiness |
+| PR-H | Process tree viewer (this doc §5) | **Shipped** (as-built §5 — local-TAR-data-only reconstruction; no seed). REST/MCP parity deferred (§5.6). |
 
 ## 10. Open questions
 

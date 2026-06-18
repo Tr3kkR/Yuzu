@@ -69,6 +69,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -8230,6 +8231,34 @@ private:
             },
             audit_fn);
 
+        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
+        // untracked dispatch (execution_id="" → not in the executions drawer, like the
+        // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
+        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
+        // agent). Per-host only; data from the agent's local tar.db only.
+        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
+        tar_tree_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -9063,6 +9092,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
