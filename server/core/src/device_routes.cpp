@@ -8,6 +8,7 @@
 #include "device_routes.hpp"
 
 #include "dex_routes.hpp"             // dex_device_score, dex_iso_since
+#include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
 #include "web_utils.hpp"              // html_escape
@@ -57,70 +58,25 @@ bool matches(const DeviceRow& d, const std::string& q) {
     return hay.find(q) != std::string::npos;
 }
 
-// One "Get live info" panel = one real plugin instruction dispatched at the
-// device NOW. The kind is an ALLOWLIST token (validated before it drives a
-// dispatch or reaches markup); each kind carries its own audit verb so a
-// usage-class read (what processes a person is running) stays separately
-// countable from a machine-health read (uptime) — the works-council access-audit
-// posture the DEX per-app panel established (dex_routes.cpp PR2 rationale).
-struct LiveKind {
-    std::string plugin;
-    std::string action;
-    std::string label;
-    std::string audit_action;
-};
-
-std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
-    if (kind == "uptime")
-        return LiveKind{"os_info", "uptime", "Uptime", "device.live.uptime"};
-    if (kind == "processes")
-        return LiveKind{"processes", "list_hashed", "Running processes", "device.live.processes"};
-    return std::nullopt;
+// The live-read kind table + wire-format parsing are shared with the REST JSON
+// path via live_kinds.hpp (governance S2) so the two surfaces can't drift.
+// `LiveKind` / `resolve_live_kind` are thin aliases over that shared header.
+using yuzu::server::live::LiveKind;
+inline std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
+    return yuzu::server::live::resolve_kind(kind);
 }
 
-// Parse the newline-joined plugin output (one write_output() line each, possible
-// trailing \r) into the matching live renderer. os_info/uptime -> a value tile;
-// processes/list -> a PID/name table.
+// Parse the newline-joined plugin output into the matching live renderer (shared
+// parser): os_info/uptime -> a value tile; processes/list -> a PID/name table.
 std::string render_live_result(const LiveKind& lk, const std::string& output) {
-    std::vector<std::string> lines;
-    std::size_t pos = 0;
-    while (pos < output.size()) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) lines.push_back(std::move(line));
-    }
     if (lk.plugin == "os_info") {
-        std::string value;
-        for (const auto& l : lines)
-            if (l.starts_with("uptime_display|")) { value = l.substr(15); break; }
-        return render_device_live_value(lk.label, value);
+        const auto u = yuzu::server::live::parse_uptime(output);
+        return render_device_live_value(lk.label, u.display.value_or(""));
     }
     if (lk.plugin == "processes") {
         std::vector<LiveProcess> procs;
-        for (const auto& l : lines) {
-            if (!l.starts_with("proc|")) continue; // proc|pid|name|sha256|path
-            const auto a = l.find('|');            // after "proc"
-            const auto b = l.find('|', a + 1);     // after pid
-            if (b == std::string::npos) continue;
-            const auto c = l.find('|', b + 1);     // after name
-            LiveProcess lp;
-            try { lp.pid = std::stoi(l.substr(a + 1, b - a - 1)); } catch (...) { lp.pid = 0; }
-            if (c == std::string::npos) {
-                lp.name = l.substr(b + 1); // tolerate the old proc|pid|name shape
-            } else {
-                lp.name = l.substr(b + 1, c - b - 1);
-                const auto d = l.find('|', c + 1); // after sha256 (path may contain none)
-                if (d == std::string::npos) {
-                    lp.sha256 = l.substr(c + 1);
-                } else {
-                    lp.sha256 = l.substr(c + 1, d - c - 1);
-                    lp.path = l.substr(d + 1);
-                }
-            }
-            procs.push_back(std::move(lp));
-        }
+        for (const auto& p : yuzu::server::live::parse_processes(output))
+            procs.push_back(LiveProcess{static_cast<int>(p.pid), p.name, p.sha256, p.path});
         return render_device_live_processes(procs);
     }
     return "<div class=\"gp-note\">Unsupported live result.</div>";

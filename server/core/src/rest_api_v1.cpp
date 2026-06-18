@@ -1,5 +1,6 @@
 #include "rest_api_v1.hpp"
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
+#include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "guardian_rule_spec.hpp"
@@ -191,73 +192,26 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .str();
 }
 
-// Parse a live plugin output (newline-joined write_output() lines, possible trailing
-// \r) into the JSON `data` object for GET /dex/devices/{id}/live. The agent
-// sanitizes '|'/CR/LF out of every field, so splitting on '|' is safe. Mirrors the
-// field extraction in device_routes.cpp render_live_result (which is tested), but
-// emits JSON instead of HTML.
+// Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
+// The wire-format parsing (kind table + field extraction) is shared with the
+// dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
+// this only maps the parsed fields to JSON. The agent sanitizes '|'/CR/LF out of
+// every field, and the parser is bounds-safe on any input regardless.
 std::string live_result_json(const std::string& kind, const std::string& output) {
-    std::vector<std::string> lines;
-    std::size_t pos = 0;
-    while (pos < output.size()) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            lines.push_back(std::move(line));
-    }
     if (kind == "uptime") {
+        const auto u = live::parse_uptime(output);
         JObj o;
         o.add("kind", "uptime");
-        for (const auto& l : lines) {
-            const auto bar = l.find('|');
-            if (bar == std::string::npos)
-                continue;
-            const auto k = l.substr(0, bar);
-            const auto v = l.substr(bar + 1);
-            if (k == "uptime_display")
-                o.add("uptime_display", v);
-            else if (k == "uptime_seconds") {
-                try {
-                    o.add("uptime_seconds", static_cast<int64_t>(std::stoll(v)));
-                } catch (...) {
-                }
-            }
-        }
+        if (u.display)
+            o.add("uptime_display", *u.display);
+        if (u.seconds)
+            o.add("uptime_seconds", *u.seconds);
         return o.str();
     }
-    // processes: proc|pid|name|sha256|path (tolerate the shorter proc|pid|name form)
     JArr procs;
-    for (const auto& l : lines) {
-        if (l.rfind("proc|", 0) != 0)
-            continue;
-        const auto a = l.find('|');        // after "proc"
-        const auto b = l.find('|', a + 1); // after pid
-        if (b == std::string::npos)
-            continue;
-        const auto c = l.find('|', b + 1); // after name
-        int64_t pid = 0;
-        try {
-            pid = std::stoll(l.substr(a + 1, b - a - 1));
-        } catch (...) {
-        }
-        std::string name, sha256, path;
-        if (c == std::string::npos) {
-            name = l.substr(b + 1);
-        } else {
-            name = l.substr(b + 1, c - b - 1);
-            const auto e = l.find('|', c + 1); // after sha256
-            if (e == std::string::npos) {
-                sha256 = l.substr(c + 1);
-            } else {
-                sha256 = l.substr(c + 1, e - c - 1);
-                path = l.substr(e + 1);
-            }
-        }
-        procs.add(JObj().add("pid", pid).add("name", name).add("sha256", sha256).add("path", path));
-    }
+    for (const auto& p : live::parse_processes(output))
+        procs.add(
+            JObj().add("pid", p.pid).add("name", p.name).add("sha256", p.sha256).add("path", p.path));
     return JObj().add("kind", "processes").raw("processes", procs.str()).str();
 }
 
@@ -5027,14 +4981,10 @@ void RestApiV1::register_routes(
             const auto cid = detail::make_correlation_id();
             const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
             std::string plugin, action, audit_action;
-            if (kind == "uptime") {
-                plugin = "os_info";
-                action = "uptime";
-                audit_action = "device.live.uptime";
-            } else if (kind == "processes") {
-                plugin = "processes";
-                action = "list_hashed";
-                audit_action = "device.live.processes";
+            if (const auto lk = live::resolve_kind(kind)) {
+                plugin = lk->plugin;
+                action = lk->action;
+                audit_action = lk->audit_action;
             }
             // Per-device scope is mandatory — fail CLOSED if unwired (never widen to
             // the global gate). Scoped Read floor + Execute, before validate/dispatch.
