@@ -6,6 +6,8 @@ owner: "@lesault (Andy Younie)"
 
 # 0002 — Reachability graph data model: host + service nodes, two edge classes
 
+> **Implementation status (2026-06-18 conformance audit):** Accepted decision; the reachability/attack-path engine is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`. (Note: this is the canonical ADR-0002; the "gateway-scaling ADR-0002" cited in older notes does not exist.)
+
 ## Context
 
 An attack path is not "host A → host B"; it is "reach the *service* B exposes → exploit the

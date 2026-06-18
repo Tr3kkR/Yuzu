@@ -7,6 +7,8 @@ depends-on: 0006/0007/0008 (server-side Postgres substrate chain — accepted 20
 
 # 0005 — Attack-path & chokepoint scoring: bounded max-probability paths, ROI chokepoints
 
+> **Implementation status (2026-06-18 conformance audit):** Accepted decision; attack-path/chokepoint scoring is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
+
 ## Context
 
 Raw CVSS ranking is noise at fleet scale. We want findings ranked by their position on a
