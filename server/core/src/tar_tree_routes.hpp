@@ -16,8 +16,11 @@
 /// DEX-perf drills use; only the Execute-PROBE posture (soft in-panel note for a
 /// read-only operator) is shared with those seams. A reconstruction additionally
 /// DISPATCHES a live `tar.sql`, so /run + /result require `Execution:Execute`. The
-/// reconstruction is cached under an unguessable token; the /detail route re-checks the
-/// SCOPED Read on the cached device_id so a leaked token can't cross management scope.
+/// reconstruction is cached under an unguessable CSPRNG token (secure_random); the
+/// /detail route holds the SAME tier as the reconstruction (re-checks SCOPED Read +
+/// Execute on the cached device_id) AND binds the entry to the originating principal,
+/// so a predicted/leaked token can neither cross management scope, downgrade the
+/// Execute tier, nor be replayed under a different session.
 
 #include <yuzu/server/auth.hpp>
 
@@ -75,9 +78,12 @@ private:
     /// One cached reconstruction. Holds the rendered tree (node-id addressable by the
     /// detail route) + the host's connection set (filtered per-pid at detail time) +
     /// the device_id/os used for the per-detail scoped re-check and the names-only
-    /// caption.
+    /// caption + the originating principal (the detail route fails closed unless the
+    /// requesting session matches, so a predicted/leaked token can't be replayed under
+    /// a different identity even within the same management scope).
     struct ReconEntry {
         std::string device_id;
+        std::string principal; ///< session->username that created this reconstruction
         std::string os;
         TarProcTree tree;
         std::vector<TarTcpConn> conns;

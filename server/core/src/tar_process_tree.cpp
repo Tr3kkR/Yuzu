@@ -15,6 +15,7 @@
 #include <format>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -284,6 +285,34 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
     return w;
 }
 
+std::string canonical_tar_preset(const std::string& preset) {
+    // Keep in lock-step with resolve_tar_window's accepted tokens. Anything else
+    // (empty, garbage, an injection attempt) collapses to the `10m` default.
+    if (preset == "on_boot" || preset == "on_install" || preset == "1m" || preset == "10m" ||
+        preset == "1h" || preset == "1d" || preset == "custom")
+        return preset;
+    return "10m";
+}
+
+std::string normalize_tar_os(const std::string& os) {
+    const std::string o = to_lower(os);
+    if (o.empty())
+        return "?";
+    // Check macOS first: "darwin" contains the substring "win", so the windows
+    // check must not run before it.
+    if (o.find("mac") != std::string::npos || o.find("darwin") != std::string::npos ||
+        o.find("osx") != std::string::npos)
+        return "macos";
+    if (o.find("win") != std::string::npos)
+        return "windows";
+    if (o.find("linux") != std::string::npos || o.find("nix") != std::string::npos ||
+        o.find("bsd") != std::string::npos || o.find("ubuntu") != std::string::npos ||
+        o.find("debian") != std::string::npos || o.find("centos") != std::string::npos ||
+        o.find("fedora") != std::string::npos || o.find("rhel") != std::string::npos)
+        return "linux";
+    return "?";
+}
+
 namespace {
 
 // Civil date → days since 1970-01-01 (Howard Hinnant). Used to parse a
@@ -550,13 +579,21 @@ TarProcTree reconstruct_tar_process_tree(const std::vector<TarProcEvent>& events
     //    the reconstruction itself is never pruned (every node stays addressable by
     //    the detail route, and a filter toggle needs no re-dispatch).
     std::vector<bool> seen(tree.nodes.size(), false);
-    std::vector<std::size_t> stack = tree.roots;
+    std::vector<std::pair<std::size_t, int>> stack; // {node_id, depth}
+    stack.reserve(tree.roots.size());
+    for (std::size_t r : tree.roots)
+        stack.emplace_back(r, 0);
     while (!stack.empty()) {
-        std::size_t id = stack.back();
+        const auto [id, depth] = stack.back();
         stack.pop_back();
         if (id >= tree.nodes.size() || seen[id])
             continue;
         seen[id] = true;
+        // The renderer collapses branches past kTarRenderDepthCap, but the counts
+        // here cover the FULL reconstruction (every node stays detail-addressable);
+        // flag the mismatch so the banner can say the count includes hidden depth.
+        if (depth > kTarRenderDepthCap)
+            tree.depth_capped = true;
         const TarProcNode& n = tree.nodes[id];
         if (n.running)
             ++tree.running_count;
@@ -565,7 +602,7 @@ TarProcTree reconstruct_tar_process_tree(const std::vector<TarProcEvent>& events
         if (n.anomaly)
             ++tree.anomaly_count;
         for (std::size_t c : n.children)
-            stack.push_back(c);
+            stack.emplace_back(c, depth + 1);
     }
     return tree;
 }
@@ -735,22 +772,31 @@ void render_group(const TarProcTree& tree, const std::string& name,
 
 /// Render a sibling set, grouping same-name runs of >= kTarGroupThreshold into a
 /// single collapsed group (first-appearance order).
+///
+/// First-appearance-ordered bucketing in O(n): the prior nested-loop scan was
+/// O(n²) in per-level fan-out (a forged flat tree can put ~50k distinct-name
+/// children under one parent → ~1.25B string compares at render). This reproduces
+/// the previous output exactly — groups emit in first-appearance order, ids keep
+/// their original order within a group, and a name with < kTarGroupThreshold
+/// members still renders as individual nodes at its first-appearance position.
+/// Keys are string_views into the stable `tree.nodes[id].name` (tree is const for
+/// the whole render, nodes is never reallocated), so no per-id key copy.
 void render_children(const TarProcTree& tree, const std::vector<std::size_t>& ids, int depth,
                      const std::string& token, const ConnIndex& conn_index, std::string& out) {
-    std::vector<bool> done(ids.size(), false);
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (done[i])
-            continue;
-        const std::string& nm = tree.nodes[ids[i]].name;
-        std::vector<std::size_t> group;
-        for (std::size_t j = i; j < ids.size(); ++j) {
-            if (!done[j] && tree.nodes[ids[j]].name == nm) {
-                group.push_back(ids[j]);
-                done[j] = true;
-            }
-        }
+    std::vector<std::string_view> order;
+    order.reserve(ids.size());
+    std::unordered_map<std::string_view, std::vector<std::size_t>> buckets;
+    for (std::size_t id : ids) {
+        std::string_view nm{tree.nodes[id].name};
+        auto [it, inserted] = buckets.try_emplace(nm);
+        if (inserted)
+            order.push_back(nm);
+        it->second.push_back(id);
+    }
+    for (std::string_view nm : order) {
+        const auto& group = buckets[nm];
         if (group.size() >= kTarGroupThreshold)
-            render_group(tree, nm, group, depth, token, conn_index, out);
+            render_group(tree, std::string(nm), group, depth, token, conn_index, out);
         else
             for (std::size_t id : group)
                 render_node(tree, id, depth, token, conn_index, out);
@@ -761,7 +807,7 @@ void render_node(const TarProcTree& tree, std::size_t id, int depth, const std::
                  const ConnIndex& conn_index, std::string& out) {
     if (id >= tree.nodes.size())
         return;
-    if (depth > 256) {
+    if (depth > kTarRenderDepthCap) {
         out += "<div class=\"tar-tree-leaf tar-tree-mute\">\xE2\x80\xA6 (depth capped)</div>";
         return;
     }
@@ -814,6 +860,12 @@ std::string render_tar_tree_fragment(const TarProcTree& tree, const std::vector<
         h += "<div class=\"tar-tree-warn\">Tree exceeds the render limit (" +
              std::to_string(kTarTreeMaxNodes) +
              " nodes) \xE2\x80\x94 showing the most recent. Narrow the timescale.</div>";
+
+    if (tree.depth_capped)
+        h += "<div class=\"tar-tree-warn\">Some branches are deeper than the display limit (" +
+             std::to_string(kTarRenderDepthCap) +
+             " levels) and are collapsed with \xE2\x80\x9C\xE2\x80\xA6 (depth capped)\xE2\x80\x9D. "
+             "The node counts above include those hidden descendants.</div>";
 
     if (tree.roots.empty()) {
         h += "<div class=\"tar-tree-empty\">No processes reconstructable for this window. Widen "

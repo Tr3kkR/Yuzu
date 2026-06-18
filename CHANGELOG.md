@@ -40,7 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   management scope, and emits a `tar.process_tree.read` audit event. **Windows is
   names-only** (no per-process path/command line; populated on Linux/macOS), and the
   reconstruction has an honest no-seed completeness limit — both stated in-page. REST/MCP
-  parity is a tracked follow-up. (`docs/tar-dashboard.md` §5, `docs/user-manual/tar.md`.)
+  parity is a tracked follow-up. The reconstruction cache uses a **CSPRNG token bound to the
+  originating operator**; the node-detail route holds the **same `Execution:Execute` tier** as
+  the reconstruction and binds to the creating session, so a predicted or leaked token can't
+  cross scope, downgrade the Execute tier, or be replayed by another operator. Each drilldown
+  emits a `tar.process_tree.detail` audit row, and `preset`/`os` are canonicalized before they
+  reach any audit field. (`docs/tar-dashboard.md` §5, `docs/user-manual/tar.md`.)
 - **Offline hosts stay visible on the fleet map.** A new born-on-Postgres store
   (`endpoint_state`) records each agent's last-known identity + last-seen on every heartbeat, so
   a host that drops out of the in-memory 60 s topology cache renders **stale-flagged** on

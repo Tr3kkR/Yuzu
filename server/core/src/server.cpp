@@ -228,21 +228,12 @@ struct ScopedKeyZero {
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
-// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
-// every control byte and structural delimiter (space, '=', ',') with '_'; the
-// identity is preserved verbatim in its own audit columns (principal/target_id)
-// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
-[[nodiscard]] inline std::string audit_token(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
-            out.push_back('_');
-        else
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
+// #1290 adds (field confusion), and a CRLF could split the audit line. The
+// canonical implementation now lives in web_utils.hpp so the same neutralizer
+// guards every structured-audit call site (here + tar_tree_routes.cpp) without
+// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// spellings below resolving unchanged.
+using yuzu::server::audit_token;
 
 // -- Platform-specific log path -----------------------------------------------
 

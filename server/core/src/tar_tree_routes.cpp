@@ -5,7 +5,8 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
-#include "web_utils.hpp" // html_escape, now_epoch_seconds
+#include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
+#include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
 
 #include <algorithm>
 #include <array>
@@ -13,7 +14,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
-#include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,11 +46,8 @@ std::string get_param(const httplib::Request& req, const char* k) {
     return req.has_param(k) ? req.get_param_value(k) : std::string{};
 }
 // parse_ts_param lives in tar_process_tree.{hpp,cpp} (pure + unit-tested).
-
-std::string random_token() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return std::format("{:016x}{:016x}", rng(), rng());
-}
+// The reconstruction cache token is a CSPRNG hex string (random_hex, secure_random.hpp,
+// #801) minted at the /result generation site — never a std::mt19937_64 value.
 
 // One device's OS string via the unscoped lookup (for the names-only caption).
 std::string device_os(const std::optional<DeviceRow>& d) { return d ? d->os : std::string{}; }
@@ -310,6 +307,12 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::int64_t fetch_to = 0;
         if (preset == "custom")
             fetch_to = parse_ts_param(to);
+        // SECURITY: `fetch_to` is interpolated into the tar.sql query STRING handed to
+        // the agent. The agent forbids parameterized/recursive CTEs, so there is NO
+        // bind-parameter path here — this is safe ONLY because `fetch_to` is a
+        // std::int64_t produced by parse_ts_param (digits → number, never a string).
+        // Never interpolate a string-typed value into this query without an
+        // allowlist / quote-escape; doing so would be SQL injection into tar.sql.
         const std::string where = fetch_to > 0 ? std::format(" WHERE ts <= {}", fetch_to) : "";
         const std::string psql =
             "SELECT ts, action, pid, ppid, name, cmdline, user FROM $Process_Live" + where +
@@ -326,8 +329,8 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (audit_fn_)
             audit_fn_(req, "tar.process_tree.read", psent > 0 ? "dispatched" : "no_agents",
                       "Agent", device,
-                      std::format("dispatch preset={} command_id={}", preset.empty() ? "10m" : preset,
-                                  pcmd));
+                      std::format("dispatch preset={} command_id={}", canonical_tar_preset(preset),
+                                  audit_token(pcmd)));
         if (psent == 0 || tsent == 0) {
             note(res, "Device offline \xE2\x80\x94 the process tree needs a connected agent.");
             return;
@@ -339,6 +342,15 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     // -- Result: poll both commands -> reconstruct -> cache -> render tree. --
     sink.Get("/fragments/tar/process-tree/result", [this, can_execute](const httplib::Request& req,
                                                                         httplib::Response& res) {
+        // Resolve the session up front: the reconstruction cache binds to the
+        // originating principal so a leaked token can't be replayed by another
+        // operator (an unauthenticated poll must 401, not render a fragment).
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
         const std::string device = get_param(req, "device");
         const std::string preset = get_param(req, "preset");
         const std::string from = get_param(req, "from");
@@ -396,9 +408,20 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             return;
         }
 
-        // TCP is included only if it completed cleanly; otherwise the tree still renders
-        // (without inline per-process connections) and says so.
-        const bool tcp_ok = tcp.ready && !tcp.failed && !tcp.output.starts_with("error|");
+        // Defense-in-depth byte cap before parse (a compromised agent controls
+        // proc.output; gRPC already bounds the message, but don't rely on it). Reject
+        // an over-cap process payload rather than truncate — a torn process stream
+        // produces phantom roots, so an honest "narrow the timescale" is better.
+        if (proc.output.size() > kMaxTarProcOutputBytes) {
+            note(res, "The device returned an unexpectedly large process dataset for this "
+                      "window. Narrow the timescale and re-run.");
+            return;
+        }
+
+        // TCP is included only if it completed cleanly AND fits the byte cap; otherwise
+        // the tree still renders (without inline per-process connections) and says so.
+        const bool tcp_ok = tcp.ready && !tcp.failed && !tcp.output.starts_with("error|") &&
+                            tcp.output.size() <= kMaxTarTcpOutputBytes;
         auto events = parse_tar_process_output(proc.output);
         auto conns = tcp_ok ? parse_tar_tcp_output(tcp.output) : std::vector<TarTcpConn>{};
         const auto anchors = compute_tar_anchors(events);
@@ -408,7 +431,21 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         auto tree = reconstruct_tar_process_tree(events, win.from_ts, win.to_ts, anchors);
 
         const std::string os = device_os(lookup_fn_ ? lookup_fn_(device) : std::nullopt);
-        const std::string token = random_token();
+        // CSPRNG cache token (#801). random_hex(16) → 32 lowercase hex chars, matching
+        // the /detail token-format check. On entropy failure surface an in-panel error
+        // and record a `failure` audit (the SOC2 CC7.2/7.3 evidence row) — we do NOT
+        // 503 (htmx suppresses the swap on a non-2xx response, so the operator would
+        // see nothing) and we never cache a half-built entry under a weak token.
+        auto token_exp = random_hex(16);
+        if (!token_exp) {
+            if (audit_fn_)
+                audit_fn_(req, "tar.process_tree.read", "failure", "Agent", device,
+                          "csprng_unavailable");
+            note(res, "The server could not generate a secure token for this reconstruction "
+                      "(entropy temporarily unavailable). Retry in a few seconds.");
+            return;
+        }
+        const std::string token = std::move(*token_exp);
         const int node_count = tree.running_count + tree.exited_count;
         const int anomaly_count = tree.anomaly_count;
 
@@ -423,6 +460,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
 
         ReconEntry entry;
         entry.device_id = device;
+        entry.principal = session->username; // fail-closed binding for /detail replay
         entry.os = os;
         entry.conns = std::move(conns);
         entry.tree = std::move(tree);
@@ -435,14 +473,17 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (audit_fn_)
             audit_fn_(req, "tar.process_tree.read", "success", "Agent", device,
                       std::format("preset={} from={} to={} nodes={} anomalies={} os={} conns={}",
-                                  preset.empty() ? "10m" : preset, win.from_ts, win.to_ts,
-                                  node_count, anomaly_count, os.empty() ? "?" : os, tcp_ok ? 1 : 0));
+                                  canonical_tar_preset(preset), win.from_ts, win.to_ts, node_count,
+                                  anomaly_count, normalize_tar_os(os), tcp_ok ? 1 : 0));
         res.set_content(body, "text/html; charset=utf-8");
     });
 
-    // -- Detail: render one node from the cached reconstruction (re-checks scope). --
-    sink.Get("/fragments/tar/process-tree/detail", [this](const httplib::Request& req,
-                                                          httplib::Response& res) {
+    // -- Detail: render one node from the cached reconstruction. Holds the SAME tier as
+    // the reconstruction (scoped Read + Execute on the cached device) and binds to the
+    // originating principal, so a predicted/leaked token can't cross scope, downgrade
+    // the Execute tier, or be replayed under another session. --
+    sink.Get("/fragments/tar/process-tree/detail",
+             [this, can_execute](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) {
             res.status = 401;
@@ -464,26 +505,54 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             res.set_content("bad request", "text/plain");
             return;
         }
-        // Resolve the cached device first (without rendering), then re-check the
-        // SCOPED Read on it — a leaked token must not cross management scope.
+        // Resolve the cached device + binding fields first (without rendering), then
+        // re-check the SCOPED Read + Execute on it and the principal binding.
         std::string device_id;
+        std::string principal;
+        std::string os;
         {
             std::lock_guard<std::mutex> lk(cache_mu_);
             auto it = cache_.find(token);
-            if (it != cache_.end())
+            if (it != cache_.end()) {
                 device_id = it->second.device_id;
+                principal = it->second.principal;
+                os = it->second.os;
+            }
         }
         if (device_id.empty()) {
             note(res, "The reconstruction expired. Re-run the tree.");
             return;
         }
+        // Fail-closed principal binding: a token is usable only by the operator who ran
+        // the reconstruction — a leaked/shared token can't be replayed under a different
+        // identity even within the same management scope. An empty principal can never
+        // match (a valid session always carries a non-empty username — auth_db rejects
+        // empty — but enforce it locally so the binding never degrades to ""=="").
+        if (principal.empty() || principal != session->username) {
+            note(res, "This reconstruction belongs to a different session. Re-run the tree.");
+            return;
+        }
+        // A leaked token must not cross management scope (scoped Read) nor downgrade the
+        // Execute tier the reconstruction itself required.
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device_id))
             return;
+        if (!can_execute(req, device_id)) {
+            note(res, "Viewing process detail needs the <b>Execute</b> permission "
+                      "(the same gate used to reconstruct the tree).");
+            return;
+        }
         auto html = cache_render_detail(token, node_id, nullptr);
         if (!html) {
             note(res, "The reconstruction expired. Re-run the tree.");
             return;
         }
+        // Per-drilldown access audit (works-council "who viewed which process" posture,
+        // mirrors dex.signal.view). Fires once per row-click — intentionally per-click,
+        // bounded by the Execute + scoped-Read + principal gates above. `os` is
+        // normalized so the agent-controlled value can't forge an audit field.
+        if (audit_fn_)
+            audit_fn_(req, "tar.process_tree.detail", "success", "Agent", device_id,
+                      std::format("node={} os={}", node_id, normalize_tar_os(os)));
         res.set_content(*html, "text/html; charset=utf-8");
     });
 }

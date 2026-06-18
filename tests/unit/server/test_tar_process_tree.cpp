@@ -480,3 +480,85 @@ TEST_CASE("tar render: Windows names-only caption, Linux shows cmdline", "[tar][
     auto lin = render_tar_proc_detail(n, {}, "linux");
     CHECK(lin.find("/usr/bin/proc --flag") != std::string::npos);
 }
+
+// ── Review-round coverage (PR #1551 should-fix cluster) ─────────────────────
+
+TEST_CASE("tar render: interleaved same-name siblings group by first appearance",
+          "[tar][tree][render]") {
+    // 4 alpha.exe + 3 beta.exe, interleaved. alpha crosses the threshold (grouped),
+    // beta does not (individual). The O(n) bucketing must reproduce first-appearance
+    // ordering — alpha's group emits where alpha first appears, before beta's rows.
+    std::vector<TarProcEvent> e{ev(100, "started", 1, 0, "services.exe")};
+    const char* names[] = {"alpha.exe", "beta.exe", "alpha.exe", "beta.exe",
+                           "alpha.exe", "beta.exe", "alpha.exe"};
+    std::uint32_t pid = 2000;
+    for (const char* nm : names)
+        e.push_back(ev(110, "started", pid++, 1, nm));
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    auto html = render_tar_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "windows");
+    CHECK(html.find("tar-tree-group") != std::string::npos);      // alpha grouped
+    CHECK(html.find("\xC3\x97" "4") != std::string::npos);        // "×4"
+    CHECK(html.find("alpha.exe") < html.find("beta.exe"));        // first-appearance order
+}
+
+TEST_CASE("tar render: wide distinct-name fan-out stays ungrouped and complete",
+          "[tar][tree][render]") {
+    // 200 distinct-name children under one parent: none reaches the group threshold,
+    // so every child renders individually (exercises the O(n) bucketing at scale).
+    std::vector<TarProcEvent> e{ev(100, "started", 1, 0, "root")};
+    for (std::uint32_t i = 0; i < 200; ++i)
+        e.push_back(ev(110, "started", 2000 + i, 1, ("proc" + std::to_string(i)).c_str()));
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    auto html = render_tar_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "linux");
+    CHECK(html.find("tar-tree-group") == std::string::npos);
+    CHECK(html.find("proc0") != std::string::npos);   // first child rendered
+    CHECK(html.find("proc199") != std::string::npos); // last child rendered
+}
+
+TEST_CASE("tar tree: a branch deeper than the render cap sets depth_capped",
+          "[tar][tree][cap]") {
+    // Linear chain deeper than kTarRenderDepthCap → the count pass flags depth_capped
+    // and the banner warns the count includes hidden descendants.
+    std::vector<TarProcEvent> e;
+    const std::uint32_t depth = static_cast<std::uint32_t>(kTarRenderDepthCap) + 20;
+    e.push_back(ev(100, "started", 1, 0, "p1"));
+    for (std::uint32_t i = 2; i <= depth; ++i)
+        e.push_back(ev(100, "started", i, i - 1, ("p" + std::to_string(i)).c_str()));
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    CHECK(t.depth_capped);
+    auto html = render_tar_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "linux");
+    CHECK(html.find("deeper than the display limit") != std::string::npos);
+
+    // A shallow tree must NOT flag depth_capped.
+    std::vector<TarProcEvent> shallow{ev(100, "started", 1, 0, "root"),
+                                      ev(110, "started", 2, 1, "child")};
+    auto t2 = reconstruct_tar_process_tree(shallow, 0, 1000, compute_tar_anchors(shallow));
+    CHECK(!t2.depth_capped);
+}
+
+TEST_CASE("tar canonical_tar_preset: allowlist passes, garbage → 10m default",
+          "[tar][tree][audit]") {
+    for (const char* ok : {"on_boot", "on_install", "1m", "10m", "1h", "1d", "custom"})
+        CHECK(canonical_tar_preset(ok) == ok);
+    CHECK(canonical_tar_preset("") == "10m");
+    CHECK(canonical_tar_preset("bogus") == "10m");
+    // An injection attempt is canonicalized away (no audit-field forgery survives).
+    CHECK(canonical_tar_preset("x command_id=forged") == "10m");
+    CHECK(canonical_tar_preset("10m\r\nnodes=0") == "10m");
+}
+
+TEST_CASE("tar normalize_tar_os: maps to a closed audit-safe set", "[tar][tree][audit]") {
+    CHECK(normalize_tar_os("Windows 11 Pro") == "windows");
+    CHECK(normalize_tar_os("Microsoft Windows") == "windows");
+    CHECK(normalize_tar_os("Ubuntu 22.04") == "linux");
+    CHECK(normalize_tar_os("debian") == "linux");
+    CHECK(normalize_tar_os("macOS 14") == "macos");
+    CHECK(normalize_tar_os("Darwin") == "macos");
+    CHECK(normalize_tar_os("") == "?");
+    // An agent-controlled OS carrying structural delimiters can't escape the set.
+    CHECK(normalize_tar_os("win\ndows evil=1") == "windows");
+    CHECK(normalize_tar_os("totally unknown os") == "?");
+}

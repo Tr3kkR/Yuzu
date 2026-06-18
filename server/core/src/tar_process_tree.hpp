@@ -95,12 +95,39 @@ struct TarProcTree {
     int running_count = 0;
     int exited_count = 0;
     int anomaly_count = 0;
-    bool truncated = false; ///< hit the kMaxNodes render cap
+    bool truncated = false;    ///< hit the kMaxNodes render cap
+    bool depth_capped = false; ///< a branch is deeper than kTarRenderDepthCap (display truncates)
 };
 
 /// Hard cap on reconstructed nodes — a runaway/forged event stream must not OOM or
 /// produce an unrenderable tree (design §5.5).
 inline constexpr std::size_t kTarTreeMaxNodes = 50000;
+
+/// Render-time depth cap: branches deeper than this are collapsed with a
+/// "… (depth capped)" leaf. Shared by the renderer and the count pass so the
+/// honesty banner (`TarProcTree::depth_capped`) and the display agree.
+inline constexpr int kTarRenderDepthCap = 256;
+
+/// Defense-in-depth byte caps on the raw agent output handed to the parsers. gRPC
+/// already bounds a single message (~4 MiB default), so these guard a future limit
+/// bump / a non-gRPC path and bound the per-line `substr` scan independent of the
+/// row-count cap. Enforced at the route call site (a compromised agent controls the
+/// output), not inside the pure parsers.
+inline constexpr std::size_t kMaxTarProcOutputBytes = 16ull * 1024 * 1024; // 16 MiB
+inline constexpr std::size_t kMaxTarTcpOutputBytes = 4ull * 1024 * 1024;   //  4 MiB
+
+/// Canonicalize a `preset` query token to one of the known window tokens
+/// {on_boot, on_install, 1m, 10m, 1h, 1d, custom}, mapping any empty/unrecognized
+/// value to the `10m` default (the same fallback `resolve_tar_window` applies).
+/// The output is a fixed allowlist, so it is inherently safe to interpolate into a
+/// structured `k=v` audit detail (an attacker-supplied `preset` can no longer forge
+/// an audit field). Pure + exposed for unit tests.
+std::string canonical_tar_preset(const std::string& preset);
+
+/// Normalize an agent-reported OS string to one of {windows, linux, macos, ?}
+/// (`?` for empty/unknown). Bounds the agent-controlled `os` to a closed set before
+/// it reaches the `tar.process_tree.read` audit detail. Pure + exposed for unit tests.
+std::string normalize_tar_os(const std::string& os);
 
 // ── Parsers (defensive, mirroring parse_dex_perf_output's __schema__ contract) ──
 // Both expect the agent's `tar.sql` output: a `__schema__|col1|col2|…` header line

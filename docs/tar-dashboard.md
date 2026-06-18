@@ -220,8 +220,13 @@ panel on the right** (stacks below on narrow viewports). Clicking any process ro
 hx-gets `/fragments/tar/process-tree/detail` into the right panel — name, PID, parent
 PID, user, running/exited + start time, path + command line (blank-with-note on
 Windows), the process's connections, and anomaly evidence. The detail renders from a
-**server-side reconstruction cache** (bounded LRU, 180 s TTL, keyed by an unguessable
-token) so row clicks need no further agent round-trip.
+**server-side reconstruction cache** (bounded LRU, 180 s TTL, keyed by a CSPRNG token —
+`secure_random::random_hex`, never `mt19937`) so row clicks need no further agent
+round-trip. The cache entry is **bound to the operator who created it**: `detail`
+fails closed unless the requesting session matches, so a predicted or leaked token
+can't be replayed by a different operator (transparent to the normal same-session
+flow). If secure token generation fails (entropy exhaustion), `result` returns an
+in-panel error and caches nothing rather than minting a weak token.
 
 ### 5.4 Routes
 
@@ -230,7 +235,7 @@ token) so row clicks need no further agent round-trip.
 | `GET /fragments/tar/process-tree` | Frame body: host picker (operator-scoped) + timescale + filter bar + tree/detail targets |
 | `GET /fragments/tar/process-tree/run?device=&preset=&from=&to=` | Resolve window, dispatch the two `tar.sql`, return the polling fragment |
 | `GET /fragments/tar/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, reconstruct, cache, render the tree |
-| `GET /fragments/tar/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope) |
+| `GET /fragments/tar/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
 
 ### 5.5 Permissions & audit
 
@@ -240,17 +245,27 @@ token) so row clicks need no further agent round-trip.
   (`require_scoped_permission`) — same posture as the TAR SQL frame and the device
   live-info probe. (This tightens the original "`Infrastructure:Read` to view"
   framing, which assumed a stored, non-dispatching tree.)
-- `detail` re-checks `Infrastructure:Read` scoped to the cached device, so a leaked
-  cache token can't cross management scope.
+- `detail` holds the **same tier as the reconstruction** — it re-checks
+  `Infrastructure:Read` **and** `Execution:Execute` scoped to the cached device, **and**
+  binds to the originating principal. So a leaked/predicted token can neither cross
+  management scope, downgrade the Execute tier (read behavioral detail an operator
+  couldn't reconstruct themselves), nor be replayed under a different session.
 - `$Process_Live.cmdline` is already redaction-applied at capture by the agent, so no
   server-side re-redaction is needed; all agent-controlled fields are HTML-escaped.
+- Agent output is byte-capped before parse (16 MiB process / 4 MiB TCP, defense in
+  depth over the gRPC message bound); the `tar.sql` query interpolates only an
+  `int64` upper-bound timestamp (no string concat — see the load-bearing comment at
+  the query site).
 - Audit `tar.process_tree.read` fires twice (parity with `device.live.*`): a
   **dispatch** row when the live query is sent (recorded even if the device is offline
-  or the poll never completes) and a **success** row after the tree renders. The device
+  or the poll never completes) and a **success** row after the tree renders; a
+  **failure** row (`csprng_unavailable`) if secure token generation fails. The device
   is the `target_id` (not in `detail`); the success `detail` is
-  `preset=… from=… to=… nodes=… anomalies=… os=… conns=…` (`os` distinguishes a
-  names-only Windows read from a behavioral Linux/macOS one; `conns=1` flags that
-  per-process connection data was shown). See `docs/user-manual/audit-log.md`.
+  `preset=… from=… to=… nodes=… anomalies=… os=… conns=…` (`preset` canonicalized to a
+  fixed allowlist and `os` normalized to `{windows,linux,macos,?}` so neither can forge
+  an audit field; `conns=1` flags that per-process connection data was shown). Each
+  `detail` drilldown emits a `tar.process_tree.detail` row (`node=… os=…`). See
+  `docs/user-manual/audit-log.md`.
 
 ### 5.6 Deferred
 
