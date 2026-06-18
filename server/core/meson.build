@@ -362,6 +362,7 @@ yuzu_server_core_lib = static_library(
     'src/workflow_engine.cpp',
     'src/product_pack_store.cpp',
     'src/inventory_store.cpp',
+    'src/offline_endpoint_store.cpp',
     'src/notification_store.cpp',
     'src/webhook_store.cpp',
     'src/offload_target_store.cpp',

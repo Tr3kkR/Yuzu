@@ -1323,7 +1323,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=yuzu-postgres
-            org.opencontainers.image.description=Yuzu server storage substrate — PostgreSQL 16 + pgvector (ADR-0006)
+            org.opencontainers.image.description=Yuzu server storage substrate — PostgreSQL 18 + pgvector (ADR-0006)
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}

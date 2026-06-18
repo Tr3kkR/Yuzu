@@ -301,6 +301,8 @@ if build_server
       'unit/server/test_pg_raii.cpp',
       'unit/server/test_pg_pool.cpp',
       'unit/server/test_pg_migration_runner.cpp',
+      'unit/server/test_pg_hardening.cpp',
+      'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
     ),
     include_directories: [

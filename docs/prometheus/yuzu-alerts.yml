@@ -200,3 +200,47 @@ groups:
   #         severity: critical
   #       annotations:
   #         summary: "Secret blob failed GCM authentication (tamper signal)"
+
+  # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
+  # The server fails closed without PostgreSQL, so substrate health is
+  # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on
+  # breaker-open (off yuzu_pg_connect_failed_total), so the load balancer
+  # drains the instance right away. These alerts carry `for:` windows and are
+  # for paging/escalation — they fire AFTER the LB has already reacted, not
+  # before. Metrics come from the pool's Observer feed.
+  - name: yuzu-postgres
+    rules:
+      - alert: YuzuPgConnectFailing
+        # The connect-failure circuit breaker has armed — the database is
+        # unreachable. /readyz already reports not-ready off the same signal
+        # (LB eviction is immediate); this alert fires after for:2m of
+        # sustained failure to page/escalate, NOT to drive LB eviction.
+        expr: |
+          rate(yuzu_pg_connect_failed_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu cannot connect to PostgreSQL (breaker armed; /readyz already 503)"
+
+      - alert: YuzuPgPoolSaturated
+        # >90% of the pool leased for 5m — acquire timeouts (and heartbeat
+        # upsert skips) are imminent. Raise --postgres-pool-size or scale.
+        expr: |
+          yuzu_pg_pool_in_use / yuzu_pg_pool_size > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu PostgreSQL pool >90% saturated"
+
+      - alert: YuzuPgAcquireWaitHigh
+        # p99 acquire wait > 200ms — the leading saturation indicator; the
+        # heartbeat upsert deadline is 250ms, so persistence starts to drop here.
+        expr: |
+          histogram_quantile(0.99, rate(yuzu_pg_acquire_wait_seconds_bucket[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"

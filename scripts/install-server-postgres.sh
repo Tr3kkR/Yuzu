@@ -103,9 +103,9 @@ if ! command -v psql >/dev/null 2>&1 \
    || ! run_as_postgres psql -At -c 'SELECT 1' >/dev/null 2>&1; then
   echo "warn: no running local PostgreSQL found — skipping provisioning (non-fatal until #1320)." >&2
   echo "      Install one first, e.g.:" >&2
-  echo "        Debian/Ubuntu:  apt-get install postgresql-16   (or distro default)" >&2
+  echo "        Debian/Ubuntu:  apt-get install postgresql-18   (or distro default)" >&2
   echo "        RHEL/Fedora:    dnf install postgresql-server && postgresql-setup --initdb" >&2
-  echo "        macOS:          brew install postgresql@16 && brew services start postgresql@16" >&2
+  echo "        macOS:          brew install postgresql@18 && brew services start postgresql@18" >&2
   echo "      then re-run this script, or point at a managed database with:" >&2
   echo "        $0 --dsn 'postgresql://...'" >&2
   # Durable breadcrumb: the soft-skip is silent in package-install logs, and
@@ -164,11 +164,11 @@ else
 fi
 
 # pgvector if available (the yuzu-postgres image always has it; a distro
-# cluster needs the postgresql-16-pgvector package). Non-fatal — only the
+# cluster needs the postgresql-18-pgvector package). Non-fatal — only the
 # vuln-graph store (ADR-0004) needs it, and that lands later.
 if ! run_as_postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME" \
      -c 'CREATE EXTENSION IF NOT EXISTS vector' >/dev/null 2>&1; then
-  echo "warn: pgvector extension unavailable — install postgresql-16-pgvector (or distro equivalent) before the vuln-graph store migrates" >&2
+  echo "warn: pgvector extension unavailable — install postgresql-18-pgvector (or distro equivalent) before the vuln-graph store migrates" >&2
 fi
 
 if [[ -n "$DB_PASSWORD" ]]; then
