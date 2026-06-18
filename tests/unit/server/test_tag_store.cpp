@@ -106,6 +106,35 @@ TEST_CASE("TagStore: sync replaces old agent tags", "[tag_store]") {
     CHECK(store.get_tag("agent-1", "k3") == "v3");
 }
 
+TEST_CASE("TagStore: agent sync cannot clobber an operator tag for the same key (#1411)",
+          "[tag_store][security]") {
+    TagStore store(":memory:");
+
+    // Operator declares the benchmark-cohort value for this device.
+    store.set_tag("agent-1", "model", "executive-laptops", "server");
+
+    // A rogue/compromised agent reports the SAME key with a different value on its
+    // Register sync. store-first cohort precedence depends on this NOT winning.
+    store.sync_agent_tags("agent-1", {{"model", "developer-desktops"}});
+    CHECK(store.get_tag("agent-1", "model") == "executive-laptops");
+
+    // The cohort accessor must therefore see the operator value, not the self-assignment.
+    auto vals = store.get_values_for_key("model");
+    REQUIRE(vals.count("agent-1") == 1);
+    CHECK(vals["agent-1"] == "executive-laptops");
+
+    // An agent may still set a brand-new key the operator never declared.
+    store.sync_agent_tags("agent-1", {{"model", "developer-desktops"}, {"os.version", "11.0"}});
+    CHECK(store.get_tag("agent-1", "model") == "executive-laptops"); // still protected
+    CHECK(store.get_tag("agent-1", "os.version") == "11.0");          // new agent key set
+
+    // Operator/API writes stay authoritative — a non-'agent' source overwrites an agent row.
+    store.set_tag("agent-2", "model", "agent-guess", "agent");
+    CHECK(store.get_tag("agent-2", "model") == "agent-guess");
+    store.set_tag("agent-2", "model", "operator-final", "server");
+    CHECK(store.get_tag("agent-2", "model") == "operator-final");
+}
+
 TEST_CASE("TagStore: delete_all_tags", "[tag_store]") {
     TagStore store(":memory:");
 

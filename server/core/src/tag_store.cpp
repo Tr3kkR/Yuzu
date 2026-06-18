@@ -105,10 +105,31 @@ void TagStore::set_tag_impl(const std::string& agent_id, const std::string& key,
     if (!validate_key(key) || !validate_value(value))
         return;
 
-    const char* sql = R"(
-        INSERT OR REPLACE INTO tags (agent_id, key, value, source, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-    )";
+    // Source precedence (#1411). The PK is (agent_id, key) with `source` OUTSIDE
+    // the key, so a blanket INSERT OR REPLACE let an 'agent'-sourced write (agent
+    // self-reported scopable_tags, re-synced on every Register via sync_agent_tags)
+    // overwrite an operator/API row for the same (agent_id, key) — flipping both
+    // value and source and letting a rogue agent self-assign into an
+    // operator-declared benchmark cohort. Fix: an agent write may only upsert when
+    // the existing row is itself agent-sourced (or absent); any non-'agent' source
+    // (operator/API) is authoritative and still wins unconditionally. When the
+    // ON CONFLICT WHERE is false the statement is a clean no-op (no error).
+    const bool agent_sourced = (source == "agent");
+    const char* sql =
+        agent_sourced
+            ? R"(
+                INSERT INTO tags (agent_id, key, value, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id, key) DO UPDATE SET
+                    value = excluded.value,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                WHERE tags.source = 'agent'
+              )"
+            : R"(
+                INSERT OR REPLACE INTO tags (agent_id, key, value, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+              )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return;
