@@ -20,6 +20,16 @@ CLAUDE.md keeps only the load-bearing invariants (embed point, tier-before-RBAC 
 - **Kill switch:** `--mcp-disable` rejects all `/mcp/v1/` requests with `kMcpDisabled` JSON-RPC error. `--mcp-read-only` blocks non-read tools.
 - **Audit:** Every MCP tool call logged with `action: "mcp.<tool_name>"` and `mcp_tool` field on `AuditEvent`.
 
+## Error envelope
+
+JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy, approval-required) carry a structured `error.data` field (A4, per `docs/agentic-first-principle.md`):
+
+```json
+{ "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null, "remediation": null }
+```
+
+`correlation_id` is a grep token tying the error to the server's `spdlog` rows and audit log — the same format as the REST `X-Correlation-Id` header. `retry_after_ms` and `remediation` are `null` on tier-denial errors; per-tool validation errors may populate them. Parse `error.code` for the error class and `error.data.correlation_id` for traceability.
+
 ## Phase 1 (Implemented)
 
 - 26 read-only tools: `list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`, `get_guardian_schemas`, `list_dex_signals`, `get_dex_signal_scope`, `get_dex_signal_detail`

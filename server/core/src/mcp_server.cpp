@@ -806,10 +806,28 @@ McpServer::HandlerFn McpServer::build_handler(
             // spdlog / audit), matching the REST a4 envelope shape (nullable
             // retry_after_ms / remediation). Per-tool validation errors can adopt
             // the same helper incrementally.
-            auto a4_error = [&id](int code, std::string_view message) {
+            // Shared remediation hint for tier/permission denials (governance Gate 4
+            // consistency, #1470): the cohort-diff sibling emits an actionable
+            // remediation on tier-denial, so the rest of the family does too rather
+            // than null on an identical condition. `remediation` is ALWAYS a
+            // server-controlled literal — raw-embedded like correlation_id; never
+            // pass caller-supplied text here without escaping.
+            constexpr std::string_view kTierRemediation =
+                "this MCP token's tier does not permit the operation; use a higher-tier "
+                "MCP token (operator or supervised), or the REST API / dashboard";
+            auto a4_error = [&id](int code, std::string_view message,
+                                  std::string_view remediation = {}) {
                 const std::string cid = yuzu::server::detail::make_correlation_id();
-                const std::string data = R"({"correlation_id":")" + cid +
-                                         R"(","retry_after_ms":null,"remediation":null})";
+                std::string data = R"({"correlation_id":")" + cid +
+                                   R"(","retry_after_ms":null,"remediation":)";
+                if (remediation.empty()) {
+                    data += "null";
+                } else {
+                    data += '"';
+                    data += remediation;
+                    data += '"';
+                }
+                data += "}";
                 return error_response(id, code, message, data);
             };
 
@@ -818,7 +836,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // performs a Write/Execute/Delete operation.
             if (is_read_only && kWriteTools.contains(tool_name)) {
                 mcp_audit("denied", "read-only mode");
-                res.set_content(a4_error(kTierDenied, "MCP is in read-only mode"),
+                res.set_content(a4_error(kTierDenied, "MCP is in read-only mode",
+                                         "the server is running with --mcp-read-only; use the "
+                                         "REST API or dashboard for write/execute operations"),
                                 "application/json");
                 return;
             }
@@ -835,7 +855,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -850,7 +870,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             kApprovalRequired,
                             "This operation requires approval, but approval-gated "
                             "MCP execution is not yet implemented. Use the REST API "
-                            "or dashboard for operations that require the supervised tier."),
+                            "or dashboard for operations that require the supervised tier.",
+                            "approval-gated MCP execution is not implemented; perform this "
+                            "operation via the REST API or dashboard"),
                         "application/json");
                     mcp_audit("approval_required", "approval-gated execution not implemented");
                     return;
@@ -861,7 +883,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_agents") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -891,7 +913,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_agent_details") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -949,7 +971,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "query_audit_log") {
                 if (!tier_allows(tier, "AuditLog", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -994,7 +1016,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_definitions") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1036,7 +1058,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_definition") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1082,7 +1104,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "query_responses") {
                 if (!tier_allows(tier, "Response", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1128,7 +1150,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "aggregate_responses") {
                 if (!tier_allows(tier, "Response", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1176,7 +1198,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "query_inventory") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1215,7 +1237,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_inventory_tables") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1249,7 +1271,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_agent_inventory") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1289,7 +1311,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_tags") {
                 if (!tier_allows(tier, "Tag", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1324,7 +1346,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "search_agents_by_tag") {
                 if (!tier_allows(tier, "Tag", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1355,7 +1377,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_policies") {
                 if (!tier_allows(tier, "Policy", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1391,7 +1413,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_compliance_summary") {
                 if (!tier_allows(tier, "Policy", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1426,7 +1448,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_fleet_compliance") {
                 if (!tier_allows(tier, "Policy", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1458,7 +1480,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_management_groups") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1495,7 +1517,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_execution_status") {
                 if (!tier_allows(tier, "Execution", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1543,7 +1565,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_executions") {
                 if (!tier_allows(tier, "Execution", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1585,7 +1607,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_schedules") {
                 if (!tier_allows(tier, "Schedule", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1648,7 +1670,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "preview_scope_targets") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1725,7 +1747,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_pending_approvals") {
                 if (!tier_allows(tier, "Approval", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1765,7 +1787,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_guardian_schemas") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1797,7 +1819,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_dex_signals") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1832,7 +1854,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_dex_signal_scope") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -1866,7 +1888,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_dex_signal_detail") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -2173,7 +2195,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_network_fleet" || tool_name == "list_network_devices") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -2472,7 +2494,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_issued_certs") {
                 if (!tier_allows(tier, "Security", "Read")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
@@ -2539,7 +2561,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "revoke_certificate") {
                 if (!tier_allows(tier, "Security", "Delete")) {
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation"),
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }

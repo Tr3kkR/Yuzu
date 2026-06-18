@@ -1133,6 +1133,9 @@ TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
     REQUIRE(denied["error"].contains("data"));
     CHECK(denied["error"]["data"]["correlation_id"].is_string());
     CHECK(denied["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    // #1470 Gate-4 consistency: tier-denials carry an actionable remediation hint
+    // (parity with the cohort-diff sibling), not a bare null.
+    CHECK(denied["error"]["data"]["remediation"].is_string());
 }
 
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",

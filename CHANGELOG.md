@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian ingest-drop counter.** New `/metrics` gauge
+  `yuzu_server_guardian_events_dropped_total` counts cumulative Guardian events dropped at
+  ingest on an `event_id` PK/UNIQUE conflict (redelivery, an agent `event_seq_` reset, clock
+  skew, or a forged-id pre-claim). `> 0` distinguishes "no drift observed" from "drift observed
+  but silently discarded" (CC7.3 evidence). Sits alongside
+  `yuzu_server_guardian_events_{total,written_total,reaped_total}`. (#1414)
+
 - **Offline hosts stay visible on the fleet map.** A new born-on-Postgres store
   (`endpoint_state`) records each agent's last-known identity + last-seen on every heartbeat, so
   a host that drops out of the in-memory 60 s topology cache renders **stale-flagged** on
@@ -261,6 +268,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently ignored, leaving the directory — which now holds the boot trace
   `procboot.etl` (boot-process names reveal which security/EDR tools are present)
   — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
+
+### Fixed
+
+- **A4 error envelope on MCP tier-denied paths and dex-perf REST endpoints.** MCP tier-denied
+  errors (read-only mode, tier policy, approval-required) now carry
+  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":null}`, and
+  `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on every 400/503
+  branch and an `X-Correlation-Id` response header (on success and error), matching the
+  `cohort-diff` sibling. (#1470)
+
+- **DEX catalogue family tile labelled honestly.** The family device figure is the *largest
+  single signal's* distinct-device count, not the family union (two disjoint 50-device signals
+  read 50, not 100); the tile now reads "Peak signal devices / largest single signal" so the
+  number and label agree. Health score unchanged. (#1374)
+
+- **Operator/API tags beat agent self-report.** An agent's reported `scopable_tags` can no
+  longer overwrite an operator- or API-set tag for the same `(agent_id, key)`, preventing a
+  rogue or misconfigured agent from self-assigning into an operator-declared benchmark cohort. (#1411)
+
+- **Guardian enforce-stop denylist extended with WdFilter and BFE.** Two Windows built-ins that
+  could defeat a *listed* control indirectly — `WdFilter` (Defender's filesystem minifilter,
+  stopping it blinds real-time scanning while `WinDefend` still reads as up) and `BFE` (the Base
+  Filtering Engine the firewall sits on, stopping it tears down the firewall while `mpssvc`
+  looks protected) — are now rejected by `dangerous_enforce_service_stop`. (#1285)
 
 ### Changed
 

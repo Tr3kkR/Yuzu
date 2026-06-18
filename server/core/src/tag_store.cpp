@@ -255,8 +255,15 @@ void TagStore::sync_agent_tags(const std::string& agent_id,
     if (!db_)
         return;
 
-    // Delete all agent-sourced tags, then re-insert
-    sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    // Delete all agent-sourced tags, then re-insert — atomically. RAII rollback
+    // (governance UP-2): a throw (e.g. bad_alloc in set_tag_impl) or a step failure
+    // between the DELETE and COMMIT must not leave the agent's tags half-applied or
+    // wedge the shared FULLMUTEX connection with a dangling transaction. The
+    // source-precedence guarantee (#1411 — operator rows survive an agent sync)
+    // depends on this DELETE+reinsert being one transaction.
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return;
+    SqliteTxn txn(db_);
 
     {
         sqlite3_stmt* stmt = nullptr;
@@ -274,7 +281,7 @@ void TagStore::sync_agent_tags(const std::string& agent_id,
         set_tag_impl(agent_id, key, value, "agent");
     }
 
-    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+    txn.commit();
 }
 
 void TagStore::delete_all_tags(const std::string& agent_id) {
