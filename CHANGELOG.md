@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
 ### Added
+
+- **Offline hosts stay visible on the fleet map.** A new born-on-Postgres store
+  (`endpoint_state`) records each agent's last-known identity + last-seen on every heartbeat, so
+  a host that drops out of the in-memory 60 s topology cache renders **stale-flagged** on
+  `/viz/fleet` instead of vanishing. New pool observability on `/metrics`
+  (`yuzu_pg_pool_{in_use,open,size}`, `yuzu_pg_connect_failed_total`,
+  `yuzu_pg_acquire_timeout_total`, `yuzu_pg_unhealthy_discard_total`,
+  `yuzu_pg_acquire_wait_seconds`) and a live pool probe + the new store join the `/readyz`
+  readiness conjunction.
 
 - **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
   filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
