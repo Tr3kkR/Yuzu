@@ -37,6 +37,8 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_pool.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -289,6 +291,30 @@ public:
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");
+        // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
+        // Gauges are sampled every recompute cycle; counters/histogram are fed
+        // live by the pool's observer hooks wired at pool construction.
+        metrics_.describe("yuzu_pg_pool_in_use", "PostgreSQL pool connections currently leased out",
+                          "gauge");
+        metrics_.describe("yuzu_pg_pool_open",
+                          "PostgreSQL pool connections currently open (leased + idle)", "gauge");
+        metrics_.describe("yuzu_pg_pool_size", "PostgreSQL pool configured maximum size", "gauge");
+        metrics_.describe("yuzu_pg_pool_waiters",
+                          "Threads currently blocked waiting for a PostgreSQL pool connection — "
+                          "the saturation signal between fully-leased and an acquire timeout",
+                          "gauge");
+        metrics_.describe("yuzu_pg_connect_failed_total",
+                          "Total PostgreSQL connection attempts that failed", "counter");
+        metrics_.describe("yuzu_pg_acquire_timeout_total",
+                          "Total PostgreSQL pool acquires that timed out before a connection was "
+                          "available",
+                          "counter");
+        metrics_.describe("yuzu_pg_unhealthy_discard_total",
+                          "Total PostgreSQL connections discarded as unhealthy on return", "counter");
+        metrics_.describe("yuzu_pg_acquire_wait_seconds",
+                          "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
+                          "leading pool-saturation indicator",
+                          "histogram");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -672,6 +698,10 @@ public:
         metrics_.describe("yuzu_viz_oversize_response_total",
                           "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
                           "counter");
+        metrics_.describe("yuzu_viz_offline_hosts_total",
+                          "Stale-flagged offline hosts merged into /viz/fleet from the durable "
+                          "OfflineEndpointStore (hosts that aged out of the in-memory snapshot)",
+                          "counter");
         metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
                           "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
         metrics_.describe("yuzu_viz_refill_oversize_drops_total",
@@ -895,6 +925,72 @@ public:
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
+
+        // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
+        // BEFORE any Postgres-backed store and validated by a probe checkout so
+        // the server FAILS CLOSED — no SQLite fallback — when the DSN is empty
+        // or the database is unreachable. The observer hooks feed the pool's
+        // saturation/health metrics and capture &metrics_, which outlives the
+        // pool (declaration order). A distinct "[PG] Refusing to start" log
+        // token separates a substrate failure from other startup failures.
+        {
+            if (cfg_.postgres_dsn.empty()) {
+                spdlog::error("[PG] Refusing to start: no PostgreSQL DSN. Set --postgres-dsn / "
+                              "YUZU_POSTGRES_DSN (ADR-0006/0007 — the server requires Postgres; "
+                              "the agent stays SQLite).");
+                startup_failed_ = true;
+            } else {
+                pg::PgPool::Options opts;
+                opts.conninfo = cfg_.postgres_dsn;
+                opts.size = cfg_.postgres_pool_size > 0
+                                ? static_cast<std::size_t>(cfg_.postgres_pool_size)
+                                : 16;
+                opts.observer.on_connect_failure = [this] {
+                    metrics_.counter("yuzu_pg_connect_failed_total").increment();
+                };
+                opts.observer.on_acquire_timeout = [this] {
+                    metrics_.counter("yuzu_pg_acquire_timeout_total").increment();
+                };
+                opts.observer.on_unhealthy_discard = [this] {
+                    metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
+                };
+                opts.observer.on_acquire_wait_seconds = [this](double s) {
+                    metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
+                };
+                pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
+                // Probe: a live checkout proves reachability and warms one
+                // connection. Bounded by connect_timeout_s; an empty lease means
+                // an invalid DSN or an unreachable database — fail closed.
+                if (auto probe = pg_pool_->acquire(); !probe) {
+                    spdlog::error("[PG] Refusing to start: cannot reach PostgreSQL substrate: {}",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
+                                 pg_pool_->size());
+                }
+            }
+        }
+
+        // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
+        // so offline hosts render stale-flagged on /viz/fleet. Only built when
+        // the substrate probe above succeeded (an unreachable database already
+        // set startup_failed_ and run() refuses to serve). FAIL CLOSED on a
+        // migration/open failure too (ADR-0007 + the ADR-0008 per-store
+        // migration invariant): a reachable database whose schema migration
+        // fails — schema conflict, missing CREATE privilege, advisory-lock
+        // contention — must NOT serve degraded. This is the template every
+        // future Postgres-backed store inherits, so the contract is uniform:
+        // a Postgres-backed store that cannot open is a fatal startup error.
+        if (pg_pool_ && !startup_failed_) {
+            offline_endpoint_store_ = std::make_unique<OfflineEndpointStore>(*pg_pool_);
+            if (!offline_endpoint_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
+                              "failed (database reachable but the endpoint_state schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            }
+        }
 
         // Initialize response store
         {
@@ -1238,7 +1334,8 @@ public:
             // that fleet_topology_store_ and health_store_ are wired, then
             // inject into both ingestion paths so they cannot drift.
             heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
-                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_,
+                offline_endpoint_store_.get());
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
@@ -2002,6 +2099,14 @@ public:
     void run() override {
         spdlog::info("run(): entering");
 
+        // Fail closed if construction already determined the server cannot
+        // start — e.g. the PostgreSQL substrate (ADR-0007) was absent or
+        // unreachable in the ctor. main() exits non-zero on startup_failed().
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed during construction");
+            return;
+        }
+
         // PKI: generate + wire per-install default certs before building TLS
         // credentials (fills cfg_ cert paths + cfg_.using_default_certs).
         bootstrap_default_certs();
@@ -2235,6 +2340,17 @@ public:
                 // revoked-agent teardown by the same amount. Make it visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // PostgreSQL pool gauges (#1368): sampled on the same cadence as
+                // the fleet families. Counters/histogram are fed live by the
+                // pool's observer hooks, so only the level gauges are polled here.
+                if (pg_pool_) {
+                    metrics_.gauge("yuzu_pg_pool_in_use")
+                        .set(static_cast<double>(pg_pool_->in_use()));
+                    metrics_.gauge("yuzu_pg_pool_open").set(static_cast<double>(pg_pool_->open()));
+                    metrics_.gauge("yuzu_pg_pool_size").set(static_cast<double>(pg_pool_->size()));
+                    metrics_.gauge("yuzu_pg_pool_waiters")
+                        .set(static_cast<double>(pg_pool_->waiters()));
+                }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
@@ -2646,6 +2762,20 @@ public:
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
+
+        // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
+        // quiesced every handler thread that could hold a pool lease through a
+        // Postgres-backed store (the heartbeat ingest path's borrowed
+        // offline-store pointer was nulled before this), so it is now safe to
+        // drop the stores that borrow the pool, then the pool itself — LAST, so
+        // no lease outlives it. The pool dtor blocks on outstanding leases; a
+        // still-leased thread destroying the pool would self-deadlock (see
+        // pg_pool.hpp). Reset is idempotent, so a startup_failed() server that
+        // never built these tears down cleanly too.
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        offline_endpoint_store_.reset();
+        pg_pool_.reset();
     }
 
 private:
@@ -4206,6 +4336,24 @@ private:
                 // the right probe. Without this, a store-construction failure
                 // would leave /readyz "ready" while every viz request 503s.
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // #1320 PR 3 (#1368 Pattern E): the Postgres substrate is
+                // load-bearing — without it every Postgres-backed store is
+                // dead. Cheap, NON-lease-consuming signal: valid() (conninfo
+                // parsed) AND the connect breaker is closed. The breaker arms
+                // on real connect failures (PG unreachable) but NOT on pool
+                // saturation, so this reflects runtime reachability without the
+                // false-negative a lease-consuming probe would hit under load
+                // (gov UP-2 — a busy-but-healthy server must NOT be evicted
+                // from the LB). Saturation is surfaced via the acquire-wait
+                // histogram + pool gauges + their alert rules, not /readyz.
+                {"pg_pool", pg_pool_ != nullptr && pg_pool_->valid() &&
+                                !pg_pool_->connect_breaker_open()},
+                // First migrated store (#1368). The server fails closed without
+                // Postgres, so this is true whenever it serves; a false here is
+                // the loud signal that the migration path is broken even though
+                // the pool answered.
+                {"offline_endpoint_store",
+                 offline_endpoint_store_ && offline_endpoint_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8234,7 +8382,8 @@ private:
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_,
+                                     offline_endpoint_store_.get());
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -8924,6 +9073,15 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
+    /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
+    /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
+    /// gRPC drain so no handler thread still holds a lease. DECLARED right after
+    /// metrics_ on purpose: its observer hooks capture &metrics_, so the pool
+    /// must destruct before metrics_ (reverse-declaration order) — and before it,
+    /// every Postgres-backed store (declared later) releases its PgPool& and
+    /// every ingest thread (agent_service_, declared later) has already stopped.
+    std::unique_ptr<pg::PgPool> pg_pool_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
@@ -8976,6 +9134,11 @@ private:
 
     // Phase 1: Data infrastructure
     std::unique_ptr<ResponseStore> response_store_;
+    /// Born-on-Postgres last-known endpoint store (#1320 PR 3). Borrows pg_pool_
+    /// (declared earlier, destructs later) and is borrowed by the heartbeat
+    /// ingest path; declared here among the stores so it destructs AFTER the
+    /// ingest services + BEFORE the pool.
+    std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -9033,7 +9196,11 @@ private:
     // — not atomic by design; do NOT read/write it from another thread without
     // converting to std::atomic first (gov L1).
     std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
-    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // atomic so a future background-thread read can never be UB; today it is
+    // written/read only on the main thread (ctor → run() → main()), so the
+    // default seq_cst on the implicit load/store is free on this cold path
+    // (gov fjarvis L2).
+    std::atomic<bool> startup_failed_{false}; // run() refused to start — main() exits non-zero
     // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
     // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
     std::string agent_ca_cert_pem_;
