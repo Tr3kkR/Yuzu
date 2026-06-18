@@ -32,7 +32,8 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 class FleetTopologyStore;
-}
+class OfflineEndpointStore;
+} // namespace yuzu::server
 
 namespace yuzu::server::detail {
 class AgentRegistry;
@@ -48,12 +49,19 @@ namespace yuzu::server {
 class HeartbeatIngestion {
 public:
     HeartbeatIngestion(detail::AgentRegistry& registry, detail::AgentHealthStore* health_store,
-                       FleetTopologyStore* fleet_topology_store, MetricsRegistry* metrics)
+                       FleetTopologyStore* fleet_topology_store, MetricsRegistry* metrics,
+                       OfflineEndpointStore* offline_store = nullptr)
         : registry_(registry), health_store_(health_store),
-          fleet_topology_store_(fleet_topology_store), metrics_(metrics) {}
+          fleet_topology_store_(fleet_topology_store), metrics_(metrics),
+          offline_store_(offline_store) {}
 
     HeartbeatIngestion(const HeartbeatIngestion&) = delete;
     HeartbeatIngestion& operator=(const HeartbeatIngestion&) = delete;
+
+    /// Borrowed durable last-known-endpoint store (#1320 PR 3). Nulled in
+    /// server stop() after the gRPC drain so a late ingest cannot touch the
+    /// released store. Optional — null = no persistence (legacy behavior).
+    void set_offline_endpoint_store(OfflineEndpointStore* s) { offline_store_ = s; }
 
     /// Ingest one heartbeat. `agent_id` is the session-resolved agent id
     /// (already validated by the caller). `via` is "direct" or "gateway"
@@ -77,6 +85,7 @@ private:
     detail::AgentHealthStore* health_store_;
     FleetTopologyStore* fleet_topology_store_;
     MetricsRegistry* metrics_;
+    OfflineEndpointStore* offline_store_{nullptr};
     GuardianReconcileFn guardian_reconcile_fn_;
 };
 

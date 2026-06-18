@@ -811,11 +811,17 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 
 ## PostgreSQL Substrate
 
-The server's storage substrate is moving from SQLite to **PostgreSQL** (ADR-0006; the agent stays SQLite). Today the database is **inert-but-ready**: the bundled containers, the provisioning helper, and the backup procedure below all exist so that deployments are Postgres-ready *before* the release that makes the server require a DSN at boot (#1320 — a **breaking** change; the CHANGELOG entry for that release will say so explicitly).
+The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
+
+> **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_in_use` / `yuzu_pg_pool_size` gauges and the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+
+**`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 
 ### Provisioning a native (non-container) install
 
-Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
 
 | Install method | Helper location | Invocation |
 |---|---|---|

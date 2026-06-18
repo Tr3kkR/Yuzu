@@ -295,17 +295,22 @@ Operator                     Server                                  Agent
 |---|---|---|
 | Agent identity | SQLite (`agent.db`) | Persistent agent_id, enrollment state |
 | Agent KV storage | SQLite (`agent.db`) | Cross-instruction persistent state |
-| Server responses | SQLite (sharded) | Command response persistence with TTL |
-| Server audit | SQLite | User action audit trail |
-| Server config | Config files (`.cfg`) | Users, tokens, enrollment, settings |
+| Server substrate | **PostgreSQL** (shared `PgPool`) | Server storage substrate (ADR-0006/0007); server **fails closed** without it |
+| Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store) |
+| Server responses | SQLite (sharded) | Command response persistence with TTL *(SQLite today; per-store PG migration pending)* |
+| Server audit | SQLite | User action audit trail *(SQLite today; per-store PG migration pending)* |
+| Server identity/auth | AuthDB (`auth.db`) + config files (`.cfg`) | Users, tokens, enrollment, settings *(AuthDB since v0.12.0; per-store PG migration pending)* |
 | NVD/CVE data | SQLite | Vulnerability database |
 | Policy state | SQLite | Rule evaluation history, compliance |
 | Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
 | VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
-**Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** The
-table above reflects the SQLite-everywhere origin; that principle has been **retired for the
-server**. PostgreSQL is now the standard server-side storage substrate, driven by cross-store
+**Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** As of the
+flip (#1320 PR 3) the server **constructs a shared PostgreSQL pool at startup and fails closed
+without it** — the substrate is live, not aspirational, and the rows above marked "per-store PG
+migration pending" still open their own SQLite files only because each store migrates
+incrementally behind its own ADR. The SQLite-everywhere principle has been **retired for the
+server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
 joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
 scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
 is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the federated edge
