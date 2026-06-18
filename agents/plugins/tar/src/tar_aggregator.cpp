@@ -128,9 +128,30 @@ void apply_source_enabled_transition(TarDatabase& db,
     auto paused_at_key = std::format("{}_paused_at", source);
     if (new_value == "false" && prev != "false") {
         db.set_config(paused_at_key, std::to_string(now_epoch));
+        // #538: clear the diff baseline so a later re-enable starts from a clean
+        // snapshot rather than diffing against the frozen pre-pause state — which
+        // would emit ghost "stopped" events for entities that exited during the
+        // pause. No-op for sources without a snapshot-diff baseline
+        // (perf/procperf/netqual). The caller serialises this against the
+        // collectors via collect_mu_ (see do_configure).
+        if (auto key = diff_state_key(source); !key.empty())
+            db.set_state(std::string{key}, "");
     } else if (new_value == "true" && prev == "false") {
         db.set_config(paused_at_key, "0");
     }
+}
+
+std::string_view diff_state_key(std::string_view source) {
+    // Mapping is NOT 1:1 with the source name: tcp's baseline lives under
+    // "network" (historical). Keep this the ONE home for the mapping — the
+    // collectors (collect_fast/slow) and apply_source_enabled_transition both
+    // route through here so the on-disable clear can never target the wrong key.
+    if (source == "process") return "process";
+    if (source == "tcp")     return "network";
+    if (source == "service") return "service";
+    if (source == "user")    return "user";
+    // perf/procperf keep an in-memory previous reading; netqual is stateless.
+    return {};
 }
 
 void run_retention(TarDatabase& db, int64_t now_epoch) {

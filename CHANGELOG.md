@@ -383,6 +383,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
+  per-source enable check could commit one extra snapshot **after** the operator's
+  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
+  diffed against that stale baseline and emitted ghost "stopped" events for every
+  process/connection/service/user that had exited during the pause, breaking the
+  documented "re-enabling starts from a clean baseline" contract. The disable
+  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
+  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
+  rebuilds from scratch. The source→baseline-key mapping (note `tcp`'s baseline lives
+  under `"network"`) is centralised in `diff_state_key()`, used by both the collectors
+  and the disable path so it cannot drift. (`perf`/`procperf` keep an in-memory
+  baseline — out of scope; their re-enable delta is a rate-average over the gap, not a
+  ghost-event spike.)
 - **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
   The `/tar` retention-paused list had three defects: (a) a source whose
   `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered

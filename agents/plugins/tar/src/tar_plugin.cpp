@@ -521,6 +521,10 @@ private:
             pending_etw_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
         if (process_enabled) {
+            // #538: single source of truth for the diff-baseline state key (see
+            // diff_state_key) — the same key apply_source_enabled_transition
+            // clears on disable, so the two can't drift.
+            const std::string proc_key{yuzu::tar::diff_state_key("process")};
             if (etw_active_) {
                 // Windows: gap-free ETW stream supersedes the snapshot-diff poll.
                 // Same process_live schema + 'started'/'stopped' so rollups and
@@ -611,7 +615,7 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state("process", processes_to_json(current).dump());
+                    db_->set_state(proc_key, processes_to_json(current).dump());
                 }
             } else {
                 // Non-Windows (or ETW unavailable): snapshot-diff poll.
@@ -629,7 +633,7 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state("process");
+                auto prev_json = db_->get_state(proc_key);
                 auto previous = json_to_processes(prev_json);
 
                 auto typed =
@@ -643,14 +647,16 @@ private:
                     total_events += static_cast<int>(typed.size());
                 }
 
-                db_->set_state("process", processes_to_json(current).dump());
+                db_->set_state(proc_key, processes_to_json(current).dump());
             }
         }
 
         // Network diff
         if (source_enabled(*db_, "tcp")) {
+            // #538: tcp's diff baseline lives under "network" (see diff_state_key).
+            const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
-            auto prev_json = db_->get_state("network");
+            auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
             auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
@@ -663,7 +669,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("network", connections_to_json(current).dump());
+            db_->set_state(net_key, connections_to_json(current).dump());
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -816,8 +822,9 @@ private:
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
+            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
             auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state("service");
+            auto prev_json = db_->get_state(svc_key);
             auto previous = json_to_services(prev_json);
 
             auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
@@ -830,13 +837,14 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("service", services_to_json(current).dump());
+            db_->set_state(svc_key, services_to_json(current).dump());
         }
 
         // User diff
         if (source_enabled(*db_, "user")) {
+            const std::string usr_key{yuzu::tar::diff_state_key("user")}; // #538
             auto current = yuzu::tar::enumerate_users();
-            auto prev_json = db_->get_state("user");
+            auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
@@ -849,7 +857,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("user", users_to_json(current).dump());
+            db_->set_state(usr_key, users_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -1365,7 +1373,18 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            {
+                // #538: collect_fast/slow hold collect_mu_ for their whole
+                // enumerate→diff→set_state cycle. Taking it here makes the
+                // enabled-flag write + baseline clear atomic w.r.t. a collection
+                // tick: the tick either fully precedes the disable (its set_state
+                // is then wiped by the baseline clear) or sees enabled=false and
+                // skips. No interleaving ⇒ no post-disable snapshot, no ghost
+                // "stopped" events on re-enable. No deadlock: do_configure runs
+                // without collect_mu_ held and the helper re-acquires nothing.
+                std::lock_guard lock(collect_mu_);
+                yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            }
             ctx.write_output(std::format("config|{}|{}", key, v));
             // Echo the resulting paused_at so the operator/dashboard sees the
             // transition timestamp without an extra status round-trip. We

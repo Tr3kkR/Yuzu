@@ -40,13 +40,22 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  * `<source>_paused_at` config row used by the TAR dashboard's
  * retention-paused list (PR-A / issue #547). The semantics are:
  *
- *   - enabled→disabled: writes `<source>_paused_at = now_epoch`.
+ *   - enabled→disabled: writes `<source>_paused_at = now_epoch` AND clears the
+ *     source's diff baseline (see #538 below).
  *   - disabled→enabled: writes `<source>_paused_at = "0"` (cleared, but kept
  *     present — a missing row would be ambiguous with "never paused").
  *   - no transition (idempotent set): leaves `<source>_paused_at` untouched.
  *
  * The default for `<source>_enabled` if not yet set is `"true"`, so the
  * first-ever set to `"false"` correctly registers as a transition.
+ *
+ * #538: on the enabled→disabled transition the source's snapshot-diff baseline
+ * (`diff_state_key(source)`) is cleared so a later re-enable starts from a clean
+ * snapshot instead of diffing against the frozen pre-pause state — which would
+ * emit ghost "stopped" events for every entity that exited during the pause.
+ * No-op for sources without a diff baseline (perf/procperf/netqual). The CALLER
+ * must serialise this against the collectors (they hold `collect_mu_` for their
+ * whole enumerate→diff→set_state cycle); this function takes no lock itself.
  *
  * @param db        The TAR database.
  * @param source    Source name (e.g. "process", "tcp", "service", "user").
@@ -58,5 +67,19 @@ void apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view source,
                                       std::string_view new_value,
                                       int64_t now_epoch);
+
+/**
+ * Map a capture source to its snapshot-diff baseline key in the TAR state store
+ * (the key passed to `TarDatabase::get_state`/`set_state`).
+ *
+ * The mapping is NOT 1:1 with the source name: `tcp`'s baseline lives under
+ * `"network"`. Sources with no snapshot-diff baseline (`perf`/`procperf` keep an
+ * in-memory previous reading; `netqual` is stateless) return an empty view.
+ *
+ * Single source of truth: both the collectors (`collect_fast`/`collect_slow`)
+ * and the enable/disable transition above route through this so the on-disable
+ * clear can never target the wrong key (a silent no-op).
+ */
+[[nodiscard]] std::string_view diff_state_key(std::string_view source);
 
 } // namespace yuzu::tar
