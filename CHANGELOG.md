@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device's management group (a device outside your scope cannot be live-queried); each dispatch
   is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
   usage-class read kept separately countable for works-council access audit.
+- **REST: agentic-first per-device DEX endpoints.** `GET /api/v1/dex/devices/{id}` — the
+  per-device DEX read model (score + signal summary), the machine-readable equivalent of the
+  dashboard DEX lens; `GuaranteedState:Read` scoped to the device, audited `dex.device.view`,
+  off-enum `window` rejected `400`. `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` —
+  the machine-readable "Get live info": dispatches a read-only instruction now and returns the
+  result synchronously (~20s). **POST, not GET** (it dispatches a command — a side effect);
+  `GuaranteedState:Read` + `Execution:Execute` scoped to the device; audited per kind
+  (`device.live.uptime` / `device.live.processes`, `result=dispatched`). Concurrent live polls
+  are capped server-wide (over-budget → `429`); offline → `503`, timeout → `504`, device error
+  → `502`, all with `retry_after_ms` where applicable.
 - **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
   executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux
   `/proc/<pid>/exe`, macOS `proc_pidpath`) — not the spoofable argv[0] — and the on-disk image

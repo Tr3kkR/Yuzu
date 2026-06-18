@@ -53,6 +53,7 @@ class ExecutionEventBus;
 
 #include <httplib.h>
 
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <string>
@@ -61,6 +62,18 @@ class ExecutionEventBus;
 #include <vector>
 
 namespace yuzu::server {
+
+namespace detail {
+// --- /api/v1/dex/devices/{id}/live tuning (TEST SEAM, not a request knob) ---
+// The synchronous live-read handler bounds its blast radius with an in-flight cap
+// (UP-1/2/3: keeps httplib workers free for the dashboard, SSE and health probes)
+// and a bounded poll. These default to production values; unit tests lower them to
+// exercise the 429 (cap) and 504 (timeout) branches without real concurrency or a
+// ~20s wall. Process-global by design — the cap is a whole-server budget.
+std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
+std::atomic<int>& live_poll_max_polls();   // default 40
+std::atomic<int>& live_poll_interval_ms(); // default 500
+} // namespace detail
 
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.
 class RestApiV1 {
@@ -74,9 +87,12 @@ public:
     /// AuthRoutes::require_scoped_permission (global grant OR a role on the agent's
     /// management group / an ancestor). Used by the per-device agentic-first
     /// endpoints so a REST worker is held to the SAME per-device scope as the
-    /// dashboard device lenses. Optional: when unset, per-device routes fall back
-    /// to the global `perm_fn` gate (parity with the rest of the per-device
-    /// `/api/v1` surface, which is global-gated today).
+    /// dashboard device lenses. The per-device agentic-first endpoints REQUIRE
+    /// this gate: when it is unset they **fail closed (500)** rather than silently
+    /// downgrading to the global `perm_fn` (which would widen scope) — production
+    /// always wires it from `server.cpp` (`require_scoped_permission`). This
+    /// matches the sibling `DeviceRoutes`, which also refuses to serve per-device
+    /// data without a scope gate (governance R-sec-LOW / architect S4).
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,

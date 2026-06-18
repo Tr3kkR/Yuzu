@@ -777,7 +777,7 @@ TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, 
     r.output = "uptime_seconds|181740\nuptime_display|2d 2h 29m";
     h.resp_store->store(r);
 
-    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.last_live_plugin == "os_info");
@@ -805,7 +805,7 @@ TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|pat
         "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh";
     h.resp_store->store(r);
 
-    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=processes");
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.last_live_action == "list_hashed"); // the hashed variant
@@ -823,7 +823,7 @@ TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited 
           "[rest][dex][device][live]") {
     RestGsHarness h;
     h.live_sent = 0; // dispatch reaches no connected agent
-    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 503);
     bool audited = false;
@@ -836,7 +836,7 @@ TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited 
 TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
           "[rest][dex][device][live]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=bogus");
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=bogus", "");
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.last_live_plugin.empty()); // never dispatched
@@ -846,10 +846,114 @@ TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch"
           "[rest][dex][device][live][scope]") {
     RestGsHarness h;
     h.deny_scoped_agent = "WS-9";
-    auto res = h.sink.Get("/api/v1/dex/devices/WS-9/live?kind=uptime");
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-9/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.last_live_plugin.empty()); // gate denied before any dispatch
+}
+
+// ── Governance hardening-round coverage (R1) ──────────────────────────────
+
+TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
+          "[rest][dex][device]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=banana");
+    REQUIRE(res);
+    CHECK(res->status == 400);          // not a silent default to 7d
+    CHECK(h.audit_log.empty());         // validated before any audit emission
+}
+
+TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-output row → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // A single frame that carries BOTH partial output AND a failure status — the
+    // pre-fix poll returned 200 with the partial data (UP-4). Failure must 502.
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 2; // FAILURE
+    r.output = "uptime_display|2d 2h"; // partial output present alongside the failure
+    r.error_detail = "agent aborted";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    CHECK(res->body.find("device query failed") != std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 0;
+    r.output = "error|disk subsystem offline";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    CHECK(res->body.find("device reported an error") != std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 3; // FAILURE, no output
+    r.error_detail = "plugin crashed";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty (not a 504)",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = 1; // SUCCESS, no output rows
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["kind"].get<std::string>() == "processes");
+    REQUIRE(j["data"]["processes"].is_array());
+    CHECK(j["data"]["processes"].empty());
+}
+
+TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    auto& cap = yuzu::server::detail::live_max_inflight();
+    const int saved = cap.load();
+    cap.store(0); // any call is immediately over budget
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    cap.store(saved); // restore the process-global default before the next test
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(h.last_live_plugin.empty()); // 429'd before dispatch — no command sent
+}
+
+TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    auto& mp = yuzu::server::detail::live_poll_max_polls();
+    auto& iv = yuzu::server::detail::live_poll_interval_ms();
+    const int smp = mp.load(), siv = iv.load();
+    mp.store(2);
+    iv.store(1); // ~2ms instead of ~20s — no response row is ever inserted
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    mp.store(smp);
+    iv.store(siv);
+    REQUIRE(res);
+    CHECK(res->status == 504);
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {

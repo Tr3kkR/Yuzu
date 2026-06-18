@@ -261,6 +261,29 @@ std::string live_result_json(const std::string& kind, const std::string& output)
     return JObj().add("kind", "processes").raw("processes", procs.str()).str();
 }
 
+// Bound concurrent /api/v1/dex/devices/{id}/live polls (UP-1/2/3): each call pins
+// an httplib worker for up to ~20s, so an unbounded burst (or SSE pre-pressure)
+// would starve the dashboard, REST and the health probes. The cap is a whole-server
+// in-flight budget held strictly below the worker pool; over-budget callers get 429
+// + retry_after_ms instead of dispatching a command they can't wait for. RAII so
+// EVERY exit path (429/400/502/503/504/200) releases the slot — a leaked slot would
+// permanently shrink capacity. `acquired` records whether we were within budget.
+class LiveInflightGuard {
+public:
+    LiveInflightGuard() {
+        const int cap = detail::live_max_inflight().load(std::memory_order_relaxed);
+        acquired_ = inflight_.fetch_add(1, std::memory_order_acq_rel) < cap;
+    }
+    ~LiveInflightGuard() { inflight_.fetch_sub(1, std::memory_order_acq_rel); }
+    LiveInflightGuard(const LiveInflightGuard&) = delete;
+    LiveInflightGuard& operator=(const LiveInflightGuard&) = delete;
+    bool acquired() const { return acquired_; }
+
+private:
+    static inline std::atomic<int> inflight_{0};
+    bool acquired_{false};
+};
+
 // A4 / event-envelope helpers move to `yuzu::server::detail` below —
 // declared in `rest_a4_envelope.hpp` so unit tests can assert the shape
 // directly without driving the httplib chunked content provider.
@@ -490,7 +513,7 @@ const std::string& openapi_spec() {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
               "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
-              "retry_after_ms": {"type": "integer", "format": "int64", "description": "Optional. Advises the worker to back off this many milliseconds before retrying. Currently emitted on 503 (warmup) only."},
+              "retry_after_ms": {"type": "integer", "format": "int64", "description": "Optional. Advises the worker to back off this many milliseconds before retrying. Emitted on 503 (warmup / device offline), 504 (live-read timeout) and 429 (live-read concurrency cap)."},
               "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
             }
           },
@@ -675,10 +698,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/devices/{id}": {
-      "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/devices/{id}/live": {
-      "get": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. Dispatches a read-only plugin instruction to the device NOW (not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). Audited per kind (device.live.uptime / device.live.processes). A slow device returns 504 and an offline device 503, both with retry_after_ms.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
+      "post": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The dispatch is audited per kind (device.live.uptime / device.live.processes) with result=dispatched. Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
     },
     "/dex/perf/fleet": {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
@@ -859,6 +882,22 @@ std::string make_event_envelope(std::string_view execution_id,
         .add("type", ev.event_type)
         .raw("payload", payload)
         .str();
+}
+
+// --- /api/v1/dex/devices/{id}/live tuning (test seam; see rest_api_v1.hpp) ---
+// Meyers-singleton atomics: production reads the defaults; unit tests lower them to
+// exercise the 429 (cap) and 504 (timeout) branches deterministically.
+std::atomic<int>& live_max_inflight() {
+    static std::atomic<int> v{4};
+    return v;
+}
+std::atomic<int>& live_poll_max_polls() {
+    static std::atomic<int> v{40};
+    return v;
+}
+std::atomic<int>& live_poll_interval_ms() {
+    static std::atomic<int> v{500};
+    return v;
 }
 
 } // namespace detail
@@ -4913,14 +4952,20 @@ void RestApiV1::register_routes(
     // same posture as /fragments/device/dex.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+))",
-        [perm_fn, scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
+                                                           httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
-            const bool ok = scoped_perm_fn
-                                ? scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id)
-                                : perm_fn(req, res, "GuaranteedState", "Read");
-            if (!ok)
+            // Per-device scope is mandatory — fail CLOSED if the gate is unwired
+            // rather than silently widening to a global Read (production always wires
+            // it from server.cpp; sibling DeviceRoutes likewise refuses without it).
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
             if (!guaranteed_state_store) {
                 res.status = 503;
@@ -4928,11 +4973,21 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Validate the window enum BEFORE auditing/reading — an off-enum value is
+            // a 400, not a silently-defaulted 7d whose echoed `window` would then
+            // contradict the data (parity with /dex/signals/{obs_type}'s validation).
+            const std::string window =
+                req.has_param("window") ? req.get_param_value("window") : "7d";
+            if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                    "application/json");
+                return;
+            }
             if (audit_fn)
                 audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
                          "REST per-device DEX read model");
-            const std::string window =
-                req.has_param("window") ? req.get_param_value("window") : "7d";
             const std::string since = dex_iso_since(dex_window_to_days(window));
             const int score = dex_device_score(guaranteed_state_store, agent_id, since);
             JArr signals;
@@ -4951,7 +5006,7 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(data), "application/json");
         });
 
-    // GET /dex/devices/{id}/live?kind=uptime|processes — live device read. Dispatches
+    // POST /dex/devices/{id}/live?kind=uptime|processes — live device read. Dispatches
     // a real read-only plugin instruction NOW and returns the result as JSON. The
     // machine-readable equivalent of the dashboard "Get live info" panel, which has
     // NO other REST path (raw plugin actions are not dispatchable via /api/v1, and no
@@ -4960,9 +5015,13 @@ void RestApiV1::register_routes(
     // a slow/offline device returns 504/503 with retry_after_ms. POINTER-FREE poll —
     // each iteration copies the fields it needs out of the freshly queried vector, so
     // no pointer outlives the loop (the device-routes UAF class, avoided by design).
-    sink.Get(
+    // POST (not GET): /live DISPATCHES a real command to the device — a side effect.
+    // GET must stay safe/idempotent (prefetchers/proxies/retry libraries fire GETs
+    // speculatively), and every other command-dispatch route on /api/v1 is POST
+    // (architect B1). The read model above stays GET.
+    sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
-        [perm_fn, scoped_perm_fn, response_store, command_dispatch_fn, audit_fn](
+        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn](
             const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
@@ -4977,10 +5036,16 @@ void RestApiV1::register_routes(
                 action = "list_hashed";
                 audit_action = "device.live.processes";
             }
-            // Per-device scoped Read floor + Execute (gate before validate/dispatch).
+            // Per-device scope is mandatory — fail CLOSED if unwired (never widen to
+            // the global gate). Scoped Read floor + Execute, before validate/dispatch.
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
             const auto gate = [&](const char* sec, const char* op) {
-                return scoped_perm_fn ? scoped_perm_fn(req, res, sec, op, agent_id)
-                                      : perm_fn(req, res, sec, op);
+                return scoped_perm_fn(req, res, sec, op, agent_id);
             };
             if (!gate("GuaranteedState", "Read"))
                 return;
@@ -4999,12 +5064,27 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
+            // an over-budget caller gets 429 without orphaning a command. RAII releases
+            // the slot on every return below.
+            LiveInflightGuard slot;
+            if (!slot.acquired()) {
+                res.status = 429;
+                res.set_content(detail::error_json_a4(
+                                    429, "too many concurrent live queries; retry shortly", cid,
+                                    2000, "retry the request"),
+                                "application/json");
+                return;
+            }
             const auto [command_id, sent] =
                 command_dispatch_fn(plugin, action, {agent_id}, "", {}, /*execution_id=*/"");
-            // Usage-class read (processes) stays separately auditable from machine-health
-            // (uptime) — parity with the dashboard live panel's per-kind audit split.
+            // Audit the DISPATCH (the works-council-relevant event — the operator
+            // requested live data on this device), with an HONEST result: "dispatched"
+            // when it reached an agent, "no_agents" when it didn't. NOT "success" —
+            // the outcome (502/504/empty) isn't known yet (UP-8). Usage-class read
+            // (processes) stays separately auditable from machine-health (uptime).
             if (audit_fn)
-                audit_fn(req, audit_action, sent > 0 ? "success" : "no_agents", "Agent", agent_id,
+                audit_fn(req, audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent", agent_id,
                          "REST live " + plugin + "/" + action + " command_id=" + command_id);
             if (sent == 0) {
                 res.status = 503;
@@ -5014,13 +5094,18 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            // Bounded synchronous poll (~20s; processes/list_hashed hashes each on-disk
-            // image, so allow generous time before a 504).
-            constexpr int kMaxPolls = 40;
-            constexpr auto kInterval = std::chrono::milliseconds(500);
-            for (int i = 0; i < kMaxPolls; ++i) {
+            // Bounded synchronous poll (~20s default; processes/list_hashed hashes each
+            // on-disk image, so allow generous time before a 504). Budget is a test
+            // seam (defaults in detail::live_poll_*).
+            const int max_polls = detail::live_poll_max_polls().load(std::memory_order_relaxed);
+            const auto interval =
+                std::chrono::milliseconds(detail::live_poll_interval_ms().load(std::memory_order_relaxed));
+            // Cap the device output we parse/return (UP-11) — a runaway/malicious agent
+            // must not make us hold + line-split a multi-MB blob in the worker.
+            constexpr std::size_t kMaxLiveOutputBytes = 4 * 1024 * 1024;
+            for (int i = 0; i < max_polls; ++i) {
                 if (i > 0)
-                    std::this_thread::sleep_for(kInterval); // query first; back off only on miss
+                    std::this_thread::sleep_for(interval); // query first; back off only on miss
                 std::string output, error_detail;
                 int terminal = -1;
                 bool have_output = false;
@@ -5036,6 +5121,17 @@ void RestApiV1::register_routes(
                         error_detail = r.error_detail;
                     }
                 }
+                // FAILURE WINS (UP-4): a terminal-failure row must 502 even if a
+                // partial-output row is also present — otherwise a failed command with
+                // partial output returns a false 200.
+                if (terminal >= 2) {
+                    res.status = 502;
+                    res.set_content(
+                        detail::error_json_a4(502, "device query failed: " + error_detail.substr(0, 200),
+                                              cid),
+                        "application/json");
+                    return;
+                }
                 if (have_output) {
                     if (output.rfind("error|", 0) == 0) {
                         res.status = 502;
@@ -5045,15 +5141,14 @@ void RestApiV1::register_routes(
                                         "application/json");
                         return;
                     }
+                    if (output.size() > kMaxLiveOutputBytes) {
+                        res.status = 502;
+                        res.set_content(
+                            detail::error_json_a4(502, "device output too large", cid),
+                            "application/json");
+                        return;
+                    }
                     res.set_content(ok_json(live_result_json(kind, output)), "application/json");
-                    return;
-                }
-                if (terminal >= 2) {
-                    res.status = 502;
-                    res.set_content(
-                        detail::error_json_a4(502, "device query failed: " + error_detail.substr(0, 200),
-                                              cid),
-                        "application/json");
                     return;
                 }
                 if (terminal == 1) {

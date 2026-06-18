@@ -3478,6 +3478,27 @@ The one device list behind every Performance drill: worst devices by a metric (d
 - **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
+#### `GET /api/v1/dex/devices/{id}`
+
+Per-device DEX read model — the machine-readable equivalent of the **DEX** lens on the `/device?id=` dashboard page.
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group (a REST worker is held to the same per-device scope as the dashboard lens).
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameters:** `window` — one of `24h` / `7d` / `30d` / `all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable.
+- **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`) on every successful access — behavioral PII.
+
+#### `POST /api/v1/dex/devices/{id}/live`
+
+Dispatches a read-only instruction to the live agent **now** and synchronously returns the result (~20 s). The machine-readable equivalent of the dashboard **"Get live info"** button. **POST, not GET** — it has a side effect (it dispatches a command), so it must not be fired speculatively by prefetchers/proxies/retry libraries.
+
+- **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
+- **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
+- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent). `504` — the device did not respond within the timeout (`retry_after_ms`).
+- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=dispatched`) — the dispatch is the works-council-relevant event, kept separately countable per kind.
+
 ---
 
 ### Network

@@ -231,6 +231,8 @@ Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read
 
 On a host with many distinct large executables the process panel can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
 
+The machine-readable equivalents (for agentic workers and automation) are `GET /api/v1/dex/devices/{id}` (the per-device DEX read model) and `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` (the live dispatch — POST because it has a side effect). They enforce the same scoped permissions and emit the same audit verbs as these panels. See [REST API — DEX](rest-api.md).
+
 ### REST API
 
 **List all agents (legacy endpoint):**
