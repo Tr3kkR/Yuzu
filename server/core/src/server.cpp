@@ -299,6 +299,10 @@ public:
         metrics_.describe("yuzu_pg_pool_open",
                           "PostgreSQL pool connections currently open (leased + idle)", "gauge");
         metrics_.describe("yuzu_pg_pool_size", "PostgreSQL pool configured maximum size", "gauge");
+        metrics_.describe("yuzu_pg_pool_waiters",
+                          "Threads currently blocked waiting for a PostgreSQL pool connection — "
+                          "the saturation signal between fully-leased and an acquire timeout",
+                          "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
                           "Total PostgreSQL connection attempts that failed", "counter");
         metrics_.describe("yuzu_pg_acquire_timeout_total",
@@ -934,6 +938,9 @@ public:
             } else {
                 pg::PgPool::Options opts;
                 opts.conninfo = cfg_.postgres_dsn;
+                opts.size = cfg_.postgres_pool_size > 0
+                                ? static_cast<std::size_t>(cfg_.postgres_pool_size)
+                                : 16;
                 opts.observer.on_connect_failure = [this] {
                     metrics_.counter("yuzu_pg_connect_failed_total").increment();
                 };
@@ -2329,6 +2336,8 @@ public:
                         .set(static_cast<double>(pg_pool_->in_use()));
                     metrics_.gauge("yuzu_pg_pool_open").set(static_cast<double>(pg_pool_->open()));
                     metrics_.gauge("yuzu_pg_pool_size").set(static_cast<double>(pg_pool_->size()));
+                    metrics_.gauge("yuzu_pg_pool_waiters")
+                        .set(static_cast<double>(pg_pool_->waiters()));
                 }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
@@ -4317,19 +4326,16 @@ private:
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
                 // #1320 PR 3 (#1368 Pattern E): the Postgres substrate is
                 // load-bearing — without it every Postgres-backed store is
-                // dead. Live BOUNDED probe rather than a cached flag: an idle
-                // pooled connection returns instantly, and a down database with
-                // the connect breaker armed fails fast (no 10 s connect storm),
-                // so /readyz reflects RUNTIME reachability, not just startup.
-                // Pool saturation surfacing as not-ready is correct (the server
-                // genuinely cannot serve a Postgres query then).
-                {"pg_pool",
-                 [this] {
-                     if (!pg_pool_ || !pg_pool_->valid())
-                         return false;
-                     auto lease = pg_pool_->try_acquire_for(std::chrono::milliseconds(250));
-                     return static_cast<bool>(lease);
-                 }()},
+                // dead. Cheap, NON-lease-consuming signal: valid() (conninfo
+                // parsed) AND the connect breaker is closed. The breaker arms
+                // on real connect failures (PG unreachable) but NOT on pool
+                // saturation, so this reflects runtime reachability without the
+                // false-negative a lease-consuming probe would hit under load
+                // (gov UP-2 — a busy-but-healthy server must NOT be evicted
+                // from the LB). Saturation is surfaced via the acquire-wait
+                // histogram + pool gauges + their alert rules, not /readyz.
+                {"pg_pool", pg_pool_ != nullptr && pg_pool_->valid() &&
+                                !pg_pool_->connect_breaker_open()},
                 // First migrated store (#1368). The server fails closed without
                 // Postgres, so this is true whenever it serves; a false here is
                 // the loud signal that the migration path is broken even though

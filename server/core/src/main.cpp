@@ -146,6 +146,13 @@ int main(int argc, char* argv[]) {
                    "storage substrate. REQUIRED — the server fails closed without a reachable "
                    "database (ADR-0006/0007). The agent stays SQLite.")
         ->envname("YUZU_POSTGRES_DSN");
+    app.add_option("--postgres-pool-size", cfg.postgres_pool_size,
+                   "Max concurrent PostgreSQL connections in the shared pool (default 16). "
+                   "Raise for high agent counts / slow managed-PG links; tune against "
+                   "yuzu_pg_pool_in_use and yuzu_pg_acquire_wait_seconds.")
+        ->default_val(16)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_POSTGRES_POOL_SIZE");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");

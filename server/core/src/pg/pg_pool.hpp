@@ -221,6 +221,19 @@ public:
     /// Connections currently open (leased + idle).
     [[nodiscard]] std::size_t open() const;
 
+    /// Threads currently blocked in acquire() waiting for a lease — the
+    /// saturation depth that fills the gap between "all leased" and a /readyz
+    /// flip (gov sre).
+    [[nodiscard]] std::size_t waiters() const;
+
+    /// True while the connect-failure breaker is suppressing new connects.
+    /// A cheap, NON-lease-consuming health signal for readiness probes: armed
+    /// ⇒ the database is unreachable (recent connect failures). Pool
+    /// saturation alone — all leases out but no connect failures — does NOT
+    /// arm the breaker, so this never false-trips under load, which a
+    /// lease-consuming probe would (gov UP-2).
+    [[nodiscard]] bool connect_breaker_open() const;
+
 private:
     void release(PGconn* conn) noexcept;
     Lease acquire_internal(const std::chrono::steady_clock::time_point* deadline);

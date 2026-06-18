@@ -46,6 +46,12 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
+        // agent_ts is RESERVED: the schema/struct carry it for a future
+        // agent-emitted snapshot timestamp, but the heartbeat path has no such
+        // value today, so it is always 0 in production (gov consistency
+        // SHOULD-1). Staleness is driven entirely by the server-side
+        // last_heartbeat_ms. Wire a real agent ts here when one exists, or drop
+        // the column — tracked as a follow-up.
         offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0);
     }
 

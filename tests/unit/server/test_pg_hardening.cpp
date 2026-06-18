@@ -85,10 +85,15 @@ TEST_CASE("PgPool connect breaker fails fast and fires the observer", "[pg][hard
     PgPool pool{std::move(opts)};
     REQUIRE(pool.valid()); // conninfo parses; the host is just unreachable
 
+    CHECK_FALSE(pool.connect_breaker_open()); // closed before any failure
+
     // First acquire attempts a connect, fails, arms the breaker.
     auto first = pool.acquire();
     CHECK_FALSE(static_cast<bool>(first));
     CHECK(connect_failures.load() >= 1);
+    // The breaker is now the cheap, non-lease-consuming "PG unreachable" signal
+    // that /readyz reads (gov UP-2) — must report open after the failure.
+    CHECK(pool.connect_breaker_open());
 
     // Second acquire, while the breaker window is open, must return an empty
     // lease FAST without launching another connect — the anti-storm contract.
@@ -116,6 +121,10 @@ TEST_CASE("PgPool acquire-wait observer fires on a successful checkout", "[pg][h
     { auto l = pool.acquire(); REQUIRE(static_cast<bool>(l)); }
     { auto l = pool.acquire(); REQUIRE(static_cast<bool>(l)); }
     CHECK(waits.load() == 2);
+    // A reachable database never arms the breaker, so /readyz stays ready even
+    // while the pool is busy (gov UP-2: saturation must not evict a healthy
+    // server).
+    CHECK_FALSE(pool.connect_breaker_open());
 }
 
 // CH-9: the pool destructor must wait for an outstanding lease and then

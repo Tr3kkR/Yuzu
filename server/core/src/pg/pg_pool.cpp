@@ -369,6 +369,16 @@ std::size_t PgPool::open() const {
     return open_;
 }
 
+std::size_t PgPool::waiters() const {
+    std::lock_guard lk{mu_};
+    return waiters_;
+}
+
+bool PgPool::connect_breaker_open() const {
+    std::lock_guard lk{mu_};
+    return std::chrono::steady_clock::now() < connect_blocked_until_;
+}
+
 void PgPool::set_error(std::string msg) {
     std::lock_guard lk{mu_};
     last_error_ = std::move(msg);

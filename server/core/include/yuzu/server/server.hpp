@@ -74,6 +74,12 @@ struct Config {
     // returns non-zero. The agent stays SQLite; this is server-only.
     std::string postgres_dsn;
 
+    // Max concurrent PostgreSQL connections in the shared pool. Default 16.
+    // Sizing guidance in docs/user-manual/server-admin.md; tuning signals are
+    // yuzu_pg_pool_in_use / yuzu_pg_acquire_wait_seconds. Wired via
+    // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
+    int postgres_pool_size{16};
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
