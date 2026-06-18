@@ -244,3 +244,32 @@ groups:
           severity: warning
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
+
+  - name: yuzu-guardian
+    rules:
+      # yuzu_server_guardian_events_dropped_total is a cumulative-but-published-
+      # as-gauge counter that RESETS on server restart, so alert on increase()
+      # over a window, never an absolute value or `> 0`. The metric conflates
+      # benign redelivery (agent reconnect / event_seq_ reset after a crash-loop)
+      # with real loss and the forged-id pre-claim path (#1360), so the threshold
+      # needs a real-fleet redelivery baseline — the value below is a placeholder
+      # starting point, tune it against your own reconnect churn. Closing this
+      # alert is what turns the #1414 CC7.3 visibility gauge into an operating
+      # control: a sustained climb means drift was observed but silently discarded.
+      - alert: YuzuGuardianEventsDropped
+        expr: |
+          increase(yuzu_server_guardian_events_dropped_total[1h]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian events dropped at ingest (event_id PK conflict)"
+          description: >-
+            More than 50 Guardian events were dropped at ingest on an event_id
+            PK/UNIQUE conflict in the last hour. Some redelivery is benign
+            (agent reconnects, event_seq_ resets); a sustained climb means real
+            drift is being silently discarded — check the server `warn` logs for
+            the rejected event_id, and rule out a clock-skewed fleet or a
+            forged-id pre-claim. Tune the threshold to your fleet's reconnect
+            churn.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-events-dropped"

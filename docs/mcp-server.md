@@ -28,7 +28,7 @@ JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy
 { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null, "remediation": null }
 ```
 
-`correlation_id` is a grep token tying the error to the server's `spdlog` rows and audit log — the same format as the REST `X-Correlation-Id` header. `retry_after_ms` and `remediation` are `null` on tier-denial errors; per-tool validation errors may populate them. Parse `error.code` for the error class and `error.data.correlation_id` for traceability.
+`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. `retry_after_ms` and `remediation` are `null` on tier-denial errors; per-tool validation errors may populate them. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
 
 ## Phase 1 (Implemented)
 

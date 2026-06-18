@@ -17,6 +17,25 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: operator/API tags now beat agent self-report (#1411)
+
+An agent's self-reported tags (`scopable_tags`, synced on every Register) can no
+longer overwrite an operator- or API-set tag for the same `(agent_id, key)` — the
+operator/API value is now authoritative. This closes a path where a rogue or
+misconfigured agent could self-assign into an operator-declared benchmark cohort.
+
+**Who this affects:** only an operator who *deliberately* relied on agent-reported
+values winning over an operator/API-set tag for the same key. After upgrade those
+agent values stop overriding — silently (no error, no log line); an affected device
+simply drops out of the cohort the operator-set value defines.
+
+**Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
+each key is `server`- (operator/API) or `agent`-sourced.
+
+**Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
+via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
+the agent reports that the operator never set are unaffected.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and
