@@ -4978,9 +4978,18 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): match the cohort-diff sibling — a correlation
+                 // id on every response + the A4 error envelope on failures.
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
@@ -5003,16 +5012,25 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const std::string key =
                      req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid tag key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid),
+                                     "application/json");
                      return;
                  }
                  const auto snap = dex_perf_fn(key);
@@ -5150,9 +5168,17 @@ void RestApiV1::register_routes(
              [perm_fn, dex_perf_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const DexPerfMetric metric = dex_perf_metric_from_token(
@@ -5168,7 +5194,8 @@ void RestApiV1::register_routes(
                                                  : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(cohort_key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid cohort_key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid cohort_key", cid),
+                                     "application/json");
                      return;
                  }
                  std::optional<std::string> cohort_filter;
@@ -5182,7 +5209,8 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v <= 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::error_json_a4(400, "invalid limit", cid),
+                                         "application/json");
                          return;
                      }
                      limit = std::min(v, 500);

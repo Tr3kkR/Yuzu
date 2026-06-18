@@ -1116,6 +1116,25 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(badkey["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
+          "[mcp][integration][a4]") {
+    McpTestServer ts;
+    ts.start("readonly"); // readonly tier allows only Read
+
+    // set_tag is Tag:Write — denied by the readonly tier through the shared C8
+    // chokepoint that gates ~13 tools. The whole MCP error family must now carry
+    // an A4 error.data correlation id (#1470), not just the per-tool validations.
+    auto denied = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"set_tag","arguments":{"agent_id":"a","key":"k","value":"v"}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    REQUIRE(denied["error"].contains("data"));
+    CHECK(denied["error"]["data"]["correlation_id"].is_string());
+    CHECK(denied["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+}
+
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
