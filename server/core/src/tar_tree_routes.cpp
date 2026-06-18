@@ -45,38 +45,7 @@ void note(httplib::Response& res, const std::string& text) {
 std::string get_param(const httplib::Request& req, const char* k) {
     return req.has_param(k) ? req.get_param_value(k) : std::string{};
 }
-
-// Civil date → days since 1970-01-01 (Howard Hinnant's algorithm). Used to parse a
-// datetime-local value as UTC without libc timezone surprises.
-std::int64_t days_from_civil(int y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
-}
-
-// Accept either an epoch-seconds string (all digits) or a datetime-local value
-// "YYYY-MM-DDTHH:MM[:SS]" interpreted as UTC. 0 = empty/invalid.
-std::int64_t parse_ts_param(const std::string& s) {
-    if (s.empty())
-        return 0;
-    if (std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; })) {
-        if (s.size() > 19)
-            return 0;
-        std::int64_t v = 0;
-        for (char c : s)
-            v = v * 10 + (c - '0');
-        return v;
-    }
-    int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0, Se = 0;
-    const int n = std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &Mo, &D, &H, &Mi, &Se);
-    if (n < 5 || Mo < 1 || Mo > 12 || D < 1 || D > 31 || H < 0 || H > 23 || Mi < 0 || Mi > 59)
-        return 0;
-    return days_from_civil(Y, static_cast<unsigned>(Mo), static_cast<unsigned>(D)) * 86400 +
-           H * 3600 + Mi * 60 + Se;
-}
+// parse_ts_param lives in tar_process_tree.{hpp,cpp} (pure + unit-tested).
 
 std::string random_token() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -351,8 +320,15 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             where + " ORDER BY ts DESC LIMIT 5000";
         const auto [pcmd, psent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}});
         const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}});
-        (void)tsent;
-        if (psent == 0) {
+        // Audit at DISPATCH (parity with device-live-info / DEX-perf): the live query
+        // hitting the endpoint is the access event and must be recorded even when it
+        // reaches no agent or the later poll never completes.
+        if (audit_fn_)
+            audit_fn_(req, "tar.process_tree.read", psent > 0 ? "dispatched" : "no_agents",
+                      "Agent", device,
+                      std::format("dispatch preset={} command_id={}", preset.empty() ? "10m" : preset,
+                                  pcmd));
+        if (psent == 0 || tsent == 0) {
             note(res, "Device offline \xE2\x80\x94 the process tree needs a connected agent.");
             return;
         }
@@ -386,17 +362,22 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             note(res, "Live device query is unavailable on this server.");
             return;
         }
-        constexpr int kMaxAttempts = 40; // ~28s at 700ms
+        constexpr int kMaxAttempts = 40;      // ~28s at 700ms — overall budget
+        constexpr int kTcpGraceAttempts = 12; // ~8s — then render the tree WITHOUT
+                                              // connections rather than let a hung TCP
+                                              // query block the whole process view.
         int attempt = 1;
         if (req.has_param("n")) {
             try {
-                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 60);
+                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, kMaxAttempts);
             } catch (...) {
             }
         }
         const PollResult proc = poll_command(responses_fn_, pcmd, device);
         const PollResult tcp = poll_command(responses_fn_, tcmd, device);
-        if (!proc.ready || !tcp.ready) {
+        // The process query is essential; the TCP query is best-effort past its grace.
+        const bool tcp_done = tcp.ready || attempt >= kTcpGraceAttempts;
+        if (!proc.ready || !tcp_done) {
             if (attempt >= kMaxAttempts) {
                 note(res, "No response from the device (timed out) \xE2\x80\x94 it may have gone "
                           "offline. Re-run to retry.");
@@ -415,8 +396,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             return;
         }
 
+        // TCP is included only if it completed cleanly; otherwise the tree still renders
+        // (without inline per-process connections) and says so.
+        const bool tcp_ok = tcp.ready && !tcp.failed && !tcp.output.starts_with("error|");
         auto events = parse_tar_process_output(proc.output);
-        auto conns = tcp.failed ? std::vector<TarTcpConn>{} : parse_tar_tcp_output(tcp.output);
+        auto conns = tcp_ok ? parse_tar_tcp_output(tcp.output) : std::vector<TarTcpConn>{};
         const auto anchors = compute_tar_anchors(events);
         const std::int64_t now = now_epoch_seconds();
         const TarWindow win =
@@ -431,7 +415,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // Full tree, rendered once; running/exited/anomalies/text filtering is applied
         // client-side from the toolbar (each row carries data-state/data-anom), so a
         // filter toggle needs no re-dispatch.
-        std::string body = render_tar_tree_fragment(tree, conns, device, token, os);
+        std::string body;
+        if (!tcp_ok)
+            body += "<div class=\"tar-tree-warn\">Connection data was unavailable for this host; "
+                    "the process tree is shown without per-process network info.</div>";
+        body += render_tar_tree_fragment(tree, conns, device, token, os);
 
         ReconEntry entry;
         entry.device_id = device;
@@ -441,11 +429,14 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         entry.created = now;
         cache_put(token, std::move(entry));
 
+        // Record the data class exposed (works-council access-audit posture): `os`
+        // distinguishes a names-only Windows read from a behavioral Linux/macOS read
+        // (which carries command lines); `conns` flags whether connection data was shown.
         if (audit_fn_)
             audit_fn_(req, "tar.process_tree.read", "success", "Agent", device,
-                      std::format("preset={} from={} to={} nodes={} anomalies={}",
+                      std::format("preset={} from={} to={} nodes={} anomalies={} os={} conns={}",
                                   preset.empty() ? "10m" : preset, win.from_ts, win.to_ts,
-                                  node_count, anomaly_count));
+                                  node_count, anomaly_count, os.empty() ? "?" : os, tcp_ok ? 1 : 0));
         res.set_content(body, "text/html; charset=utf-8");
     });
 

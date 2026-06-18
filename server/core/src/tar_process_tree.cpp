@@ -9,10 +9,13 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -232,6 +235,10 @@ TarTreeAnchors compute_tar_anchors(const std::vector<TarProcEvent>& events) {
     bool first = true;
     std::int64_t boot = 0;
     for (const auto& e : events) {
+        // Ignore non-positive timestamps — a forged/garbage `ts<=0` must not poison the
+        // "observed since" / install anchor (it would otherwise drag MIN to 0/negative).
+        if (e.ts <= 0)
+            continue;
         if (first || e.ts < a.observed_since) {
             a.observed_since = e.ts;
             first = false;
@@ -275,6 +282,43 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
     if (w.to_ts < w.from_ts)
         w.to_ts = w.from_ts; // reversed range → point-in-time at `to`
     return w;
+}
+
+namespace {
+
+// Civil date → days since 1970-01-01 (Howard Hinnant). Used to parse a
+// datetime-local value as UTC without libc timezone surprises.
+std::int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+} // namespace
+
+std::int64_t parse_ts_param(const std::string& s) {
+    if (s.empty())
+        return 0;
+    if (std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        if (s.size() > 18) // > 18 digits cannot be a real epoch and risks overflow
+            return 0;
+        std::int64_t v = 0;
+        for (char c : s)
+            v = v * 10 + (c - '0'); // bounded: ≤18 digits < INT64_MAX, no overflow
+        return v;
+    }
+    int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0, Se = 0;
+    const int n = std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &Mo, &D, &H, &Mi, &Se);
+    // Bound the year so days_from_civil*86400 cannot overflow int64 and the result is
+    // a sane wall-clock; reject out-of-range fields rather than fabricate a time.
+    if (n < 5 || Y < 1970 || Y > 9999 || Mo < 1 || Mo > 12 || D < 1 || D > 31 || H < 0 || H > 23 ||
+        Mi < 0 || Mi > 59 || Se < 0 || Se > 60)
+        return 0;
+    return days_from_civil(Y, static_cast<unsigned>(Mo), static_cast<unsigned>(D)) * 86400 +
+           H * 3600 + Mi * 60 + Se;
 }
 
 namespace {
@@ -378,10 +422,17 @@ TarProcTree reconstruct_tar_process_tree(const std::vector<TarProcEvent>& events
         if (inc.running || inc.end >= from_ts)
             kept.push_back(std::move(inc));
     }
-    // 3. Node cap: keep the most-recent kTarTreeMaxNodes (largest start) on overflow.
+    // 3. Node cap: on overflow keep RUNNING incarnations first, then the most-recent
+    //    by start. Running-first matters because a long-running process whose start
+    //    aged out has start=0 (start_known=false) — ranking purely by start would drop
+    //    exactly those persistent, often forensically-interesting processes first.
     if (kept.size() > kTarTreeMaxNodes) {
         std::partial_sort(kept.begin(), kept.begin() + kTarTreeMaxNodes, kept.end(),
-                          [](const Incarnation& a, const Incarnation& b) { return a.start > b.start; });
+                          [](const Incarnation& a, const Incarnation& b) {
+                              if (a.running != b.running)
+                                  return a.running; // running before exited
+                              return a.start > b.start;
+                          });
         kept.resize(kTarTreeMaxNodes);
         tree.truncated = true;
     }
@@ -425,18 +476,24 @@ TarProcTree reconstruct_tar_process_tree(const std::vector<TarProcEvent>& events
         const std::int64_t child_start = node_lo(i);
         std::size_t best = TarProcNode::kNoParent;
         std::int64_t best_lo = INT64_MIN;
+        bool best_contains = false; // a containing parent always beats a non-containing one
         for (std::size_t pcand : it->second) {
             if (pcand == i)
                 continue;
             const std::int64_t plo = node_lo(pcand), phi = node_hi(pcand);
             const bool contains = plo <= child_start && child_start <= phi;
-            // Prefer the incarnation whose interval contains the child's start; among
-            // those, the most-recent (largest plo). If none contains, fall back to the
-            // most-recent incarnation that started before the child.
-            if (contains && plo >= best_lo) {
-                best = pcand;
-                best_lo = plo;
-            } else if (best == TarProcNode::kNoParent && plo <= child_start && plo >= best_lo) {
+            // Prefer the incarnation whose interval CONTAINS the child's start; among
+            // those, the most-recent (largest plo). Only if none contains, fall back to
+            // the most-recent incarnation that started before the child. `best_contains`
+            // is tracked separately so a containing candidate found AFTER a higher-plo
+            // non-containing fallback still wins (candidates aren't plo-sorted).
+            if (contains) {
+                if (!best_contains || plo >= best_lo) {
+                    best = pcand;
+                    best_lo = plo;
+                    best_contains = true;
+                }
+            } else if (!best_contains && plo <= child_start && plo >= best_lo) {
                 best = pcand;
                 best_lo = plo;
             }
@@ -569,16 +626,16 @@ std::string endpoint_chip(const TarTcpConn& c) {
 std::string net_cell(const std::vector<const TarTcpConn*>& conns) {
     if (conns.empty())
         return {};
-    // Distinct endpoints, public first, preserving first-seen order otherwise.
+    // Distinct endpoints, public first, preserving first-seen order otherwise. Dedup
+    // via a hash set (a single pid can own thousands of $TCP_Live rows — O(n) not O(n²)).
     std::vector<const TarTcpConn*> distinct;
-    std::vector<std::string> seen;
+    std::unordered_set<std::string> seen;
     bool any_public = false;
     for (const TarTcpConn* c : conns) {
         std::string key = c->remote_addr + ":" + std::to_string(c->remote_port) + "/" +
                           std::to_string(c->local_port);
-        if (std::find(seen.begin(), seen.end(), key) != seen.end())
+        if (!seen.insert(std::move(key)).second)
             continue;
-        seen.push_back(key);
         distinct.push_back(c);
         if (remote_class(c->remote_addr) == "pub")
             any_public = true;

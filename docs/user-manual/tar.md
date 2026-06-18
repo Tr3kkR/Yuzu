@@ -268,7 +268,7 @@ The third frame on the `/tar` page reconstructs a **per-host process tree** enti
 - **`On boot` / `On agent install` are proxies.** TAR stores no boot or install timestamp, so these anchors are derived from the retained events (install ≈ oldest retained row; boot ≈ the most recent root-process start).
 - **Windows is names-only.** On Windows the process feeder is ETW (Kernel-Process), which captures image **names only** — so per-process **path and command line are blank** on Windows (they are populated on Linux/macOS). Loaded libraries/DLLs are not captured by TAR on any platform.
 
-**Permissions:** viewing the frame requires `Infrastructure:Read`. Reconstructing a tree dispatches a read-only `tar.sql` to the device, so it additionally requires `Execution:Execute` and the device must be inside your management scope. Every reconstruction emits a `tar.process_tree.read` audit event (`device_id`, `preset`, `from`, `to`, `nodes`, `anomalies`).
+**Permissions:** viewing the frame requires `Infrastructure:Read`. Reconstructing a tree dispatches a read-only `tar.sql` to the device, so it additionally requires `Execution:Execute` and the device must be inside your management scope. The access is audited as `tar.process_tree.read` — once when the query is dispatched (recorded even if the device is offline) and again on a successful reconstruction (recording the time window, node/anomaly counts, the OS data-class, and whether connection data was shown). The device is the audit event's target.
 
 ## Forcing an immediate snapshot
 

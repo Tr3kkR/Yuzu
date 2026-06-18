@@ -283,6 +283,134 @@ TEST_CASE("tar render: few same-name siblings are not grouped", "[tar][tree][ren
     CHECK(html.find("tar-tree-group") == std::string::npos);
 }
 
+TEST_CASE("tar render: grouping threshold boundary (3 no, 4 yes)", "[tar][tree][render]") {
+    auto build = [](std::uint32_t count) {
+        std::vector<TarProcEvent> e{ev(100, "started", 1, 0, "services.exe")};
+        for (std::uint32_t i = 0; i < count; ++i)
+            e.push_back(ev(110, "started", 2000 + i, 1, "svchost.exe"));
+        auto a = compute_tar_anchors(e);
+        auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+        return render_tar_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "windows");
+    };
+    CHECK(build(3).find("tar-tree-group") == std::string::npos); // exactly 3 → no group
+    CHECK(build(4).find("tar-tree-group") != std::string::npos);  // exactly 4 → group
+}
+
+// ── Hardening-round coverage (governance Gate 3/4) ──────────────────────────
+
+TEST_CASE("tar parse_ts_param: epoch, datetime-local, and rejection", "[tar][tree][parse]") {
+    CHECK(parse_ts_param("") == 0);
+    CHECK(parse_ts_param("1718000000") == 1718000000);
+    CHECK(parse_ts_param("2026-06-18T12:00:00") == 1781784000); // verified UTC epoch
+    CHECK(parse_ts_param("2026-06-18T12:00") == parse_ts_param("2026-06-18T12:00:00")); // seconds optional
+    CHECK(parse_ts_param("9999999999999999999") == 0); // 19 digits → overflow-guarded to 0
+    CHECK(parse_ts_param("2026-13-01T00:00") == 0);     // invalid month
+    CHECK(parse_ts_param("99999-01-01T00:00") == 0);    // year out of [1970,9999]
+    CHECK(parse_ts_param("not-a-time") == 0);
+}
+
+TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {
+    std::vector<TarProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
+                                ev(-5, "started", 8, 0, "garbage"),    // negative ignored
+                                ev(1000, "started", 1, 0, "systemd")};
+    auto a = compute_tar_anchors(e);
+    CHECK(a.observed_since == 1000);
+    CHECK(a.install_ts == 1000);
+}
+
+TEST_CASE("tar anchors: boot falls back to install when no root start", "[tar][tree][anchor]") {
+    std::vector<TarProcEvent> e{ev(500, "started", 100, 50, "bash")}; // no ppid==0 start
+    auto a = compute_tar_anchors(e);
+    CHECK(a.observed_since == 500);
+    CHECK(a.boot_ts == a.install_ts); // fallback
+}
+
+TEST_CASE("tar tree: stop-without-start synthesises a start_known=false incarnation",
+          "[tar][tree]") {
+    // Only the stop survives (the start aged out of the cap). Window covers the stop.
+    std::vector<TarProcEvent> e{ev(200, "stopped", 777, 1, "ghost", "alice")};
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    const TarProcNode* n = find_pid(t, 777);
+    REQUIRE(n != nullptr);
+    CHECK_FALSE(n->start_known);
+    CHECK_FALSE(n->running);
+    CHECK(n->exited_ts == 200);
+    CHECK(n->name == "ghost");
+}
+
+TEST_CASE("tar anomaly: denylist is basename-stripped and case-insensitive", "[tar][tree][anomaly]") {
+    CHECK(tar_is_suspicious_spawn("C:\\Program Files\\Microsoft Office\\WINWORD.EXE",
+                                  "POWERSHELL.EXE"));
+    CHECK(tar_is_suspicious_spawn("/opt/MsEdge/msedge.exe", "Cmd.Exe"));
+    CHECK_FALSE(tar_is_suspicious_spawn("notepad.exe", "powershell.exe")); // benign parent
+}
+
+TEST_CASE("tar tree: parent resolution prefers the containing incarnation", "[tar][tree][reuse]") {
+    // ppid 10 has an exited incarnation [100,150] and a running one [180,..]; a child
+    // starting at 200 must link to the RUNNING (containing) incarnation, not the exited.
+    std::vector<TarProcEvent> e{
+        ev(100, "started", 10, 1, "parent"),
+        ev(150, "stopped", 10, 1, "parent"),
+        ev(180, "started", 10, 1, "parent"), // reused, running, contains 200
+        ev(200, "started", 50, 10, "child"),
+        ev(90, "started", 1, 0, "systemd"),
+    };
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    const TarProcNode* child = find_pid(t, 50);
+    REQUIRE(child != nullptr);
+    REQUIRE(child->parent != TarProcNode::kNoParent);
+    const TarProcNode& par = t.nodes[child->parent];
+    CHECK(par.pid == 10);
+    CHECK(par.running);          // the containing (live) incarnation
+    CHECK(par.started_ts == 180);
+}
+
+TEST_CASE("tar tree: cycle guard leaves a reused-pid loop node as a root", "[tar][tree][reuse]") {
+    // A forged stream where 10's parent is 20 and 20's parent is 10 (a loop). The guard
+    // must break it — every node still renders, none infinitely recurses.
+    std::vector<TarProcEvent> e{ev(100, "started", 10, 20, "a"),
+                                ev(100, "started", 20, 10, "b")};
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    REQUIRE_FALSE(t.roots.empty());      // not all nodes are children of each other
+    CHECK(t.running_count == 2);          // both reachable, counted once
+}
+
+TEST_CASE("tar tree: node cap sets truncated", "[tar][tree][cap]") {
+    std::vector<TarProcEvent> e;
+    e.reserve(kTarTreeMaxNodes + 2);
+    for (std::uint32_t i = 0; i < kTarTreeMaxNodes + 1; ++i)
+        e.push_back(ev(100 + i, "started", 1000 + i, 0, "p")); // all running roots
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 0x7fffffffLL, a);
+    CHECK(t.truncated);
+    CHECK(t.running_count == static_cast<int>(kTarTreeMaxNodes)); // capped, running kept
+}
+
+TEST_CASE("tar render: net_cell dedups, orders public first, labels listeners",
+          "[tar][tree][render][net]") {
+    std::vector<TarProcEvent> e{ev(100, "started", 42, 1, "proc")};
+    auto a = compute_tar_anchors(e);
+    auto t = reconstruct_tar_process_tree(e, 0, 1000, a);
+    auto conn = [](const char* raddr, int rport, int lport, const char* state) {
+        TarTcpConn c; c.pid = 42; c.proto = "tcp"; c.remote_addr = raddr;
+        c.remote_port = rport; c.local_port = lport; c.state = state; return c;
+    };
+    std::vector<TarTcpConn> conns{
+        conn("203.0.113.9", 443, 5001, "ESTABLISHED"),// public (sorts first, shown inline)
+        conn("203.0.113.9", 443, 5001, "ESTABLISHED"),// duplicate → deduped
+        conn("", 0, 8080, "LISTEN"),                  // listener (2nd distinct, shown inline)
+    };
+    auto html = render_tar_tree_fragment(t, conns, "d", "0123456789abcdef0123456789abcdef", "linux");
+    CHECK(html.find(":8080 listen") != std::string::npos);  // listener label
+    CHECK(html.find("203.0.113.9:443") != std::string::npos);
+    CHECK(html.find("tt-ep-pub") != std::string::npos);      // public endpoint highlighted
+    // 2 distinct endpoints (one dup removed): badge count "2" appears in the net cell.
+    CHECK(html.find("tt-net-ico\">\xE2\x86\x97</span>2") != std::string::npos);
+}
+
 TEST_CASE("tar anchors: install = min ts, boot = latest root start", "[tar][tree][anchor]") {
     std::vector<TarProcEvent> e{
         ev(100, "started", 1, 0, "systemd"),

@@ -76,7 +76,7 @@ URL structure:
 | `/fragments/tar/sql` | (existing, relocated) HTMX fragment for the SQL frame | `Infrastructure:Read` + dispatch |
 | `/fragments/tar/process-tree` | HTMX fragment for the tree viewer | `Infrastructure:Read` |
 | `/api/v1/tar/retention-status` | JSON: per-device per-source enabled/disabled | `Infrastructure:Read` |
-| `/api/v1/tar/process-tree/{device_id}` | JSON: reconstructed tree for one device | `Infrastructure:Read` |
+| `/api/v1/tar/process-tree/{device_id}` | JSON: reconstructed tree for one device — **DEFERRED, not implemented (§5.6)**; the shipped viewer is HTMX-fragment-only | `Infrastructure:Read` |
 
 ## 3. PR-A — Retention-paused source list
 
@@ -244,8 +244,13 @@ token) so row clicks need no further agent round-trip.
   cache token can't cross management scope.
 - `$Process_Live.cmdline` is already redaction-applied at capture by the agent, so no
   server-side re-redaction is needed; all agent-controlled fields are HTML-escaped.
-- Audit on every reconstruction: `action: tar.process_tree.read, detail:
-  {device_id, preset, from, to, nodes, anomalies}`.
+- Audit `tar.process_tree.read` fires twice (parity with `device.live.*`): a
+  **dispatch** row when the live query is sent (recorded even if the device is offline
+  or the poll never completes) and a **success** row after the tree renders. The device
+  is the `target_id` (not in `detail`); the success `detail` is
+  `preset=… from=… to=… nodes=… anomalies=… os=… conns=…` (`os` distinguishes a
+  names-only Windows read from a behavioral Linux/macOS one; `conns=1` flags that
+  per-process connection data was shown). See `docs/user-manual/audit-log.md`.
 
 ### 5.6 Deferred
 
@@ -285,22 +290,23 @@ The dashboard rendered the seed timestamp prominently (`Tree as observed since �
 | Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
 | TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
-| Process tree view | `Infrastructure:Read` | With redaction pass |
-| Re-seed process tree | `Infrastructure:Update` | Dispatches `tar.process_tree` to one device |
+| Process tree view (frame only) | `Infrastructure:Read` | Frame, host picker, filter bar |
+| Process tree reconstruct | `Infrastructure:Read` + `Execution:Execute` | Dispatches two read-only `tar.sql` queries to one device; per-device management scope required; emits `tar.process_tree.read` |
 
 ## 7. Observability
 
 Per `docs/observability-conventions.md`:
 
-| Metric | Type | Labels |
-|---|---|---|
-| `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` |
-| `yuzu_tar_retention_paused_devices` | gauge | `source` |
-| `yuzu_tar_purge_total` | counter | `source`, `result` |
-| `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` |
-| `yuzu_tar_process_tree_seed_age_seconds` | gauge | `device_id` (only top-N noisiest) |
+| Metric | Type | Labels | Status |
+|---|---|---|---|
+| `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
+| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
+| `yuzu_tar_purge_total` | counter | `source`, `result` | planned (purge deferred) |
+| `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` | **planned — not yet emitted** (SRE follow-up) |
 
-Audit actions: `tar.status.scan` (operator-triggered Scan fleet — emitted by PR-A.A), `tar.source.reenable` (operator-triggered Re-enable on a row — emitted by PR-A.A), `tar.source.purge` (operator-triggered purge — Phase 15.A.next), `tar.process_tree.read` (Phase 15.H), `tar.process_tree.reseed` (Phase 15.H). All carry `device_id` and `source` in `detail` where applicable.
+> The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
+
+Audit actions: `tar.status.scan` (Scan fleet — PR-A.A), `tar.source.reenable` (Re-enable a row — PR-A.A), `tar.source.purge` (purge — Phase 15.A.next, deferred), `tar.process_tree.read` (PR-H — emitted at dispatch **and** on a successful reconstruction; the device is `target_id`, never in `detail`; see `docs/user-manual/audit-log.md`). The seed-based `tar.process_tree.reseed` verb is removed (no seed).
 
 ## 8. Cross-references
 

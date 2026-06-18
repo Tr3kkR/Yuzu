@@ -139,6 +139,13 @@ TarWindow resolve_tar_window(const std::string& preset, std::int64_t custom_from
                              std::int64_t custom_to, const TarTreeAnchors& anchors,
                              std::int64_t now);
 
+/// Parse a `from`/`to` query value: either epoch-seconds (all digits) or a
+/// datetime-local value `YYYY-MM-DDTHH:MM[:SS]` interpreted as UTC. Returns 0 for
+/// empty/invalid/out-of-range input (callers treat 0 as "unset"). Overflow-guarded:
+/// an oversized digit string or an absurd year yields 0, never signed-overflow UB.
+/// Pure + free so it is unit-testable without the HTTP layer.
+std::int64_t parse_ts_param(const std::string& s);
+
 /// Reconstruct the per-host tree: build per-pid alive intervals from the event
 /// stream, keep incarnations whose lifetime overlaps `[from, to]`, link each to the
 /// parent incarnation that owned its `ppid` when it started (orphans → roots), and

@@ -11,11 +11,13 @@
 /// blocks hx-on). Per-host only; data from the agent's local tar.db only.
 ///
 /// AUTH: the frame fragment + a per-host reconstruction gate on `Infrastructure:Read`
-/// SCOPED to the device. A reconstruction additionally DISPATCHES a live `tar.sql`,
-/// so /run + /result require `Execution:Execute` (soft in-panel note for a read-only
-/// operator, mirroring the device live-info + DEX-perf posture). The reconstruction
-/// is cached under an unguessable token; the /detail route re-checks the SCOPED Read
-/// on the cached device_id so a leaked token can't cross management scope.
+/// SCOPED to the device. The READ tier follows the TAR page (the TAR SQL frame is also
+/// `Infrastructure:Read`) — NOT the `GuaranteedState:Read` floor the device-live-info /
+/// DEX-perf drills use; only the Execute-PROBE posture (soft in-panel note for a
+/// read-only operator) is shared with those seams. A reconstruction additionally
+/// DISPATCHES a live `tar.sql`, so /run + /result require `Execution:Execute`. The
+/// reconstruction is cached under an unguessable token; the /detail route re-checks the
+/// SCOPED Read on the cached device_id so a leaked token can't cross management scope.
 
 #include <yuzu/server/auth.hpp>
 
@@ -84,7 +86,11 @@ private:
 
     /// Bounded (kCacheCap) + TTL (kCacheTtlSeconds) reconstruction cache. Token is an
     /// unguessable random hex; insertion-ordered for eviction. Guarded by cache_mu_.
-    static constexpr std::size_t kCacheCap = 64;
+    /// Cap kept modest: each entry can hold up to a 50k-node tree + 5k conns, so 32 ×
+    /// worst-case bounds peak cache RSS (~0.8 GB ceiling; typical trees are far smaller).
+    /// NOTE (multi-server): this cache is node-local — a future multi-server deployment
+    /// must NOT assume a token resolves on another node.
+    static constexpr std::size_t kCacheCap = 32;
     static constexpr std::int64_t kCacheTtlSeconds = 180;
 
     void cache_put(const std::string& token, ReconEntry entry);
