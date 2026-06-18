@@ -336,7 +336,7 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). On this
+      # Postgres for server tests (ADR-0006 decision 8, #1318). On this
       # self-hosted runner the script idempotently (re)uses a persistent
       # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
       # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
@@ -580,7 +580,7 @@ jobs:
           fi
           echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
+      # Postgres for server tests (ADR-0006 decision 8, #1318).
       # Precondition on yuzu-local-windows: a native PostgreSQL 16+ service
       # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
       # see docs/ci-architecture.md "Postgres for server tests"), or a
@@ -749,7 +749,7 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). GHA
+      # Postgres for server tests (ADR-0006 decision 8, #1318). GHA
       # macOS runners have no docker; the script brew-installs
       # postgresql@18 (bottle, ~1 min), boots a throwaway trust-auth
       # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports

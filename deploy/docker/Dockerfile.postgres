@@ -56,8 +56,12 @@ FROM ${PG_BASE} AS pgvector-build
 # actual pin (PR #1334 review). Resolved 2026-06-11 via
 #   git ls-remote https://github.com/pgvector/pgvector.git refs/tags/v0.8.2
 # v0.8.2 supports PostgreSQL 18 (tested upstream on 18.x) and also carries
-# the CVE-2026-3172 fix (parallel-HNSW-build buffer overflow), so it stays
-# the right pin across the 16 → 18 base bump — same tag, same commit.
+# the CVE-2026-3172 fix (a buffer overflow in parallel HNSW index builds), so
+# it stays the right pin across the 16 → 18 base bump — same tag, same commit.
+# Advisory + release note (gov fjarvis): the 0.8.2 release announcement cites
+# the CVE fix —
+#   https://www.postgresql.org/about/news/pgvector-082-released-3245/
+#   https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md (v0.8.2)
 ARG PGVECTOR_VERSION=v0.8.2
 ARG PGVECTOR_COMMIT=cab9da72c04353f143bb06b42ab70a403daac64a
 

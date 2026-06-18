@@ -80,7 +80,10 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       -p "127.0.0.1:${DOCKER_PORT}:5432" \
       "$PG_IMAGE" >/dev/null
   fi
-  for _ in $(seq 1 30); do
+  # 120 s budget (60 × 2 s): a cold PG18 first boot runs the init scripts +
+  # pgvector extension install, which on a loaded self-hosted runner can take
+  # longer than the old 60 s (gov fjarvis).
+  for _ in $(seq 1 60); do
     # -h 127.0.0.1: the init-phase temporary server is unix-socket-only,
     # so a TCP probe can't false-positive mid-init.
     if docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -U yuzu -d yuzu_test >/dev/null 2>&1; then
@@ -89,7 +92,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 60s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
+  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 120s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
