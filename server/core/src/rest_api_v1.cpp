@@ -224,16 +224,27 @@ std::string live_result_json(const std::string& kind, const std::string& output)
 // permanently shrink capacity. `acquired` records whether we were within budget.
 class LiveInflightGuard {
 public:
-    LiveInflightGuard() {
+    // `gauge` (optional) mirrors the current in-flight depth for observability —
+    // updated to the live atomic value on acquire and release so an operator can see
+    // saturation approaching the cap (sre S1). Borrowed; the registry outlives the
+    // handler.
+    explicit LiveInflightGuard(yuzu::Gauge* gauge = nullptr) : gauge_(gauge) {
         const int cap = detail::live_max_inflight().load(std::memory_order_relaxed);
         acquired_ = inflight_.fetch_add(1, std::memory_order_acq_rel) < cap;
+        if (gauge_)
+            gauge_->set(inflight_.load(std::memory_order_relaxed));
     }
-    ~LiveInflightGuard() { inflight_.fetch_sub(1, std::memory_order_acq_rel); }
+    ~LiveInflightGuard() {
+        inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        if (gauge_)
+            gauge_->set(inflight_.load(std::memory_order_relaxed));
+    }
     LiveInflightGuard(const LiveInflightGuard&) = delete;
     LiveInflightGuard& operator=(const LiveInflightGuard&) = delete;
     bool acquired() const { return acquired_; }
 
 private:
+    yuzu::Gauge* gauge_{nullptr};
     static inline std::atomic<int> inflight_{0};
     bool acquired_{false};
 };
@@ -4960,6 +4971,17 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(data), "application/json");
         });
 
+    if (metrics_registry) {
+        metrics_registry->describe(
+            "yuzu_server_live_requests_total",
+            "Per-device live-read (/api/v1/dex/devices/{id}/live) requests by kind and terminal "
+            "HTTP status",
+            "counter");
+        metrics_registry->describe(
+            "yuzu_server_live_inflight",
+            "Current in-flight synchronous live-read polls (bounded by the concurrency cap)",
+            "gauge");
+    }
     // POST /dex/devices/{id}/live?kind=uptime|processes — live device read. Dispatches
     // a real read-only plugin instruction NOW and returns the result as JSON. The
     // machine-readable equivalent of the dashboard "Get live info" panel, which has
@@ -4975,11 +4997,26 @@ void RestApiV1::register_routes(
     // (architect B1). The read model above stays GET.
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
-        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn](
+        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry](
             const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+            // Count every live-read by kind + terminal HTTP status at handler exit
+            // (RAII, so all return paths — 200/400/403/429/500/502/503/504 — are
+            // covered without littering each branch). sre S1.
+            struct OutcomeRecorder {
+                yuzu::MetricsRegistry* reg;
+                const std::string& kind;
+                const httplib::Response& res;
+                ~OutcomeRecorder() {
+                    if (reg)
+                        reg->counter("yuzu_server_live_requests_total",
+                                     {{"kind", kind.empty() ? "unknown" : kind},
+                                      {"outcome", std::to_string(res.status)}})
+                            .increment();
+                }
+            } outcome{metrics_registry, kind, res};
             std::string plugin, action, audit_action;
             if (const auto lk = live::resolve_kind(kind)) {
                 plugin = lk->plugin;
@@ -5017,8 +5054,10 @@ void RestApiV1::register_routes(
             }
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
             // an over-budget caller gets 429 without orphaning a command. RAII releases
-            // the slot on every return below.
-            LiveInflightGuard slot;
+            // the slot on every return below; the gauge mirrors current depth.
+            yuzu::Gauge* inflight_gauge =
+                metrics_registry ? &metrics_registry->gauge("yuzu_server_live_inflight") : nullptr;
+            LiveInflightGuard slot{inflight_gauge};
             if (!slot.acquired()) {
                 res.status = 429;
                 res.set_content(detail::error_json_a4(

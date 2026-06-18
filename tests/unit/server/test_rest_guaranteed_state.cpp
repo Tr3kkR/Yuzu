@@ -83,6 +83,7 @@ struct RestGsHarness {
 
     std::vector<AuditRecord> audit_log;
 
+    yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
     RestGsHarness() : db_path(unique_temp_path("rest-gs")) {
@@ -167,7 +168,7 @@ struct RestGsHarness {
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr, store.get(),
-                            /*metrics_registry=*/nullptr,
+                            /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
@@ -996,6 +997,36 @@ TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)
     auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
     CHECK(res == nullptr);
     CHECK(h.last_live_plugin.empty()); // never dispatched
+}
+
+TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
+          "[rest][dex][device][live][metrics]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess;
+    r.output = "uptime_display|1d";
+    h.resp_store->store(r);
+
+    auto ok = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    // One uptime/200 counted; the in-flight gauge returns to 0 after the call.
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "200"}})
+              .value() == 1.0);
+    CHECK(h.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
+
+    // A 429 (cap exhausted) is counted under its own outcome label, no dispatch.
+    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
+    yuzu::server::detail::live_max_inflight().store(0);
+    auto rej = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(rej);
+    CHECK(rej->status == 429);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "429"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
