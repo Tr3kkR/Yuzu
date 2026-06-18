@@ -5010,8 +5010,9 @@ void RestApiV1::register_routes(
             }
             if (!command_dispatch_fn || !response_store) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "live device query unavailable", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "live device query unavailable", cid, 5000, ""),
+                    "application/json");
                 return;
             }
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so

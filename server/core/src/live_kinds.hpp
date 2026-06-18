@@ -12,9 +12,11 @@
 //
 // Header-only (inline): no new TU / meson wiring; both callers include it.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::live {

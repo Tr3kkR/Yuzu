@@ -786,9 +786,11 @@ TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, 
     CHECK(j["data"]["kind"].get<std::string>() == "uptime");
     CHECK(j["data"]["uptime_display"].get<std::string>() == "2d 2h 29m");
     CHECK(j["data"]["uptime_seconds"].get<int64_t>() == 181740);
+    // UP-8: the dispatch audit result must be "dispatched" (not "success") — the
+    // outcome isn't known at dispatch time. Lock it so a revert to "success" fails.
     bool audited = false;
     for (const auto& a : h.audit_log)
-        if (a.action == "device.live.uptime" && a.target_id == "WS-1")
+        if (a.action == "device.live.uptime" && a.result == "dispatched" && a.target_id == "WS-1")
             audited = true;
     CHECK(audited);
 }
@@ -817,6 +819,11 @@ TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|pat
     CHECK(sh["name"].get<std::string>() == "sh");
     CHECK(sh["sha256"].get<std::string>().rfind("deadbeefcafe0000", 0) == 0);
     CHECK(sh["path"].get<std::string>() == "/bin/sh");
+    bool audited = false; // UP-8: result is "dispatched", not "success"
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.processes" && a.result == "dispatched")
+            audited = true;
+    CHECK(audited);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited no_agents",
@@ -854,6 +861,28 @@ TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch"
 
 // ── Governance hardening-round coverage (R1) ──────────────────────────────
 
+namespace {
+// StoredResponse::status mirrors CommandResponse::Status; name the values the /live
+// poll branches on so a proto enum shuffle breaks these tests loudly (quality S4).
+constexpr int kStatusPending = 0;
+constexpr int kStatusSuccess = 1;
+constexpr int kStatusFailure = 2;
+constexpr int kStatusFatal = 3;
+
+// Exception-safe save/restore for a process-global test-seam atomic: restores in the
+// dtor so a throwing REQUIRE between mutate and restore can't poison later tests
+// (quality S1 / cpp-safety SHOULD).
+struct AtomicSave {
+    std::atomic<int>& ref;
+    int saved;
+    explicit AtomicSave(std::atomic<int>& a) : ref(a), saved(a.load()) {}
+    ~AtomicSave() { ref.store(saved); }
+    AtomicSave(const AtomicSave&) = delete;
+    AtomicSave& operator=(const AtomicSave&) = delete;
+};
+} // namespace
+
+
 TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
           "[rest][dex][device]") {
     RestGsHarness h;
@@ -872,14 +901,16 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-outp
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = 2; // FAILURE
+    r.status = kStatusFailure;
     r.output = "uptime_display|2d 2h"; // partial output present alongside the failure
     r.error_detail = "agent aborted";
     h.resp_store->store(r);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 502);
-    CHECK(res->body.find("device query failed") != std::string::npos);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
+    CHECK(j["error"]["message"].get<std::string>().find("device query failed") != std::string::npos);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
@@ -888,13 +919,16 @@ TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = 0;
+    r.status = kStatusPending;
     r.output = "error|disk subsystem offline";
     h.resp_store->store(r);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 502);
-    CHECK(res->body.find("device reported an error") != std::string::npos);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
+    CHECK(j["error"]["message"].get<std::string>().find("device reported an error") !=
+          std::string::npos);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
@@ -903,12 +937,14 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = 3; // FAILURE, no output
+    r.status = kStatusFatal; // FAILURE, no output
     r.error_detail = "plugin crashed";
     h.resp_store->store(r);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 502);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty (not a 504)",
@@ -917,7 +953,7 @@ TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
-    r.status = 1; // SUCCESS, no output rows
+    r.status = kStatusSuccess; // no output rows
     h.resp_store->store(r);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
     REQUIRE(res);
@@ -931,11 +967,9 @@ TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty
 TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
           "[rest][dex][device][live]") {
     RestGsHarness h;
-    auto& cap = yuzu::server::detail::live_max_inflight();
-    const int saved = cap.load();
-    cap.store(0); // any call is immediately over budget
+    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
+    yuzu::server::detail::live_max_inflight().store(0); // any call is over budget
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
-    cap.store(saved); // restore the process-global default before the next test
     REQUIRE(res);
     CHECK(res->status == 429);
     CHECK(h.last_live_plugin.empty()); // 429'd before dispatch — no command sent
@@ -944,16 +978,24 @@ TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no disp
 TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
           "[rest][dex][device][live]") {
     RestGsHarness h;
-    auto& mp = yuzu::server::detail::live_poll_max_polls();
-    auto& iv = yuzu::server::detail::live_poll_interval_ms();
-    const int smp = mp.load(), siv = iv.load();
-    mp.store(2);
-    iv.store(1); // ~2ms instead of ~20s — no response row is ever inserted
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1); // ~2ms not ~20s; no row inserted
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
-    mp.store(smp);
-    iv.store(siv);
     REQUIRE(res);
     CHECK(res->status == 504);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // The endpoint is POST-only (it dispatches a command). A GET must NOT reach the
+    // handler — the TestRouteSink returns nullptr when no route matches the method,
+    // mirroring httplib's 404. Locks the GET->POST migration (architect B1).
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    CHECK(res == nullptr);
+    CHECK(h.last_live_plugin.empty()); // never dispatched
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {

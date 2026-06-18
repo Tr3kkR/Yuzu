@@ -98,8 +98,10 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         CHECK(r->body.find("/fragments/device/live/result?command_id=os_info-test") !=
               std::string::npos);
         CHECK(r->body.find("kind=uptime") != std::string::npos);
-        // Usage vs machine-health audit split (works-council posture).
-        CHECK(h.audited == "device.live.uptime|success|a-1");
+        // Usage vs machine-health audit split (works-council posture). The result
+        // is "dispatched" (not "success") — the outcome isn't known at dispatch time
+        // and this stays in lockstep with the REST sibling.
+        CHECK(h.audited == "device.live.uptime|dispatched|a-1");
     }
     SECTION("processes -> processes/list_hashed, audited as device.live.processes") {
         LiveHarness h;
@@ -107,7 +109,7 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         REQUIRE(r);
         CHECK(h.seen_plugin == "processes");
         CHECK(h.seen_action == "list_hashed"); // hashed variant carries the SHA-256
-        CHECK(h.audited == "device.live.processes|success|a-1");
+        CHECK(h.audited == "device.live.processes|dispatched|a-1");
     }
     SECTION("offline device (sent=0): honest note, no polling, no auto-fire") {
         LiveHarness h;
