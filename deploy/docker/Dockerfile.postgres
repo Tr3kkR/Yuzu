@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Yuzu Postgres — the server's storage substrate (ADR-0006/0007/0008).
 #
-# PostgreSQL 16 + pgvector, plus an init script that creates the Yuzu app
+# PostgreSQL 18 + pgvector, plus an init script that creates the Yuzu app
 # role and database on first boot (docker-entrypoint-initdb.d). Per-store
 # SCHEMAs and all tables are created at runtime by the server's migration
 # runner (ADR-0008 "PgMigrationRunner") — deliberately NOT here, so the
@@ -18,7 +18,7 @@
 #   - Base image is pinned tag + manifest-list digest (multi-arch:
 #     linux/amd64 + linux/arm64 — the demo/viz rigs are arm64).
 #   - pgvector is built from source at a pinned release tag. The PGDG apt
-#     package (postgresql-16-pgvector) was considered but rejected: PGDG
+#     package (postgresql-18-pgvector) was considered but rejected: PGDG
 #     only carries the latest package revision, so an apt version pin rots
 #     as soon as PGDG supersedes it. A git release tag is reproducible for
 #     as long as the upstream repo exists.
@@ -44,9 +44,9 @@
 #   false-positive mid-init).
 
 # Global ARG so both stages use the same pinned base.
-# postgres:16.14-bookworm, multi-arch manifest list (amd64 + arm64),
-# resolved 2026-06-10.
-ARG PG_BASE=postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb0942a77e012fe74f016c114c3e25b8
+# postgres:18.4-bookworm, multi-arch manifest list (amd64 + arm64),
+# resolved 2026-06-18.
+ARG PG_BASE=postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf
 
 # ── Stage 1: build pgvector against the exact server version ────────────
 FROM ${PG_BASE} AS pgvector-build
@@ -55,11 +55,14 @@ FROM ${PG_BASE} AS pgvector-build
 # deliberately, never float. Tags are mutable refs; the commit SHA is the
 # actual pin (PR #1334 review). Resolved 2026-06-11 via
 #   git ls-remote https://github.com/pgvector/pgvector.git refs/tags/v0.8.2
+# v0.8.2 supports PostgreSQL 18 (tested upstream on 18.x) and also carries
+# the CVE-2026-3172 fix (parallel-HNSW-build buffer overflow), so it stays
+# the right pin across the 16 → 18 base bump — same tag, same commit.
 ARG PGVECTOR_VERSION=v0.8.2
 ARG PGVECTOR_COMMIT=cab9da72c04353f143bb06b42ab70a403daac64a
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git ca-certificates postgresql-server-dev-16 \
+        build-essential git ca-certificates postgresql-server-dev-18 \
     && rm -rf /var/lib/apt/lists/*
 
 # OPTFLAGS="" strips pgvector's default -march=native — this image must be

@@ -146,7 +146,7 @@ jobs:
       # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
       # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
       # fails the job here, before the test step.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
@@ -331,7 +331,7 @@ jobs:
 
       # Postgres 16 for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
@@ -510,7 +510,7 @@ jobs:
 
       # Postgres 16 for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
