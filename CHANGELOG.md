@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `query_responses` closes the dispatch→collect loop by `execution_id`.** The tool now
+  accepts an `execution_id` argument (routed to `ResponseStore::query_by_execution`) so an
+  agentic worker that dispatched via `execute_instruction` can collect exactly that run's
+  responses — exact-correlation, no cross-execution bleed — instead of the definition-wide
+  `instruction_id` collect. At least one of `execution_id`/`instruction_id` is now required (was
+  `instruction_id`-only); when both are given, `execution_id` wins. Each returned row now echoes
+  its `execution_id`. The advertised `status` filter is corrected to `integer` in the tool schema
+  (the handler always read it as the `CommandResponse` status enum; the prior `string` declaration
+  was wrong), and `limit` is now clamped to `[1,1000]` (a negative limit previously bound as an
+  unbounded SQLite `LIMIT -1`, and `limit:0` returned zero rows a worker could misread as "done").
+  Foundation for fleet-scale agentic fan-out across tens of thousands of devices. *(Scope: `limit`
+  caps a page at 1000 rows; correct collection of executions that fan out to more than 1000 devices
+  is a keyset-pagination follow-up — offset paging is deliberately not exposed, as it skips/dupes
+  rows while responses are still arriving. The sibling `aggregate_responses` tool still keys on
+  `instruction_id` only; an `execution_id` aggregate is a follow-up. MCP-first: the streaming REST
+  surface `GET /api/v1/events?execution_id=` already exists; a non-streaming polling REST collect
+  by `execution_id` is a deferred follow-up slice.)*
+
 - **Offline hosts stay visible on the fleet map.** A new born-on-Postgres store
   (`endpoint_state`) records each agent's last-known identity + last-seen on every heartbeat, so
   a host that drops out of the in-memory 60 s topology cache renders **stale-flagged** on

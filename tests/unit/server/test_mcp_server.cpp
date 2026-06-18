@@ -544,6 +544,12 @@ struct McpTestServer {
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
+    /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
+    /// ResponseStore so query_responses can be exercised end-to-end, including
+    /// the new execution_id exact-correlation collect path. Default nullptr
+    /// keeps existing tests on the "Response store unavailable" path.
+    yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
     /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
     /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
     /// nullptr keeps every existing test on the no-CA path (tools report
@@ -657,7 +663,7 @@ private:
             /*rbac_store=*/nullptr,
             /*instruction_store=*/nullptr,
             /*execution_tracker=*/execution_tracker_for_test,
-            /*response_store=*/nullptr,
+            /*response_store=*/response_store_for_test,
             /*audit_store=*/nullptr,
             /*tag_store=*/nullptr,
             /*inventory_store=*/nullptr,
@@ -2099,6 +2105,218 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
 
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|failure");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// query_responses — execution_id exact-correlation collect (agentic fan-out
+// scale-hardening, Slice 1)
+//
+// Closes the dispatch->collect loop: execute_instruction mints an execution_id,
+// every response row is stamped with it, and query_responses{execution_id}
+// returns ONLY that dispatch's rows. Exact-correlation, no legacy fallback.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+/// Seed one response row under a given (execution_id, instruction_id, agent_id).
+yuzu::server::StoredResponse mk_resp(const std::string& exec_id, const std::string& instr_id,
+                                     const std::string& agent_id, int status,
+                                     const std::string& output, int64_t ts) {
+    yuzu::server::StoredResponse r;
+    r.execution_id = exec_id;
+    r.instruction_id = instr_id;
+    r.agent_id = agent_id;
+    r.status = status;
+    r.output = output;
+    r.timestamp = ts;
+    return r;
+}
+} // namespace
+
+TEST_CASE("MCP query_responses: execution_id collects only that dispatch's rows",
+          "[mcp][integration][response][fanout]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    // Two executions of the SAME instruction. Pre-execution_id, a
+    // timestamp-window join would conflate them; exact-correlation must not.
+    store.store(mk_resp("exec-A", "instr-1", "agent-1", 0, "A1", 100));
+    store.store(mk_resp("exec-A", "instr-1", "agent-2", 0, "A2", 101));
+    store.store(mk_resp("exec-B", "instr-1", "agent-3", 0, "B1", 102));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":70,"params":{"name":"query_responses","arguments":{"execution_id":"exec-A"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    CHECK(rows.size() == 2);
+    std::set<std::string> agents;
+    for (const auto& r : rows) {
+        // Every returned row belongs to exec-A and echoes the id so the
+        // worker can verify isolation client-side.
+        CHECK(r["execution_id"] == "exec-A");
+        agents.insert(r["agent_id"].get<std::string>());
+    }
+    CHECK(agents == std::set<std::string>{"agent-1", "agent-2"});
+
+    // Precedence: when BOTH ids are supplied, execution_id wins (exact
+    // correlation), not the broader instruction_id match. instr-1 spans 3
+    // rows (exec-A + exec-B); exec-A must still return only its own 2.
+    auto both = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":76,"params":{"name":"query_responses","arguments":{"execution_id":"exec-A","instruction_id":"instr-1"}}})");
+    REQUIRE(both);
+    auto both_rows = nlohmann::json::parse(
+        nlohmann::json::parse(both->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(both_rows.size() == 2);
+    for (const auto& r : both_rows)
+        CHECK(r["execution_id"] == "exec-A");
+}
+
+TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)",
+          "[mcp][integration][response][fanout]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-A", "instr-1", "agent-1", 0, "A1", 100));
+    store.store(mk_resp("exec-B", "instr-1", "agent-3", 0, "B1", 102));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // Querying by instruction_id returns BOTH execs' rows (the legacy,
+    // definition-wide collect) — proves the new branch didn't change it.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":71,"params":{"name":"query_responses","arguments":{"instruction_id":"instr-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(rows.size() == 2);
+}
+
+TEST_CASE("MCP query_responses: rejects when neither id provided",
+          "[mcp][integration][response][fanout]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":72,"params":{"name":"query_responses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("execution_id") != std::string::npos);
+}
+
+TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no cap bypass)",
+          "[mcp][integration][response][fanout]") {
+    // Governance Gate 2 MEDIUM / UP-2 / UP-3: a lower-bound on limit is
+    // load-bearing. `limit:0` must NOT return zero rows (a worker misreads that
+    // as "done, no responses"); a negative limit must NOT bind as SQLite
+    // `LIMIT -1` (= unbounded), which would defeat the 1000-row cap. Both clamp
+    // to 1. (offset is intentionally NOT exposed — see UP-1.)
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-C", "instr-1", "agent-1", 0, "C1", 200));
+    store.store(mk_resp("exec-C", "instr-1", "agent-2", 0, "C2", 201));
+    store.store(mk_resp("exec-C", "instr-1", "agent-3", 0, "C3", 202));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto query_limit = [&](const std::string& limit_literal) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":73,)"
+                                       R"("params":{"name":"query_responses","arguments":)") +
+                           R"({"execution_id":"exec-C","limit":)" + limit_literal + "}}}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // limit:0 clamps to 1 — a non-empty result, never a false "done".
+    CHECK(query_limit("0").size() == 1);
+    // limit:-1 clamps to 1 — does NOT become an unbounded SQLite LIMIT -1.
+    CHECK(query_limit("-1").size() == 1);
+    // A normal limit returns all matching rows up to the cap.
+    CHECK(query_limit("50").size() == 3);
+}
+
+TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
+          "[mcp][integration][response][fanout][execute]") {
+    // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints
+    // the execution_id), stamp a response row with the returned id, then collect
+    // it back via query_responses{execution_id}. This is the loop an agentic
+    // worker runs at fleet scale.
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-fanout-loop-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.response_store_for_test = &store;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string& execution_id) -> std::pair<std::string, int> {
+        ts.last_dispatch_execution_id = execution_id;
+        return {"cmd-loop", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // 1. Dispatch → obtain execution_id.
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":74,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(disp);
+    auto disp_body = nlohmann::json::parse(disp->body);
+    auto exec_id =
+        nlohmann::json::parse(disp_body["result"]["content"][0]["text"].get<std::string>())
+            ["execution_id"]
+                .get<std::string>();
+    REQUIRE(!exec_id.empty());
+
+    // 2. Simulate the agent's response landing, stamped with that execution_id
+    //    (production stamps it via the command_id->execution_id map in
+    //    AgentServiceImpl; here we store directly).
+    store.store(mk_resp(exec_id, "", "agent-1", 0, "Windows 11", 300));
+
+    // 3. Collect by execution_id — the loop closes on exactly that row.
+    auto coll = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":75,)"
+                                    R"("params":{"name":"query_responses","arguments":)") +
+                        R"({"execution_id":")" + exec_id + R"("}}})");
+    REQUIRE(coll);
+    auto coll_body = nlohmann::json::parse(coll->body);
+    auto rows = nlohmann::json::parse(coll_body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0]["execution_id"] == exec_id);
+    CHECK(rows[0]["agent_id"] == "agent-1");
+    CHECK(rows[0]["output"] == "Windows 11");
 }
 
 // ── PR4 B-2: internal-CA MCP tools (MCP/REST parity for /api/v1/ca/*) ─────────

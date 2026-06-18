@@ -970,7 +970,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 }
 ```
 
-- `command_id` — legacy correlation token; pair with `query_responses` to poll individual agent results.
+- `command_id` — legacy correlation token; retained on the response body for future use. To poll individual agent results, call `query_responses` with the `execution_id` (exact — just this dispatch) or `instruction_id` (all responses to that definition); `command_id` itself is not a `query_responses` filter.
 - `execution_id` — per-run identifier required by `GET /api/v1/events` (live JSON SSE stream) and `GET /api/v1/executions/{id}` (final state lookup). Agentic workers should subscribe to the events stream with `?execution_id=<execution_id>` immediately after dispatch to watch progress in real time. Empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
 - `agents_reached` — number of agents the command was actually sent to (may be smaller than the targeted set if some are offline).
 - `definition_id` — echoes the path parameter.

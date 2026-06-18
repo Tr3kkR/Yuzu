@@ -204,8 +204,15 @@ static const ToolDef kTools[] = {
     {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
      R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})"},
 
-    {"query_responses", "Query command response data with filters.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","description":"Instruction ID (required)"},"agent_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":100,"maximum":1000}},"required":["instruction_id"]})j"},
+    {"query_responses",
+     "Query command response data. Provide execution_id to collect exactly the "
+     "responses produced by a single execute_instruction dispatch (closing the "
+     "agentic dispatch->collect loop), or instruction_id for every response to a "
+     "definition. At least one of execution_id / instruction_id is required. When "
+     "both are given, execution_id wins. Returns up to `limit` rows (max 1000); an "
+     "empty result can mean the dispatch is still in flight (responses not yet "
+     "landed) — use get_execution_status to confirm a run reached a terminal state.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j"},
 
     {"aggregate_responses", "Aggregate response data (COUNT, SUM, AVG) grouped by a column.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
@@ -1080,22 +1087,46 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                auto exec_id = param_str(args, "execution_id");
                 auto instr_id = param_str(args, "instruction_id");
-                if (instr_id.empty()) {
+                if (exec_id.empty() && instr_id.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "instruction_id is required"),
+                        error_response(id, kInvalidParams,
+                                       "one of execution_id / instruction_id is required"),
                         "application/json");
                     return;
                 }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
                 rq.status = param_int32(args, "status", -1);
-                rq.limit = std::min(param_int32(args, "limit", 100), 1000);
-                auto responses = response_store->query(instr_id, rq);
+                // Clamp BOTH bounds. Upper alone is insufficient: a negative
+                // limit (or one that wraps negative through param_int32's
+                // int64->int32 cast) binds as SQLite `LIMIT -1`, which means
+                // "unbounded" and would defeat the 1000-row cap on this
+                // fan-out path — and `limit:0` would return zero rows, which a
+                // worker misreads as "done, no responses" (governance Gate 2
+                // MEDIUM / UP-2 / UP-3). No `offset` here: offset over a
+                // *growing* result set (responses land mid-fan-out) on the
+                // non-unique `timestamp DESC` order silently skips/duplicates
+                // agents (UP-1). Correct >1000-row collection is the keyset-
+                // pagination follow-up, not offset.
+                rq.limit = std::clamp(param_int32(args, "limit", 100), 1, 1000);
+                // When execution_id is supplied, route to the exact-correlation
+                // path so the agentic dispatch->collect loop closes cleanly:
+                // execute_instruction mints the execution_id, stamps it onto
+                // every response row, and this returns ONLY that dispatch's
+                // rows. No legacy timestamp-window fallback here (unlike the
+                // dashboard sibling at workflow_routes.cpp:548) — an exec_id
+                // freshly minted by execute_instruction on this server cannot
+                // have pre-PR-2 untagged rows, so a fallback would only risk
+                // folding in another execution's responses.
+                auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
+                                                   : response_store->query(instr_id, rq);
                 JArr arr;
                 for (const auto& r : responses) {
                     arr.add(JObj()
                                 .add("agent_id", r.agent_id)
+                                .add("execution_id", r.execution_id)
                                 .add("status", r.status)
                                 .add("output", r.output)
                                 .add("timestamp", r.timestamp));
@@ -1105,7 +1136,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
                         .str();
-                mcp_audit("success", instr_id);
+                // Audit target is the primary correlation key actually used:
+                // execution_id when present (the exact-correlation path), else
+                // instruction_id. When both are supplied execution_id wins, so
+                // a dual-id call is recorded under the execution_id it served —
+                // deliberate (execution_id is the agentic-dispatch unit).
+                mcp_audit("success", !exec_id.empty() ? exec_id : instr_id);
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

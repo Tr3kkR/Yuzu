@@ -4638,7 +4638,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `query_audit_log` | Search audit events with filters |
 | `list_definitions` | List instruction definitions |
 | `get_definition` | Get a specific instruction definition |
-| `query_responses` | Query instruction responses |
+| `query_responses` | Collect responses by `execution_id` (one dispatch) or `instruction_id` |
 | `aggregate_responses` | Aggregate response data |
 | `query_inventory` | Query inventory data with filters |
 | `list_inventory_tables` | List available inventory tables |
