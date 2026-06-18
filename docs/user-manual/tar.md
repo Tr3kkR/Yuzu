@@ -214,7 +214,7 @@ config|user_oldest_ts|1710900100
 config|network_capture_method|polling
 ```
 
-The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines; the dashboard renders `—` in their absence.
+The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ## TAR dashboard page
 
@@ -225,6 +225,11 @@ The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the *
 The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
 
 **Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+
+**Row states.** Beyond a normal paused row (with a timestamp), the table surfaces two conditions and floats both to the top of the list so they aren't missed:
+
+- **"schema older than server" badge** — the agent reported the source disabled but sent no `paused_at` timestamp, i.e. it is a pre-v0.12.0 agent that lacks the field. The row sorts as the oldest entry. **Action:** upgrade the agent so it records the transition time.
+- **"value error" badge** — the agent reported a `<source>_enabled` value other than `true`/`false` (e.g. `errored`, or garbage from a corrupt or tampered `tar.db`); the reported value is shown. Previously such a source was silently omitted, hiding a paused/broken collector. **Action:** re-configure the source (`tar.configure <source>_enabled=true`) or inspect the agent's `tar.db`; if tampering is suspected, treat the device as potentially compromised.
 
 **Workflow:**
 
@@ -237,11 +242,33 @@ The first frame surfaces every device × source pair where the collector has bee
 - Viewing the page and the retention-paused list requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
 - **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
-- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle).
+- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle). When RBAC is **disabled** (the default), "your scope" is the full enrolled fleet; when RBAC is **enabled**, scope is determined by your management-group role assignments.
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 
 **Audit trail:** Every Scan emits a `tar.status.scan` audit event. Every Re-enable emits `tar.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation` or `agent_not_connected` — on rejected attempts). See `docs/user-manual/audit-log.md` for the full schema.
+
+### Process tree viewer
+
+The third frame on the `/tar` page reconstructs a **per-host process tree** entirely from that host's local TAR warehouse (`$Process_Live` + `$TCP_Live`) — no extra data is collected, and no other host is involved.
+
+**Workflow:**
+
+1. **Pick a live host** from the dropdown (only connected agents in your scope are listed). Selecting one reconstructs the default **Last 10m** window.
+2. **Choose a timescale** — the preset chips **On boot · On agent install · Last minute · Last 10m · Last hour · Last day**, or type a **custom From/To (UTC)** range and click **Apply**. Setting From == To gives a true point-in-time tree.
+3. **Read the tree.** Each row shows a running/exited dot, PID, name, owning user, and — when the process has connections — an inline network summary of remote `IP:port` endpoints (public/internet egress is highlighted). Dozens of identical-name siblings (e.g. `svchost.exe`) collapse into one `name ×N` row you can expand.
+4. **Click any process** to open the **detail panel on the right**: path, command line, user, start time, full connection list, and any anomaly evidence.
+5. **Filter** with the toolbar: **All / Running / Exited**, an **Anomalies only** toggle, and a text box that matches name, PID, or remote IP. Filters combine and apply instantly (no reload).
+
+**What "anomalies" means here:** the viewer flags **suspicious parent→child spawns** — a common-document or browser application (Word, Excel, Outlook, Chrome, Edge, …) launching a shell or LOLBin (`powershell.exe`, `cmd.exe`, `mshta.exe`, `rundll32.exe`, …). This is computed on the server from the TAR data; it is heuristic, name-based, and deliberately conservative.
+
+**Honest limitations:**
+
+- **No seed.** The tree is replayed from the retained `$Process_Live` events only. A process whose `started` event has aged out of the live-tier cap (or that started before the oldest retained row) may not appear; the banner states the observation window.
+- **`On boot` / `On agent install` are proxies.** TAR stores no boot or install timestamp, so these anchors are derived from the retained events (install ≈ oldest retained row; boot ≈ the most recent root-process start).
+- **Windows is names-only.** On Windows the process feeder is ETW (Kernel-Process), which captures image **names only** — so per-process **path and command line are blank** on Windows (they are populated on Linux/macOS). Loaded libraries/DLLs are not captured by TAR on any platform.
+
+**Permissions:** viewing the frame requires `Infrastructure:Read`. Reconstructing a tree dispatches a read-only `tar.sql` to the device, so it additionally requires `Execution:Execute` and the device must be inside your management scope. The access is audited as `tar.process_tree.read` — once when the query is dispatched (recorded even if the device is offline) and again on a successful reconstruction (recording the time window, node/anomaly counts, the OS data-class, and whether connection data was shown). The device is the audit event's target.
 
 ## Forcing an immediate snapshot
 

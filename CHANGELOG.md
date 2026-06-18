@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
 ### Added
 
 - **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
@@ -328,6 +340,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
 - **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
   set `Permissions: service-full` on `{app}\logs`, which is not a valid
   InnoSetup permission group — ISCC silently ignores it, leaving the directory
@@ -342,6 +367,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device. Both sites now match the OS prefix.
 
 ### Added
+
+- **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
+  `KekProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
+  no store writes secret columns yet).** Secret columns in PostgreSQL are
+  AES-256-GCM-encrypted app-side under a fresh per-value DEK; the DEK is
+  wrapped by the install's KEK, which lives behind the `KekProvider` seam
+  (a dedicated interface implemented by `FileKeyProvider` alongside the CA
+  `KeyProvider` contract)
+  (`secrets-kek-v<N>.key`, 0600, generated on first codec init with a
+  temp-fsync-rename atomic write) and never enters the database. Identity-
+  bound AAD makes blobs non-relocatable across rows/columns (canonical
+  length-prefixed serialization; kek_version rides the wrap layer only, so
+  rotation re-wraps DEK headers without touching payloads). The `secrets`
+  schema's `kek_meta` table registers non-secret KEK fingerprints; boot
+  verification fails closed with distinct `kek_unresolvable` / `kek_corrupt`
+  operator tokens (backup-skew and dual-server misconfigurations refuse
+  loudly). KEK lifecycle: rotation (incremental, interruptible, per-row CAS),
+  `oldest_kek_version_in_use` completion signal, retirement refused while a
+  version is active or referenced with `retired_at` destruction evidence.
+  Audit verbs `kek.generated`/`kek.rotated`/`kek.retired`/
+  `secret.decrypt_failure` and per-store failure-class counters are defined
+  as wiring seams — no audit events or metrics are emitted until the
+  per-store migration PRs wire them. Operator guidance (the
+  DB+keys-dir restore-pairing invariant, rotation, break-glass) lives in
+  `docs/user-manual/server-admin.md` "Key management (secrets KEK)". The
+  gated stores (`auth` TOTP, `webhooks`, `offload_targets`, OIDC client
+  secret) adopt the codec as each migrates to Postgres.
 
 - **Guardian: Linux systemd service guard (observe-only).** The
   `service-status-change` Guardian Spark now arms on Linux hosts with systemd,

@@ -499,6 +499,13 @@ void RbacStore::set_rbac_enabled(bool enabled) {
     }
 }
 
+bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
+    // Permit the full-fleet fallback (return false) ONLY for a store that is
+    // loaded AND explicitly disabled. Null / load-failed (!is_open()) fail
+    // CLOSED — see the header for the #1498 rationale.
+    return !(store && store->is_open() && !store->is_rbac_enabled());
+}
+
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {
