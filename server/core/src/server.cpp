@@ -584,6 +584,12 @@ public:
                           "Total Guaranteed-State events currently persisted", "gauge");
         metrics_.describe("yuzu_server_guardian_events_written_total",
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_dropped_total",
+                          "Cumulative Guaranteed-State events dropped at ingest on an event_id "
+                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
+                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
+                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -2383,6 +2389,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_dropped_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
