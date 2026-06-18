@@ -48,6 +48,12 @@
 #endif
 #include <windows.h>
 
+// Self-sufficient link (#1287): this TU calls advapi32 directly (OpenSCManagerW,
+// NotifyServiceStatusChangeW, StartServiceW, ControlService). Don't rely on a
+// sibling TU's pragma to carry advapi32 across the whole yuzu_agent_core link
+// line — mirrors updater.cpp / process_enum.cpp / temp_file.cpp.
+#pragma comment(lib, "advapi32.lib")
+
 #include <algorithm>
 #include <cctype>
 #include <string>
@@ -297,6 +303,10 @@ void ServiceGuard::run() try {
         d.rule_name = cfg_.rule_name;
         d.detected_value = det_token(got);
         d.expected_value = expected_token;
+        // #1286: every caller passes latency_us=0 by design. Unlike RegistryGuard
+        // (which times a steady_clock read), a service run-state change is delivered
+        // by the SCM via NotifyServiceStatusChangeW in an APC — kernel-push, with no
+        // agent-side read step to measure. 0 is honest here, not an unfilled field.
         d.detection_latency_us = latency_us;
         if (cfg_.enforce) {
             const ResilienceDecision dec = strategy.decide(now_ms());
