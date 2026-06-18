@@ -10,7 +10,7 @@ TAR monitors five categories of system activity:
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
-| **Processes** | **event-driven on Windows** (ETW, gap-free); 60 s poll on Linux/macOS | Process started, process stopped |
+| **Processes** | **event-driven on Windows** (ETW) **and macOS** (Endpoint Security), gap-free; 60 s poll on Linux | Process started, process stopped |
 | **Network connections** | 60 seconds (fast) | Connection opened, connection closed |
 | **Services** | 300 seconds (slow) | Service started, stopped, state changed |
 | **User sessions** | 300 seconds (slow) | User login, user logout |
@@ -68,7 +68,7 @@ Example:
 1711050423|user|login|1711050423002|{"user":"admin","domain":"CORP","logon_type":"remote","session_id":"pts/0"}
 ```
 
-> The `cmdline` field above is shown populated for a Linux example. **On Windows the process feeder is ETW (names-only), so `cmdline` is empty** — see the OS compatibility matrix below.
+> The `cmdline` field above is shown populated for a **Linux** example. **On Windows (ETW) and macOS, the process feeder is names-only, so `cmdline` is empty** — see the OS compatibility matrix below. On macOS this holds on **both paths**: when the Endpoint Security stream is unavailable the agent falls back to the `KERN_PROC_ALL` sysctl poll, which also blanks `cmdline` (only Linux populates it).
 
 ### JSON export
 
@@ -134,7 +134,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 
 | Source | Windows | Linux | macOS |
 |--------|---------|-------|-------|
-| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`sysctl`) — `KERN_PROC_ALL`. Cmdline empty for hardened-runtime processes the agent cannot inspect. |
+| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`endpoint_security`) — Endpoint Security `NOTIFY_EXEC`/`NOTIFY_EXIT` stream: **gap-free** start/stop, full image path, accurate ppid, owning user from the audit token. **Names only — no command line** (parity with the Windows ETW posture). Requires a build against the **full Xcode SDK** (the Command Line Tools SDK omits the framework), the `com.apple.developer.endpoint-security.client` entitlement, and root. Falls back to the `KERN_PROC_ALL` sysctl poll when the stream is unavailable (CLT-SDK build, missing entitlement, or non-root) — **the poll is also names-only** (it blanks the `proc_pidpath` image it would otherwise place in `cmdline`), so macOS process rows carry no command line on either path. **Boot gap** (as on Windows): processes alive before the agent's session opens get no `started` row — macOS has no AutoLogger-equivalent backfill. **Not active in current shipped builds** — the Apple entitlement + notarized release pipeline are pending (#1455), so macOS agents poll until then; check `process_capture_method` in `tar.status` to see the live path. |
 | **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
@@ -162,7 +162,7 @@ POST /api/v1/instructions/execute
 
 TAR automatically redacts sensitive command-line arguments before storing process events. Any command line matching a redaction pattern has its `cmdline` field replaced with `[REDACTED by TAR]`.
 
-> **Windows scope.** On Windows the process source is the ETW Kernel-Process feeder, which captures **image names only — it never captures a command line** (the start event carries none). The `cmdline` column is therefore empty for Windows process rows, and these redaction patterns have **no effect on Windows process events** (there is nothing to redact). They still apply to Windows **per-app perf** rows (`procperf`, matched against the image *name*) and to Linux/macOS process command lines captured by the poll. If your threat model depends on never storing command-line secrets on Windows, the ETW feeder already guarantees that structurally.
+> **Windows + macOS (stream) scope.** On Windows the process source is the ETW Kernel-Process feeder; on macOS with the Endpoint Security stream active it is likewise names-only — both capture **image names only, never a command line**. The `cmdline` column is therefore empty for those process rows, and these redaction patterns have **no effect on them** (there is nothing to redact). They still apply to **per-app perf** rows (`procperf`, matched against the image *name*) on all platforms and to **Linux** process command lines (always poll-captured). **macOS is names-only on both paths** (ES stream and sysctl poll), so these patterns have nothing to redact there either. If your threat model depends on never storing command-line secrets on Windows/macOS, both the streaming feeder and the macOS poll guarantee that structurally.
 
 Default redaction patterns:
 
@@ -312,10 +312,12 @@ TAR is designed for minimal performance overhead:
 > Three operator-visible changes:
 > - **`cmdline` is now empty for Windows process rows** (the feeder is
 >   names-only). Any dashboard, SIEM export, or Guardian rule that relied on the
->   Windows process command line will see an empty field after upgrade. Linux and
->   macOS are unchanged (the poll still captures command lines there). This is
->   intentional (works-council / data-minimization posture) and not reversible by
->   configuration — see the redaction section.
+>   Windows process command line will see an empty field after upgrade. **Linux is
+>   unchanged** (the poll still captures command lines there). **macOS is now
+>   names-only on both paths** — the Endpoint Security stream and the sysctl poll —
+>   so `cmdline` is empty there too (the poll blanks the `proc_pidpath` image it
+>   would otherwise store). This is intentional (works-council / data-minimization
+>   posture) and not reversible by configuration — see the redaction section.
 > - **Live capture is active from the next agent start** — gap-free during the
 >   live session, so short-lived processes the poll missed now appear, and
 >   `$Process_Live` holds more rows (cap raised to 100000). (One narrow seam: at
@@ -324,12 +326,28 @@ TAR is designed for minimal performance overhead:
 >   the backfill nor the live stream — tracked as a follow-up.) If the ETW session
 >   cannot start, the agent
 >   logs the reason and falls back to the `toolhelp32` poll automatically; if the
->   session later dies, it self-heals to the poll. The active path is reported by
->   the `status` action as `process_capture_method` (`etw` or `polling`). Once it
->   has fallen back to the poll, ETW capture is **not** re-established until the
->   agent restarts (so `process_capture_method=polling` on a Windows host that
->   should be on ETW indicates a prior session failure — restart the agent to
->   retry ETW).
+>   session later dies it self-heals to the poll. On Windows the death signal is
+>   immediate (the ETW `ProcessTrace` returns). On **macOS** the Endpoint Security
+>   client exposes no liveness API, so the agent treats a prolonged TOTAL silence
+>   (no exec/exit for ~1h) as presumed-dead and re-arms the poll then — the
+>   threshold is deliberately long because a NOTIFY-only client cannot distinguish a
+>   dead stream from a legitimately quiet host, and a false trip drops a healthy
+>   stream to the inferior poll. The active path is reported by the `status` action
+>   as `process_capture_method` (`etw` or `polling` on Windows; `endpoint_security`
+>   or `polling` on macOS). Once it has fallen back to the poll, stream capture is
+>   **not** re-established until the agent restarts (so `process_capture_method=polling`
+>   on a host that should be streaming indicates a prior session failure — restart
+>   the agent to retry). Two drop counters: `process_stream_dropped` is the
+>   **userspace ring-overflow** count (the drain tick fell behind; renamed from
+>   `process_etw_dropped` this release, now cross-platform), and
+>   `process_stream_kernel_dropped` is the **kernel/provider-side** drop count
+>   (Endpoint Security `seq_num` gaps on macOS; 0 on Windows ETW, which exposes no
+>   per-message sequence here).
+> - **macOS parity gap (fork-without-exec).** The Endpoint Security stream
+>   subscribes `NOTIFY_EXEC`/`NOTIFY_EXIT` only, so a child that forks but never
+>   execs is invisible until it exits (Windows ETW fires on every process create).
+>   Capturing it via `NOTIFY_FORK` is deferred (#1455) — adding it naively would
+>   double-count the overwhelmingly common fork→exec case.
 > - **Boot-window backfill requires the boot AutoLogger**, configured by the
 >   production InnoSetup installer (scoped to the `advanced` component that ships
 >   `tar.dll`) and by the developer install path (`install-agent-user.ps1`). A
@@ -372,7 +390,7 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 
 ### Key columns by table type
 
-**Process tables:** `ts`, `name`, `pid`, `ppid`, `cmdline`, `user`, `action` (started/stopped). Aggregated tiers add `start_count`, `stop_count`. **`cmdline` is empty on Windows** (the ETW feeder is names-only — see the OS compatibility matrix and the command-line redaction section); it is populated on Linux/macOS by the poll.
+**Process tables:** `ts`, `name`, `pid`, `ppid`, `cmdline`, `user`, `action` (started/stopped). Aggregated tiers add `start_count`, `stop_count`. **`cmdline` is empty on Windows (ETW) and on macOS** (names-only feeders — see the OS compatibility matrix and the command-line redaction section); it is populated on **Linux only**. macOS is names-only on **both** paths (the Endpoint Security stream and the sysctl-poll fallback).
 
 **TCP tables:** `ts`, `process_name`, `pid`, `remote_addr`, `remote_port`, `local_port`, `proto`, `state`. Aggregated tiers add `connect_count`.
 

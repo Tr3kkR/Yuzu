@@ -34,10 +34,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "if the ETW session cannot start. No command line is captured."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
-                {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
-                 "KERN_PROC_ALL via sysctl. Cmdline requires SIP-respecting "
-                 "KERN_PROCARGS2 — empty for hardened-runtime processes that "
-                 "the agent cannot inspect."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
+                 "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
+                 "path, accurate ppid, owning user from the audit token) where the "
+                 "framework + entitlement are present (full Xcode SDK build, "
+                 "com.apple.developer.endpoint-security.client, root). Falls back to "
+                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
+                 "— no command line (works-council posture); the poll blanks the "
+                 "proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
