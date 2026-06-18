@@ -68,10 +68,14 @@ returns false and self-hosted jobs are skipped with a clear reason.
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
 ADR-0006 decision 8: every tier that runs server tests gets a real
-PostgreSQL 16 and exports `YUZU_TEST_POSTGRES_DSN`. One script implements
-it everywhere — `scripts/ci/ensure-postgres.sh`, inserted as an
-`Ensure Postgres 16 (server tests)` step between Build and Test in
-ci.yml (linux / windows / macos) and nightly.yml (asan / tsan / coverage).
+PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
+**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
++ GHA-macOS legs test against it; the server SQL is version-agnostic (13+), so
+a runner-native cluster on an older major still exercises the suites
+correctly. One script implements it everywhere —
+`scripts/ci/ensure-postgres.sh`, inserted as an `Ensure Postgres (server
+tests)` step between Build and Test in ci.yml (linux / windows / macos) and
+nightly.yml (asan / tsan / coverage).
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — trusted
@@ -82,11 +86,11 @@ Resolution order inside the script:
    unless-stopped`, image pinned to the same digest as
    `deploy/docker/Dockerfile.postgres`'s base). One-time cost per runner;
    port 15432 avoids colliding with native clusters or UAT rigs on 5432.
-3. **brew** (GHA-hosted macOS, no docker) — `postgresql@16` bottle +
+3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
 4. **Native cluster on `127.0.0.1:5432`** — the generic self-hosted
-   Windows precondition: a PostgreSQL 16 Windows service with role
+   Windows precondition: a PostgreSQL 16+ Windows service with role
    `yuzu` / password `yuzu` / database `yuzu_test`, bootstrapped
    **once** per runner (installer or `choco install postgresql16`, then
    `createuser`/`createdb` as above). When `psql` is on PATH the script

@@ -821,7 +821,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 ### Provisioning a native (non-container) install
 
-Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
 
 | Install method | Helper location | Invocation |
 |---|---|---|
