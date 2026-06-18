@@ -41,6 +41,7 @@ shared_library(
     'src/tar_perf.cpp',
     'src/tar_proc_perf.cpp',
     'src/tar_proc_stream.cpp',
+    'src/tar_module_stream.cpp',
     'src/tar_proc_etw.cpp',
     'src/tar_proc_es.cpp',
     'src/tar_service_collector.cpp',

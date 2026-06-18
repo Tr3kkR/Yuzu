@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
+  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  image-load activity (module name + directory + code-signing verdict) — the
+  DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
+  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
+  opt-in (`module_enabled`, default off). The process-stream ring is promoted to
+  a reusable `EventRing<T>` template (no behaviour change for the `process`
+  source), and `run_aggregation` is now data-driven over the capture-source
+  registry so a newly-registered source's rollups can no longer be silently
+  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
 - **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
   The TAR `process` source on macOS now feeds from the Endpoint Security
   `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl
@@ -340,6 +352,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
+  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
+  on `tar.status` because every source defaulted its enabled flag to `true`.
+  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
+  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
+  transition from a single source of truth — so status, retention, and the
+  retention-paused list all agree the source starts disabled (and the first
+  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
+  an agent that never set these keys now reports `<source>_enabled|false` on
+  `tar.status` where it previously reported `true`; **no data collection
+  changes** (collection was already gated off), so this only affects automation
+  that parses `tar.status` to inventory active sources.
 - **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
   The `/tar` retention-paused list had three defects: (a) a source whose
   `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered

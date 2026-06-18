@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace yuzu::tar {
@@ -53,14 +55,21 @@ struct ProcEvent {
 
 /// Bounded ring buffer bridging a push-based consumer thread/queue (producer) to
 /// the pull-based drain tick (consumer). Overflow drops the incoming event and
-/// bumps `dropped_` (the blast-radius / fan-out backpressure idiom) so a
-/// process-spawn storm can neither grow memory without bound nor block the
-/// producer. push() never blocks.
-class ProcEventRing {
+/// bumps `dropped_` (the blast-radius / fan-out backpressure idiom) so an event
+/// storm can neither grow memory without bound nor block the producer. push()
+/// never blocks.
+///
+/// Templated over the event type so every gap-free TAR collector shares ONE
+/// backpressure idiom rather than forking it: `ProcEventRing` (process exec/exit,
+/// below) and `ModuleEventRing` (module/image loads, tar_module_stream.hpp) are
+/// both just `EventRing<T>`. Header-only — the bodies are tiny; tar_proc_stream.cpp
+/// pins the ProcEvent instantiation as a translation unit.
+template <typename T>
+class EventRing {
 public:
     /// A capacity of 0 is meaningless (every push would drop); clamp to 1 so a
     /// mis-sized ring degrades to "holds one event" rather than "drops all".
-    explicit ProcEventRing(std::size_t capacity) : cap_(capacity == 0 ? 1 : capacity) {
+    explicit EventRing(std::size_t capacity) : cap_(capacity == 0 ? 1 : capacity) {
         // Pre-allocate the full capacity up front so a push() under the lock never
         // reallocates. A reallocation could throw std::bad_alloc inside the ETW /
         // Endpoint Security handler, which runs across a C (provider) frame where an
@@ -70,10 +79,45 @@ public:
     }
 
     /// Append one event. Returns false (and increments dropped()) when full.
-    bool push(ProcEvent ev);
+    bool push(T ev) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (buf_.size() >= cap_) {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        buf_.push_back(std::move(ev));
+        return true;
+    }
 
     /// Move all buffered events out for batched persistence; leaves the ring empty.
-    std::vector<ProcEvent> drain();
+    std::vector<T> drain() {
+        // The exception-safety argument below relies on the two vector swaps
+        // under the lock being noexcept; assert it so a future T or allocator
+        // that breaks nothrow-swap is caught at compile time, not at runtime in
+        // the kernel-serial callback.
+        static_assert(std::is_nothrow_swappable_v<std::vector<T>>,
+                      "EventRing::drain() needs noexcept vector swap for its "
+                      "no-throw-under-lock invariant");
+        // Allocate the replacement buffer (the only throwing op) BEFORE taking
+        // the lock and before mutating buf_. A swap() leaves buf_ at zero
+        // capacity, so re-reserving buf_ *under the lock* would, on a bad_alloc,
+        // leave buf_ permanently at zero capacity — and the next push() (which
+        // runs in the kernel-serial ETW/ES callback) would then reallocate, and
+        // a bad_alloc escaping across that C frame is undefined behaviour. By
+        // reserving `fresh` here, a throw happens before the lock with buf_
+        // untouched (still at cap_ from the ctor / previous drain), so the
+        // no-reallocation-in-the-handler invariant survives EVERY drain. Under
+        // the lock only the two noexcept vector swaps run.
+        std::vector<T> fresh;
+        fresh.reserve(cap_);
+        std::vector<T> out;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            out.swap(buf_);   // out = the drained events (old buf_, cap_ capacity)
+            buf_.swap(fresh); // buf_ = the freshly-reserved empty buffer (noexcept)
+        }
+        return out;
+    }
 
     /// Events discarded due to overflow since construction (NFR visibility).
     std::uint64_t dropped() const noexcept {
@@ -83,10 +127,14 @@ public:
 
 private:
     mutable std::mutex mu_;
-    std::vector<ProcEvent> buf_;
+    std::vector<T> buf_;
     std::size_t cap_;
     std::atomic<std::uint64_t> dropped_{0};
 };
+
+/// The process exec/exit ring — the canonical EventRing instantiation, shared by
+/// the ETW (Windows) and Endpoint Security (macOS) process collectors.
+using ProcEventRing = EventRing<ProcEvent>;
 
 /// Common interface for a gap-free process start/stop stream — ETW on Windows
 /// (ProcEtwCollector), Endpoint Security on macOS (ProcEsCollector). The TAR
@@ -97,6 +145,15 @@ private:
 class ProcStreamCollector {
 public:
     virtual ~ProcStreamCollector() = default;
+
+    // Non-copyable / non-movable: a concrete collector owns a live ETW session
+    // or ES client — copying or slicing it would duplicate or sever that
+    // ownership. (Sibling invariant: ImageStreamCollector is identical.)
+    ProcStreamCollector() = default;
+    ProcStreamCollector(const ProcStreamCollector&) = delete;
+    ProcStreamCollector& operator=(const ProcStreamCollector&) = delete;
+    ProcStreamCollector(ProcStreamCollector&&) = delete;
+    ProcStreamCollector& operator=(ProcStreamCollector&&) = delete;
 
     /// Begin streaming. Returns false if unavailable (wrong platform, missing
     /// entitlement/privilege, session-open failure) — caller falls back to poll.
