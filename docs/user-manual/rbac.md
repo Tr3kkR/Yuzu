@@ -13,6 +13,25 @@ Toggle RBAC via the Settings page or the server configuration file:
 enabled = true
 ```
 
+> **Before enabling RBAC in production:** ensure every operator who needs device
+> visibility has at least one management-group role assignment. With RBAC
+> **disabled**, all authenticated users see the full enrolled fleet. Turning RBAC
+> **on** immediately applies role-scoped visibility — a user without a
+> management-group role assignment will see **no agents** (including on the TAR
+> fleet scan), and the role-grant endpoints themselves require an existing group
+> role, which can be a chicken-and-egg lockout. The broadest grant is an
+> `ITServiceOwner` role on the root "All Devices" group; see
+> [`management-groups.md`](management-groups.md) for the delegation API.
+
+> **RBAC store integrity (fail-closed).** If the RBAC store cannot open or
+> migrate (e.g. a corrupt `rbac.db`), the server fails **closed**: device
+> visibility falls back to the role-scoped path for every caller, so agents stop
+> appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
+> the whole fleet being exposed. A corrupt store therefore looks like "no agents
+> in scope," not a visibility leak — check the server startup log for `RbacStore`
+> errors and the `/health` store status, then restore or remove the file and
+> restart.
+
 ## Concepts
 
 | Concept | Description |

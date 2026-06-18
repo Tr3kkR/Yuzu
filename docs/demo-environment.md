@@ -16,7 +16,7 @@ point it at a new release.
 | Tier | Image | Base |
 |------|-------|------|
 | Server | `ghcr.io/<owner>/yuzu-server-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
-| Postgres (server substrate, #1318) | `ghcr.io/<owner>/yuzu-postgres:<version>` | `postgres:16` + pgvector (no `-chisel` variant — same image production composes use) |
+| Postgres (server substrate, #1318) | `ghcr.io/<owner>/yuzu-postgres:<version>` | `postgres:18` + pgvector (no `-chisel` variant — same image production composes use) |
 | Gateway | `ghcr.io/<owner>/yuzu-gateway-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
 | Agents (×N, default 10) | `ghcr.io/<owner>/yuzu-agent-chisel:<version>` | chiselled Ubuntu 26.04, `FROM scratch` |
 

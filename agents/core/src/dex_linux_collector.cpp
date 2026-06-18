@@ -25,6 +25,7 @@
 #include "dex_linux_journal.hpp" // parse_journal_line, kMsgId* (journald → DEX)
 #include "dex_linux_proc.hpp"
 #include "dex_linux_storage.hpp"  // storage_low_observation — the non-PII subject chokepoint
+#include "dex_linux_sysfs.hpp"    // parse_throttle_count — /sys thermal-throttle counter
 #include "dex_macos_signals.hpp"  // uptime_observation (shared cross-platform os.uptime_report)
 #include "dex_perf_breach.hpp"    // breach_update, kCpuBreach/kMemoryBreach, *_observation
 #include "dex_win_poll.hpp"       // DiskLevel, latch_should_emit
@@ -39,6 +40,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem> // /sys/devices/system/cpu/cpu* enumeration for the throttle poll
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -214,6 +216,7 @@ private:
                 if (now - last_disk_poll_ >= kDiskIntervalSeconds) {
                     last_disk_poll_ = now;
                     poll_disks();
+                    poll_throttle(); // CPU thermal throttling — same slow hardware-state cadence
                 }
                 if (now - last_journald_poll_ >= kJournaldIntervalSeconds) {
                     last_journald_poll_ = now;
@@ -284,6 +287,79 @@ private:
         if (const auto avg =
                 win::breach_update(mem_breach_, mem_pct, mem_valid, win::kMemoryBreach))
             emit(win::memory_pressure_observation(*avg));
+
+        // Disk service time (await) — the Linux analogue of the Windows
+        // IOCTL_DISK_PERFORMANCE per-IO latency, summed over the whole physical disks
+        // (/proc/diskstats reports times already in ms). Same hysteresis + 25 ms
+        // threshold as Windows (win::kDiskLatBreach) via the SAME breach_update, so a
+        // slow Linux disk renders identically to a slow Windows one. The first poll
+        // (and any unreadable one) only re-baselines — disk_await_ms treats it as a gap.
+        bool disk_valid = false;
+        double disk_ms = 0.0;
+        if (const auto ds = read_proc_file("/proc/diskstats")) {
+            const lnx::DiskIoTotals cur = lnx::parse_diskstats(*ds);
+            if (const auto await = lnx::disk_await_ms(prev_disk_, cur)) {
+                disk_ms = *await;
+                disk_valid = true;
+            }
+            prev_disk_ = cur; // baseline the next interval (even if this one was invalid)
+        } else {
+            prev_disk_ = lnx::DiskIoTotals{}; // unreadable — drop the baseline
+        }
+        if (const auto avg =
+                win::breach_update(disk_lat_breach_, disk_ms, disk_valid, win::kDiskLatBreach))
+            emit(win::disk_latency_observation(*avg));
+    }
+
+    // CPU thermal throttling via /sys — a transition-latched hardware-state poll (the
+    // storage.low shape, NOT a sustained breach). core_throttle_count is a monotonic
+    // per-core count of throttling episodes; summed across cores, an INCREASE since the
+    // last poll means the CPU throttled this interval. Latch on entry, suppress while it
+    // keeps throttling, re-arm on an interval with no new throttling. No thermal_throttle
+    // interface (VM / non-x86) → no read → never emits (no false positive). Reused
+    // hw.cpu_throttled obs_type (the Windows Kernel-Processor-Power 37 analogue).
+    void poll_throttle() {
+        // PER-CORE counts (cpuN -> core_throttle_count), NOT a single sum: a summed
+        // counter cannot distinguish a genuine throttle from a CPU offlining/onlining
+        // (vCPU hotplug, SMT toggle), where the sum drops then jumps and fabricates a
+        // throttle on the re-online edge (Gate-4 UP-5 / Gate-8). Comparing per-core and
+        // counting ONLY cores present in BOTH samples makes hotplug invisible.
+        lnx::ThrottleCounts cur;
+        std::error_code ec;
+        const std::filesystem::path cpus{"/sys/devices/system/cpu"};
+        for (std::filesystem::directory_iterator it{cpus, ec}, end; !ec && it != end;
+             it.increment(ec)) {
+            std::string name = it->path().filename().string();
+            if (name.size() <= 3 || name.compare(0, 3, "cpu") != 0)
+                continue;
+            if (!std::all_of(name.begin() + 3, name.end(),
+                             [](unsigned char c) { return c >= '0' && c <= '9'; }))
+                continue; // "cpu0".."cpuN" only — skip "cpufreq", "cpuidle", …
+            const std::string path =
+                (it->path() / "thermal_throttle" / "core_throttle_count").string();
+            if (const auto content = read_proc_file(path.c_str()))
+                if (const auto v = lnx::parse_throttle_count(*content))
+                    cur.emplace(std::move(name), *v);
+        }
+        if (cur.empty())
+            return; // no thermal_throttle interface — leave prev untouched, never emit
+        if (!prev_throttle_counts_.empty()) {
+            // Throttling iff SOME core present in both samples incremented (pure +
+            // unit-tested in dex_linux_sysfs). A core that appeared (re-online) or
+            // disappeared (offline) is never compared, so hotplug cannot fire a spurious
+            // throttle. The latch re-arms only when no common core increments — bounded
+            // to one observation per throttling episode.
+            const bool throttling = lnx::throttle_increased(prev_throttle_counts_, cur);
+            if (win::latch_should_emit(throttling, /*valid=*/true, throttle_reported_)) {
+                SignalObservation o;
+                o.obs_type = "hw.cpu_throttled";
+                o.subject = "cpu";
+                o.reason = "thermal-throttle";
+                o.sentence = "CPU thermal throttling detected";
+                emit(std::move(o));
+            }
+        }
+        prev_throttle_counts_ = std::move(cur);
     }
 
     // Poll-and-latch storage.low over real local filesystems, via the SAME pure
@@ -462,7 +538,10 @@ private:
     std::int64_t last_uptime_poll_ = 0;
     int proc_stat_fail_streak_ = 0;                          // consecutive /proc/stat read misses
     lnx::CpuJiffies prev_cpu_;                               // valid=false until the first read
-    win::BreachState cpu_breach_, mem_breach_;              // sustained-breach latches
+    lnx::DiskIoTotals prev_disk_;                            // valid=false until the first diskstats read
+    win::BreachState cpu_breach_, mem_breach_, disk_lat_breach_; // sustained-breach latches
+    lnx::ThrottleCounts prev_throttle_counts_;             // per-core core_throttle_count, prior snapshot
+    bool throttle_reported_ = false;                        // hw.cpu_throttled poll-and-latch
     std::unordered_map<std::string, bool> disk_low_reported_; // per-device storage.low latch
     std::string journal_cursor_;                              // "" until baselined at the journal tail
     lnx::JournalDebounce journal_debounce_{kJournaldDebounceSeconds}; // per-(type,subject) flap collapse

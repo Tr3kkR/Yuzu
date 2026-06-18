@@ -18,6 +18,14 @@ usage() {
     echo "  --output DIR       Output directory (default: ./yuzu-backup-TIMESTAMP)"
     echo "  --no-color         Disable colored output"
     echo "  --help             Show this help"
+    echo ""
+    echo "NOT COVERED by this script (back up separately — see"
+    echo "docs/user-manual/server-admin.md 'PostgreSQL Substrate' and"
+    echo "'Key management (secrets KEK)'):"
+    echo "  * The PostgreSQL database (pg_dump --format=custom ...)"
+    echo "  * The CA/keys directory (--ca-dir; default /etc/yuzu/certs) —"
+    echo "    a Postgres restore is UNUSABLE without the paired keys dir"
+    echo "    once envelope-encrypted secrets land (ADR-0010)"
 }
 
 green()  { if $NO_COLOR; then echo "$1"; else echo -e "\033[32m$1\033[0m"; fi; }
@@ -111,3 +119,15 @@ echo "=== Backup Complete ==="
 green "Files:  $FILE_COUNT"
 green "Size:   $((TOTAL_SIZE / 1024)) KB"
 green "Output: $OUTPUT"
+
+# Restore-pairing warning (ADR-0010 / governance Gate 6): this script covers
+# SQLite + config files ONLY. A deployment on the PostgreSQL substrate also
+# needs a pg_dump AND the CA/keys directory captured on the same schedule —
+# a Postgres restore without the paired keys dir cannot recover any
+# envelope-encrypted secret.
+echo ""
+echo "WARNING: NOT included in this backup:"
+echo "  * PostgreSQL database (use pg_dump --format=custom; see"
+echo "    docs/user-manual/server-admin.md 'Backing up PostgreSQL state')"
+echo "  * CA/keys directory (--ca-dir, default /etc/yuzu/certs) — pair it"
+echo "    with every database backup (ADR-0010 restore-pairing invariant)"

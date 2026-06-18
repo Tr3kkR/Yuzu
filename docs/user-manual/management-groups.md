@@ -49,6 +49,16 @@ When RBAC is enabled, the agent list shown in the dashboard and returned by the 
 
 For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
 
+> **When RBAC is disabled (the default posture):** management-group role
+> assignments are **not** consulted. Every authenticated user sees the full
+> enrolled agent set, matching the legacy-admin "full access" behaviour. The
+> dashboard agent list, the `/api/agents` endpoint, and the TAR fleet scan all
+> draw from this path. If you later **enable** RBAC, visibility immediately
+> becomes role-scoped — ensure users have appropriate management-group role
+> assignments *before* enabling RBAC in production (see "Enabling RBAC" in
+> [`rbac.md`](rbac.md)), or operators without a role assignment will see no
+> agents.
+
 ## REST API
 
 All endpoints require authentication (session cookie or API token). Management group operations require appropriate RBAC permissions on the `ManagementGroup` securable type.
