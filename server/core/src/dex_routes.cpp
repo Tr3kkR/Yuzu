@@ -454,7 +454,12 @@ struct DexFamilyRollup {
     int64_t events = 0;
     int active = 0;
     int total = 0;
-    int64_t devices = 0;
+    // #1374: the MAX of member signals' distinct-device counts, NOT the family-wide
+    // union. Two disjoint 50-device signals yield 50, not 100. Named explicitly so
+    // the UI label and the health-deduction basis agree (a true union would need a
+    // per-family COUNT(DISTINCT agent_id) query — deferred; this is a secondary,
+    // already-cross-family-overlapping composite).
+    int64_t max_signal_devices = 0;
     const DexSignalCount* top = nullptr;
     bool benign = false;
 };
@@ -475,8 +480,8 @@ DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
         r.events += c->count;
         if (c->count > 0)
             ++r.active;
-        if (c->distinct_devices > r.devices)
-            r.devices = c->distinct_devices;
+        if (c->distinct_devices > r.max_signal_devices)
+            r.max_signal_devices = c->distinct_devices; // #1374: max, not union (see field doc)
         if (!r.top || c->count > r.top->count)
             r.top = c;
     }
@@ -782,13 +787,15 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
               osf == "all" ? "on your fleet" : "on " + osf);
     h += tile(r.benign ? "ok" : (r.events > 0 ? "warn" : ""), num(r.events),
               r.benign ? "Reports (window)" : "Events (window)", "");
-    h += tile("", num(r.devices), "Devices affected", "");
+    h += tile("", num(r.max_signal_devices), "Peak signal devices", "largest single signal");
     h += "</div>";
 
     h += "<div class=\"gp-sech\">Signals in this family</div>";
     h += "<div class=\"gp-note\">Every catalogued type is listed. <b>Monitored</b> rows are watched "
          "by a connected platform (lit even at zero events); <b>not collected</b> rows have no "
-         "platform in view that emits them. Devices is the blast radius (distinct devices).</div>";
+         "platform in view that emits them. <b>Peak signal devices</b> above is the largest single "
+         "signal's distinct-device count, not the family-wide union (two disjoint 50-device signals "
+         "read 50, not 100); the per-signal counts below are exact.</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Coverage</th>"
          "<th class=\"gp-num\">Events</th><th class=\"gp-num\">Devices</th><th>Last seen</th>"
          "</tr></thead><tbody>";
@@ -1056,7 +1063,8 @@ DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, i
                 break;
             }
         const DexFamilyRollup rr = g ? dex_family_rollup(*g, signals) : DexFamilyRollup{};
-        double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+        // #1374: largest single-signal device radius, not the family union (see field doc).
+        double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
         if (impact > 1.0)
             impact = 1.0;
         const double ded = dex_severity_points(fw.severity) * dex_preset_mult(fw, preset) * impact;
@@ -1074,7 +1082,11 @@ double dex_family_health_deduction(const DexSignalGroup& g,
     if (N <= 0)
         return 0.0;
     const DexFamilyRollup rr = dex_family_rollup(g, signals);
-    double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+    // #1374: impact uses the largest single-signal device radius, not the family
+    // union — documented in the methodology so the number and label agree. A union
+    // would deduct more for disjoint-device families; this stays the (intentionally
+    // approximate, cross-family-overlapping) secondary composite.
+    double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
     if (impact > 1.0)
         impact = 1.0;
     for (const auto& fw : dex_family_weights())
