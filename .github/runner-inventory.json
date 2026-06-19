@@ -17,11 +17,32 @@
       "installed": "2026-04-14"
     },
     {
-      "name": "scw-eager-lumiere",
-      "host": "Scaleway VPS (Ubuntu 24.04, 4 vCPU, 7.7 GB RAM, ~45 GB disk)",
-      "labels": ["self-hosted", "Linux", "X64", "yuzu-cloud-builder"],
-      "role": "Cloud-side Linux capacity sharing the [self-hosted, Linux, X64] label set with yuzu-wsl2-linux. The yuzu-cloud-builder label exists for future opt-in pinning of jobs that should land here specifically. Disk is tighter than the WSL2 box — sanitizer-tests.yml's ≥30 GB preflight will fail-fast if a sanitizer dispatch lands on this runner; that is intentional and the dispatch will retry on yuzu-wsl2-linux.",
-      "installed": "2026-05-04"
+      "name": "yuzu-bigtam-linux-0",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "installed": "2026-06-19"
+    },
+    {
+      "name": "yuzu-bigtam-linux-1",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "installed": "2026-06-19"
+    },
+    {
+      "name": "yuzu-bigtam-linux-2",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "installed": "2026-06-19"
+    },
+    {
+      "name": "yuzu-bigtam-linux-3",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "installed": "2026-06-19"
     }
   ]
 }
