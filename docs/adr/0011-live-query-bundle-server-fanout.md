@@ -134,6 +134,18 @@ instances (true HA). This migration is a **committed direction recorded here so 
 deferred from v1 by scope only, not by doubt. The in-memory implementation must carry a code
 comment at the store pointing back to this ADR section.
 
+**Per-surface manifests in v1 (folds into this migration).** Because the v1 manifest is
+in-memory, each transport surface owns its own `BundleOrchestrator` instance: a bundle
+dispatched via REST is collated via REST, and one dispatched via MCP is collated via MCP. This
+is adequate because **every real caller stays on one transport** — ServiceNow dispatches and
+polls over REST; an agentic worker dispatches and polls over MCP — so cross-surface collation
+(dispatch on one surface, collate on the other) is not a v1 use case. The REST/MCP *parity* the
+agentic-first principle requires is satisfied by both surfaces offering the same capability over
+the same transport-agnostic core, not by shared in-flight state. When the manifest moves to the
+durable Postgres store above it becomes shared across surfaces (and across instances) for free,
+which is the point at which cross-surface collation becomes possible — so this is a property the
+migration *delivers*, not one v1 deliberately gives up.
+
 ## Future — Option B (deliberately deferred)
 
 If bundles need to be **first-class, live, in the executions drawer** (an operator watching a

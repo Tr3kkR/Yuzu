@@ -5,11 +5,15 @@
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
+#include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
+#include <random>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -373,6 +377,33 @@ static const ToolDef kTools[] = {
      R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
 
+    // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
+    // One instruction → several plugin actions on ONE device → collated results,
+    // via server-side async fan-out. The agent is unchanged.
+    {"execute_bundle",
+     "Fan one instruction out into several plugin actions on ONE device, async. The server "
+     "dispatches each step as an ordinary command under a shared correlation id and returns "
+     "execution_id + expected immediately (it does NOT wait). Poll get_bundle_result for the "
+     "collated result. Use this instead of N execute_instruction calls when refreshing a device "
+     "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
+     "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
+     R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
+     R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
+     R"j(},"required":["plugin","action"]}})j"
+     R"j(},"required":["agent_id","steps"]})j"},
+
+    {"get_bundle_result",
+     "Collate a bundle dispatched by execute_bundle: server-grouped "
+     "{complete, received, expected, steps[]} in request order, each step carrying its state "
+     "(pending|responded|dispatch_failed), status, and output. complete=true once every step is "
+     "terminal. Mirrors GET /api/v1/bundles/{id}. Requires Response:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("execution_id":{"type":"string","description":"The correlation id (bundle-…) returned by execute_bundle"})j"
+     R"j(},"required":["execution_id"]})j"},
+
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
     {"list_issued_certs",
      "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
@@ -404,7 +435,7 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
-    "revoke_certificate",
+    "revoke_certificate", "execute_bundle",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -453,6 +484,10 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"set_tag", {"Tag", "Write"}},
     {"delete_tag", {"Tag", "Delete"}},
     {"execute_instruction", {"Execution", "Execute"}},
+    // Live-query bundle (ADR-0011) — same securable as the underlying ops:
+    // dispatch is Execution:Execute, collate is Response:Read.
+    {"execute_bundle", {"Execution", "Execute"}},
+    {"get_bundle_result", {"Response", "Read"}},
     // Planned write tools (security metadata pre-registered)
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
@@ -528,6 +563,26 @@ McpServer::HandlerFn McpServer::build_handler(
     // which outlive the returned handler (owned by the server impl).
     const bool& is_read_only = read_only_mode;
     const bool& is_disabled = mcp_disabled;
+
+    // Live-query bundle orchestrator (ADR-0011) — backs execute_bundle /
+    // get_bundle_result. Built from the same dispatch_fn + response_store the MCP
+    // surface already has, so it is a thin wrapper over the SAME transport-agnostic
+    // core the REST routes use (rest_api_v1.cpp) — REST/MCP parity by construction.
+    // v1 manifests are per-surface + in-memory: a bundle dispatched on MCP is
+    // collated on MCP (and REST→REST). Cross-surface collation + HA + restart
+    // durability arrive when the manifest moves to Postgres (ADR-0011 "Future —
+    // durable manifest in Postgres", a committed follow-up). Captured by value in
+    // the handler below; outlives every request.
+    std::shared_ptr<BundleOrchestrator> bundle_orch;
+    if (dispatch_fn && response_store) {
+        bundle_orch = std::make_shared<BundleOrchestrator>(dispatch_fn, response_store, [] {
+            std::random_device rd;
+            const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+            char buf[17];
+            std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
+            return std::string(buf);
+        });
+    }
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
     return [=](const httplib::Request& req, httplib::Response& res) {
@@ -2447,6 +2502,115 @@ McpServer::HandlerFn McpServer::build_handler(
                 // without a separate lookup.
                 mcp_audit("success", std::string("command_id=") + command_id +
                                          " execution_id=" + execution_id);
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── execute_bundle (ADR-0011) ─────────────────────────────────
+            // Async fan-out of one instruction into several plugin actions on ONE
+            // device. Thin wrapper over the shared BundleOrchestrator — the SAME
+            // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
+            // already enforced by the C8 generic block (execute_bundle ∈
+            // kToolSecurity); this mirrors execute_instruction (perm_fn only here).
+            if (tool_name == "execute_bundle") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!bundle_orch) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Command dispatch unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "agent_id is required — a bundle targets one device"),
+                        "application/json");
+                    return;
+                }
+                if (!args.contains("steps")) {
+                    res.set_content(error_response(id, kInvalidParams, "steps is required"),
+                                    "application/json");
+                    return;
+                }
+                auto specs = validate_bundle_steps(args["steps"].dump());
+                if (!specs) {
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                                    "application/json");
+                    return;
+                }
+                // Per-step audit ("bundle.<plugin>.<action>", target_type=Agent —
+                // the works-council device-access lens, identical to the REST path)
+                // bound to this request; the orchestrator stays req-free.
+                auto bundle_audit = [&audit_fn, &req](
+                                        const std::string& verb, const std::string& result_status,
+                                        const std::string& type, const std::string& tid,
+                                        const std::string& detail) {
+                    audit_fn(req, verb, result_status, type, tid, detail);
+                };
+                BundleOrchestrator::DispatchResult r;
+                try {
+                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit);
+                } catch (const std::exception& e) {
+                    spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
+                    mcp_audit("failure", std::string("dispatch_exception: ") + e.what());
+                    res.set_content(error_response(id, kInternalError, "dispatch failed"),
+                                    "application/json");
+                    return;
+                }
+                auto result_obj = JObj()
+                                      .add("execution_id", r.correlation_id)
+                                      .add("expected", static_cast<int64_t>(r.expected))
+                                      .add("agent_id", agent_id);
+                auto result =
+                    JObj()
+                        .raw("content", JArr()
+                                            .add(JObj().add("type", "text").add("text",
+                                                                                result_obj.str()))
+                                            .str())
+                        .str();
+                mcp_audit("success", std::string("execution_id=") + r.correlation_id +
+                                         " steps=" + std::to_string(r.expected));
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── get_bundle_result (ADR-0011) ──────────────────────────────
+            // Collate a bundle dispatched by execute_bundle. Mirrors GET
+            // /api/v1/bundles/{id}; same ownership (IDOR) guard — a non-owner sees
+            // the same not-found error as an unknown id (no enumeration oracle).
+            if (tool_name == "get_bundle_result") {
+                if (!perm_fn(req, res, "Response", "Read"))
+                    return;
+                if (!bundle_orch) {
+                    res.set_content(error_response(id, kInternalError, "Response store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto exec_id = param_str(args, "execution_id");
+                if (exec_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "execution_id is required"),
+                                    "application/json");
+                    return;
+                }
+                const bool is_admin = session->role == auth::Role::admin;
+                auto agg = bundle_orch->collate(exec_id, session->username, is_admin);
+                if (!agg) {
+                    mcp_audit("denied", "not found or not owned: " + exec_id);
+                    res.set_content(error_response(id, kInvalidParams, "bundle not found"),
+                                    "application/json");
+                    return;
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr()
+                                 .add(JObj().add("type", "text").add("text", aggregate_to_json(*agg)))
+                                 .str())
+                        .str();
+                mcp_audit("success", std::string("execution_id=") + exec_id +
+                                         " complete=" + (agg->complete ? "1" : "0"));
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }
