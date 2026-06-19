@@ -147,8 +147,21 @@ plugin change.
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
 > let retention delete the paused window (#560). When adding a new always-on
 > capture source, gate collection on `source_enabled(*db_, "<name>")` and do
-> **not** add a parallel `== "false"` retention check — `run_retention` already
-> covers every registered source through the same canonical gate.
+> **not** add a parallel `== "false"` retention check — `run_retention` walks
+> `capture_sources()` and gates *every* registered source (including the opt-in
+> ones) through the same canonical helper, so retention is uniform.
+>
+> **Caveat for the opt-in collect gates.** The *retention* gate is canonical for
+> all sources, but the *collect* legs of the opt-in privacy sources (`procperf`,
+> `netqual`) deliberately read a raw `db_->get_config("<src>_enabled","false") ==
+> "true"` rather than `source_enabled()` — they default OFF and must not inherit
+> a source's `default_enabled`. That raw `== "true"` is *coincidentally*
+> fail-closed-equivalent to the canonical gate (only the literal `"true"`
+> enables), so an `errored` value still stops collection — but it is a separate
+> code path, not the shared helper. Unifying the opt-in collect gates onto
+> `canonical_source_enabled` is tracked as a follow-up; until then, the perf and
+> always-on collect legs are canonical and the two opt-in legs are raw-but-
+> equivalent.
 
 ---
 

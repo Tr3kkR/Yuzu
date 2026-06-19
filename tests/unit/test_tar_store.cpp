@@ -892,6 +892,48 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
     CHECK(found_quarantine);
 }
 
+TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
+          "[tar][store][lifecycle][corruption]") {
+    // Quarantine names are 1-second granular; two corruptions in the same wall
+    // second (or after a backward clock step) must NOT rename over each other —
+    // that would shred preserved forensic evidence. Drive two corrupt-open
+    // cycles back-to-back (same second) and assert TWO distinct `.corrupt-*`
+    // files survive.
+    auto tmp = yuzu::test::unique_temp_path("tar_collide_");
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+
+    auto corrupt_then_open = [&]() {
+        for (const char* suffix : {"-wal", "-shm"}) {
+            std::error_code ec;
+            fs::remove(fs::path{tmp.string() + suffix}, ec);
+        }
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            REQUIRE(f.is_open());
+            f << "corrupt tar.db -- collision test #559";
+        }
+        auto reopened = TarDatabase::open(tmp);
+        REQUIRE(reopened.has_value()); // quarantined + fresh DB each time
+    };
+
+    corrupt_then_open();
+    corrupt_then_open(); // same wall-second as the first → must not clobber it
+
+    int quarantine_count = 0;
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) {
+            ++quarantine_count;
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+    CHECK(quarantine_count >= 2); // both quarantines preserved, neither overwritten
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
 TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
           "[tar][store][lifecycle][corruption]") {
     // The happy path: integrity_ok returns true, so a previously-written DB is

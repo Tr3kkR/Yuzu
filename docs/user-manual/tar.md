@@ -226,17 +226,28 @@ A block is emitted for every capture source. The opt-in sources report
 `configure` (see the configuration table above). `module_live_rows` stays `0`
 until a collector for the host's OS ships.
 
+A `<source>_enabled` value can also read `errored` — automation that scrapes
+this output should match three values, not two:
+
+```
+config|process_enabled|errored
+```
+
+`errored` means the stored value is not the literal `true`/`false` the agent
+ever writes (corruption or tampering); the source is fail-closed until it is
+re-`configure`d. See the tri-state description below.
+
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ### Corrupt-database quarantine
 
-When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. Consequences an operator should know:
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
 
 - **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
 - **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
-- **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` with any SQLite tool before the new database's retention overwrites the device's storage budget; remove the sidecar manually once recovered.
+- **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
 
-If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Clear the underlying fault and restart the agent.
+If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 
 ## TAR dashboard page
 

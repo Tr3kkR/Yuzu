@@ -148,6 +148,18 @@ quarantine_corrupt_db(const std::filesystem::path& path) {
                            .count();
     std::filesystem::path dest = path;
     dest += std::format(".corrupt-{}", epoch);
+    // Collision-safe naming: `epoch` is only 1-second granular, and the wall
+    // clock can step backward (NTP correction, RTC reset). A second corruption
+    // that resolved to an already-existing `.corrupt-<epoch>` would otherwise
+    // rename ON TOP of the earlier quarantine and silently destroy preserved
+    // forensic evidence. Append a disambiguator so every quarantine is kept.
+    {
+        std::error_code exists_ec;
+        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
+            dest = path;
+            dest += std::format(".corrupt-{}-{}", epoch, n);
+        }
+    }
     std::error_code ec;
     std::filesystem::rename(path, dest, ec);
     if (ec)
