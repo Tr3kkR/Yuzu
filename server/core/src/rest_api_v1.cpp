@@ -1,4 +1,6 @@
 #include "rest_api_v1.hpp"
+#include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
+#include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -29,6 +31,8 @@
 #include <cstring>
 #include <ctime>
 #include <format>
+#include <memory>
+#include <random>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -869,6 +873,111 @@ void RestApiV1::register_routes(
         }
         res.set_content(ok_json(data.str()), "application/json");
     });
+
+    // ── Live-query bundle (/api/v1/bundles) — ADR-0011 ───────────────────
+    // One instruction → several plugin actions on ONE device → collated
+    // results, via server-side async fan-out. The agent is unchanged (it only
+    // sees ordinary commands). The same BundleOrchestrator backs the MCP tools
+    // (slice 3) — REST/MCP parity by construction. v1 manifest is in-memory;
+    // migrating it to a durable Postgres store is a committed follow-up for HA +
+    // assurance (ADR-0011 "Future — durable manifest in Postgres").
+    std::shared_ptr<BundleOrchestrator> bundle_orch;
+    if (command_dispatch_fn && response_store) {
+        bundle_orch = std::make_shared<BundleOrchestrator>(
+            command_dispatch_fn, response_store, [] {
+                std::random_device rd;
+                const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
+                return std::string(buf);
+            });
+    }
+
+    // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
+    // GET /api/v1/bundles/{id} for the collated result.
+    sink.Post("/api/v1/bundles",
+              [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
+                                                        httplib::Response& res) {
+                  if (!perm_fn(req, res, "Execution", "Execute"))
+                      return;
+                  if (!bundle_orch) {
+                      res.status = 503;
+                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      return;
+                  }
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded()) {
+                      res.status = 400;
+                      res.set_content(error_json("invalid JSON"), "application/json");
+                      return;
+                  }
+                  if (!body.contains("agent_id") || !body["agent_id"].is_string()) {
+                      res.status = 400;
+                      res.set_content(
+                          error_json("agent_id (string) is required — a bundle targets one device"),
+                          "application/json");
+                      return;
+                  }
+                  if (!body.contains("steps")) {
+                      res.status = 400;
+                      res.set_content(error_json("steps is required"), "application/json");
+                      return;
+                  }
+                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  if (!specs) {
+                      res.status = 400;
+                      res.set_content(error_json("steps: " + specs.error()), "application/json");
+                      return;
+                  }
+                  auto session = auth_fn(req, res);
+                  const std::string principal = session ? session->username : std::string{};
+                  const std::string agent_id = body["agent_id"].get<std::string>();
+                  // Per-step audit bound to this request; the orchestrator stays req-free.
+                  auto audit = [&audit_fn, &req](const std::string& verb, const std::string& result,
+                                                 const std::string& type, const std::string& id,
+                                                 const std::string& detail) {
+                      audit_fn(req, verb, result, type, id, detail);
+                  };
+                  auto r = bundle_orch->dispatch(agent_id, *specs, principal, audit);
+                  audit_fn(req, "bundle.dispatch", "success", "Execution", r.correlation_id,
+                           "agent=" + agent_id + " steps=" + std::to_string(r.expected));
+                  res.status = 202; // accepted — collect via GET /api/v1/bundles/{id}
+                  res.set_content(ok_json(JObj()
+                                              .add("execution_id", r.correlation_id)
+                                              .add("expected", static_cast<int64_t>(r.expected))
+                                              .str()),
+                                  "application/json");
+              });
+
+    // GET /api/v1/bundles/{id} — collate (poll). Server-grouped result.
+    sink.Get(R"(/api/v1/bundles/(bundle-[a-f0-9]+))",
+             [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
+                                                       httplib::Response& res) {
+                 if (!perm_fn(req, res, "Response", "Read"))
+                     return;
+                 if (!bundle_orch) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto session = auth_fn(req, res);
+                 const std::string principal = session ? session->username : std::string{};
+                 const bool is_admin = session && session->role == auth::Role::admin;
+                 const auto id = req.matches[1].str();
+                 auto agg = bundle_orch->collate(id, principal, is_admin);
+                 if (!agg) {
+                     // not-found and not-owned return the same 404 so existence
+                     // isn't an enumeration oracle; the real reason is audited.
+                     audit_fn(req, "bundle.collate", "denied", "Execution", id,
+                              "not found or not owned");
+                     res.status = 404;
+                     res.set_content(error_json("bundle not found"), "application/json");
+                     return;
+                 }
+                 audit_fn(req, "bundle.collate", "success", "Execution", id,
+                          std::string("complete=") + (agg->complete ? "1" : "0"));
+                 res.set_content(ok_json(aggregate_to_json(*agg)), "application/json");
+             });
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
