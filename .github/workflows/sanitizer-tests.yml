@@ -77,7 +77,7 @@ jobs:
           # toolchain baked in. Fail loudly if anything is missing so
           # the gate operator can fix the runner rather than accept
           # silent misconfiguration.
-          for tool in meson ninja gcc-13 g++-13 ccache python3 bison flex; do
+          for tool in meson ninja gcc-13 g++-13 ccache python3 bison flex autoconf automake libtool; do
               if ! command -v "$tool" >/dev/null; then
                   echo "::error::$tool not on PATH on yuzu-wsl2-linux runner"
                   exit 1
@@ -216,7 +216,7 @@ jobs:
 
       - name: Assert toolchain available
         run: |
-          for tool in meson ninja gcc-13 g++-13 ccache python3 bison flex; do
+          for tool in meson ninja gcc-13 g++-13 ccache python3 bison flex autoconf automake libtool; do
               if ! command -v "$tool" >/dev/null; then
                   echo "::error::$tool not on PATH on yuzu-wsl2-linux runner"
                   exit 1

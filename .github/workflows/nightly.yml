@@ -82,7 +82,7 @@ jobs:
           sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev
+            bison flex libsystemd-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -208,7 +208,7 @@ jobs:
           sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev
+            bison flex libsystemd-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -441,7 +441,7 @@ jobs:
           sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev
+            bison flex libsystemd-dev autoconf automake libtool
           # requirements-ci.txt is hash-pinned (includes gcovr for the
           # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
