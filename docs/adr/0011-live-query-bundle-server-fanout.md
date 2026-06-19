@@ -73,6 +73,12 @@ it only ever sees ordinary single commands.
    governed executions-history ladder untouched and makes the collate op the single
    authoritative source of bundle completion (`received >= expected`).
 
+   **v1 storage is an in-memory map + TTL** (the TTL doubles as the abandoned-bundle sweep). It
+   matches the instance-locality of `response_store` (still per-instance SQLite), so it is no
+   less durable than the responses during normal operation; an in-memory map is not a "store"
+   per ADR-0006, so no new-store ADR is required for v1. **This is a deliberate v1 simplification
+   with a committed migration target — see "Future: durable manifest in Postgres" below.**
+
 ## Options considered
 
 - **Agent-side `__bundle__` multiplex** — implemented + governed, then superseded (see Context).
@@ -112,6 +118,21 @@ it only ever sees ordinary single commands.
   hung plugin holds one agent worker until it returns — but a bundle is N *ordinary* commands,
   so this is the pre-existing agent-wide limitation reachable via N calls anyway, not a new
   capability. Filed as an agent-wide follow-up.
+
+## Future — durable manifest in Postgres (committed, not optional)
+
+v1's in-memory step-map is acceptable *only* because bundles are short-lived and the data is
+ephemeral. It has a real gap: a server restart mid-bundle loses the in-flight manifests
+(`command_id→action` + `expected` + `dispatched_by`), so those bundles cannot be collated
+(the responses survive in `response_store`, but attribution and `complete` do not) and the
+caller must re-dispatch. **For high availability and assurance this is not acceptable long-term:
+the bundle manifest MUST move to a durable Postgres store** (a `bundles` table under its own
+schema via `PgMigrationRunner`, per ADR-0006's "new server stores default to Postgres"). This
+makes a mid-bundle restart survivable, and — once `response_store` itself migrates off
+per-instance SQLite — is a prerequisite for serving dispatch and collate from different server
+instances (true HA). This migration is a **committed direction recorded here so it is not lost**,
+deferred from v1 by scope only, not by doubt. The in-memory implementation must carry a code
+comment at the store pointing back to this ADR section.
 
 ## Future — Option B (deliberately deferred)
 
