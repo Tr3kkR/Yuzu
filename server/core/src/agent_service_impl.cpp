@@ -1581,6 +1581,18 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     if (execution_id.starts_with("polchk-"))
         return;
 
+    // Live-query bundle correlation ids ("bundle-…", minted by
+    // BundleOrchestrator) are the same case as polchk-: NOT operator
+    // executions. A bundle stamps its N ordinary command responses with this
+    // id only so collate can read them via ResponseStore::query_by_execution;
+    // there is deliberately no ExecutionTracker row (a bundle is N commands to
+    // ONE agent, which the agent-counted tracker would mark complete after the
+    // first step — see ADR-0011). Notifying here would publish an
+    // `agent-transition` SSE event and create an orphan agent_exec_status row
+    // for a phantom execution. Skip; collate is the bundle's completion authority.
+    if (execution_id.starts_with("bundle-"))
+        return;
+
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();

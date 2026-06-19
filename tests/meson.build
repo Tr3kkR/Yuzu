@@ -225,6 +225,7 @@ if build_server
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
       'unit/server/test_bundle_service.cpp',
+      'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_audit_store.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
