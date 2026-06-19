@@ -4464,7 +4464,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list and placeholder slots for the SQL frame and process tree viewer.
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the ad-hoc TAR SQL frame, and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`).
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
