@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live-query bundles — one instruction → several plugin actions on one device,
+  collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
+  returns `202 {execution_id, expected}`) + `GET /api/v1/bundles/{id}` (collate,
+  `Response:Read`, returns `{complete, received, expected, steps[]}` in request
+  order), with MCP parity via the `execute_bundle` / `get_bundle_result` tools.
+  Collapses the N round-trips of refreshing one device (e.g. a ServiceNow CI sync)
+  to a single dispatch plus a poll. The server expands the bundle into N ordinary
+  plugin commands under one `bundle-…` correlation id and fans them out **async**
+  (a slow step never withholds the others); **the agent is unchanged** — it never
+  sees a "bundle". Each step emits its own `bundle.<plugin>.<action>` device-access
+  audit (`target_type=Agent`), so a bundle is exactly as auditable as the N
+  executions it replaces; collate enforces an ownership guard (a non-owner gets the
+  same 404 as an unknown id). Bundles are caller-polled, **not** in the live
+  executions drawer. v1 bundle state is per-surface and in-memory; a durable
+  Postgres manifest for HA + cross-surface collation is a committed follow-up
+  (ADR-0011).
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
   `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
