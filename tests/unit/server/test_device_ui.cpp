@@ -86,14 +86,20 @@ TEST_CASE("device page: live-info button enabled online, disabled offline", "[de
     CHECK(off.find("device offline") != std::string::npos);
 }
 
-TEST_CASE("device live shell: one auto-loading run panel per live instruction", "[device][ui]") {
+TEST_CASE("device live shell: collapsible cards + KPI strip + chrome", "[device][ui]") {
     const auto html = render_device_live_shell("a-1");
-    // Each panel dispatches a REAL plugin instruction at the device via the run route.
+    // Each card auto-loads its REAL plugin instruction via the run route on render.
     CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=uptime") != std::string::npos);
-    CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=processes") != std::string::npos);
+    CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=process_tree") != std::string::npos);
+    CHECK(html.find("/fragments/device/live/run?id=a-1&amp;kind=connections") != std::string::npos);
     CHECK(html.find("hx-trigger=\"load\"") != std::string::npos); // fires on render, no 30s wait
-    CHECK(html.find("Uptime") != std::string::npos);
-    CHECK(html.find("Running processes") != std::string::npos);
+    CHECK(html.find("class=\"ls-card\"") != std::string::npos);   // collapsible cards
+    CHECK(html.find("id=\"ls-kpi-uptime\"") != std::string::npos); // KPI tiles (filled via OOB)
+    CHECK(html.find("id=\"ls-kpi-procs\"") != std::string::npos);
+    CHECK(html.find("lsToggleAll(this)") != std::string::npos);   // expand/collapse all
+    CHECK(html.find("lsPopOut(event,this)") != std::string::npos); // per-card pop-out
+    CHECK(html.find("Processes") != std::string::npos);
+    CHECK(html.find("Capture sources") != std::string::npos);
 }
 
 TEST_CASE("device live value: value tile; empty -> dash", "[device][ui]") {
@@ -127,4 +133,94 @@ TEST_CASE("device live processes: hash table, search, first-10 preview", "[devic
     const auto big = render_device_live_processes(many);
     CHECK(big.find("display:none") != std::string::npos);     // rows 11+ hidden
     CHECK(big.find("Showing 10 of 15") != std::string::npos); // preview counter
+}
+
+// ── Live-snapshot v2 renderers (feat/device-live-snapshot) ──────────────────
+
+TEST_CASE("device live tree: nesting, hash, net join, suspicious flag, escaping", "[device][ui]") {
+    std::vector<LiveProcNode> nodes{
+        {4, 0, "System", "", ""},
+        {800, 4, "explorer.exe", "abc123def456", "C:\\Windows\\explorer.exe"},
+        {900, 800, "powershell.exe", "ffee", ""},     // explorer -> powershell: NOT suspicious
+        {950, 900, "<evil>", "dd", ""},               // agent-controlled name must be escaped
+    };
+    std::vector<LiveConn> conns{{800, "140.82.112.4", 443, 52000, false}};
+    const auto html = render_device_live_tree(nodes, conns);
+    CHECK(html.find("explorer.exe") != std::string::npos);
+    CHECK(html.find("tar-tree-node") != std::string::npos);             // TAR tree markup
+    CHECK(html.find("abc123def456") != std::string::npos);             // hash on the node
+    CHECK(html.find("140.82.112.4:443") != std::string::npos);         // joined connection chip
+    CHECK(html.find("tt-net-pub") != std::string::npos);               // public endpoint highlighted
+    CHECK(html.find("lsFilterTree(this)") != std::string::npos);       // name/PID/hash search bar
+    CHECK(html.find("&lt;evil&gt;") != std::string::npos);             // name HTML-escaped
+    CHECK(html.find("<evil>") == std::string::npos);                   // never raw
+    CHECK(render_device_live_tree({}, {}).find("No processes returned") != std::string::npos);
+}
+
+TEST_CASE("device live tree: same-name siblings grouped; cycle is bounded", "[device][ui]") {
+    std::vector<LiveProcNode> nodes{{4, 0, "services.exe", "", ""}};
+    for (std::uint32_t i = 0; i < 8; ++i) // 8 svchost under services -> grouped (>=5)
+        nodes.push_back({100 + i, 4, "svchost.exe", "h", ""});
+    const auto html = render_device_live_tree(nodes, {});
+    CHECK(html.find("tt-group-count") != std::string::npos); // "×8" group
+    CHECK(html.find("\xC3\x97" "8") != std::string::npos);
+    // A 2-cycle (A<->B as each other's parent) must not hang or crash — both are roots
+    // (ppid present but mutual), bounded by the depth/node caps.
+    std::vector<LiveProcNode> cyc{{10, 11, "a.exe", "", ""}, {11, 10, "b.exe", "", ""}};
+    const auto safe = render_device_live_tree(cyc, {});
+    CHECK(safe.find("a.exe") != std::string::npos);
+}
+
+TEST_CASE("device live ARP / DNS / sockets / services / users / netconfig renderers",
+          "[device][ui]") {
+    SECTION("arp: type pills + empty note") {
+        std::vector<LiveArpEntry> rows{{"Ethernet", "10.0.0.1", "00:1a:2b:3c:4d:5e", "dynamic"},
+                                       {"Ethernet", "10.0.0.9", "", "incomplete"}};
+        const auto h = render_device_live_arp(rows);
+        CHECK(h.find("00:1a:2b:3c:4d:5e") != std::string::npos);
+        CHECK(h.find("dynamic") != std::string::npos);
+        CHECK(render_device_live_arp({}).find("not available on this OS") != std::string::npos);
+    }
+    SECTION("dns: searchable, escaped, empty note") {
+        std::vector<LiveDnsEntry> rows{{"github.com", "A"}, {"<x>", "AAAA"}};
+        const auto h = render_device_live_dns(rows);
+        CHECK(h.find("github.com") != std::string::npos);
+        CHECK(h.find("lsFilterRows(this)") != std::string::npos);
+        CHECK(h.find("&lt;x&gt;") != std::string::npos);
+        CHECK(render_device_live_dns({}).find("no resolver cache") != std::string::npos);
+    }
+    SECTION("listening + connections") {
+        const auto l = render_device_live_listening({{"tcp", "0.0.0.0", 445, 4}});
+        CHECK(l.find("445") != std::string::npos);
+        const auto c = render_device_live_connections({{"tcp", "10.0.0.5:52000", "1.2.3.4:443", "ESTABLISHED"}});
+        CHECK(c.find("1.2.3.4:443") != std::string::npos);
+        CHECK(c.find("ESTABLISHED") != std::string::npos);
+    }
+    SECTION("services: running highlighted, searchable") {
+        std::vector<LiveService> rows{{"Spooler", "Print Spooler", "Running", "Automatic"},
+                                      {"wuauserv", "Windows Update", "Stopped", "Manual"}};
+        const auto h = render_device_live_services(rows);
+        CHECK(h.find("Print Spooler") != std::string::npos);
+        CHECK(h.find("Running") != std::string::npos);
+        CHECK(h.find("lsFilterRows(this)") != std::string::npos);
+    }
+    SECTION("users + netconfig") {
+        const auto u = render_device_live_users({{"CORP\\alex", "local", "Interactive", "console"}});
+        CHECK(u.find("CORP\\alex") != std::string::npos);
+        const auto n = render_device_live_netconfig({{"Ethernet", "10.0.0.5", 24, "10.0.0.1"}});
+        CHECK(n.find("10.0.0.5") != std::string::npos);
+        CHECK(n.find("10.0.0.1") != std::string::npos);
+    }
+}
+
+TEST_CASE("device live capture sources: toggle state + $-table + read-only link", "[device][ui]") {
+    std::vector<LiveCaptureSource> rows{{"process", "Process", "Activity", true, 1234},
+                                        {"arp", "ARP", "Network", false, -1}};
+    const auto h = render_device_live_capture_sources(rows);
+    CHECK(h.find("$Process_Live") != std::string::npos);
+    CHECK(h.find("1234") != std::string::npos);
+    CHECK(h.find("ls-sw on") != std::string::npos);  // process enabled (toggle on)
+    CHECK(h.find("src-off") != std::string::npos);   // arp disabled
+    CHECK(h.find("/tar") != std::string::npos);      // configure-on-TAR link (read-only here)
+    CHECK(render_device_live_capture_sources({}).find("not running") != std::string::npos);
 }

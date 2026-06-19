@@ -6,6 +6,9 @@
  *   "ip_addresses" — Lists assigned IP addresses with subnet and gateway.
  *   "dns_servers"  — Lists configured DNS servers per adapter.
  *   "proxy"        — Returns system proxy configuration.
+ *   "dns_cache"    — Returns the DNS resolver cache (Windows).
+ *   "arp"          — Returns the host ARP / neighbour table (Windows):
+ *                    arp|iface|ip|mac|type.
  *
  * Output is pipe-delimited via write_output().
  */
@@ -35,6 +38,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias (arp)
 #include <winhttp.h>
 #include <vector>
 #pragma comment(lib, "iphlpapi.lib")
@@ -535,8 +539,8 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"adapters", "ip_addresses", "dns_servers",
-                                     "proxy",    "dns_cache",    nullptr};
+        static const char* acts[] = {"adapters", "ip_addresses", "dns_servers", "proxy",
+                                     "dns_cache", "arp",         nullptr};
         return acts;
     }
 
@@ -556,12 +560,95 @@ public:
             return do_proxy(ctx);
         if (action == "dns_cache")
             return do_dns_cache(ctx);
+        if (action == "arp")
+            return do_arp(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
     }
 
 private:
+    // arp|iface|ip|mac|type — the host ARP / IPv6-neighbour table. Windows reads the
+    // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux/macOS are not yet
+    // implemented (the live ARP panel renders an honest "not available" note there).
+    // Mirrors the proven enumeration in tar_arp_collector.cpp (reimplemented here —
+    // the TAR plugin internals aren't linked into network_config).
+    static int do_arp(yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+        // Cap entries so a large/forged neighbour cache can't produce an unbounded
+        // response (mirrors the TAR collector's kArpEntryCap posture).
+        constexpr ULONG kArpEntryCap = 20000;
+
+        auto state_to_type = [](NL_NEIGHBOR_STATE st) -> const char* {
+            switch (st) {
+            case NlnsPermanent:
+                return "static";
+            case NlnsReachable:
+            case NlnsStale:
+            case NlnsDelay:
+            case NlnsProbe:
+                return "dynamic";
+            case NlnsIncomplete:
+            case NlnsUnreachable:
+                return "incomplete";
+            default:
+                return "other";
+            }
+        };
+        auto mac_string = [](const UCHAR* addr, ULONG len) -> std::string {
+            if (len == 0)
+                return "-"; // incomplete entry — no hardware address yet
+            std::string out;
+            static const char* kHex = "0123456789abcdef";
+            for (ULONG i = 0; i < len; ++i) {
+                if (i)
+                    out += ':';
+                out += kHex[addr[i] >> 4];
+                out += kHex[addr[i] & 0x0F];
+            }
+            return out;
+        };
+        auto ip_string = [](const SOCKADDR_INET& a) -> std::string {
+            char buf[INET6_ADDRSTRLEN]{};
+            if (a.si_family == AF_INET)
+                inet_ntop(AF_INET, const_cast<IN_ADDR*>(&a.Ipv4.sin_addr), buf, sizeof(buf));
+            else if (a.si_family == AF_INET6)
+                inet_ntop(AF_INET6, const_cast<IN6_ADDR*>(&a.Ipv6.sin6_addr), buf, sizeof(buf));
+            return buf;
+        };
+        auto iface_name = [](const NET_LUID& luid, NET_IFINDEX idx) -> std::string {
+            wchar_t alias[IF_MAX_STRING_SIZE + 1]{};
+            if (ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1) == NO_ERROR)
+                return wide_to_utf8(alias);
+            return std::format("if{}", static_cast<unsigned long>(idx));
+        };
+
+        PMIB_IPNET_TABLE2 table = nullptr;
+        DWORD rc = GetIpNetTable2(AF_UNSPEC, &table);
+        if (rc != NO_ERROR || table == nullptr) {
+            ctx.write_output(std::format("error|GetIpNetTable2 failed (rc={})", rc));
+            return 1;
+        }
+        ULONG emitted = 0;
+        for (ULONG i = 0; i < table->NumEntries && emitted < kArpEntryCap; ++i) {
+            const MIB_IPNET_ROW2& row = table->Table[i];
+            std::string ip = ip_string(row.Address);
+            if (ip.empty())
+                continue; // address failed to format — skip defensively
+            ctx.write_output(std::format(
+                "arp|{}|{}|{}|{}", iface_name(row.InterfaceLuid, row.InterfaceIndex), ip,
+                mac_string(row.PhysicalAddress, row.PhysicalAddressLength),
+                state_to_type(row.State)));
+            ++emitted;
+        }
+        FreeMibTable(table);
+        return 0;
+#else
+        ctx.write_output("error|arp not available on this platform");
+        return 1;
+#endif
+    }
+
     static int do_dns_cache(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
         // Dynamically load DnsGetCacheDataTable from dnsapi.dll

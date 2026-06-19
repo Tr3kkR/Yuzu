@@ -8341,12 +8341,15 @@ private:
         device_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
             guaranteed_state_store_.get(),
-            // "Get live info" dispatches real plugin instructions (os_info/uptime,
-            // processes/list_hashed) through the shared chokepoint. DELIBERATELY an
+            // "Get live info" dispatches real read-only plugin instructions through the
+            // shared chokepoint — the live-snapshot cards (processes/list_tree +
+            // network_diag/connections, services/list, users/logged_on,
+            // network_config/{ip_addresses,arp,dns_cache}, network_diag/listening +
+            // connections, tar/status) plus os_info/uptime for the KPI. DELIBERATELY an
             // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
-            // the executions drawer): the live shell auto-fires one panel per kind on
-            // every device-page open, so tracking would flood the drawer with two
-            // executions per view. This matches the already-shipped DEX device-perf
+            // the executions drawer): the snapshot auto-fires one query per card when an
+            // operator clicks Get live info, so tracking would flood the drawer with a
+            // burst of executions per view. This matches the already-shipped DEX device-perf
             // panel (also execution_id="") and the compliance polchk- skip — the same
             // high-frequency-read rationale. Agentic-first parity (a machine-readable
             // MCP/REST equivalent + discovery) for live-info AND the DEX-perf sibling

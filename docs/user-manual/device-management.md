@@ -222,14 +222,26 @@ Every per-device route is scoped to the device's management group (a global gran
 
 #### Get live info
 
-The **Get live info** button (shown when the device is online) dispatches read-only instructions to the agent **now** — not from cached heartbeat data — and renders the results:
+The **Get live info** button (shown when the device is online) dispatches read-only instructions to the agent **now** — not from cached heartbeat data — and renders a **TAR-styled live snapshot**: a KPI strip (uptime, process/service/connection/user counts) over a grid of **collapsible, uniformly-sized cards**. Cards are collapsed by default; an **Expand all / Collapse all** control toggles them together, and each card has a **pop-out (⤢)** for a larger view. Each card is one live query against the OS, dispatched through the same proven chokepoint as before.
 
-- **Uptime** — current system uptime (`os_info/uptime`). Audit verb `device.live.uptime`.
-- **Running processes** — the full process list with the **SHA-256 of each process's on-disk executable** (resolved from the kernel, not argv[0]; bounded at 512 MiB per image). The first 10 are previewed; the full list is searchable by name, PID, or hash. Audit verb `device.live.processes`.
+Each card has its own audit verb so a usage-class read (what a person is running) stays separately countable from a machine-health read — the works-council posture (see [Audit log](audit-log.md)):
 
-Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the panel shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. Dispatching the process list is **usage-class behavioral telemetry** (it reveals which programs a person is running) and is individually audit-logged — see [Audit log](audit-log.md) for the works-council posture.
+| Card | Source | Audit verb | OS |
+|---|---|---|---|
+| **Uptime** (KPI) | `os_info/uptime` | `device.live.uptime` | all |
+| **Processes** — a parent→child **tree** (TAR `/tar` viewer style), each node showing the **SHA-256** of its on-disk image and its **live network connections** (joined by PID, public endpoints highlighted); suspicious `parent→child` spawns are flagged. Searchable by name / PID / hash / endpoint. | `processes/list_tree` + `network_diag/connections` | `device.live.process_tree` | tree all; hash all; connection join Windows |
+| **Services** — run state | `services/list` | `device.live.services` | all |
+| **Adapters & IP** | `network_config/ip_addresses` | `device.live.netconfig` | all |
+| **ARP / neighbours** | `network_config/arp` | `device.live.arp` | Windows |
+| **DNS cache** | `network_config/dns_cache` | `device.live.dns_cache` | Windows |
+| **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
+| **Active connections** | `network_diag/connections` | `device.live.connections` | all |
+| **Logged-in users** | `users/logged_on` | `device.live.users` | all |
+| **Capture sources** — read-only view of which TAR warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the TAR page | `tar/status` | `device.live.capture_sources` | all |
 
-On a host with many distinct large executables the process panel can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
+Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, and logged-in-user reads are **usage-class behavioral telemetry** and are individually audit-logged.
+
+ARP and DNS-cache are **Windows-only** today (the agent has no portable resolver-cache / neighbour-table source elsewhere); on other platforms those cards render an honest "not available on this OS" note. On a host with many distinct large executables the process card can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
 
 ### REST API
 

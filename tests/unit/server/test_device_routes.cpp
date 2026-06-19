@@ -19,6 +19,7 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,9 +34,11 @@ struct LiveHarness {
 
     int dispatched = 0;
     int fake_sent = 1;
-    std::string seen_plugin, seen_action, seen_id;
-    std::vector<DexAgentResponse> fake_rows; // what the response store "has"
-    std::string audited;                     // "action|result|target_id"
+    std::string seen_plugin, seen_action, seen_id;            // LAST dispatch (compat)
+    std::vector<std::pair<std::string, std::string>> seen_dispatches; // ALL (plugin,action)
+    std::vector<DexAgentResponse> fake_rows;                  // default response store contents
+    std::unordered_map<std::string, std::vector<DexAgentResponse>> rows_by_cmd; // per-command override
+    std::string audited;                                      // "action|result|target_id"
     bool allow_execute = true;
 
     LiveHarness() {
@@ -60,10 +63,14 @@ struct LiveHarness {
             seen_plugin = plugin;
             seen_action = action;
             seen_id = ids.empty() ? "" : ids.front();
+            seen_dispatches.emplace_back(plugin, action);
             // command_id prefix MUST be <plugin>- so the result route accepts it.
             return {plugin + "-test", fake_sent};
         };
-        auto responses = [this](const std::string&) { return fake_rows; };
+        auto responses = [this](const std::string& cmd) {
+            auto it = rows_by_cmd.find(cmd);
+            return it != rows_by_cmd.end() ? it->second : fake_rows;
+        };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string&, const std::string& tid, const std::string&) {
             audited = a + "|" + r + "|" + tid;
@@ -76,13 +83,22 @@ struct LiveHarness {
 
 } // namespace
 
-TEST_CASE("device live shell: serves one auto-firing run panel per kind", "[device][routes]") {
+TEST_CASE("device live shell: serves a collapsible card per kind + chrome", "[device][routes]") {
     LiveHarness h;
     auto r = h.sink.Get("/fragments/device/live?id=a-1");
     REQUIRE(r);
     CHECK(r->status == 200);
+    // uptime is the hidden KPI loader; the cards cover the rest of the snapshot.
     CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=uptime") != std::string::npos);
-    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=processes") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=process_tree") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=services") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=arp") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=dns_cache") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=capture_sources") != std::string::npos);
+    // Snapshot chrome: collapsible cards + expand-all + pop-out (CSP-safe inline handlers).
+    CHECK(r->body.find("class=\"ls-card\"") != std::string::npos);
+    CHECK(r->body.find("lsToggleAll(this)") != std::string::npos);
+    CHECK(r->body.find("lsPopOut(event,this)") != std::string::npos);
 }
 
 TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[device][routes]") {
@@ -140,14 +156,15 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
 // (the original bug) is a use-after-free; these sections drive that path with
 // real output and assert the rendered result.
 TEST_CASE("device live result: output renders, server survives the poll", "[device][routes]") {
-    SECTION("uptime output -> value tile, polling stops") {
+    SECTION("uptime output -> KPI out-of-band swap, polling stops") {
         LiveHarness h;
         h.fake_rows = {{"a-1", 0, "uptime_seconds|181740\nuptime_display|2d 2h 29m", ""}};
         auto r = h.sink.Get(
             "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
         REQUIRE(r);
         CHECK(r->body.find("2d 2h 29m") != std::string::npos);
-        CHECK(r->body.find("Uptime") != std::string::npos);
+        CHECK(r->body.find("id=\"ls-kpi-uptime\"") != std::string::npos); // fills the KPI tile
+        CHECK(r->body.find("hx-swap-oob=\"true\"") != std::string::npos);
         CHECK(r->body.find("hx-trigger") == std::string::npos); // resolved, no re-poll
     }
     SECTION("processes output -> PID/name/hash table (proc|pid|name|sha256|path)") {
@@ -234,6 +251,89 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
         CHECK(r->body.find("timed out") == std::string::npos); // 20 < 40 -> still polling
         CHECK(r->body.find("&amp;n=21") != std::string::npos);
     }
+}
+
+// The expanded live-snapshot kinds each map to ONE real plugin action with its own
+// audit verb. process_tree additionally dual-dispatches its connection join.
+TEST_CASE("device live run: expanded kinds map to the right plugin/action + audit",
+          "[device][routes]") {
+    struct Case { const char* kind; const char* plugin; const char* action; const char* verb; };
+    const Case cases[] = {
+        {"services", "services", "list", "device.live.services"},
+        {"users", "users", "logged_on", "device.live.users"},
+        {"netconfig", "network_config", "ip_addresses", "device.live.netconfig"},
+        {"arp", "network_config", "arp", "device.live.arp"},
+        {"dns_cache", "network_config", "dns_cache", "device.live.dns_cache"},
+        {"listening", "network_diag", "listening", "device.live.listening"},
+        {"connections", "network_diag", "connections", "device.live.connections"},
+        {"capture_sources", "tar", "status", "device.live.capture_sources"},
+    };
+    for (const auto& c : cases) {
+        LiveHarness h;
+        auto r = h.sink.Get(std::string("/fragments/device/live/run?id=a-1&kind=") + c.kind);
+        REQUIRE(r);
+        CHECK(h.seen_plugin == c.plugin);
+        CHECK(h.seen_action == c.action);
+        CHECK(h.audited == std::string(c.verb) + "|success|a-1");
+    }
+}
+
+TEST_CASE("device live process_tree: dual-dispatch (list_tree + connections), joined",
+          "[device][routes]") {
+    SECTION("run dispatches BOTH the tree and the connections, audited as process_tree") {
+        LiveHarness h;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=process_tree");
+        REQUIRE(r);
+        CHECK(h.dispatched == 2);
+        bool tree = false, conns = false;
+        for (const auto& [p, a] : h.seen_dispatches) {
+            if (p == "processes" && a == "list_tree") tree = true;
+            if (p == "network_diag" && a == "connections") conns = true;
+        }
+        CHECK(tree);
+        CHECK(conns);
+        CHECK(h.audited == "device.live.process_tree|success|a-1");
+        // The poll URL carries BOTH command ids so the result can join them.
+        CHECK(r->body.find("command_id=processes-test") != std::string::npos);
+        CHECK(r->body.find("command_id2=network_diag-test") != std::string::npos);
+    }
+    SECTION("result reconstructs the tree and joins connections by pid") {
+        LiveHarness h;
+        h.rows_by_cmd["processes-test"] = {
+            {"a-1", 1, "proc|4|0|System||\nproc|800|4|svchost.exe|abc123|C:\\\\svchost.exe", ""}};
+        h.rows_by_cmd["network_diag-test"] = {
+            {"a-1", 1, "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=network_diag-test&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("svchost.exe") != std::string::npos);
+        CHECK(r->body.find("140.82.112.4:443") != std::string::npos); // joined connection chip
+        CHECK(r->body.find("abc123") != std::string::npos);           // hash on the node
+        CHECK(r->body.find("id=\"ls-kpi-procs\"") != std::string::npos); // OOB process count
+    }
+    SECTION("a network_diag- secondary id is the ONLY accepted command_id2 prefix") {
+        LiveHarness h;
+        // A foreign secondary prefix (e.g. tar-) must be rejected.
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=tar-evil&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+}
+
+TEST_CASE("device live capture_sources: tar status -> read-only source table", "[device][routes]") {
+    LiveHarness h;
+    h.fake_rows = {{"a-1", 1,
+                    "config|process_enabled|true\nconfig|process_live_rows|1234\n"
+                    "config|arp_enabled|false\nconfig|arp_live_rows|0",
+                    ""}};
+    auto r = h.sink.Get("/fragments/device/live/result?command_id=tar-test"
+                        "&agent_id=a-1&kind=capture_sources&n=1");
+    REQUIRE(r);
+    CHECK(r->body.find("$Process_Live") != std::string::npos);
+    CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
+    CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
+    CHECK(r->body.find("/tar") != std::string::npos);                  // configure-on-TAR link
 }
 
 // The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
