@@ -13,6 +13,11 @@ Two consumers (do not duplicate the logic):
    $GITHUB_OUTPUT as <name>_healthy=true|false (slugified) and exits 0
    regardless. Downstream jobs gate on these outputs with explicit `==
    'true'` checks (fail-closed: an absent or false value skips the job).
+   Also emits `linux_pool_healthy` — true iff >=1 runner eligible for the
+   [self-hosted, Linux, X64] job pool is online (see LINUX_POOL_LABELS). The
+   proto-compat + linux jobs gate on the pool rather than a single named runner,
+   so any free pool member (yuzu-bigtam-* or the Shulgi fallback) keeps them
+   running, while a wholly-offline pool still skips them fast.
 
 The fall-closed contract is intentional: a degraded sentinel must NOT
 silently accept "I don't know" as healthy. Always check `== 'true'`,
@@ -38,6 +43,26 @@ from typing import Any
 
 
 INVENTORY_PATH = ".github/runner-inventory.json"
+
+# The self-hosted Linux job pool. ci.yml's proto-compat + linux jobs use
+# runs-on: [self-hosted, Linux, X64], so any declared runner whose labels are a
+# superset of this set is eligible to run them. In preflight mode the script
+# emits `linux_pool_healthy=true` iff >=1 such runner is online+labelled
+# (fail-closed: zero online -> the Linux jobs skip fast, exactly as the old
+# single-named gate did when that one runner was down). This includes Shulgi
+# (yuzu-wsl2-linux) as a fallback during the BigTam cutover; Shulgi drops out of
+# the pool automatically when it is later removed from the inventory, leaving the
+# yuzu-bigtam-* runners as the pool. Per-runner `<slug>_healthy` outputs are still
+# emitted unchanged (the sentinel and any pinned-runner gates rely on them).
+LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
+
+
+def linux_pool_members(expected: dict[str, Any]) -> list[str]:
+    """Declared runners eligible for the [self-hosted, Linux, X64] job pool."""
+    return [
+        name for name, exp in expected.items()
+        if LINUX_POOL_LABELS.issubset(set(exp["labels"]))
+    ]
 
 
 def slug(name: str) -> str:
@@ -153,6 +178,7 @@ def main() -> int:
         print(" runner unavailability via normal queue timeout.)")
         for name in expected:
             write_output(f"{slug(name)}_healthy", "true")
+        write_output("linux_pool_healthy", "true")
         write_output("all_healthy", "true")
         return 0
 
@@ -162,6 +188,7 @@ def main() -> int:
             # Fail closed — every gated job sees healthy=false and skips.
             for name in expected:
                 write_output(f"{slug(name)}_healthy", "false")
+            write_output("linux_pool_healthy", "false")
             write_output("all_healthy", "false")
             return 0
         return 1
@@ -220,6 +247,12 @@ def main() -> int:
             write_output(f"{slug(name)}_healthy", v)
             if v != "true":
                 all_healthy = False
+        # Pool gate: the [self-hosted, Linux, X64] job pool is healthy iff >=1
+        # eligible runner is online (fail-closed). proto-compat + linux gate on
+        # this instead of a single named runner.
+        pool = linux_pool_members(expected)
+        pool_ok = any(healthy_map.get(n, False) for n in pool)
+        write_output("linux_pool_healthy", "true" if pool_ok else "false")
         write_output("all_healthy", "true" if all_healthy else "false")
         if drift:
             print("=== HEALTH ISSUES (preflight mode — non-fatal) ===")
