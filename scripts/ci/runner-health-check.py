@@ -17,7 +17,9 @@ Two consumers (do not duplicate the logic):
    [self-hosted, Linux, X64] job pool is online (see LINUX_POOL_LABELS). The
    proto-compat + linux jobs gate on the pool rather than a single named runner,
    so any free pool member (yuzu-bigtam-* or the Shulgi fallback) keeps them
-   running, while a wholly-offline pool still skips them fast.
+   running, while a wholly-offline pool still skips them fast. Likewise emits
+   `windows_pool_healthy` for the [self-hosted, Windows, X64] pool — the windows
+   job gates on it (yuzu-weetam-windows-* or the yuzu-local-windows fallback).
 
 The fall-closed contract is intentional: a degraded sentinel must NOT
 silently accept "I don't know" as healthy. Always check `== 'true'`,
@@ -56,12 +58,27 @@ INVENTORY_PATH = ".github/runner-inventory.json"
 # emitted unchanged (the sentinel and any pinned-runner gates rely on them).
 LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
 
+# The self-hosted Windows job pool — ci.yml's windows job uses
+# runs-on: [self-hosted, Windows, X64]. Same pool-gating treatment as Linux:
+# `windows_pool_healthy=true` iff >=1 eligible runner is online. Includes Shulgi
+# (yuzu-local-windows) as a fallback during the Wee Tam cutover; it drops out of
+# the pool when removed from the inventory, leaving the yuzu-weetam-windows-* runners.
+WINDOWS_POOL_LABELS = frozenset({"self-hosted", "Windows", "X64"})
+
 
 def linux_pool_members(expected: dict[str, Any]) -> list[str]:
     """Declared runners eligible for the [self-hosted, Linux, X64] job pool."""
     return [
         name for name, exp in expected.items()
         if LINUX_POOL_LABELS.issubset(set(exp["labels"]))
+    ]
+
+
+def windows_pool_members(expected: dict[str, Any]) -> list[str]:
+    """Declared runners eligible for the [self-hosted, Windows, X64] job pool."""
+    return [
+        name for name, exp in expected.items()
+        if WINDOWS_POOL_LABELS.issubset(set(exp["labels"]))
     ]
 
 
@@ -179,6 +196,7 @@ def main() -> int:
         for name in expected:
             write_output(f"{slug(name)}_healthy", "true")
         write_output("linux_pool_healthy", "true")
+        write_output("windows_pool_healthy", "true")
         write_output("all_healthy", "true")
         return 0
 
@@ -189,6 +207,7 @@ def main() -> int:
             for name in expected:
                 write_output(f"{slug(name)}_healthy", "false")
             write_output("linux_pool_healthy", "false")
+            write_output("windows_pool_healthy", "false")
             write_output("all_healthy", "false")
             return 0
         return 1
@@ -253,6 +272,9 @@ def main() -> int:
         pool = linux_pool_members(expected)
         pool_ok = any(healthy_map.get(n, False) for n in pool)
         write_output("linux_pool_healthy", "true" if pool_ok else "false")
+        win_pool = windows_pool_members(expected)
+        win_ok = any(healthy_map.get(n, False) for n in win_pool)
+        write_output("windows_pool_healthy", "true" if win_ok else "false")
         write_output("all_healthy", "true" if all_healthy else "false")
         if drift:
             print("=== HEALTH ISSUES (preflight mode — non-fatal) ===")
