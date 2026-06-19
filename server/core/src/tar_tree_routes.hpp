@@ -44,7 +44,14 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 
-/// `/fragments/tar/process-tree*` routes — the process tree viewer.
+/// The `/tar` interactive-fragment route controller. Despite the historical name it
+/// now owns THREE operator surfaces, all sharing the same scoped-Read + Execute-probe
+/// + dispatch/poll seam and the eight providers below:
+///   1. Process-tree viewer   — `/fragments/tar/process-tree[/run|/result|/detail]`
+///   2. Device DNS/ARP panels — `/fragments/tar/process-tree/device-net` (ADR-0011)
+///   3. Capture-sources frame — `/fragments/tar/capture-sources[/load|/push]` (ADR-0011)
+/// (A rename to `TarFrameRoutes` + a split of the capture-sources surface is tracked
+/// as a deferred follow-up; folding them here avoids a second server.cpp registration.)
 class TarTreeRoutes {
 public:
     using AuthFn =

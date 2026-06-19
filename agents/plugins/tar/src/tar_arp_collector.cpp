@@ -13,6 +13,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic> // rate-limited truncation warn
 #include <format>
 #include <string>
 #include <vector>
@@ -105,6 +106,7 @@ std::vector<ArpEntry> enumerate_arp() {
     }
 
     out.reserve(table->NumEntries);
+    bool truncated = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPNET_ROW2& row = table->Table[i];
         ArpEntry e;
@@ -117,13 +119,23 @@ std::vector<ArpEntry> enumerate_arp() {
         out.push_back(std::move(e));
 
         if (out.size() >= kArpEntryCap) {
-            spdlog::warn("TAR arp: entry cap {} reached ({} table entries) — truncating",
-                         kArpEntryCap, static_cast<unsigned long>(table->NumEntries));
+            truncated = true;
             break;
         }
     }
 
     FreeMibTable(table);
+    // Rate-limit the truncation warn (UP-7): once when it begins, suppressed until
+    // the table drops back under the cap.
+    static std::atomic<bool> s_arp_cap_warned{false};
+    if (truncated) {
+        if (!s_arp_cap_warned.exchange(true))
+            spdlog::warn("TAR arp: entry cap {} reached — truncating (repeats suppressed until it "
+                         "clears)",
+                         kArpEntryCap);
+    } else {
+        s_arp_cap_warned.store(false);
+    }
     return out;
 }
 

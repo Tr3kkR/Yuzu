@@ -1132,8 +1132,14 @@ std::string render_tar_arp_panel(const std::vector<TarArpEntry>& rows) {
         for (const auto* r : cur) {
             if (shown++ >= 500)
                 break;
-            const std::string tclass =
-                r->entry_type == "static" ? "arp-type-static" : "arp-type-dynamic";
+            // static → muted; dynamic → accent; incomplete/other/unknown → a distinct
+            // "other" class so an unresolved (no-MAC) neighbour is not coloured as a
+            // healthy dynamic entry (consistency S2).
+            std::string tclass = "arp-type-dynamic";
+            if (r->entry_type == "static")
+                tclass = "arp-type-static";
+            else if (r->entry_type != "dynamic")
+                tclass = "arp-type-other";
             h += "<tr><td>" + html_escape(r->iface) + "</td>";
             h += "<td>" + html_escape(r->ip_address) + "</td>";
             h += "<td class=\"arp-mac\">" + html_escape(r->mac_address) + "</td>";

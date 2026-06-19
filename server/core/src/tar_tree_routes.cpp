@@ -650,6 +650,12 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
 
     sink.Get("/fragments/tar/capture-sources/load", [this, can_execute](const httplib::Request& req,
                                                                         httplib::Response& res) {
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
         const std::string device = get_param(req, "device");
         if (device.empty()) {
             res.set_content("<div class=\"tar-tree-empty\">Select a host to view and manage its "
@@ -675,7 +681,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {});
             if (audit_fn_)
                 audit_fn_(req, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents", "Agent",
-                          device, std::format("command_id={}", audit_token(sc)));
+                          device,
+                          std::format("status_command_id={} compat_command_id={}",
+                                      audit_token(sc), audit_token(cc)));
             if (ssent == 0 || csent == 0) {
                 note(res, "Device offline \xE2\x80\x94 capture-source management needs a connected agent.");
                 return;

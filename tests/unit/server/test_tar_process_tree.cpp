@@ -637,3 +637,24 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("stageCapToggle(this)") != std::string::npos);  // guardrail wiring
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
 }
+
+TEST_CASE("render_tar_dns_panel: newest-first input is a load-bearing invariant (ADR-0011)",
+          "[tar][dns][panel]") {
+    // The route feeds rows ORDER BY ts DESC; the reduction is newest-wins. Pin that
+    // the ORDER BY is load-bearing — a future refactor dropping it would corrupt the
+    // panel (the wrong row would win per key).
+    std::vector<TarDnsCacheEntry> newest_first = {
+        {200, "x.test", "A", "1.1.1.1", 5, "cache", "removed"},   // newest action: removed
+        {100, "x.test", "A", "1.1.1.1", 60, "cache", "appeared"}, // older
+    };
+    CHECK(render_tar_dns_panel(newest_first).find("devnet-count\">0<") !=
+          std::string::npos); // removed wins → empty cache
+
+    std::vector<TarDnsCacheEntry> oldest_first = {
+        {100, "x.test", "A", "1.1.1.1", 60, "cache", "appeared"},
+        {200, "x.test", "A", "1.1.1.1", 5, "cache", "removed"},
+    };
+    // Fed oldest-first the FIRST-seen (appeared) wrongly wins → entry shown. This is
+    // the documented wrong result the route's ORDER BY prevents.
+    CHECK(render_tar_dns_panel(oldest_first).find("devnet-count\">1<") != std::string::npos);
+}

@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors five categories of system activity:
+TAR monitors the following categories of system activity — the first five are always-on; **ARP** and **DNS** are opt-in (off by default), Windows-only today (ADR-0011):
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -15,8 +15,10 @@ TAR monitors five categories of system activity:
 | **Services** | 300 seconds (slow) | Service started, stopped, state changed |
 | **User sessions** | 300 seconds (slow) | User login, user logout |
 | **Performance** | 30 seconds (perf) | Device CPU/memory/disk/network sample (a scalar reading, not a diff) |
+| **ARP** *(opt-in, Windows)* | 60 seconds (fast) | ARP / neighbour binding appeared, removed |
+| **DNS cache** *(opt-in, Windows)* | 60 seconds (fast) | DNS resolver-cache entry appeared, removed |
 
-The first four categories take a snapshot of the current state each cycle, compare it to the previous snapshot, and record only the differences as events. This keeps the database compact while providing full visibility into system changes.
+Every source except **Performance** takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
 The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
@@ -221,16 +223,28 @@ config|module_enabled|false
 config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
+config|arp_enabled|false
+config|arp_paused_at|0
+config|arp_live_rows|0
+config|arp_oldest_ts|0
+config|dns_enabled|false
+config|dns_paused_at|0
+config|dns_live_rows|0
+config|dns_oldest_ts|0
 config|network_capture_method|polling
 ```
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module` (shown above),
-`procperf`, and `netqual` are off by default and must be enabled explicitly via
-`configure` (see the configuration table above). `module_live_rows` stays `0`
-until a collector for the host's OS ships.
+`procperf`, `netqual`, `arp`, and `dns` are off by default and must be enabled
+explicitly via `configure` (see the configuration table above). `module_live_rows`
+stays `0` until a collector for the host's OS ships; likewise `arp`/`dns` are
+**Windows-only today** (planned on Linux/macOS), so on a Linux or macOS agent
+`arp_enabled|true` / `dns_enabled|true` still report `*_live_rows|0` — run the
+`compatibility` action to distinguish a supported-but-empty source from a
+planned-but-unimplemented one.
 
-The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
+These `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ## TAR dashboard page
 
@@ -288,7 +302,7 @@ The third frame on the `/tar` page reconstructs a **per-host process tree** enti
 
 ## Forcing an immediate snapshot
 
-The `snapshot` action triggers an immediate full collection of all four categories, useful before a maintenance window or at the start of an investigation:
+The `snapshot` action triggers an immediate full collection of all **enabled** capture sources (including opt-in `arp`/`dns` when on), useful before a maintenance window or at the start of an investigation:
 
 ```
 POST /api/v1/instructions/execute
@@ -329,6 +343,15 @@ TAR is designed for minimal performance overhead:
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
+>
+> **`arp_enabled` / `dns_enabled` are new this release (ADR-0011) and also ship
+> off by default.** Expect both to read `false` in `tar.status` on upgrade; the
+> new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
+> empty until you opt in (Windows-only collectors today; Linux/macOS planned).
+> No data collection changes on upgrade. **GUI note:** after enabling a source
+> (Capture-sources frame or `configure`), the first rows appear at the next
+> `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
+> is expected, not a fault.
 
 > **Upgrade note (Windows process capture → ETW). BREAKING for `cmdline`
 > consumers.** On upgrade, the Windows process source switches from the
@@ -406,6 +429,8 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
 | **Module** | `$Module_Live` (100000 rows) | `$Module_Hourly` (24h) | `$Module_Daily` (31d) | `$Module_Monthly` (12mo) |
+| **ARP** *(opt-in)* | `$ARP_Live` (5000 rows) | `$ARP_Hourly` (24h) | — | — |
+| **DNS** *(opt-in)* | `$DNS_Live` (5000 rows) | `$DNS_Hourly` (24h) | — | — |
 
 The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 

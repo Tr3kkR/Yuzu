@@ -110,9 +110,12 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user. Leave empty to return all types.
+          service, user, arp, dns. arp/dns are opt-in device-state sources
+          (ADR-0011) reached only by an explicit filter — they are excluded
+          from the default (empty-filter) feed. Leave empty to return the
+          core process/network/service/user types.
         validation:
-          enum: [process, network, service, user, ""]
+          enum: [process, network, service, user, arp, dns, ""]
       limit:
         type: string
         displayName: Result Limit
@@ -243,7 +246,7 @@ spec:
       type:
         type: string
         displayName: Event Type Filter
-        description: Filter by event type (process, network, service, user).
+        description: Filter by event type (process, network, service, user, arp, dns).
       limit:
         type: string
         displayName: Result Limit

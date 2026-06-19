@@ -35,7 +35,9 @@ spec:
           A SELECT query using $-prefixed table names. Available tables include
           $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly,
           $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
-          $Service_Live, $Service_Hourly, $User_Live, $User_Daily.
+          $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and the opt-in
+          $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0011; require
+          arp_enabled=true / dns_enabled=true, Windows-only today — empty elsewhere).
     required: [sql]
 
   result:

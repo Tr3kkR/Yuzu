@@ -573,7 +573,12 @@ private:
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_fast_impl(yuzu::CommandContext& ctx) {
+    // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
+    // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
+    // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    int collect_fast_impl(yuzu::CommandContext& ctx,
+                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -782,7 +787,7 @@ private:
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
         // success so a failed insert retries the same deltas next tick.
         if (source_enabled(*db_, "arp")) {
-            auto current = yuzu::tar::enumerate_arp();
+            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
             auto previous = json_to_arp(db_->get_state("arp"));
             auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
             bool ok = true;
@@ -801,7 +806,7 @@ private:
         // Device-level resolver-cache state; NOT per-process (no pid). Same
         // non-fatal / advance-on-success discipline as the arp leg.
         if (source_enabled(*db_, "dns")) {
-            auto current = yuzu::tar::enumerate_dns();
+            auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
             bool ok = true;
@@ -821,8 +826,31 @@ private:
     }
 
     int do_collect_fast(yuzu::CommandContext& ctx) {
+        // SRE/UP-1: enumerate the syscall-heavy opt-in network sources (arp via
+        // GetIpNetTable2; dns via DnsGetCacheDataTable + up to kDnsEntryCap cache-only
+        // DnsQuery_W calls) BEFORE taking collect_mu_, so a large host cache cannot
+        // stall the always-on process/tcp legs or the fleet-snapshot pump (mirrors
+        // do_collect_perf's lock-free counter read). The diff/insert/state-save still
+        // run under collect_mu_ inside collect_fast_impl.
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        return collect_fast_impl(ctx);
+        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
     }
 
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
@@ -1310,8 +1338,26 @@ private:
     // ── snapshot action (force immediate full collection) ─────────────────────
 
     int do_snapshot(yuzu::CommandContext& ctx) {
+        // Pre-enumerate arp/dns lock-free (same rationale as do_collect_fast).
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        collect_fast_impl(ctx);
+        collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
         collect_slow_impl(ctx);
         ctx.write_output("tar|snapshot|complete");
         return 0;

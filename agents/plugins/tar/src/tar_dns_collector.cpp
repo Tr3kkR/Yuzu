@@ -25,6 +25,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic> // rate-limited truncation warn
 #include <cstring> // std::memcpy (AAAA formatting)
 #include <string>
 #include <vector>
@@ -160,8 +161,19 @@ std::vector<DnsEntry> enumerate_dns() {
         return out; // empty cache (or call failed) — not an error
     }
 
+    // Defense-in-depth (UP-9): bound the walk by a node ceiling so a corrupted or
+    // cyclic pNext from the undocumented dnsapi list can't loop unboundedly. The
+    // ceiling is far above any real resolver cache; exceeding it aborts the walk
+    // (remaining nodes leak rather than risk an infinite loop on a bad list).
+    constexpr std::size_t kDnsNodeWalkCap = 65536;
     bool capped = false;
+    bool overrun = false;
+    std::size_t nodes = 0;
     for (DnsCacheEntryW* p = table; p != nullptr;) {
+        if (++nodes > kDnsNodeWalkCap) {
+            overrun = true;
+            break;
+        }
         DnsCacheEntryW* next = p->pNext;
 
         if (!capped && p->pszName) {
@@ -185,7 +197,6 @@ std::vector<DnsEntry> enumerate_dns() {
                     e.source = "cache";
                     out.push_back(std::move(e));
                     if (out.size() >= kDnsEntryCap) {
-                        spdlog::warn("TAR dns: entry cap {} reached — truncating", kDnsEntryCap);
                         capped = true;
                         break;
                     }
@@ -202,6 +213,23 @@ std::vector<DnsEntry> enumerate_dns() {
             DnsFree(p->pszName, DnsFreeFlat);
         DnsFree(p, DnsFreeFlat);
         p = next;
+    }
+
+    if (overrun)
+        spdlog::error("TAR dns: cache walk exceeded {} nodes — aborting (possible corrupted "
+                      "dnsapi list)",
+                      kDnsNodeWalkCap);
+    // Rate-limit the truncation warn (UP-7): log once when truncation begins, then
+    // suppress until the cache drops back under the cap — avoids a 60s log-spam on a
+    // persistently large-cache host.
+    static std::atomic<bool> s_dns_cap_warned{false};
+    if (capped) {
+        if (!s_dns_cap_warned.exchange(true))
+            spdlog::warn("TAR dns: entry cap {} reached — truncating (repeats suppressed until it "
+                         "clears)",
+                         kDnsEntryCap);
+    } else {
+        s_dns_cap_warned.store(false);
     }
 
     if (owned)

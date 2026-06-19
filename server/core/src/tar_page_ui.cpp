@@ -393,6 +393,7 @@ R"HTM(
     .arp-mac { color: var(--fg); }
     .arp-type-static { color: var(--mds-color-theme-text-tertiary); }
     .arp-type-dynamic { color: var(--accent); }
+    .arp-type-other { color: var(--mds-color-theme-indicator-warning, #d6a500); } /* incomplete / unresolved */
     .devnet-caveat { padding: 0.4rem 0.8rem; font-size: 0.68rem; color: var(--mds-color-theme-text-tertiary);
       background: var(--surface); border-top: 1px solid var(--border); }
     .devnet-empty { padding: 1.5rem; text-align: center; color: var(--mds-color-theme-text-tertiary); font-size: 0.78rem; }
