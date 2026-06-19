@@ -144,8 +144,8 @@ static_assert(!is_valid_plugin_name(std::string_view{"nul\0byte", 8}));
 /// the file exceeds `max_bytes` (a bounded read — defends a hashing-DoS / TOCTOU
 /// grow on an attacker-controlled path, e.g. Guardian's file-hash-equals guard).
 /// Default SIZE_MAX = unbounded (existing trusted-plugin callers are unchanged).
-[[nodiscard]] std::string sha256_file(const std::filesystem::path& path,
-                                      std::size_t max_bytes = SIZE_MAX);
+[[nodiscard]] YUZU_EXPORT std::string sha256_file(const std::filesystem::path& path,
+                                                  std::size_t max_bytes = SIZE_MAX);
 
 /// Load a plugin allowlist file (one "sha256  filename" per line, like sha256sum output).
 /// Returns a map of filename -> expected hash. Empty map on failure or missing file.

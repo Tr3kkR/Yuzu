@@ -1,5 +1,6 @@
 #include "pg_migration_runner.hpp"
 
+#include "pg_exec.hpp"
 #include "pg_raii.hpp"
 
 #include <spdlog/spdlog.h>
@@ -24,6 +25,13 @@ namespace {
 // serialize on each other. That is benign — transaction-scoped locks
 // release on commit/abort/disconnect, so the worst case is brief
 // serialization, never deadlock or cross-database corruption.
+//
+// Collision bound (gov fjarvis L3): hashtext() yields a 32-bit signed int, so
+// two DISTINCT store names can collide on the second lock key. The only effect
+// is brief over-serialization (the two stores' migration txns can't run
+// concurrently); the per-store version is still re-read under the lock, so
+// correctness is unaffected. Across ~27 stores the birthday probability is
+// negligible. A collision can never corrupt or mis-apply a migration.
 constexpr const char* kAdvisoryLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext($1::text))";
 
@@ -34,11 +42,11 @@ constexpr const char* kAdvisoryLockSql =
 // Startup-only, so the brief global serialization is free.
 constexpr const char* kGlobalLockSql = "SELECT pg_advisory_xact_lock(2037545589, 0)";
 
-/// One-row, one-param text query helper.
+/// One-row, one-param text query helper — the single-param case of the shared
+/// `pg::exec_params` (#1368 promoted the boilerplate into pg_exec.hpp; this is
+/// now a thin adapter so there is one PQexecParams call site, not two).
 PgResult exec_param(PGconn* conn, const char* sql, const std::string& param) {
-    const char* values[] = {param.c_str()};
-    return PgResult{
-        PQexecParams(conn, sql, 1, nullptr, values, nullptr, nullptr, /*resultFormat=*/0)};
+    return exec_params(conn, sql, std::vector<std::string>{param});
 }
 
 /// Version row lookup. Returns 0 when absent, -1 on error. `missing_table_ok`
@@ -162,6 +170,27 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
     if (current < 0)
         return false;
 
+    // Schema-drift guard (#1368 CH-11 / UP-9). Version 0 means "no migration
+    // recorded", yet a non-empty store schema means tables exist out-of-band:
+    // schema_meta was wiped or poisoned, or someone hand-created tables. Blindly
+    // running migration v1 (whose `CREATE TABLE` is not IF-NOT-EXISTS) over
+    // existing tables would either error opaquely or silently diverge. Refuse
+    // and fail the boot closed with a cause the operator can act on. A genuinely
+    // new store reaches here with the empty schema just created above, so this
+    // never false-fires on first boot. ensure_meta_and_schema already created
+    // the schema, so information_schema.tables is the authoritative check.
+    if (current == 0) {
+        PgResult drift = exec_param(
+            conn, "SELECT 1 FROM information_schema.tables WHERE table_schema = $1 LIMIT 1", store);
+        if (drift.status() == PGRES_TUPLES_OK && PQntuples(drift.get()) > 0) {
+            spdlog::error("PgMigrationRunner: store '{}' is at version 0 in schema_meta but its "
+                          "schema already contains tables — schema_meta loss/poisoning or "
+                          "out-of-band DDL. Refusing to migrate (manual reconciliation required).",
+                          store);
+            return false;
+        }
+    }
+
     bool any_applied = false;
     for (const auto& m : migrations) {
         if (m.version <= current)
@@ -192,7 +221,11 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
 
         // Transaction-local search_path so the migration's unqualified DDL
         // lands in the store's schema and nothing leaks onto the pooled
-        // connection after COMMIT/ROLLBACK.
+        // connection after COMMIT/ROLLBACK. `store` is interpolated (libpq has
+        // no parameter binding for identifiers), which is injection-safe ONLY
+        // because run() rejected anything but [a-z_][a-z0-9_]{0,62} via
+        // valid_store_name() before reaching here (gov fjarvis L4); double-
+        // quoted as defence in depth.
         if (!exec_ok(conn, "SET LOCAL search_path TO \"" + store + "\", public", "SET search_path",
                      store))
             return false;

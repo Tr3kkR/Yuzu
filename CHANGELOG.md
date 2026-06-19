@@ -7,50 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
 ### Added
 
-- **Linux server DEX: systemd unit-health signals from the journal.** The Linux DEX
-  collector now emits `service.hung` (a `WatchdogSec` timeout — the existing
-  unit-failed journal entry routed by `UNIT_RESULT="watchdog"`, since a watchdog kill
-  is a hang, not a crash; one entry, no double-emit) and `os.time_unsynced` (chrony's
-  "Can't synchronise: no selectable sources" / large-step markers, via a low-volume
-  `SYSLOG_IDENTIFIER=chronyd` query clause; the raw message, which carries NTP source
-  IPs, is never shipped). `service.hung` is verified through the agent's emit on a real
-  watchdog timeout. Reused obs_types need no live-render change; the per-OS coverage map
-  `dex_obs_platforms` (`dex_routes.cpp`) gains the new Linux types. Linux DEX coverage is now 17 signals.
-  (`service.dependency_failed` is deferred — no `MESSAGE_ID`, and the root failure is
-  already captured as `service.crashed`.)
-
-- **Linux server DEX: `/proc` + `/sys` performance/hardware state polls.** The Linux
-  DEX collector now also emits `perf.disk_latency_high` (per-I/O service time / iostat
-  `await` over the whole physical disks, from `/proc/diskstats` — completing the
-  Windows cpu/mem/disk perf trio on Linux, same `dex_perf_breach` hysteresis + 25 ms
-  threshold) and `hw.cpu_throttled` (a poll-and-latch on the `/sys`
-  `core_throttle_count` thermal-throttle counters, the Windows Kernel-Processor-Power
-  37 analogue). New pure parsers `parse_diskstats`/`disk_await_ms`/`is_whole_disk`
-  (`dex_linux_proc`) and `parse_throttle_count` (new `dex_linux_sysfs.cpp`); field
-  positions verified against a real box. Reused obs_types (no live-render change; the
-  per-OS coverage map gains them); this slice adds 2 (Linux 13→15, building on the
-  kernel-reliability slice below; the systemd unit-health entry above reaches 17).
-
-- **Linux server DEX: kernel-reliability signals from the journal.** The Linux DEX
-  collector's journald reader now also classifies `_TRANSPORT=kernel` ring-buffer
-  lines (free text, no `MESSAGE_ID`) via anchored substring markers in a new pure
-  `dex_linux_kmsg.cpp`, emitting on **existing** obs_types (no live-render change; the
-  per-OS coverage map gains them):
-  `os.bugcheck` (a fatal `Kernel panic - not syncing` only — survivable Oops/
-  soft-lockup deliberately not mapped, to keep the BSOD-equivalent rate honest),
-  `os.dirty_shutdown` (ext4/xfs journal-recovery at mount = the prior shutdown was
-  unclean), `disk.error` (block-layer / buffer I/O error, subject = backing device),
-  `fs.corruption` (ext4/xfs/btrfs metadata error, subject = device), `hw.error`
-  (machine-check / `[Hardware Error]`), and `process.hung` (the hung-task watchdog).
-  Markers for `disk.error`, `fs.corruption` and `os.dirty_shutdown` are pinned to
-  records live-captured on a real systemd-259 box via safe error injection (and
-  `disk.error` verified through the agent's emit on a real injected error); panic, MCE and
-  hung-task use the documented kernel format strings. Only infra-safe fields leave
-  the device (device / comm / short reason) — the raw kernel `MESSAGE` is never
-  shipped (`[dex][linux][kmsg][privacy]` pins). Linux server DEX coverage grows from
-  7 to 13 reused signals, all in the same `/dex` display groups.
+- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
+  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  image-load activity (module name + directory + code-signing verdict) — the
+  DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
+  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
+  opt-in (`module_enabled`, default off). The process-stream ring is promoted to
+  a reusable `EventRing<T>` template (no behaviour change for the `process`
+  source), and `run_aggregation` is now data-driven over the capture-source
+  registry so a newly-registered source's rollups can no longer be silently
+  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
+- **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
+  The TAR `process` source on macOS now feeds from the Endpoint Security
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl
+  poll), reaching Windows-ETW parity: short-lived processes the poll missed are
+  captured, with accurate timestamps, ppid, image name, and owning user from the
+  audit token (names-only — no command line). Requires a **full Xcode SDK** build
+  (the Command Line Tools SDK omits `EndpointSecurity.framework`), the
+  `com.apple.developer.endpoint-security.client` entitlement, and root; the agent
+  automatically **falls back to the sysctl poll** when any of these is absent, and
+  **self-heals** to the poll if the ES client goes silent for an extended period
+  (a NOTIFY-only client has no liveness API — the idle threshold is deliberately
+  long to avoid abandoning a healthy stream on a quiet host). The active path is
+  reported by `tar.status` as `process_capture_method` (`endpoint_security` or
+  `polling`), alongside two drop counters — `process_stream_dropped` (userspace
+  ring overflow) and `process_stream_kernel_dropped` (Endpoint Security `seq_num`
+  gaps). The ES handler is `noexcept` and drops malformed / zero-pid / zero-ts
+  events, mirroring the ETW peer. **Boot gap:** processes that start *and* exit
+  before the agent opens its ES session are not captured — macOS has no
+  AutoLogger-equivalent backfill. **Fork gap:** the stream subscribes
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` only, so a fork-without-exec child is invisible until
+  it exits (`NOTIFY_FORK` capture deferred, #1455). Both collectors now share a
+  cross-platform `ProcStreamCollector` interface. See `docs/user-manual/tar.md` and
+  `docs/darwin-compat.md`. **Not yet active in shipped builds:** the Apple
+  entitlement and the codesign/notarization release pipeline are pending
+  (#1455), so current macOS agents transparently use the **sysctl poll** until
+  that lands — confirm the live path per device via `process_capture_method` in
+  `tar.status` (`endpoint_security` = streaming, `polling` = fallback).
 
 - **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
   collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
@@ -210,6 +219,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
+  `process_stream_kernel_dropped` added.** The Windows-specific
+  `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
+  meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
+  both platforms. A new `process_stream_kernel_dropped` key reports
+  **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
+  macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
+  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
+  `process_etw_dropped` will find no value after upgrade — update it to
+  `process_stream_dropped`.
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
   server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
   Postgres substrate move and generated a server with no database to talk to.
@@ -242,11 +261,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
   names-only — the ETW start event carries no command line. Any dashboard, SIEM
   export, `tar.sql` query, or Guardian rule that read `cmdline` from
-  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
-  (the poll still captures command lines). This is intentional
-  (works-council / data-minimization posture) and not reversible by
-  configuration; `process_enabled=false` disables Windows process capture
-  entirely (ETW and poll) if required. Command-line redaction patterns
+  `$Process_*` on Windows now sees an empty string. **macOS process rows are now
+  names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
+  Added): the stream carries no command line, and the poll fallback (a Command Line
+  Tools SDK build, or a host without the ES entitlement/root) now blanks the
+  `proc_pidpath` image path it previously placed in `cmdline`. **Linux is
+  unaffected** (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not
+  reversible by configuration; `process_enabled=false` disables process capture
+  entirely (stream and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
   redact). The boot-window AutoLogger backfill is configured by the production
   InnoSetup installer (scoped to the `advanced` component) and by the developer
@@ -342,6 +365,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
   `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
   `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
+- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
+  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
+  on `tar.status` because every source defaulted its enabled flag to `true`.
+  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
+  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
+  transition from a single source of truth — so status, retention, and the
+  retention-paused list all agree the source starts disabled (and the first
+  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
+  an agent that never set these keys now reports `<source>_enabled|false` on
+  `tar.status` where it previously reported `true`; **no data collection
+  changes** (collection was already gated off), so this only affects automation
+  that parses `tar.status` to inventory active sources.
 - **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
   The `/tar` retention-paused list had three defects: (a) a source whose
   `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
@@ -369,6 +405,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device. Both sites now match the OS prefix.
 
 ### Added
+
+- **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
+  `KekProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
+  no store writes secret columns yet).** Secret columns in PostgreSQL are
+  AES-256-GCM-encrypted app-side under a fresh per-value DEK; the DEK is
+  wrapped by the install's KEK, which lives behind the `KekProvider` seam
+  (a dedicated interface implemented by `FileKeyProvider` alongside the CA
+  `KeyProvider` contract)
+  (`secrets-kek-v<N>.key`, 0600, generated on first codec init with a
+  temp-fsync-rename atomic write) and never enters the database. Identity-
+  bound AAD makes blobs non-relocatable across rows/columns (canonical
+  length-prefixed serialization; kek_version rides the wrap layer only, so
+  rotation re-wraps DEK headers without touching payloads). The `secrets`
+  schema's `kek_meta` table registers non-secret KEK fingerprints; boot
+  verification fails closed with distinct `kek_unresolvable` / `kek_corrupt`
+  operator tokens (backup-skew and dual-server misconfigurations refuse
+  loudly). KEK lifecycle: rotation (incremental, interruptible, per-row CAS),
+  `oldest_kek_version_in_use` completion signal, retirement refused while a
+  version is active or referenced with `retired_at` destruction evidence.
+  Audit verbs `kek.generated`/`kek.rotated`/`kek.retired`/
+  `secret.decrypt_failure` and per-store failure-class counters are defined
+  as wiring seams — no audit events or metrics are emitted until the
+  per-store migration PRs wire them. Operator guidance (the
+  DB+keys-dir restore-pairing invariant, rotation, break-glass) lives in
+  `docs/user-manual/server-admin.md` "Key management (secrets KEK)". The
+  gated stores (`auth` TOTP, `webhooks`, `offload_targets`, OIDC client
+  secret) adopt the codec as each migrates to Postgres.
 
 - **Guardian: Linux systemd service guard (observe-only).** The
   `service-status-change` Guardian Spark now arms on Linux hosts with systemd,

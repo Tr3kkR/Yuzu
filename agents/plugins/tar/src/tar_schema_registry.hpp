@@ -66,6 +66,16 @@ struct OsSupport {
 struct CaptureSourceDef {
     std::string_view name;        // "process", "tcp", "service", "user"
     std::string_view dollar_name; // "Process", "TCP", "Service", "User"
+    // Whether a fresh agent (no `<name>_enabled` config row yet) treats this
+    // source as enabled. Always-on sources keep the default `true`; high-volume
+    // usage-class sources that are opt-in under the works-council posture
+    // (module, procperf, netqual) set this `false` so `tar.status`, retention,
+    // and the paused_at transition all agree the source starts disabled. This is
+    // the single source of truth — `source_default_enabled()` exposes it to the
+    // two call sites that only have the source name (issue #59 follow-up).
+    // (Declared before os_support so the designated initialisers in
+    // build_sources() stay in member-declaration order.)
+    bool default_enabled = true;
     std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
@@ -97,6 +107,17 @@ struct CaptureSourceDef {
 // alongside the configured value so it can never misrepresent the active
 // mechanism.
 [[nodiscard]] std::string effective_network_capture_method(std::string_view configured);
+
+// ── Per-source default-enabled lookup ──────────────────────────────────────
+//
+// Returns `CaptureSourceDef::default_enabled` for the named source — the value
+// a fresh agent should assume when no `<source>_enabled` config row exists yet.
+// `true` (the always-on default) when the source name is unknown. Used by the
+// two default-enabled read sites that only have the bare source name (the
+// plugin's `source_enabled()` and the aggregator's
+// `apply_source_enabled_transition()`); call sites that already hold the
+// `CaptureSourceDef` read the field directly.
+[[nodiscard]] bool source_default_enabled(std::string_view source_name);
 
 // ── Registry access ─────────────────────────────────────────────────────────
 

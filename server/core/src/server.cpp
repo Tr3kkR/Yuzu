@@ -37,6 +37,8 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_pool.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -68,6 +70,8 @@
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
+#include "device_routes.hpp"
+#include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -224,21 +228,12 @@ struct ScopedKeyZero {
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
-// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
-// every control byte and structural delimiter (space, '=', ',') with '_'; the
-// identity is preserved verbatim in its own audit columns (principal/target_id)
-// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
-[[nodiscard]] inline std::string audit_token(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
-            out.push_back('_');
-        else
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
+// #1290 adds (field confusion), and a CRLF could split the audit line. The
+// canonical implementation now lives in web_utils.hpp so the same neutralizer
+// guards every structured-audit call site (here + tar_tree_routes.cpp) without
+// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// spellings below resolving unchanged.
+using yuzu::server::audit_token;
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -288,6 +283,30 @@ public:
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");
+        // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
+        // Gauges are sampled every recompute cycle; counters/histogram are fed
+        // live by the pool's observer hooks wired at pool construction.
+        metrics_.describe("yuzu_pg_pool_in_use", "PostgreSQL pool connections currently leased out",
+                          "gauge");
+        metrics_.describe("yuzu_pg_pool_open",
+                          "PostgreSQL pool connections currently open (leased + idle)", "gauge");
+        metrics_.describe("yuzu_pg_pool_size", "PostgreSQL pool configured maximum size", "gauge");
+        metrics_.describe("yuzu_pg_pool_waiters",
+                          "Threads currently blocked waiting for a PostgreSQL pool connection — "
+                          "the saturation signal between fully-leased and an acquire timeout",
+                          "gauge");
+        metrics_.describe("yuzu_pg_connect_failed_total",
+                          "Total PostgreSQL connection attempts that failed", "counter");
+        metrics_.describe("yuzu_pg_acquire_timeout_total",
+                          "Total PostgreSQL pool acquires that timed out before a connection was "
+                          "available",
+                          "counter");
+        metrics_.describe("yuzu_pg_unhealthy_discard_total",
+                          "Total PostgreSQL connections discarded as unhealthy on return", "counter");
+        metrics_.describe("yuzu_pg_acquire_wait_seconds",
+                          "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
+                          "leading pool-saturation indicator",
+                          "histogram");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -671,6 +690,10 @@ public:
         metrics_.describe("yuzu_viz_oversize_response_total",
                           "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
                           "counter");
+        metrics_.describe("yuzu_viz_offline_hosts_total",
+                          "Stale-flagged offline hosts merged into /viz/fleet from the durable "
+                          "OfflineEndpointStore (hosts that aged out of the in-memory snapshot)",
+                          "counter");
         metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
                           "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
         metrics_.describe("yuzu_viz_refill_oversize_drops_total",
@@ -894,6 +917,72 @@ public:
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
+
+        // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
+        // BEFORE any Postgres-backed store and validated by a probe checkout so
+        // the server FAILS CLOSED — no SQLite fallback — when the DSN is empty
+        // or the database is unreachable. The observer hooks feed the pool's
+        // saturation/health metrics and capture &metrics_, which outlives the
+        // pool (declaration order). A distinct "[PG] Refusing to start" log
+        // token separates a substrate failure from other startup failures.
+        {
+            if (cfg_.postgres_dsn.empty()) {
+                spdlog::error("[PG] Refusing to start: no PostgreSQL DSN. Set --postgres-dsn / "
+                              "YUZU_POSTGRES_DSN (ADR-0006/0007 — the server requires Postgres; "
+                              "the agent stays SQLite).");
+                startup_failed_ = true;
+            } else {
+                pg::PgPool::Options opts;
+                opts.conninfo = cfg_.postgres_dsn;
+                opts.size = cfg_.postgres_pool_size > 0
+                                ? static_cast<std::size_t>(cfg_.postgres_pool_size)
+                                : 16;
+                opts.observer.on_connect_failure = [this] {
+                    metrics_.counter("yuzu_pg_connect_failed_total").increment();
+                };
+                opts.observer.on_acquire_timeout = [this] {
+                    metrics_.counter("yuzu_pg_acquire_timeout_total").increment();
+                };
+                opts.observer.on_unhealthy_discard = [this] {
+                    metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
+                };
+                opts.observer.on_acquire_wait_seconds = [this](double s) {
+                    metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
+                };
+                pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
+                // Probe: a live checkout proves reachability and warms one
+                // connection. Bounded by connect_timeout_s; an empty lease means
+                // an invalid DSN or an unreachable database — fail closed.
+                if (auto probe = pg_pool_->acquire(); !probe) {
+                    spdlog::error("[PG] Refusing to start: cannot reach PostgreSQL substrate: {}",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
+                                 pg_pool_->size());
+                }
+            }
+        }
+
+        // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
+        // so offline hosts render stale-flagged on /viz/fleet. Only built when
+        // the substrate probe above succeeded (an unreachable database already
+        // set startup_failed_ and run() refuses to serve). FAIL CLOSED on a
+        // migration/open failure too (ADR-0007 + the ADR-0008 per-store
+        // migration invariant): a reachable database whose schema migration
+        // fails — schema conflict, missing CREATE privilege, advisory-lock
+        // contention — must NOT serve degraded. This is the template every
+        // future Postgres-backed store inherits, so the contract is uniform:
+        // a Postgres-backed store that cannot open is a fatal startup error.
+        if (pg_pool_ && !startup_failed_) {
+            offline_endpoint_store_ = std::make_unique<OfflineEndpointStore>(*pg_pool_);
+            if (!offline_endpoint_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
+                              "failed (database reachable but the endpoint_state schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            }
+        }
 
         // Initialize response store
         {
@@ -1237,7 +1326,8 @@ public:
             // that fleet_topology_store_ and health_store_ are wired, then
             // inject into both ingestion paths so they cannot drift.
             heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
-                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_,
+                offline_endpoint_store_.get());
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
@@ -2001,6 +2091,14 @@ public:
     void run() override {
         spdlog::info("run(): entering");
 
+        // Fail closed if construction already determined the server cannot
+        // start — e.g. the PostgreSQL substrate (ADR-0007) was absent or
+        // unreachable in the ctor. main() exits non-zero on startup_failed().
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed during construction");
+            return;
+        }
+
         // PKI: generate + wire per-install default certs before building TLS
         // credentials (fills cfg_ cert paths + cfg_.using_default_certs).
         bootstrap_default_certs();
@@ -2234,6 +2332,17 @@ public:
                 // revoked-agent teardown by the same amount. Make it visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // PostgreSQL pool gauges (#1368): sampled on the same cadence as
+                // the fleet families. Counters/histogram are fed live by the
+                // pool's observer hooks, so only the level gauges are polled here.
+                if (pg_pool_) {
+                    metrics_.gauge("yuzu_pg_pool_in_use")
+                        .set(static_cast<double>(pg_pool_->in_use()));
+                    metrics_.gauge("yuzu_pg_pool_open").set(static_cast<double>(pg_pool_->open()));
+                    metrics_.gauge("yuzu_pg_pool_size").set(static_cast<double>(pg_pool_->size()));
+                    metrics_.gauge("yuzu_pg_pool_waiters")
+                        .set(static_cast<double>(pg_pool_->waiters()));
+                }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
@@ -2645,6 +2754,20 @@ public:
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
+
+        // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
+        // quiesced every handler thread that could hold a pool lease through a
+        // Postgres-backed store (the heartbeat ingest path's borrowed
+        // offline-store pointer was nulled before this), so it is now safe to
+        // drop the stores that borrow the pool, then the pool itself — LAST, so
+        // no lease outlives it. The pool dtor blocks on outstanding leases; a
+        // still-leased thread destroying the pool would self-deadlock (see
+        // pg_pool.hpp). Reset is idempotent, so a startup_failed() server that
+        // never built these tears down cleanly too.
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        offline_endpoint_store_.reset();
+        pg_pool_.reset();
     }
 
 private:
@@ -4205,6 +4328,24 @@ private:
                 // the right probe. Without this, a store-construction failure
                 // would leave /readyz "ready" while every viz request 503s.
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // #1320 PR 3 (#1368 Pattern E): the Postgres substrate is
+                // load-bearing — without it every Postgres-backed store is
+                // dead. Cheap, NON-lease-consuming signal: valid() (conninfo
+                // parsed) AND the connect breaker is closed. The breaker arms
+                // on real connect failures (PG unreachable) but NOT on pool
+                // saturation, so this reflects runtime reachability without the
+                // false-negative a lease-consuming probe would hit under load
+                // (gov UP-2 — a busy-but-healthy server must NOT be evicted
+                // from the LB). Saturation is surfaced via the acquire-wait
+                // histogram + pool gauges + their alert rules, not /readyz.
+                {"pg_pool", pg_pool_ != nullptr && pg_pool_->valid() &&
+                                !pg_pool_->connect_breaker_open()},
+                // First migrated store (#1368). The server fails closed without
+                // Postgres, so this is true whenever it serves; a false here is
+                // the loud signal that the migration path is broken even though
+                // the pool answered.
+                {"offline_endpoint_store",
+                 offline_endpoint_store_ && offline_endpoint_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -7510,6 +7651,29 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+        // Per-device tier + management-group scope gate (wraps
+        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
+        // operator can only open / read / live-query a device inside their scope.
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
+        // device drills). SAME policy as get_visible_agents_json / the /devices list:
+        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
+        // off); else the caller's management-group members. The global-read branch is
+        // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        auto visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
+                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+                    auto v = mgmt_group_store_->get_visible_agents(username);
+                    return std::set<std::string>(v.begin(), v.end());
+                }
+            }
+            return std::nullopt; // global read or RBAC disabled → sees all
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -7927,6 +8091,18 @@ private:
             // and of those the Windows ones (the only OS with a crash collector
             // today — the coverage-honest crash-free denominator). Real data; an
             // empty fleet degrades the rates to the "no data" tile, never a fake number.
+            //
+            // SCOPING NOTE (PR #1522 re-review): this provider is intentionally
+            // fleet-wide and is NOT an enumeration vector — it renders NO agent_ids.
+            // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
+            // score-distribution histogram). The device-id LISTS the re-review flagged
+            // get their ids from the per-OBSERVATION store queries (dex_top_devices /
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
+            // scoped to the caller's management groups (VisibleSetFn). So the
+            // enumeration is closed independent of this provider. True per-TENANT
+            // aggregate RATES would also need the store-side crash/signal NUMERATORS
+            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
+            // scoping the denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();
@@ -7940,6 +8116,19 @@ private:
                         // (G4 UP-1; pre-existing here, fixed with the sibling).
                         if (os.starts_with("win"))
                             ++f.windows_online;
+                        // Distinct connected OS tokens → the Catalogue's "All
+                        // connected" coverage scope (render normalises darwin→macos).
+                        if (!os.empty() && std::find(f.connected_os.begin(),
+                                                     f.connected_os.end(), os) ==
+                                               f.connected_os.end())
+                            f.connected_os.push_back(os);
+                        // Normalized (id, os) for the Overview score distribution +
+                        // the segment breakdown.
+                        const std::string nos = os.starts_with("win")            ? "windows"
+                                                : os.starts_with("lin")          ? "linux"
+                                                : (os == "darwin" || os == "macos") ? "macos"
+                                                                                    : os;
+                        f.connected_agents.emplace_back(id, nos);
                     }
                 }
                 return f;
@@ -7966,7 +8155,11 @@ private:
                 return out;
             },
             // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn);
+            dex_perf_fn,
+            // Per-device scope gate (same require_scoped_permission the /device routes
+            // use) + the visible-agent set resolver — so the per-device DEX drills are
+            // scoped and the device-id lists never enumerate out-of-scope agents.
+            scoped_perm_fn, visible_set_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -8092,11 +8285,125 @@ private:
         network_routes_ = std::make_unique<NetworkRoutes>();
         network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
 
+        // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
+        // page; Device-info lens). Sourced from the live registry (the CONNECTED
+        // agents) → identity + tags, online=true. The DEX/Guardian lenses + the
+        // live pull are gated per-device by scoped_perm_fn (management-group scope).
+        // Provider is PER-OPERATOR SCOPED via get_visible_agents_json — the SAME
+        // path /api/agents uses, so a scope-limited operator never enumerates the
+        // whole fleet. Identity-only — deliberately does NOT score (dex_score stays
+        // -1); scoring is per-device in DeviceRoutes at the render sites (the single
+        // device on a page open; only the filtered rows on the list), so opening one
+        // device's page never pays an N-device GROUP-BY cost. (Governance Gate-3
+        // architect finding; 400k-scale + NFR.)
+        // Shared json-agent → DeviceRow identity mapping (used by both the scoped
+        // list provider and the unscoped single-device lookup).
+        auto make_device_row = [this](const nlohmann::json& a) -> DeviceRow {
+            DeviceRow d;
+            d.agent_id = a.value("agent_id", "");
+            d.hostname = a.value("hostname", "");
+            d.os = a.value("os", "");
+            d.arch = a.value("arch", "");
+            d.agent_version = a.value("agent_version", "");
+            d.online = true; // the registry holds connected sessions
+            d.last_seen = "now";
+            if (auto s = registry_.get_session(d.agent_id)) {
+                for (const auto& [k, v] : s->scopable_tags)
+                    d.tags.push_back(v.empty() ? k : (k + "=" + v));
+            }
+            return d;
+        };
+        auto devices_fn =
+            [this, make_device_row](const std::string& username) -> std::vector<DeviceRow> {
+            std::vector<DeviceRow> out;
+            auto arr = get_visible_agents_json(username);
+            out.reserve(arr.size());
+            for (const auto& a : arr)
+                out.push_back(make_device_row(a));
+            return out;
+        };
+        // UNSCOPED single-device resolver (the `get_one(id)` the list scan was meant
+        // to become). Authz is the scoped_perm_fn gate the per-device routes run
+        // FIRST; this only fetches the identity row. It must NOT re-scope: the list
+        // filter (get_visible_agents) is a flat group-member JOIN with no ancestor
+        // walk, while require_scoped_permission IS ancestor-aware — re-scoping here
+        // would 404 a device a parent-group role legitimately authorizes.
+        auto lookup_fn =
+            [this, make_device_row](const std::string& agent_id) -> std::optional<DeviceRow> {
+            if (agent_id.empty())
+                return std::nullopt;
+            for (const auto& a : registry_.to_json_obj())
+                if (a.value("agent_id", "") == agent_id)
+                    return make_device_row(a);
+            return std::nullopt;
+        };
+        device_routes_ = std::make_unique<DeviceRoutes>();
+        device_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            guaranteed_state_store_.get(),
+            // "Get live info" dispatches real plugin instructions (os_info/uptime,
+            // processes/list_hashed) through the shared chokepoint. DELIBERATELY an
+            // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
+            // the executions drawer): the live shell auto-fires one panel per kind on
+            // every device-page open, so tracking would flood the drawer with two
+            // executions per view. This matches the already-shipped DEX device-perf
+            // panel (also execution_id="") and the compliance polchk- skip — the same
+            // high-frequency-read rationale. Agentic-first parity (a machine-readable
+            // MCP/REST equivalent + discovery) for live-info AND the DEX-perf sibling
+            // is a tracked cross-cutting follow-up, not this PR (PR #1522 review #3).
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            // Narrow ResponseStore seam for the result poll.
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
+        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
+        // untracked dispatch (execution_id="" → not in the executions drawer, like the
+        // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
+        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
+        // agent). Per-host only; data from the agent's local tar.db only.
+        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
+        tar_tree_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_,
+                                     offline_endpoint_store_.get());
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -8786,6 +9093,15 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
+    /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
+    /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
+    /// gRPC drain so no handler thread still holds a lease. DECLARED right after
+    /// metrics_ on purpose: its observer hooks capture &metrics_, so the pool
+    /// must destruct before metrics_ (reverse-declaration order) — and before it,
+    /// every Postgres-backed store (declared later) releases its PgPool& and
+    /// every ingest thread (agent_service_, declared later) has already stopped.
+    std::unique_ptr<pg::PgPool> pg_pool_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
@@ -8838,6 +9154,11 @@ private:
 
     // Phase 1: Data infrastructure
     std::unique_ptr<ResponseStore> response_store_;
+    /// Born-on-Postgres last-known endpoint store (#1320 PR 3). Borrows pg_pool_
+    /// (declared earlier, destructs later) and is borrowed by the heartbeat
+    /// ingest path; declared here among the stores so it destructs AFTER the
+    /// ingest services + BEFORE the pool.
+    std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -8895,7 +9216,11 @@ private:
     // — not atomic by design; do NOT read/write it from another thread without
     // converting to std::atomic first (gov L1).
     std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
-    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // atomic so a future background-thread read can never be UB; today it is
+    // written/read only on the main thread (ctor → run() → main()), so the
+    // default seq_cst on the implicit load/store is free on this cold path
+    // (gov fjarvis L2).
+    std::atomic<bool> startup_failed_{false}; // run() refused to start — main() exits non-zero
     // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
     // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
     std::string agent_ca_cert_pem_;
@@ -8924,6 +9249,8 @@ private:
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
+    std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

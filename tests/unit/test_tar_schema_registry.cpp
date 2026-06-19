@@ -175,3 +175,30 @@ TEST_CASE("TAR schema: effective network capture method is always polling today"
     CHECK(effective_network_capture_method("") == "polling");
     CHECK(effective_network_capture_method("not_a_real_method") == "polling");
 }
+
+// ── Per-source default-enabled (review R1) ──────────────────────────────────
+
+TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
+          "[tar][schema][default-off]") {
+    // default_enabled is the single source of truth the plugin's source_enabled(),
+    // do_status(), apply_source_enabled_transition(), and run_retention() all
+    // read. The high-volume usage-class sources (module ~100× process volume,
+    // procperf per-app, netqual per-connection) are opt-in and must report
+    // disabled on a fresh agent; everything else is always-on.
+    for (const auto* name : {"module", "procperf", "netqual"}) {
+        INFO("opt-in source=" << name);
+        CHECK_FALSE(source_default_enabled(name));
+    }
+    for (const auto* name : {"process", "tcp", "service", "user", "perf"}) {
+        INFO("always-on source=" << name);
+        CHECK(source_default_enabled(name));
+    }
+    // An unknown source falls back to the always-on default.
+    CHECK(source_default_enabled("does_not_exist"));
+
+    // The field and the lookup must agree for every registered source.
+    for (const auto& src : capture_sources()) {
+        INFO("source=" << src.name);
+        CHECK(source_default_enabled(src.name) == src.default_enabled);
+    }
+}

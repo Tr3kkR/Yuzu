@@ -150,10 +150,24 @@ test(
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
+tar_test_cpp_args = []
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp ETW decode
+elif host_machine.system() == 'darwin'
+  # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
+  # audit-token helpers, gated on the framework being present (full Xcode SDK).
+  # The live client never starts in CI (unentitled) so the pure-mapping + clean-
+  # fallback tests run regardless; the ES TU only links the framework where it
+  # exists. Mirror the plugin's capability detection (docs/darwin-compat.md).
+  es_test_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
+  if es_test_dep.found()
+    tar_test_deps += es_test_dep
+    tar_test_deps += cxx.find_library('bsm')
+    # -fblocks required for the ES block literal in tar_proc_es.cpp (see plugin meson).
+    tar_test_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
+  endif
 endif
 
 tar_test_exe = executable(
@@ -167,6 +181,8 @@ tar_test_exe = executable(
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
     'unit/test_tar_proc_etw.cpp',
+    'unit/test_tar_proc_es.cpp',
+    'unit/test_tar_module_stream.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -175,12 +191,16 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_aggregator.cpp',
     '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_perf.cpp',
+    '../agents/plugins/tar/src/tar_proc_stream.cpp',
+    '../agents/plugins/tar/src/tar_module_stream.cpp',
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
+    '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
   ],
+  cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -244,6 +264,10 @@ if build_server
       'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
+      'unit/server/test_device_ui.cpp',
+      'unit/server/test_device_routes.cpp',
+      'unit/server/test_tar_process_tree.cpp',
+      'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
@@ -298,6 +322,9 @@ if build_server
       'unit/server/test_pg_raii.cpp',
       'unit/server/test_pg_pool.cpp',
       'unit/server/test_pg_migration_runner.cpp',
+      'unit/server/test_pg_hardening.cpp',
+      'unit/server/test_offline_endpoint_store.cpp',
+      'unit/server/test_secret_codec.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
