@@ -7,6 +7,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('ws2_32')
   tar_deps += cxx.find_library('wtsapi32')
   tar_deps += cxx.find_library('tdh')     # ETW event decoding (tar_proc_etw)
+  tar_deps += cxx.find_library('dnsapi')  # DnsQuery_W / DnsRecordListFree (tar_dns_collector)
 elif host_machine.system() == 'darwin'
   # Endpoint Security process stream (tar_proc_es). The ES framework ships only
   # with the FULL Xcode SDK, not the Command Line Tools SDK, so detect it: where
@@ -38,6 +39,8 @@ shared_library(
     'src/tar_aggregator.cpp',
     'src/tar_sql_executor.cpp',
     'src/tar_network_collector.cpp',
+    'src/tar_arp_collector.cpp',
+    'src/tar_dns_collector.cpp',
     'src/tar_perf.cpp',
     'src/tar_proc_perf.cpp',
     'src/tar_proc_stream.cpp',

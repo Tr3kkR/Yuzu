@@ -681,3 +681,108 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.recent_arp
+  displayName: "TAR: ARP table (recent)"
+  version: 1.0.0
+  description: >
+    Recent ARP / neighbour-table activity (ADR-0011) — IP<->MAC bindings per
+    interface with their appeared/removed action. Requires the opt-in `arp`
+    capture source to be enabled on the device.
+  tags: [tar, warehouse, arp, network, forensics]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.recent_dns
+  displayName: "TAR: DNS cache (recent)"
+  version: 1.0.0
+  description: >
+    Recent DNS resolver-cache state (ADR-0011) — name/record_type/data/TTL with
+    their appeared/removed action. Device-level (no per-process attribution).
+    Requires the opt-in `dns` capture source to be enabled on the device; DNS
+    cache is usage-class telemetry under the works-council posture.
+  tags: [tar, warehouse, dns, network, forensics]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active

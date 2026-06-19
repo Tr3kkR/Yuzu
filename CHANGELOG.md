@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ARP + DNS capture sources (TAR, ADR-0011) — Windows.** Two new **opt-in**
+  (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
+  via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS
+  resolver-cache state via `DnsGetCacheDataTable` → `$DNS_Live`/`$DNS_Hourly` —
+  device-level, **no per-process attribution**; DNS is usage-class PII, enabling is
+  audited). Queryable via `tar.sql`, the `query`/`export` actions (`type: arp|dns`),
+  and the `crossplatform.tar.recent_arp`/`recent_dns` canned instructions; toggled
+  via `crossplatform.tar.configure` (`arp_enabled`/`dns_enabled`) or the new **/tar
+  "Capture sources" frame** (staged-then-push guardrail + category filter). The
+  process-tree pane gains device-level **DNS-cache + ARP-table panels**
+  (audit verbs `tar.dns.read`/`tar.arp.read`). Linux/macOS collectors are planned
+  (schema registered, queryable-empty). The Windows agent links `dnsapi`.
+
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
   `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver

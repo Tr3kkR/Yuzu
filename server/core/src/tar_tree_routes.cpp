@@ -124,6 +124,13 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     h += "<aside class=\"tar-tree-side\"><div id=\"tar-tree-detail\"><div class=\"tar-tree-mute\">"
          "Select a process to see its path, user, connections and anomaly evidence.</div></div></aside>";
     h += "</div>";
+
+    // Device-level DNS cache + ARP table panels (ADR-0011). Loaded when the host
+    // picker changes — htmx `from:` selector fires this alongside the tree run, with
+    // no hx-on (CSP-safe). Device view, NOT per-process (the DNS cache carries no pid).
+    h += "<div id=\"tar-devnet\" hx-get=\"/fragments/tar/process-tree/device-net\" "
+         "hx-include=\"#tar-tree-host\" hx-trigger=\"change from:#tar-tree-host\" "
+         "hx-swap=\"innerHTML\"></div>";
     return h;
 }
 
@@ -140,6 +147,54 @@ std::string tree_pending(const std::string& device, const std::string& preset,
            "&amp;n=" + std::to_string(attempt) +
            "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
            "class=\"tar-tree-loading\">Reconstructing the process tree\xE2\x80\xA6</div>";
+}
+
+// Self-re-issuing poll for the device-net (DNS cache + ARP table) panels (ADR-0011).
+// Carries both dispatched command_ids; ready when DNS + ARP queries both complete.
+std::string devnet_pending(const std::string& device, const std::string& dcmd,
+                           const std::string& acmd, int attempt) {
+    return "<div hx-get=\"/fragments/tar/process-tree/device-net?device=" + url_enc(device) +
+           "&amp;dcmd=" + url_enc(dcmd) + "&amp;acmd=" + url_enc(acmd) +
+           "&amp;n=" + std::to_string(attempt) +
+           "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
+           "class=\"tar-tree-loading\">Loading device DNS / ARP\xE2\x80\xA6</div>";
+}
+
+// Capture-sources frame body: device picker (operator-scoped) + a target the table
+// loads into on host change. Mirrors render_frame's picker (ADR-0011).
+std::string render_cap_frame(const std::vector<DeviceRow>& devices) {
+    std::string h = "<div class=\"picker-row\"><label for=\"cap-host\">Device</label>";
+    h += "<select id=\"cap-host\" name=\"device\" class=\"scope-chip-select\" "
+         "hx-get=\"/fragments/tar/capture-sources/load\" hx-target=\"#cap-sources-body\" "
+         "hx-trigger=\"change\"><option value=\"\">Select a host\xE2\x80\xA6</option>";
+    std::vector<DeviceRow> rows = devices;
+    std::sort(rows.begin(), rows.end(), [](const DeviceRow& a, const DeviceRow& b) {
+        return (a.hostname.empty() ? a.agent_id : a.hostname) <
+               (b.hostname.empty() ? b.agent_id : b.hostname);
+    });
+    for (const auto& d : rows) {
+        if (!d.online)
+            continue;
+        const std::string label =
+            (d.hostname.empty() ? d.agent_id : d.hostname) + (d.os.empty() ? "" : (" (" + d.os + ")"));
+        h += "<option value=\"" + html_escape(d.agent_id) + "\">" + html_escape(label) + "</option>";
+    }
+    h += "</select><span class=\"src-note\">Toggling <b>stages</b> a change \xE2\x80\x94 nothing is "
+         "sent until you <b>Push</b> (a guardrail against accidentally enabling a source).</span></div>";
+    h += "<div id=\"cap-sources-body\"><div class=\"tar-tree-empty\">Select a host to view and manage "
+         "its capture sources.</div></div>";
+    return h;
+}
+
+// Self-re-issuing poll for the capture-sources table (carries the status + compat
+// command_ids; ready when both complete).
+std::string cap_pending(const std::string& device, const std::string& scmd, const std::string& ccmd,
+                        int attempt) {
+    return "<div hx-get=\"/fragments/tar/capture-sources/load?device=" + url_enc(device) +
+           "&amp;scmd=" + url_enc(scmd) + "&amp;ccmd=" + url_enc(ccmd) +
+           "&amp;n=" + std::to_string(attempt) +
+           "\" hx-trigger=\"load delay:600ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
+           "class=\"tar-tree-loading\">Loading capture sources\xE2\x80\xA6</div>";
 }
 
 // Poll one dispatched command for `device`: ready when it has output OR a terminal
@@ -476,6 +531,251 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                                   canonical_tar_preset(preset), win.from_ts, win.to_ts, node_count,
                                   anomaly_count, normalize_tar_os(os), tcp_ok ? 1 : 0));
         res.set_content(body, "text/html; charset=utf-8");
+    });
+
+    // -- Device-net panels: DNS cache + ARP table for the selected host (ADR-0011).
+    // Dispatches two canned read-only tar.sql ($DNS_Live, $ARP_Live), polls, renders
+    // DEVICE-level panels (never per-process — the DNS cache has no pid). Same scoped
+    // Read + Execute-probe tier as the tree run; audits tar.dns.read / tar.arp.read as
+    // DISTINCT verbs (DNS is usage-class PII, kept separately countable). --
+    sink.Get("/fragments/tar/process-tree/device-net", [this, can_execute](
+                                                            const httplib::Request& req,
+                                                            httplib::Response& res) {
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        const std::string device = get_param(req, "device");
+        if (device.empty()) {
+            res.set_content("", "text/html; charset=utf-8"); // no host picked yet
+            return;
+        }
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
+            return;
+        if (!can_execute(req, device)) {
+            note(res, "Live device DNS/ARP needs the <b>Execute</b> permission.");
+            return;
+        }
+        if (!dispatch_fn_ || !responses_fn_) {
+            note(res, "Live device query is unavailable on this server.");
+            return;
+        }
+        std::string dcmd = get_param(req, "dcmd");
+        std::string acmd = get_param(req, "acmd");
+        if (dcmd.empty() || acmd.empty()) {
+            // First call: dispatch the two queries (newest-first; the render reduces the
+            // appeared/removed stream to the current cache).
+            const std::string dsql =
+                "SELECT name, record_type, data, ttl_remaining_s, source, ts, action "
+                "FROM $DNS_Live ORDER BY ts DESC LIMIT 20000";
+            const std::string asql =
+                "SELECT interface, ip_address, mac_address, entry_type, ts, action "
+                "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
+            const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}});
+            const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}});
+            if (audit_fn_) {
+                audit_fn_(req, "tar.dns.read", dsent > 0 ? "dispatched" : "no_agents", "Agent",
+                          device, std::format("command_id={}", audit_token(dc)));
+                audit_fn_(req, "tar.arp.read", asent > 0 ? "dispatched" : "no_agents", "Agent",
+                          device, std::format("command_id={}", audit_token(ac)));
+            }
+            if (dsent == 0 || asent == 0) {
+                note(res, "Device offline \xE2\x80\x94 the DNS/ARP panels need a connected agent.");
+                return;
+            }
+            res.set_content(devnet_pending(device, dc, ac, 1), "text/html; charset=utf-8");
+            return;
+        }
+        // Poll: validate the command-id shape (same guard as the tree result route).
+        if (dcmd.size() > 64 || acmd.size() > 64 || !dcmd.starts_with("tar-") ||
+            !acmd.starts_with("tar-")) {
+            res.status = 400;
+            res.set_content("bad request", "text/plain");
+            return;
+        }
+        constexpr int kMaxAttempts = 30; // ~21s at 700ms
+        int attempt = 1;
+        if (req.has_param("n")) {
+            try {
+                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, kMaxAttempts);
+            } catch (...) {
+            }
+        }
+        const PollResult dns = poll_command(responses_fn_, dcmd, device);
+        const PollResult arp = poll_command(responses_fn_, acmd, device);
+        if (!dns.ready || !arp.ready) {
+            if (attempt >= kMaxAttempts) {
+                note(res, "No response from the device (timed out). Re-select the host to retry.");
+                return;
+            }
+            res.set_content(devnet_pending(device, dcmd, acmd, attempt + 1),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto dns_rows = (!dns.failed && !dns.output.starts_with("error|") &&
+                         dns.output.size() <= kMaxTarTcpOutputBytes)
+                            ? parse_tar_dns_output(dns.output)
+                            : std::vector<TarDnsCacheEntry>{};
+        auto arp_rows = (!arp.failed && !arp.output.starts_with("error|") &&
+                         arp.output.size() <= kMaxTarTcpOutputBytes)
+                            ? parse_tar_arp_output(arp.output)
+                            : std::vector<TarArpEntry>{};
+        const std::string body = "<div class=\"devnet-row\">" + render_tar_dns_panel(dns_rows) +
+                                 render_tar_arp_panel(arp_rows) + "</div>";
+        res.set_content(body, "text/html; charset=utf-8");
+    });
+
+    // ── Capture-sources frame (ADR-0011): the /tar enable/disable surface. The
+    // frame route renders an operator-scoped device picker; /load dispatches
+    // `tar status` + `tar compatibility` and renders the table; /push dispatches
+    // `tar configure <src>_enabled=<bool>` per staged change. Same scoped Read +
+    // Execute-probe tier as the tree; the staged-then-push guardrail lives in the
+    // page JS (a toggle never dispatches — only Push does). ──
+    sink.Get("/fragments/tar/capture-sources", [this](const httplib::Request& req,
+                                                      httplib::Response& res) {
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        if (!perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        std::vector<DeviceRow> devices =
+            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
+        res.set_content(render_cap_frame(devices), "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/tar/capture-sources/load", [this, can_execute](const httplib::Request& req,
+                                                                        httplib::Response& res) {
+        const std::string device = get_param(req, "device");
+        if (device.empty()) {
+            res.set_content("<div class=\"tar-tree-empty\">Select a host to view and manage its "
+                            "capture sources.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
+            return;
+        if (!can_execute(req, device)) {
+            note(res, "Reading a device's capture-source state dispatches a read-only query and "
+                      "needs the <b>Execute</b> permission.");
+            return;
+        }
+        if (!dispatch_fn_ || !responses_fn_) {
+            note(res, "Live device query is unavailable on this server.");
+            return;
+        }
+        std::string scmd = get_param(req, "scmd");
+        std::string ccmd = get_param(req, "ccmd");
+        if (scmd.empty() || ccmd.empty()) {
+            const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {});
+            const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {});
+            if (audit_fn_)
+                audit_fn_(req, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents", "Agent",
+                          device, std::format("command_id={}", audit_token(sc)));
+            if (ssent == 0 || csent == 0) {
+                note(res, "Device offline \xE2\x80\x94 capture-source management needs a connected agent.");
+                return;
+            }
+            res.set_content(cap_pending(device, sc, cc, 1), "text/html; charset=utf-8");
+            return;
+        }
+        if (scmd.size() > 64 || ccmd.size() > 64 || !scmd.starts_with("tar-") ||
+            !ccmd.starts_with("tar-")) {
+            res.status = 400;
+            res.set_content("bad request", "text/plain");
+            return;
+        }
+        constexpr int kMaxAttempts = 30;
+        int attempt = 1;
+        if (req.has_param("n")) {
+            try {
+                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, kMaxAttempts);
+            } catch (...) {
+            }
+        }
+        const PollResult st = poll_command(responses_fn_, scmd, device);
+        const PollResult cp = poll_command(responses_fn_, ccmd, device);
+        if (!st.ready || !cp.ready) {
+            if (attempt >= kMaxAttempts) {
+                note(res, "No response from the device (timed out). Re-select the host to retry.");
+                return;
+            }
+            res.set_content(cap_pending(device, scmd, ccmd, attempt + 1), "text/html; charset=utf-8");
+            return;
+        }
+        if (st.failed || st.output.starts_with("error|")) {
+            note(res, "The device failed the status query.");
+            return;
+        }
+        const std::string compat = (!cp.failed && !cp.output.starts_with("error|")) ? cp.output : "";
+        res.set_content(render_tar_capture_sources(device, st.output, compat),
+                        "text/html; charset=utf-8");
+    });
+
+    // Push: apply staged enable/disable changes. POST body: device + changes
+    // ("src=on,src2=off"). One `tar configure` dispatch per source, each audited
+    // separately (tar.sources.configure) — DNS enable is its own audit row.
+    sink.Post("/fragments/tar/capture-sources/push", [this, can_execute](const httplib::Request& req,
+                                                                         httplib::Response& res) {
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        const std::string device = get_param(req, "device");
+        if (device.empty()) {
+            note(res, "No device selected.");
+            return;
+        }
+        if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
+            return;
+        if (!can_execute(req, device)) {
+            note(res, "Pushing capture-source changes needs the <b>Execute</b> permission.");
+            return;
+        }
+        if (!dispatch_fn_) {
+            note(res, "Live device dispatch is unavailable on this server.");
+            return;
+        }
+        // Allowlist of source names — never interpolate an arbitrary token into the
+        // `<src>_enabled` configure key.
+        static const std::array<std::string_view, 10> kKnown = {
+            "process", "tcp", "service", "user",   "perf",
+            "procperf", "netqual", "module", "arp", "dns"};
+        const std::string changes = get_param(req, "changes");
+        int applied = 0;
+        std::size_t pos = 0;
+        while (pos < changes.size()) {
+            const auto comma = changes.find(',', pos);
+            std::string tok =
+                changes.substr(pos, (comma == std::string::npos ? changes.size() : comma) - pos);
+            pos = (comma == std::string::npos) ? changes.size() : comma + 1;
+            const auto eq = tok.find('=');
+            if (eq == std::string::npos)
+                continue;
+            const std::string src = tok.substr(0, eq);
+            const std::string val = tok.substr(eq + 1);
+            if (std::find(kKnown.begin(), kKnown.end(), src) == kKnown.end())
+                continue; // reject unknown source name
+            if (val != "on" && val != "off")
+                continue;
+            const std::string enabled = (val == "on") ? "true" : "false";
+            const auto [cmd, sent] =
+                dispatch_fn_("tar", "configure", {device}, "", {{src + "_enabled", enabled}});
+            if (audit_fn_)
+                audit_fn_(req, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
+                          "Agent", device,
+                          std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
+            ++applied;
+        }
+        res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
+                                    applied),
+                        "text/html; charset=utf-8");
     });
 
     // -- Detail: render one node from the cached reconstruction. Holds the SAME tier as

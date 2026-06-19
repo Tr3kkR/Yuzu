@@ -241,3 +241,66 @@ For new-source bring-up, the smallest viable change is: add a
 `CaptureSourceDef` to `build_sources()`, write the platform collectors
 + enumeration function, write the diff, write tests. No DDL, no
 rollup, no plumbing changes — the registry is the contract.
+
+## 8. Adding a capture source
+
+A **capture source** is a snapshot-and-diff observer (births/deaths of host
+state) — like `process`, `tcp`, `service`, `user`. ARP and DNS (ADR-0011) are the
+worked example. Follow the **core capture-source pattern** below — do **not** copy
+the self-contained *tier* files (`tar_perf.*`, `tar_proc_perf.*`, `tar_netqual.*`),
+which are derived-metric samplers with their own headers and pure helpers, a
+different shape.
+
+The core pattern (mirror network/service/user — none of which have a per-source
+header):
+
+1. **`agents/plugins/tar/src/tar_collectors.hpp`** — add the collected-snapshot
+   struct (e.g. `ArpEntry`), the `enumerate_<source>()` declaration, and the typed
+   `compute_<source>_events()` diff declaration. **Watch for Win32 macro
+   collisions** — `interface` is `#define interface struct` under the full
+   `<windows.h>` (the server pulls it via httplib), so a member named `interface`
+   breaks the moment a TU without `WIN32_LEAN_AND_MEAN` includes the header; name
+   it `iface`.
+2. **`agents/plugins/tar/src/tar_<source>_collector.cpp`** (new) — `#include
+   "tar_collectors.hpp"`; implement `enumerate_<source>()` per platform with
+   `#ifdef _WIN32` / `#elif __APPLE__` / `#elif __linux__`, returning `{}` on
+   platforms whose collector is `kPlanned`. Enforce a per-cycle cap with a
+   `spdlog::warn` on truncation (there is no agent `/metrics` and no event bus, so
+   a log line is the truncation signal — not a metric or audit event).
+3. **`tar_db.{hpp,cpp}`** — add the warehouse-row struct (e.g. `ArpEvent`, next to
+   `NetworkEvent`) and `insert_<source>_events()` (mirror `insert_network_events`:
+   `BEGIN`/prepared insert/`COMMIT`, `StmtPtr` RAII).
+4. **`tar_diff.cpp`** — implement `compute_<source>_events()`: an `unordered_map`
+   keyed on the source's identity (delimiter `\x1f`, which never appears in the
+   data) → `appeared`/`removed`. Keep value-only fields (TTL, entry_type) **out**
+   of the key so they don't churn the warehouse.
+5. **`tar_schema_registry.cpp`** `build_sources()` — add ONE `CaptureSourceDef`.
+   This is the single source of truth: it auto-drives the warehouse DDL, the
+   `$Name_Tier` → `name_tier` translation, the read-only-SQL authorizer allowlist
+   (`is_queryable_table`, the #760/#631 chokepoint — **no hardcoded list to
+   touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
+   Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
+   `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
+   branch per non-live tier. **Usage-class / PII sources are opt-in**
+   (`default_enabled = false`, like `module`/`procperf`/`netqual`) under the
+   works-council posture.
+6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
+   gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
+   `set_state` (advance the diff baseline **only on insert success**). For an
+   opt-in source, an insert failure is non-fatal (log + skip — don't fail the
+   always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   should appear in those actions.
+7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
+   `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).
+8. **Content** (`content/definitions/`) — add `<source>_enabled` to
+   `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
+   `tar.sql` drill-downs.
+9. **Server GUI** (optional) — the Capture-sources frame
+   (`render_tar_capture_sources`) auto-lists any source the agent reports in
+   `tar status`; presentation metadata (category, always-on, `$`-name, badges)
+   lives in that render function. Device-level panels (no pid) go in the
+   process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
+10. **Tests** — extend `test_tar_schema_registry.cpp` (every source has all three
+    OS rows; opt-in sources in the `default_enabled=false` cross-check),
+    `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
+    `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.

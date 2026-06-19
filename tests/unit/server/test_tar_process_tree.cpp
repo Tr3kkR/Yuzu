@@ -562,3 +562,78 @@ TEST_CASE("tar normalize_tar_os: maps to a closed audit-safe set", "[tar][tree][
     CHECK(normalize_tar_os("win\ndows evil=1") == "windows");
     CHECK(normalize_tar_os("totally unknown os") == "?");
 }
+
+// =============================================================================
+// Device DNS / ARP panels (ADR-0011) — parsers + current-state reduction + escape
+// =============================================================================
+
+TEST_CASE("parse_tar_dns_output: schema-located, skips torn/error rows", "[tar][dns][panel]") {
+    const std::string out =
+        "__schema__|name|record_type|data|ttl_remaining_s|source|ts|action\n"
+        "example.com|A|93.184.216.34|60|cache|100|appeared\n"
+        "torn-row-missing-cells\n"
+        "evil.test|A|10.0.0.9|30|cache|101|appeared\n"
+        "total|2\n";
+    auto rows = parse_tar_dns_output(out);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].name == "example.com");
+    CHECK(rows[0].record_type == "A");
+    CHECK(rows[0].ttl_remaining_s == 60);
+    CHECK(rows[0].action == "appeared");
+    CHECK(rows[1].name == "evil.test");
+}
+
+TEST_CASE("parse_tar_dns_output: an error| payload yields no rows", "[tar][dns][panel]") {
+    CHECK(parse_tar_dns_output("error|dns source disabled\n").empty());
+}
+
+TEST_CASE("render_tar_dns_panel: newest-wins, removed dropped, fields escaped",
+          "[tar][dns][panel]") {
+    // Rows are newest-first. A 'removed' newest action drops the binding; an older
+    // duplicate of an already-seen key is ignored.
+    std::vector<TarDnsCacheEntry> rows = {
+        {200, "gone.test", "A", "1.2.3.4", 5, "cache", "removed"},
+        {150, "keep.test", "A", "<script>", 9, "cache", "appeared"},
+        {100, "keep.test", "A", "<script>", 60, "cache", "appeared"}, // older dup — ignored
+    };
+    const std::string html = render_tar_dns_panel(rows);
+    CHECK(html.find("keep.test") != std::string::npos);
+    CHECK(html.find("gone.test") == std::string::npos);          // removed → omitted
+    CHECK(html.find("&lt;script&gt;") != std::string::npos);     // agent field escaped
+    CHECK(html.find("<script>") == std::string::npos);           // never raw
+    CHECK(html.find("devnet-count\">1<") != std::string::npos);  // one current entry
+}
+
+TEST_CASE("parse_tar_arp_output + render_tar_arp_panel", "[tar][arp][panel]") {
+    const std::string out =
+        "__schema__|interface|ip_address|mac_address|entry_type|ts|action\n"
+        "Ethernet|192.168.1.1|aa:bb:cc:dd:ee:ff|dynamic|100|appeared\n"
+        "Ethernet|192.168.1.9|11:22:33:44:55:66|static|90|removed\n";
+    auto rows = parse_tar_arp_output(out);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].iface == "Ethernet");
+    CHECK(rows[0].ip_address == "192.168.1.1");
+    const std::string html = render_tar_arp_panel(rows);
+    CHECK(html.find("192.168.1.1") != std::string::npos);
+    CHECK(html.find("192.168.1.9") == std::string::npos); // removed → omitted
+}
+
+TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr",
+          "[tar][capture-sources]") {
+    const std::string status =
+        "config|process_enabled|true\nconfig|process_live_rows|18204\n"
+        "config|arp_enabled|false\nconfig|arp_live_rows|0\n"
+        "config|dns_enabled|true\nconfig|dns_live_rows|42\n";
+    const std::string compat =
+        "header|source|os|status|capture_method|notes\n"
+        "row|arp|windows|supported|iphlpapi|x\nrow|arp|linux|planned|procfs|y\n"
+        "row|dns|windows|supported|dnsapi|x\n";
+    const std::string html = render_tar_capture_sources("agent-123", status, compat);
+    CHECK(html.find("data-device=\"agent-123\"") != std::string::npos);
+    CHECK(html.find("always on") != std::string::npos);             // process is locked
+    CHECK(html.find("data-source=\"arp\"") != std::string::npos);   // arp is a staged toggle
+    CHECK(html.find("badge-new") != std::string::npos);             // arp/dns NEW badge
+    CHECK(html.find("badge-pii") != std::string::npos);             // dns PII badge
+    CHECK(html.find("stageCapToggle(this)") != std::string::npos);  // guardrail wiring
+    CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
+}

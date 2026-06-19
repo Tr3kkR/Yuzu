@@ -141,7 +141,7 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // read. The high-volume usage-class sources (module ~100× process volume,
     // procperf per-app, netqual per-connection) are opt-in and must report
     // disabled on a fresh agent; everything else is always-on.
-    for (const auto* name : {"module", "procperf", "netqual"}) {
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }

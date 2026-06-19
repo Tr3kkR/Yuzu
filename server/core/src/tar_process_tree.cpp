@@ -6,6 +6,8 @@
 
 #include "web_utils.hpp" // html_escape, format_iso_utc, format_relative_time
 
+#include <unordered_set> // device-net panel current-state reduction (ADR-0011)
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -227,6 +229,113 @@ std::vector<TarTcpConn> parse_tar_tcp_output(const std::string& output, std::siz
             t.ts = *v;
         t.action = to_lower(at(c_action));
         out.push_back(std::move(t));
+    }
+    return out;
+}
+
+std::vector<TarDnsCacheEntry> parse_tar_dns_output(const std::string& output, std::size_t max_rows) {
+    std::vector<TarDnsCacheEntry> out;
+    int c_ts = -1, c_name = -1, c_type = -1, c_data = -1, c_ttl = -1, c_src = -1, c_action = -1;
+    bool have_schema = false;
+    std::size_t pos = 0;
+    while (pos < output.size() && out.size() < max_rows) {
+        const auto nl = output.find('\n', pos);
+        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return out;
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto cols = split_pipe(line);
+            c_ts = schema_index(cols, "ts");
+            c_name = schema_index(cols, "name");
+            c_type = schema_index(cols, "record_type");
+            c_data = schema_index(cols, "data");
+            c_ttl = schema_index(cols, "ttl_remaining_s");
+            c_src = schema_index(cols, "source");
+            c_action = schema_index(cols, "action");
+            if (c_name < 0 || c_type < 0 || c_data < 0)
+                return out; // need at least the resolution identity
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        auto at = [&](int idx) -> std::string {
+            return (idx >= 0 && idx < static_cast<int>(cells.size()))
+                       ? cells[static_cast<std::size_t>(idx)]
+                       : std::string{};
+        };
+        const int need = (std::max)({c_name, c_type, c_data});
+        if (static_cast<int>(cells.size()) <= need)
+            continue; // trailer ("total|N") or torn row
+        TarDnsCacheEntry e;
+        if (auto v = cell_i64(at(c_ts)); v)
+            e.ts = *v;
+        e.name = at(c_name);
+        e.record_type = at(c_type);
+        e.data = at(c_data);
+        if (auto v = cell_i64(at(c_ttl)); v)
+            e.ttl_remaining_s = *v;
+        e.source = at(c_src);
+        e.action = to_lower(at(c_action));
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::vector<TarArpEntry> parse_tar_arp_output(const std::string& output, std::size_t max_rows) {
+    std::vector<TarArpEntry> out;
+    int c_ts = -1, c_iface = -1, c_ip = -1, c_mac = -1, c_type = -1, c_action = -1;
+    bool have_schema = false;
+    std::size_t pos = 0;
+    while (pos < output.size() && out.size() < max_rows) {
+        const auto nl = output.find('\n', pos);
+        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return out;
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto cols = split_pipe(line);
+            c_ts = schema_index(cols, "ts");
+            c_iface = schema_index(cols, "interface");
+            c_ip = schema_index(cols, "ip_address");
+            c_mac = schema_index(cols, "mac_address");
+            c_type = schema_index(cols, "entry_type");
+            c_action = schema_index(cols, "action");
+            if (c_ip < 0 || c_mac < 0)
+                return out; // need at least the binding endpoints
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        auto at = [&](int idx) -> std::string {
+            return (idx >= 0 && idx < static_cast<int>(cells.size()))
+                       ? cells[static_cast<std::size_t>(idx)]
+                       : std::string{};
+        };
+        const int need = (std::max)(c_ip, c_mac);
+        if (static_cast<int>(cells.size()) <= need)
+            continue;
+        TarArpEntry e;
+        if (auto v = cell_i64(at(c_ts)); v)
+            e.ts = *v;
+        e.iface = at(c_iface);
+        e.ip_address = at(c_ip);
+        e.mac_address = at(c_mac);
+        e.entry_type = at(c_type);
+        e.action = to_lower(at(c_action));
+        out.push_back(std::move(e));
     }
     return out;
 }
@@ -949,6 +1058,221 @@ std::string render_tar_proc_detail(const TarProcNode& node, const std::vector<Ta
         h += "</tbody></table>";
     }
     h += "</div>";
+    return h;
+}
+
+// ── Device DNS/ARP panels (ADR-0011) — device-level, NOT per process ──────────
+
+std::string render_tar_dns_panel(const std::vector<TarDnsCacheEntry>& rows) {
+    // Reduce the appeared/removed event stream (rows assumed newest-first) to the
+    // current cache: newest row per (name, record_type, data) wins; a binding whose
+    // newest action is `removed` is omitted.
+    std::unordered_set<std::string> seen;
+    std::vector<const TarDnsCacheEntry*> cur;
+    for (const auto& r : rows) {
+        std::string key = r.name + "\x1f" + r.record_type + "\x1f" + r.data;
+        if (!seen.insert(key).second)
+            continue;
+        if (r.action == "removed")
+            continue;
+        cur.push_back(&r);
+    }
+    std::string h = "<details class=\"devnet-panel\" open>";
+    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>DNS cache (device)</span>"
+         "<span class=\"devnet-count\">" +
+         std::to_string(cur.size()) + "</span></summary>";
+    if (cur.empty()) {
+        h += "<div class=\"devnet-empty\">No DNS cache entries &mdash; the <code>dns</code> source "
+             "may be disabled on this device.</div>";
+    } else {
+        h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Name</th>"
+             "<th>Type</th><th>Data</th><th>TTL</th><th>Src</th></tr></thead><tbody>";
+        std::size_t shown = 0;
+        for (const auto* r : cur) {
+            if (shown++ >= 500)
+                break;
+            h += "<tr><td>" + html_escape(r->name) + "</td>";
+            h += "<td class=\"dn-type\">" + html_escape(r->record_type) + "</td>";
+            h += "<td class=\"dn-data\">" + html_escape(r->data) + "</td>";
+            h += "<td class=\"dn-ttl\">" +
+                 (r->ttl_remaining_s < 0 ? std::string("\xE2\x80\x94")
+                                         : std::to_string(r->ttl_remaining_s)) +
+                 "</td>";
+            h += "<td class=\"dn-src\">" + html_escape(r->source) + "</td></tr>";
+        }
+        h += "</tbody></table></div>";
+    }
+    h += "<div class=\"devnet-caveat\">Device resolver-cache state &mdash; <strong>not</strong> "
+         "per-process (the cache carries no PID).</div></details>";
+    return h;
+}
+
+std::string render_tar_arp_panel(const std::vector<TarArpEntry>& rows) {
+    std::unordered_set<std::string> seen;
+    std::vector<const TarArpEntry*> cur;
+    for (const auto& r : rows) {
+        std::string key = r.iface + "\x1f" + r.ip_address + "\x1f" + r.mac_address;
+        if (!seen.insert(key).second)
+            continue;
+        if (r.action == "removed")
+            continue;
+        cur.push_back(&r);
+    }
+    std::string h = "<details class=\"devnet-panel\" open>";
+    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>ARP table (device)</span>"
+         "<span class=\"devnet-count\">" +
+         std::to_string(cur.size()) + "</span></summary>";
+    if (cur.empty()) {
+        h += "<div class=\"devnet-empty\">No ARP entries &mdash; the <code>arp</code> source may be "
+             "disabled on this device.</div>";
+    } else {
+        h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Interface</th>"
+             "<th>IP address</th><th>MAC</th><th>Type</th></tr></thead><tbody>";
+        std::size_t shown = 0;
+        for (const auto* r : cur) {
+            if (shown++ >= 500)
+                break;
+            const std::string tclass =
+                r->entry_type == "static" ? "arp-type-static" : "arp-type-dynamic";
+            h += "<tr><td>" + html_escape(r->iface) + "</td>";
+            h += "<td>" + html_escape(r->ip_address) + "</td>";
+            h += "<td class=\"arp-mac\">" + html_escape(r->mac_address) + "</td>";
+            h += "<td class=\"" + tclass + "\">" + html_escape(r->entry_type) + "</td></tr>";
+        }
+        h += "</tbody></table></div>";
+    }
+    h += "<div class=\"devnet-caveat\">Layer-2 adjacency for spoofing / poisoning checks.</div>"
+         "</details>";
+    return h;
+}
+
+// ── Capture-sources frame (ADR-0011) ─────────────────────────────────────────
+
+std::string render_tar_capture_sources(const std::string& device, const std::string& status_output,
+                                       const std::string& compat_output) {
+    auto each_line = [](const std::string& s, auto&& fn) {
+        std::size_t pos = 0;
+        while (pos < s.size()) {
+            const auto nl = s.find('\n', pos);
+            std::string line = s.substr(pos, (nl == std::string::npos ? s.size() : nl) - pos);
+            pos = (nl == std::string::npos) ? s.size() : nl + 1;
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            fn(line);
+        }
+    };
+
+    // status: config|<key>|<value>
+    std::unordered_map<std::string, std::string> cfg;
+    each_line(status_output, [&](const std::string& line) {
+        const auto c = split_pipe(line);
+        if (c.size() >= 3 && c[0] == "config")
+            cfg[c[1]] = c[2];
+    });
+    // compatibility: row|<src>|<os>|<status>|<method>|<notes>
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> osmap;
+    each_line(compat_output, [&](const std::string& line) {
+        const auto c = split_pipe(line);
+        if (c.size() >= 4 && c[0] == "row")
+            osmap[c[1]][c[2]] = c[3];
+    });
+
+    struct Meta {
+        const char* name;
+        const char* dollar;
+        const char* category;
+        bool always_on;
+        bool is_new;
+        bool pii;
+    };
+    // Presentation metadata (the agent's schema registry is not linked here).
+    // Category follows docs/user-manual/tar.md's five categories. always_on = the
+    // default-enabled core sources (locked here; forensic-pause uses the configure
+    // path). is_new/pii drive the badges.
+    static const std::array<Meta, 10> kSources = {{
+        {"process", "$Process", "Processes", true, false, false},
+        {"tcp", "$TCP", "Network connections", true, false, false},
+        {"service", "$Service", "Services", true, false, false},
+        {"user", "$User", "User sessions", true, false, false},
+        {"perf", "$Perf", "Performance", true, false, false},
+        {"procperf", "$ProcPerf", "Performance", false, false, false},
+        {"netqual", "$NetQual", "Network connections", false, false, false},
+        {"module", "$Module", "Processes", false, false, false},
+        {"arp", "$ARP", "Network connections", false, true, false},
+        {"dns", "$DNS", "Network connections", false, true, true},
+    }};
+
+    auto os_cell = [&](const std::string& src, const char* os) -> std::string {
+        auto s = osmap.find(src);
+        std::string st = (s != osmap.end() && s->second.count(os)) ? s->second.at(os) : "";
+        std::string cls = st == "supported" ? "os-ok" : (st == "constrained" ? "os-con" : "os-planned");
+        if (st.empty()) {
+            st = "\xE2\x80\x94";
+            cls = "os-planned";
+        }
+        return "<td class=\"os-cell " + cls + "\">" + html_escape(st) + "</td>";
+    };
+
+    std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
+                    "Category</span><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
+    static const std::array<std::pair<const char*, const char*>, 5> kChips = {
+        {{"Processes", "Processes"},
+         {"Network connections", "Network"},
+         {"Services", "Services"},
+         {"User sessions", "User sessions"},
+         {"Performance", "Performance"}}};
+    for (const auto& [cat, label] : kChips)
+        h += std::string("<a class=\"tar-chip\" onclick=\"filterCap(this,'") + cat + "')\">" + label +
+             "</a>";
+    h += "</div>";
+
+    h += "<table id=\"capTable\" data-device=\"" + html_escape(device) +
+         "\"><thead><tr><th>Source</th><th>Category</th><th>Table</th><th>State</th>"
+         "<th>Live rows</th><th>Windows</th><th>Linux</th><th>macOS</th></tr></thead><tbody>";
+
+    int rendered = 0;
+    for (const auto& m : kSources) {
+        const std::string en_key = std::string(m.name) + "_enabled";
+        if (!cfg.count(en_key))
+            continue; // not reported by this agent — skip
+        ++rendered;
+        const bool enabled = cfg.at(en_key) != "false";
+        const std::string rows_key = std::string(m.name) + "_live_rows";
+        const std::string rows = cfg.count(rows_key) ? cfg.at(rows_key) : "0";
+
+        h += "<tr data-cat=\"" + std::string(m.category) + "\"><td><span class=\"src-name\">" +
+             std::string(m.name) + "</span>";
+        if (m.is_new)
+            h += " <span class=\"badge badge-new\">NEW</span>";
+        if (m.pii)
+            h += " <span class=\"badge badge-pii\">PII</span>";
+        h += "</td><td class=\"cat\">" + std::string(m.category) + "</td><td class=\"src-dollar\">" +
+             std::string(m.dollar) + "</td><td><div class=\"state-cell\">";
+        if (m.always_on) {
+            h += "<label class=\"tgl locked\"><input type=\"checkbox\" checked disabled>"
+                 "<span class=\"sl\"></span></label><span class=\"state-txt state-on\">always on</span>";
+        } else {
+            h += "<label class=\"tgl\"><input type=\"checkbox\" data-source=\"" + std::string(m.name) +
+                 "\" data-committed=\"" + (enabled ? "true" : "false") + "\"" +
+                 (enabled ? " checked" : "") +
+                 " onchange=\"stageCapToggle(this)\"><span class=\"sl\"></span></label>"
+                 "<span class=\"state-txt" +
+                 std::string(enabled ? " state-on" : "") + "\">" + (enabled ? "enabled" : "disabled") +
+                 "</span>";
+        }
+        h += "</div></td><td><span class=\"badge badge-rows\">" + html_escape(rows) + "</span></td>";
+        h += os_cell(m.name, "windows");
+        h += os_cell(m.name, "linux");
+        h += os_cell(m.name, "macos");
+        h += "</tr>";
+    }
+    h += "</tbody></table>";
+    if (rendered == 0)
+        return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
+    h += "<div class=\"apply-bar\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
+         "<span id=\"capApplyMsg\">0 pending changes</span><span class=\"apply-spacer\"></span>"
+         "<button class=\"btn-secondary\" onclick=\"discardCapChanges()\">Discard</button>"
+         "<button class=\"apply-push\" onclick=\"pushCapChanges()\">Push changes &#8594;</button></div>";
     return h;
 }
 
