@@ -17,31 +17,31 @@
       "installed": "2026-04-14"
     },
     {
-      "name": "yuzu-bigtam-0",
-      "host": "BigTam (Threadripper 9970X, native Ubuntu 26.04)",
-      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam"],
-      "role": "Linux CI pool (shared label yuzu-bigtam) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "name": "yuzu-bigtam-linux-0",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
       "installed": "2026-06-19"
     },
     {
-      "name": "yuzu-bigtam-1",
-      "host": "BigTam (Threadripper 9970X, native Ubuntu 26.04)",
-      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam"],
-      "role": "Linux CI pool (shared label yuzu-bigtam) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "name": "yuzu-bigtam-linux-1",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
       "installed": "2026-06-19"
     },
     {
-      "name": "yuzu-bigtam-2",
-      "host": "BigTam (Threadripper 9970X, native Ubuntu 26.04)",
-      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam"],
-      "role": "Linux CI pool (shared label yuzu-bigtam) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "name": "yuzu-bigtam-linux-2",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
       "installed": "2026-06-19"
     },
     {
-      "name": "yuzu-bigtam-3",
-      "host": "BigTam (Threadripper 9970X, native Ubuntu 26.04)",
-      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam"],
-      "role": "Linux CI pool (shared label yuzu-bigtam) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "name": "yuzu-bigtam-linux-3",
+      "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
       "installed": "2026-06-19"
     }
   ]
