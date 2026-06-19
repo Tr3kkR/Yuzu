@@ -116,8 +116,10 @@ it only ever sees ordinary single commands.
 - **Bundles are not in the live executions drawer.** They remain fully observable via the audit
   log (per-step verbs), responses queryable by the correlation id, and the `yuzu_bundle_*` metrics
   (`yuzu_bundle_dispatched_total{surface,result}`, `yuzu_bundle_collated_total{surface,result}`,
-  `yuzu_bundle_manifests{surface}` gauge, `yuzu_bundle_evictions_total{reason}`). The caller's
-  collate poll is its own live view. (See Future for the drawer option.)
+  `yuzu_bundle_manifests{surface}` gauge, `yuzu_bundle_evictions_total{reason}`, and the
+  `yuzu_bundle_dispatch_duration_seconds{surface}` histogram — the synchronous fan-out latency,
+  surfaced so the UP-15 HTTP-worker hold is observable before the deferred async-dispatch fix).
+  The caller's collate poll is its own live view. (See Future for the drawer option.)
 - **Residuals to handle:** collate must ownership-check the correlation id against the bundle
   record's `dispatched_by` (IDOR); partial-dispatch failure must be recorded per step so a
   step that never reached the agent reads as failed, not pending-forever; abandoned bundle

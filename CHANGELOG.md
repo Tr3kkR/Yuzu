@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`target_type=Agent`), so a bundle is exactly as auditable as the N executions it
   replaces; collate enforces an ownership guard (a non-owner gets the same 404 as an
   unknown id). Observable via `yuzu_bundle_{dispatched,collated,manifests,evictions}`
-  metrics (labelled by surface). v1 bundle state is per-surface and in-memory; a
+  metrics plus a `yuzu_bundle_dispatch_duration_seconds` histogram (labelled by
+  surface). v1 bundle state is per-surface and in-memory; a
   durable Postgres manifest for HA + cross-surface collation is a committed
   follow-up (ADR-0011).
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**

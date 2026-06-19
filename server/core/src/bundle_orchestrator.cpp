@@ -63,6 +63,11 @@ BundleOrchestrator::DispatchResult
 BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
                              const std::string& principal, const AuditSink& audit) {
     const std::string correlation = std::string(kCorrelationPrefix) + mint_();
+    // Time the synchronous fan-out so the cost of holding the HTTP worker through
+    // N gRPC writes is observable BEFORE it becomes a thread-pool-starvation
+    // incident (governance UP-15, mitigation C — the async-dispatch fix that
+    // removes the synchronous hold is deferred to its own PR).
+    const auto dispatch_start = std::chrono::steady_clock::now();
 
     std::vector<DispatchedStep> dispatched;
     dispatched.reserve(steps.size());
@@ -150,6 +155,10 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
             ok_count == steps.size() ? "ok" : (ok_count == 0 ? "no_agents" : "partial");
         metrics_->counter("yuzu_bundle_dispatched_total", {{"surface", surface_}, {"result", result}})
             .increment();
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - dispatch_start).count();
+        metrics_->histogram("yuzu_bundle_dispatch_duration_seconds", {{"surface", surface_}})
+            .observe(secs);
     }
 
     return DispatchResult{correlation, steps.size()};

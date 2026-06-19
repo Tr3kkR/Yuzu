@@ -276,3 +276,23 @@ groups:
           description: >-
             In-flight bundle manifests are within ~15% of the cap; sustained growth
             will force cross-operator cap-eviction (see YuzuBundleCapEviction).
+      - alert: YuzuBundleDispatchLatencyHigh
+        # UP-15: the bundle fan-out is synchronous — a POST holds an HTTP worker
+        # across N gRPC writes. This pages before that hold (×concurrency) starves
+        # the worker pool; observe-only is not enough while the async-dispatch fix
+        # is deferred. 500ms is well above the ms-scale normal case.
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(yuzu_bundle_dispatch_duration_seconds_bucket[5m])) by (le, surface)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bundle dispatch fan-out p99 > 500ms (HTTP worker hold risk)"
+          description: >-
+            The synchronous bundle dispatch fan-out is holding HTTP workers for
+            >500ms p99 on surface={{ $labels.surface }}. Under load this risks
+            HTTP thread-pool starvation affecting unrelated routes. Reduce
+            concurrent bundle dispatches, reduce steps-per-bundle, or prioritise
+            the deferred async-dispatch fix (UP-15).
