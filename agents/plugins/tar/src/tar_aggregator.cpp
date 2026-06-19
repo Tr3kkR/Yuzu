@@ -95,23 +95,22 @@ bool rollup_tier(TarDatabase& db, std::string_view source_name,
 int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     int ops = 0;
 
-    struct RollupStep { std::string_view source; std::string_view target; };
-    static const RollupStep steps[] = {
-        {"process", "hourly"},
-        {"process", "daily"},
-        {"process", "monthly"},
-        {"tcp", "hourly"},
-        {"tcp", "daily"},
-        {"tcp", "monthly"},
-        {"service", "hourly"},
-        {"user", "daily"},
-        {"perf", "hourly"},
-        {"procperf", "hourly"},
-    };
-
-    for (const auto& step : steps) {
-        if (rollup_tier(db, step.source, step.target, now_epoch))
-            ++ops;
+    // Data-driven over the registry — symmetric with run_retention() below, which
+    // also walks capture_sources(). Every source's non-live granularities roll up
+    // in declaration order (hourly → daily → monthly), so the Live→Hourly→Daily→
+    // Monthly chain runs in dependency order within a tick (daily reads hourly,
+    // monthly reads daily). rollup_tier() is a no-op when the (source, tier) pair
+    // has no rollup_sql, so a source that lacks a tier — or has none, e.g. the
+    // single-tier netqual — is skipped automatically. This replaces a
+    // hand-maintained steps[] array that silently omitted any newly-registered
+    // source: the $Module rollup SQL was dead until this loop (governance UP-1).
+    for (const auto& src : capture_sources()) {
+        for (const auto& g : src.granularities) {
+            if (g.suffix == "live")
+                continue;
+            if (rollup_tier(db, src.name, g.suffix, now_epoch))
+                ++ops;
+        }
     }
 
     return ops;
@@ -122,7 +121,15 @@ bool apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view new_value,
                                       int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
-    std::string prev = db.get_config(enabled_key, "true");
+    // Default `prev` to the source's declared default so the first-ever set on a
+    // fresh DB is only a transition when it differs from that default. For an
+    // opt-in source (module/procperf/netqual, default false) the first
+    // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
+    // does not write a spurious paused_at. The `_enabled` flag itself is written
+    // below (in-branch), not here, so the #538 fail-safe ordering holds: on a
+    // disable the flag flips only after the baseline clear persists.
+    const char* prev_def = source_default_enabled(source) ? "true" : "false";
+    std::string prev = db.get_config(enabled_key, prev_def);
     auto paused_at_key = std::format("{}_paused_at", source);
 
     if (new_value == "false" && prev != "false") {
@@ -179,7 +186,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
         auto enabled_key = std::format("{}_enabled", src.name);
-        if (db.get_config(enabled_key, "true") == "false")
+        if (db.get_config(enabled_key, src.default_enabled ? "true" : "false") == "false")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);

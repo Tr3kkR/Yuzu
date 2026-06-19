@@ -308,15 +308,35 @@ TarStats TarDatabase::stats() {
     if (!db_)
         return s;
 
+    // Build the per-source live-table fragments once, data-driven over the
+    // capture-source registry — so a newly-registered source (perf, procperf,
+    // netqual, module, …) is counted automatically instead of being silently
+    // omitted by a hand-maintained four-table list. Source names come from the
+    // registry, a compile-time allowlist, so the concatenation carries no
+    // injection risk; every live tier has a `ts` column, and an empty table
+    // contributes COUNT 0 / NULL MIN/MAX, so including them is harmless.
+    std::string count_expr;
+    std::string min_union;
+    std::string max_union;
+    bool first = true;
+    for (const auto& src : capture_sources()) {
+        std::string live = std::string(src.name) + "_live";
+        if (!first) {
+            count_expr += " + ";
+            min_union += " UNION ALL ";
+            max_union += " UNION ALL ";
+        }
+        count_expr += "(SELECT COUNT(*) FROM " + live + ")";
+        min_union += "SELECT MIN(ts) AS m FROM " + live;
+        max_union += "SELECT MAX(ts) AS m FROM " + live;
+        first = false;
+    }
+
     // Aggregate record count across all live tables
     {
-        const char* sql = "SELECT "
-                          "(SELECT COUNT(*) FROM process_live) + "
-                          "(SELECT COUNT(*) FROM tcp_live) + "
-                          "(SELECT COUNT(*) FROM service_live) + "
-                          "(SELECT COUNT(*) FROM user_live)";
+        std::string sql = "SELECT " + count_expr;
         sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
             if (sqlite3_step(stmt.get()) == SQLITE_ROW)
                 s.record_count = sqlite3_column_int64(stmt.get(), 0);
@@ -325,13 +345,9 @@ TarStats TarDatabase::stats() {
 
     // Oldest timestamp across all live tables
     {
-        const char* sql = "SELECT MIN(m) FROM ("
-                          "SELECT MIN(ts) AS m FROM process_live UNION ALL "
-                          "SELECT MIN(ts) FROM tcp_live UNION ALL "
-                          "SELECT MIN(ts) FROM service_live UNION ALL "
-                          "SELECT MIN(ts) FROM user_live)";
+        std::string sql = "SELECT MIN(m) FROM (" + min_union + ")";
         sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
             if (sqlite3_step(stmt.get()) == SQLITE_ROW)
                 s.oldest_timestamp = sqlite3_column_int64(stmt.get(), 0);
@@ -340,13 +356,9 @@ TarStats TarDatabase::stats() {
 
     // Newest timestamp
     {
-        const char* sql = "SELECT MAX(m) FROM ("
-                          "SELECT MAX(ts) AS m FROM process_live UNION ALL "
-                          "SELECT MAX(ts) FROM tcp_live UNION ALL "
-                          "SELECT MAX(ts) FROM service_live UNION ALL "
-                          "SELECT MAX(ts) FROM user_live)";
+        std::string sql = "SELECT MAX(m) FROM (" + max_union + ")";
         sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
             if (sqlite3_step(stmt.get()) == SQLITE_ROW)
                 s.newest_timestamp = sqlite3_column_int64(stmt.get(), 0);

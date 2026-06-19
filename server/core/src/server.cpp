@@ -71,6 +71,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -227,21 +228,12 @@ struct ScopedKeyZero {
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
-// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
-// every control byte and structural delimiter (space, '=', ',') with '_'; the
-// identity is preserved verbatim in its own audit columns (principal/target_id)
-// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
-[[nodiscard]] inline std::string audit_token(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
-            out.push_back('_');
-        else
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
+// #1290 adds (field confusion), and a CRLF could split the audit line. The
+// canonical implementation now lives in web_utils.hpp so the same neutralizer
+// guards every structured-audit call site (here + tar_tree_routes.cpp) without
+// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// spellings below resolving unchanged.
+using yuzu::server::audit_token;
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -8378,6 +8370,34 @@ private:
             },
             audit_fn);
 
+        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
+        // untracked dispatch (execution_id="" → not in the executions drawer, like the
+        // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
+        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
+        // agent). Per-host only; data from the agent's local tar.db only.
+        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
+        tar_tree_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -9230,6 +9250,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
