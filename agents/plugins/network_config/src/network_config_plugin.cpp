@@ -629,6 +629,15 @@ private:
             ctx.write_output(std::format("error|GetIpNetTable2 failed (rc={})", rc));
             return 1;
         }
+        // RAII owner: FreeMibTable runs on every scope exit, including an exception
+        // thrown by std::format / write_output between here and the end of the loop
+        // (a manual FreeMibTable would leak the kernel table on that path).
+        // Aggregate with a destructor only (a user-declared ctor would disqualify the
+        // {table} brace-init); it's a named local, never copied.
+        struct MibTableGuard {
+            PMIB_IPNET_TABLE2 t;
+            ~MibTableGuard() { if (t) FreeMibTable(t); }
+        } table_guard{table};
         ULONG emitted = 0;
         for (ULONG i = 0; i < table->NumEntries && emitted < kArpEntryCap; ++i) {
             const MIB_IPNET_ROW2& row = table->Table[i];
@@ -641,8 +650,8 @@ private:
                 state_to_type(row.State)));
             ++emitted;
         }
-        FreeMibTable(table);
-        return 0;
+        return 0; // ~MibTableGuard frees the table on every path
+
 #else
         ctx.write_output("error|arp not available on this platform");
         return 1;

@@ -129,13 +129,17 @@ std::vector<std::string> pipe_fields(const std::string& line) {
 }
 
 // An htmx out-of-band swap that fills a card count-badge / KPI tile already in the DOM.
-std::string oob(const std::string& id, const std::string& text) {
-    return "<span id=\"" + id + "\" hx-swap-oob=\"true\">" + text + "</span>";
+// `cls` matches the placeholder element's class so styling survives the swap (htmx
+// replaces the whole target element, not just its text).
+std::string oob(const std::string& id, const std::string& cls, const std::string& text) {
+    return "<span class=\"" + cls + "\" id=\"" + id + "\" hx-swap-oob=\"true\">" + text + "</span>";
 }
 
 // Bound on parsed rows per source — a forged/huge response can shrink the rendered set
-// but never blow up memory or produce an unrenderable card.
-constexpr std::size_t kMaxLiveRows = 60000;
+// but never blow up memory or produce an unrenderable card. 20k is far above any real
+// process/connection count while bounding the per-request parse allocation (~8 MB worst
+// case for the heaviest LiveProcNode set) against an adversarial agent (SRE finding).
+constexpr std::size_t kMaxLiveRows = 20000;
 
 // Parse the agent output for `kind` into its typed rows and render the card body,
 // appending the OOB count-badge + KPI updates. `output2` carries the optional joined
@@ -148,7 +152,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         std::string value;
         for (const auto& l : lines)
             if (l.starts_with("uptime_display|")) { value = l.substr(15); break; }
-        return oob("ls-kpi-uptime", value.empty() ? "&mdash;" : html_escape(value));
+        return oob("ls-kpi-uptime", "n", value.empty() ? "&mdash;" : html_escape(value));
     }
 
     if (kind == "processes") { // legacy flat hashed list
@@ -175,8 +179,13 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             auto f = pipe_fields(l);
             if (f.size() < 4) continue;
             LiveProcNode n;
-            try { n.pid = static_cast<std::uint32_t>(std::stoul(f[1])); } catch (...) { continue; }
-            try { n.ppid = static_cast<std::uint32_t>(std::stoul(f[2])); } catch (...) { n.ppid = 0; }
+            // Guard the 64-bit-unsigned-long → uint32 narrowing: a forged pid/ppid
+            // above UINT32_MAX would otherwise truncate (e.g. 2^32 → 0) and collide
+            // with the "ppid==0 ⇒ root" sentinel, corrupting parent→child attribution.
+            try { unsigned long v = std::stoul(f[1]); if (v > 0xFFFFFFFFUL) continue; n.pid = static_cast<std::uint32_t>(v); }
+            catch (...) { continue; }
+            try { unsigned long v = std::stoul(f[2]); n.ppid = (v > 0xFFFFFFFFUL) ? 0u : static_cast<std::uint32_t>(v); }
+            catch (...) { n.ppid = 0; }
             n.name = f[3];
             if (f.size() > 4) n.sha256 = f[4];
             if (f.size() > 5) n.path = f[5];
@@ -197,8 +206,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (conns.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_tree(nodes, conns);
-        body += oob("ls-cnt-process_tree", std::to_string(nodes.size()));
-        body += oob("ls-kpi-procs", std::to_string(nodes.size()));
+        body += oob("ls-cnt-process_tree", "ls-cnt", std::to_string(nodes.size()));
+        body += oob("ls-kpi-procs", "n", std::to_string(nodes.size()));
         return body;
     }
 
@@ -209,9 +218,21 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (!l.starts_with("svc|")) continue;
             auto f = pipe_fields(l);
             LiveService s;
-            if (f.size() >= 5) { s.name = f[1]; s.display = f[2]; s.status = f[3]; s.startup = f[4]; }
-            else if (f.size() == 4) { s.name = f[1]; s.status = f[2]; s.display = f[3]; }
-            else continue;
+            if (f.size() >= 5) { // Windows: svc|name|display|status|startup
+                s.name = f[1]; s.display = f[2]; s.status = f[3]; s.startup = f[4];
+            } else if (f.size() == 4) {
+                // Two distinct 4-field shapes share this arity: Linux svc|name|status|description
+                // and macOS svc|label|pid|status. Disambiguate on the numeric pid column so the
+                // macOS State cell shows the status, not the PID (consistency B1).
+                s.name = f[1];
+                const bool macos = !f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
+                    return std::isdigit(ch) != 0;
+                });
+                if (macos) { s.status = f[3]; }            // svc|label|pid|status
+                else { s.status = f[2]; s.display = f[3]; } // svc|name|status|description
+            } else {
+                continue;
+            }
             std::string st = s.status;
             for (char& c : st) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (st.find("run") != std::string::npos) ++running;
@@ -219,9 +240,9 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_services(rows);
-        body += oob("ls-cnt-services",
+        body += oob("ls-cnt-services", "ls-cnt",
                     std::to_string(rows.size()) + " &middot; " + std::to_string(running) + " run");
-        body += oob("ls-kpi-svc", std::to_string(running));
+        body += oob("ls-kpi-svc", "n", std::to_string(running));
         return body;
     }
 
@@ -240,8 +261,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_users(rows);
-        body += oob("ls-cnt-users", std::to_string(rows.size()));
-        body += oob("ls-kpi-users", std::to_string(rows.size()));
+        body += oob("ls-cnt-users", "ls-cnt", std::to_string(rows.size()));
+        body += oob("ls-kpi-users", "n", std::to_string(rows.size()));
         return body;
     }
 
@@ -260,7 +281,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_netconfig(rows);
-        body += oob("ls-cnt-netconfig", std::to_string(rows.size()));
+        body += oob("ls-cnt-netconfig", "ls-cnt", std::to_string(rows.size()));
         return body;
     }
 
@@ -275,7 +296,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_arp(rows);
-        body += oob("ls-cnt-arp", std::to_string(rows.size()));
+        body += oob("ls-cnt-arp", "ls-cnt", std::to_string(rows.size()));
         return body;
     }
 
@@ -289,7 +310,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_dns(rows);
-        body += oob("ls-cnt-dns_cache", std::to_string(rows.size()));
+        body += oob("ls-cnt-dns_cache", "ls-cnt", std::to_string(rows.size()));
         return body;
     }
 
@@ -308,8 +329,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_listening(rows);
-        body += oob("ls-cnt-listening", std::to_string(rows.size()));
-        body += oob("ls-kpi-listen", std::to_string(rows.size()));
+        body += oob("ls-cnt-listening", "ls-cnt", std::to_string(rows.size()));
+        body += oob("ls-kpi-listen", "n", std::to_string(rows.size()));
         return body;
     }
 
@@ -328,14 +349,19 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             if (rows.size() >= kMaxLiveRows) break;
         }
         std::string body = render_device_live_connections(rows);
-        body += oob("ls-cnt-connections", std::to_string(rows.size()));
-        body += oob("ls-kpi-conn", std::to_string(rows.size()));
+        body += oob("ls-cnt-connections", "ls-cnt", std::to_string(rows.size()));
+        body += oob("ls-kpi-conn", "n", std::to_string(rows.size()));
         return body;
     }
 
     if (kind == "capture_sources") { // tar status: config|<src>_enabled|v, config|<src>_live_rows|N
-        // Display order + presentation metadata (the agent schema registry is not linked
-        // into the server — same posture as render_tar_capture_sources).
+        // Display order + presentation metadata. The server does NOT link the agent's
+        // tar_schema_registry, so source name/$-table/category are held here; we only
+        // render a row for a source the agent actually reported (its `<src>_enabled` key
+        // is present in tar/status), so an older agent without arp/dns shows no phantom
+        // rows for them. This hand-maintained table is the os-capability-matrix "will
+        // drift; durable fix = generate from machine-readable metadata" situation —
+        // tracked as a follow-up.
         struct Meta { const char* name; const char* dollar; const char* category; };
         static const Meta kSrc[] = {
             {"process", "Process", "Activity"},  {"tcp", "TCP", "Network"},
@@ -352,12 +378,14 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         std::vector<LiveCaptureSource> rows;
         int on = 0;
         for (const auto& m : kSrc) {
+            auto en = cfg.find(std::string(m.name) + "_enabled");
+            if (en == cfg.end())
+                continue; // agent did not report this source (older agent / not built) — no phantom row
             LiveCaptureSource s;
             s.name = m.name;
             s.dollar = m.dollar;
             s.category = m.category;
-            if (auto it = cfg.find(std::string(m.name) + "_enabled"); it != cfg.end())
-                s.enabled = (it->second == "true");
+            s.enabled = (en->second == "true");
             if (auto it = cfg.find(std::string(m.name) + "_live_rows"); it != cfg.end()) {
                 try { s.live_rows = std::stoll(it->second); } catch (...) {}
             }
@@ -365,7 +393,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             rows.push_back(std::move(s));
         }
         std::string body = render_device_live_capture_sources(rows);
-        body += oob("ls-cnt-capture_sources",
+        body += oob("ls-cnt-capture_sources", "ls-cnt",
                     std::to_string(on) + " of " + std::to_string(rows.size()) + " on");
         return body;
     }

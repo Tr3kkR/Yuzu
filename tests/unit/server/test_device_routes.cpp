@@ -319,6 +319,72 @@ TEST_CASE("device live process_tree: dual-dispatch (list_tree + connections), jo
         REQUIRE(r);
         CHECK(r->status == 400);
     }
+    SECTION("secondary not ready: tree renders best-effort WITHOUT connections, no re-poll") {
+        LiveHarness h;
+        // Primary terminal-SUCCESS with output; secondary has no rows yet (empty).
+        h.rows_by_cmd["processes-test"] = {{"a-1", 1, "proc|800|4|svchost.exe|abc|", ""}};
+        // command_id2 present in the URL but rows_by_cmd has no network_diag-test entry → empty.
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=network_diag-test&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("svchost.exe") != std::string::npos); // tree still renders
+        CHECK(r->body.find("tt-net") == std::string::npos);      // no connection chips (best-effort)
+        CHECK(r->body.find("hx-trigger") == std::string::npos);  // primary terminal -> not re-polled
+    }
+}
+
+// Result-route render coverage for the table kinds (the B1 macOS services field-shape
+// divergence + the arp honest-error path were governance Gate-4 findings).
+TEST_CASE("device live result: table kinds parse + render", "[device][routes]") {
+    SECTION("services Windows 5-field shape: state + running count") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|Spooler|Print Spooler|Running|Automatic\n"
+                                  "svc|wuauserv|Windows Update|Stopped|Manual", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("Print Spooler") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos);      // OOB count: 1 running
+        CHECK(r->body.find("id=\"ls-kpi-svc\"") != std::string::npos);
+    }
+    SECTION("services macOS 4-field svc|label|pid|status: State shows status, not PID (B1)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("running") != std::string::npos); // status, from f[3]
+        CHECK(r->body.find("1 run") != std::string::npos);   // counted as running (not the PID)
+    }
+    SECTION("services Linux 4-field svc|name|status|desc: State shows status") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|sshd|running|OpenSSH server", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("sshd") != std::string::npos);
+        CHECK(r->body.find("running") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos);
+    }
+    SECTION("arp non-Windows error payload -> honest error note, not silent blank") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "error|arp not available on this platform", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=network_config-test"
+                            "&agent_id=a-1&kind=arp&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(r->body.find("not available on this platform") != std::string::npos);
+    }
+    SECTION("listening rows render with proto/port/pid") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "listen|tcp|0.0.0.0|445|4", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=network_diag-test"
+                            "&agent_id=a-1&kind=listening&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("445") != std::string::npos);
+        CHECK(r->body.find("id=\"ls-kpi-listen\"") != std::string::npos);
+    }
 }
 
 TEST_CASE("device live capture_sources: tar status -> read-only source table", "[device][routes]") {

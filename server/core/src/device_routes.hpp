@@ -163,7 +163,8 @@ struct LiveUserRow { std::string user, host, logon_type, session; };
 struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
 /// One TAR capture source's local state (tar/status → config|<src>_enabled / _live_rows).
 /// `dollar`/`category` are server-side presentation metadata (the agent schema registry
-/// is not linked into the server — same posture as render_tar_capture_sources).
+/// is not linked into the server, so the source list is hand-held in device_routes.cpp;
+/// only sources the agent actually reports are rendered).
 struct LiveCaptureSource {
     std::string name, dollar, category;
     bool enabled = false;

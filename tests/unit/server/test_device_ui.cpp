@@ -141,7 +141,8 @@ TEST_CASE("device live tree: nesting, hash, net join, suspicious flag, escaping"
     std::vector<LiveProcNode> nodes{
         {4, 0, "System", "", ""},
         {800, 4, "explorer.exe", "abc123def456", "C:\\Windows\\explorer.exe"},
-        {900, 800, "powershell.exe", "ffee", ""},     // explorer -> powershell: NOT suspicious
+        {860, 4, "excel.exe", "e0e0", "C:\\Office\\excel.exe"}, // suspicious PARENT
+        {900, 860, "powershell.exe", "ffee", ""},     // excel -> powershell: FLAGGED (LOLBin spawn)
         {950, 900, "<evil>", "dd", ""},               // agent-controlled name must be escaped
     };
     std::vector<LiveConn> conns{{800, "140.82.112.4", 443, 52000, false}};
@@ -152,6 +153,8 @@ TEST_CASE("device live tree: nesting, hash, net join, suspicious flag, escaping"
     CHECK(html.find("140.82.112.4:443") != std::string::npos);         // joined connection chip
     CHECK(html.find("tt-net-pub") != std::string::npos);               // public endpoint highlighted
     CHECK(html.find("lsFilterTree(this)") != std::string::npos);       // name/PID/hash search bar
+    CHECK(html.find("tt-anom") != std::string::npos);                  // excel->powershell flagged
+    CHECK(html.find("data-anom=\"1\"") != std::string::npos);          // the suspicious row carries it
     CHECK(html.find("&lt;evil&gt;") != std::string::npos);             // name HTML-escaped
     CHECK(html.find("<evil>") == std::string::npos);                   // never raw
     CHECK(render_device_live_tree({}, {}).find("No processes returned") != std::string::npos);
@@ -173,12 +176,15 @@ TEST_CASE("device live tree: same-name siblings grouped; cycle is bounded", "[de
 
 TEST_CASE("device live ARP / DNS / sockets / services / users / netconfig renderers",
           "[device][ui]") {
-    SECTION("arp: type pills + empty note") {
+    SECTION("arp: type pills + empty note + escaping") {
         std::vector<LiveArpEntry> rows{{"Ethernet", "10.0.0.1", "00:1a:2b:3c:4d:5e", "dynamic"},
-                                       {"Ethernet", "10.0.0.9", "", "incomplete"}};
+                                       {"Ethernet", "10.0.0.9", "", "incomplete"},
+                                       {"<script>", "10.0.0.2", "aa", "dynamic"}}; // agent-controlled iface
         const auto h = render_device_live_arp(rows);
         CHECK(h.find("00:1a:2b:3c:4d:5e") != std::string::npos);
         CHECK(h.find("dynamic") != std::string::npos);
+        CHECK(h.find("&lt;script&gt;") != std::string::npos); // iface HTML-escaped
+        CHECK(h.find("<script>") == std::string::npos);
         CHECK(render_device_live_arp({}).find("not available on this OS") != std::string::npos);
     }
     SECTION("dns: searchable, escaped, empty note") {
@@ -196,20 +202,27 @@ TEST_CASE("device live ARP / DNS / sockets / services / users / netconfig render
         CHECK(c.find("1.2.3.4:443") != std::string::npos);
         CHECK(c.find("ESTABLISHED") != std::string::npos);
     }
-    SECTION("services: running highlighted, searchable") {
+    SECTION("services: running highlighted, searchable, escaped") {
         std::vector<LiveService> rows{{"Spooler", "Print Spooler", "Running", "Automatic"},
-                                      {"wuauserv", "Windows Update", "Stopped", "Manual"}};
+                                      {"wuauserv", "Windows Update", "Stopped", "Manual"},
+                                      {"x", "<b>Display</b>", "Running", "Manual"}}; // agent-controlled display
         const auto h = render_device_live_services(rows);
         CHECK(h.find("Print Spooler") != std::string::npos);
         CHECK(h.find("Running") != std::string::npos);
         CHECK(h.find("lsFilterRows(this)") != std::string::npos);
+        CHECK(h.find("&lt;b&gt;Display&lt;/b&gt;") != std::string::npos); // display escaped
+        CHECK(h.find("<b>Display</b>") == std::string::npos);
     }
-    SECTION("users + netconfig") {
-        const auto u = render_device_live_users({{"CORP\\alex", "local", "Interactive", "console"}});
-        CHECK(u.find("CORP\\alex") != std::string::npos);
-        const auto n = render_device_live_netconfig({{"Ethernet", "10.0.0.5", 24, "10.0.0.1"}});
+    SECTION("users + netconfig + connections escaping") {
+        const auto u = render_device_live_users({{"<u>", "local", "Interactive", "console"}});
+        CHECK(u.find("&lt;u&gt;") != std::string::npos); // username escaped
+        CHECK(u.find("<u>") == std::string::npos);
+        const auto n = render_device_live_netconfig({{"<a>", "10.0.0.5", 24, "10.0.0.1"}});
         CHECK(n.find("10.0.0.5") != std::string::npos);
-        CHECK(n.find("10.0.0.1") != std::string::npos);
+        CHECK(n.find("&lt;a&gt;") != std::string::npos); // adapter escaped
+        const auto c = render_device_live_connections({{"tcp", "10.0.0.5:1", "<r>:443", "ESTABLISHED"}});
+        CHECK(c.find("&lt;r&gt;:443") != std::string::npos); // remote escaped
+        CHECK(c.find("<r>:443") == std::string::npos);
     }
 }
 

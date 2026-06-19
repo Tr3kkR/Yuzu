@@ -363,9 +363,11 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += "<div class=\"gp-note\" style=\"margin-top:0\">Live instructions dispatched to the device "
          "now (read-only &middot; Execute-gated &middot; audited) &mdash; one query per card.</div>";
     // KPI strip — filled by each card's result via hx-swap-oob.
+    // The value element is a <span class="n"> (not a <div>) so the result's OOB
+    // <span class="n" id=…> swap replaces like-with-like and keeps the styling.
     auto kpi = [](const char* id, const char* label) {
-        return "<div class=\"ls-kpi\"><div class=\"n\" id=\"" + std::string(id) +
-               "\">&mdash;</div><div class=\"l\">" + label + "</div></div>";
+        return "<div class=\"ls-kpi\"><span class=\"n\" id=\"" + std::string(id) +
+               "\">&mdash;</span><div class=\"l\">" + label + "</div></div>";
     };
     h += "<div class=\"ls-kpis\">";
     h += kpi("ls-kpi-uptime", "Uptime");
