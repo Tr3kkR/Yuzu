@@ -18,8 +18,11 @@
 
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
+#include <string_view>
 
 namespace yuzu::tar {
 
@@ -109,6 +112,65 @@ constexpr const char* kCreateSchema = R"(
     );
 )";
 
+// #559 — self-test a freshly-opened tar.db with PRAGMA integrity_check. A
+// corrupt file (filesystem damage, partial restore, mid-write crash) must NOT
+// be silently trusted: get_config() returns the caller's default on a read
+// failure, so a corrupt DB would read every `<source>_enabled` key as its
+// "true" default and silently re-enable sources an operator deliberately paused
+// for forensic preservation — defeating the #539 retention guard with no
+// telemetry. Returns true only when the check reports the canonical "ok".
+bool integrity_ok(sqlite3* db) noexcept {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr) != SQLITE_OK)
+        return false; // can't even read the DB → treat as corrupt
+    StmtPtr stmt(raw);
+    bool ok = false;
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        ok = txt && std::string_view{txt} == "ok";
+    }
+    return ok;
+}
+
+// Move a corrupt tar.db (and its -wal/-shm sidecars) aside to a timestamped
+// `.corrupt-<epoch>` path for forensic review, so open() can re-initialise a
+// fresh, trustworthy database rather than refusing to load TAR entirely.
+// Returns the quarantine path, or std::nullopt if the corrupt main file could
+// NOT be moved aside (read-only mount, locked file on Windows, permissions) —
+// in which case the caller MUST fail closed rather than re-open-and-trust the
+// still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
+// instead, so the freshly-created DB can never adopt a stale -wal/-shm; the
+// caller's post-reopen integrity re-check is the backstop if even that fails.
+std::optional<std::filesystem::path>
+quarantine_corrupt_db(const std::filesystem::path& path) {
+    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    std::filesystem::path dest = path;
+    dest += std::format(".corrupt-{}", epoch);
+    std::error_code ec;
+    std::filesystem::rename(path, dest, ec);
+    if (ec)
+        return std::nullopt; // could not move the corrupt DB aside — fail closed
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::filesystem::path side = path;
+        side += suffix;
+        std::error_code ec2;
+        if (std::filesystem::exists(side, ec2)) {
+            std::filesystem::path side_dest = dest;
+            side_dest += suffix;
+            std::filesystem::rename(side, side_dest, ec2);
+            if (ec2) {
+                // Couldn't preserve the sidecar — remove it so the fresh DB
+                // can't replay a stale WAL belonging to the quarantined file.
+                std::error_code ec3;
+                std::filesystem::remove(side, ec3);
+            }
+        }
+    }
+    return dest;
+}
+
 } // namespace
 
 // ── Construction / destruction ───────────────────────────────────────────────
@@ -167,6 +229,52 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         if (raw_db)
             sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to open tar.db: {}", err));
+    }
+
+    // #559 — corruption self-test BEFORE we trust the DB. A fresh/empty file
+    // passes trivially; an existing corrupt one is quarantined aside and a clean
+    // DB is re-opened in its place, so the agent never silently serves garbage
+    // config (which would re-enable operator-paused sources, compounding #539).
+    if (!integrity_ok(raw_db)) {
+        sqlite3_close(raw_db);
+        raw_db = nullptr;
+        auto quarantined = quarantine_corrupt_db(path);
+        if (!quarantined) {
+            // FAIL CLOSED (UP-1): the corrupt DB could not be moved aside, so we
+            // must NOT re-open and trust it — doing so would silently serve the
+            // "true" get_config default for every `<source>_enabled` key and
+            // re-enable sources an operator paused for forensic preservation,
+            // the exact failure #559 guards against. Refuse to open; the
+            // operator must clear the underlying fault (read-only mount, locked
+            // file, permissions) and restart.
+            return std::unexpected(std::format(
+                "tar.db failed integrity_check and could not be quarantined "
+                "(corrupt and unmovable): {}",
+                path.string()));
+        }
+        spdlog::error("TAR: tar.db failed PRAGMA integrity_check (tar.db.corruption_detected) — "
+                      "quarantined to {} and re-initialising a fresh database",
+                      quarantined->string());
+        rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
+        if (rc != SQLITE_OK) {
+            std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
+            if (raw_db)
+                sqlite3_close(raw_db);
+            return std::unexpected(
+                std::format("failed to re-open tar.db after quarantine: {}", err));
+        }
+        // Backstop (UP-2): the freshly-created DB must itself be clean — this
+        // also catches the case where a -wal/-shm sidecar belonging to the
+        // quarantined file could neither be moved nor removed and was adopted by
+        // the new file. If even the fresh DB is corrupt, fail closed.
+        if (!integrity_ok(raw_db)) {
+            sqlite3_close(raw_db);
+            return std::unexpected(std::format(
+                "tar.db re-initialised after quarantine still fails integrity_check: {}",
+                path.string()));
+        }
     }
 
     // WAL mode for concurrent read performance -- required for correctness

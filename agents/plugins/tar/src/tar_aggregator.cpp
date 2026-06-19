@@ -138,6 +138,14 @@ void apply_source_enabled_transition(TarDatabase& db,
     }
 }
 
+std::string_view canonical_source_enabled(std::string_view stored_value) {
+    if (stored_value == "true")
+        return "true";
+    if (stored_value == "false")
+        return "false";
+    return "errored"; // anything else was written outside the plugin
+}
+
 void run_retention(TarDatabase& db, int64_t now_epoch) {
     // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
     db.execute_sql("BEGIN TRANSACTION");
@@ -148,8 +156,15 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // queryable." Without this guard, time-based retention drains hourly
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
+        // #539/#560 — preserve rows whenever the source is NOT actively-and-
+        // validly enabled. Gating on the canonical tri-state (not `== "false"`)
+        // means a paused source ("false") AND a corrupt/tampered one ("errored")
+        // both skip retention, so the forensic window an operator paused — or one
+        // whose `_enabled` value was clobbered — is never pruned. This matches the
+        // collect-time source_enabled() gate, which also fails closed on "errored".
         auto enabled_key = std::format("{}_enabled", src.name);
-        if (db.get_config(enabled_key, src.default_enabled ? "true" : "false") == "false")
+        if (canonical_source_enabled(
+                db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);

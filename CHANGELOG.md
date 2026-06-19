@@ -352,6 +352,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR source enable/disable is now corruption-resilient and reports a strict
+  state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
+  corrupt `tar.db` was opened and trusted, and since `get_config` returns the
+  caller default on a read failure, every `<source>_enabled` key read as its
+  default — silently re-enabling sources an operator had paused for forensic
+  preservation and defeating the #539 retention guard with no telemetry (#559);
+  (b) `tar.status` echoed the raw stored enable value, so a garbage value
+  (corruption, tampering, a downgrade/upgrade) was passed through instead of
+  flagged, and the collect-time `!= "false"` gate treated any non-`false` value
+  as enabled (#560). Fixes: `TarDatabase::open` runs `PRAGMA integrity_check` and
+  quarantines a corrupt DB aside (`tar.db.corrupt-<epoch>`, with its `-wal`/`-shm`
+  sidecars) before re-initialising a fresh one — failing **closed** if the corrupt
+  file cannot be moved aside rather than re-opening and trusting it; `status` now
+  emits a strict tri-state (`true`/`false`/`errored`); and the collect-time gate
+  (`source_enabled`) and `run_retention` both gate on that same canonical
+  tri-state, so a corrupt or tampered `<source>_enabled` value fails closed —
+  collection stops *and* the source's rows are preserved (not pruned).
 - **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
   The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
   opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`

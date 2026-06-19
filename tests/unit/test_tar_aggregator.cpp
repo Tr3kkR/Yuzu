@@ -338,3 +338,44 @@ TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition"
     CHECK(db.get_config("module_enabled", "false") == "true");
     CHECK(db.get_config("module_paused_at", "0") == "0");
 }
+
+TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
+          "[tar][retention][source-lifecycle]") {
+    // The collect-time gate (source_enabled) fails closed on a non-canonical
+    // _enabled value, mapping it to "errored". Retention MUST agree and preserve
+    // that source's rows — otherwise a tampered or bit-flipped value would stop
+    // collection (per the gate) yet still let run_retention prune the forensic
+    // window the operator believes is paused, the exact breach #560/#559 guard.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-retention-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    seed_tcp_hourly(db, t_now);
+
+    // A value the plugin never writes — canonical_source_enabled => "errored".
+    db.set_config("process_enabled", "maybe");
+    REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
+    // tcp_enabled left at default => "true" (actively, validly enabled).
+    run_retention(db, t_now);
+
+    CHECK(row_count(db, "process_hourly") == 48);   // errored => preserved, not pruned
+    auto tcp_remaining = row_count(db, "tcp_hourly");
+    CHECK(tcp_remaining > 0);                       // enabled => aged normally
+    CHECK(tcp_remaining < 48);
+}
+
+TEST_CASE("TAR canonical_source_enabled is a strict tri-state (#560)",
+          "[tar][source-lifecycle]") {
+    CHECK(canonical_source_enabled("true") == "true");
+    CHECK(canonical_source_enabled("false") == "false");
+    // Anything the plugin never writes is flagged, never coerced/guessed.
+    CHECK(canonical_source_enabled("FALSE") == "errored");
+    CHECK(canonical_source_enabled("0") == "errored");
+    CHECK(canonical_source_enabled(" false ") == "errored");
+    CHECK(canonical_source_enabled("yes") == "errored");
+    CHECK(canonical_source_enabled("") == "errored");
+}
