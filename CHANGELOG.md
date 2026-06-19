@@ -370,9 +370,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   centralised in `diff_state_key()`, used by both the collectors and the disable path
   so it cannot drift. **Operator-visible change:** the first collection cycle after a
   re-enable emits a `started` event for every entity currently running/open (an
-  expected one-time rebaseline), not ghost `stopped` events. (`perf`/`procperf` keep
-  an in-memory baseline — out of scope; their re-enable delta is a rate-average over
-  the gap, not a ghost-event spike.)
+  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
+  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
+  row, so the same race is closed for them too: disabling resets the in-memory
+  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
+  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
+  commits no post-disable row, and a re-enable re-baselines instead of emitting a
+  first row whose rate-average covers the entire paused window (a privacy concern on
+  the opt-in, default-off `procperf` per-application source).
 - **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
   The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
   opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
