@@ -2284,7 +2284,7 @@ yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
 }
 } // namespace
 
-TEST_CASE("MCP execute_bundle fans each step out + returns bundle- execution_id",
+TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id",
           "[mcp][bundle]") {
     yuzu::server::ResponseStore store(":memory:");
     REQUIRE(store.is_open());
@@ -2308,9 +2308,10 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle- execution_id"
         R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
     REQUIRE(res);
     auto p = bundle_payload(res);
-    auto exec_id = p["execution_id"].get<std::string>();
+    auto exec_id = p["bundle_id"].get<std::string>();
     CHECK(exec_id.rfind("bundle-", 0) == 0); // bundle- prefix → notify_exec_tracker skips it
     CHECK(p["expected"] == 2);
+    CHECK(p["agent_id"] == "agent-1"); // REST/MCP response parity (governance arch-S2)
 
     REQUIRE(calls.size() == 2);
     CHECK(calls[0].plugin == "os_info");
@@ -2333,7 +2334,7 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp
 
     auto disp = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
-    auto exec_id = bundle_payload(disp)["execution_id"].get<std::string>();
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
 
     auto inject = [&](const std::string& cmd, const std::string& out) {
         yuzu::server::StoredResponse r;
@@ -2350,7 +2351,7 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp
 
     auto get = ts.call(
         std::string(
-            R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"get_bundle_result","arguments":{"execution_id":")") +
+            R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
         exec_id + R"("}}})");
     auto p = bundle_payload(get);
     CHECK(p["complete"] == true);
@@ -2371,11 +2372,11 @@ TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
     // Owner is the default admin "test-user".
     auto disp = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
-    auto exec_id = bundle_payload(disp)["execution_id"].get<std::string>();
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
 
     const std::string get_call =
         std::string(
-            R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_bundle_result","arguments":{"execution_id":")") +
+            R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
         exec_id + R"("}}})";
 
     // A different, non-admin principal → error (indistinguishable from not-found).
@@ -2410,4 +2411,47 @@ TEST_CASE("MCP execute_bundle validation errors", "[mcp][bundle][unhappy]") {
     // unsafe identifier
     CHECK(is_err(
         R"({"jsonrpc":"2.0","method":"tools/call","id":87,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"p p","action":"x"}]}}})"));
+}
+
+TEST_CASE("MCP bundle tools error when the orchestrator is unwired", "[mcp][bundle][unhappy]") {
+    // governance QE-N2: no response store wired → bundle_orch is null → both
+    // tools must return a structured error, not crash.
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto e1 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]}}})")
+            ->body);
+    CHECK(e1.contains("error"));
+    auto e2 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"get_bundle_result","arguments":{"bundle_id":"bundle-x"}}})")
+            ->body);
+    CHECK(e2.contains("error"));
+}
+
+TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp][bundle]") {
+    // governance QE-S2 (MCP surface).
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch([](const std::string&, const std::string&, const std::vector<std::string>&,
+                              const std::string&,
+                              const std::unordered_map<std::string, std::string>&,
+                              const std::string&) -> std::pair<std::string, int> {
+        return {std::string{}, 0}; // reached no agent
+    });
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto bid = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto get = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bid + R"("}}})");
+    auto p = bundle_payload(get);
+    CHECK(p["complete"] == true);
+    CHECK(p["succeeded"] == 0);
+    REQUIRE(p["steps"].size() == 1);
+    CHECK(p["steps"][0]["state"] == "dispatch_failed");
 }

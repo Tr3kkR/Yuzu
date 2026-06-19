@@ -22,8 +22,8 @@ std::string to_lower(std::string s) {
 // Identifier rule for an already-lower-cased plugin/action: non-empty, <= 64
 // bytes, [a-z0-9_]. Written out by hand (not std::isalnum) — locale-independent
 // and safe on high-bit char values. These identifiers are used to build per-step
-// audit verbs (mcp.bundle.<plugin>.<action>), so the charset is also the
-// injection guard.
+// audit verbs (bundle.<plugin>.<action>), so the charset is also the injection
+// guard.
 constexpr std::size_t kMaxIdentLen = 64;
 bool is_ident(std::string_view s) {
     if (s.empty() || s.size() > kMaxIdentLen)
@@ -94,11 +94,22 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
             const auto& p = elem["params"];
             if (!p.is_object())
                 return std::unexpected(where + ": 'params' must be an object");
+            if (p.size() > kMaxParamCountPerStep)
+                return std::unexpected(where + ": too many params (max " +
+                                       std::to_string(kMaxParamCountPerStep) + ")");
             s.params.reserve(p.size());
             for (const auto& [k, v] : p.items()) {
                 // Coerce to string: strings pass through, other JSON types are
                 // dumped to their textual form (matches execute_instruction).
-                s.params.emplace_back(k, v.is_string() ? v.get<std::string>() : v.dump());
+                std::string val = v.is_string() ? v.get<std::string>() : v.dump();
+                // Bound the per-step payload — a bundle fans this out ×N (UP-7).
+                if (k.size() > kMaxParamKeyLen)
+                    return std::unexpected(where + ": param key too long (max " +
+                                           std::to_string(kMaxParamKeyLen) + " bytes)");
+                if (val.size() > kMaxParamValueLen)
+                    return std::unexpected(where + ": param '" + k + "' value too large (max " +
+                                           std::to_string(kMaxParamValueLen) + " bytes)");
+                s.params.emplace_back(k, std::move(val));
             }
         }
 
@@ -110,12 +121,21 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
 
 BundleAggregate aggregate_bundle(const std::vector<DispatchedStep>& steps,
                                  const std::vector<BundleResponseRow>& rows) {
-    // Index rows by command_id (last write wins — a command can emit a RUNNING
-    // data frame then a terminal; the terminal-or-latest is what we want).
+    // Index rows by command_id, preferring the TERMINAL frame. A command can
+    // emit a RUNNING data frame (status == kRunningStatus) and then a terminal
+    // SUCCESS/FAILURE frame; we want the terminal. We pick status-aware rather
+    // than order-aware because BundleResponseRow carries no timestamp — relying
+    // on the store's ORDER BY (and on equal-timestamp tie-breaks) is unsound, so
+    // a terminal frame always wins over a RUNNING one regardless of row order
+    // (governance cppx-S1 / CH-5).
+    constexpr int kRunningStatus = 0; // CommandResponse::Status: 0=RUNNING, 1=SUCCESS, 2=FAILURE
     std::unordered_map<std::string, const BundleResponseRow*> by_cmd;
     by_cmd.reserve(rows.size());
-    for (const auto& r : rows)
-        by_cmd[r.command_id] = &r;
+    for (const auto& r : rows) {
+        auto [it, inserted] = by_cmd.try_emplace(r.command_id, &r);
+        if (!inserted && it->second->status == kRunningStatus && r.status != kRunningStatus)
+            it->second = &r; // prefer a terminal frame over a held RUNNING one
+    }
 
     BundleAggregate agg;
     agg.expected = steps.size();
@@ -133,6 +153,8 @@ BundleAggregate aggregate_bundle(const std::vector<DispatchedStep>& steps,
             res.status = it->second->status;
             res.output = it->second->output;
             ++agg.received;
+            if (res.status == 1) // SUCCESS — distinct from a responded FAILURE
+                ++agg.succeeded;
         } else {
             res.state = BundleStepState::Pending;
         }
@@ -156,6 +178,7 @@ std::string aggregate_to_json(const BundleAggregate& agg) {
     nlohmann::json j;
     j["complete"] = agg.complete;
     j["received"] = agg.received;
+    j["succeeded"] = agg.succeeded;
     j["expected"] = agg.expected;
     auto steps = nlohmann::json::array();
     for (const auto& s : agg.steps) {

@@ -282,8 +282,8 @@ for the tool to execute.
 | 32 | `list_dex_perf_devices` | The device list behind every fleet-performance drill (worst-by-metric / not-reporting / cohort members). Machine-health telemetry. Mirrors `GET /api/v1/dex/perf/devices`. | `GuaranteedState:Read` |
 | 33 | `get_network_fleet` | Fleet network-quality now-stats (avg/p50/p90/max for RTT / retransmit / throughput + reporting populations incl. the honest RTT denominator; null = nobody reported) plus measured net/device/app co-occurrence counts. Mirrors `GET /api/v1/network/fleet`. | `GuaranteedState:Read` |
 | 34 | `list_network_devices` | The device list behind every network-quality drill (worst-by-metric / not-reporting / co-occurrence band / cohort members), with the co-occurring facts inline. Device link-health telemetry, never a verdict. Mirrors `GET /api/v1/network/devices`. | `GuaranteedState:Read` |
-| 35 | `execute_bundle` | Fan one instruction out into 1–32 plugin actions on **one** device, async (server-side fan-out, ADR-0011). Returns `{execution_id, expected}` immediately; poll `get_bundle_result`. Use instead of N `execute_instruction` calls when refreshing a single device. Mirrors `POST /api/v1/bundles`. | `Execution:Execute` |
-| 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle`: `{complete, received, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
+| 35 | `execute_bundle` | Fan one instruction out into 1–32 plugin actions on **one** device, async (server-side fan-out, ADR-0011). Returns `{bundle_id, agent_id, expected}` immediately; poll `get_bundle_result` with the `bundle_id`. Use instead of N `execute_instruction` calls when refreshing a single device. Mirrors `POST /api/v1/bundles`. | `Execution:Execute` |
+| 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle` (arg `bundle_id`): `{complete, received, succeeded, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output. `complete` is terminal **not** success — check `succeeded == expected`. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
@@ -309,7 +309,8 @@ for the tool to execute.
 
 > **Live-query bundle (`execute_bundle` / `get_bundle_result`) — ADR-0011:**
 > `execute_bundle` is the **single-device** companion to `execute_instruction`. Instead of N round-trips to refresh one device, fan one instruction out into several plugin actions on that device. The server dispatches each step as an ordinary command under one `bundle-…` correlation id (the agent is unchanged — it never sees a "bundle") and returns immediately. It is **async**: a slow plugin step does not withhold the others; collate when you need the current state.
-> - **Two-call shape:** `execute_bundle` → `{execution_id, expected}` (HTTP 202 on the REST sibling); then poll `get_bundle_result` with that `execution_id` until `complete` is `true`. Each step is reported in request order with its `state` (`pending`/`responded`/`dispatch_failed`), so duplicate or same-plugin steps stay unambiguous; a step that reached no agent is `dispatch_failed` (terminal — it does not hold the bundle open).
+> - **Two-call shape:** `execute_bundle` → `{bundle_id, agent_id, expected}` (HTTP 202 on the REST sibling); then poll `get_bundle_result` with that `bundle_id` until `complete` is `true`. `bundle_id` is **not** an `execution_id` — it is not a tracked execution, so don't feed it to `get_execution_status` / `/api/v1/events` (they'd 404). Each step is reported in request order with its `state` (`pending`/`responded`/`dispatch_failed`), so duplicate or same-plugin steps stay unambiguous; a step that reached no agent is `dispatch_failed` (terminal — it does not hold the bundle open).
+> - **`complete` ≠ success:** an all-offline bundle completes with `received=0`, `succeeded=0`, every step `dispatch_failed`. Check `succeeded == expected`, never `complete` alone.
 > - **Tier behavior** mirrors `execute_instruction` (`readonly` blocked; `operator` immediate; `supervised` returns the approval-not-implemented error).
 > - **Audit:** each step emits its own `bundle.<plugin>.<action>` audit (`target_type=Agent`) — the works-council device-access lens — so a bundle is exactly as auditable as the N separate executions it replaces.
 > - **Ownership guard:** `get_bundle_result` returns the same not-found error for a bundle the caller did not dispatch (and is not admin) as for an unknown id — no enumeration oracle.
@@ -329,7 +330,7 @@ Required parameters are validated server-side; missing required fields return a
 - `agent_id` + `steps` -- required by `execute_bundle`. `steps` is an array of
   `{plugin, action, params?}` objects (1–32, each `(plugin, action)` distinct);
   `agent_id` is the single target device.
-- `execution_id` (string) -- required by `get_bundle_result`; the `bundle-…`
+- `bundle_id` (string) -- required by `get_bundle_result`; the `bundle-…`
   id returned by `execute_bundle`.
 - `expression` (string) -- required by `validate_scope` and
   `preview_scope_targets`. Uses the Yuzu scope DSL (e.g.,

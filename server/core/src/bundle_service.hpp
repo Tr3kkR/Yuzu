@@ -25,6 +25,15 @@ namespace yuzu::server {
 /// ordinary commands on the agent; the cap bounds that fan-out.
 inline constexpr std::size_t kMaxBundleSteps = 32;
 
+/// Per-step parameter bounds. A bundle fans out up to kMaxBundleSteps commands,
+/// so an unbounded param payload is amplified ×N at dispatch (UP-7 governance) —
+/// these caps keep the fan-out's memory bounded without constraining real use
+/// (live-query params are short flags). Values above the cap are rejected at
+/// validation, before any dispatch.
+inline constexpr std::size_t kMaxParamCountPerStep = 32;
+inline constexpr std::size_t kMaxParamKeyLen = 256;
+inline constexpr std::size_t kMaxParamValueLen = 64 * 1024; // 64 KiB
+
 /// One validated step from the instruction's step list.
 struct BundleStepSpec {
     std::string plugin;
@@ -69,8 +78,9 @@ struct BundleStepResult {
 struct BundleAggregate {
     std::vector<BundleStepResult> steps; ///< request order
     std::size_t expected{0};
-    std::size_t received{0}; ///< steps that have a response
-    bool complete{false};    ///< no step is still Pending (all responded or dispatch-failed)
+    std::size_t received{0};  ///< steps that have a response (any terminal status)
+    std::size_t succeeded{0}; ///< steps responded with status == SUCCESS (1)
+    bool complete{false};     ///< no step is still Pending (all responded or dispatch-failed)
 };
 
 /// One response row, decoupled from `StoredResponse` so the aggregator is pure
@@ -91,9 +101,13 @@ struct BundleResponseRow {
                                                const std::vector<BundleResponseRow>& rows);
 
 /// Serialize the aggregate to the caller-facing result JSON:
-///   {"complete":bool,"received":N,"expected":M,
+///   {"complete":bool,"received":N,"succeeded":S,"expected":M,
 ///    "steps":[{"plugin","action","state","status","output"}, ...]}
 /// `state` is one of "pending" | "responded" | "dispatch_failed".
+/// NOTE: `complete` means terminal, NOT success — a bundle to an offline device
+/// completes with received=0, succeeded=0 and every step dispatch_failed. A
+/// caller deciding "did it work" must check `succeeded == expected` (or inspect
+/// per-step `state`/`status`), never `complete` alone.
 [[nodiscard]] std::string aggregate_to_json(const BundleAggregate& agg);
 
 } // namespace yuzu::server

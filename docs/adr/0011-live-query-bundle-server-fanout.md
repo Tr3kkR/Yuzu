@@ -73,11 +73,13 @@ it only ever sees ordinary single commands.
    governed executions-history ladder untouched and makes the collate op the single
    authoritative source of bundle completion (`received >= expected`).
 
-   **v1 storage is an in-memory map + TTL** (the TTL doubles as the abandoned-bundle sweep). It
-   matches the instance-locality of `response_store` (still per-instance SQLite), so it is no
-   less durable than the responses during normal operation; an in-memory map is not a "store"
-   per ADR-0006, so no new-store ADR is required for v1. **This is a deliberate v1 simplification
-   with a committed migration target — see "Future: durable manifest in Postgres" below.**
+   **v1 storage is an in-memory map + a sliding TTL** (the TTL doubles as the abandoned-bundle
+   sweep; an actively-polled bundle is kept alive because each collate refreshes its window). The
+   map is **ephemeral and acceptable only because bundles are short-lived** — unlike the responses
+   it indexes (which survive in `response_store`), the manifest is lost on a mid-bundle restart.
+   An in-memory map is not a "store" per ADR-0006, so no new-store ADR is required for v1. **This
+   is a deliberate v1 simplification with a committed migration target — see "Future: durable
+   manifest in Postgres" below.**
 
 ## Options considered
 
@@ -102,14 +104,20 @@ it only ever sees ordinary single commands.
   `BundleFrameEmitter`, the envelope carrier, and the gateway frame contract are all dropped —
   and with them nearly every agent-side governance finding (UTF-8 crash, pool exhaustion).
 - **Reuse:** the `execution_id` / `cmd_execution_ids_` / `query_by_execution` substrate; the
-  existing `dispatch_fn`; step validation + caps; the per-step audit verbs (`mcp.bundle.<plugin>.<action>`,
-  `target_type="Agent"`); the `bundle_collect` aggregation (adapted to build from ordinary
+  existing `dispatch_fn`; step validation + caps; the per-step audit verb `bundle.<plugin>.<action>`
+  (`target_type="Agent"`, transport-agnostic — identical on REST and MCP; the MCP tool-call
+  envelope additionally audits as `mcp.execute_bundle`); the aggregation logic (built from ordinary
   response rows rather than envelopes).
-- **New:** a shared `bundle_service` core (dispatch + collate); a small bundle record holding the
-  step map + status; REST routes + MCP tools.
+- **New:** a shared `bundle_service` + `BundleOrchestrator` core (dispatch + collate); a small
+  in-memory bundle record holding the step map + status; REST routes + MCP tools. The dispatch
+  response field is `bundle_id` (NOT `execution_id` — a bundle is not a tracked execution); collate
+  returns `succeeded` alongside `received`/`expected` so callers never mistake `complete` (terminal)
+  for success.
 - **Bundles are not in the live executions drawer.** They remain fully observable via the audit
-  log (per-step verbs), responses queryable by the correlation id, and `yuzu_mcp_bundle_*`
-  metrics. The caller's collate poll is its own live view. (See Future for the drawer option.)
+  log (per-step verbs), responses queryable by the correlation id, and the `yuzu_bundle_*` metrics
+  (`yuzu_bundle_dispatched_total{surface,result}`, `yuzu_bundle_collated_total{surface,result}`,
+  `yuzu_bundle_manifests{surface}` gauge, `yuzu_bundle_evictions_total{reason}`). The caller's
+  collate poll is its own live view. (See Future for the drawer option.)
 - **Residuals to handle:** collate must ownership-check the correlation id against the bundle
   record's `dispatched_by` (IDOR); partial-dispatch failure must be recorded per step so a
   step that never reached the agent reads as failed, not pending-forever; abandoned bundle

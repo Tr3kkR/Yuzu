@@ -884,13 +884,15 @@ void RestApiV1::register_routes(
     std::shared_ptr<BundleOrchestrator> bundle_orch;
     if (command_dispatch_fn && response_store) {
         bundle_orch = std::make_shared<BundleOrchestrator>(
-            command_dispatch_fn, response_store, [] {
+            command_dispatch_fn, response_store,
+            [] {
                 std::random_device rd;
                 const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
                 char buf[17];
                 std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
                 return std::string(buf);
-            });
+            },
+            metrics_registry, /*surface=*/"rest");
     }
 
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
@@ -931,6 +933,17 @@ void RestApiV1::register_routes(
                   }
                   auto session = auth_fn(req, res);
                   const std::string principal = session ? session->username : std::string{};
+                  // A bundle is owned by its dispatcher (collate gates on it). An
+                  // empty principal would be un-attributable and collatable by any
+                  // other empty-principal caller — refuse it, matching the
+                  // self-target/empty-principal guard used elsewhere in this file
+                  // (governance sec-M2 / comp-S1).
+                  if (principal.empty()) {
+                      res.status = 500;
+                      res.set_content(error_json("authenticated session has no principal", 500),
+                                      "application/json");
+                      return;
+                  }
                   const std::string agent_id = body["agent_id"].get<std::string>();
                   // Per-step audit bound to this request; the orchestrator stays req-free.
                   auto audit = [&audit_fn, &req](const std::string& verb, const std::string& result,
@@ -938,12 +951,25 @@ void RestApiV1::register_routes(
                                                  const std::string& detail) {
                       audit_fn(req, verb, result, type, id, detail);
                   };
-                  auto r = bundle_orch->dispatch(agent_id, *specs, principal, audit);
+                  // dispatch fans N gRPC writes; a throw must not leave a
+                  // half-written 202 — audit the failure and return 503 (parity
+                  // with the MCP wrapper; governance UP-1 / sec-M1 / comp-S2).
+                  BundleOrchestrator::DispatchResult r;
+                  try {
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit);
+                  } catch (const std::exception& e) {
+                      audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
+                               std::string("agent=") + agent_id + " error=" + e.what());
+                      res.status = 503;
+                      res.set_content(error_json("bundle dispatch failed", 503), "application/json");
+                      return;
+                  }
                   audit_fn(req, "bundle.dispatch", "success", "Execution", r.correlation_id,
                            "agent=" + agent_id + " steps=" + std::to_string(r.expected));
                   res.status = 202; // accepted — collect via GET /api/v1/bundles/{id}
                   res.set_content(ok_json(JObj()
-                                              .add("execution_id", r.correlation_id)
+                                              .add("bundle_id", r.correlation_id)
+                                              .add("agent_id", agent_id)
                                               .add("expected", static_cast<int64_t>(r.expected))
                                               .str()),
                                   "application/json");

@@ -244,3 +244,35 @@ groups:
           severity: warning
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
+
+  - name: yuzu-bundles
+    # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
+    # (TTL + cap), so cap-eviction silently discards another operator's in-flight
+    # bundle — these alerts make that (and dispatch health) observable until the
+    # manifest moves to Postgres.
+    rules:
+      - alert: YuzuBundleCapEviction
+        expr: |
+          rate(yuzu_bundle_evictions_total{reason="cap"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest cap is forcing evictions"
+          description: >-
+            The in-memory bundle manifest map has hit its cap and is evicting
+            non-expired bundles to admit new ones — an in-flight bundle may 404 on
+            collate for an operator who did not cause the load. Likely a runaway
+            agentic dispatch loop. Investigate the dispatching principal; the
+            durable Postgres manifest (ADR-0011) removes the cap.
+      - alert: YuzuBundleManifestSaturation
+        expr: |
+          max(yuzu_bundle_manifests) > 3500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest count approaching the 4096 cap"
+          description: >-
+            In-flight bundle manifests are within ~15% of the cap; sustained growth
+            will force cross-operator cap-eviction (see YuzuBundleCapEviction).

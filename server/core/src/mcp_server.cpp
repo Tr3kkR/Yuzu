@@ -383,10 +383,10 @@ static const ToolDef kTools[] = {
     {"execute_bundle",
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
-     "execution_id + expected immediately (it does NOT wait). Poll get_bundle_result for the "
-     "collated result. Use this instead of N execute_instruction calls when refreshing a device "
-     "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
-     "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
+     "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
+     "bundle_id for the collated result. Use this instead of N execute_instruction calls when "
+     "refreshing a device (cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 "
+     "steps, distinct (plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
      R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
@@ -397,12 +397,14 @@ static const ToolDef kTools[] = {
 
     {"get_bundle_result",
      "Collate a bundle dispatched by execute_bundle: server-grouped "
-     "{complete, received, expected, steps[]} in request order, each step carrying its state "
-     "(pending|responded|dispatch_failed), status, and output. complete=true once every step is "
-     "terminal. Mirrors GET /api/v1/bundles/{id}. Requires Response:Read.",
+     "{complete, received, succeeded, expected, steps[]} in request order, each step carrying its "
+     "state (pending|responded|dispatch_failed), status, and output. complete=true once every step "
+     "is terminal — NOT a success signal (a bundle to an offline device completes with "
+     "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
+     "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("execution_id":{"type":"string","description":"The correlation id (bundle-…) returned by execute_bundle"})j"
-     R"j(},"required":["execution_id"]})j"},
+     R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
+     R"j(},"required":["bundle_id"]})j"},
 
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
     {"list_issued_certs",
@@ -556,7 +558,7 @@ McpServer::HandlerFn McpServer::build_handler(
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, yuzu::MetricsRegistry* metrics) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -575,13 +577,16 @@ McpServer::HandlerFn McpServer::build_handler(
     // the handler below; outlives every request.
     std::shared_ptr<BundleOrchestrator> bundle_orch;
     if (dispatch_fn && response_store) {
-        bundle_orch = std::make_shared<BundleOrchestrator>(dispatch_fn, response_store, [] {
-            std::random_device rd;
-            const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
-            char buf[17];
-            std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
-            return std::string(buf);
-        });
+        bundle_orch = std::make_shared<BundleOrchestrator>(
+            dispatch_fn, response_store,
+            [] {
+                std::random_device rd;
+                const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
+                return std::string(buf);
+            },
+            metrics, /*surface=*/"mcp");
     }
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
@@ -2560,7 +2565,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto result_obj = JObj()
-                                      .add("execution_id", r.correlation_id)
+                                      .add("bundle_id", r.correlation_id)
                                       .add("expected", static_cast<int64_t>(r.expected))
                                       .add("agent_id", agent_id);
                 auto result =
@@ -2570,7 +2575,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                                                                 result_obj.str()))
                                             .str())
                         .str();
-                mcp_audit("success", std::string("execution_id=") + r.correlation_id +
+                mcp_audit("success", std::string("bundle_id=") + r.correlation_id +
                                          " steps=" + std::to_string(r.expected));
                 res.set_content(success_response(id, result), "application/json");
                 return;
@@ -2588,16 +2593,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto exec_id = param_str(args, "execution_id");
-                if (exec_id.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "execution_id is required"),
+                auto bundle_id = param_str(args, "bundle_id");
+                if (bundle_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "bundle_id is required"),
                                     "application/json");
                     return;
                 }
                 const bool is_admin = session->role == auth::Role::admin;
-                auto agg = bundle_orch->collate(exec_id, session->username, is_admin);
+                auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
                 if (!agg) {
-                    mcp_audit("denied", "not found or not owned: " + exec_id);
+                    mcp_audit("denied", "not found or not owned: " + bundle_id);
                     res.set_content(error_response(id, kInvalidParams, "bundle not found"),
                                     "application/json");
                     return;
@@ -2609,7 +2614,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add(JObj().add("type", "text").add("text", aggregate_to_json(*agg)))
                                  .str())
                         .str();
-                mcp_audit("success", std::string("execution_id=") + exec_id +
+                mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
                 res.set_content(success_response(id, result), "application/json");
                 return;
@@ -2785,7 +2790,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                yuzu::MetricsRegistry* metrics) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -2793,7 +2799,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
                            mcp_disabled, std::move(dispatch_fn), ca_store,
                            std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn), std::move(net_perf_fn)));
+                           std::move(dex_perf_fn), std::move(net_perf_fn), metrics));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

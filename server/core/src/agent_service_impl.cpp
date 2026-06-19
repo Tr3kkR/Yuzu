@@ -1576,7 +1576,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // so it can read them back via ResponseStore::query_by_execution. There is no
     // ExecutionTracker row for them, so notifying the tracker here would publish
     // an `agent-transition` SSE event (execution_tracker.cpp publishes
-    // unconditionally) and create orphan execution_agents rows for a phantom
+    // unconditionally) and create orphan agent_exec_status rows for a phantom
     // execution that the executions drawer / /api/v1/events would surface. Skip.
     if (execution_id.starts_with("polchk-"))
         return;

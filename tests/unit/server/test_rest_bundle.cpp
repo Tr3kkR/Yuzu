@@ -144,7 +144,7 @@ TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution
         status);
     REQUIRE(status == 202);
     auto data = j["data"];
-    auto exec_id = data["execution_id"].get<std::string>();
+    auto exec_id = data["bundle_id"].get<std::string>();
     CHECK(exec_id.rfind("bundle-", 0) == 0); // bundle- prefix → notify_exec_tracker skips it
     CHECK(data["expected"] == 2);
 
@@ -167,7 +167,7 @@ TEST_CASE("GET /api/v1/bundles/{id} collates the responses", "[bundle][rest]") {
         "/api/v1/bundles",
         R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]})",
         status);
-    auto exec_id = disp["data"]["execution_id"].get<std::string>();
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
 
     // Before responses: complete=false.
     auto a0 = h.get("/api/v1/bundles/" + exec_id, status);
@@ -193,7 +193,7 @@ TEST_CASE("GET collate is 404 for a non-owner (IDOR guard)", "[bundle][rest]") {
     auto disp = h.post("/api/v1/bundles",
                        R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})",
                        status);
-    auto exec_id = disp["data"]["execution_id"].get<std::string>();
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
 
     // Collate as a different, non-admin principal → 404 (same as not-found).
     h.principal = "mallory";
@@ -228,4 +228,25 @@ TEST_CASE("bundle routes 503 when dispatch is unwired", "[bundle][rest][unhappy]
     h.post("/api/v1/bundles",
            R"({"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
     CHECK(status == 503);
+}
+
+TEST_CASE("REST collate surfaces dispatch_failed when a step reached no agent",
+          "[bundle][rest]") {
+    // governance QE-S2: the dispatch-failed path through the HTTP wrapper.
+    BundleHarness h;
+    h.dispatch_sent = 0; // every step reaches 0 agents
+    int status = 0;
+    auto disp = h.post("/api/v1/bundles",
+                       R"({"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]})",
+                       status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+
+    auto a = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 200);
+    CHECK(a["data"]["complete"] == true); // dispatch-failed is terminal
+    CHECK(a["data"]["received"] == 0);
+    CHECK(a["data"]["succeeded"] == 0); // complete != success
+    REQUIRE(a["data"]["steps"].size() == 1);
+    CHECK(a["data"]["steps"][0]["state"] == "dispatch_failed");
 }

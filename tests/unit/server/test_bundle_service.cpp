@@ -145,3 +145,93 @@ TEST_CASE("aggregate_to_json carries flags + per-step state tokens", "[bundle][c
     CHECK(j["steps"][2].at("state") == "dispatch_failed");
     CHECK(j["steps"][2].at("plugin") == "rdp_control");
 }
+
+// ── Gate-7 governance hardening regressions ─────────────────────────────────
+
+TEST_CASE("aggregate_bundle: a terminal frame wins over a RUNNING frame, any row order",
+          "[bundle][service]") {
+    // governance cppx-S1 / CH-5: query_by_execution returns rows timestamp-DESC,
+    // but BundleResponseRow has no timestamp — so the aggregator must pick the
+    // TERMINAL frame status-aware, not order-aware. Assert both orders.
+    std::vector<DispatchedStep> steps{{"cmd-a", "os_info", "uptime"}};
+    for (bool running_first : {true, false}) {
+        std::vector<BundleResponseRow> rows;
+        if (running_first) {
+            rows.push_back({"cmd-a", 0, "running"}); // RUNNING (status 0)
+            rows.push_back({"cmd-a", 1, "up 3d"});   // terminal SUCCESS
+        } else {
+            rows.push_back({"cmd-a", 1, "up 3d"});
+            rows.push_back({"cmd-a", 0, "running"});
+        }
+        auto agg = aggregate_bundle(steps, rows);
+        REQUIRE(agg.steps.size() == 1);
+        CHECK(agg.steps[0].status == 1);       // terminal, never the RUNNING 0
+        CHECK(agg.steps[0].output == "up 3d");
+        CHECK(agg.received == 1);
+        CHECK(agg.succeeded == 1);
+        CHECK(agg.complete);
+    }
+}
+
+TEST_CASE("aggregate_bundle: succeeded counts only SUCCESS; complete is not success",
+          "[bundle][service]") {
+    // governance ER-2 / UP-2 / CH-8.
+    std::vector<DispatchedStep> steps{
+        {"cmd-ok", "os_info", "uptime"},
+        {"cmd-fail", "os_info", "os_name"},
+        {std::string{}, "svc", "restart"}, // dispatch-failed (empty command_id)
+    };
+    std::vector<BundleResponseRow> rows{
+        {"cmd-ok", 1, "good"},
+        {"cmd-fail", 2, "boom"}, // FAILURE — responded but not succeeded
+    };
+    auto agg = aggregate_bundle(steps, rows);
+    CHECK(agg.expected == 3);
+    CHECK(agg.received == 2);  // ok + fail both responded
+    CHECK(agg.succeeded == 1); // only the SUCCESS
+    CHECK(agg.complete);       // all terminal (2 responded + 1 dispatch-failed)
+    CHECK(agg.steps[2].state == BundleStepState::DispatchFailed);
+}
+
+TEST_CASE("aggregate_bundle: all-dispatch-failed completes with received=0, succeeded=0",
+          "[bundle][service]") {
+    std::vector<DispatchedStep> steps{{std::string{}, "p", "a"}, {std::string{}, "p", "b"}};
+    auto agg = aggregate_bundle(steps, {});
+    CHECK(agg.complete);        // terminal, but NOT success
+    CHECK(agg.received == 0);
+    CHECK(agg.succeeded == 0);
+}
+
+TEST_CASE("aggregate_bundle: a response row matching no step is ignored", "[bundle][service]") {
+    // governance QE-N1: a stray command_id must not inflate received / complete.
+    std::vector<DispatchedStep> steps{{"cmd-a", "os_info", "uptime"}};
+    std::vector<BundleResponseRow> rows{
+        {"cmd-a", 1, "up"},
+        {"cmd-orphan", 1, "stray"}, // no dispatched step owns this command_id
+    };
+    auto agg = aggregate_bundle(steps, rows);
+    CHECK(agg.received == 1); // not 2
+    CHECK(agg.succeeded == 1);
+    CHECK(agg.complete);
+}
+
+TEST_CASE("validate_bundle_steps: bounds param payload (UP-7)", "[bundle][service][unhappy]") {
+    // Oversized value rejected.
+    const std::string big(kMaxParamValueLen + 1, 'x');
+    const std::string over_value =
+        R"([{"plugin":"os_info","action":"uptime","params":{"k":")" + big + R"("}}])";
+    CHECK_FALSE(validate_bundle_steps(over_value).has_value());
+
+    // Too many params rejected.
+    std::string params;
+    for (std::size_t i = 0; i <= kMaxParamCountPerStep; ++i)
+        params += (i ? "," : "") + ("\"k" + std::to_string(i) + "\":\"v\"");
+    const std::string over_count =
+        R"([{"plugin":"os_info","action":"uptime","params":{)" + params + R"(}}])";
+    CHECK_FALSE(validate_bundle_steps(over_count).has_value());
+
+    // A normal small param still passes.
+    CHECK(validate_bundle_steps(
+              R"([{"plugin":"os_info","action":"uptime","params":{"k":"v"}}])")
+              .has_value());
+}

@@ -1527,8 +1527,8 @@ Query audit events.
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
-| `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`, `target_id=<bundle-… correlation id>`, `result=success`. Detail format `agent=<id> steps=<n>`. |
-| `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`, `result=dispatched`. A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). |
+| `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
+| `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`) or `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
@@ -2699,21 +2699,22 @@ Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bun
 
 ```json
 {
-  "data": { "execution_id": "bundle-1a2b3c4d5e6f7a8b", "expected": 2 },
+  "data": { "bundle_id": "bundle-1a2b3c4d5e6f7a8b", "agent_id": "agent-001", "expected": 2 },
   "meta": { "api_version": "v1" }
 }
 ```
 
-`execution_id` is the `bundle-…` correlation id; `expected` is the number of steps dispatched.
+`bundle_id` is the `bundle-…` correlation id — pass it to `GET /api/v1/bundles/{id}` to collate. It is **not** an `ExecutionTracker` `execution_id`: a bundle is deliberately not a tracked execution, so feeding `bundle_id` into `GET /api/v1/events` / execution-status endpoints returns 404. `expected` is the number of steps dispatched.
 
 **Errors:**
 
 | Status | Cause |
 |---|---|
-| `400` | Invalid JSON, missing `agent_id`, missing/empty `steps`, more than 32 steps, a non-distinct `(plugin, action)` pair, or an unsafe plugin/action identifier. |
+| `400` | Invalid JSON, missing `agent_id`, missing/empty `steps`, more than 32 steps, a non-distinct `(plugin, action)` pair, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
+| `500` | The authenticated session resolved to an empty principal (a bundle must be attributable to its dispatcher). |
 | `503` | Command dispatch or response store unavailable. |
 
-**Audit:** each step emits a `bundle.<plugin>.<action>` event with `target_type=Agent`, `target_id=<agent_id>`, `result=dispatched` — the device-access lens, so a bundle is exactly as auditable as the N executions it replaces. One `bundle.dispatch` (`target_type=Execution`) envelope records the dispatch itself.
+**Audit:** each step emits a `bundle.<plugin>.<action>` event with `target_type=Agent`, `target_id=<agent_id>`, `result=dispatched` (the step reached the agent) or `result=no_agents` (the step reached zero agents — it will read `dispatch_failed` on collate) — the device-access lens, so a bundle is exactly as auditable as the N executions it replaces. One `bundle.dispatch` (`target_type=Execution`) envelope records the dispatch itself (`result=success`, or `result=failure` with the error detail if dispatch threw).
 
 #### `GET /api/v1/bundles/{id}`
 
@@ -2734,6 +2735,7 @@ Collate a dispatched bundle into a server-grouped result.
   "data": {
     "complete": true,
     "received": 2,
+    "succeeded": 2,
     "expected": 2,
     "steps": [
       { "plugin": "os_info", "action": "uptime",  "state": "responded", "status": 1, "output": "up 3 days" },
@@ -2744,7 +2746,9 @@ Collate a dispatched bundle into a server-grouped result.
 }
 ```
 
-Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame). `complete` is `true` once every step is terminal.
+Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame — only meaningful when `state=responded`). `received` counts steps with any response; `succeeded` counts only steps that responded with status SUCCESS.
+
+> **`complete` is terminal, NOT success.** A bundle to an **offline device** completes (`complete=true`) with `received=0`, `succeeded=0`, and every step `dispatch_failed`. A caller deciding "did the refresh work" must check `succeeded == expected` (or inspect each `steps[].state`/`status`) — never `complete` alone. Polling `complete` to mark a record refreshed would silently treat an unreachable device as a success.
 
 **Errors:**
 
@@ -2760,6 +2764,12 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 - A bundle is **not** a tracked execution — it does not appear in the live executions drawer, and `notify_exec_tracker` skips its `bundle-…` correlation id. The collate poll is the sole completion authority.
 - v1 bundle state (the step map) is **per-surface and in-memory**: a bundle dispatched over REST is collated over REST (MCP→MCP). A server restart mid-bundle loses the in-flight step map (the responses survive in the response store, but attribution does not), and the caller must re-dispatch. A durable Postgres manifest for HA + cross-surface collation is a committed follow-up (ADR-0011).
 
+**Error handling and retry (for integrators):**
+
+- **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
+- **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
+
 **Example:**
 
 ```bash
@@ -2767,7 +2777,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"agent_id":"agent-001","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}' \
   "https://yuzu.example.com/api/v1/bundles"
-# -> {"data":{"execution_id":"bundle-…","expected":2}, ...}
+# -> {"data":{"bundle_id":"bundle-…","agent_id":"agent-001","expected":2}, ...}
 
 # collate (poll until data.complete == true)
 curl -s -H "Authorization: Bearer $TOKEN" \

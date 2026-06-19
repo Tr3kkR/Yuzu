@@ -34,6 +34,10 @@
 // manifests). See ADR-0011 "Future — durable manifest in Postgres (committed,
 // not optional)". Do not let this in-memory store calcify.
 
+namespace yuzu {
+class MetricsRegistry; // optional metrics sink (yuzu_bundle_*)
+}
+
 namespace yuzu::server {
 
 class ResponseStore; // collate reads responses by correlation id
@@ -58,7 +62,21 @@ public:
     /// Mints the random component of ids (hex). Injected for testability.
     using IdMinter = std::function<std::string()>;
 
-    BundleOrchestrator(DispatchFn dispatch, ResponseStore* response_store, IdMinter mint);
+    /// Monotonic-ish wall clock in ms. Injected so TTL/eviction is deterministic
+    /// in tests (mirrors IdMinter); default uses system_clock.
+    using ClockFn = std::function<std::int64_t()>;
+
+    static constexpr std::int64_t kDefaultManifestTtlMs = 10 * 60 * 1000; // 10 min
+    static constexpr std::size_t kDefaultMaxManifests = 4096;
+
+    /// `metrics`/`surface` are optional: when set, the orchestrator emits
+    /// yuzu_bundle_* counters/gauges labelled by `surface` ("rest"|"mcp").
+    /// `clock`/`ttl_ms`/`max_manifests` are injectable for tests; defaults
+    /// preserve production behaviour.
+    BundleOrchestrator(DispatchFn dispatch, ResponseStore* response_store, IdMinter mint,
+                       yuzu::MetricsRegistry* metrics = nullptr, std::string surface = {},
+                       ClockFn clock = {}, std::int64_t ttl_ms = kDefaultManifestTtlMs,
+                       std::size_t max_manifests = kDefaultMaxManifests);
 
     struct DispatchResult {
         std::string correlation_id;
@@ -92,19 +110,28 @@ private:
         std::int64_t created_at_ms{0};
     };
 
-    void evict_expired_locked(std::int64_t now_ms); // caller holds mu_
+    std::int64_t now_ms() const;                            // via clock_ (or system_clock)
+    void maybe_sweep_locked(std::int64_t now);              // amortized TTL sweep; holds mu_
+    void evict_expired_locked(std::int64_t now);            // full TTL scan; holds mu_
+    void update_manifests_gauge_locked();                   // holds mu_
 
     DispatchFn dispatch_;
     ResponseStore* response_store_;
     IdMinter mint_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    std::string surface_;
+    ClockFn clock_;
+    std::int64_t ttl_ms_{kDefaultManifestTtlMs};
+    std::size_t max_manifests_{kDefaultMaxManifests};
 
     std::mutex mu_;
     std::unordered_map<std::string, Manifest> manifests_;
+    std::int64_t last_sweep_ms_{0}; // amortize the O(n) TTL scan off the poll hot path
 
-    // TTL doubles as the abandoned-bundle sweep; a generous window for a caller
-    // to finish polling. Cap bounds the in-memory footprint.
-    static constexpr std::int64_t kManifestTtlMs = 10 * 60 * 1000; // 10 min
-    static constexpr std::size_t kMaxManifests = 4096;
+    // The full O(n) TTL scan runs at most this often; an actively-polled bundle
+    // is kept alive by collate refreshing its timestamp, so a coarse sweep is
+    // safe and keeps the poll path O(1).
+    static constexpr std::int64_t kSweepIntervalMs = 30 * 1000; // 30 s
 };
 
 } // namespace yuzu::server
