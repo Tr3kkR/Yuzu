@@ -1,0 +1,109 @@
+# CI cutover runbook — Shulgi (Ubuntu 24.04) → Big Tam (Ubuntu 26.04)
+
+Status: **staged, not yet flipped** (2026-06-20).
+
+The self-hosted Linux CI is moving from Shulgi (`yuzu-wsl2-linux`, WSL2 Ubuntu
+24.04, GCC 13 / Clang 19) to the Big Tam pool (`yuzu-bigtam-linux-{0..3}`, native
+Ubuntu 26.04, **GCC 15 / Clang 21**). This runbook is the one-shot flip to run
+**once Big Tam is back online and healthy**.
+
+## Why it is deferred
+
+GCC 15 / Clang 21 exist only on Ubuntu 26.04. Shulgi is 24.04 and **cannot**
+build them. While Big Tam is offline, Shulgi is the only available Linux runner —
+flipping the compiler now would fail every self-hosted Linux job at the
+`apt-get install gcc-15` step. So the scaffolding below is landed, but the live
+`runs-on:` / compiler / `ImageOS` changes wait for Big Tam.
+
+## What is already staged (this PR)
+
+- `meson/native/linux-gcc15.ini`, `meson/native/linux-clang21.ini` (additive; the
+  24.04 `linux-gcc13.ini` / `linux-clang19.ini` stay for Shulgi).
+- `deploy/docker/Dockerfile.ci-linux`, `Dockerfile.ci` (+ `ci-entrypoint.sh`),
+  and the four sanitizer images `Dockerfile.{server,agent}-{asan,tsan}` →
+  `ubuntu:26.04` + gcc-15/clang-21. (`Dockerfile.runner-linux` left on its
+  `actions-runner` base — it is the *containerized* runner path, not Big Tam,
+  which is a native runner.)
+- `.github/workflows/pre-release.yml` `install-deb` matrix gained `ubuntu:26.04`.
+
+## Pre-flip verification (do these first)
+
+Status verified on Big Tam 2026-06-20 (now back online): OS = Ubuntu 26.04,
+gcc-15/g++-15 installed, clang-21 + the rest apt-installable, `runner` user has a
+dedicated `/etc/sudoers.d/10-runner` NOPASSWD grant, runners run as `runner` from
+`/home/runner/r{0..3}`. Outstanding items below.
+
+0. **Container runtime (HARD PREREQ).** `scripts/ci/ensure-postgres.sh` needs
+   docker (or a pre-set `YUZU_TEST_POSTGRES_DSN`) for the server-test step. Big
+   Tam shipped with **no** container runtime. Install it (needs root on Big Tam):
+   ```
+   sudo apt-get update && sudo apt-get install -y docker.io
+   sudo usermod -aG docker runner
+   sudo systemctl restart 'actions.runner.Tr3kkR-Yuzu.yuzu-bigtam-linux-*.service'
+   sudo -u runner docker run --rm hello-world   # verify
+   ```
+   (`docker.io` 29.1.3 is in 26.04's archive; Docker Hub egress confirmed.)
+   Without this the `linux` job fails at "Ensure Postgres".
+1. **Big Tam online & healthy** — `gh api repos/Tr3kkR/Yuzu/actions/runners`
+   shows `yuzu-bigtam-linux-*` as `online`; ci.yml `preflight` reports
+   `bigtam_pool_healthy == true`.
+2. **Toolchain present on the host** — validated on `ubuntu:26.04` and on Big Tam:
+   gcc 15.2.0 default, clang-21 1.21.1.8,
+   `libasan8`/`libubsan1`/`libtsan2`/`libssl3t64`/`libgcc-15-dev`/`libpq5` all
+   resolve; a C++23 `<print>` program compiles & runs.
+3. **`erlef/setup-beam` ImageOS — RESOLVED: keep `ubuntu24`.** setup-beam has
+   **no** `ubuntu26` prebuilt OTP (supported ImageOS tops out at `ubuntu24`).
+   ImageOS only selects which OTP tarball to fetch; the 24.04 build runs on 26.04
+   (same `libcrypto.so.3` soname). **Do NOT flip ImageOS to ubuntu26** — it would
+   fail to resolve the asset. Validate via `gateway eunit` on the Big Tam leg.
+4. **Per-runner state** — `scripts/ci/ensure-postgres.sh` works on Big Tam (needs
+   item 0); ccache (`~/.cache/ccache`) and the vcpkg binary cache
+   (`runner.tool_cache/yuzu-vcpkg-binary-cache-linux`) directories are writable.
+
+## The flip (edits)
+
+Reference by content — line numbers drift. In every file below, the change is
+`gcc-13`→`gcc-15`, `g++-13`→`g++-15`, `clang-19`→`clang-21`,
+`clang++-19`→`clang++-21`, `linux-gcc13.ini`→`linux-gcc15.ini`,
+`linux-clang19.ini`→`linux-clang21.ini`. **`ImageOS: ubuntu24` stays `ubuntu24`**
+(see pre-flip item 3). Pin compile jobs to `…, yuzu-bigtam-linux` and gate them on
+`bigtam_pool_healthy` (compiler-agnostic jobs like proto-compat stay on the
+broader `linux_pool` gate).
+
+Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
+
+1. **`.github/workflows/ci.yml`** — `linux` job — **DONE (2026-06-20).**
+   matrix→`[gcc-15, clang-21]`, the `exclude` ternaries, the apt line, `CC`/`CXX`,
+   `--native-file`, `-Db_lto`; `runs-on`→`[self-hosted, Linux, X64, yuzu-bigtam-linux]`;
+   `if`→`bigtam_pool_healthy == 'true'` (new gate added to
+   `scripts/ci/runner-health-check.py` + the preflight outputs). `ImageOS` left at
+   `ubuntu24` with an explanatory comment. `proto-compat` left on the generic pool
+   (no compiler — needs no pin). The GHA-hosted **canary** stays on
+   `ubuntu-24.04`/gcc-13 per the "keep GHA-hosted on 24.04" decision, so it no
+   longer mirrors the primary toolchain (a known, accepted divergence).
+2. **`.github/workflows/sanitizer-tests.yml`** — repin
+   `[self-hosted, Linux, X64, yuzu-shulgi]` → `…, yuzu-bigtam-linux`; bump the
+   `gcc-13`/`g++-13` tool-presence checks + `CC: ccache gcc-13`. Add a
+   `bigtam_pool_healthy` gate (it currently has none). Leave `ImageOS: ubuntu24`.
+3. **`.github/workflows/nightly.yml`** — ASan + TSan legs repin
+   `yuzu-shulgi` → `yuzu-bigtam-linux`; the generic coverage leg is already
+   pool-labelled; bump every `gcc-13 g++-13` apt line and `CC: ccache gcc-13`.
+   Leave `ImageOS: ubuntu24`.
+4. **`.github/workflows/codeql.yml`** — Linux leg repin `yuzu-shulgi` →
+   `yuzu-bigtam-linux`; bump the `TOOLS=` list and `CC: ccache gcc-13`.
+   Leave `ImageOS: ubuntu24`.
+5. **`.github/workflows/release.yml`** — the `[self-hosted, Linux]` legs match
+   both boxes. Decide deliberately: keep release on gcc-13 (Shulgi) until the PR
+   matrix has soaked on gcc-15, **or** move it. If moving, bump the `gcc-13 g++-13`
+   tool-check + `CC: ccache gcc-13` and pin to Big Tam.
+6. **`.github/runner-inventory.json`** — update the Shulgi role (no longer the
+   live Linux runner) and the Big Tam roles (now live); if Shulgi is retired from
+   Linux CI, reflect that.
+7. **`docs/ci-architecture.md`** — update the runner-topology table + flip this
+   doc's status to "flipped".
+
+## Rollback
+
+Revert the `runs-on` pins and compiler tokens to gcc-13/clang-19/`ImageOS: ubuntu24`
+and the jobs run on Shulgi again unchanged. The staged 26.04 Docker images and
+native files are inert when nothing references them, so they need no rollback.
