@@ -250,6 +250,12 @@ void ServiceGuard::run() try {
     std::optional<std::chrono::steady_clock::time_point> last_emit;
     std::uint64_t suppressed = 0;
 
+    // Compliance-edge state (Slice B), mirroring RegistryGuard: nullopt until the
+    // first compare, then tracks the last-reported compliant/drifted state so a
+    // guard.compliant event fires ONCE on the compliant↔drift edge — a steady
+    // compliant service stays silent. Only this run() thread touches it.
+    std::optional<bool> last_compliant;
+
     // C3: per-rule retry policy. Consulted ONLY in enforce mode and ONLY to gate the
     // control call — detection + emission happen regardless. next_wake_ms carries a
     // strategy-scheduled self-wake (Backoff retry / Bounded resume) OR the degraded
@@ -289,8 +295,30 @@ void ServiceGuard::run() try {
     // resilience-gated enforce (detection still reported when the fix is withheld),
     // then collapse-with-count debounce before the sink.
     auto emit = [&](Det got, std::uint64_t latency_us) {
-        if (is_compliant(cfg_.desired, got))
+        if (is_compliant(cfg_.desired, got)) {
+            // Compliant. Emit guard.compliant ONCE on the edge into compliant (incl.
+            // the initial on-registration compare, last_compliant == nullopt); a steady
+            // compliant service stays silent (NFR). Bypasses the drift-debounce collapse
+            // below — a compliant edge ends a drift, it is not another drift to fold.
+            // Mirrors RegistryGuard::emit (Slice B): without this a compliant service
+            // never produces a census signal and reads as "pending" forever in the
+            // per-(agent,rule) status table.
+            if (last_compliant != true) {
+                last_compliant = true;
+                ServiceDrift c;
+                c.guard_type = "service";
+                c.rule_id = cfg_.rule_id;
+                c.rule_name = cfg_.rule_name;
+                c.detected_value = det_token(got);
+                c.expected_value = expected_token;
+                c.detection_latency_us = latency_us;
+                c.compliant = true;
+                if (sink_)
+                    sink_(c);
+            }
             return;
+        }
+        last_compliant = false; // drifted (reported below, possibly debounce-collapsed)
         ServiceDrift d;
         d.guard_type = "service";
         d.rule_id = cfg_.rule_id;
@@ -327,6 +355,12 @@ void ServiceGuard::run() try {
                              dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
+        // A successful control call drove the service to `desired`: the resulting SCM
+        // notify will re-reconcile and read compliant. drift.remediated already carries
+        // that "now compliant" meaning, so pre-set the edge to avoid a redundant
+        // guard.compliant chasing every remediation (mirrors RegistryGuard, Slice B).
+        if (d.remediation_attempted && d.remediation_success)
+            last_compliant = true;
         const auto now = std::chrono::steady_clock::now();
         if (last_emit && (now - *last_emit) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
             ++suppressed;
