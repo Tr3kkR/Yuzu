@@ -23,32 +23,78 @@ if sys.platform == "win32":
     env["TEMP"] = real_temp
     env["TMP"] = real_temp
 
-    # Bypass the Chocolatey shim for rebar3 — it can lose env vars.
-    # Use escript.exe directly via the C:\Erlang junction (space-free path).
+    # Resolve the Erlang toolchain WITHOUT hardcoding one host's layout. The
+    # proven-good invocation is `<real escript.exe> <rebar3 escript file>
+    # compile`: it bypasses the Chocolatey shim (which can lose env vars) and
+    # the OTP 28 top-level launcher stub at <root>\bin\escript.exe (no useful
+    # output non-interactively; can segfault with access violation 0xC0000005
+    # under the choco path). The real escript.exe lives at
+    # <root>\erts-*\bin\escript.exe across modern (Erlang OTP\) and legacy
+    # (erl-<ver>\) layouts. We just resolve the PATHS portably instead of
+    # assuming Shulgi's C:\Erlang junction + Chocolatey path.
     #
-    # Modern OTP 28 installers ship a launcher stub at <root>\bin\escript.exe
-    # that produces no useful output when invoked non-interactively and can
-    # segfault with Windows access violation 0xC0000005 under the choco
-    # install path. The real escript.exe lives at <root>\erts-*\bin\escript.exe
-    # across both modern (Erlang OTP\) and legacy (erl-<ver>\) layouts;
-    # prefer that. Fallback to the top-level launcher for older OTP installs
-    # where no erts-* subdir exists, then to PATH-resolved rebar3 if the
-    # junction doesn't exist at all.
-    erlang_junction = r"C:\Erlang"
-    erts_escripts = sorted(
-        glob.glob(os.path.join(erlang_junction, "erts-*", "bin", "escript.exe")),
-        reverse=True,
-    )
-    escript = (
-        erts_escripts[0]
-        if erts_escripts
-        else os.path.join(erlang_junction, "bin", "escript.exe")
-    )
-    rebar3_escript = r"C:\ProgramData\chocolatey\lib\rebar3\tools\rebar3"
-    if os.path.isfile(escript) and os.path.isfile(rebar3_escript):
+    # Resolution precedence (per the runner provisioning contract — see
+    # deploy/windows/Provision-Windows-Runner.ps1 + toolchain-manifest.json):
+    #   1. explicit env vars (YUZU_ESCRIPT / ESCRIPT, YUZU_REBAR3 / REBAR3)
+    #   2. the real erts escript globbed across common OTP install roots
+    #   3. PATH (shutil.which)
+    def _env_file(*names):
+        for n in names:
+            v = os.environ.get(n)
+            if v and os.path.isfile(v):
+                return v
+        return None
+
+    escript = _env_file("YUZU_ESCRIPT", "ESCRIPT")
+    if not escript:
+        roots = [r"C:\Erlang"]
+        roots += glob.glob(r"C:\Program Files\Erlang*")
+        roots += glob.glob(r"C:\Program Files\erl*")
+        candidates = []
+        for root in roots:
+            candidates += sorted(
+                glob.glob(os.path.join(root, "erts-*", "bin", "escript.exe")),
+                reverse=True,
+            )
+            candidates.append(os.path.join(root, "bin", "escript.exe"))
+        escript = next((c for c in candidates if os.path.isfile(c)), None)
+    if not escript:
+        escript = shutil.which("escript")
+
+    rebar3_escript = _env_file("YUZU_REBAR3", "REBAR3")
+    if not rebar3_escript:
+        rebar3_escript = next(
+            (
+                c
+                for c in (
+                    r"C:\tools\rebar3\rebar3",
+                    r"C:\ProgramData\chocolatey\lib\rebar3\tools\rebar3",
+                )
+                if os.path.isfile(c)
+            ),
+            None,
+        )
+
+    if escript and rebar3_escript:
         cmd = [escript, rebar3_escript, "compile"]
     else:
-        cmd = ["rebar3", "compile"]
+        # Last resort: a PATH-resolved rebar3 launcher. shutil.which returns the
+        # full path incl. extension (.cmd/.bat), which subprocess CAN exec — a
+        # bare "rebar3" cannot be exec'd on Windows (no PATHEXT resolution), the
+        # old FileNotFoundError trap.
+        rebar3_launcher = shutil.which("rebar3")
+        if rebar3_launcher:
+            cmd = [rebar3_launcher, "compile"]
+        else:
+            sys.stderr.write(
+                "build_gateway: could not locate the Erlang toolchain on Windows.\n"
+                "  Set YUZU_ESCRIPT and YUZU_REBAR3 (see "
+                "deploy/windows/toolchain-manifest.json), or put escript.exe and\n"
+                "  rebar3 on PATH.\n"
+                f"  escript={escript!r} rebar3={rebar3_escript!r} "
+                f"which(rebar3)={shutil.which('rebar3')!r}\n"
+            )
+            sys.exit(1)
 else:
     cmd = ["rebar3", "compile"]
 

@@ -75,6 +75,15 @@ The remaining **flip** (live `runs-on`/compiler/`ImageOS` changes) is deferred
 until Big Tam is confirmed online — Shulgi (24.04) cannot build gcc-15/clang-21,
 so flipping while it is the only available Linux runner would red the board. The
 exact one-shot flip is enumerated in **`docs/ci-ubuntu-2604-cutover.md`**.
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | windows matrix (successor to Shulgi for Windows); provisioned from [`deploy/windows/`](../deploy/windows/README.md) |
+| `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows (legacy — retire once Wee Tam is proven) |
+| `macos-15` | GitHub-hosted | macos matrix |
+
+The Windows toolchain is codified in [`deploy/windows/`](../deploy/windows/README.md)
+(the native-Windows analog of `deploy/docker/Dockerfile.ci-linux`): a versioned
+provisioning spec, a manifest, and a runner self-test. All four runners share one
+vcpkg binary cache via `RUNNER_TOOL_CACHE=D:\ci\tool_cache` (mirroring
+`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
