@@ -5567,7 +5567,7 @@ void RestApiV1::register_routes(
     // as a follow-up; an assignment filter now would diverge from fleet-wide enforce.
     sink.Get(
         R"(/api/v1/guaranteed-state/baselines/([A-Za-z0-9._\-]+)/devices/([A-Za-z0-9._\-]+))",
-        [perm_fn, scoped_perm_fn, audit_fn, guaranteed_state_store,
+        [scoped_perm_fn, audit_fn, guaranteed_state_store,
          baseline_store](const httplib::Request& req, httplib::Response& res) {
             const std::string baseline_id = req.matches[1].str();
             const std::string agent_id = req.matches[2].str();
@@ -5584,13 +5584,20 @@ void RestApiV1::register_routes(
             // GuaranteedState:Read passes fleet-wide, otherwise the principal must hold
             // Read via a management group the agent is in — so a group-scoped operator
             // (or integration service account) is not fail-closed out of the devices
-            // they can legitimately see. Falls back to the flat gate only if no scoped
-            // fn was wired (e.g. a caller that hasn't adopted it). agent_id must be in
-            // hand before the gate, hence the reorder above.
-            const bool authorized =
-                scoped_perm_fn ? scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id)
-                               : perm_fn(req, res, "GuaranteedState", "Read");
-            if (!authorized)
+            // they can legitimately see. agent_id must be in hand before the gate,
+            // hence the reorder above. The scoped fn is a REQUIRED dependency for this
+            // route: if a call site fails to wire it, fail loud (503) rather than
+            // silently fall back to the flat global gate that re-introduces the
+            // group-scoped lockout this route exists to fix. Production wires it in
+            // server.cpp; the in-process test harness wires its own.
+            if (!scoped_perm_fn) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
             if (!guaranteed_state_store || !baseline_store) {
                 const auto cid = detail::make_correlation_id();
