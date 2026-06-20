@@ -1,6 +1,21 @@
 # CI cutover runbook — Shulgi (Ubuntu 24.04) → Big Tam (Ubuntu 26.04)
 
-Status: **staged, not yet flipped** (2026-06-20).
+Status: **ci.yml linux leg FLIPPED + validated on Big Tam** (2026-06-20). Remaining:
+sanitizer-tests → nightly → codeql still on Shulgi.
+
+Branch `ci/ubuntu-2604-cutover`. Two extra shared-host fixes were needed beyond the
+plan, both because Big Tam runs **4 runners on one host** (Shulgi was one):
+- **apt lock:** the matrix legs race `apt-get`. `DPkg::Lock::Timeout` does NOT cover
+  `apt-get update`'s lists lock, so the install step is wrapped in `flock -w 600 9 …
+  9>/tmp/yuzu-ci-apt.lock`. **The sanitizer/nightly/codeql legs must add the SAME
+  flock when they move to Big Tam** (reuse that lock path so they coordinate).
+- **eunit fixed-port collision:** `yuzu_gw_health_nf_tests` hardcoded `health_port=18081`
+  → 2nd concurrent leg got `eaddrinuse` → setup crash → eunit cancelled the group
+  ("0 failures, one cancelled, exit 1"). Fixed to ephemeral port 0 (commit `60412341`).
+- Pre-created shared `yuzu-ci-postgres` container (no per-leg creation race) + job-env
+  `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (harmless defence; the cookie reports were red herrings).
+- The per-runner `.env` (HOME/ERL_EPMD_PORT) was tried but the runner ignored it; it
+  proved unnecessary once the above landed.
 
 The self-hosted Linux CI is moving from Shulgi (`yuzu-wsl2-linux`, WSL2 Ubuntu
 24.04, GCC 13 / Clang 19) to the Big Tam pool (`yuzu-bigtam-linux-{0..3}`, native
