@@ -8815,11 +8815,10 @@ private:
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
             // Per-device-scoped permission (management-group aware) for that route —
-            // same closure DeviceRoutes uses for the dashboard Guardian device lens.
-            [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
-                   const std::string& op, const std::string& agent_id) -> bool {
-                return require_scoped_permission(req, res, type, op, agent_id);
-            });
+            // the SAME named closure DeviceRoutes already uses for the dashboard
+            // Guardian device lens (defined once above), not a re-inlined duplicate
+            // that two copies would have to keep in sync.
+            scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

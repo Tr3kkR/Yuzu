@@ -221,6 +221,12 @@ The Baseline surface is on the dashboard (`/guardian` → Baselines). Its **read
 
 > **Targeting is fleet-wide for now.** A Baseline carries an *assignment* (included − excluded management groups), but management-group targeting is **not yet wired** — every deploy currently converges the **whole fleet**, and the dashboard labels the assignment area as coming-soon. Do not rely on the assignment to contain a Baseline's blast radius yet.
 
+## Assignment
+
+A Baseline's **assignment** is its device targeting: a set of *included* minus *excluded* management groups (exclude wins). It is **deferred — management-group targeting is not yet wired** (see the targeting note above), so every deploy currently converges the **whole fleet** and the dashboard labels the assignment area "coming soon". Until assignment lands, a *deployed* Baseline applies to every device; do not rely on assignment to contain a Baseline's blast radius.
+
+The per-device REST read (`GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`, see [REST API](rest-api.md) → Guaranteed State) reflects this: it returns a device's compliance against a deployed Baseline's Guards, **not** a statement that the Baseline was *targeted* at that device. It becomes assignment-aware (returning *not-applicable* for an out-of-scope device) when assignment is wired.
+
 ## Compliance overview
 
 The dashboard's compliance overview (`/guardian`) reports live fleet compliance from a per-(agent, rule) census the server maintains off the `guard.compliant` / `drift.*` event stream (table `guardian_agent_rule_status`, deliberately **not** subject to the event-retention reaper, so a long-quiet compliant Guard keeps its real state). The Fleet Status panel has three views:

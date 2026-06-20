@@ -78,8 +78,12 @@ public:
     /// global grant passes fleet-wide, otherwise the principal must hold the
     /// permission via a management group the agent is in. Per-device REST reads gate
     /// on this so a management-group-scoped operator is not fail-closed out of
-    /// devices they can legitimately see. Empty → caller falls back to the flat
-    /// PermFn (the pre-scoping behaviour).
+    /// devices they can legitimately see. The empty/default `{}` exists ONLY for
+    /// source-stability of the other (unrelated) call sites — a route that requires
+    /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED (503); it
+    /// does NOT silently fall back to the flat PermFn (that would re-introduce the
+    /// group-scoped lockout this typedef exists to fix). See the baseline-device route
+    /// in rest_api_v1.cpp for the fail-closed contract.
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,

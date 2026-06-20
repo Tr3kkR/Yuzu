@@ -616,7 +616,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
     "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
-      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope"}, "404": {"description": "Baseline not found"}}}
+      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope (RBAC-layer denial shape, not the A4 envelope)"}, "404": {"description": "Baseline not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -5571,8 +5571,13 @@ void RestApiV1::register_routes(
          baseline_store](const httplib::Request& req, httplib::Response& res) {
             const std::string baseline_id = req.matches[1].str();
             const std::string agent_id = req.matches[2].str();
-            // The route regex caps the charset but not the length; bound it (A4 400).
-            if (baseline_id.size() > 128 || agent_id.size() > 128) {
+            // The route regex caps the charset but not the length; bound it to the
+            // canonical enrolled-agent-id limit (auth::kMaxAgentIdLength, 256 — the
+            // same ceiling enrollment enforces) so a legitimately-enrolled device with
+            // an operator-set long --agent-id is never falsely rejected by THIS route
+            // alone. A4 400 only past that ceiling.
+            if (baseline_id.size() > auth::kMaxAgentIdLength ||
+                agent_id.size() > auth::kMaxAgentIdLength) {
                 const auto cid = detail::make_correlation_id();
                 res.status = 400;
                 res.set_content(detail::error_json_a4(400, "path parameter too long", cid),
@@ -5592,6 +5597,11 @@ void RestApiV1::register_routes(
             // server.cpp; the in-process test harness wires its own.
             if (!scoped_perm_fn) {
                 const auto cid = detail::make_correlation_id();
+                // Distinct message from the store-null 503 below so log triage
+                // identifies the defect (unwired call site) without reading source.
+                spdlog::error("guardian.device.baseline: scoped_perm_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -5601,6 +5611,10 @@ void RestApiV1::register_routes(
                 return;
             if (!guaranteed_state_store || !baseline_store) {
                 const auto cid = detail::make_correlation_id();
+                spdlog::error("guardian.device.baseline: store null "
+                              "(guaranteed_state_store/baseline_store) — "
+                              "registration-order defect; cid={}",
+                              cid);
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -5614,6 +5628,10 @@ void RestApiV1::register_routes(
             // probe stream is distinguishable from genuine reads (matches the
             // /guaranteed-state/events?agent_id= sibling). Same verb the dashboard
             // Guardian device lens emits, so one SIEM filter catches both surfaces.
+            // The pre-auth rejections above (400 over-length, 503 unwired/store-null)
+            // return before this point and are intentionally NOT audited here — they
+            // carry no authorized access; a scoped-permission DENIAL is audited at the
+            // auth layer as auth.scoped_permission_required, not by this verb.
             if (audit_fn)
                 audit_fn(req, "guardian.device.view", baseline ? "success" : "not_found", "Agent",
                          agent_id, "baseline " + baseline_id + " per-device guard status via REST");

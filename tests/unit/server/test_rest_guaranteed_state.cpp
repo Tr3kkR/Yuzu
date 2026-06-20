@@ -84,7 +84,11 @@ struct RestGsHarness {
 
     RestApiV1 api;
 
-    RestGsHarness() : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")) {
+    // wire_scoped_perm=false registers the baseline-device route with an EMPTY
+    // ScopedPermFn, exercising the route's fail-closed-503 path (an unwired call
+    // site). Defaults true so every existing test is unchanged.
+    explicit RestGsHarness(bool wire_scoped_perm = true)
+        : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")) {
         fs::remove(db_path);
         fs::remove(bl_db_path);
         // retention=0 keeps the reaper out of the way for ingest tests.
@@ -162,7 +166,9 @@ struct RestGsHarness {
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
                             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{},
                             /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-                            baseline_store.get(), scoped_perm_fn);
+                            baseline_store.get(),
+                            wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
+                                             : RestApiV1::ScopedPermFn{});
     }
 
     ~RestGsHarness() {
@@ -1051,6 +1057,72 @@ TEST_CASE("REST gs.baseline-device: per-device scope — out-of-scope agent 403,
     REQUIRE(ok);
     CHECK(ok->status == 200);
     CHECK(h.last_scoped_agent_id == "WS-2");
+}
+
+TEST_CASE("REST gs.baseline-device: unwired scoped_perm_fn → fail-closed 503 (A4)",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h{/*wire_scoped_perm=*/false};
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    // With no scoped_perm_fn wired the route MUST fail closed (503) — never silently
+    // fall back to the flat gate that would re-introduce the group-scoped lockout.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["meta"]["api_version"] == "v1");
+    CHECK(h.audit_log.empty()); // fail-closed before any audit
+}
+
+TEST_CASE("REST gs.baseline-device: path-param length cap at kMaxAgentIdLength (256)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+
+    // 256-char baseline_id is AT the cap → passes → reaches the store → 404 (unknown
+    // id), proving the cap did not bite a valid-length id.
+    const std::string id256(256, 'x');
+    auto ok_b = h.sink.Get("/api/v1/guaranteed-state/baselines/" + id256 + "/devices/WS-1");
+    REQUIRE(ok_b);
+    CHECK(ok_b->status == 404);
+
+    // 257-char baseline_id is past the cap → 400 A4.
+    const std::string id257(257, 'x');
+    auto bad_b = h.sink.Get("/api/v1/guaranteed-state/baselines/" + id257 + "/devices/WS-1");
+    REQUIRE(bad_b);
+    CHECK(bad_b->status == 400);
+    auto jb = nlohmann::json::parse(bad_b->body);
+    CHECK(jb["error"]["code"].get<int>() == 400);
+    CHECK(jb["error"].contains("correlation_id"));
+
+    // 257-char agent_id is independently capped → 400 A4.
+    const std::string a257(257, 'a');
+    auto bad_a = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/" + a257);
+    REQUIRE(bad_a);
+    CHECK(bad_a->status == 400);
+    CHECK(nlohmann::json::parse(bad_a->body)["error"].contains("correlation_id"));
+
+    // 256-char agent_id is AT the cap → passes → deployed baseline → 200 (all pending).
+    const std::string a256(256, 'a');
+    auto ok_a = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/" + a256);
+    REQUIRE(ok_a);
+    CHECK(ok_a->status == 200);
+}
+
+TEST_CASE("REST gs.baseline-device: 404 uses the A4 envelope (code + correlation_id)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/does-not-exist/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 404);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"]["message"].get<std::string>() == "baseline not found");
+    CHECK(j["meta"]["api_version"] == "v1");
 }
 
 TEST_CASE("REST gs.baseline-device: route + schema are in the OpenAPI spec (A1 discoverability)",
