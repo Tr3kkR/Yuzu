@@ -1,0 +1,127 @@
+# Yuzu demo — observability overlay (Prometheus + ClickHouse + Grafana).
+#
+# Layered ON TOP of docker-compose.demo.yml by scripts/start-demo.sh when
+# DEMO_FULL=1:
+#   docker compose -f docker-compose.demo.yml \
+#                  -f docker-compose.demo.observability.yml \
+#                  -f docker-compose.demo.cedar-vale.yml ...
+#
+# Adds the metrics/analytics stack and rewires the chiselled server to drain
+# analytics into ClickHouse so the dashboard analytics + Grafana panels
+# populate. Scrape config, datasources, dashboards, and the CH schema are
+# lifted verbatim from the full-UAT rig — service names (server/gateway/
+# prometheus/clickhouse) match across both composes, so the configs need no
+# edits.
+#
+# ⚠ DEMO/UAT ONLY — baked admin password, --metrics-no-auth, no TLS. Never prod.
+
+services:
+  # Override only: append the ClickHouse analytics flags to the chiselled
+  # server command. compose REPLACES list-type `command` (it does not merge
+  # element-wise), so this restates docker-compose.demo.yml's server command
+  # verbatim and appends the --clickhouse-* / --analytics-* flags from the
+  # full-UAT rig. image/ports/volumes/healthcheck are inherited from demo.yml.
+  server:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--log-level"
+      - "info"
+      - "--metrics-no-auth"
+      - "--no-nvd-sync"
+      - "--no-ota"
+      - "--config"
+      - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
+      # ── analytics → ClickHouse (lifted from docker-compose.full-uat.yml) ──
+      - "--clickhouse-url"
+      - "http://clickhouse:8123"
+      - "--clickhouse-database"
+      - "yuzu"
+      - "--clickhouse-table"
+      - "yuzu_events"
+      - "--clickhouse-user"
+      - "default"
+      - "--analytics-drain-interval"
+      - "5"
+      - "--analytics-batch-size"
+      - "50"
+
+  # ── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
+    container_name: yuzu-demo-prometheus
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../prometheus/prometheus-full-uat.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-demo-data:/prometheus
+    restart: unless-stopped
+
+  # ── ClickHouse (analytics sink) ──────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12@sha256:a65ca89ddbe8e04a05036dd7d7110a203256293b407b9359130ed5e4333f45ff
+    container_name: yuzu-demo-clickhouse
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+      CLICKHOUSE_DB: yuzu
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"     # HTTP interface (server drains here)
+      - "9000:9000"     # Native TCP
+    volumes:
+      - ../clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-demo-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
+  # ── Grafana (Prometheus + ClickHouse datasources, provisioned dashboards) ─
+  grafana:
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
+    container_name: yuzu-demo-grafana
+    environment:
+      NO_PROXY: "*"
+      no_proxy: "*"
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/yuzu-dashboard.json
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana:/var/lib/grafana/dashboards:ro
+      - grafana-demo-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - clickhouse
+    restart: unless-stopped
+
+volumes:
+  prometheus-demo-data:
+  clickhouse-demo-data:
+  grafana-demo-data:
