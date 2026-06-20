@@ -19,6 +19,7 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -60,6 +61,10 @@ struct RestGsHarness {
     fs::path db_path;
     std::unique_ptr<GuaranteedStateStore> store;
 
+    // BaselineStore for the baseline-anchored per-device status route.
+    fs::path bl_db_path;
+    std::unique_ptr<BaselineStore> baseline_store;
+
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
 
@@ -72,12 +77,15 @@ struct RestGsHarness {
 
     RestApiV1 api;
 
-    RestGsHarness() : db_path(unique_temp_path("rest-gs")) {
+    RestGsHarness() : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")) {
         fs::remove(db_path);
+        fs::remove(bl_db_path);
         // retention=0 keeps the reaper out of the way for ingest tests.
         store = std::make_unique<GuaranteedStateStore>(db_path, /*retention_days=*/0,
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
+        baseline_store = std::make_unique<BaselineStore>(bl_db_path);
+        REQUIRE(baseline_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -125,15 +133,64 @@ struct RestGsHarness {
                             /*product_pack_store=*/nullptr,
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
-                            /*license_store=*/nullptr, store.get());
+                            /*license_store=*/nullptr, store.get(),
+                            /*metrics_registry=*/nullptr, /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{}, /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+                            baseline_store.get());
     }
 
     ~RestGsHarness() {
         store.reset();
-        fs::remove(db_path);
-        // sqlite WAL/SHM siblings
-        fs::remove(db_path.string() + "-wal");
-        fs::remove(db_path.string() + "-shm");
+        baseline_store.reset();
+        for (const auto& p : {db_path, bl_db_path}) {
+            fs::remove(p);
+            // sqlite WAL/SHM siblings
+            fs::remove(p.string() + "-wal");
+            fs::remove(p.string() + "-shm");
+        }
+    }
+
+    // Seed a Guard rule (name resolves in the route's list_rules() lookup).
+    void seed_rule(const std::string& rule_id, const std::string& name) {
+        GuaranteedStateRuleRow r;
+        r.rule_id = rule_id;
+        r.name = name;
+        REQUIRE(store->create_rule(r).has_value());
+    }
+
+    // Seed one device's reported verdict for a Guard via the status feed
+    // (insert_event → upsert_rule_status). event_type maps to state per
+    // event_state_from_type: guard.compliant→compliant, drift.detected→drifted,
+    // guard.unhealthy→errored.
+    void seed_status(const std::string& event_id, const std::string& agent,
+                     const std::string& rule_id, const std::string& event_type,
+                     const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = event_id;
+        e.rule_id = rule_id;
+        e.agent_id = agent;
+        e.event_type = event_type;
+        e.severity = "info";
+        e.timestamp = ts;
+        REQUIRE(store->insert_event(e).has_value());
+    }
+
+    // Create + deploy a Baseline with the given member Guards (snapshot = members,
+    // lifecycle = deployed). Returns the generated baseline_id.
+    std::string seed_deployed_baseline(const std::string& name,
+                                       const std::vector<std::string>& member_rule_ids) {
+        Baseline b;
+        b.name = name;
+        auto bid = baseline_store->create_baseline(b);
+        REQUIRE(bid.has_value());
+        REQUIRE(baseline_store->set_members(*bid, member_rule_ids).has_value());
+        Baseline deployed = *baseline_store->get_baseline(*bid);
+        deployed.deployed_snapshot = nlohmann::json(member_rule_ids).dump();
+        deployed.lifecycle = kBaselineDeployed;
+        REQUIRE(baseline_store->update_baseline(deployed).has_value());
+        return *bid;
     }
 
     // Seed one ruleless DEX observation (the __observation__ projection the DEX
@@ -745,5 +802,137 @@ TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
     CHECK(res->status == 403);
     // No audit emission on a denied request — the permission check is the first
     // statement in the handler, before the dex.signal.view audit.
+    CHECK(h.audit_log.empty());
+}
+
+// ── Baseline-anchored per-device Guardian status ─────────────────────────────
+// GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}
+
+TEST_CASE("REST gs.baseline-device: deployed baseline returns per-guard verdicts + counts",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Firewall on");
+    h.seed_rule("r2", "RDP NLA");
+    h.seed_rule("r3", "BitLocker");
+    const auto bid = h.seed_deployed_baseline("ServiceNow Compliance", {"r1", "r2", "r3"});
+    // WS-1: r1 compliant, r2 drifted, r3 unreported (→ pending).
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r2", "drift.detected", "2026-06-20T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["baseline"]["name"].get<std::string>() == "ServiceNow Compliance");
+    CHECK(d["baseline"]["baseline_id"].get<std::string>() == bid);
+    CHECK(d["deployed"].get<bool>() == true);
+    CHECK(d["agent_id"].get<std::string>() == "WS-1");
+    CHECK(d["total_guards"].get<int>() == 3);
+    CHECK(d["compliant"].get<int>() == 1);
+    CHECK(d["drifted"].get<int>() == 1);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 1);
+    CHECK(d["total_guards"].get<int>() == d["compliant"].get<int>() + d["drifted"].get<int>()
+                                             + d["errored"].get<int>() + d["pending"].get<int>());
+    // last_updated = newest reported verdict (the pending guard contributes nothing).
+    CHECK(d["last_updated"].get<std::string>() == "2026-06-20T11:00:00Z");
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 3);
+    bool saw_pending = false, saw_named = false;
+    for (auto& g : d["guards"]) {
+        if (g["rule_id"].get<std::string>() == "r3")
+            saw_pending =
+                g["status"].get<std::string>() == "pending" && g["updated_at"].is_null();
+        if (g["rule_id"].get<std::string>() == "r1")
+            saw_named = g["name"].get<std::string>() == "Firewall on"
+                        && g["status"].get<std::string>() == "compliant"
+                        && !g["updated_at"].is_null();
+    }
+    CHECK(saw_pending);
+    CHECK(saw_named);
+    bool audited = false;
+    for (auto& a : h.audit_log)
+        if (a.action == "guardian.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST gs.baseline-device: verdicts are isolated per agent (WHERE agent_id)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_rule("r2", "G2");
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r2"});
+    // WS-1 all compliant; WS-2 all errored — the WS-2 rows must not bleed into WS-1.
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("a2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("b1", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("b2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["compliant"].get<int>() == 2);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.baseline-device: unknown agent on a deployed baseline → all pending",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_rule("r2", "G2");
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r2"});
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/ghost");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 2);
+    CHECK(d["pending"].get<int>() == 2);
+    CHECK(d["last_updated"].is_null());
+}
+
+TEST_CASE("REST gs.baseline-device: draft baseline → deployed:false, no guards",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    // Members set but never deployed → empty deployed_snapshot.
+    Baseline b;
+    b.name = "Draft B";
+    auto bid = h.baseline_store->create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(h.baseline_store->set_members(*bid, {"r1"}).has_value());
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + *bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["deployed"].get<bool>() == false);
+    CHECK(d["total_guards"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].empty());
+}
+
+TEST_CASE("REST gs.baseline-device: unknown baseline_id → 404",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/nope123abc/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("REST gs.baseline-device: permission gate runs before audit",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    h.grant_perms = false; // perm_fn denies → 403
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
     CHECK(h.audit_log.empty());
 }

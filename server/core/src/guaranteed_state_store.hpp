@@ -385,6 +385,14 @@ public:
     // drill-down, served by idx_gars_rule); empty = the whole fleet. Read-only.
     std::vector<GuardianAgentRuleStatus> agent_rule_statuses(const std::string& rule_id = "") const;
 
+    // One agent's current per-rule compliance verdicts (every rule it has reported
+    // on) — the per-agent analog of agent_rule_statuses(rule_id), read via the
+    // (agent_id, rule_id) PK index. Backs the baseline-anchored per-device status
+    // REST view; the caller intersects the returned rule_ids with a Baseline's
+    // deployed members. Read-only (last-reported state, not a live probe).
+    std::vector<GuardianAgentRuleStatus>
+    agent_rule_statuses_for_agent(const std::string& agent_id) const;
+
     std::size_t rule_count() const;
     std::size_t event_count() const;
 

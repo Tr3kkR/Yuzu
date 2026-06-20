@@ -1788,6 +1788,34 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
     return out;
 }
 
+std::vector<GuardianAgentRuleStatus>
+GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianAgentRuleStatus> out;
+    if (!db_)
+        return out;
+    // One agent's current per-rule verdicts. Rides the (agent_id, rule_id) PK
+    // auto-index (agent_id leading), so it scans only this agent's rows — the
+    // baseline-anchored per-device REST view's denominator is small. Pure SELECT,
+    // so no sqlite3_changes()/#1033 concern.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT agent_id, rule_id, state, updated_at "
+                           "FROM guardian_agent_rule_status WHERE agent_id = ?1",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(s.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        GuardianAgentRuleStatus r;
+        r.agent_id = col_text(s.get(), 0);
+        r.rule_id = col_text(s.get(), 1);
+        r.state = col_text(s.get(), 2);
+        r.updated_at = col_text(s.get(), 3);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
 std::vector<GuardianDayCount>
 GuaranteedStateStore::daily_remediations(const std::string& since) const {
     std::shared_lock lock(mtx_);

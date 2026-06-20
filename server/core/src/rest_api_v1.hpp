@@ -49,6 +49,10 @@
 // explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
+// Baseline-anchored per-device Guardian status route borrows the BaselineStore.
+// Forward-declared (used only as a pointer in register_routes); the .cpp includes
+// baseline_store.hpp for the definition.
+class BaselineStore;
 }
 
 #include <httplib.h>
@@ -168,7 +172,10 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -195,7 +202,10 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr);
 };
 
 } // namespace yuzu::server

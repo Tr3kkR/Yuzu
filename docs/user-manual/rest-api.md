@@ -3514,6 +3514,24 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 
+#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+
+Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+
+- **Permission:** `GuaranteedState:Read`
+- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.)
+- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
+- **`404`** if `baseline_id` is unknown.
+- **Response keys:**
+  - `baseline` — `{ baseline_id, name, lifecycle }`.
+  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
+  - `agent_id`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+
+**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+
 #### `GET /api/v1/guaranteed-state/alerts`
 
 Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11).

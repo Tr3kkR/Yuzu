@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <random>
@@ -615,6 +616,39 @@ std::unordered_set<std::string> BaselineStore::deployed_member_rule_ids() const 
             if (rid.is_string())
                 ids.insert(rid.get<std::string>());
     }
+    return ids;
+}
+
+std::vector<std::string>
+BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<std::string> ids;
+    if (!db_)
+        return ids;
+    // The deployed snapshot (the ENFORCED set captured at last deploy) of ONE
+    // Baseline — the per-Baseline analog of the fleet-union overload above, for
+    // the baseline-anchored per-device REST view. Same fail-closed parse: a
+    // draft / never-deployed / empty / malformed snapshot yields {}.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT deployed_snapshot FROM guaranteed_state_baselines "
+                           "WHERE baseline_id = ?;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return ids;
+    sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(s.get()) == SQLITE_ROW) {
+        const char* snap = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        if (snap && *snap) {
+            // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
+            const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
+            if (parsed.is_array())
+                for (const auto& rid : parsed)
+                    if (rid.is_string())
+                        ids.push_back(rid.get<std::string>());
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     return ids;
 }
 

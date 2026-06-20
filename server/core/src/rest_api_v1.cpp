@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
@@ -348,7 +349,25 @@ const std::string& openapi_spec() {
           "drifted_rules": {"type": "integer"},
           "errored_rules": {"type": "integer"}
         }
-      },
+      },)json"
+        // Split literal: MSVC caps a single string literal at ~16 KB (C2026).
+        R"json(
+      "GuaranteedStateBaselineDeviceStatus": {
+        "type": "object",
+        "properties": {
+          "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
+          "deployed": {"type": "boolean", "description": "lifecycle == deployed; false => consumer shows 'No Baseline Deployed'"},
+          "agent_id": {"type": "string"},
+          "total_guards": {"type": "integer"},
+          "compliant": {"type": "integer"},
+          "drifted": {"type": "integer"},
+          "errored": {"type": "integer"},
+          "pending": {"type": "integer", "description": "deployed Guards with no recognized verdict for this device (not yet reported / offline / unsupported); equals total_guards - (compliant+drifted+errored)"},
+          "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null if none reported"},
+          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when pending"}}}}
+        }
+      },)json"
+        R"json(
       "GuaranteedStateEvent": {
         "type": "object",
         "properties": {
@@ -595,6 +614,9 @@ const std::string& openapi_spec() {
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
+    "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
+      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. 404 if baseline_id is unknown.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "404": {"description": "Baseline not found"}}}
+    },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },
@@ -815,7 +837,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    BaselineStore* baseline_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -825,7 +848,7 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn));
+                    std::move(net_perf_fn), baseline_store);
 }
 
 void RestApiV1::register_routes(
@@ -840,7 +863,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    BaselineStore* baseline_store) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -5517,6 +5541,118 @@ void RestApiV1::register_routes(
                                              .str()),
                                  "application/json");
              });
+
+    // ── Baseline-anchored per-device Guardian status (ServiceNow CI record) ──
+    //
+    // GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}
+    //
+    // Machine-readable A1 sibling of the dashboard baseline page: for ONE Baseline
+    // + ONE device, return the Baseline's DEPLOYED Guards each with this device's
+    // last reported (Observe-mode) verdict. The denominator is the deployed set
+    // (deployed_snapshot — the enforced set captured at last deploy), so a Guard
+    // that has not reported yet still shows, as "pending". A not-deployed Baseline
+    // returns deployed:false + empty guards (consumer renders "No Baseline
+    // Deployed"). No liveness fold — "pending" conflates never-reported / offline /
+    // platform-unsupported; updated_at carries staleness. Per-device behavioral
+    // read → flat GuaranteedState:Read + guardian.device.view audit, matching the
+    // sibling /guaranteed-state/events?agent_id= and /dex/* per-device routes.
+    sink.Get(
+        R"(/api/v1/guaranteed-state/baselines/([A-Za-z0-9._\-]+)/devices/([A-Za-z0-9._\-]+))",
+        [perm_fn, audit_fn, guaranteed_state_store, baseline_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+            if (!guaranteed_state_store || !baseline_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
+                return;
+            }
+            const std::string baseline_id = req.matches[1].str();
+            const std::string agent_id = req.matches[2].str();
+
+            const auto baseline = baseline_store->get_baseline(baseline_id);
+            if (!baseline) {
+                res.status = 404;
+                res.set_content(error_json("baseline not found", 404), "application/json");
+                return;
+            }
+
+            // Per-device behavioral-data access audit — same verb the dashboard
+            // Guardian device lens emits, so one SIEM filter catches both surfaces.
+            if (audit_fn)
+                audit_fn(req, "guardian.device.view", "success", "Agent", agent_id,
+                         "baseline " + baseline_id + " per-device guard status via REST");
+
+            const bool deployed = (baseline->lifecycle == kBaselineDeployed);
+            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline_id);
+
+            // rule_id -> Guard name (small catalogue; one pass). Falls back to the
+            // rule_id when a snapshot member Guard has since been deleted.
+            std::unordered_map<std::string, std::string> rule_names;
+            for (const auto& r : guaranteed_state_store->list_rules())
+                rule_names[r.rule_id] = r.name;
+
+            // rule_id -> last reported verdict for THIS device.
+            std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
+            for (auto& st : guaranteed_state_store->agent_rule_statuses_for_agent(agent_id))
+                dev[st.rule_id] = std::move(st);
+
+            int64_t compliant = 0, drifted = 0, errored = 0;
+            std::string last_updated; // max reported updated_at (ISO-8601 sorts lexically)
+            JArr guards;
+            for (const auto& rid : guard_ids) {
+                std::string status = "pending";
+                std::string updated_at;
+                if (auto it = dev.find(rid); it != dev.end()) {
+                    const std::string& s = it->second.state;
+                    if (s == "compliant") { status = s; ++compliant; }
+                    else if (s == "drifted") { status = s; ++drifted; }
+                    else if (s == "errored") { status = s; ++errored; }
+                    // any unexpected stored state falls through to "pending"
+                    if (status != "pending") {
+                        updated_at = it->second.updated_at;
+                        if (updated_at > last_updated)
+                            last_updated = updated_at;
+                    }
+                }
+                const auto nit = rule_names.find(rid);
+                JObj g;
+                g.add("rule_id", rid)
+                    .add("name",
+                         (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid)
+                    .add("status", status);
+                if (updated_at.empty())
+                    g.raw("updated_at", "null");
+                else
+                    g.add("updated_at", updated_at);
+                guards.add(std::move(g));
+            }
+
+            const int64_t total_guards = static_cast<int64_t>(guard_ids.size());
+            const int64_t pending = total_guards - (compliant + drifted + errored);
+
+            JObj b;
+            b.add("baseline_id", baseline->baseline_id)
+                .add("name", baseline->name)
+                .add("lifecycle", baseline->lifecycle);
+
+            JObj data;
+            data.raw("baseline", b.str())
+                .add("deployed", deployed)
+                .add("agent_id", agent_id)
+                .add("total_guards", total_guards)
+                .add("compliant", compliant)
+                .add("drifted", drifted)
+                .add("errored", errored)
+                .add("pending", pending);
+            if (last_updated.empty())
+                data.raw("last_updated", "null");
+            else
+                data.add("last_updated", last_updated);
+            data.raw("guards", guards.str());
+
+            res.set_content(ok_json(data.str()), "application/json");
+        });
 
     sink.Get("/api/v1/guaranteed-state/alerts",
              [perm_fn](const httplib::Request& req, httplib::Response& res) {

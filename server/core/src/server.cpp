@@ -8811,7 +8811,9 @@ private:
             // N1: the shared network-quality snapshot provider — the same closure
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
-            net_perf_fn);
+            net_perf_fn,
+            // Baseline-anchored per-device Guardian status route (trailing optional dep).
+            baseline_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
