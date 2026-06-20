@@ -100,6 +100,10 @@ jobs:
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
       # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
       linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
+      # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
+      # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
+      # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
+      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -391,9 +395,10 @@ jobs:
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Windows runner
-    # is unhealthy or unknown. Fail-closed `== 'true'`.
-    if: needs.preflight.outputs.yuzu_local_windows_healthy == 'true'
+    # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
+    # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
+    # Shulgi fallback) — mirrors the Linux pool gate.
+    if: needs.preflight.outputs.windows_pool_healthy == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
