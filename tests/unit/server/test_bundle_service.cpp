@@ -262,6 +262,24 @@ TEST_CASE("aggregate_to_json tolerates non-UTF-8 plugin output (no throw)", "[bu
     auto j = nlohmann::json::parse(out); // must be valid, parseable JSON
     CHECK(j["steps"][0]["state"] == "responded");
     CHECK(j["received"] == 1);
+    // The invalid byte must be REPLACED with U+FFFD (EF BF BD), not dropped —
+    // guards against a future regression that silently omits the output instead.
+    CHECK(out.find("\xef\xbf\xbd") != std::string::npos);
+}
+
+TEST_CASE("aggregate_to_json: a non-UTF-8 step does not corrupt a valid sibling step",
+          "[bundle][collate]") {
+    // governance re-review QE SHOULD: in a mixed bundle the replace substitution
+    // is confined to the offending step; the valid step + counts are intact.
+    std::vector<DispatchedStep> steps{step("cmd-bad", "files", "read"),
+                                      step("cmd-ok", "os_info", "os_name")};
+    std::vector<BundleResponseRow> rows{{"cmd-bad", 1, std::string(1, '\xff') + "bin"},
+                                        {"cmd-ok", 1, "Windows 11"}};
+    auto j = nlohmann::json::parse(aggregate_to_json(aggregate_bundle(steps, rows)));
+    CHECK(j["received"] == 2);
+    CHECK(j["succeeded"] == 2);
+    CHECK(j["steps"][1]["output"] == "Windows 11"); // valid sibling untouched
+    CHECK(j["steps"][0]["state"] == "responded");
 }
 
 TEST_CASE("aggregate_bundle demuxes duplicate (plugin,action) steps by command_id",

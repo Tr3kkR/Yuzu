@@ -2690,7 +2690,7 @@ Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bun
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `agent_id` | string | Yes | The single target device — a bundle targets one device. |
-| `steps` | array | Yes | 1–32 step objects. Each `(plugin, action)` pair must be distinct. |
+| `steps` | array | Yes | 1–32 step objects, executed in request order. Duplicate `(plugin, action)` is allowed (e.g. two `registry/get_value` reads with different params) — each step gets its own command_id and collates back in order. |
 | `steps[].plugin` | string | Yes | Plugin name, lowercased `[a-z0-9_]`, ≤ 64 chars. |
 | `steps[].action` | string | Yes | Action name, same charset / length rule. |
 | `steps[].params` | object | No | String→string parameter map (non-string values are coerced to strings). |
@@ -2710,7 +2710,7 @@ Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bun
 
 | Status | Cause |
 |---|---|
-| `400` | Invalid JSON, missing `agent_id`, missing/empty `steps`, more than 32 steps, a non-distinct `(plugin, action)` pair, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
+| `400` | Invalid JSON, missing/empty `agent_id`, missing/empty `steps`, more than 32 steps, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
 | `500` | The authenticated session resolved to an empty principal (a bundle must be attributable to its dispatcher). |
 | `503` | Command dispatch or response store unavailable. |
 
@@ -2746,7 +2746,7 @@ Collate a dispatched bundle into a server-grouped result.
 }
 ```
 
-Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame — only meaningful when `state=responded`). `received` counts steps with any response; `succeeded` counts only steps that responded with status SUCCESS.
+Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame — only meaningful when `state=responded`). `received` counts steps with any response; `succeeded` counts only steps that responded with status SUCCESS. Plugin `output` is transcoded to UTF-8 — any bytes that are not valid UTF-8 (e.g. binary or a non-UTF-8 codepage) are replaced with U+FFFD so the JSON always serializes.
 
 > **`complete` is terminal, NOT success.** A bundle to an **offline device** completes (`complete=true`) with `received=0`, `succeeded=0`, and every step `dispatch_failed`. A caller deciding "did the refresh work" must check `succeeded == expected` (or inspect each `steps[].state`/`status`) — never `complete` alone. Polling `complete` to mark a record refreshed would silently treat an unreachable device as a success.
 

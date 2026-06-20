@@ -283,7 +283,7 @@ for the tool to execute.
 | 33 | `get_network_fleet` | Fleet network-quality now-stats (avg/p50/p90/max for RTT / retransmit / throughput + reporting populations incl. the honest RTT denominator; null = nobody reported) plus measured net/device/app co-occurrence counts. Mirrors `GET /api/v1/network/fleet`. | `GuaranteedState:Read` |
 | 34 | `list_network_devices` | The device list behind every network-quality drill (worst-by-metric / not-reporting / co-occurrence band / cohort members), with the co-occurring facts inline. Device link-health telemetry, never a verdict. Mirrors `GET /api/v1/network/devices`. | `GuaranteedState:Read` |
 | 35 | `execute_bundle` | Fan one instruction out into 1–32 plugin actions on **one** device, async (server-side fan-out, ADR-0011). Returns `{bundle_id, agent_id, expected}` immediately; poll `get_bundle_result` with the `bundle_id`. Use instead of N `execute_instruction` calls when refreshing a single device. Mirrors `POST /api/v1/bundles`. | `Execution:Execute` |
-| 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle` (arg `bundle_id`): `{complete, received, succeeded, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output. `complete` is terminal **not** success — check `succeeded == expected`. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
+| 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle` (arg `bundle_id`): `{complete, received, succeeded, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output (invalid-UTF-8 bytes replaced with U+FFFD). `complete` is terminal **not** success — check `succeeded == expected`. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
@@ -328,7 +328,8 @@ Required parameters are validated server-side; missing required fields return a
   `get_tags`.
 - `instruction_id` (string) -- required by `query_responses`.
 - `agent_id` + `steps` -- required by `execute_bundle`. `steps` is an array of
-  `{plugin, action, params?}` objects (1–32, each `(plugin, action)` distinct);
+  `{plugin, action, params?}` objects (1–32, in request order; duplicate
+  `(plugin, action)` allowed — each gets its own command_id);
   `agent_id` is the single target device.
 - `bundle_id` (string) -- required by `get_bundle_result`; the `bundle-…`
   id returned by `execute_bundle`.
