@@ -99,10 +99,13 @@ jobs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
       # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
-      linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
       # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
+      # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
+      # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
+      # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
+      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -429,9 +432,10 @@ jobs:
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Windows runner
-    # is unhealthy or unknown. Fail-closed `== 'true'`.
-    if: needs.preflight.outputs.yuzu_local_windows_healthy == 'true'
+    # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
+    # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
+    # Shulgi fallback) — mirrors the Linux pool gate.
+    if: needs.preflight.outputs.windows_pool_healthy == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -611,7 +615,12 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-windows-${{ matrix.build_type }}
+        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS,
+        # exported only by the Wee Tam pin-wrapper (Shulgi is unpinned and omits
+        # it, keeping ninja's default). Without the cap, ninja sizes -j from the
+        # 64-CPU system count and oversubscribes the 16-thread CCD, thrashing the
+        # very L3 the pinning exists to keep hot.
+        run: meson compile -C build-windows-${{ matrix.build_type }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the

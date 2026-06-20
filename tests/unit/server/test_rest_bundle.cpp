@@ -250,3 +250,40 @@ TEST_CASE("REST collate surfaces dispatch_failed when a step reached no agent",
     REQUIRE(a["data"]["steps"].size() == 1);
     CHECK(a["data"]["steps"][0]["state"] == "dispatch_failed");
 }
+
+TEST_CASE("REST collate tolerates non-UTF-8 plugin output (no 500)", "[bundle][rest]") {
+    // governance review #1593 blocker 1: a 0xff byte in plugin output must not
+    // make aggregate_to_json's dump() throw → 500; collate must return 200.
+    BundleHarness h;
+    int status = 0;
+    auto disp = h.post("/api/v1/bundles",
+                       R"({"agent_id":"a","steps":[{"plugin":"files","action":"read"}]})", status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-files-read", 1, std::string(1, '\xff') + "binary");
+    auto a = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 200); // NOT 500
+    CHECK(a["data"]["complete"] == true);
+    CHECK(a["data"]["steps"][0]["state"] == "responded");
+}
+
+TEST_CASE("REST bundle routes are in the OpenAPI spec (A1 discoverability)", "[bundle][rest]") {
+    // governance review #1593 should-fix: REST surface must be machine-discoverable.
+    BundleHarness h;
+    int status = 0;
+    auto spec = h.get("/api/v1/openapi.json", status);
+    REQUIRE(status == 200);
+    REQUIRE(spec.contains("paths"));
+    CHECK(spec["paths"].contains("/bundles"));
+    CHECK(spec["paths"]["/bundles"].contains("post"));
+    CHECK(spec["paths"].contains("/bundles/{id}"));
+    CHECK(spec["paths"]["/bundles/{id}"].contains("get"));
+}
+
+TEST_CASE("REST POST rejects empty agent_id", "[bundle][rest][unhappy]") {
+    BundleHarness h;
+    int status = 0;
+    h.post("/api/v1/bundles", R"({"agent_id":"","steps":[{"plugin":"os_info","action":"uptime"}]})",
+           status);
+    CHECK(status == 400);
+}

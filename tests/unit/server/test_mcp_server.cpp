@@ -2455,3 +2455,33 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp]
     REQUIRE(p["steps"].size() == 1);
     CHECK(p["steps"][0]["state"] == "dispatch_failed");
 }
+
+TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope throw)",
+          "[mcp][bundle]") {
+    // governance review #1593 blocker 1: on MCP the strict-dump throw ESCAPED the
+    // JSON-RPC envelope; with the replace handler collate must return a result.
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"files","action":"read"}]}}})");
+    auto bid = bundle_payload(disp)["bundle_id"].get<std::string>();
+    yuzu::server::StoredResponse r;
+    r.execution_id = bid;
+    r.instruction_id = "cmd-files-read";
+    r.agent_id = "a";
+    r.status = 1;
+    r.output = std::string(1, '\xff') + "binary";
+    r.timestamp = 100;
+    store.store(r);
+    auto resp = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bid + R"("}}})");
+    auto body = nlohmann::json::parse(resp->body);
+    REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
+    auto p = bundle_payload(resp);
+    CHECK(p["steps"][0]["state"] == "responded");
+}

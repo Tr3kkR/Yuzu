@@ -529,6 +529,14 @@ const std::string& openapi_spec() {
     },
     "/inventory/query": {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
+    },)json"
+        // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
+        R"json(
+    "/bundles": {
+      "post": {"summary": "Dispatch a live-query bundle: fan one instruction into up to 32 plugin actions on one device (ADR-0011)", "tags": ["Bundles"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id", "steps"], "properties": {"agent_id": {"type": "string", "description": "The single target device"}, "steps": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "required": ["plugin", "action"], "properties": {"plugin": {"type": "string"}, "action": {"type": "string"}, "params": {"type": "object", "additionalProperties": {"type": "string"}}}}}}}}}}, "responses": {"202": {"description": "Accepted; returns {bundle_id, agent_id, expected}. Poll GET /bundles/{id} to collate."}, "400": {"description": "Invalid JSON, missing/empty agent_id, missing/empty steps, >32 steps, unsafe identifier, or param size caps"}, "403": {"description": "Requires Execution:Execute"}, "500": {"description": "Authenticated session has no principal"}, "503": {"description": "Dispatch unavailable"}}}
+    },
+    "/bundles/{id}": {
+      "get": {"summary": "Collate a dispatched bundle", "tags": ["Bundles"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^bundle-[a-f0-9]+$"}}], "responses": {"200": {"description": "Server-grouped {complete, received, succeeded, expected, steps[]} in request order. complete is terminal, NOT success — check succeeded==expected. Invalid-UTF-8 bytes in step output are replaced with U+FFFD."}, "403": {"description": "Requires Response:Read"}, "404": {"description": "Not found, expired, or not owned (no enumeration oracle)"}, "503": {"description": "Service unavailable"}}}
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
@@ -913,10 +921,12 @@ void RestApiV1::register_routes(
                       res.set_content(error_json("invalid JSON"), "application/json");
                       return;
                   }
-                  if (!body.contains("agent_id") || !body["agent_id"].is_string()) {
+                  if (!body.contains("agent_id") || !body["agent_id"].is_string() ||
+                      body["agent_id"].get<std::string>().empty()) {
                       res.status = 400;
                       res.set_content(
-                          error_json("agent_id (string) is required — a bundle targets one device"),
+                          error_json("agent_id (non-empty string) is required — a bundle "
+                                     "targets one device"),
                           "application/json");
                       return;
                   }
