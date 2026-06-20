@@ -73,6 +73,13 @@ struct RestGsHarness {
     // preserving every other test's behaviour).
     bool grant_perms{true};
 
+    // Per-device scoped-permission simulation for the baseline-anchored route.
+    // scoped_deny_agent (when non-empty) is treated as OUT OF SCOPE → 403; every
+    // other agent is in scope. last_scoped_agent_id records the agent_id the route
+    // handed the scoped check (proves the route scopes by the right device).
+    std::string scoped_deny_agent;
+    std::string last_scoped_agent_id;
+
     std::vector<AuditRecord> audit_log;
 
     RestApiV1 api;
@@ -107,6 +114,23 @@ struct RestGsHarness {
             return false;
         };
 
+        // Scoped per-device permission: records the agent_id, denies (403) when
+        // grant_perms is off OR the agent is the configured out-of-scope device.
+        // Mirrors require_scoped_permission's contract (global passes; otherwise the
+        // device must be in scope). The real RBAC group-widening is covered in
+        // test_rbac_store.cpp; this proves the ROUTE gates on the scoped fn with the
+        // correct agent_id (catches a regression to flat perm_fn or a wrong device).
+        auto scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+            last_scoped_agent_id = agent_id;
+            if (!grant_perms || (!scoped_deny_agent.empty() && agent_id == scoped_deny_agent)) {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
@@ -138,7 +162,7 @@ struct RestGsHarness {
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
                             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{},
                             /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-                            baseline_store.get());
+                            baseline_store.get(), scoped_perm_fn);
     }
 
     ~RestGsHarness() {
@@ -997,11 +1021,36 @@ TEST_CASE("REST gs.baseline-device: permission gate runs before audit",
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     const auto bid = h.seed_deployed_baseline("B", {"r1"});
-    h.grant_perms = false; // perm_fn denies → 403
+    h.grant_perms = false; // scoped_perm_fn denies → 403
     auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST gs.baseline-device: per-device scope — out-of-scope agent 403, in-scope 200",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    // WS-1 is outside the caller's management-group scope → 403, and the gate runs
+    // before the store read + audit (no leak, no audit row). Also proves the route
+    // hands the scoped check the RIGHT device id (regression net vs flat perm_fn).
+    h.scoped_deny_agent = "WS-1";
+    auto denied = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK(h.last_scoped_agent_id == "WS-1");
+    CHECK(h.audit_log.empty());
+
+    // WS-2 is in scope → 200.
+    auto ok = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-2");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.last_scoped_agent_id == "WS-2");
 }
 
 TEST_CASE("REST gs.baseline-device: route + schema are in the OpenAPI spec (A1 discoverability)",

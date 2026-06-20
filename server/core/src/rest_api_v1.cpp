@@ -616,7 +616,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
     "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
-      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. 404 if baseline_id is unknown.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "404": {"description": "Baseline not found"}}}
+      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope"}, "404": {"description": "Baseline not found"}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -839,7 +839,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store) {
+    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -849,7 +849,7 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn), baseline_store);
+                    std::move(net_perf_fn), baseline_store, std::move(scoped_perm_fn));
 }
 
 void RestApiV1::register_routes(
@@ -865,7 +865,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store) {
+    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -5555,22 +5555,50 @@ void RestApiV1::register_routes(
     // returns deployed:false + empty guards (consumer renders "No Baseline
     // Deployed"). No liveness fold — "pending" conflates never-reported / offline /
     // platform-unsupported; updated_at carries staleness. Per-device behavioral
-    // read → flat GuaranteedState:Read + guardian.device.view audit, matching the
-    // sibling /guaranteed-state/events?agent_id= and /dex/* per-device routes.
+    // read → per-device-SCOPED GuaranteedState:Read (management-group aware, mirroring
+    // the dashboard Guardian device lens, so a group-scoped operator isn't fail-closed
+    // out of in-scope devices) + guardian.device.view audit.
+    //
+    // Applicability note (Baseline assignment): management-group assignment is
+    // DEFERRED product-wide (deploy is fleet-wide), so a *deployed* Baseline applies
+    // to every device and the verdict here is the device's compliance against that
+    // deployed Baseline's guards. When assignment lands, this must become
+    // assignment-aware (return not-applicable for an out-of-scope device) — tracked
+    // as a follow-up; an assignment filter now would diverge from fleet-wide enforce.
     sink.Get(
         R"(/api/v1/guaranteed-state/baselines/([A-Za-z0-9._\-]+)/devices/([A-Za-z0-9._\-]+))",
-        [perm_fn, audit_fn, guaranteed_state_store, baseline_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                return;
-            if (!guaranteed_state_store || !baseline_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
-                return;
-            }
+        [perm_fn, scoped_perm_fn, audit_fn, guaranteed_state_store,
+         baseline_store](const httplib::Request& req, httplib::Response& res) {
             const std::string baseline_id = req.matches[1].str();
             const std::string agent_id = req.matches[2].str();
-
+            // The route regex caps the charset but not the length; bound it (A4 400).
+            if (baseline_id.size() > 128 || agent_id.size() > 128) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "path parameter too long", cid),
+                                "application/json");
+                return;
+            }
+            // Per-device VISIBILITY scope (management-group aware), matching the
+            // dashboard Guardian device lens (device_routes.cpp): a global
+            // GuaranteedState:Read passes fleet-wide, otherwise the principal must hold
+            // Read via a management group the agent is in — so a group-scoped operator
+            // (or integration service account) is not fail-closed out of the devices
+            // they can legitimately see. Falls back to the flat gate only if no scoped
+            // fn was wired (e.g. a caller that hasn't adopted it). agent_id must be in
+            // hand before the gate, hence the reorder above.
+            const bool authorized =
+                scoped_perm_fn ? scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id)
+                               : perm_fn(req, res, "GuaranteedState", "Read");
+            if (!authorized)
+                return;
+            if (!guaranteed_state_store || !baseline_store) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
             const auto baseline = baseline_store->get_baseline(baseline_id);
 
             // Per-device behavioral-data access audit — emitted for EVERY authorized
@@ -5584,8 +5612,10 @@ void RestApiV1::register_routes(
                          agent_id, "baseline " + baseline_id + " per-device guard status via REST");
 
             if (!baseline) {
+                const auto cid = detail::make_correlation_id();
                 res.status = 404;
-                res.set_content(error_json("baseline not found", 404), "application/json");
+                res.set_content(detail::error_json_a4(404, "baseline not found", cid),
+                                "application/json");
                 return;
             }
 

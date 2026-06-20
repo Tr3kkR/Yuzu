@@ -3518,10 +3518,10 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 
 Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
 
-- **Permission:** `GuaranteedState:Read`
+- **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices).
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.)
 - **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
-- **`404`** if `baseline_id` is unknown.
+- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 128 chars; **`403`** if the caller lacks `Read` on the device's scope. Error bodies use the A4 envelope (`correlation_id`).
 - **Response keys:**
   - `baseline` — `{ baseline_id, name, lifecycle }`.
   - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
@@ -3531,6 +3531,8 @@ Baseline-anchored per-device compliance — the machine-readable sibling of the 
   - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
 
 **Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+
+**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State](guaranteed-state.md) → Assignment). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
 
 Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
 

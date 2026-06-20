@@ -74,6 +74,16 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    /// Per-device-scoped permission check (mirrors DeviceRoutes::ScopedPermFn): a
+    /// global grant passes fleet-wide, otherwise the principal must hold the
+    /// permission via a management group the agent is in. Per-device REST reads gate
+    /// on this so a management-group-scoped operator is not fail-closed out of
+    /// devices they can legitimately see. Empty → caller falls back to the flat
+    /// PermFn (the pre-scoping behaviour).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -175,7 +185,7 @@ public:
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
         // Baseline-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr);
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -205,7 +215,7 @@ public:
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
         // Baseline-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr);
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 };
 
 } // namespace yuzu::server

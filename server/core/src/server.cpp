@@ -8812,8 +8812,14 @@ private:
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
             net_perf_fn,
-            // Baseline-anchored per-device Guardian status route (trailing optional dep).
-            baseline_store_.get());
+            // Baseline-anchored per-device Guardian status route (trailing optional deps).
+            baseline_store_.get(),
+            // Per-device-scoped permission (management-group aware) for that route —
+            // same closure DeviceRoutes uses for the dashboard Guardian device lens.
+            [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op, const std::string& agent_id) -> bool {
+                return require_scoped_permission(req, res, type, op, agent_id);
+            });
 
         // -- Register MCP server routes ----------------------------------------
 
