@@ -229,8 +229,15 @@ jobs:
 
       - name: Install system packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          # DPkg::Lock::Timeout: the Big Tam host runs 4 runners (r0-r3), so the
+          # matrix legs hit `apt-get` concurrently and race the single system
+          # apt/dpkg lock (Shulgi was one runner, so its matrix serialized and
+          # never contended). Wait up to 300s for the lock instead of failing
+          # with "Could not get lock /var/lib/apt/lists/lock" (exit 100). Applied
+          # to BOTH update and install — the lists lock bites first. Matches the
+          # nightly.yml shared-box pattern.
+          sudo apt-get -o DPkg::Lock::Timeout=300 update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             bison flex libsystemd-dev \
             ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
