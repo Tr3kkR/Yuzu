@@ -15,7 +15,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <optional>
+#include <set>
 #include <string>
 
 using namespace yuzu::server;
@@ -91,11 +93,14 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
     // Raw family names (literal '&') match dex_signal_groups(); a wrong name
     // would render "Unknown family" and its labels would go missing below.
     std::string html;
+    // All three platforms connected → every catalogued type is MONITORED
+    // (coverage-first), so quiet types render as watched real-zero rows.
+    const DexFleet all_os{1, 1, {"windows", "linux", "darwin"}};
     for (const char* family :
          {"App reliability", "Boot, start-up & shutdown", "Service health", "System stability",
           "Hardware & storage", "Performance", "File system", "Network", "Identity & logon",
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
-        html += render_dex_catalogue_group_fragment(&store, "", 7, family);
+        html += render_dex_catalogue_group_fragment(&store, "", 7, family, all_os);
 
     // All 107 labels.
     for (const char* label :
@@ -147,11 +152,14 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
 
 TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    const auto html = render_dex_catalogue_fragment(&store, "", 7);
+    // windows connected → all 107 catalogue types are monitored (coverage-first).
+    const auto html =
+        render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
-    CHECK(html.find("All 107 monitored signal types") != std::string::npos);
+    CHECK(html.find("actively monitored") != std::string::npos);
+    CHECK(html.find("of 107 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -163,14 +171,26 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
           "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network");
-    CHECK(net.find("Wi-Fi disconnect") != std::string::npos);  // friendly label
-    CHECK(net.find("network.wifi_drop") != std::string::npos); // obs_type
+    // Windows connected → the Windows-collected Network types are MONITORED.
+    const DexFleet win{1, 1, {"windows"}};
+    const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network", win);
+    CHECK(net.find("Wi-Fi disconnect") != std::string::npos); // friendly label
+    CHECK(net.find("monitored") != std::string::npos);        // coverage-first pill
+    CHECK(net.find("Windows") != std::string::npos);          // coverage detail
     CHECK(net.find("&larr; All families") != std::string::npos);
+    // OS chips are present IN the family view so the filter is changeable in place.
+    CHECK(net.find("/fragments/dex/catalogue/group?name=Network&window=7d&os=windows") !=
+          std::string::npos);
     // unknown family → placeholder; the reflected name is HTML-escaped (no XSS)
-    const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>");
+    const auto bad = render_dex_catalogue_group_fragment(&store, "", 7, "<script>x</script>", win);
     CHECK(bad.find("Unknown family") != std::string::npos);
     CHECK(bad.find("<script>") == std::string::npos);
+    // OS filter persists: the back-link to the grid carries the lens.
+    const DexFleet lin_fleet{0, 0, {"linux"}};
+    const auto lin = render_dex_catalogue_group_fragment(&store, "", 7, "Network", lin_fleet, "linux");
+    CHECK(lin.find("/fragments/dex/catalogue?window=7d&os=linux") != std::string::npos);
+    // Coverage-first: a Windows-only type reads "not collected" under the Linux lens.
+    CHECK(lin.find("not collected") != std::string::npos);
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",
@@ -342,9 +362,43 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
     GuaranteedStateStore store(":memory:");
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", kDayB + "T10:00:00Z");
-    auto html = render_dex_catalogue_fragment(&store, "", 7);
+    auto html = render_dex_catalogue_fragment(&store, "", 7, DexFleet{}, "all");
     CHECK(html.find("future.signal_type") != std::string::npos);
     CHECK(html.find(">Other") != std::string::npos);
+}
+
+TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=-1",
+          "[dex][score]") {
+    GuaranteedStateStore store(":memory:");
+    // Null store → n/a sentinel.
+    CHECK(dex_device_score(nullptr, "WS-1", "") == -1);
+    // A device with no observations is a clean 100.
+    CHECK(dex_device_score(&store, "CLEAN-1", "") == 100);
+    // A failure signal (process.crashed = App reliability, high severity) deducts.
+    seed_signal(store, "e1", "WS-1", "process.crashed",
+                R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "WS-1", "") < 100);
+    // The score is per-device: a different device is unaffected.
+    CHECK(dex_device_score(&store, "OTHER-1", "") == 100);
+    // Benign reports (uptime) never deduct → still 100.
+    seed_signal(store, "e2", "BENIGN-1", "os.uptime_report",
+                R"({"subject":"host","platform":"windows"})", kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "BENIGN-1", "") == 100);
+}
+
+TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
+          "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "e1", "WS-1", "process.crashed",
+                R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
+    // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
+    DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
+    auto html = render_dex_overview_fragment(&store, "", 7, fleet);
+    CHECK(html.find("Experience") != std::string::npos);         // new headline section
+    CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
+    CHECK(html.find("great") != std::string::npos);              // the distribution bar
+    CHECK(html.find("Experience by segment") != std::string::npos); // the segment breakdown
+    CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
 }
 
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
@@ -498,6 +552,23 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(audited == "dex.signal.view|ObsType|process.crashed");
     }
 
+    SECTION("signal drill-down 'Collected on' reflects the coverage map, incl. Linux") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        // process.crashed is collected on all three platforms; the caption is derived
+        // from dex_obs_platforms (coverage), not observed events, so it must name
+        // Linux and never regress to the old event-derived "Windows only". The
+        // " + "-joined form is unique to the coverage caption (the by_os table can't
+        // produce it), so this can't pass on incidental seeded Linux rows.
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->body.find("Collected on") != std::string::npos);
+        CHECK(sig->body.find("Windows + Linux + macOS") != std::string::npos);
+        CHECK(sig->body.find("Windows only") == std::string::npos);
+    }
+
     SECTION("unauthenticated shell redirects to /login") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
@@ -529,6 +600,55 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 403);
         CHECK(audited.empty());
+    }
+
+    // Re-review blocker: the per-device DEX surface must be management-scoped (mirror
+    // the /device routes) — an operator can't drill another team's device, and the
+    // device-id lists must not enumerate out-of-scope agents.
+    SECTION("per-device DEX surface is scoped: drill 403 + lists drop out-of-scope ids") {
+        seed_crash(store, "e9", "WS-OTHER", "chrome.exe", "ntdll.dll", "windows",
+                   kDayA + "T12:00:00Z");
+        // Scoped gate: deny the per-device drill for the out-of-scope agent.
+        auto scopedPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                             const std::string&, const std::string& id) {
+            if (id == "WS-OTHER") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        // Visible set: only WS-1 is in the caller's scope (the lists must drop WS-OTHER).
+        auto visibleSet = [](const std::string&) -> std::optional<std::set<std::string>> {
+            return std::set<std::string>{"WS-1"};
+        };
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm,
+                               visibleSet);
+
+        // (1) The per-device drill is scoped: out-of-scope → 403, in-scope still opens.
+        auto other = sink.Get("/fragments/dex/device?id=WS-OTHER");
+        REQUIRE(other);
+        CHECK(other->status == 403);
+        auto mine = sink.Get("/fragments/dex/device?id=WS-1");
+        REQUIRE(mine);
+        CHECK(mine->status == 200);
+
+        // (2) The device-id lists drop the out-of-scope agent (no enumeration), while
+        //     still showing the in-scope one.
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->body.find("WS-1") != std::string::npos);
+        CHECK(sig->body.find("WS-OTHER") == std::string::npos);
+
+        auto app = sink.Get("/fragments/dex/app?name=chrome.exe");
+        REQUIRE(app);
+        CHECK(app->body.find("WS-OTHER") == std::string::npos);
+
+        auto ov = sink.Get("/fragments/dex/overview?window=7d");
+        REQUIRE(ov);
+        CHECK(ov->body.find("WS-OTHER") == std::string::npos);
     }
 
     SECTION("hostile ?window= is canonicalised, never reflected into markup (Gate-8 XSS)") {
@@ -817,4 +937,49 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(r);
         CHECK(r->body.find("unavailable") != std::string::npos);
     }
+}
+
+// ── Drift-net for the per-OS coverage map (dex_obs_platforms). The map must claim
+// a platform collects a signal type ONLY when an agent on that platform actually
+// emits it. This is the guard the comment by dex_obs_platforms promises but that
+// never existed — its absence let the Linux column advertise kernel/sysfs signals
+// whose collectors live in a separate PR (#1523), so a Linux fleet would read
+// "monitored, quiet" as healthy for signals nothing collects. The server suite
+// can't introspect the agent collectors, so the emitted set is pinned here; when
+// collectors are added or removed, update BOTH the collector and the set below in
+// the same change (that conscious edit is the point). ──
+TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
+          "[dex][coverage]") {
+    // What a Linux agent emits today: dex_linux_proc + dex_linux_storage polls and
+    // dex_linux_journal mappings. The expanded kmsg/sysfs set arrives with #1523.
+    const std::set<std::string> kLinuxEmitted = {
+        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
+        "process.crashed",    "service.crashed",      "memory.exhausted"};
+
+    auto claims = [](const std::string& obs_type, const char* os) {
+        const auto p = dex_obs_platforms(obs_type);
+        return std::find(p.begin(), p.end(), os) != p.end();
+    };
+
+    // Overclaim guard: every catalogued type the map marks "linux" must be emitted.
+    for (const auto& g : dex_signal_groups()) {
+        for (const char* t : g.types) {
+            if (claims(t, "linux")) {
+                INFO("coverage map claims Linux collects '"
+                     << t << "' but no Linux collector emits it (see dex_obs_platforms)");
+                CHECK(kLinuxEmitted.count(t) == 1);
+            }
+        }
+    }
+
+    // Underclaim guard: every emitted Linux signal is actually advertised.
+    for (const auto& t : kLinuxEmitted) {
+        INFO("emitted Linux signal '" << t << "' is missing from the coverage map");
+        CHECK(claims(t, "linux"));
+    }
+
+    // Windows is the whole EvtSubscribe catalogue — always present and first.
+    const auto win = dex_obs_platforms("process.crashed");
+    REQUIRE_FALSE(win.empty());
+    CHECK(win.front() == "windows");
 }

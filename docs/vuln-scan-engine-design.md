@@ -235,6 +235,27 @@ the **service**, rolled up to the host by **max**. Two uses of the same axis:
   jewel for landing on an unrelated service on the same box — strictly more honest, lower
   FP.
 
+### 3.6 Access control (graph + authoring surfaces) — G7
+
+The scored reachability graph is a **literal map of how to compromise the fleet** — strictly
+more sensitive than the findings it ranks — and the trust-zone (§3.4) and crown-jewel (§3.5)
+declarations are **new privileged authoring surfaces**. Both need RBAC before they ship, and
+neither exists today: RBAC is uniformly `(securable_type, operation)` and there is **no
+graph/topology securable type**.
+
+- **Read** — the scored graph, attack paths, and chokepoint output get a **dedicated
+  securable type**, gated *tighter* than findings. A path map is offensive intelligence; an
+  operator who can read findings should not automatically read "here is the cheapest route to
+  the crown jewel." **Read access is audited** — every graph query carries a principal and
+  timestamp in the audit log (same envelope as findings access).
+- **Write** — authority to declare/edit **trust-zone CIDR-site tiers** and **crown-jewel
+  values** is restricted to a privileged role and **audited**. Mis-declaring a tier or a
+  jewel silently distorts *every* ranking (it moves entry points and value sinks), so these
+  are integrity-sensitive, not cosmetic, config.
+
+Owned by the **auth-and-authz workstream (G7)**, not the scoring model — tracked so it lands
+*with* the §3.4/§3.5 authoring surfaces rather than retrofitted after they ship.
+
 ---
 
 ## 4. Data sources & feasibility (audited 2026-06-08)
@@ -335,6 +356,7 @@ flag makes a node a **candidate**, not a finding.
 | **G4** | **Traversability probability function** (EPSS/CVSS-exploitability/KEV/auth → P) | **Andy** — heart of the model |
 | **G5** | **Depth bound, entry-point definition, segmentation cost model** | **Andy** |
 | **G6** | **Acceptance bar for rankings** (match expert intuition on a reference topology) | **Andy** |
+| **G7** | **Access control** — graph/chokepoint read securable + trust-zone/crown-jewel authoring authority & audit (§3.6) | **Auth-and-authz workstream** |
 
 ---
 

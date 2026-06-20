@@ -117,6 +117,27 @@ inline std::string html_escape(const std::string& s) {
     return out;
 }
 
+/// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
+/// detail string (#1290 Hermes MEDIUM). Audit details are assembled by string
+/// concatenation, so a value carrying a space, `=`, `,`, or a control byte (CRLF)
+/// could forge an adjacent field (field confusion) or split the audit line. This
+/// replaces every control byte and structural delimiter (space, '=', ',') with
+/// '_'; the identity is preserved verbatim in its own audit columns
+/// (principal/target_id) and rendered safely elsewhere (DB-parameterised,
+/// html-escaped, json-escaped). Canonical home for the neutralizer so the rule
+/// can't drift between call sites (server.cpp CA audits, tar_tree_routes.cpp).
+[[nodiscard]] inline std::string audit_token(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+            out.push_back('_');
+        else
+            out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
 /// Percent-decode a URL-encoded string (also handles + as space).
 inline std::string url_decode(const std::string& s) {
     auto hexval = [](char c) -> int {

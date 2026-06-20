@@ -143,7 +143,7 @@ services:
       start_period: 30s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ──────────────────
-  # Release-pinned, signed yuzu-postgres image: PostgreSQL 16 + pgvector +
+  # Release-pinned, signed yuzu-postgres image: PostgreSQL 18 + pgvector +
   # first-boot app role/db init. Per-store schemas are created at runtime
   # by the server's migration runner. Using an external/managed Postgres
   # instead is first-class — point YUZU_POSTGRES_DSN at it and remove this

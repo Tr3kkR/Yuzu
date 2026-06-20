@@ -45,8 +45,13 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  *     present — a missing row would be ambiguous with "never paused").
  *   - no transition (idempotent set): leaves `<source>_paused_at` untouched.
  *
- * The default for `<source>_enabled` if not yet set is `"true"`, so the
- * first-ever set to `"false"` correctly registers as a transition.
+ * The default for `<source>_enabled` if not yet set comes from
+ * `CaptureSourceDef::default_enabled` (`"true"` for always-on sources, `"false"`
+ * for the opt-in module/procperf/netqual). So the first-ever set registers as a
+ * transition only when it differs from that default — e.g. the first
+ * `module_enabled=false` on a fresh DB is a no-op (module already defaults off)
+ * and writes no spurious `paused_at`, whereas the first `process_enabled=false`
+ * is a real enabled→disabled transition.
  *
  * @param db        The TAR database.
  * @param source    Source name (e.g. "process", "tcp", "service", "user").

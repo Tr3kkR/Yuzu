@@ -348,8 +348,19 @@ TEST_CASE("TarDatabase: stats returns correct values", "[tar][store][stats]") {
     }
     REQUIRE(t.db.insert_process_events(events));
 
+    // stats() is data-driven over capture_sources() (review S6), so a row in any
+    // live table — not just the original four — must be counted. Insert one
+    // module_live row (ts within [2000,2004] so oldest/newest are unchanged) and
+    // confirm record_count picks it up. Guards against a future regression that
+    // drops a source from the aggregate.
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO module_live "
+        "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
+        "signed_state,signer,is_kernel) "
+        "VALUES (2002, 1, 'loaded', 100, 'app.exe', 'a.dll', '', 'signed', '', 0)"));
+
     auto s = t.db.stats();
-    CHECK(s.record_count == 5);
+    CHECK(s.record_count == 6); // 5 process_live + 1 module_live
     CHECK(s.oldest_timestamp == 2000);
     CHECK(s.newest_timestamp == 2004);
     CHECK(s.db_size_bytes > 0);

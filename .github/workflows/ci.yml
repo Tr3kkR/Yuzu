@@ -81,6 +81,11 @@ jobs:
   # Output names are slugified runner names from .github/runner-inventory.json:
   #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
   #   yuzu-local-windows → yuzu_local_windows_healthy
+  # Plus a pool gate:
+  #   linux_pool_healthy → true iff >=1 [self-hosted, Linux, X64] runner is online
+  #     (any yuzu-bigtam-* OR the yuzu-wsl2-linux Shulgi fallback). The Linux jobs
+  #     gate on the pool, not a single named runner, so a free pool member keeps
+  #     them running and a fully-offline pool still skips them fast.
   #
   # If RUNNER_INVENTORY_TOKEN is missing, the script writes
   # all runners as `false` and exits 0 (fail-closed): downstream jobs
@@ -91,6 +96,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
+      # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
+      # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
+      # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
+      linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
+      # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
+      # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
+      # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
+      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -131,7 +144,9 @@ jobs:
   proto-compat:
     name: "Proto backward-compat"
     needs: [preflight]
-    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
+    # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
+    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
+    if: needs.preflight.outputs.linux_pool_healthy == 'true'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
@@ -152,9 +167,10 @@ jobs:
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Linux runner is
-    # unhealthy or unknown. Fail-closed `== 'true'` (NOT `!= 'false'`).
-    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
+    # PR-7 of CI overhaul plan: skip if the self-hosted Linux job pool is
+    # unhealthy or unknown. Pool = any [self-hosted, Linux, X64] runner online
+    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'` (NOT `!= 'false'`).
+    if: needs.preflight.outputs.linux_pool_healthy == 'true'
     # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
     # state between runs on the same workspace amortizes the install
     # cost. Trade-off: the single runner process serializes this 4-way
@@ -336,13 +352,13 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). On this
+      # Postgres for server tests (ADR-0006 decision 8, #1318). On this
       # self-hosted runner the script idempotently (re)uses a persistent
       # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
       # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
       # no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1): a missing
       # Postgres fails the job here, before the test step.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
@@ -379,9 +395,10 @@ jobs:
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Windows runner
-    # is unhealthy or unknown. Fail-closed `== 'true'`.
-    if: needs.preflight.outputs.yuzu_local_windows_healthy == 'true'
+    # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
+    # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
+    # Shulgi fallback) — mirrors the Linux pool gate.
+    if: needs.preflight.outputs.windows_pool_healthy == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -561,7 +578,12 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-windows-${{ matrix.build_type }}
+        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS,
+        # exported only by the Wee Tam pin-wrapper (Shulgi is unpinned and omits
+        # it, keeping ninja's default). Without the cap, ninja sizes -j from the
+        # 64-CPU system count and oversubscribes the 16-thread CCD, thrashing the
+        # very L3 the pinning exists to keep hot.
+        run: meson compile -C build-windows-${{ matrix.build_type }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the
@@ -580,8 +602,8 @@ jobs:
           fi
           echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318).
-      # Precondition on yuzu-local-windows: a native PostgreSQL 16 service
+      # Postgres for server tests (ADR-0006 decision 8, #1318).
+      # Precondition on yuzu-local-windows: a native PostgreSQL 16+ service
       # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
       # see docs/ci-architecture.md "Postgres for server tests"), or a
       # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
@@ -593,7 +615,7 @@ jobs:
       # `bash` resolves to the WSL stub, which refuses to run as the
       # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
       # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: source scripts/ci/ensure-postgres.sh
 
       - name: Test
@@ -749,13 +771,13 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres 16 for server tests (ADR-0006 decision 8, #1318). GHA
+      # Postgres for server tests (ADR-0006 decision 8, #1318). GHA
       # macOS runners have no docker; the script brew-installs
-      # postgresql@16 (bottle, ~1 min), boots a throwaway trust-auth
+      # postgresql@18 (bottle, ~1 min), boots a throwaway trust-auth
       # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports
       # YUZU_TEST_POSTGRES_DSN. Required since #1320 PR 1 (SOFT_EXIT=1) — a
       # missing Postgres fails the job here, before the test step.
-      - name: Ensure Postgres 16 (server tests)
+      - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test

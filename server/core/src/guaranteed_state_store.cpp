@@ -1151,6 +1151,38 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     return out;
 }
 
+std::vector<DexSignalCount>
+GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
+                                                const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexSignalCount> out;
+    if (!db_)
+        return out;
+    // Per-device analog of dex_signal_summary — one row per obs_type this device
+    // emitted in the window. Indexed by agent_id; distinct_devices is 1 by build.
+    const char* sql = R"(
+        SELECT obs_type, COUNT(*), MAX(observed_at)
+        FROM guardian_observations
+        WHERE agent_id = ?1 AND observed_at >= ?2
+        GROUP BY obs_type
+        ORDER BY COUNT(*) DESC, obs_type ASC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexSignalCount c;
+        c.obs_type = col_text(st.get(), 0);
+        c.count = sqlite3_column_int64(st.get(), 1);
+        c.distinct_devices = 1;
+        c.last_seen = col_text(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
 std::vector<DexSubjectCount>
 GuaranteedStateStore::dex_signal_subjects(const std::string& obs_type, const std::string& since,
                                           int limit) const {

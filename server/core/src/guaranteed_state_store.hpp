@@ -366,6 +366,10 @@ public:
     std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
                                                            const std::string& since = "",
                                                            int limit = 100) const;
+    // Per-device obs_type rollup — the per-device analog of dex_signal_summary
+    // (one GROUP BY pass, indexed by agent_id). Drives the per-device DEX score.
+    std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
+                                                          const std::string& since = "") const;
 
     // ── Overview aggregations (read-only GROUP BY; no event materialisation) ──
     // Each takes an ISO-8601 `since` cutoff (empty = all retained events) and

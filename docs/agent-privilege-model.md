@@ -9,7 +9,9 @@
 
 ## TL;DR
 
-The Yuzu agent runs under a dedicated unprivileged account (`_yuzu` on macOS, `yuzu` on Linux, `YuzuAgent` or virtual `NT SERVICE\YuzuAgent` on Windows). Plugins that need privileged operations shell out via narrow `sudo NOPASSWD` entries (Linux/macOS) or rely on the service account's pre-granted LSA privileges (Windows). The agent's own process **never runs as root or LocalSystem**.
+The Yuzu agent runs under a dedicated unprivileged account (`yuzu` on Linux, `YuzuAgent` or virtual `NT SERVICE\YuzuAgent` on Windows). Plugins that need privileged operations shell out via narrow `sudo NOPASSWD` entries (Linux) or rely on the service account's pre-granted LSA privileges (Windows). On **Linux and Windows** the agent's own process **never runs as root or LocalSystem**.
+
+**macOS is the current exception.** The shipped LaunchDaemon (`deploy/packaging/macos/com.yuzu.agent.plist`) has no `UserName` key, so launchd runs the agent as **root**. This is required today: the TAR process stream's Endpoint Security client (`es_new_client`) needs root + the `com.apple.developer.endpoint-security.client` entitlement, and several macOS collectors read system-wide state. The `_yuzu` unprivileged-account model is therefore **not yet applied on macOS** — narrowing macOS to a non-root, ES-entitled account is tracked as future hardening in **#1455** (the ESF programming model generally requires root). Until then, treat the macOS agent as root-privileged.
 
 If the doc and an install script disagree, **the doc wins** — fix the script, then re-run.
 
@@ -81,10 +83,10 @@ This table is the source of truth for what each plugin requires. When you add a 
 | `network_config.*` | default | default | default |
 | `installed_apps.*`, `msi_packages.*` | default | default | default |
 | `event_logs.*` | default | `systemd-journal` group | `Event Log Readers` group; `Security` log additionally needs `SeSecurityPrivilege` |
-| DEX journald collector (`dex_linux_journal.cpp`, built-in — not a plugin) | n/a | `systemd-journal` group (`journalctl` shell-out for crash/OOM/unit-failure signals; no elevated capability) | n/a |
+| DEX journald collector (`dex_linux_journal.cpp` + `dex_linux_kmsg.cpp`, built-in — not a plugin) | n/a | `systemd-journal` group (one `journalctl --after-cursor -o json` shell-out serving unit-health, coredump, OOM, **kernel ring-buffer** (panic/disk/fs/MCE/hung-task), and **chrony time-sync** signals; no elevated capability). `/proc` + `/sys` polls (perf, disk latency via `/proc/diskstats`, thermal throttle via `/sys`) read world-readable files — no group required. | n/a |
 | `services.list`, `services.running` | default | default | default |
 | `certificates.list`, `certificates.details` | default | default | default |
-| `tar.*` (TAR snapshots) | default | `cap_dac_read_search` (read all `/proc/<pid>/*`) | `SeBackupPrivilege` (read regardless of DACL). **Process capture runs a real-time ETW session on `Microsoft-Windows-Kernel-Process`** — enabled by the agent account's `Performance Log Users` membership (see Group memberships above; no extra LSA privilege). Per-process user attribution uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` on still-alive processes only. See the deployment-footprint note below for the boot AutoLogger. |
+| `tar.*` (TAR snapshots) | **root** (LaunchDaemon, no `UserName` — see TL;DR). The Endpoint Security process stream's `es_new_client` requires root + the `com.apple.developer.endpoint-security.client` entitlement; without them it falls back to the `KERN_PROC_ALL` sysctl poll. | `cap_dac_read_search` (read all `/proc/<pid>/*`) | `SeBackupPrivilege` (read regardless of DACL). **Process capture runs a real-time ETW session on `Microsoft-Windows-Kernel-Process`** — enabled by the agent account's `Performance Log Users` membership (see Group memberships above; no extra LSA privilege). Per-process user attribution uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` on still-alive processes only. See the deployment-footprint note below for the boot AutoLogger. |
 | `netstat.*`, `sockwho.*` | default | default | default |
 | `bitlocker.state` | n/a | n/a | `SeBackupPrivilege` (some BitLocker WMI properties require this on system drives) |
 
