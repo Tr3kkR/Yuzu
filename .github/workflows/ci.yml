@@ -578,7 +578,12 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-windows-${{ matrix.build_type }}
+        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS,
+        # exported only by the Wee Tam pin-wrapper (Shulgi is unpinned and omits
+        # it, keeping ninja's default). Without the cap, ninja sizes -j from the
+        # 64-CPU system count and oversubscribes the 16-thread CCD, thrashing the
+        # very L3 the pinning exists to keep hot.
+        run: meson compile -C build-windows-${{ matrix.build_type }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the
