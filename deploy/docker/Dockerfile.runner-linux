@@ -20,7 +20,7 @@ FROM ghcr.io/actions/actions-runner:latest@sha256:08c30b0a7105f64bddfc485d2487a2
 
 USER root
 
-ARG MESON_VERSION=1.9.2
+ARG MESON_VERSION=1.11.1
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 
 # ── Build tools (mirrors Dockerfile.ci-linux) ─────────────────────────
