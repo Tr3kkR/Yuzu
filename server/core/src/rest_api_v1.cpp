@@ -5571,16 +5571,18 @@ void RestApiV1::register_routes(
             const std::string baseline_id = req.matches[1].str();
             const std::string agent_id = req.matches[2].str();
 
-            // Per-device behavioral-data access audit — emitted on the ATTEMPT,
-            // BEFORE baseline resolution, so enumerating baseline_ids against a
-            // device leaves a trail even on a miss (matches the
+            const auto baseline = baseline_store->get_baseline(baseline_id);
+
+            // Per-device behavioral-data access audit — emitted for EVERY authorized
+            // attempt (found or not), so enumerating baseline_ids against a device
+            // leaves a trail on misses too; `result` reflects the outcome so a 404
+            // probe stream is distinguishable from genuine reads (matches the
             // /guaranteed-state/events?agent_id= sibling). Same verb the dashboard
             // Guardian device lens emits, so one SIEM filter catches both surfaces.
             if (audit_fn)
-                audit_fn(req, "guardian.device.view", "success", "Agent", agent_id,
-                         "baseline " + baseline_id + " per-device guard status via REST");
+                audit_fn(req, "guardian.device.view", baseline ? "success" : "not_found", "Agent",
+                         agent_id, "baseline " + baseline_id + " per-device guard status via REST");
 
-            const auto baseline = baseline_store->get_baseline(baseline_id);
             if (!baseline) {
                 res.status = 404;
                 res.set_content(error_json("baseline not found", 404), "application/json");
@@ -5590,11 +5592,10 @@ void RestApiV1::register_routes(
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
             const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline_id);
 
-            // rule_id -> Guard name (small catalogue; one pass). Falls back to the
-            // rule_id when a snapshot member Guard has since been deleted.
-            std::unordered_map<std::string, std::string> rule_names;
-            for (const auto& r : guaranteed_state_store->list_rules())
-                rule_names[r.rule_id] = r.name;
+            // rule_id -> Guard name (name-only read; never materializes the rule
+            // body blobs). Falls back to the rule_id when a snapshot member Guard
+            // has since been deleted.
+            const auto rule_names = guaranteed_state_store->rule_names();
 
             // rule_id -> last reported verdict for THIS device.
             std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
@@ -5602,7 +5603,9 @@ void RestApiV1::register_routes(
                 dev[st.rule_id] = std::move(st);
 
             int64_t compliant = 0, drifted = 0, errored = 0;
-            std::string last_updated; // max reported updated_at (ISO-8601 sorts lexically)
+            // max reported updated_at; ISO-8601 sorts lexically (all stamps are UTC
+            // 'Z', written by the store's format_iso_utc, so the byte compare is correct).
+            std::string last_updated;
             JArr guards;
             for (const auto& rid : guard_ids) {
                 std::string status = "pending";

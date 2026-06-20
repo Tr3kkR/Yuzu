@@ -3532,6 +3532,10 @@ Baseline-anchored per-device compliance — the machine-readable sibling of the 
 
 **Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
 
+Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
+
+Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+
 **Example:**
 
 ```bash

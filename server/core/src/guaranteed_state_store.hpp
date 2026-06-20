@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -392,6 +393,12 @@ public:
     // deployed members. Read-only (last-reported state, not a live probe).
     std::vector<GuardianAgentRuleStatus>
     agent_rule_statuses_for_agent(const std::string& agent_id) const;
+
+    // rule_id -> name for the whole catalogue, reading ONLY the two small columns
+    // (not yaml_source / spec_json / signature blobs that list_rules() materializes).
+    // For per-request name resolution on read paths like the baseline-anchored
+    // per-device status route, where the full rule body is never needed.
+    std::unordered_map<std::string, std::string> rule_names() const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;

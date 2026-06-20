@@ -905,8 +905,19 @@ TEST_CASE("REST gs.baseline-device: verdicts are isolated per agent (WHERE agent
     auto j = nlohmann::json::parse(res->body);
     auto& d = j["data"];
     CHECK(d["compliant"].get<int>() == 2);
-    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["errored"].get<int>() == 0); // WS-2's errored verdicts must not leak here
     CHECK(d["pending"].get<int>() == 0);
+
+    // The same data, queried for WS-2, positively exercises the errored bucket
+    // (guard.unhealthy -> "errored" via event_state_from_type) and confirms the
+    // counts are isolated in both directions.
+    auto res2 = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-2");
+    REQUIRE(res2);
+    auto j2 = nlohmann::json::parse(res2->body);
+    auto& d2 = j2["data"];
+    CHECK(d2["errored"].get<int>() == 2);
+    CHECK(d2["compliant"].get<int>() == 0);
+    CHECK(d2["pending"].get<int>() == 0);
 }
 
 TEST_CASE("REST gs.baseline-device: unknown agent on a deployed baseline → all pending",
@@ -947,12 +958,38 @@ TEST_CASE("REST gs.baseline-device: draft baseline → deployed:false, no guards
     CHECK(d["guards"].empty());
 }
 
-TEST_CASE("REST gs.baseline-device: unknown baseline_id → 404",
+TEST_CASE("REST gs.baseline-device: unknown baseline_id → 404 + not_found audit",
           "[rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/nope123abc/devices/WS-1");
     REQUIRE(res);
     CHECK(res->status == 404);
+    // The attempt is still audited (enumeration trail), but result reflects the
+    // miss — not "success" — so a 404 probe stream stays distinguishable.
+    bool not_found_audited = false;
+    for (auto& a : h.audit_log)
+        if (a.action == "guardian.device.view" && a.target_id == "WS-1" &&
+            a.result == "not_found")
+            not_found_audited = true;
+    CHECK(not_found_audited);
+}
+
+TEST_CASE("REST gs.baseline-device: deployed-but-empty baseline → deployed:true, no guards",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    // A genuinely deployed Baseline with zero members (snapshot "[]") — distinct
+    // from a draft (deployed:false). A consumer must branch on `deployed`, not on
+    // total_guards, to decide "No Baseline Deployed".
+    const auto bid = h.seed_deployed_baseline("Empty Deployed", {});
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["deployed"].get<bool>() == true);
+    CHECK(d["total_guards"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].empty());
 }
 
 TEST_CASE("REST gs.baseline-device: permission gate runs before audit",
