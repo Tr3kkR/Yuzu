@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
   `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
 
+### Fixed
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
 ### Added
 
 - **Guardian — baseline-anchored per-device compliance REST.**
