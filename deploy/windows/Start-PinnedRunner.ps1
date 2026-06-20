@@ -74,6 +74,21 @@ Write-Host "[r$Index] RUNNER_TOOL_CACHE = $ToolCache (shared)"
 # affinity mask). ci.yml's Windows Build step honors -j $YUZU_BUILD_JOBS when set.
 [Environment]::SetEnvironmentVariable('YUZU_BUILD_JOBS', "$BuildJobs", 'Process')
 
+# Registration-time self-test: assert the toolchain manifest (if present) before
+# taking jobs, so a mis-provisioned box is flagged loudly at startup instead of
+# 90 min into a build. WARN, don't block — the in-job "Assert toolchain
+# available" step hard-fails a genuinely broken build, and we'd rather a
+# slightly-stale manifest not strand a runner offline. (Assert-Toolchain.ps1
+# deploys alongside this wrapper — see deploy/windows/README.md.)
+$selftest = Join-Path $PSScriptRoot 'Assert-Toolchain.ps1'
+$manifest = 'C:\actions-runner\toolchain-manifest.json'
+if((Test-Path $selftest) -and (Test-Path $manifest)){
+  & $selftest -ManifestPath $manifest
+  if($LASTEXITCODE -ne 0){ Write-Warning "[r$Index] toolchain self-test FAILED — starting anyway; fix provisioning (see deploy/windows/README.md)." }
+} else {
+  Write-Host "[r$Index] toolchain self-test skipped (manifest/selftest not present)"
+}
+
 $run = Join-Path $RunnerRoot 'run.cmd'
 while ($true) {
   if (-not (Test-Path (Join-Path $RunnerRoot '.runner'))) {

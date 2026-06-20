@@ -478,7 +478,7 @@ jobs:
           # a specific error rather than producing weird build failures.
           for tool in meson ninja cl ccache cmake python; do
             if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::$tool not on PATH on yuzu-local-windows runner"
+              echo "::error::$tool not on PATH on the self-hosted Windows runner"
               exit 1
             fi
           done
@@ -493,6 +493,20 @@ jobs:
           # cannot inject a malicious wheel (Gate 7 re-review LOW).
           python -c "import yaml" >/dev/null 2>&1 || \
             python -m pip install --user --require-hashes -r requirements-ci.txt
+
+      - name: Assert toolchain manifest (self-hosted, optional)
+        shell: pwsh
+        run: |
+          # Manifest-based self-test for boxes provisioned via
+          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
+          # runners that predate the manifest — the PATH check above still covers
+          # them. Catches path/version/env drift the bare PATH check misses.
+          $m = 'C:\actions-runner\toolchain-manifest.json'
+          if (Test-Path $m) {
+            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
+          } else {
+            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
+          }
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -648,9 +662,38 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: ccache stats
+      - name: ccache stats + build observability
         if: always()
-        run: ccache -s
+        run: |
+          # Informational only — never fail the job from here (set +e).
+          set +e
+          ccache -s
+          # Machine-readable parse for a job-summary: cache warmth + effective
+          # parallelism + LTO. Surfaces cold/fragmented caches and -j
+          # oversubscription automatically, instead of only by hand (P3).
+          s="$(ccache --print-stats 2>/dev/null)"
+          get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
+          hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
+          miss=$(get cache_miss)
+          total=$(( hits + miss ))
+          rate="n/a"; [ "$total" -gt 0 ] && rate=$(( 100 * hits / total ))
+          {
+            echo "### Windows ${{ matrix.build_type }} — cache & parallelism"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| ccache hit rate | ${rate}% (${hits}/${total}) |"
+            echo "| ccache misses | ${miss} |"
+            echo "| effective -j | ${YUZU_BUILD_JOBS:-ninja default} |"
+            echo "| LTO | ${{ matrix.build_type == 'release' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Cold-cache alarm: a near-zero hit rate over a meaningful sample on a
+          # self-hosted runner means the shared caches aren't warming (the
+          # fragmentation signal we previously only caught manually).
+          if [ "$total" -gt 100 ] && [ "$rate" != "n/a" ] && [ "$rate" -lt 40 ]; then
+            echo "::warning::ccache hit rate ${rate}% over ${total} compiles is low on a self-hosted runner — caches may be cold/fragmented (see deploy/windows/README.md: shared RUNNER_TOOL_CACHE)"
+          fi
+          exit 0
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
