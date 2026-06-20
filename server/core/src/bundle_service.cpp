@@ -2,7 +2,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -68,7 +67,6 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
 
     std::vector<BundleStepSpec> specs;
     specs.reserve(doc.size());
-    std::set<std::pair<std::string, std::string>> seen;
 
     std::size_t idx = 0;
     for (const auto& elem : doc) {
@@ -87,8 +85,10 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
             return std::unexpected(where + ": invalid plugin name");
         if (!is_ident(s.action))
             return std::unexpected(where + ": invalid action name");
-        if (!seen.insert({s.plugin, s.action}).second)
-            return std::unexpected(where + ": duplicate (plugin, action) — each must be unique");
+        // Duplicate (plugin, action) steps are DELIBERATELY allowed (ADR-0011
+        // §61-64): each step gets its own command_id, the persisted ordered step
+        // map demuxes by command_id in request order, so e.g. two registry reads
+        // with different params on one device are unambiguous. No uniqueness set.
 
         if (elem.contains("params")) {
             const auto& p = elem["params"];
@@ -191,7 +191,14 @@ std::string aggregate_to_json(const BundleAggregate& agg) {
         });
     }
     j["steps"] = std::move(steps);
-    return j.dump();
+    // Plugin output is UNTRUSTED and may not be valid UTF-8 (binary, a non-UTF-8
+    // Windows codepage, a truncated multibyte sequence). nlohmann's default
+    // (strict) dump() THROWS type_error.316 on an invalid byte — which on the MCP
+    // path escapes the JSON-RPC envelope and leaves the bundle permanently
+    // uncollatable until TTL. This is exactly the non-UTF-8 `.dump()` crash class
+    // ADR-0011 retired; the `replace` handler substitutes U+FFFD so collate
+    // always serializes (governance review #1593: blocker 1).
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 } // namespace yuzu::server

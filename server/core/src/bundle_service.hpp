@@ -50,7 +50,9 @@ struct BundleStepSpec {
 /// values are coerced to strings (non-strings JSON-dumped). Returns the parsed
 /// steps, or a human-readable error. Rejects: malformed JSON, non-array, empty,
 /// > max_steps, non-object element, missing/invalid plugin or action,
-/// non-object `params`, duplicate `(plugin, action)` pairs.
+/// non-object `params`, oversized params. Duplicate `(plugin, action)` steps are
+/// ALLOWED and preserved in request order (ADR-0011 §61-64 — demux is by
+/// command_id, so duplicates with different params are unambiguous).
 [[nodiscard]] std::expected<std::vector<BundleStepSpec>, std::string>
 validate_bundle_steps(std::string_view steps_json, std::size_t max_steps = kMaxBundleSteps);
 

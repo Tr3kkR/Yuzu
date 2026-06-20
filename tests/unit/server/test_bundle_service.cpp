@@ -59,12 +59,24 @@ TEST_CASE("validate_bundle_steps rejects malformed / unsafe steps", "[bundle][va
     CHECK_FALSE(validate_bundle_steps(R"([{"plugin":"p","action":"a","params":[]}])").has_value());
 }
 
-TEST_CASE("validate_bundle_steps rejects duplicate (plugin,action) but allows same plugin diff action",
+TEST_CASE("validate_bundle_steps allows duplicate (plugin,action) in request order",
           "[bundle][validate]") {
-    CHECK_FALSE(validate_bundle_steps(
-                    R"([{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"uptime"}])")
-                    .has_value());
-    // same plugin, different action is fine (ServiceNow does several os_info actions)
+    // ADR-0011 §61-64 + governance review #1593 blocker 2: duplicate
+    // (plugin,action) is DELIBERATELY allowed — each step gets its own command_id
+    // and the ordered step map demuxes them (e.g. two registry reads with
+    // different params on one device). The validator must NOT reject them.
+    auto dup = validate_bundle_steps(
+        R"([{"plugin":"registry","action":"get_value","params":{"path":"A"}},)"
+        R"({"plugin":"registry","action":"get_value","params":{"path":"B"}}])");
+    REQUIRE(dup.has_value());
+    REQUIRE(dup->size() == 2);
+    CHECK((*dup)[0].params[0].second == "A"); // request order preserved
+    CHECK((*dup)[1].params[0].second == "B");
+    // exact duplicate (same params) is also allowed — just redundant
+    CHECK(validate_bundle_steps(
+              R"([{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"uptime"}])")
+              .has_value());
+    // same plugin, different action still fine
     auto ok = validate_bundle_steps(
         R"([{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}])");
     REQUIRE(ok.has_value());
@@ -234,4 +246,34 @@ TEST_CASE("validate_bundle_steps: bounds param payload (UP-7)", "[bundle][servic
     CHECK(validate_bundle_steps(
               R"([{"plugin":"os_info","action":"uptime","params":{"k":"v"}}])")
               .has_value());
+}
+
+// ── Governance review #1593 regressions ─────────────────────────────────────
+
+TEST_CASE("aggregate_to_json tolerates non-UTF-8 plugin output (no throw)", "[bundle][collate]") {
+    // Blocker 1: plugin output is untrusted and may not be valid UTF-8 (binary,
+    // a non-UTF-8 codepage). The default strict dump() THROWS type_error.316 on
+    // an invalid byte → the bundle becomes permanently uncollatable. The replace
+    // handler must substitute U+FFFD so collate always serializes.
+    std::vector<DispatchedStep> steps{step("cmd-a", "files", "read")};
+    std::vector<BundleResponseRow> rows{{"cmd-a", 1, std::string(1, '\xff') + "raw"}};
+    std::string out;
+    REQUIRE_NOTHROW(out = aggregate_to_json(aggregate_bundle(steps, rows)));
+    auto j = nlohmann::json::parse(out); // must be valid, parseable JSON
+    CHECK(j["steps"][0]["state"] == "responded");
+    CHECK(j["received"] == 1);
+}
+
+TEST_CASE("aggregate_bundle demuxes duplicate (plugin,action) steps by command_id",
+          "[bundle][collate]") {
+    // Blocker 2: two identical (plugin,action) steps (different params) must
+    // collate to distinct results in request order, keyed by their command_ids.
+    std::vector<DispatchedStep> steps{step("cmd-1", "registry", "get_value"),
+                                      step("cmd-2", "registry", "get_value")};
+    std::vector<BundleResponseRow> rows{{"cmd-2", 1, "valB"}, {"cmd-1", 1, "valA"}}; // arrival order
+    auto agg = aggregate_bundle(steps, rows);
+    REQUIRE(agg.steps.size() == 2);
+    CHECK(agg.steps[0].output == "valA"); // request order, demuxed by command_id
+    CHECK(agg.steps[1].output == "valB");
+    CHECK(agg.received == 2);
 }
