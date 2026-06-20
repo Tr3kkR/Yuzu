@@ -229,18 +229,30 @@ jobs:
 
       - name: Install system packages
         run: |
-          # DPkg::Lock::Timeout: the Big Tam host runs 4 runners (r0-r3), so the
-          # matrix legs hit `apt-get` concurrently and race the single system
-          # apt/dpkg lock (Shulgi was one runner, so its matrix serialized and
-          # never contended). Wait up to 300s for the lock instead of failing
-          # with "Could not get lock /var/lib/apt/lists/lock" (exit 100). Applied
-          # to BOTH update and install — the lists lock bites first. Matches the
-          # nightly.yml shared-box pattern.
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
-            cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev \
-            ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
+          # The Big Tam host runs 4 runners (r0-r3), so the matrix legs hit apt
+          # concurrently and race the system locks (Shulgi was one runner, so its
+          # matrix serialized and never contended). apt operations cannot run in
+          # parallel by design. DPkg::Lock::Timeout only governs the dpkg FRONTEND
+          # lock (install) — it does NOT cover `apt-get update`'s lists lock
+          # (/var/lib/apt/lists/lock), which still failed instantly under
+          # contention. So serialize the whole apt sequence across legs with flock
+          # on a shared host lock (the standard fix — this is what apt-systemd-daily
+          # itself does). Keep DPkg::Lock::Timeout inside as belt-and-suspenders
+          # for the frontend lock vs. any background unattended-upgrades. Serializing
+          # apt also staggers the legs, so they don't hit ensure-postgres (one
+          # shared yuzu-ci-postgres container) or pip --user ($HOME) all at once.
+          # FD-9 flock pattern: the subshell opens the lock file on fd 9, flock
+          # blocks up to 600s for it, and releases on subshell exit. /tmp is
+          # 1777 so the runner can create the lock; all 4 runners are the same
+          # user on the same host, so they share it.
+          (
+            flock -w 600 9 || { echo "::error::timed out waiting for apt lock"; exit 1; }
+            sudo apt-get -o DPkg::Lock::Timeout=300 update
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
+              cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
+              bison flex libsystemd-dev \
+              ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
+          ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
