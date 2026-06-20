@@ -180,6 +180,15 @@ jobs:
     # Actions-minute spend, not per-PR latency.
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
+    env:
+      # Big Tam runs 4 runners on one host. A gateway eunit test that boots the
+      # app can transiently bring up Erlang distribution and trip the #659
+      # insecure-default-cookie boot guard (observed flaking 1/4 legs). This is
+      # the documented dev/CI override — the guard's policy logic is still
+      # unit-tested directly by yuzu_gw_app_tests. The host-side per-runner
+      # ERL_EPMD_PORT isolation (each runner's .env) removes the cross-runner
+      # EPMD collision that triggers the transient distribution in the first place.
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     strategy:
       fail-fast: false
       matrix:
