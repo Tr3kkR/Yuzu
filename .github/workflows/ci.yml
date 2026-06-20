@@ -81,6 +81,11 @@ jobs:
   # Output names are slugified runner names from .github/runner-inventory.json:
   #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
   #   yuzu-local-windows → yuzu_local_windows_healthy
+  # Plus a pool gate:
+  #   linux_pool_healthy → true iff >=1 [self-hosted, Linux, X64] runner is online
+  #     (any yuzu-bigtam-* OR the yuzu-wsl2-linux Shulgi fallback). The Linux jobs
+  #     gate on the pool, not a single named runner, so a free pool member keeps
+  #     them running and a fully-offline pool still skips them fast.
   #
   # If RUNNER_INVENTORY_TOKEN is missing, the script writes
   # all runners as `false` and exits 0 (fail-closed): downstream jobs
@@ -91,6 +96,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
+      # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
+      # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
+      # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
+      linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -131,7 +140,9 @@ jobs:
   proto-compat:
     name: "Proto backward-compat"
     needs: [preflight]
-    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
+    # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
+    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
+    if: needs.preflight.outputs.linux_pool_healthy == 'true'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
@@ -152,9 +163,10 @@ jobs:
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Linux runner is
-    # unhealthy or unknown. Fail-closed `== 'true'` (NOT `!= 'false'`).
-    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
+    # PR-7 of CI overhaul plan: skip if the self-hosted Linux job pool is
+    # unhealthy or unknown. Pool = any [self-hosted, Linux, X64] runner online
+    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'` (NOT `!= 'false'`).
+    if: needs.preflight.outputs.linux_pool_healthy == 'true'
     # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
     # state between runs on the same workspace amortizes the install
     # cost. Trade-off: the single runner process serializes this 4-way
