@@ -244,3 +244,55 @@ groups:
           severity: warning
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
+
+  - name: yuzu-bundles
+    # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
+    # (TTL + cap), so cap-eviction silently discards another operator's in-flight
+    # bundle — these alerts make that (and dispatch health) observable until the
+    # manifest moves to Postgres.
+    rules:
+      - alert: YuzuBundleCapEviction
+        expr: |
+          rate(yuzu_bundle_evictions_total{reason="cap"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest cap is forcing evictions"
+          description: >-
+            The in-memory bundle manifest map has hit its cap and is evicting
+            non-expired bundles to admit new ones — an in-flight bundle may 404 on
+            collate for an operator who did not cause the load. Likely a runaway
+            agentic dispatch loop. Investigate the dispatching principal; the
+            durable Postgres manifest (ADR-0011) removes the cap.
+      - alert: YuzuBundleManifestSaturation
+        expr: |
+          max(yuzu_bundle_manifests) > 3500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest count approaching the 4096 cap"
+          description: >-
+            In-flight bundle manifests are within ~15% of the cap; sustained growth
+            will force cross-operator cap-eviction (see YuzuBundleCapEviction).
+      - alert: YuzuBundleDispatchLatencyHigh
+        # UP-15: the bundle fan-out is synchronous — a POST holds an HTTP worker
+        # across N gRPC writes. This pages before that hold (×concurrency) starves
+        # the worker pool; observe-only is not enough while the async-dispatch fix
+        # is deferred. 500ms is well above the ms-scale normal case.
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(yuzu_bundle_dispatch_duration_seconds_bucket[5m])) by (le, surface)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bundle dispatch fan-out p99 > 500ms (HTTP worker hold risk)"
+          description: >-
+            The synchronous bundle dispatch fan-out is holding HTTP workers for
+            >500ms p99 on surface={{ $labels.surface }}. Under load this risks
+            HTTP thread-pool starvation affecting unrelated routes. Reduce
+            concurrent bundle dispatches, reduce steps-per-bundle, or prioritise
+            the deferred async-dispatch fix (UP-15).

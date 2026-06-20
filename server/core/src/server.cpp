@@ -8926,7 +8926,10 @@ private:
                 // three surfaces — fragments, REST, MCP).
                 dex_perf_fn,
                 // N1: the shared network-quality provider (fragments + REST + MCP).
-                net_perf_fn);
+                net_perf_fn,
+                // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
+                // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
+                &metrics_);
         }
 
         // -- Listen -----------------------------------------------------------
