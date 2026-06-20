@@ -50,6 +50,31 @@ dormant until merged.
 | Runner | Host | Jobs |
 |---|---|---|
 | `yuzu-wsl2-linux` | Shulgi 5950X WSL2 Ubuntu 24.04 | proto-compat, linux matrix, nightly (asan/tsan/coverage), cache-prune-linux |
+| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** | Linux CI pool (shared label `yuzu-bigtam-linux`) — successor to Shulgi for the Linux legs; see "Ubuntu 26.04 migration" below |
+| `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows |
+| `macos-15` | GitHub-hosted | macos matrix |
+
+### Ubuntu 26.04 migration (Big Tam)
+
+Big Tam is a native **Ubuntu 26.04 (Resolute)** box whose default toolchain is
+**GCC 15 / Clang 21** — versus Shulgi's Ubuntu 24.04 (GCC 13 / Clang 19). The
+self-hosted Linux build is being moved to it. The 26.04/gcc-15 scaffolding is
+**staged but not yet live** (the live self-hosted jobs still target Shulgi@24.04
+on gcc-13/clang-19):
+
+- Native files `meson/native/linux-gcc15.ini` + `linux-clang21.ini` exist (the
+  24.04 `linux-gcc13.ini`/`linux-clang19.ini` stay for Shulgi).
+- The CI runner image (`Dockerfile.ci-linux`), the local `Dockerfile.ci`, and
+  the four sanitizer images (`Dockerfile.{server,agent}-{asan,tsan}`) are on
+  `ubuntu:26.04` + gcc-15/clang-21. `gcc-13` and `clang-19` remain installable
+  from 26.04's archive (gcc-13 in *universe*; clang-19 in-archive) but are not
+  the defaults.
+- `pre-release.yml`'s `install-deb` smoke matrix gained an `ubuntu:26.04` leg.
+
+The remaining **flip** (live `runs-on`/compiler/`ImageOS` changes) is deferred
+until Big Tam is confirmed online — Shulgi (24.04) cannot build gcc-15/clang-21,
+so flipping while it is the only available Linux runner would red the board. The
+exact one-shot flip is enumerated in **`docs/ci-ubuntu-2604-cutover.md`**.
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | windows matrix (successor to Shulgi for Windows); provisioned from [`deploy/windows/`](../deploy/windows/README.md) |
 | `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows (legacy — retire once Wee Tam is proven) |
 | `macos-15` | GitHub-hosted | macos matrix |
