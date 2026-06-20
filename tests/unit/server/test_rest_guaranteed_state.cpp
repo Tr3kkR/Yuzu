@@ -163,7 +163,10 @@ struct RestGsHarness {
     // Seed one device's reported verdict for a Guard via the status feed
     // (insert_event → upsert_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant→compliant, drift.detected→drifted,
-    // guard.unhealthy→errored.
+    // guard.unhealthy→errored. NOTE: the upsert keeps the row only when
+    // excluded.updated_at >= the existing updated_at, so re-seeding the same
+    // (agent, rule_id) with an EARLIER (or equal-then-different-state) timestamp
+    // is silently dropped — use strictly increasing ts when overwriting a verdict.
     void seed_status(const std::string& event_id, const std::string& agent,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts) {
@@ -175,6 +178,30 @@ struct RestGsHarness {
         e.severity = "info";
         e.timestamp = ts;
         REQUIRE(store->insert_event(e).has_value());
+    }
+
+    // Write a RAW guardian_agent_rule_status row (arbitrary `state`) directly via
+    // a second SQLite connection — the public ingest path (insert_event →
+    // event_state_from_type) can only ever write "compliant"/"drifted"/"errored",
+    // so this is the only way to exercise the handler's defensive "unrecognized
+    // state → pending" fallthrough (e.g. a corrupt DB or a future state token).
+    void seed_raw_status(const std::string& agent, const std::string& rule_id,
+                         const std::string& state, const std::string& ts) {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(
+                    raw,
+                    "INSERT OR REPLACE INTO guardian_agent_rule_status"
+                    "(agent_id, rule_id, state, updated_at) VALUES(?1,?2,?3,?4)",
+                    -1, &st, nullptr) == SQLITE_OK);
+        sqlite3_bind_text(st, 1, agent.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, state.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        REQUIRE(sqlite3_close(raw) == SQLITE_OK);
     }
 
     // Create + deploy a Baseline with the given member Guards (snapshot = members,
@@ -823,6 +850,9 @@ TEST_CASE("REST gs.baseline-device: deployed baseline returns per-guard verdicts
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
+    // A1 envelope: ok_json() wraps the payload as {data:..., meta:...}.
+    CHECK(j.contains("data"));
+    CHECK(j.contains("meta"));
     auto& d = j["data"];
     CHECK(d["baseline"]["name"].get<std::string>() == "ServiceNow Compliance");
     CHECK(d["baseline"]["baseline_id"].get<std::string>() == bid);
@@ -935,4 +965,72 @@ TEST_CASE("REST gs.baseline-device: permission gate runs before audit",
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST gs.baseline-device: route + schema are in the OpenAPI spec (A1 discoverability)",
+          "[rest][guaranteed_state][baseline][discovery]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    nlohmann::json spec;
+    // Parsing validates the spec survived the C2026 string-literal split.
+    REQUIRE_NOTHROW(spec = nlohmann::json::parse(res->body));
+    REQUIRE(spec.contains("paths"));
+    CHECK(spec["paths"].contains("/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}"));
+    REQUIRE(spec.contains("components"));
+    REQUIRE(spec["components"].contains("schemas"));
+    CHECK(spec["components"]["schemas"].contains("GuaranteedStateBaselineDeviceStatus"));
+}
+
+TEST_CASE("REST gs.baseline-device: unrecognized stored state folds into pending (invariant holds)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    // A corrupt/future state token the public ingest path can never write.
+    h.seed_raw_status("WS-1", "r1", "weird-future-state", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 1);
+    CHECK(d["compliant"].get<int>() == 0);
+    CHECK(d["drifted"].get<int>() == 0);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 1); // unrecognized state -> pending
+    CHECK(d["total_guards"].get<int>() == d["compliant"].get<int>() + d["drifted"].get<int>()
+                                             + d["errored"].get<int>() + d["pending"].get<int>());
+    CHECK(d["last_updated"].is_null()); // only recognized verdicts contribute
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["status"].get<std::string>() == "pending");
+    CHECK(d["guards"][0]["updated_at"].is_null());
+}
+
+TEST_CASE("REST gs.baseline-device: snapshot guard with no rule row falls back to rule_id name",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Real Guard");
+    // r-gone is in the deployed snapshot but its rule row was never created
+    // (e.g. the Guard was deleted after deploy) -> name falls back to the rule_id.
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r-gone"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 2);
+    bool saw_fallback = false;
+    for (auto& g : d["guards"]) {
+        if (g["rule_id"].get<std::string>() == "r-gone") {
+            CHECK(g["name"].get<std::string>() == "r-gone"); // fallback to rule_id
+            CHECK(g["status"].get<std::string>() == "pending");
+            saw_fallback = true;
+        }
+    }
+    CHECK(saw_fallback);
 }

@@ -3532,6 +3532,32 @@ Baseline-anchored per-device compliance — the machine-readable sibling of the 
 
 **Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
 
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+```
+
+```json
+{
+  "data": {
+    "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
+    "deployed": true,
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "total_guards": 3,
+    "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
+    "last_updated": "2026-06-20T13:45:00Z",
+    "guards": [
+      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
+      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},
+      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z"}
+    ]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
 #### `GET /api/v1/guaranteed-state/alerts`
 
 Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11).

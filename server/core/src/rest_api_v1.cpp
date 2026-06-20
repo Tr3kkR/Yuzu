@@ -38,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -5570,18 +5571,21 @@ void RestApiV1::register_routes(
             const std::string baseline_id = req.matches[1].str();
             const std::string agent_id = req.matches[2].str();
 
+            // Per-device behavioral-data access audit — emitted on the ATTEMPT,
+            // BEFORE baseline resolution, so enumerating baseline_ids against a
+            // device leaves a trail even on a miss (matches the
+            // /guaranteed-state/events?agent_id= sibling). Same verb the dashboard
+            // Guardian device lens emits, so one SIEM filter catches both surfaces.
+            if (audit_fn)
+                audit_fn(req, "guardian.device.view", "success", "Agent", agent_id,
+                         "baseline " + baseline_id + " per-device guard status via REST");
+
             const auto baseline = baseline_store->get_baseline(baseline_id);
             if (!baseline) {
                 res.status = 404;
                 res.set_content(error_json("baseline not found", 404), "application/json");
                 return;
             }
-
-            // Per-device behavioral-data access audit — same verb the dashboard
-            // Guardian device lens emits, so one SIEM filter catches both surfaces.
-            if (audit_fn)
-                audit_fn(req, "guardian.device.view", "success", "Agent", agent_id,
-                         "baseline " + baseline_id + " per-device guard status via REST");
 
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
             const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline_id);

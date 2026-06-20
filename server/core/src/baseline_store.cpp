@@ -627,15 +627,20 @@ BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
         return ids;
     // The deployed snapshot (the ENFORCED set captured at last deploy) of ONE
     // Baseline — the per-Baseline analog of the fleet-union overload above, for
-    // the baseline-anchored per-device REST view. Same fail-closed parse: a
-    // draft / never-deployed / empty / malformed snapshot yields {}.
+    // the baseline-anchored per-device REST view. The `lifecycle = deployed`
+    // filter mirrors the union overload so the two share ONE definition of "what
+    // is deployed": a draft / never-deployed Baseline yields {} from the store
+    // itself (the "deployed:false ⟹ no guards" contract is self-enforcing here,
+    // not only via the externally-empty snapshot). Same fail-closed parse: an
+    // empty / malformed snapshot also yields {}.
     SqliteStmt s;
     if (sqlite3_prepare_v2(db_,
                            "SELECT deployed_snapshot FROM guaranteed_state_baselines "
-                           "WHERE baseline_id = ?;",
+                           "WHERE baseline_id = ?1 AND lifecycle = ?2;",
                            -1, s.addr(), nullptr) != SQLITE_OK)
         return ids;
     sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, kBaselineDeployed, -1, SQLITE_STATIC);
     if (sqlite3_step(s.get()) == SQLITE_ROW) {
         const char* snap = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
         if (snap && *snap) {

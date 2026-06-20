@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian — baseline-anchored per-device compliance REST.**
+  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+  (`GuaranteedState:Read`, audited `guardian.device.view`) returns one Baseline's
+  deployed Guards each with the device's last reported verdict (`compliant` |
+  `drifted` | `errored` | `pending`), plus counts and a `last_updated` freshness
+  stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced set,
+  not the live member list); a not-yet-deployed Baseline returns `deployed:false`
+  with empty guards (consumer renders "No Baseline Deployed"), and member edits
+  appear only after a re-deploy. Designed for embedding Guardian compliance into an
+  external CMDB / ITSM CI record (e.g. ServiceNow).
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
