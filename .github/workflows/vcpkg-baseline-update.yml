@@ -87,6 +87,7 @@ jobs:
             deploy/docker/Dockerfile.ci-linux
             deploy/docker/Dockerfile.runner-linux
             deploy/docker/Dockerfile.ci
+            deploy/windows/Provision-Windows-Runner.ps1
           )
           # sed -i works because SHAs are globally unique 40-char strings.
           sed -i "s/${old}/${new}/g" "${files[@]}"
@@ -127,6 +128,7 @@ jobs:
             - `deploy/docker/Dockerfile.ci-linux` `VCPKG_COMMIT` ARG
             - `deploy/docker/Dockerfile.runner-linux` `VCPKG_COMMIT` ARG
             - `deploy/docker/Dockerfile.ci` `VCPKG_COMMIT` ENV
+            - `deploy/windows/Provision-Windows-Runner.ps1` `$VcpkgBaseline` param
 
             CI will re-resolve every vcpkg port against the new baseline. If
             any downstream port now fails to build, **revert this PR** and
