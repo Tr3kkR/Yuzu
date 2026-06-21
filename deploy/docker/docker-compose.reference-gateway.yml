@@ -32,8 +32,12 @@
 ##
 ## Usage:
 ##   export YUZU_VERSION=0.12.0
+##   # the server REQUIRES Postgres (fails closed otherwise) — set the two
+##   # DISTINCT db passwords (superuser + app role):
+##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+##   export YUZU_DB_PASSWORD="$(openssl rand -hex 24)"
 ##   # seed an admin into ./yuzu-server.cfg (user:admin:<salt>:<pbkdf2> — see
-##   # scripts/start-demo.sh for the one-liner), then:
+##   # scripts/start-demo.sh for the one-liner), then (depends_on pulls in postgres):
 ##   docker compose -f docker-compose.reference-gateway.yml up -d server gateway
 ##   # create an enrollment token via the dashboard / REST, then start agents:
 ##   YUZU_ENROLL_TOKEN=<token> docker compose -f docker-compose.reference-gateway.yml up -d agent
@@ -58,6 +62,16 @@ services:
       - "--cert-group=yuzu-pki"       # share the cert volume across the uids
       - "--config=/etc/yuzu/yuzu-server.cfg"
       - "--data-dir=/var/lib/yuzu"
+    environment:
+      # Postgres substrate (ADR-0006/0007): the server REQUIRES Postgres and
+      # FAILS CLOSED without a reachable DSN. The DSN carries the APP role
+      # password (YUZU_DB_PASSWORD), never the superuser's. Point at an
+      # external/managed Postgres instead by replacing this DSN and dropping
+      # the postgres service + depends_on below.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD; no insecure default in the reference template)}@postgres:5432/yuzu
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8443:8443"     # Dashboard + REST API (HTTPS)
     volumes:
@@ -102,7 +116,39 @@ services:
     depends_on:
       gateway: { condition: service_started }
 
+  # ── PostgreSQL (server storage substrate, ADR-0006/0007) ─────────────
+  # The server REQUIRES Postgres and fails closed without it. Release-pinned,
+  # signed yuzu-postgres image (PG18 + pgvector + first-boot app role/db
+  # init); per-store schemas are created at runtime by the migration runner.
+  # An external/managed Postgres is first-class — point the server's
+  # YUZU_POSTGRES_DSN at it and drop this service + the server depends_on.
+  postgres:
+    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (superuser; no insecure default in the reference template)}
+      # App role password — DISTINCT from the superuser password above.
+      # First-boot init refuses to run if they are equal or if this is unset.
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD)}
+      # PG18 defaults PGDATA to a version-pinned subdir (/var/lib/postgresql/18/
+      # docker); pin it back to the mounted /data path so the data lands in the
+      # named volume below (else PG18 treats the /data mount as unused and aborts).
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is liveness; the psql SELECT 1 over the app DSN proves the
+      # app credential authenticates. $$ defers expansion to the container
+      # shell so the password never appears in `docker compose config`.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
 volumes:
   certs:         # per-install CA + leaves — DO NOT delete (down -v re-roots)
   server-data:
   agent-data:    # each agent's issued per-agent mTLS leaf
+  postgres-data: # PostgreSQL substrate state — back it up; never `down -v`

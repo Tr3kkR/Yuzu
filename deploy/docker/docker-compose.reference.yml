@@ -109,13 +109,13 @@ services:
         soft: 65536
         hard: 65536
     environment:
-      # Postgres substrate DSN (ADR-0006/0007, #1318). The server does not
-      # consume this yet — #1320 wires the server-side plumbing — so it is
-      # inert today and the server still boots without Postgres. Env var
-      # (not a CLI flag) on purpose: the current binary rejects unknown
-      # flags. Pointing this at an external/managed Postgres instead of
-      # the bundled service below is fully supported — replace the whole
-      # DSN and drop the postgres service + depends_on if you do.
+      # Postgres substrate DSN (ADR-0006/0007, #1318/#1320). The server now
+      # REQUIRES Postgres and FAILS CLOSED (refuses to boot, exits non-zero)
+      # if this DSN is unset or unreachable — there is no SQLite fallback for
+      # the server (the agent stays SQLite). Pointing this at an external/
+      # managed Postgres instead of the bundled service below is fully
+      # supported — replace the whole DSN and drop the postgres service +
+      # depends_on if you do.
       # The DSN carries the APP role password (YUZU_DB_PASSWORD), never the
       # superuser's — a leaked server environment must not disclose
       # superuser credentials.
@@ -158,6 +158,10 @@ services:
       # First-boot init refuses to run if they are equal or if this is
       # unset. The server's YUZU_POSTGRES_DSN carries this credential.
       YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD)}
+      # PG18 defaults PGDATA to a version-pinned subdir (/var/lib/postgresql/18/
+      # docker); pin it back to the mounted /data path so the data lands in the
+      # named volume below (else PG18 treats the /data mount as unused and aborts).
+      PGDATA: /var/lib/postgresql/data
     volumes:
       # Database state — same persistence rules as server-data: back it up,
       # never `down -v` unless you intend to destroy it.
