@@ -99,6 +99,7 @@ jobs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
       # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
+      linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
       # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
