@@ -17,12 +17,25 @@ gateway_dir = sys.argv[1]
 env = None
 
 if sys.platform == "win32":
-    # MSYS2 sets TEMP/TMP to "/tmp" which native Windows programs resolve to
-    # "\tmp\" — a nonexistent path that breaks file moves (e.g. rebar3 dep fetch).
-    real_temp = tempfile.gettempdir()
+    # MSYS2 exports TEMP/TMP=/tmp, which native Windows programs resolve to the
+    # bogus UNC path \\tmp\. On a cold _build, rebar3's gpb-plugin install then
+    # runs `robocopy /move \\tmp\.tmp_dir... <dest>` and hangs ~forever retrying
+    # a nonexistent SMB host "tmp" (warm builds skip the move, so it's
+    # intermittent). Force a real, native temp dir for the whole rebar3/erl/gpb
+    # subtree. Three subtleties: rebar3's system_tmpdir() reads
+    # ["TMPDIR","TEMP","TMP"] in that order, so TMPDIR MUST be set too; and
+    # tempfile.gettempdir() happily echoes "/tmp" back when handed it, so we
+    # don't trust it blindly. RUNNER_TEMP (GitHub Actions, e.g.
+    # D:\ci\work-N\_temp) is a guaranteed-native, per-runner, writable path;
+    # otherwise fall back to a validated drive-letter temp.
+    real_temp = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+    if not (len(real_temp) >= 2 and real_temp[1] == ":" and os.path.isdir(real_temp)):
+        real_temp = os.path.join(os.environ.get("LOCALAPPDATA", r"C:\Windows"), "Temp")
+        os.makedirs(real_temp, exist_ok=True)
     env = os.environ.copy()
     env["TEMP"] = real_temp
     env["TMP"] = real_temp
+    env["TMPDIR"] = real_temp
 
     # Resolve the Erlang toolchain WITHOUT hardcoding one host's layout. The
     # proven-good invocation is `<real escript.exe> <rebar3 escript file>
