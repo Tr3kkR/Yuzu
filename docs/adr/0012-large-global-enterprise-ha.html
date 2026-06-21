@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ADR-0012 - Large global enterprise HA</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #0b1117;
+      color: #e8eef6;
+      font: 16px/1.62 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 56px 0 80px;
+    }
+
+    header {
+      margin-bottom: 32px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid #2b3b4d;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #67d6ff;
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.18;
+      text-wrap: balance;
+    }
+
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 4rem);
+      letter-spacing: -0.03em;
+    }
+
+    h2 {
+      margin: 42px 0 14px;
+      font-size: 1.75rem;
+    }
+
+    h3 {
+      margin: 28px 0 10px;
+      font-size: 1.18rem;
+      color: #7ce7b2;
+    }
+
+    p,
+    li {
+      max-width: 78ch;
+    }
+
+    a {
+      color: #67d6ff;
+    }
+
+    code {
+      color: #d7ecff;
+      background: #071018;
+      border: 1px solid #2b3b4d;
+      border-radius: 6px;
+      padding: 0.08rem 0.28rem;
+      font-size: 0.92em;
+    }
+
+    .meta,
+    .callout,
+    .diagram,
+    table {
+      border: 1px solid #2b3b4d;
+      background: #121b24;
+      border-radius: 10px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 0;
+      overflow: hidden;
+      margin: 28px 0 0;
+      max-width: 980px;
+    }
+
+    .meta dt,
+    .meta dd {
+      margin: 0;
+      padding: 12px 14px;
+      border-bottom: 1px solid #2b3b4d;
+    }
+
+    .meta dt {
+      color: #a8b6c7;
+      background: #172331;
+      font-weight: 700;
+    }
+
+    .meta dd {
+      color: #e8eef6;
+    }
+
+    .meta dt:last-of-type,
+    .meta dd:last-of-type {
+      border-bottom: 0;
+    }
+
+    .callout {
+      max-width: 980px;
+      margin: 24px 0;
+      padding: 18px 20px;
+    }
+
+    .callout strong {
+      color: #ffd166;
+    }
+
+    .diagram {
+      max-width: 980px;
+      margin: 20px 0;
+      padding: 18px;
+      overflow: auto;
+    }
+
+    pre {
+      margin: 0;
+      color: #d7ecff;
+      font: 0.92rem/1.42 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+
+    table {
+      width: 100%;
+      max-width: 980px;
+      border-collapse: separate;
+      border-spacing: 0;
+      overflow: hidden;
+      margin: 18px 0;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #2b3b4d;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #e8eef6;
+      background: #172331;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      max-width: 980px;
+    }
+
+    .metric {
+      padding: 16px;
+      background: #121b24;
+      border: 1px solid #2b3b4d;
+      border-radius: 10px;
+    }
+
+    .metric b {
+      display: block;
+      margin-bottom: 6px;
+      color: #7ce7b2;
+      font-size: 1.08rem;
+    }
+
+    @media print {
+      main {
+        width: auto;
+        padding: 24px;
+      }
+
+      body {
+        background: #ffffff;
+        color: #0b1117;
+      }
+
+      header,
+      .meta dt,
+      .meta dd,
+      th,
+      td {
+        border-color: #c7d0dc;
+      }
+
+      .meta,
+      .callout,
+      .diagram,
+      table,
+      .metric {
+        border-color: #c7d0dc;
+        background: #f7f9fb;
+      }
+
+      .meta dt,
+      th {
+        color: #405064;
+        background: #edf2f7;
+      }
+
+      .meta dd,
+      th {
+        color: #0b1117;
+      }
+
+      .eyebrow,
+      a {
+        color: #005f86;
+      }
+
+      h3,
+      .metric b {
+        color: #006b4f;
+      }
+
+      .callout strong {
+        color: #7a5400;
+      }
+
+      code,
+      pre {
+        color: #10253a;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Architecture Decision Record 0012</p>
+      <h1>Large global enterprise HA: regional cells, durable command ownership, and warm-region DR</h1>
+      <dl class="meta">
+        <dt>Status</dt>
+        <dd>Proposed</dd>
+        <dt>Date</dt>
+        <dd>2026-06-20</dd>
+        <dt>Owner</dt>
+        <dd>Nathan Dornbrook (platform)</dd>
+        <dt>Scope</dt>
+        <dd>Platform / SRE / enterprise deployment - large global enterprise HA, regional control planes, gateway HA, server HA, and DR</dd>
+        <dt>Builds on</dt>
+        <dd>ADR-0006, ADR-0007, ADR-0008, ADR-0011</dd>
+      </dl>
+    </header>
+
+    <section>
+      <h2>Context</h2>
+      <p>Yuzu's first enterprise HA design must be sized for a large global enterprise: roughly 2,200 locations across 56 countries, 1.2 million active devices, and 210,000 staff. This is not a single-region availability problem. Multiple warm regions are required from the first implementation.</p>
+      <p>Endpoint management is operational infrastructure at this scale. Yuzu will be the control plane through which humans and Agentic Colleagues query, command, scan, patch, quarantine, enforce policy, and observe endpoint posture. Outage time becomes manual triage, duplicated regional work, spreadsheet chasing, delayed remediation, and slower incident containment.</p>
+      <p>Commercial endpoint platforms already train enterprises to expect cloud-style availability, service health, documented SLOs, and supportable disaster recovery. Yuzu's opportunity is to offer that posture in a self-hostable and inspectable form, with a low-latency command path designed for Agentic Colleagues rather than a black-box SaaS control plane.</p>
+    </section>
+
+    <section>
+      <h2>Decision</h2>
+      <div class="callout">
+        <strong>Decision:</strong> Yuzu will implement a large-global-enterprise HA profile as the first HA target. The primary shape is macro-regional cells across EMEA, APAC, and Americas, each with active-active gateways, horizontally replicated servers, HA Postgres, regional data residency, and at least one manually promoted warm standby region.
+      </div>
+      <div class="grid">
+        <div class="metric"><b>Availability target</b>99.95% regional control-plane availability</div>
+        <div class="metric"><b>DR RTO</b>Manual warm-region promotion in 30 minutes or less</div>
+        <div class="metric"><b>DR RPO</b>5 minutes or less for replicated non-command telemetry and control-plane state</div>
+        <div class="metric"><b>Command durability</b>Accepted commands are durable in regional Postgres before delivery</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Architecture</h2>
+      <div class="diagram">
+<pre>Global aggregate/routing plane
+  - tenant metadata
+  - regional assignment
+  - aggregate health and SLO views
+  - break-glass discovery
+
+EMEA cell
+  yuzu-server x N
+  gateway x 3+
+  HA Postgres
+  monitoring/SIEM
+  warm standby region
+  regional agents
+
+APAC cell
+  yuzu-server x N
+  gateway x 3+
+  HA Postgres
+  monitoring/SIEM
+  warm standby region
+  regional agents
+
+Americas cell
+  yuzu-server x N
+  gateway x 3+
+  HA Postgres
+  monitoring/SIEM
+  warm standby region
+  regional agents</pre>
+      </div>
+
+      <h3>Gateway Layer</h3>
+      <p>Gateways own live streams only. They publish health, load, drain state, build version, active stream count, queue depth, BEAM mailbox pressure, memory pressure, and upstream health. Agents receive a signed gateway directory and reconnect using sticky selection, latency, load, health, and jittered backoff.</p>
+
+      <h3>Durable Presence</h3>
+      <p>Regional Postgres stores gateway membership and agent presence. Agent ownership is fenced with <code>connection_epoch</code>, <code>gateway_id</code>, and <code>session_id</code> so stale gateways cannot overwrite newer stream ownership.</p>
+
+      <h3>Durable Command Mailbox</h3>
+      <p>Accepted commands, target rows, delivery leases, attempts, and response sequence keys are stored in Postgres before delivery. Gateways claim target rows for connected agents; gateway death is recovered by lease expiry and agent reconnect.</p>
+
+      <h3>Server Layer</h3>
+      <p>Multiple <code>yuzu-server</code> replicas serve REST, HTMX, MCP, enrollment, command admission, and collation. Singleton jobs use Postgres advisory locks or row leases. Process-local state is cache only for HA-sensitive flows.</p>
+
+      <h3>Postgres Layer</h3>
+      <p>Each regional cell uses a single writable primary, synchronous same-region standby, async warm-region replica, PITR, tested backups, monitored replication lag, and an explicit manual promotion runbook. Multi-primary writes are out of scope for v1.</p>
+    </section>
+
+    <section>
+      <h2>Correctness Invariants</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Invariant</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Gateways own live streams only; Postgres owns accepted work.</td>
+            <td>Gateway loss must not lose admitted commands.</td>
+          </tr>
+          <tr>
+            <td>Server replicas are interchangeable on HA paths.</td>
+            <td>Dispatch and collate must survive process loss.</td>
+          </tr>
+          <tr>
+            <td>Presence and delivery are fenced by epoch and lease owner.</td>
+            <td>Stale gateways cannot clobber newer ownership.</td>
+          </tr>
+          <tr>
+            <td>Delivery is at-least-once, with idempotent command and response recording.</td>
+            <td>Exactly-once network delivery is not a realistic distributed-system contract.</td>
+          </tr>
+          <tr>
+            <td>Warm-region promotion fences the old primary before accepting writes.</td>
+            <td>Prevents split-brain command, audit, and RBAC state.</td>
+          </tr>
+          <tr>
+            <td>Global views are aggregate-first and residency-aware.</td>
+            <td>Prevents the global plane from becoming an undeclared data-exfiltration path.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Operational Requirements</h2>
+      <ul>
+        <li>SLOs for API/MCP availability, command admission, dispatch latency, gateway reconnect, mailbox age, command success, and DR readiness.</li>
+        <li>Dashboards for gateways, servers, Postgres, replication lag, command leases, reconnect rate, mailbox backlog, and error-budget burn.</li>
+        <li>Alerts for SLO burn, Postgres lag, gateway pressure, reconnect storms, lease backlog, stuck singleton jobs, failed backups, failed restore drills, and standby promotion readiness.</li>
+        <li>Runbooks for gateway loss, gateway drain, server loss, Postgres failover, warm-region promotion, reconnect storm, backup restore, regional isolation, and post-failover reconciliation.</li>
+        <li>Scale and chaos proof from 10k to 100k to 1.2M simulated agents.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Consequences</h2>
+      <ul>
+        <li>HA becomes a multi-quarter platform program, not a gateway-only feature.</li>
+        <li>HA-sensitive server state defaults to Postgres per ADR-0006/0007/0008.</li>
+        <li>Agent registration/config grows a signed gateway directory and regional assignment surface.</li>
+        <li>Gateway upstream protocol grows heartbeat, load, and drain publication.</li>
+        <li>Command dispatch moves from in-memory routing to durable mailbox ownership.</li>
+        <li>Operations artifacts become product deliverables: SLOs, runbooks, drills, dashboards, and evidence.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Options Considered</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Option</th>
+            <th>Decision</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Single-region HA first</td>
+            <td>Rejected. Insufficient for a large global enterprise and would force an immediate second architecture pass.</td>
+          </tr>
+          <tr>
+            <td>Global active primary</td>
+            <td>Rejected. Creates latency, residency, and blast-radius problems for 56 countries.</td>
+          </tr>
+          <tr>
+            <td>Country-level cells from v1</td>
+            <td>Deferred. Macro-regional cells are the first target; strict country residency can extend the model.</td>
+          </tr>
+          <tr>
+            <td>Active-active multi-region writes</td>
+            <td>Rejected for v1. Conflict semantics across commands, audit, RBAC, enrollment, and policy state are too costly.</td>
+          </tr>
+          <tr>
+            <td>Gateway gossip as durable truth</td>
+            <td>Rejected. Gossip is useful for fast routing, but durable recovery needs leases and fencing in Postgres.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Implementation Ladder</h2>
+      <ol>
+        <li>Define Enterprise HA SLOs, evidence requirements, and readiness semantics.</li>
+        <li>Add signed gateway directory publication and agent-side multi-gateway failover.</li>
+        <li>Add gateway heartbeat, load, and drain publication.</li>
+        <li>Add durable gateway and agent presence with epoch fencing.</li>
+        <li>Add durable command mailbox and per-target leases.</li>
+        <li>Move bundle manifests to Postgres.</li>
+        <li>Make server replicas horizontally safe by fencing singleton jobs.</li>
+        <li>Package a 3-zone regional cell deployment.</li>
+        <li>Add warm-region replication, promotion tooling, and standby readiness checks.</li>
+        <li>Add the thin global aggregate/routing plane.</li>
+        <li>Run scale and chaos proof against large-enterprise-size assumptions.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://learn.microsoft.com/en-us/intune/fundamentals/what-is-intune">Microsoft Intune overview</a></li>
+        <li><a href="https://www.kamailio.org/docs/modules/stable/modules/dispatcher.html">Kamailio dispatcher</a></li>
+        <li><a href="https://www.kamailio.org/docs/modules/stable/modules/dmq.html">Kamailio DMQ</a></li>
+        <li><a href="https://grpc.io/docs/guides/custom-load-balancing/">gRPC custom load balancing</a></li>
+        <li><a href="https://www.postgresql.org/docs/current/high-availability.html">PostgreSQL high availability</a></li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

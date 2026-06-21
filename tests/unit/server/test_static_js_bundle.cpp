@@ -415,7 +415,7 @@ TEST_CASE("static_js_bundle: WEB_PORTS contains only classic frontend-tier ports
     // contract today: WEB_PORTS is the set of listener ports that mean
     // "this machine is an HTTP-serving frontend / reverse proxy / load
     // balancer" — the **first tier** in a classic three-tier deployment
-    // (HSBC-style: API gateway / reverse proxy → app servers → database).
+    // (enterprise-style: API gateway / reverse proxy → app servers → database).
     //
     // Dev-server defaults (express on :3000, angular on :4200, vite on
     // :5173, django dev on :8000) are NOT frontend tier — they're

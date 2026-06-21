@@ -50,7 +50,7 @@ The actual Windows validation does NOT depend on this workflow — see "Resume" 
 
 ## Resume the Windows live run
 
-When on a network that lets Tailscale reach Shulgi (anything that isn't HSBC guest WiFi — UDP and DERP both seem blocked there):
+When on a network that lets Tailscale reach Shulgi (some guest WiFi networks block both UDP and DERP):
 
 ```bash
 # Step 1 — confirm Shulgi is reachable

@@ -405,7 +405,7 @@ reading the Postgres graph into an in-memory adjacency.
 **Tractability is N-independent** because (a) depth-bounding makes per-source cost depend
 on the *d-hop neighborhood*, not on N, and (b) sources/sinks are bounded by the *declared*
 entry/jewel surface, not fleet size. The remaining constraint is graph *loading* at
-**1.2M hosts (HSBC scale target)** — solved by the **edge pre-filter**: every agent
+**1.2M hosts (large-enterprise scale target)** — solved by the **edge pre-filter**: every agent
 self-flags `(has-KEV ∧ exposes-service)`, `(is-crown-jewel)`, `(on-cross-trust-boundary)`
 as zero-message local facts, and **the server assembles only the flagged subgraph + its
 connecting edges.** Even a pessimistic 5% survival = ~60k host-nodes — trivial for central

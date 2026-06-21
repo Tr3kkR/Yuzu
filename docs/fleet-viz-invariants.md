@@ -238,7 +238,7 @@ Standing rules:
   API gateways. Common dev-server ports (`3000` express, `4200`
   angular, `5173` vite, `8000` django) are **not** in WEB_PORTS, even
   though they speak HTTP. A nodejs/django/vite server is application
-  work in a classic three-tier deployment (HSBC-style: gateway →
+  work in a classic three-tier deployment (enterprise-style: gateway →
   app servers → database); putting it on the frontend plane
   misrepresents the topology a reviewer expects. The dev-server
   ports cost a real misclassification on the Cedar & Vale UAT rig

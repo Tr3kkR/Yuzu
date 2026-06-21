@@ -13,7 +13,7 @@ depends-on: 0006/0007/0008 (server-side Postgres substrate chain — accepted 20
 
 Raw CVSS ranking is noise at fleet scale. We want findings ranked by their position on a
 probable attack path from an entry point to a crown jewel, plus chokepoint and segmentation
-recommendations — at up to **1.2M hosts (HSBC scale)**. The naive approach (enumerate all
+recommendations — at up to **1.2M hosts (large-enterprise scale)**. The naive approach (enumerate all
 attack paths) is the well-known attack-graph state explosion (worst-case factorial paths);
 generic betweenness centrality is O(V·E) and answers the wrong question.
 

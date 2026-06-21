@@ -312,7 +312,7 @@ migration pending" still open their own SQLite files only because each store mig
 incrementally behind its own ADR. The SQLite-everywhere principle has been **retired for the
 server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
 joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
-scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
+scale (1.2M large-enterprise target), durable offline-endpoint state, and pgvector identity matching. **SQLite
 is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the federated edge
 warehouse (ADR-0003) and `agent.db` KV/identity — because endpoint locality is exactly what
 makes SQLite right there.

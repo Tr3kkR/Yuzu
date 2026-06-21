@@ -22,7 +22,7 @@ server's storage substrate."
 
 The server today runs ~27 separate SQLite stores. Their cross-store joins are
 application-layer joins across files (`edges ⨝ findings ⨝ value ⨝ guardian_state` is the
-sharp example — ADR-0004); the scale targets (>1M agents; 1.2M at HSBC), durable
+sharp example — ADR-0004); the scale targets (>1M agents; 1.2M large-enterprise target), durable
 offline-endpoint state, pgvector identity matching, and ordinary operational maturity (HA,
 point-in-time backup/restore, real concurrency) all argue for one relational substrate
 rather than a file-per-concern sprawl. `docs/architecture.md` already anticipated exactly
