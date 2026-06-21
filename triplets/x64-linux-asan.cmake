@@ -17,6 +17,24 @@ set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE dynamic)
 set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 
+# libpq (Postgres substrate, ADR-0006) must be STATIC even though the rest of the
+# sanitizer dep tree is dynamic — two reasons, both surfaced by the Big Tam cold
+# sanitizer build (the deps haven't been rebuilt from source since libpq landed):
+#   1. meson.build's unix libpq block hard-requires the static
+#      libpgcommon.a/libpgport.a archives (scram/auth helpers) that ONLY the
+#      static build emits; a dynamic libpq.so has no standalone pgcommon → meson
+#      fails with "library 'pgcommon' not found".
+#   2. PostgreSQL's shared-lib `libpq-refs-stamp` check rejects the ASan-injected
+#      symbols as "calling exit". vcpkg's libpq Makefile builds the .so only on
+#      the `all-shared-lib` path; the static path (`all-static-lib`) skips the .so
+#      and that check entirely.
+# Matches the stock x64-linux triplet (which is already static). The triplet's
+# -fsanitize flags still apply to the static archive, so sanitizer coverage
+# inside libpq is preserved.
+if(PORT STREQUAL "libpq")
+    set(VCPKG_LIBRARY_LINKAGE static)
+endif()
+
 # Sanitiser flags propagate to every compiled C/C++ TU in vendored
 # dependencies. `-fno-omit-frame-pointer` keeps backtraces accurate;
 # `-g` keeps file:line debug info.
