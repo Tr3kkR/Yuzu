@@ -425,9 +425,39 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: ccache stats
+      - name: ccache stats + build observability
         if: always()
-        run: ccache -s
+        run: |
+          # Informational only — never fail the job from here (set +e).
+          set +e
+          ccache -s
+          # Machine-readable parse for a job-summary: cache warmth + effective
+          # parallelism + LTO. Mirrors the Windows leg (P3 observability) so
+          # every self-hosted leg surfaces cold/fragmented caches and -j
+          # behaviour automatically, instead of only by hand.
+          s="$(ccache --print-stats 2>/dev/null)"
+          get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
+          hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
+          miss=$(get cache_miss)
+          total=$(( hits + miss ))
+          rate="n/a"; [ "$total" -gt 0 ] && rate=$(( 100 * hits / total ))
+          {
+            echo "### Linux ${{ matrix.compiler }} ${{ matrix.build_type }} — cache & parallelism"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| ccache hit rate | ${rate}% (${hits}/${total}) |"
+            echo "| ccache misses | ${miss} |"
+            echo "| effective -j | ${YUZU_BUILD_JOBS:-ninja default} |"
+            echo "| LTO | ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Cold-cache alarm: a near-zero hit rate over a meaningful sample on a
+          # self-hosted runner means the shared caches aren't warming (the
+          # fragmentation signal we previously only caught manually).
+          if [ "$total" -gt 100 ] && [ "$rate" != "n/a" ] && [ "$rate" -lt 40 ]; then
+            echo "::warning::ccache hit rate ${rate}% over ${total} compiles is low on the Big Tam self-hosted pool — caches may be cold/fragmented (see docs/ci-architecture.md)"
+          fi
+          exit 0
 
   # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
@@ -876,9 +906,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: ccache stats
+      - name: ccache stats + build observability
         if: always()
-        run: ccache -s
+        run: |
+          # Informational only — never fail the job from here (set +e).
+          set +e
+          ccache -s
+          # Mirror the Linux/Windows job-summary (P3 observability). macOS is a
+          # GHA-hosted ephemeral runner with an actions/cache-backed ccache, so
+          # a cold restore is expected on a cache-key miss — no cold-cache
+          # ::warning:: here (that signal is self-hosted-only).
+          s="$(ccache --print-stats 2>/dev/null)"
+          get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
+          hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
+          miss=$(get cache_miss)
+          total=$(( hits + miss ))
+          rate="n/a"; [ "$total" -gt 0 ] && rate=$(( 100 * hits / total ))
+          {
+            echo "### macOS ${{ matrix.build_type }} — cache & parallelism"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| ccache hit rate | ${rate}% (${hits}/${total}) |"
+            echo "| ccache misses | ${miss} |"
+            echo "| effective -j | ${YUZU_BUILD_JOBS:-ninja default} |"
+            echo "| LTO | ${{ matrix.build_type == 'release' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       # Paired saves for the two restore-only steps above. `if: always()`
       # is the documented replacement for `save-always: true` and lets
