@@ -130,6 +130,7 @@ agent_test_exe = executable(
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
+    'unit/test_env_util.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

@@ -22,6 +22,14 @@
 ## --cert-san: the default leaves are minted with SANs for the in-compose
 ## service names so SNI verification succeeds (agent→`gateway`, gateway→`server`).
 ##
+## Mgmt-plane reachability: the gateway co-hosts the agent edge (:50051) and the
+## privileged mgmt plane (:50063) on 0.0.0.0, so on this single demo bridge an
+## agent could reach :50063 at the network layer. Strict mutual TLS (#1314) is the
+## control that rejects it (no CA-issued cert → no handshake). A *production*
+## deployment additionally isolates/firewalls the mgmt plane from agents at the
+## infra layer; binding the enrolled-agent residual to the server's identity (not
+## just any CA cert) is tracked as #1422.
+##
 ## Usage:
 ##   export YUZU_VERSION=0.12.0
 ##   # seed an admin into ./yuzu-server.cfg (user:admin:<salt>:<pbkdf2> — see

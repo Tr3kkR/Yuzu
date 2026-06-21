@@ -397,8 +397,18 @@ disable checkbox) were already secure-by-default.
 (`/etc/yuzu/certs/default-ca.pem`, or the Windows ProgramData path) **before**
 grpc falls back to the system trust store — a Yuzu self-signed CA is not in the
 system roots, so without this an agent pointed at a default-cert server silently
-fails the handshake. If neither an explicit `--ca-cert` nor a discovered CA is
-present it logs a clear warning rather than failing opaquely.
+fails the handshake.
+
+**Fail-closed when no CA can be pinned (#1303).** If neither an explicit `--ca-cert`
+nor a discovered install CA is present, the agent **refuses to start** (logs the
+remediation and exits non-zero) rather than connecting against the system trust
+store — which does *not* trust a Yuzu self-signed install CA, so with the gateway
+one-way-TLS edge live an empty root set is a fail-open MITM window on the command
+fan-out plane. The deliberate escape hatch is **`--tls-system-roots` /
+`YUZU_TLS_SYSTEM_ROOTS`** (value-aware: `1/true/yes/on` enables, anything else incl.
+unset/`0` disables), for the case where the server leaf chains to a public/corporate
+CA already in the system store; it logs a loud warning and is never the default.
+`--no-tls` remains the dev/demo opt-out.
 
 **Cross-container cert sharing — `--cert-group`.** A multi-container deploy
 (server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids but

@@ -285,7 +285,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
   redirect) and the agent/management/gateway listeners over (m)TLS; the agent
   connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
-  install CA** at `/etc/yuzu/certs/default-ca.pem`. Two operational notes: (1)
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
+  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
+  **refuses to start** (exits non-zero) instead of silently verifying against the
+  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
+  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
+  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
+  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
   the dashboard cert is signed by the per-install CA, so a browser shows an
   untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
   /api/v1/ca/root`); (2) for a multi-container deploy sharing one
