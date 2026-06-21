@@ -277,6 +277,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
+  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
+  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
+  container started from the published image is **encrypted + mutually
+  authenticated out of the box**: the server auto-generates a per-install CA and
+  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
+  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
+  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
+  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
+  **refuses to start** (exits non-zero) instead of silently verifying against the
+  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
+  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
+  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
+  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
+  the dashboard cert is signed by the per-install CA, so a browser shows an
+  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
+  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
+  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
+  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
+  with the `yuzu-pki` group baked into all three images, so the
+  different-uid containers can read the shared certs (the CA/server/HTTPS private
+  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
+  Native installs (deb/systemd, Windows installer) were already secure-by-default.
+  New secure reference composes: `docker-compose.reference.yml` (single server) and
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
+  gateway topology the **privileged server→gateway command plane (`:50063`) is now
+  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
+  CA-issued client cert, so a container with no Yuzu cert — including a compromised
+  agent — can no longer push commands to the fleet over that plane (previously it
+  was plaintext + unauthenticated). To run the old insecure posture, pass
+  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
+  "Secure-by-default deployment".
 - **Windows TAR process events no longer carry a command line (`cmdline` is
   empty).** With the Windows `process` source moving from the snapshot-diff poll
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
