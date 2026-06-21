@@ -1,14 +1,4 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
   "annotations": {
     "list": []
   },
@@ -22,7 +12,7 @@
       "title": "Connected Agents",
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_agents_connected",
@@ -45,7 +35,7 @@
       "title": "Total Registrations",
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_agents_registered_total",
@@ -57,7 +47,7 @@
       "title": "Commands Dispatched",
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_commands_dispatched_total[5m])",
@@ -74,7 +64,7 @@
       "title": "Command Completion Rate",
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_commands_completed_total[5m])",
@@ -91,7 +81,7 @@
       "title": "Connected Agents Over Time",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_agents_connected",
@@ -103,7 +93,7 @@
       "title": "Command Latency (p50 / p95 / p99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, rate(yuzu_command_duration_seconds_bucket[5m]))",
@@ -128,7 +118,7 @@
       "title": "Commands Dispatched vs Completed",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_commands_dispatched_total[5m])",
@@ -153,7 +143,7 @@
       "title": "gRPC Requests by Method",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_grpc_requests_total[5m])",
@@ -170,7 +160,7 @@
       "title": "HTTP Requests by Method/Status",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_http_requests_total[5m])",
@@ -187,7 +177,7 @@
       "title": "Agent Commands Executed (by plugin)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_agent_commands_executed_total[5m])",
@@ -210,7 +200,7 @@
       "title": "Healthy Agents",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 0, "y": 29 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_fleet_agents_healthy",
@@ -233,7 +223,7 @@
       "title": "Heartbeat Rate",
       "type": "timeseries",
       "gridPos": { "h": 4, "w": 8, "x": 8, "y": 29 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_heartbeats_received_total[5m])",
@@ -248,7 +238,7 @@
       "title": "Agents by OS",
       "type": "piechart",
       "gridPos": { "h": 4, "w": 8, "x": 16, "y": 29 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_fleet_agents_by_os",

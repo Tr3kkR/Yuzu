@@ -1,14 +1,4 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
   "annotations": { "list": [] },
   "editable": true,
   "graphTooltip": 1,
@@ -30,7 +20,7 @@
       "title": "Current Agents",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "sum(yuzu_gw_agents_current)",
@@ -52,7 +42,7 @@
       "title": "Total Connections",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "sum(yuzu_gw_agents_connected_total)",
@@ -64,7 +54,7 @@
       "title": "Total Disconnections",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "sum(yuzu_gw_agents_disconnected_total)",
@@ -76,7 +66,7 @@
       "title": "Commands Dispatched Rate",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_gw_commands_dispatched_total[5m])",
@@ -91,7 +81,7 @@
       "title": "Command Latency (p50 / p95 / p99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, rate(yuzu_gw_command_duration_ms_bucket[5m]))",
@@ -114,7 +104,7 @@
       "title": "Upstream RPC Latency",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, rate(yuzu_gw_upstream_rpc_duration_ms_bucket[5m]))",
@@ -133,7 +123,7 @@
       "title": "Upstream RPC Errors",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "rate(yuzu_gw_upstream_rpc_errors_total[5m])",
@@ -148,7 +138,7 @@
       "title": "BEAM Process Count",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_gw_beam_process_count",
@@ -160,7 +150,7 @@
       "title": "BEAM Memory Usage",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_gw_beam_memory_bytes",
@@ -175,7 +165,7 @@
       "title": "Scheduler Utilization",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
-      "datasource": "${DS_PROMETHEUS}",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "expr": "yuzu_gw_beam_scheduler_util",
