@@ -45,7 +45,7 @@ name: "CodeQL"
 #     build-{linux,windows}-{asan,tsan,coverage}/
 #   - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB Windows;
 #     MSVC debug builds are chunkier)
-#   - Weekly scheduled run (Sunday 04:00 UTC, low-activity window)
+#   - Daily scheduled run (04:00 UTC, low-activity window)
 #   - Manual workflow_dispatch
 #
 # Known remaining coverage gaps:
@@ -62,11 +62,13 @@ name: "CodeQL"
 on:
   workflow_dispatch:
   schedule:
-    # Weekly Sunday 04:00 UTC — off-hours, both runners available.
-    # Both Linux and Windows runs start simultaneously on their
-    # respective runners (no queue contention between them; they're
-    # different physical hosts on the same desktop).
-    - cron: "0 4 * * 0"
+    # Daily 04:00 UTC — off-hours, both runners available. Tightens C++
+    # vuln detection from <=7 days to <=24h (folds CodeQL into the Tier-3
+    # nightly cadence; it stays a ~20-25 min trace, NOT the PR fast-path).
+    # 04:00 is 2h ahead of nightly.yml's 06:00 cron so the two self-hosted
+    # Linux workloads don't contend for the Big Tam pool. Both Linux and
+    # Windows legs start simultaneously on their respective runners.
+    - cron: "0 4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
