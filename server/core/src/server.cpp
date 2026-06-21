@@ -793,13 +793,11 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Create gateway management client for command forwarding
-        if (!cfg_.gateway_command_address.empty()) {
-            gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address,
-                                                   grpc::InsecureChannelCredentials());
-            gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-            spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
-        }
+        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // built in run(), AFTER bootstrap_default_certs() — for a default-cert
+        // install the client cert/key paths are empty here and only populated by
+        // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
+        // pre-bootstrap-empty reason the per-agent mTLS wiring is deferred to run().
 
         // Load auto-approve policies
         auto approve_path = cfg_.db_dir() / "auto-approve.cfg";
@@ -2004,7 +2002,7 @@ public:
             spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
-                                  cfg_.cert_sans)) {
+                                  cfg_.cert_sans, cfg_.cert_group)) {
             spdlog::error("default certificates were required but generation failed");
             default_certs_failed_ = true;
             return;
@@ -2108,6 +2106,38 @@ public:
                           "--no-default-certs to opt out.");
             startup_failed_ = true;
             return;
+        }
+
+        // Gateway command-forwarding client — built HERE (post-bootstrap) so the
+        // mutual-TLS dial sees the now-populated server leaf + CA (HIGH-2 #1314).
+        // When TLS is on, dial the gateway's privileged command plane over MUTUAL
+        // TLS (server presents its leaf, verifies the gateway against the install
+        // CA). The gateway's mgmt listener requires the client cert, so an
+        // unauthenticated container — including a compromised agent with no
+        // CA-issued cert — can no longer push commands to the fleet. Only a
+        // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
+        if (!cfg_.gateway_command_address.empty()) {
+            std::shared_ptr<grpc::ChannelCredentials> gw_creds;
+            if (cfg_.tls_enabled) {
+                gw_creds = build_gateway_command_credentials();
+                if (!gw_creds)
+                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
+                                  "build mutual-TLS credentials.",
+                                  cfg_.gateway_command_address);
+            } else {
+                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.",
+                             cfg_.gateway_command_address);
+                gw_creds = grpc::InsecureChannelCredentials();
+            }
+            if (gw_creds) {
+                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
+                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
+                spdlog::info("Gateway command forwarding enabled: {} ({})",
+                             cfg_.gateway_command_address,
+                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+            }
         }
 
         // PKI PR3: per-agent mTLS issuance + enforcement, wired AFTER the
@@ -2831,6 +2861,68 @@ private:
         for (auto& kc : ssl_opts.pem_key_cert_pairs) {
             yuzu::secure_zero(kc.private_key);
         }
+        return creds;
+    }
+
+    // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
+    // plane (ManagementService at --gateway-command-addr). The gateway's mgmt
+    // listener is the PRIVILEGED command-fan-out plane; without mTLS it is an
+    // unauthenticated fleet-RCE surface reachable by any container that can route
+    // to it (incl. a compromised agent). Here the server PRESENTS its own leaf as
+    // the client cert and VERIFIES the gateway against the install CA, so the
+    // gateway can require a client cert (strict mTLS) and reject anyone who can't
+    // present a CA-issued cert. Returns nullptr (fail-closed — caller disables
+    // command forwarding) if the required cert material is missing/unreadable.
+    //
+    // The two directions are NOT symmetric. Server→gateway (here): grpc verifies
+    // the gateway's identity by SNI/SAN against the dialled host, so the server
+    // talks only to the real gateway. Gateway→server (the listener's acceptance
+    // policy): verify_peer authenticates to the CA, NOT to a specific identity.
+    //
+    // Residual (tracked, PKI-ladder): because the gateway side authenticates to
+    // the CA only, ANY holder of ANY CA-issued cert+key passes — an enrolled
+    // agent's stolen per-agent leaf, or the default-server/default-gateway leaves
+    // (0600, need filesystem compromise to extract). There is also no CRL/OCSP
+    // check on this path yet, so a revoked-but-stolen leaf still passes. Pinning
+    // the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) + mgmt
+    // revocation is the cryptographic-identity-binding item that lands with the
+    // QUIC-era rework; through-gateway identity stays app-layer until then. mTLS
+    // still closes the far larger hole: the plaintext, no-cert-required plane.
+    [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
+    build_gateway_command_credentials() const {
+        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
+                          "client cert/key to present for mutual TLS — command forwarding "
+                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
+            return nullptr;
+        }
+        if (cfg_.tls_ca_cert.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
+                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
+            return nullptr;
+        }
+        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
+            return nullptr;
+        }
+        grpc::SslCredentialsOptions ssl_opts;
+        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
+        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
+        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
+        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
+            ssl_opts.pem_private_key.empty()) {
+            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
+                          "command forwarding DISABLED (fail-closed).");
+            yuzu::secure_zero(ssl_opts.pem_private_key);
+            return nullptr;
+        }
+        auto creds = grpc::SslCredentials(ssl_opts);
+        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
+        // key is the sensitive one, the CA/cert are public, but zeroing all three
+        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
+        // metadata resident longer than needed.
+        yuzu::secure_zero(ssl_opts.pem_private_key);
+        yuzu::secure_zero(ssl_opts.pem_cert_chain);
+        yuzu::secure_zero(ssl_opts.pem_root_certs);
         return creds;
     }
 
