@@ -8,6 +8,7 @@ cmd.exe on Windows.  This script works on all platforms.
 import glob
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -98,5 +99,56 @@ if sys.platform == "win32":
 else:
     cmd = ["rebar3", "compile"]
 
-result = subprocess.run(cmd, cwd=gateway_dir, env=env)
-sys.exit(result.returncode)
+# Bound the rebar3 compile so a hung gateway build fails fast instead of
+# burning the whole CI job's timeout (a stuck dep fetch or an orphaned
+# erl.exe/epmd.exe holding a lock once silently ate 120 min). Default 15 min;
+# override with YUZU_GATEWAY_BUILD_TIMEOUT (seconds; 0 or negative disables).
+# rebar3 spawns escript -> erl -> beam, so on timeout we must kill the whole
+# process tree — a bare proc.kill() leaves those grandchildren orphaned
+# (especially on Windows), which is the very lock-holder we're guarding against.
+try:
+    timeout_s = int(os.environ.get("YUZU_GATEWAY_BUILD_TIMEOUT", "900"))
+except ValueError:
+    timeout_s = 900
+
+popen_kwargs = {"cwd": gateway_dir, "env": env}
+if sys.platform != "win32":
+    # New session so the whole tree shares a process group we can signal.
+    popen_kwargs["start_new_session"] = True
+
+
+def _kill_tree(p):
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            p.kill()
+
+
+proc = subprocess.Popen(cmd, **popen_kwargs)
+try:
+    sys.exit(proc.wait(timeout=timeout_s if timeout_s > 0 else None))
+except subprocess.TimeoutExpired:
+    sys.stderr.write(
+        f"\nbuild_gateway: rebar3 compile exceeded {timeout_s}s "
+        "(YUZU_GATEWAY_BUILD_TIMEOUT) — killing the process tree and failing.\n"
+        f"  cmd: {cmd}\n"
+        "  Likely a hung dep fetch or an orphaned erl.exe/epmd.exe holding a "
+        "lock; see docs/erlang-gateway-build.md.\n"
+    )
+    sys.stderr.flush()
+    _kill_tree(proc)
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+    sys.exit(124)  # conventional timeout exit code (matches GNU `timeout`)
+except KeyboardInterrupt:
+    _kill_tree(proc)
+    raise
