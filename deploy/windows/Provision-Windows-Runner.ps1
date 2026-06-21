@@ -45,6 +45,7 @@ param(
   [string]$VcpkgRoot       = 'C:\vcpkg',
   [string]$Msys2Root       = 'C:\msys64',
   [int]   $PostgresPort    = 5433,
+  [int]   $PostgresMaxConnections = 400,  # shared 4-runner instance: the default 100 exhausts (CH-9)
   [string]$ManifestPath    = 'C:\actions-runner\toolchain-manifest.json'
 )
 $ErrorActionPreference = 'Continue'
@@ -165,8 +166,18 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
     & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
   }
+  # Tune for the shared 4-runner instance: server-test suites across concurrent
+  # CCD-pinned runners exhaust the default max_connections=100, so PgPool.acquire()
+  # returns an empty lease (the CH-9 [pg][chaos] flake). logging_collector=on so a
+  # future exhaustion is diagnosable (off by default leaves no log files). Both are
+  # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
+  & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
+  & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
+  Restart-Service $svc -Force
+  $deadline=(Get-Date).AddSeconds(90)
+  while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
   Remove-Item Env:\PGPASSWORD
-  "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready"
+  "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
