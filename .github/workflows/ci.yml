@@ -99,7 +99,9 @@ jobs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
       # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
-      linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
+      # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
+      # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
+      bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
       # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
       # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
       # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
@@ -163,32 +165,42 @@ jobs:
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
 
-  # ── Linux (GCC + Clang, self-hosted yuzu-wsl2-linux) ──────────────────
+  # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
-    # PR-7 of CI overhaul plan: skip if the self-hosted Linux job pool is
-    # unhealthy or unknown. Pool = any [self-hosted, Linux, X64] runner online
-    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'` (NOT `!= 'false'`).
-    if: needs.preflight.outputs.linux_pool_healthy == 'true'
-    # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
-    # state between runs on the same workspace amortizes the install
-    # cost. Trade-off: the single runner process serializes this 4-way
-    # matrix, so multi-commit pushes are slower end-to-end than on the
-    # parallel ubuntu-24.04 fleet. Mirrors the Windows migration in
-    # #374 — the optimization target is Actions-minute spend, not
-    # per-PR latency.
-    runs-on: [self-hosted, Linux, X64]
+    # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
+    # 26.04-only and cannot build on the Shulgi 24.04 fallback, so gate on
+    # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
+    # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
+    # Big Tam skips this job fast instead of queueing against an empty pool.
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    # Self-hosted: Big Tam (Threadripper 9970X, native Ubuntu 26.04). Persistent
+    # ccache + vcpkg state between runs on the same workspace amortizes the
+    # install cost. Trade-off: the runner process serializes this matrix, so
+    # multi-commit pushes are slower end-to-end than on the parallel GHA-hosted
+    # fleet. Mirrors the Windows migration in #374 — the optimization target is
+    # Actions-minute spend, not per-PR latency.
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
+    env:
+      # Big Tam runs 4 runners on one host. A gateway eunit test that boots the
+      # app can transiently bring up Erlang distribution and trip the #659
+      # insecure-default-cookie boot guard (observed flaking 1/4 legs). This is
+      # the documented dev/CI override — the guard's policy logic is still
+      # unit-tested directly by yuzu_gw_app_tests. The host-side per-runner
+      # ERL_EPMD_PORT isolation (each runner's .env) removes the cross-runner
+      # EPMD collision that triggers the transient distribution in the first place.
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc-13, clang-19]
+        compiler: [gcc-15, clang-21]
         build_type: [debug, release]
         exclude:
-          # PRs: only gcc-13 debug (fast feedback)
+          # PRs: only gcc-15 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
-          - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
 
     steps:
       # PR-5 of the CI overhaul plan: clean:false preserves build-linux/
@@ -229,11 +241,30 @@ jobs:
 
       - name: Install system packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev \
-            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
+          # The Big Tam host runs 4 runners (r0-r3), so the matrix legs hit apt
+          # concurrently and race the system locks (Shulgi was one runner, so its
+          # matrix serialized and never contended). apt operations cannot run in
+          # parallel by design. DPkg::Lock::Timeout only governs the dpkg FRONTEND
+          # lock (install) — it does NOT cover `apt-get update`'s lists lock
+          # (/var/lib/apt/lists/lock), which still failed instantly under
+          # contention. So serialize the whole apt sequence across legs with flock
+          # on a shared host lock (the standard fix — this is what apt-systemd-daily
+          # itself does). Keep DPkg::Lock::Timeout inside as belt-and-suspenders
+          # for the frontend lock vs. any background unattended-upgrades. Serializing
+          # apt also staggers the legs, so they don't hit ensure-postgres (one
+          # shared yuzu-ci-postgres container) or pip --user ($HOME) all at once.
+          # FD-9 flock pattern: the subshell opens the lock file on fd 9, flock
+          # blocks up to 600s for it, and releases on subshell exit. /tmp is
+          # 1777 so the runner can create the lock; all 4 runners are the same
+          # user on the same host, so they share it.
+          (
+            flock -w 600 9 || { echo "::error::timed out waiting for apt lock"; exit 1; }
+            sudo apt-get -o DPkg::Lock::Timeout=300 update
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
+              cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
+              bison flex libsystemd-dev \
+              ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
+          ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -247,6 +278,12 @@ jobs:
       # ImageOS is required because erlef/setup-beam can't auto-detect
       # the runner OS on self-hosted; set at step scope so the rest of
       # the job doesn't see it.
+      # DELIBERATELY ubuntu24 even though Big Tam is Ubuntu 26.04: setup-beam
+      # has NO ubuntu26 prebuilt OTP (supported ImageOS tops out at ubuntu24).
+      # ImageOS only selects which prebuilt OTP tarball to fetch; the 24.04
+      # build runs fine on 26.04 (same libcrypto.so.3 soname). Do NOT change to
+      # ubuntu26 until setup-beam ships a 26.04 build — it would fail to resolve
+      # the asset. Verified by gateway eunit on the Big Tam leg.
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
         env:
@@ -309,8 +346,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-19' }}
-          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-19' }}
+          CC: ccache ${{ matrix.compiler == 'gcc-15' && 'gcc-15' || 'clang-21' }}
+          CXX: ccache ${{ matrix.compiler == 'gcc-15' && 'g++-15' || 'clang++-21' }}
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           # Under clean:false (PR-5) build-linux/ may already be configured
@@ -329,11 +366,11 @@ jobs:
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$BUILDDIR" \
-            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-15' && 'linux-gcc15.ini' || 'linux-clang21.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
-            ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
+            ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
 
       - name: Build
         run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
@@ -478,7 +515,7 @@ jobs:
           # a specific error rather than producing weird build failures.
           for tool in meson ninja cl ccache cmake python; do
             if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::$tool not on PATH on yuzu-local-windows runner"
+              echo "::error::$tool not on PATH on the self-hosted Windows runner"
               exit 1
             fi
           done
@@ -493,6 +530,20 @@ jobs:
           # cannot inject a malicious wheel (Gate 7 re-review LOW).
           python -c "import yaml" >/dev/null 2>&1 || \
             python -m pip install --user --require-hashes -r requirements-ci.txt
+
+      - name: Assert toolchain manifest (self-hosted, optional)
+        shell: pwsh
+        run: |
+          # Manifest-based self-test for boxes provisioned via
+          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
+          # runners that predate the manifest — the PATH check above still covers
+          # them. Catches path/version/env drift the bare PATH check misses.
+          $m = 'C:\actions-runner\toolchain-manifest.json'
+          if (Test-Path $m) {
+            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
+          } else {
+            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
+          }
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -648,9 +699,38 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: ccache stats
+      - name: ccache stats + build observability
         if: always()
-        run: ccache -s
+        run: |
+          # Informational only — never fail the job from here (set +e).
+          set +e
+          ccache -s
+          # Machine-readable parse for a job-summary: cache warmth + effective
+          # parallelism + LTO. Surfaces cold/fragmented caches and -j
+          # oversubscription automatically, instead of only by hand (P3).
+          s="$(ccache --print-stats 2>/dev/null)"
+          get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
+          hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
+          miss=$(get cache_miss)
+          total=$(( hits + miss ))
+          rate="n/a"; [ "$total" -gt 0 ] && rate=$(( 100 * hits / total ))
+          {
+            echo "### Windows ${{ matrix.build_type }} — cache & parallelism"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| ccache hit rate | ${rate}% (${hits}/${total}) |"
+            echo "| ccache misses | ${miss} |"
+            echo "| effective -j | ${YUZU_BUILD_JOBS:-ninja default} |"
+            echo "| LTO | ${{ matrix.build_type == 'release' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Cold-cache alarm: a near-zero hit rate over a meaningful sample on a
+          # self-hosted runner means the shared caches aren't warming (the
+          # fragmentation signal we previously only caught manually).
+          if [ "$total" -gt 100 ] && [ "$rate" != "n/a" ] && [ "$rate" -lt 40 ]; then
+            echo "::warning::ccache hit rate ${rate}% over ${total} compiles is low on a self-hosted runner — caches may be cold/fragmented (see deploy/windows/README.md: shared RUNNER_TOOL_CACHE)"
+          fi
+          exit 0
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:

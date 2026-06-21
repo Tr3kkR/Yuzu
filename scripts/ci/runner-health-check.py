@@ -58,6 +58,15 @@ INVENTORY_PATH = ".github/runner-inventory.json"
 # emitted unchanged (the sentinel and any pinned-runner gates rely on them).
 LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
 
+# The Big Tam Linux pool. The ci.yml `linux` compile job pins
+# runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux] because its toolchain
+# (GCC 15 / Clang 21) exists only on Big Tam's Ubuntu 26.04 — Shulgi (24.04)
+# cannot build it. preflight emits `bigtam_pool_healthy=true` iff >=1 such
+# runner is online, so the pinned job skips fast (fail-closed) instead of
+# queueing forever against an offline Big Tam. The compiler-agnostic
+# proto-compat job stays on the broader linux_pool gate.
+BIGTAM_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64", "yuzu-bigtam-linux"})
+
 # The self-hosted Windows job pool — ci.yml's windows job uses
 # runs-on: [self-hosted, Windows, X64]. Same pool-gating treatment as Linux:
 # `windows_pool_healthy=true` iff >=1 eligible runner is online. Includes Shulgi
@@ -71,6 +80,14 @@ def linux_pool_members(expected: dict[str, Any]) -> list[str]:
     return [
         name for name, exp in expected.items()
         if LINUX_POOL_LABELS.issubset(set(exp["labels"]))
+    ]
+
+
+def bigtam_pool_members(expected: dict[str, Any]) -> list[str]:
+    """Declared runners eligible for the Big Tam (yuzu-bigtam-linux) job pool."""
+    return [
+        name for name, exp in expected.items()
+        if BIGTAM_POOL_LABELS.issubset(set(exp["labels"]))
     ]
 
 
@@ -196,6 +213,7 @@ def main() -> int:
         for name in expected:
             write_output(f"{slug(name)}_healthy", "true")
         write_output("linux_pool_healthy", "true")
+        write_output("bigtam_pool_healthy", "true")
         write_output("windows_pool_healthy", "true")
         write_output("all_healthy", "true")
         return 0
@@ -207,6 +225,7 @@ def main() -> int:
             for name in expected:
                 write_output(f"{slug(name)}_healthy", "false")
             write_output("linux_pool_healthy", "false")
+            write_output("bigtam_pool_healthy", "false")
             write_output("windows_pool_healthy", "false")
             write_output("all_healthy", "false")
             return 0
@@ -272,6 +291,10 @@ def main() -> int:
         pool = linux_pool_members(expected)
         pool_ok = any(healthy_map.get(n, False) for n in pool)
         write_output("linux_pool_healthy", "true" if pool_ok else "false")
+        # Big Tam sub-pool gate for the gcc-15/clang-21 compile job (26.04-only).
+        bigtam_pool = bigtam_pool_members(expected)
+        bigtam_ok = any(healthy_map.get(n, False) for n in bigtam_pool)
+        write_output("bigtam_pool_healthy", "true" if bigtam_ok else "false")
         win_pool = windows_pool_members(expected)
         win_ok = any(healthy_map.get(n, False) for n in win_pool)
         write_output("windows_pool_healthy", "true" if win_ok else "false")
