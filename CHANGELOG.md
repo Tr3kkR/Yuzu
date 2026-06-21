@@ -50,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unaffected). Audited `guardian.device.view` on access (denials audited at the auth
   layer as `auth.scoped_permission_required`). Path params are length-capped
   (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
-  the A4 envelope (`correlation_id`), while the `403` carries the RBAC layer's standard
-  denial shape.
+  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
+  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
