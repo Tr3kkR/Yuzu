@@ -212,7 +212,7 @@ jobs:
       # runner.tool_cache binary caches — those have their own
       # sentinel, see scripts/ci/vcpkg-triplet-sentinel.sh).
       - name: Wipe build-linux*/ on branch switch (pre-checkout)
-        # Per-variant dirs (build-linux-gcc-13-debug, ...) — wipe all of
+        # Per-variant dirs (build-linux-gcc-15-debug, ...) — wipe all of
         # them on branch switch, not just the matrix-specific one, so
         # any stale variant-dir from a different branch is also cleared.
         run: |
@@ -332,7 +332,7 @@ jobs:
         env:
           # Single shared cache across all matrix variants. The x64-linux
           # triplet produces bit-identical package zips regardless of the
-          # consuming compiler (gcc-13 vs clang-19) or buildtype (vcpkg
+          # consuming compiler (gcc-15 vs clang-21) or buildtype (vcpkg
           # builds with its own toolchain, not the consumer's). Sharing
           # one cache means the first matrix variant pays the from-source
           # cost (~25 min) and the other three restore in seconds, vs.
@@ -353,12 +353,13 @@ jobs:
           # Under clean:false (PR-5) build-linux/ may already be configured
           # from a previous matrix variant or push. meson setup errors on
           # Per-variant build dir under PR-5 clean:false. Sharing one
-          # build-linux/ across all 4 matrix legs (gcc-13/clang-19 ×
+          # build-linux/ across all 4 matrix legs (gcc-15/clang-21 ×
           # debug/release) trips a meson --reconfigure edge case where
           # the linker driver from a previous variant leaks into the
-          # current one — observed in run #25070779695 where Linux
-          # gcc-13 release ended up linking yuzu-agent with `clang++-19
-          # -flto` instead of `g++-13 -flto`, producing CLI11 undefined
+          # current one — observed historically in run #25070779695 (on
+          # the then-current gcc-13/clang-19 matrix) where Linux gcc-13
+          # release ended up linking yuzu-agent with `clang++-19 -flto`
+          # instead of `g++-13 -flto`, producing CLI11 undefined
           # references. Per-variant dirs eliminate the reconfigure
           # entirely; ccache absorbs the per-TU work across matrix runs
           # so the disk cost is the only added cost (~1-2 GB × 4).
