@@ -3,7 +3,7 @@ name: "CodeQL"
 # CodeQL C++ + GitHub Actions static analysis across BOTH self-hosted
 # runners, running in parallel:
 #   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64/yuzu-shulgi) — gcc-13 build
-#   - yuzu-local-windows (labels: self-hosted/Windows/X64) — MSVC build
+#   - yuzu-weetam-windows (labels: self-hosted/Windows/X64/yuzu-weetam-windows) — MSVC build
 #
 # The Linux leg pins `yuzu-shulgi` explicitly rather than matching the
 # bare `[self-hosted, Linux, X64]` label set. Today Shulgi is the only
@@ -45,7 +45,7 @@ name: "CodeQL"
 #     build-{linux,windows}-{asan,tsan,coverage}/
 #   - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB Windows;
 #     MSVC debug builds are chunkier)
-#   - Weekly scheduled run (Sunday 04:00 UTC, low-activity window)
+#   - Daily scheduled run (04:00 UTC, low-activity window)
 #   - Manual workflow_dispatch
 #
 # Known remaining coverage gaps:
@@ -62,11 +62,13 @@ name: "CodeQL"
 on:
   workflow_dispatch:
   schedule:
-    # Weekly Sunday 04:00 UTC — off-hours, both runners available.
-    # Both Linux and Windows runs start simultaneously on their
-    # respective runners (no queue contention between them; they're
-    # different physical hosts on the same desktop).
-    - cron: "0 4 * * 0"
+    # Daily 04:00 UTC — off-hours, both runners available. Tightens C++
+    # vuln detection from <=7 days to <=24h (folds CodeQL into the Tier-3
+    # nightly cadence; it stays a ~20-25 min trace, NOT the PR fast-path).
+    # 04:00 is 2h ahead of nightly.yml's 06:00 cron so the two self-hosted
+    # Linux workloads don't contend for the Big Tam pool. Both Linux and
+    # Windows legs start simultaneously on their respective runners.
+    - cron: "0 4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -115,7 +117,16 @@ jobs:
             disk_min_gb: 40
             shell: bash
           - os: windows
-            runner: [self-hosted, Windows, X64]
+            # yuzu-weetam-windows pin — successor to the retiring Shulgi
+            # yuzu-local-windows box (see deploy/windows/README.md). The bare
+            # [self-hosted, Windows, X64] set matches BOTH pools; pinning routes
+            # the daily trace to the proven Wee Tam fleet (shared vcpkg binary
+            # cache, meets the 45 GB disk floor). Wee Tam runners are CCD-pinned
+            # to 16 threads, so the Build step passes -j $YUZU_BUILD_JOBS (set by
+            # the pin wrapper) — without it ninja sizes -j from the 64-CPU host
+            # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
+            # CCACHE_RECACHE's forced full recompile makes acute.
+            runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
             build_dir: build-windows-codeql
@@ -381,7 +392,11 @@ jobs:
         # the cache update and degrade subsequent CI builds.
         env:
           CCACHE_RECACHE: "true"
-        run: meson compile -C ${{ matrix.build_dir }}
+        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS on
+        # Wee Tam (unset elsewhere → ninja default, so the Linux leg is
+        # unaffected). Essential here because CCACHE_RECACHE forces every TU to
+        # actually compile, so an uncapped ninja oversubscribes the pinned CCD.
+        run: meson compile -C ${{ matrix.build_dir }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
 
       - name: ccache stats
         if: always()
