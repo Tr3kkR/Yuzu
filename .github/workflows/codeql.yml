@@ -2,18 +2,28 @@ name: "CodeQL"
 
 # CodeQL C++ + GitHub Actions static analysis across BOTH self-hosted
 # runners, running in parallel:
-#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64/yuzu-shulgi) — gcc-13 build
+#   - yuzu-bigtam-linux (labels: self-hosted/Linux/X64/yuzu-bigtam-linux,
+#     native Ubuntu 26.04) — gcc-15 build
 #   - yuzu-weetam-windows (labels: self-hosted/Windows/X64/yuzu-weetam-windows) — MSVC build
 #
-# The Linux leg pins `yuzu-shulgi` explicitly rather than matching the
-# bare `[self-hosted, Linux, X64]` label set. Today Shulgi is the only
-# Linux runner, but the pin is deliberate: any future overflow runner
-# sharing the bare label set must NOT receive this workload unless it
-# meets the 40 GB disk threshold CodeQL needs. (A retired Scaleway cloud
-# builder sized for nightly Coverage routinely sat below it — run
-# 25986790721 died at the disk check at 23 GB free before any CodeQL
-# work — which is why the pin exists.) Same selector pattern nightly.yml
-# uses for the equivalent meson workload.
+# The Linux leg pins `yuzu-bigtam-linux` explicitly rather than matching
+# the bare `[self-hosted, Linux, X64]` label set. The pin is deliberate on
+# two counts: (1) the gcc-15 toolchain is 26.04-only — the Shulgi 24.04
+# fallback can't build it; (2) any future overflow runner sharing the bare
+# label set must NOT receive this workload unless it meets the 40 GB disk
+# threshold CodeQL needs. (A retired Scaleway cloud builder sized for
+# nightly Coverage routinely sat below it — run 25986790721 died at the
+# disk check at 23 GB free before any CodeQL work — which is why the pin
+# exists.) Same selector pattern ci.yml + nightly.yml use for the
+# equivalent meson workload.
+#
+# NOTE: the Linux leg is NOT gated on a preflight bigtam_pool_healthy
+# output (unlike ci.yml/sanitizer-tests/nightly). This is a single matrix
+# job spanning Linux + Windows; a job-level `if` cannot reference the
+# `matrix` context, so a fail-closed per-leg gate would require splitting
+# the job — out of scope for the cutover. If Big Tam is offline at the
+# weekly run, the Linux leg queues until its 90-min timeout (same as the
+# pre-cutover Shulgi-offline behaviour); CodeQL is not a required check.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -104,9 +114,9 @@ jobs:
       matrix:
         include:
           - os: linux
-            # yuzu-shulgi pin — see header comment (guards the 40 GB disk
-            # threshold against any future overflow Linux runner).
-            runner: [self-hosted, Linux, X64, yuzu-shulgi]
+            # yuzu-bigtam-linux pin — see header comment (gcc-15 is 26.04-only
+            # + guards the 40 GB disk threshold against any overflow runner).
+            runner: [self-hosted, Linux, X64, yuzu-bigtam-linux]
             triplet: x64-linux
             vcpkg_bin: vcpkg
             build_dir: build-linux-codeql
@@ -171,11 +181,32 @@ jobs:
         if: matrix.os == 'windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
+      # Big Tam (the Linux leg's runner) does not carry meson on the default
+      # PATH: ci.yml pip-installs it under ~/.local/bin and adds that to PATH
+      # per-job, which does not persist to this workflow. So install the
+      # toolchain here (mirrors ci.yml's linux leg) before the verify below.
+      # flock serializes apt across the 4 runners sharing the Big Tam host —
+      # DPkg::Lock::Timeout does NOT cover apt-get update's lists lock —
+      # reusing ci.yml's lock path so all Big Tam jobs coordinate. Windows
+      # has its toolchain pre-baked on the runner (no apt), so Linux-only.
+      - name: Install system packages (linux)
+        if: matrix.os == 'linux'
+        run: |
+          (
+            flock -w 600 9 || { echo "::error::timed out waiting for apt lock"; exit 1; }
+            sudo apt-get -o DPkg::Lock::Timeout=300 update
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
+              cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
+              bison flex libsystemd-dev gcc-15 g++-15
+          ) 9>/tmp/yuzu-ci-apt.lock
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Assert toolchain available
         run: |
           set -e
           if [[ "${{ matrix.os }}" == "linux" ]]; then
-            TOOLS="meson ninja gcc-13 g++-13 ccache python3 cmake pkg-config"
+            TOOLS="meson ninja gcc-15 g++-15 ccache python3 cmake pkg-config"
           else
             # MSVC cl is on PATH after ilammy/msvc-dev-cmd. Self-hosted
             # runner must have meson/ninja/ccache/cmake/python pre-baked.
@@ -280,8 +311,9 @@ jobs:
       # custom_target must succeed or `meson compile` fails the whole
       # job. Mirror ci.yml's "Install Erlang/OTP and rebar3" step
       # verbatim — same pinned SHA, same OTP version, same ImageOS
-      # override. Runs reliably on the same yuzu-wsl2-linux runner on
-      # every Tier-2 PR build. Replaces the prior `scripts/ensure-erlang.sh`
+      # override (DELIBERATELY ubuntu24 even on Big Tam's 26.04 — setup-beam
+      # has no ubuntu26 OTP; the 24.04 build runs fine on 26.04). Replaces
+      # the prior `scripts/ensure-erlang.sh`
       # +`$GITHUB_PATH` plumbing (PR #923) which could not find Erlang
       # at all when the runner lacked a kerl/asdf/brew install — the
       # 2026-05-10 and 2026-05-17 scheduled runs both failed on this
@@ -321,8 +353,8 @@ jobs:
       - name: Configure (Meson debug) — linux
         if: matrix.os == 'linux'
         env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
+          CC: ccache gcc-15
+          CXX: ccache g++-15
           # ${{ github.workspace }} is inlined directly in step env (NOT
           # via matrix include values) because matrix include values do
           # not expand workflow context expressions. The previous
@@ -342,7 +374,7 @@ jobs:
           # 2026-04-13 baseline run scanned only 231/364 files because
           # tests was skipped).
           meson setup ${{ matrix.build_dir }} \
-            --native-file meson/native/linux-gcc13.ini \
+            --native-file meson/native/linux-gcc15.ini \
             --buildtype=debug \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux" \
             -Dbuild_tests=true
