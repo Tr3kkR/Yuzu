@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
   `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
 
+### Fixed
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
 ### Added
 
 - **ARP + DNS capture sources (TAR, ADR-0011) — Windows.** Two new **opt-in**
@@ -33,7 +46,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process-tree pane gains device-level **DNS-cache + ARP-table panels**
   (audit verbs `tar.dns.read`/`tar.arp.read`). Linux/macOS collectors are planned
   (schema registered, queryable-empty). The Windows agent links `dnsapi`.
-
+- **Guardian — baseline-anchored per-device compliance REST.**
+  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+  returns one Baseline's deployed Guards each with the device's last reported verdict
+  (`compliant` | `drifted` | `errored` | `pending`), plus counts and a `last_updated`
+  freshness stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced
+  set, not the live member list); a not-yet-deployed Baseline returns `deployed:false`
+  with empty guards (consumer renders "No Baseline Deployed"), and member edits
+  appear only after a re-deploy. Designed for embedding Guardian compliance into an
+  external CMDB / ITSM CI record (e.g. ServiceNow).
+  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
+  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
+  device is in — a previously group-scoped token now gets `403` for out-of-scope
+  devices, where a flat global check would have passed them; global tokens are
+  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
+  layer as `auth.scoped_permission_required`). Path params are length-capped
+  (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
+  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
+  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
+- **Live-query bundles — one instruction → several plugin actions on one device,
+  collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
+  returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
+  (collate, `Response:Read`, returns `{complete, received, succeeded, expected,
+  steps[]}` in request order), with MCP parity via the `execute_bundle` /
+  `get_bundle_result` tools. Collapses the N round-trips of refreshing one device
+  (e.g. a ServiceNow CI sync) to a single dispatch plus a poll. The server expands
+  the bundle into N ordinary plugin commands under one `bundle-…` correlation id
+  and fans them out **async** (a slow step never withholds the others); **the agent
+  is unchanged** — it never sees a "bundle". `bundle_id` is deliberately not an
+  `execution_id` (a bundle is not a tracked execution; it is not in the live
+  executions drawer). `complete` means terminal, **not** success — check
+  `succeeded == expected` (an all-offline bundle completes with `succeeded=0`). Each
+  step emits its own `bundle.<plugin>.<action>` device-access audit
+  (`target_type=Agent`), so a bundle is exactly as auditable as the N executions it
+  replaces; collate enforces an ownership guard (a non-owner gets the same 404 as an
+  unknown id). Observable via `yuzu_bundle_{dispatched,collated,manifests,evictions}`
+  metrics plus a `yuzu_bundle_dispatch_duration_seconds` histogram (labelled by
+  surface). v1 bundle state is per-surface and in-memory; a
+  durable Postgres manifest for HA + cross-surface collation is a committed
+  follow-up (ADR-0011).
+- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+  populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
+  (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
+  code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
+  cached by file+mtime) and the loaded-image directory scrubbed of user-profile
+  prefixes before storage. Opt-in (`module_enabled`, default off; enabling takes
+  effect on the next collection tick — no restart). Signing uses the local
+  Authenticode chain **without online CRL/OCSP revocation checking** (no per-load
+  network I/O), so a revoked driver may read as `signed`; authoritative
+  revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
+  risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
+  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
+  Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
+  `docs/tar-module-loads.md`.
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
   `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
@@ -269,6 +335,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
+  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
+  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
+  container started from the published image is **encrypted + mutually
+  authenticated out of the box**: the server auto-generates a per-install CA and
+  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
+  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
+  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
+  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
+  **refuses to start** (exits non-zero) instead of silently verifying against the
+  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
+  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
+  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
+  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
+  the dashboard cert is signed by the per-install CA, so a browser shows an
+  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
+  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
+  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
+  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
+  with the `yuzu-pki` group baked into all three images, so the
+  different-uid containers can read the shared certs (the CA/server/HTTPS private
+  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
+  Native installs (deb/systemd, Windows installer) were already secure-by-default.
+  New secure reference composes: `docker-compose.reference.yml` (single server) and
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
+  gateway topology the **privileged server→gateway command plane (`:50063`) is now
+  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
+  CA-issued client cert, so a container with no Yuzu cert — including a compromised
+  agent — can no longer push commands to the fleet over that plane (previously it
+  was plaintext + unauthenticated). To run the old insecure posture, pass
+  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
+  "Secure-by-default deployment".
 - **Windows TAR process events no longer carry a command line (`cmdline` is
   empty).** With the Windows `process` source moving from the snapshot-diff poll
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
@@ -365,6 +464,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
+  per-source enable check could commit one extra snapshot **after** the operator's
+  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
+  diffed against that stale baseline and emitted ghost "stopped" events for every
+  process/connection/service/user that had exited during the pause, breaking the
+  documented "re-enabling starts from a clean baseline" contract. The disable
+  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
+  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
+  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
+  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
+  disable is refused (the source stays enabled and `configure` returns an error)
+  rather than leaving a disabled source with a stale baseline. The
+  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
+  centralised in `diff_state_key()`, used by both the collectors and the disable path
+  so it cannot drift. **Operator-visible change:** the first collection cycle after a
+  re-enable emits a `started` event for every entity currently running/open (an
+  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
+  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
+  row, so the same race is closed for them too: disabling resets the in-memory
+  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
+  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
+  commits no post-disable row, and a re-enable re-baselines instead of emitting a
+  first row whose rate-average covers the entire paused window (a privacy concern on
+  the opt-in, default-off `procperf` per-application source).
 - **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
   The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
   opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`

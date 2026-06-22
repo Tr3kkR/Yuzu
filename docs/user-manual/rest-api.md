@@ -66,6 +66,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [OpenAPI Spec](#openapi-spec)
   - [Inventory](#inventory)
   - [Execution Statistics](#execution-statistics)
+  - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
   - [Software Deployment](#software-deployment)
   - [License Management](#license-management)
@@ -1526,6 +1527,9 @@ Query audit events.
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
+| `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
+| `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
+| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`) or `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
@@ -2669,6 +2673,119 @@ See `docs/yaml-dsl-spec.md` § `spec.visualization` for the full configuration s
 
 ---
 
+### Live-Query Bundles
+
+Fan **one** instruction out into several plugin actions on **one** device and collate the results — server-side async fan-out (ADR-0011). Use this instead of issuing N separate `execute_instruction` / `POST /api/instructions/{id}/execute` calls when you need to refresh a single device (e.g. a ServiceNow CI sync): N round-trips collapse to one dispatch plus one (or a few) polls.
+
+The server expands the bundle into N ordinary plugin commands, each dispatched under one shared `bundle-…` correlation id. **The agent is unchanged — it never sees a "bundle", only ordinary commands.** Dispatch is **async**: it returns immediately, and a slow plugin step never withholds the others. The MCP tools `execute_bundle` / `get_bundle_result` are the exact parity of these two endpoints.
+
+#### `POST /api/v1/bundles`
+
+Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bundles/{id}` for the collated result.
+
+**Permission:** `Execution:Execute`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | The single target device — a bundle targets one device. |
+| `steps` | array | Yes | 1–32 step objects, executed in request order. Duplicate `(plugin, action)` is allowed (e.g. two `registry/get_value` reads with different params) — each step gets its own command_id and collates back in order. |
+| `steps[].plugin` | string | Yes | Plugin name, lowercased `[a-z0-9_]`, ≤ 64 chars. |
+| `steps[].action` | string | Yes | Action name, same charset / length rule. |
+| `steps[].params` | object | No | String→string parameter map (non-string values are coerced to strings). |
+
+**Response (202 Accepted):**
+
+```json
+{
+  "data": { "bundle_id": "bundle-1a2b3c4d5e6f7a8b", "agent_id": "agent-001", "expected": 2 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`bundle_id` is the `bundle-…` correlation id — pass it to `GET /api/v1/bundles/{id}` to collate. It is **not** an `ExecutionTracker` `execution_id`: a bundle is deliberately not a tracked execution, so feeding `bundle_id` into `GET /api/v1/events` / execution-status endpoints returns 404. `expected` is the number of steps dispatched.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `400` | Invalid JSON, missing/empty `agent_id`, missing/empty `steps`, more than 32 steps, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
+| `500` | The authenticated session resolved to an empty principal (a bundle must be attributable to its dispatcher). |
+| `503` | Command dispatch or response store unavailable. |
+
+**Audit:** each step emits a `bundle.<plugin>.<action>` event with `target_type=Agent`, `target_id=<agent_id>`, `result=dispatched` (the step reached the agent) or `result=no_agents` (the step reached zero agents — it will read `dispatch_failed` on collate) — the device-access lens, so a bundle is exactly as auditable as the N executions it replaces. One `bundle.dispatch` (`target_type=Execution`) envelope records the dispatch itself (`result=success`, or `result=failure` with the error detail if dispatch threw).
+
+#### `GET /api/v1/bundles/{id}`
+
+Collate a dispatched bundle into a server-grouped result.
+
+**Permission:** `Response:Read`
+
+**Path parameters:**
+
+| Param | Description |
+|---|---|
+| `id` | The `bundle-…` correlation id returned by `POST /api/v1/bundles`. |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "complete": true,
+    "received": 2,
+    "succeeded": 2,
+    "expected": 2,
+    "steps": [
+      { "plugin": "os_info", "action": "uptime",  "state": "responded", "status": 1, "output": "up 3 days" },
+      { "plugin": "os_info", "action": "os_name", "state": "responded", "status": 1, "output": "Windows 11" }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame — only meaningful when `state=responded`). `received` counts steps with any response; `succeeded` counts only steps that responded with status SUCCESS. Plugin `output` is transcoded to UTF-8 — any bytes that are not valid UTF-8 (e.g. binary or a non-UTF-8 codepage) are replaced with U+FFFD so the JSON always serializes.
+
+> **`complete` is terminal, NOT success.** A bundle to an **offline device** completes (`complete=true`) with `received=0`, `succeeded=0`, and every step `dispatch_failed`. A caller deciding "did the refresh work" must check `succeeded == expected` (or inspect each `steps[].state`/`status`) — never `complete` alone. Polling `complete` to mark a record refreshed would silently treat an unreachable device as a success.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `404` | Bundle not found, **or** the caller did not dispatch it and is not an admin. The two are deliberately indistinguishable (no enumeration oracle); the real reason is recorded in the audit log. |
+| `503` | Service unavailable. |
+
+**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`) or `result=denied` (not found / not owned).
+
+**Notes:**
+
+- A bundle is **not** a tracked execution — it does not appear in the live executions drawer, and `notify_exec_tracker` skips its `bundle-…` correlation id. The collate poll is the sole completion authority.
+- v1 bundle state (the step map) is **per-surface and in-memory**: a bundle dispatched over REST is collated over REST (MCP→MCP). A server restart mid-bundle loses the in-flight step map (the responses survive in the response store, but attribution does not), and the caller must re-dispatch. A durable Postgres manifest for HA + cross-surface collation is a committed follow-up (ADR-0011).
+
+**Error handling and retry (for integrators):**
+
+- **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
+- **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
+
+**Example:**
+
+```bash
+# dispatch
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent-001","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}' \
+  "https://yuzu.example.com/api/v1/bundles"
+# -> {"data":{"bundle_id":"bundle-…","agent_id":"agent-001","expected":2}, ...}
+
+# collate (poll until data.complete == true)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/bundles/bundle-1a2b3c4d5e6f7a8b"
+```
+
+---
+
 ### Device Tokens
 
 Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.
@@ -3396,6 +3513,56 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+
+#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+
+Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+
+- **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
+- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
+- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`403`** if the caller lacks `Read` on the device's scope; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
+- **Response keys:**
+  - `baseline` — `{ baseline_id, name, lifecycle }`.
+  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
+  - `agent_id`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+
+**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+
+**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State → Assignment](guaranteed-state.md#assignment)). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
+
+Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
+
+Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+```
+
+```json
+{
+  "data": {
+    "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
+    "deployed": true,
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "total_guards": 3,
+    "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
+    "last_updated": "2026-06-20T13:45:00Z",
+    "guards": [
+      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
+      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},
+      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z"}
+    ]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
 
 #### `GET /api/v1/guaranteed-state/alerts`
 

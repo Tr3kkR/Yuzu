@@ -154,6 +154,8 @@ Use `scripts/setup.sh` (auto-picks the dir) or pass `-C build-<os>` to `meson co
 
 `docs/windows-build.md` is the source of truth — MSYS2 bash sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, full path inventory, and the two hard rules: **never use `vcvars64.bat`** (extension exit-1 corrupts wrappers) and **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` and `build-ci` agents load this on any Windows-touching change.
 
+**Provisioning a native Windows CI runner** is codified in `deploy/windows/` (the analog of `deploy/docker/Dockerfile.ci-linux`): a versioned provisioning spec, a `toolchain-manifest.json`, a runner self-test, and the CCD-pin wrapper. The gateway build resolves its toolchain from `YUZU_ESCRIPT`/`YUZU_REBAR3` (no hardcoded host paths — `scripts/build_gateway.py`), and the 4 CCD-pinned runners share one vcpkg binary cache via `RUNNER_TOOL_CACHE`. See `deploy/windows/README.md`.
+
 ### Cross-compilation
 ```bash
 ./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini

@@ -427,10 +427,10 @@ std::string TarDatabase::get_state(const std::string& collector) {
     return {};
 }
 
-void TarDatabase::set_state(const std::string& collector, const std::string& json) {
+bool TarDatabase::set_state(const std::string& collector, const std::string& json) {
     std::lock_guard lock(mu_);
     if (!db_)
-        return;
+        return false;
 
     const char* sql = R"(
         INSERT INTO tar_state (collector, state_json, updated_at)
@@ -443,7 +443,7 @@ void TarDatabase::set_state(const std::string& collector, const std::string& jso
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("TarDatabase::set_state prepare failed: {}", sqlite3_errmsg(db_));
-        return;
+        return false;
     }
     StmtPtr stmt(raw_stmt);
 
@@ -455,7 +455,9 @@ void TarDatabase::set_state(const std::string& collector, const std::string& jso
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE) {
         spdlog::error("TarDatabase::set_state step failed: {}", sqlite3_errmsg(db_));
+        return false;
     }
+    return true;
 }
 
 // ── Config management ────────────────────────────────────────────────────────
@@ -1040,6 +1042,64 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
 
     if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
         spdlog::error("insert_proc_perf_samples COMMIT: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    sqlite3_free(err_msg);
+    return true;
+}
+
+bool TarDatabase::insert_module_events(const std::vector<ModuleRow>& rows) {
+    std::lock_guard lock(mu_);
+    if (!db_ || rows.empty())
+        return rows.empty();
+
+    // One transaction per drain batch — one fsync regardless of batch size.
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_module_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO module_live (ts, snapshot_id, action, pid, process_name,
+                                 module_name, module_dir, signed_state, signer, is_kernel)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_module_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& r : rows) {
+        sqlite3_bind_int64(stmt.get(), 1, r.ts);
+        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, r.action.c_str(), -1, SQLITE_TRANSIENT);
+        // pid is uint32; bind as int64 so a high pid never wraps negative.
+        sqlite3_bind_int64(stmt.get(), 4, static_cast<int64_t>(r.pid));
+        sqlite3_bind_text(stmt.get(), 5, r.process_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 6, r.module_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 7, r.module_dir.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 8, r.signed_state.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 9, r.signer.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt.get(), 10, r.is_kernel ? 1 : 0);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_module_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_module_events COMMIT: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;

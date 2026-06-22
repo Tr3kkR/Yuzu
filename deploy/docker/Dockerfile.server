@@ -113,6 +113,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libpq5 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
+    # Shared cert group (PKI #1289): FIXED gid 2000, identical across the server/
+    # gateway/agent images, so `--cert-group yuzu-pki` lets the gateway/agent
+    # (different uids, sibling containers) read the shared CA + their leaf out of a
+    # shared /etc/yuzu/certs volume. The server user joins it to chgrp the certs.
+    && groupadd -g 2000 yuzu-pki \
+    && usermod -aG yuzu-pki yuzu \
     && mkdir -p /var/lib/yuzu /etc/yuzu/certs \
     && mkdir -m 0750 -p /var/log/yuzu \
     && chown -R yuzu:yuzu /var/lib/yuzu /var/log/yuzu /etc/yuzu
@@ -124,7 +130,14 @@ COPY --from=builder /src/builddir/server/core/yuzu-server /usr/local/bin/
 USER yuzu
 WORKDIR /var/lib/yuzu
 
-EXPOSE 8080 50051 50052 50055
+# 8443 = HTTPS dashboard (secure-by-default); 8080 = HTTP→HTTPS redirect.
+EXPOSE 8443 8080 50051 50052 50055
 
 ENTRYPOINT ["yuzu-server"]
-CMD ["--listen", "0.0.0.0:50051", "--no-tls", "--no-https", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]
+# Secure by default (PKI #1289): no --no-tls/--no-https. The server auto-generates
+# a per-install CA + leaves on first boot, serves the dashboard over HTTPS (8443)
+# and the agent/management/gateway-upstream listeners over (m)TLS. For a
+# multi-container deploy sharing /etc/yuzu/certs, add `--cert-group yuzu-pki` so
+# the gateway/agent (different uids) can read the shared certs. Override with
+# --no-tls/--no-https only for a throwaway dev/demo stack.
+CMD ["--listen", "0.0.0.0:50051", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]
