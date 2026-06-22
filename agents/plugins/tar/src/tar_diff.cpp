@@ -566,4 +566,47 @@ std::vector<UserEvent> compute_user_events(
     return events;
 }
 
+std::vector<SoftwareEvent> compute_software_events(
+    const std::vector<SoftwareInfo>& previous,
+    const std::vector<SoftwareInfo>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<SoftwareEvent> events;
+
+    // Key on (scope, user, name) so a machine-scope and a per-user entry of the
+    // same name are tracked independently, and two users' copies of the same app
+    // don't collapse. \x1f (unit separator) cannot appear in a registry display
+    // name / username, so it is a collision-free joiner.
+    auto make_key = [](const SoftwareInfo& s) -> std::string {
+        return s.scope + "\x1f" + s.user + "\x1f" + s.name;
+    };
+
+    std::unordered_map<std::string, const SoftwareInfo*> prev_map;
+    for (const auto& s : previous) prev_map[make_key(s)] = &s;
+    std::unordered_map<std::string, const SoftwareInfo*> curr_map;
+    for (const auto& s : current) curr_map[make_key(s)] = &s;
+
+    for (const auto& s : current) {
+        auto it = prev_map.find(make_key(s));
+        if (it == prev_map.end()) {
+            events.push_back({timestamp, snapshot_id, "installed", s.name, s.version, "",
+                              s.publisher, s.scope, s.user, s.install_date});
+        } else if (it->second->version != s.version) {
+            // Same identity, version changed → upgrade (or downgrade); carry the
+            // previous version. A bare reinstall at the same version emits nothing.
+            events.push_back({timestamp, snapshot_id, "upgraded", s.name, s.version,
+                              it->second->version, s.publisher, s.scope, s.user, s.install_date});
+        }
+    }
+
+    for (const auto& s : previous) {
+        if (!curr_map.contains(make_key(s))) {
+            events.push_back({timestamp, snapshot_id, "removed", s.name, s.version, "",
+                              s.publisher, s.scope, s.user, s.install_date});
+        }
+    }
+
+    return events;
+}
+
 } // namespace yuzu::tar

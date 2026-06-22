@@ -386,3 +386,111 @@ TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhe
     CHECK(events[0].cmdline == "/usr/bin/python3 --token=secret"); // populated on Linux/Windows
 #endif
 }
+
+// =============================================================================
+// Software install/uninstall diff tests (compute_software_events)
+// =============================================================================
+
+namespace {
+SoftwareInfo sw(std::string name, std::string version, std::string scope = "machine",
+                std::string user = "") {
+    SoftwareInfo s;
+    s.name = std::move(name);
+    s.version = std::move(version);
+    s.publisher = "Acme";
+    s.scope = std::move(scope);
+    s.user = std::move(user);
+    s.install_date = "20260101";
+    return s;
+}
+} // namespace
+
+TEST_CASE("TAR software diff: install detected", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev;
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "23.01")};
+
+    auto events = compute_software_events(prev, curr, 1000, 1);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "installed");
+    CHECK(events[0].name == "7-Zip");
+    CHECK(events[0].version == "23.01");
+    CHECK(events[0].prev_version.empty());
+    CHECK(events[0].scope == "machine");
+    CHECK(events[0].ts == 1000);
+    CHECK(events[0].snapshot_id == 1);
+}
+
+TEST_CASE("TAR software diff: removal detected", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr;
+
+    auto events = compute_software_events(prev, curr, 2000, 2);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "removed");
+    CHECK(events[0].name == "7-Zip");
+}
+
+TEST_CASE("TAR software diff: version change is one upgrade, not remove+install",
+          "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "24.00")};
+
+    auto events = compute_software_events(prev, curr, 3000, 3);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "upgraded");
+    CHECK(events[0].version == "24.00");
+    CHECK(events[0].prev_version == "23.01");
+}
+
+TEST_CASE("TAR software diff: same version produces no event", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "23.01")};
+
+    auto events = compute_software_events(prev, curr, 4000, 4);
+
+    CHECK(events.empty());
+}
+
+TEST_CASE("TAR software diff: same name in machine vs user scope is independent",
+          "[tar][diff][software]") {
+    // A machine-scope and a per-user copy of the same product must not collapse:
+    // removing the user copy is one 'removed' event, the machine copy is untouched.
+    std::vector<SoftwareInfo> prev = {sw("VSCode", "1.90", "machine"),
+                                      sw("VSCode", "1.90", "user", "alice")};
+    std::vector<SoftwareInfo> curr = {sw("VSCode", "1.90", "machine")};
+
+    auto events = compute_software_events(prev, curr, 5000, 5);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "removed");
+    CHECK(events[0].scope == "user");
+    CHECK(events[0].user == "alice");
+}
+
+TEST_CASE("TAR software diff: two users' same app tracked separately",
+          "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("Slack", "4.0", "user", "alice")};
+    std::vector<SoftwareInfo> curr = {sw("Slack", "4.0", "user", "alice"),
+                                      sw("Slack", "4.0", "user", "bob")};
+
+    auto events = compute_software_events(prev, curr, 6000, 6);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "installed");
+    CHECK(events[0].user == "bob");
+}
+
+TEST_CASE("TAR software diff: empty snapshots produce no events (cold-start contract)",
+          "[tar][diff][software]") {
+    // The plugin seeds the baseline silently on first run; at the diff level an
+    // empty-vs-empty comparison must produce nothing.
+    std::vector<SoftwareInfo> prev;
+    std::vector<SoftwareInfo> curr;
+
+    auto events = compute_software_events(prev, curr, 7000, 7);
+
+    CHECK(events.empty());
+}

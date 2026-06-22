@@ -86,6 +86,23 @@ struct UserEvent {
     std::string session_id;
 };
 
+/// One software_live row — an install / uninstall / upgrade event derived by
+/// diffing the installed-software inventory (Phase 8 Wave 1). `scope` is
+/// "machine" or "user"; `user` carries the profile name for per-user rows and
+/// is empty for machine scope. `prev_version` is populated only for 'upgraded'.
+struct SoftwareEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // installed, removed, upgraded
+    std::string name;
+    std::string version;
+    std::string prev_version;
+    std::string publisher;
+    std::string scope; // machine, user
+    std::string user;  // profile name for per-user rows; '' for machine scope
+    std::string install_date;
+};
+
 /// One perf_live row (BRD A1 — continuous device performance sampling).
 struct PerfRow {
     int64_t ts{0};
@@ -229,6 +246,7 @@ public:
     bool insert_network_events(const std::vector<NetworkEvent>& events);
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
+    bool insert_software_events(const std::vector<SoftwareEvent>& events);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);

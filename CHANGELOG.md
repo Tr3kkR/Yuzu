@@ -34,6 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR — software install/uninstall capture source (`$Software`).** A new TAR
+  warehouse source records application **installed / removed / upgraded** events over
+  time by diffing the installed-software inventory on a dedicated hourly trigger
+  (`tar.software`; tune or disable via `software_interval`, `0`–86400 s). On Windows it
+  captures both **machine-wide** (HKLM Uninstall 64-bit + WOW6432Node) and **per-user**
+  installs (each profile's `HKU\<SID>` Uninstall key, mounting `NTUSER.DAT` for
+  logged-off users); the `scope` column distinguishes them and `user` carries the
+  profile name. Tiers: `$Software_Live` (5000 rows) → `$Software_Daily` (31 d) →
+  `$Software_Monthly` (12 mo), with per-`(name, scope)` install/remove/upgrade counts.
+  **On by default** (asset-management / vulnerability-relevance data, like Services and
+  User sessions; toggle with `software_enabled`); names, versions, and publisher only —
+  no command lines or usage data. The first scan on a host **seeds the baseline
+  silently** so an `installed` event always means "installed now". Linux (dpkg/rpm) and
+  macOS (pkgutil) collectors are a fast-follow — the `$Software_*` tables are queryable
+  but empty there until then. See `docs/user-manual/tar.md`.
 - **Guardian — baseline-anchored per-device compliance REST.**
   New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
   returns one Baseline's deployed Guards each with the device's last reported verdict

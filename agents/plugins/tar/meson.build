@@ -46,6 +46,7 @@ shared_library(
     'src/tar_proc_es.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
+    'src/tar_software_collector.cpp',
     'src/tar_fleet_snapshot.cpp',
   ),
   name_prefix: '',

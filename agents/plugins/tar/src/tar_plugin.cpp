@@ -195,6 +195,39 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
     return result;
 }
 
+json software_to_json(const std::vector<yuzu::tar::SoftwareInfo>& apps) {
+    json arr = json::array();
+    for (const auto& a : apps) {
+        arr.push_back({{"name", a.name},
+                       {"version", a.version},
+                       {"publisher", a.publisher},
+                       {"scope", a.scope},
+                       {"user", a.user},
+                       {"install_date", a.install_date}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::SoftwareInfo> json_to_software(const std::string& s) {
+    std::vector<yuzu::tar::SoftwareInfo> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::SoftwareInfo a;
+            a.name = j.value("name", "");
+            a.version = j.value("version", "");
+            a.publisher = j.value("publisher", "");
+            a.scope = j.value("scope", "");
+            a.user = j.value("user", "");
+            a.install_date = j.value("install_date", "");
+            result.push_back(std::move(a));
+        }
+    } catch (...) {}
+    return result;
+}
+
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
@@ -250,11 +283,11 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",       "query",         "snapshot",
-                                     "export",       "configure",     "collect_fast",
-                                     "collect_slow", "collect_perf",  "rollup",
-                                     "sql",          "compatibility", "fleet_snapshot",
-                                     nullptr};
+        static const char* acts[] = {"status",         "query",         "snapshot",
+                                     "export",         "configure",     "collect_fast",
+                                     "collect_slow",   "collect_perf",  "collect_software",
+                                     "rollup",         "sql",           "compatibility",
+                                     "fleet_snapshot", nullptr};
         return acts;
     }
 
@@ -318,6 +351,22 @@ public:
                 R"({{"interval_seconds":{},"plugin":"tar","action":"collect_perf","parameters":{{}}}})",
                 perf_interval);
             ctx.register_trigger("tar.perf", "interval", perf_config);
+        }
+
+        // Software install/uninstall sampler: hourly default. Installs are rare
+        // and the per-user path mounts NTUSER.DAT hives, so this runs on its own
+        // slower trigger rather than the 60s/300s collectors.
+        // software_interval_seconds = 0 disables registration entirely; the
+        // per-source software_enabled config gates collection at run time.
+        int software_interval = 3600;
+        try {
+            software_interval = std::stoi(db_->get_config("software_interval_seconds", "3600"));
+        } catch (...) {}
+        if (software_interval > 0) {
+            auto software_config = std::format(
+                R"({{"interval_seconds":{},"plugin":"tar","action":"collect_software","parameters":{{}}}})",
+                software_interval);
+            ctx.register_trigger("tar.software", "interval", software_config);
         }
 
         // Register rollup trigger (15-minute aggregation cycle)
@@ -427,6 +476,7 @@ public:
         ctx.unregister_trigger("tar.fast");
         ctx.unregister_trigger("tar.slow");
         ctx.unregister_trigger("tar.perf");
+        ctx.unregister_trigger("tar.software");
         ctx.unregister_trigger("tar.rollup");
         // Take collect_mu_ around the collector teardown: a collect_fast tick may
         // still be draining proc_stream_ (reads impl_ via drain()/running()), and
@@ -459,6 +509,8 @@ public:
             return do_collect_slow(ctx);
         if (action == "collect_perf")
             return do_collect_perf(ctx);
+        if (action == "collect_software")
+            return do_collect_software(ctx);
         if (action == "status")
             return do_status(ctx);
         if (action == "query")
@@ -887,6 +939,55 @@ private:
         return collect_slow_impl(ctx);
     }
 
+    // ── collect_software: installed-software inventory diff ───────────────────
+    // Diffs the installed-software inventory and records install/remove/upgrade
+    // events. Runs on the dedicated tar.software trigger (hourly default).
+    //
+    // The enumeration — which on Windows walks the registry and mounts NTUSER.DAT
+    // hives for logged-off profiles — runs OUTSIDE collect_mu_ so a slow registry
+    // pass cannot stall collect_fast/slow/fleet_snapshot under that shared lock
+    // (gov UP-6, mirrors collect_perf). Only the state read-diff-write is locked.
+    //
+    // Cold start: the FIRST run on a host (no prior "software" state) seeds the
+    // baseline WITHOUT emitting events — an 'installed' event must mean "installed
+    // now", not "already present when the agent started watching". This is a
+    // deliberate divergence from the service/user cold-start burst and mirrors the
+    // process-stream fallback baseline seed.
+    int do_collect_software(yuzu::CommandContext& ctx) {
+        if (!source_enabled(*db_, "software")) {
+            ctx.write_output("tar|collect_software|0|source_disabled");
+            return 0;
+        }
+
+        // Enumerate outside the lock (registry walk + possible hive mounts).
+        auto current = yuzu::tar::enumerate_software();
+        const auto ts = now_epoch_seconds();
+        const auto snap_id = next_snapshot_id();
+
+        std::lock_guard lock(collect_mu_);
+        auto prev_json = db_->get_state("software");
+        if (prev_json.empty()) {
+            // Cold start: seed the baseline silently, emit nothing. (get_state
+            // returns "" only when no row exists; after this it is at least "[]".)
+            db_->set_state("software", software_to_json(current).dump());
+            ctx.write_output("tar|collect_software|0|baseline_seeded");
+            return 0;
+        }
+
+        auto previous = json_to_software(prev_json);
+        auto typed = yuzu::tar::compute_software_events(previous, current, ts, snap_id);
+        if (!typed.empty()) {
+            if (!db_->insert_software_events(typed)) {
+                spdlog::error("TAR: failed to insert software events, skipping state save");
+                ctx.write_output("error|software insert failed");
+                return 1;
+            }
+        }
+        db_->set_state("software", software_to_json(current).dump());
+        ctx.write_output(std::format("tar|collect_software|{}|events_recorded", typed.size()));
+        return 0;
+    }
+
     // ── status action ─────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
@@ -1290,12 +1391,17 @@ private:
         auto retention = params.get("retention_days");
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
+        auto software_interval = params.get("software_interval");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
         int fast_secs = 0;
         int slow_secs = 0;
         int days = 0;
+        // Software interval accepts 0 (disable the trigger) or 300–86400, so it
+        // needs a "was it provided" flag distinct from the 0 sentinel.
+        int software_secs = 0;
+        bool software_provided = false;
 
         // M13: Validate ALL parameters BEFORE writing any to the database
         if (!retention.empty()) {
@@ -1328,6 +1434,22 @@ private:
             }
         }
 
+        if (!software_interval.empty()) {
+            software_provided = true;
+            bool parsed = false;
+            try {
+                software_secs = std::stoi(std::string{software_interval});
+                parsed = true;
+            } catch (...) {}
+            // 0 disables the trigger; otherwise 300–86400 (5 min – 1 day). A
+            // non-numeric value is rejected rather than silently treated as 0.
+            if (!parsed || software_secs < 0 ||
+                (software_secs > 0 && (software_secs < 300 || software_secs > 86400))) {
+                ctx.write_output("error|software_interval must be 0 (disable) or 300-86400 seconds");
+                return 1;
+            }
+        }
+
         // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
@@ -1350,6 +1472,12 @@ private:
         if (slow_secs > 0) {
             db_->set_config("slow_interval_seconds", std::string{slow_interval});
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
+            changed = true;
+        }
+
+        if (software_provided) {
+            db_->set_config("software_interval_seconds", std::to_string(software_secs));
+            ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
             changed = true;
         }
 
@@ -1493,7 +1621,7 @@ private:
         }
 
         // Re-register triggers with new intervals if changed
-        if (fast_secs > 0 || slow_secs > 0) {
+        if (fast_secs > 0 || slow_secs > 0 || software_provided) {
             yuzu::PluginContext pctx{plugin_ctx_};
             if (fast_secs > 0) {
                 pctx.unregister_trigger("tar.fast");
@@ -1510,6 +1638,22 @@ private:
                     slow_secs);
                 pctx.register_trigger("tar.slow", "interval", cfg);
                 ctx.write_output(std::format("trigger|tar.slow|re-registered|{}s", slow_secs));
+            }
+            if (software_provided) {
+                // Always unregister first; re-register only when non-zero. An
+                // interval of 0 leaves the trigger absent (collection disabled
+                // until re-registered with a positive interval or agent restart).
+                pctx.unregister_trigger("tar.software");
+                if (software_secs > 0) {
+                    auto cfg = std::format(
+                        R"({{"interval_seconds":{},"plugin":"tar","action":"collect_software"}})",
+                        software_secs);
+                    pctx.register_trigger("tar.software", "interval", cfg);
+                    ctx.write_output(
+                        std::format("trigger|tar.software|re-registered|{}s", software_secs));
+                } else {
+                    ctx.write_output("trigger|tar.software|unregistered|0s");
+                }
             }
         }
 

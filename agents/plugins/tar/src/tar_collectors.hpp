@@ -62,6 +62,19 @@ struct UserSession {
     std::string session_id;
 };
 
+/// One installed-software entry, as enumerated for the `software` source diff.
+/// `scope` is "machine" or "user"; `user` is the profile name for per-user
+/// entries and empty for machine scope. The diff key is (scope, user, name);
+/// a change in `version` for the same key is an 'upgraded' event.
+struct SoftwareInfo {
+    std::string name;
+    std::string version;
+    std::string publisher;
+    std::string scope; // machine, user
+    std::string user;  // profile name for per-user entries; '' for machine scope
+    std::string install_date;
+};
+
 // ── Platform enumeration functions ────────────────────────────────────────────
 
 /** Enumerate active network connections on the current host. */
@@ -85,6 +98,14 @@ std::vector<ServiceInfo> enumerate_services();
 
 /** Enumerate active user sessions on the current host. */
 std::vector<UserSession> enumerate_users();
+
+/**
+ * Enumerate installed software on the current host for the `software` source.
+ * Windows: machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit) plus
+ * per-user (HKU\<SID>\...\Uninstall, mounting NTUSER.DAT for logged-off
+ * profiles). Returns empty on Linux/macOS (kPlanned in the schema registry).
+ */
+std::vector<SoftwareInfo> enumerate_software();
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -178,5 +199,17 @@ std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>&
 std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previous,
                                            const std::vector<UserSession>& current,
                                            int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute software install/uninstall diff.
+ * Key: scope + user + name.
+ * Detects installs (present in current, not previous), removals (present in
+ * previous, not current), and upgrades (same key, different version — carries
+ * prev_version). The diff is name-keyed, so a version bump is one 'upgraded'
+ * event rather than a remove+install pair.
+ */
+std::vector<SoftwareEvent> compute_software_events(const std::vector<SoftwareInfo>& previous,
+                                                   const std::vector<SoftwareInfo>& current,
+                                                   int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar
