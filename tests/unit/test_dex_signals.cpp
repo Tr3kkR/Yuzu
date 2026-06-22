@@ -823,6 +823,35 @@ TEST_CASE("REAL records: NDIS 10317 adapter reset — vendor-neutral, named Adap
     CHECK(o->symbolic == "ADAPTER_RESET");
 }
 
+TEST_CASE("SAFETY: wave-4 extractors clip + strip control chars from untrusted subject AND reason",
+          "[dex][parse][privacy]") {
+    // A forged event (compromised endpoint) with control bytes + an oversized field
+    // must NOT carry NUL/control chars or an unbounded blob into the projection —
+    // esc() neutralizes HTML metachars but NOT control bytes (the "control-char 400"
+    // precedent). BOTH subject and reason are clipped at the edge (gov Gate-8 MEDIUM).
+    auto no_ctrl = [](const std::string& s) {
+        for (unsigned char c : s)
+            if (c < 0x20 || c == 0x7F)
+                return false;
+        return true;
+    };
+    const std::string evil = std::string(500, 'A') + std::string("\x01\x1f\x7f", 3); // C0 + DEL
+    // service.unresponsive: subject=param2 (clip 80), reason from param1 timeout (clip 16)
+    const auto su = extract_signal("System", "Service Control Manager", 7011, 2,
+                                   {{"param1", std::string("30000\x07", 6)}, {"param2", evil}});
+    REQUIRE(su);
+    CHECK(su->subject.size() < 200); // bounded, not 503
+    CHECK(no_ctrl(su->subject));
+    CHECK(no_ctrl(su->reason)); // the \x07 in the timeout is stripped
+    // adapter_reset: subject=AdapterName (clip 120), reason=MiniportEventEnum (clip 16)
+    const auto ar = extract_signal("System", "Microsoft-Windows-NDIS", 10317, 2,
+                                   {{"AdapterName", evil}, {"MiniportEventEnum", std::string("74\x1b", 3)}});
+    REQUIRE(ar);
+    CHECK(ar->subject.size() < 200);
+    CHECK(no_ctrl(ar->subject));
+    CHECK(no_ctrl(ar->reason));
+}
+
 TEST_CASE("REAL records: boot 100 duration metric (full chain)", "[dex][parse][real]") {
     const auto o = run_chain(kReal100);
     REQUIRE(o);

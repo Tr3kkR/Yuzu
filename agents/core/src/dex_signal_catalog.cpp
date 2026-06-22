@@ -207,7 +207,7 @@ SignalObservation x_power_loss(const EventFields& f, int) {
     SignalObservation o;
     o.subject = "system";
     o.symbolic = "UNEXPECTED_REBOOT";
-    const std::string bc = named(f, "BugcheckCode"); // decimal; "0" when no bugcheck
+    const std::string bc = clip(named(f, "BugcheckCode"), 16); // decimal; "0" when no bugcheck
     if (!bc.empty() && bc != "0") {
         o.reason = "bugcheck " + bc;
         o.sentence = "rebooted without clean shutdown (bugcheck " + bc + ")";
@@ -249,7 +249,7 @@ SignalObservation x_modern_standby_exit(const EventFields& f, int) {
     SignalObservation o;
     o.subject = "modern standby";
     o.symbolic = "MODERN_STANDBY_EXIT";
-    o.reason = named(f, "Reason"); // provider's numeric exit-reason code, kept verbatim
+    o.reason = clip(named(f, "Reason"), 16); // provider's numeric exit-reason code
     const double dur_us = parse_metric_ms(named(f, "DurationInUs")); // µs (parse_metric_ms = ≥0, finite)
     const double drips_us = parse_metric_ms(named(f, "DripsResidencyInUs"));
     double drips_pct = dur_us > 0.0 ? 100.0 * drips_us / dur_us : 0.0;
@@ -290,7 +290,7 @@ SignalObservation x_driver_load_failed(const EventFields& f, int) {
     // The device instance id ("HID\Vid_8087&Pid_0AC2\…") is hardware identity, no
     // user content — keep it (clipped), don't strip to a meaningless leaf token.
     o.component = clip(named(f, "DriverName"), 120);
-    o.reason = hex_reason(named(f, "Status")); // decimal NTSTATUS → 0x… hex
+    o.reason = clip(hex_reason(named(f, "Status")), 40); // decimal NTSTATUS → 0x… hex (clip the non-numeric passthrough)
     o.symbolic = "DRIVER_LOAD_FAILED";
     o.sentence = "driver '" + (o.subject.empty() ? "<unknown>" : o.subject) +
                  "' failed to load" + (o.reason.empty() ? "" : " (" + o.reason + ")");
@@ -330,7 +330,7 @@ SignalObservation x_battery_error(const EventFields& f, int) {
 SignalObservation x_service_unresponsive(const EventFields& f, int) {
     SignalObservation o;
     o.subject = clip(named_or_pos(f, "param2", 1), 80);
-    const std::string ms = named_or_pos(f, "param1", 0);
+    const std::string ms = clip(named_or_pos(f, "param1", 0), 16);
     o.reason = ms.empty() ? "timeout" : "timeout " + ms + " ms";
     o.symbolic = "SERVICE_UNRESPONSIVE";
     o.kind = "service";
@@ -362,7 +362,7 @@ SignalObservation x_service_shutdown_failed(const EventFields& f, int) {
 SignalObservation x_adapter_reset(const EventFields& f, int) {
     SignalObservation o;
     o.subject = clip(named(f, "AdapterName"), 120);
-    const std::string ev = named(f, "MiniportEventEnum");
+    const std::string ev = clip(named(f, "MiniportEventEnum"), 16);
     o.reason = ev.empty() ? "miniport-fatal" : "miniport-event " + ev;
     o.symbolic = "ADAPTER_RESET";
     o.sentence = "network adapter '" + (o.subject.empty() ? "<unknown>" : o.subject) +
@@ -1613,12 +1613,12 @@ const std::vector<SignalSpec>& catalog_impl() {
 
         // ── Wave 4 (2026-06-22): power-management + driver reliability ────────
         // Modern-standby exit quality (DRIPS residency). Fires every resume; cap
-        // generous for a thrashing box (the rate-cap summary catches a storm).
+        // generous for a thrashing box (overflow is dropped per the hourly cap).
         {"os.modern_standby_exit", "System", "Microsoft-Windows-Kernel-Power", {507}, 0, 60,
          &x_modern_standby_exit},
         // Intel Wi-Fi driver D3 diagnostic dump (7025 only; 7026 is the paired
-        // completion). A thrashing adapter storms — the generalised rate-cap
-        // summary surfaces it as one count rather than dropping the overflow.
+        // completion). A thrashing adapter storms past the cap; the overflow is
+        // dropped with one warn per hour (a count-preserving summary is deferred).
         {"network.adapter_driver_dump", "System", "Netwtw10", {7025}, 0, 60,
          &x_adapter_driver_dump},
         // Driver-load failure (distinct from device-start failure, PnP 411).

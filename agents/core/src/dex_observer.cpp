@@ -1,6 +1,6 @@
 #include <yuzu/agent/dex_observer.hpp>
 
-#include <yuzu/agent/dex_rate_limiter.hpp> // shared per-obs_type hourly cap + storm summary
+#include <yuzu/agent/dex_rate_limiter.hpp> // shared per-obs_type hourly cap (Windows + Linux)
 
 #include <algorithm>
 #include <cstdint>
