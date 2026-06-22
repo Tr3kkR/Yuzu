@@ -1,29 +1,31 @@
 # Yuzu CI — Pre-built Linux CI image with all deps ready
 #
-# Contains: GCC 13, Clang 18, Meson, ccache, vcpkg with all packages
+# Contains: GCC 15, Clang 21, Meson, ccache, vcpkg with all packages
 # pre-compiled. Mount your source tree and run configure+build+test
 # instantly — no waiting for vcpkg or apt installs.
 #
 # Build (one-time, ~40 min):
 #   docker build -t yuzu-ci -f deploy/docker/Dockerfile.ci .
 #
-# Usage — GCC 13 debug:
-#   docker run --rm -v "$(pwd):/src" yuzu-ci gcc-13 debug
+# Usage — GCC 15 debug:
+#   docker run --rm -v "$(pwd):/src" yuzu-ci gcc-15 debug
 #
-# Usage — Clang 18 release:
-#   docker run --rm -v "$(pwd):/src" yuzu-ci clang-18 release
+# Usage — Clang 21 release:
+#   docker run --rm -v "$(pwd):/src" yuzu-ci clang-21 release
 #
 # Usage — interactive shell:
 #   docker run --rm -it -v "$(pwd):/src" yuzu-ci bash
 
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+# Ubuntu 26.04 (Resolute) — matches the Big Tam self-hosted Linux runner.
+# GCC 15 / Clang 21 are 26.04 defaults. Multi-arch OCI index digest.
+FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
 
 # ── System packages (matches ci.yml) ─────────────────────────────────────
 RUN apt-get update && apt-get install -y \
         cmake ninja-build pkg-config curl zip unzip tar \
         python3-pip ccache git \
         bison flex libsystemd-dev \
-        gcc-13 g++-13 clang-18 \
+        gcc-15 g++-15 clang-21 \
     && pip3 install --break-system-packages meson==1.9.2 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -58,4 +60,4 @@ RUN chmod +x /usr/local/bin/ci-entrypoint.sh
 
 WORKDIR /build
 ENTRYPOINT ["ci-entrypoint.sh"]
-CMD ["gcc-13", "debug"]
+CMD ["gcc-15", "debug"]

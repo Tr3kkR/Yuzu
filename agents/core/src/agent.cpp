@@ -60,6 +60,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <random>
 #include <string>
@@ -922,6 +923,22 @@ public:
         int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
         const std::filesystem::path cert_dir =
             cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
+        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
+        // The install-CA auto-discovery used to live only inside build_channel and
+        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
+        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
+        // no CSR and never got its per-agent client leaf, with no error. Promoting the
+        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
+        // and build_channel see the same effective CA (an explicit --ca-cert is left
+        // untouched, so this is a no-op when one was given).
+        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
+            if (auto ca = discover_install_ca_path()) {
+                cfg_.tls_ca_cert = *ca;
+                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
+                             "anchor and enabling per-agent enrollment",
+                             cfg_.tls_ca_cert.string());
+            }
+        }
         const bool provisioning_eligible =
             cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
             cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();
@@ -966,6 +983,36 @@ public:
                         spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
                         return false;
                     }
+                } else {
+                    // PKI #1303: fail CLOSED. No --ca-cert was given and the install-CA
+                    // auto-discovery above run() found nothing usable at the standard
+                    // shared-cert-volume path (a found CA is promoted into
+                    // cfg_.tls_ca_cert there, so reaching this branch means none existed;
+                    // discover_install_ca_path() also rejects an empty/truncated file, so
+                    // it never pins nothing). An empty pem_root_certs makes gRPC verify
+                    // against the SYSTEM trust store, which does NOT trust a Yuzu
+                    // self-signed install CA. With the gateway one-way-TLS edge live that
+                    // is a fail-open MITM window (any publicly-trusted impostor cert for
+                    // the dial host would be accepted) on the command fan-out plane.
+                    // Refuse unless the operator has DELIBERATELY opted into the system
+                    // trust store (server leaf signed by a public/corporate CA).
+                    if (!cfg_.tls_allow_system_trust) {
+                        spdlog::error(
+                            "TLS is enabled but no CA could be pinned: --ca-cert was not given "
+                            "and no install CA was found at the standard path "
+                            "(/etc/yuzu/certs/default-ca.pem). Refusing to connect with the "
+                            "SYSTEM trust store, which does NOT trust a Yuzu self-signed install "
+                            "CA — that would be a fail-open MITM posture. Fix one of: provide "
+                            "--ca-cert; ensure the install CA exists at that path; pass "
+                            "--tls-system-roots if the server cert is signed by a public/"
+                            "corporate CA already in the system store; or --no-tls for a "
+                            "dev/demo stack.");
+                        return false;
+                    }
+                    spdlog::warn("TLS is enabled with no pinned CA — using the SYSTEM trust "
+                                 "store by explicit --tls-system-roots. Safe ONLY if the server "
+                                 "certificate chains to a CA already trusted by the system "
+                                 "(public/corporate root), NOT a Yuzu self-signed install CA.");
                 }
 
                 // Client certificate: prefer cert store, fall back to PEM files
@@ -1013,8 +1060,15 @@ public:
             return true;
         };
 
-        if (!build_channel())
+        if (!build_channel()) {
+            // The initial build_channel() failed closed — most importantly the #1303
+            // fail-closed TLS posture (no pinnable CA under secure-by-default), but also
+            // an unreadable CA/client cert/key. This is a fatal STARTUP failure, not a
+            // normal shutdown: flag it so main() exits non-zero and systemd Restart= /
+            // Docker / Windows SCM see the failure instead of a silent EXIT_SUCCESS.
+            startup_failed_ = true;
             return;
+        }
 
         // 2b. Detect cloud instance identity (for auto-approve)
         {
@@ -2091,6 +2145,8 @@ public:
 
     std::vector<std::string> loaded_plugins() const override { return plugin_names_; }
 
+    [[nodiscard]] bool startup_failed() const noexcept override { return startup_failed_; }
+
 private:
     // Serialize a Guardian event into the __guard__/event CommandResponse and write
     // it through the current Subscribe stream. Shared by the GuardianEngine drift
@@ -2173,6 +2229,11 @@ private:
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
+    // Set when run() returns due to a fatal STARTUP failure (the #1303 fail-closed
+    // TLS posture refused to connect, or an unreadable cert/key) — not a normal
+    // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
+    // before the connect loop, read after run() returns; no atomic needed.
+    bool startup_failed_{false};
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
     std::vector<PluginHandle> plugins_;

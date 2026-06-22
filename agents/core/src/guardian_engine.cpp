@@ -458,7 +458,7 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
     ev.set_rule_name(d.rule_name);
-    ev.set_guard_type(d.guard_type); // "registry" | "file" — set by the producing guard
+    ev.set_guard_type(d.guard_type); // "registry" | "file" | "service" — set by the producing guard
     ev.set_guard_category("event");
     ev.set_detected_value(d.detected_value);
     ev.set_expected_value(d.expected_value);

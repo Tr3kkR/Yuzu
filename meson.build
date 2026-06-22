@@ -427,6 +427,11 @@ if _rebar3.found()
     output: '.gateway_built',
     build_always_stale: true,
     build_by_default: true,
+    # console: stream rebar3 output live instead of letting Ninja buffer the
+    # edge until completion — so a hung gateway build is visible in real time
+    # (it previously showed nothing until the 120-min job timeout). Pairs with
+    # the bounded timeout in build_gateway.py.
+    console: true,
   )
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
