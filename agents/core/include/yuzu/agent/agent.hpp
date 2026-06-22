@@ -24,6 +24,13 @@ struct Config {
     std::string cert_subject;              // Subject CN match for cert store lookup
     std::string cert_thumbprint;           // SHA-1 thumbprint for cert store lookup
     bool cert_auto_discovery{true};        // Auto-discover certs from well-known paths
+    // PKI #1303: fail-closed posture. When TLS is on but NO CA can be pinned (no
+    // --ca-cert AND no install CA auto-discovered, #1289), the agent refuses to start
+    // rather than silently falling back to the system trust store (which does NOT
+    // trust a Yuzu self-signed install CA — a fail-open MITM window on the command
+    // fan-out plane). Set this ONLY when the server leaf chains to a CA already in the
+    // system store (public CA / corporate root) — a deliberate operator choice.
+    bool tls_allow_system_trust{false};    // --tls-system-roots / YUZU_TLS_SYSTEM_ROOTS
     // PKI PR3: directory for the auto-provisioned per-agent mTLS credential
     // (agent-client.{key,pem} + agent-ca.pem). When tls is enabled with a CA but
     // no explicit client cert/store, the agent generates a CSR at enrollment,
@@ -76,6 +83,14 @@ public:
 
     /** Returns the list of loaded plugins. */
     [[nodiscard]] virtual std::vector<std::string> loaded_plugins() const = 0;
+
+    /**
+     * True if run() returned because of a fatal STARTUP failure (e.g. the #1303
+     * fail-closed TLS posture refused to connect with no pinnable CA), as opposed
+     * to a normal stop(). main() maps it to a non-zero exit so systemd Restart= /
+     * Docker / Windows SCM observe the failure instead of a silent EXIT_SUCCESS.
+     */
+    [[nodiscard]] virtual bool startup_failed() const noexcept = 0;
 };
 
 } // namespace yuzu::agent

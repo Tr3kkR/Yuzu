@@ -42,6 +42,13 @@ struct Config {
     // (e.g. "dns:gateway" so an agent verifying a gateway reached by that name
     // succeeds). Ignored when operator certs are supplied or --no-default-certs.
     std::vector<std::string> cert_sans;
+    // Shared POSIX group (name or numeric gid) for the auto-generated cert volume
+    // (--cert-group, PKI #1289). When set, the cert dir (0750) and the gateway
+    // leaf key (0640) are chgrp'd to it so a gateway/agent running as a DIFFERENT
+    // uid in a sibling container can read the shared CA + its leaf out of the
+    // shared /etc/yuzu/certs volume. Empty (default) = tight single-host perms
+    // (dir 0700, keys 0600). The server/HTTPS private keys stay 0600 regardless.
+    std::string cert_group;
 
     // Optional management listener TLS override.
     // If left empty, management reuses the agent listener credentials.
