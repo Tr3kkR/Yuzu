@@ -75,6 +75,17 @@ struct SoftwareInfo {
     std::string install_date;
 };
 
+/// Result of a steady-state per-user scan (loaded hives only — no NTUSER.DAT
+/// mounting). `entries` are the apps found; `scanned_users` is EVERY logged-on
+/// profile that was read, even those with zero per-user apps — the caller needs
+/// the full scanned set (not just users that happen to have entries) to decide
+/// which logged-off users to carry forward, so an uninstall of a logged-on
+/// user's last app is not masked by carry-forward.
+struct LoadedUserScan {
+    std::vector<SoftwareInfo> entries;
+    std::vector<std::string> scanned_users;
+};
+
 // ── Platform enumeration functions ────────────────────────────────────────────
 
 /** Enumerate active network connections on the current host. */
@@ -100,12 +111,27 @@ std::vector<ServiceInfo> enumerate_services();
 std::vector<UserSession> enumerate_users();
 
 /**
- * Enumerate installed software on the current host for the `software` source.
- * Windows: machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit) plus
- * per-user (HKU\<SID>\...\Uninstall, mounting NTUSER.DAT for logged-off
- * profiles). Returns empty on Linux/macOS (kPlanned in the schema registry).
+ * Full installed-software enumeration for the `software` source COLD-START
+ * baseline only: machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit) plus
+ * EVERY user profile (HKU\<SID> for loaded hives; mounting NTUSER.DAT for
+ * logged-off profiles, capped at `max_hive_mounts` to bound the one-time I/O on
+ * many-profile hosts — profiles beyond the cap are baselined lazily when their
+ * user next logs on). Returns empty on Linux/macOS (kPlanned).
+ *
+ * Steady-state ticks must NOT call this — they use enumerate_machine_software +
+ * enumerate_loaded_user_software and carry forward logged-off users, so no hive
+ * is mounted after the baseline (a logged-off user cannot install software).
  */
-std::vector<SoftwareInfo> enumerate_software();
+std::vector<SoftwareInfo> enumerate_software(int max_hive_mounts);
+
+/** Machine-scope installed software only (HKLM 64-bit + WOW6432Node). Cheap,
+ *  no hive mounts. Empty off Windows. */
+void enumerate_machine_software(std::vector<SoftwareInfo>& out);
+
+/** Per-user installed software for CURRENTLY-LOADED hives only (HKU\<SID>) — no
+ *  NTUSER.DAT mounting. Returns the entries plus the full set of logged-on
+ *  profiles scanned. Empty off Windows. */
+LoadedUserScan enumerate_loaded_user_software();
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 

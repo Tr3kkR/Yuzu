@@ -50,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -538,6 +539,13 @@ private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
+    // Separate mutex for the software source: its state read-diff-write touches
+    // only the "software" KV state (never prev_perf_/prev_proc_/proc_stream_), and
+    // the registry walk + JSON (de)serialise can be slow on many-profile hosts —
+    // putting it on collect_mu_ would stall collect_fast/slow/fleet_snapshot. A
+    // dedicated mutex serialises concurrent collect_software (manual vs trigger)
+    // without that cross-collector coupling.
+    std::mutex software_collect_mu_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
 
@@ -954,27 +962,75 @@ private:
     // deliberate divergence from the service/user cold-start burst and mirrors the
     // process-stream fallback baseline seed.
     int do_collect_software(yuzu::CommandContext& ctx) {
+        const auto ts = now_epoch_seconds();
+        // Heartbeat: record that the tick fired regardless of outcome, so an
+        // operator reading tar.status can tell "healthy but quiet" from "trigger
+        // never ran" / "every tick errors" (the agent has no /metrics endpoint).
+        db_->set_config("software_last_run_ts", std::to_string(ts));
+
         if (!source_enabled(*db_, "software")) {
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
 
-        // Enumerate outside the lock (registry walk + possible hive mounts).
-        auto current = yuzu::tar::enumerate_software();
-        const auto ts = now_epoch_seconds();
-        const auto snap_id = next_snapshot_id();
+        // Cap on logged-off NTUSER.DAT mounts during the one-time baseline (steady
+        // state never mounts). Bounds the cold-start I/O on many-profile hosts.
+        int max_mounts = 100;
+        try {
+            max_mounts = std::stoi(db_->get_config("software_max_hive_mounts", "100"));
+        } catch (...) {}
+        if (max_mounts < 0)
+            max_mounts = 0;
 
-        std::lock_guard lock(collect_mu_);
+        std::lock_guard lock(software_collect_mu_); // serialises concurrent collect_software only
         auto prev_json = db_->get_state("software");
+
+        // Cold start (no prior state row): seed the full baseline silently — mount
+        // logged-off hives once (capped), emit no events. An 'installed' event
+        // must mean "installed now", not "already present when we started
+        // watching". get_state returns "" only when no row exists.
         if (prev_json.empty()) {
-            // Cold start: seed the baseline silently, emit nothing. (get_state
-            // returns "" only when no row exists; after this it is at least "[]".)
-            db_->set_state("software", software_to_json(current).dump());
+            auto baseline = yuzu::tar::enumerate_software(max_mounts);
+            db_->set_state("software", software_to_json(baseline).dump());
             ctx.write_output("tar|collect_software|0|baseline_seeded");
             return 0;
         }
 
+        // Corrupt/unreadable prior state (truncated write, tampering): a non-empty
+        // blob that is not a JSON array must NOT be treated as cold-start (would
+        // silently re-seed and lose the baseline) nor diffed against empty (would
+        // emit a spurious full install storm). Skip the tick and warn; the baseline
+        // is preserved for the next tick / manual repair (UP-1/UP-2).
+        auto parsed = json::parse(prev_json, nullptr, /*allow_exceptions=*/false);
+        if (parsed.is_discarded() || !parsed.is_array()) {
+            spdlog::error("TAR: software state is not a JSON array — skipping tick "
+                          "(baseline preserved, not re-seeded)");
+            ctx.write_output("tar|collect_software|0|state_unreadable");
+            return 0;
+        }
         auto previous = json_to_software(prev_json);
+
+        // Steady state: machine scope + currently-loaded user hives (NO mounting),
+        // then carry forward logged-off users unchanged from the baseline. A
+        // logged-off user cannot install software, so re-mounting their hive every
+        // tick is pure I/O (the RDS/Citrix cost) AND would risk logon/logoff
+        // flapping — carrying their last-known inventory forward makes those
+        // entries identical in `previous` and `current`, so they yield no events.
+        // `scanned_users` is every loaded profile (even those with zero apps), so
+        // an uninstall of a logged-on user's last app is NOT masked by carry-forward.
+        std::vector<yuzu::tar::SoftwareInfo> current;
+        yuzu::tar::enumerate_machine_software(current);
+        auto loaded = yuzu::tar::enumerate_loaded_user_software();
+        std::unordered_set<std::string> scanned(loaded.scanned_users.begin(),
+                                                loaded.scanned_users.end());
+        for (auto& e : loaded.entries)
+            current.push_back(std::move(e));
+        for (const auto& e : previous) {
+            if (e.scope == "user" && !scanned.contains(e.user))
+                current.push_back(e); // carry forward a logged-off user unchanged
+        }
+
+        const auto snap_id = next_snapshot_id();
         auto typed = yuzu::tar::compute_software_events(previous, current, ts, snap_id);
         if (!typed.empty()) {
             if (!db_->insert_software_events(typed)) {
@@ -1041,6 +1097,18 @@ private:
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+
+        // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
+        // of the last collect_software tick (0 if it has never run) — the operator's
+        // signal that the hourly trigger is alive even on a host with no software
+        // changes (where software_live_rows stays 0). software_max_hive_mounts caps
+        // the one-time cold-start NTUSER.DAT mounts; steady-state ticks never mount.
+        ctx.write_output(std::format("config|software_interval_seconds|{}",
+                                     db_->get_config("software_interval_seconds", "3600")));
+        ctx.write_output(std::format("config|software_max_hive_mounts|{}",
+                                     db_->get_config("software_max_hive_mounts", "100")));
+        ctx.write_output(std::format("config|software_last_run_ts|{}",
+                                     db_->get_config("software_last_run_ts", "0")));
 
         // Process stream health. capture_method reflects the LIVE path: the
         // stream's method_name() ("etw" on Windows, "endpoint_security" on macOS)
@@ -1392,6 +1460,7 @@ private:
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
+        auto software_max_mounts = params.get("software_max_hive_mounts");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -1402,6 +1471,8 @@ private:
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
         bool software_provided = false;
+        int software_mounts = 0;
+        bool software_mounts_provided = false;
 
         // M13: Validate ALL parameters BEFORE writing any to the database
         if (!retention.empty()) {
@@ -1450,6 +1521,21 @@ private:
             }
         }
 
+        if (!software_max_mounts.empty()) {
+            software_mounts_provided = true;
+            bool parsed = false;
+            try {
+                software_mounts = std::stoi(std::string{software_max_mounts});
+                parsed = true;
+            } catch (...) {}
+            // 0 = never mount logged-off hives at cold-start (loaded hives only);
+            // upper bound guards against a typo causing a huge one-time I/O storm.
+            if (!parsed || software_mounts < 0 || software_mounts > 100000) {
+                ctx.write_output("error|software_max_hive_mounts must be 0-100000");
+                return 1;
+            }
+        }
+
         // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
@@ -1478,6 +1564,12 @@ private:
         if (software_provided) {
             db_->set_config("software_interval_seconds", std::to_string(software_secs));
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
+            changed = true;
+        }
+
+        if (software_mounts_provided) {
+            db_->set_config("software_max_hive_mounts", std::to_string(software_mounts));
+            ctx.write_output(std::format("config|software_max_hive_mounts|{}", software_mounts));
             changed = true;
         }
 

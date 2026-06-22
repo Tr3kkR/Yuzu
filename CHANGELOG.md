@@ -39,16 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time by diffing the installed-software inventory on a dedicated hourly trigger
   (`tar.software`; tune or disable via `software_interval`, `0`–86400 s). On Windows it
   captures both **machine-wide** (HKLM Uninstall 64-bit + WOW6432Node) and **per-user**
-  installs (each profile's `HKU\<SID>` Uninstall key, mounting `NTUSER.DAT` for
-  logged-off users); the `scope` column distinguishes them and `user` carries the
-  profile name. Tiers: `$Software_Live` (5000 rows) → `$Software_Daily` (31 d) →
-  `$Software_Monthly` (12 mo), with per-`(name, scope)` install/remove/upgrade counts.
-  **On by default** (asset-management / vulnerability-relevance data, like Services and
-  User sessions; toggle with `software_enabled`); names, versions, and publisher only —
-  no command lines or usage data. The first scan on a host **seeds the baseline
-  silently** so an `installed` event always means "installed now". Linux (dpkg/rpm) and
-  macOS (pkgutil) collectors are a fast-follow — the `$Software_*` tables are queryable
-  but empty there until then. See `docs/user-manual/tar.md`.
+  installs (each profile's `HKU\<SID>` Uninstall key); the `scope` column distinguishes
+  them and `user` carries the profile name. Tiers: `$Software_Live` (5000 rows) →
+  `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`(name, scope)`
+  install/remove/upgrade counts. **On by default** (asset-management / vulnerability-relevance
+  data, like Services and User sessions; toggle with `software_enabled`); names, versions,
+  and publisher only — no command lines or usage data. Per-user capture is efficient:
+  **steady-state scans read only the machine scope and logged-on hives and carry
+  logged-off users forward** (no per-tick `NTUSER.DAT` mounting — the RDS/Citrix I/O
+  cost — and no logon/logoff churn); logged-off hives are mounted only once at the
+  cold-start baseline, bounded by `software_max_hive_mounts` (default 100). The first
+  scan on a host **seeds the baseline silently** so an `installed` event always means
+  "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
+  `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
+  `software_max_hive_mounts` / `software_last_run_ts` lines — update any field-count
+  parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
+  `$Software_*` tables are queryable but empty there until then. See
+  `docs/user-manual/tar.md` and the data-handling classification in
+  `docs/enterprise-readiness-soc2-first-customer.md`.
 - **Guardian — baseline-anchored per-device compliance REST.**
   New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
   returns one Baseline's deployed Guards each with the device's last reported verdict

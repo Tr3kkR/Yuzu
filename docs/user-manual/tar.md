@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors six categories of system activity:
+TAR monitors these always-on categories of system activity (the opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below):
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -19,7 +19,9 @@ TAR monitors six categories of system activity:
 
 The first five categories take a snapshot of the current state each cycle, compare it to the previous snapshot, and record only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
-The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures both **machine-wide** installs (the HKLM Uninstall keys, 64-bit and 32-bit) and **per-user** installs (each profile's `HKU\<SID>` Uninstall key, mounting an unloaded `NTUSER.DAT` for logged-off users so the inventory is complete regardless of who is signed in); the `scope` column distinguishes the two and `user` carries the profile name for per-user rows. It runs on its own slower trigger (hourly by default — installs are infrequent and the per-user path mounts user hives) and is **on by default** (asset-management and vulnerability-relevance data, like Services and User sessions). It records names, versions, and publisher only — no command lines, no usage data. The **first run on a host seeds the baseline silently** (it records no events) so an `installed` event always means "installed now", not "was already present when the agent started watching". Linux (dpkg/rpm) and macOS (pkgutil) collectors are planned; the `$Software_*` tables are queryable but stay empty on those platforms until then.
+The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures both **machine-wide** installs (the HKLM Uninstall keys, 64-bit and 32-bit) and **per-user** installs (each profile's `HKU\<SID>` Uninstall key); the `scope` column distinguishes the two and `user` carries the profile name for per-user rows. It runs on its own slower trigger (hourly by default — installs are infrequent) and is **on by default** (asset-management and vulnerability-relevance data, like Services and User sessions). It records names, versions, and publisher only — no command lines, no usage data.
+
+Per-user capture is efficient by design: a logged-off user cannot install software, so **steady-state scans read only the machine scope and currently-logged-on profiles' hives and carry each logged-off user's last-known inventory forward** — no `NTUSER.DAT` mounting per tick (which would be a real I/O cost on multi-profile RDS/Citrix hosts) and no spurious churn when users log on and off. Logged-off profiles are mounted **only once, at the cold-start baseline**, bounded by `software_max_hive_mounts` (default 100); a profile beyond that cap is not mounted — instead its software is first captured the next time that user logs on, at which point its then-installed apps are recorded as `installed` events (so on a host with more than `software_max_hive_mounts` never-recently-logged-on profiles, raise the cap if you need their inventory dated to the baseline rather than to first logon). The **first run on a host seeds the baseline silently** (it records no events) so an `installed` event always means "installed now", not "was already present when the agent started watching". Linux (dpkg/rpm) and macOS (pkgutil) collectors are planned; the `$Software_*` tables are queryable but stay empty on those platforms until then.
 
 The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
@@ -96,6 +98,7 @@ Use the `configure` action to adjust TAR behavior.
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
 | `software_interval` | `0` or 300-86400 | 3600 | Seconds between software install/uninstall scans. `0` disables the scan trigger entirely (no collection until re-set or agent restart). |
+| `software_max_hive_mounts` | 0-100000 | 100 | Max logged-off-user `NTUSER.DAT` hives mounted during the **one-time cold-start baseline** (steady-state scans never mount). `0` = baseline only the machine scope and logged-on users; logged-off users are picked up when they next log on. Raise on a host where many never-recently-logged-on profiles must be baselined immediately. |
 | `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive) |
 | `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
@@ -223,14 +226,26 @@ config|module_enabled|false
 config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
+config|software_enabled|true
+config|software_paused_at|0
+config|software_live_rows|36
+config|software_oldest_ts|1710950000
 config|network_capture_method|polling
+config|software_interval_seconds|3600
+config|software_max_hive_mounts|100
+config|software_last_run_ts|1711050000
 ```
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module` (shown above),
 `procperf`, and `netqual` are off by default and must be enabled explicitly via
 `configure` (see the configuration table above). `module_live_rows` stays `0`
-until a collector for the host's OS ships.
+until a collector for the host's OS ships. The default-ON sources — `process`,
+`tcp`, `service`, `user`, `perf`, and `software` — report `<source>_enabled|true`.
+`software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
+if it has not run yet); it is the heartbeat that distinguishes "healthy but no
+software changed" (where `software_live_rows` stays low) from "the hourly trigger
+never fired".
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
@@ -331,6 +346,20 @@ TAR is designed for minimal performance overhead:
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
+
+> **Upgrade note (new `software` source — ON by default).** This release adds the
+> `software` install/uninstall source, which ships **on by default** on Windows
+> (asset-management / vulnerability-relevance data, like Services and User
+> sessions — not the opt-in posture used for usage-class telemetry). On upgrade,
+> `tar.status` gains a `config|software_*` block per agent (Windows: live values;
+> Linux/macOS: zero rows, collector planned) **plus** the global
+> `software_interval_seconds`, `software_max_hive_mounts`, and `software_last_run_ts`
+> lines. **Automation that parses `tar.status` by field count or terminal-field
+> detection must be updated** to tolerate these additional lines. Per-user
+> software (the `scope=user` rows, which include the profile name) is captured by
+> default; disable the whole source per host with `software_enabled=false` if a
+> deployment requires it. See `docs/enterprise-readiness-soc2-first-customer.md`
+> for the data-handling classification.
 
 > **Upgrade note (Windows process capture → ETW). BREAKING for `cmdline`
 > consumers.** On upgrade, the Windows process source switches from the
