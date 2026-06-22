@@ -8903,7 +8903,14 @@ private:
             // N1: the shared network-quality snapshot provider — the same closure
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
-            net_perf_fn);
+            net_perf_fn,
+            // Baseline-anchored per-device Guardian status route (trailing optional deps).
+            baseline_store_.get(),
+            // Per-device-scoped permission (management-group aware) for that route —
+            // the SAME named closure DeviceRoutes already uses for the dashboard
+            // Guardian device lens (defined once above), not a re-inlined duplicate
+            // that two copies would have to keep in sync.
+            scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

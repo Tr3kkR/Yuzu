@@ -3514,6 +3514,56 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 
+#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+
+Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+
+- **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
+- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
+- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`403`** if the caller lacks `Read` on the device's scope; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
+- **Response keys:**
+  - `baseline` — `{ baseline_id, name, lifecycle }`.
+  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
+  - `agent_id`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+
+**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+
+**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State → Assignment](guaranteed-state.md#assignment)). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
+
+Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
+
+Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+```
+
+```json
+{
+  "data": {
+    "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
+    "deployed": true,
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "total_guards": 3,
+    "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
+    "last_updated": "2026-06-20T13:45:00Z",
+    "guards": [
+      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
+      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},
+      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z"}
+    ]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
 #### `GET /api/v1/guaranteed-state/alerts`
 
 Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11).

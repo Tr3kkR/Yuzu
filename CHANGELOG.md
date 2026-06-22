@@ -19,8 +19,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
   `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
 
+### Fixed
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
 ### Added
 
+- **Guardian — baseline-anchored per-device compliance REST.**
+  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+  returns one Baseline's deployed Guards each with the device's last reported verdict
+  (`compliant` | `drifted` | `errored` | `pending`), plus counts and a `last_updated`
+  freshness stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced
+  set, not the live member list); a not-yet-deployed Baseline returns `deployed:false`
+  with empty guards (consumer renders "No Baseline Deployed"), and member edits
+  appear only after a re-deploy. Designed for embedding Guardian compliance into an
+  external CMDB / ITSM CI record (e.g. ServiceNow).
+  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
+  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
+  device is in — a previously group-scoped token now gets `403` for out-of-scope
+  devices, where a flat global check would have passed them; global tokens are
+  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
+  layer as `auth.scoped_permission_required`). Path params are length-capped
+  (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
+  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
+  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
