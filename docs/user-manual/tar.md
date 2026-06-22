@@ -111,7 +111,8 @@ Use the `configure` action to adjust TAR behavior.
 - `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings.
 - `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. A pattern like `"a"` will match every process whose name contains the letter `a` (most of them) — use length-3+ patterns or anchor with explicit substrings (`"-helper"`, `"chrome-helper"`).
 - `network_capture_method` is accepted unconditionally for the literal value `polling` (the platform default). Any other value must appear in the accept-list returned by `accepted_capture_methods("tcp")` (currently `iphlpapi`, `procfs`, `proc_pidfdinfo`); else the configure call is rejected.
-- Disabling a collector (`<source>_enabled=false`) short-circuits new captures but leaves existing rows queryable. Re-enabling later starts from a clean baseline rather than diffing against a stale snapshot.
+- Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
+  - The interval samplers (`perf` and the opt-in `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory), which is off by default for privacy: no usage row ever spans the period it was disabled.
 
 Example:
 
@@ -382,7 +383,10 @@ TAR is designed for minimal performance overhead:
 > `process_enabled=false` via `configure`; there is no separate "disable ETW but
 > keep polling" switch today. While disabled, the live ETW session keeps running
 > but its buffered events are drained-and-discarded each cycle, so no process
-> activity from the paused window is persisted when you re-enable.
+> activity from the paused window is persisted when you re-enable. As with every
+> snapshot-diff source, re-enabling `process_enabled` clears the stored baseline,
+> so the first cycle after re-enable does not emit ghost `stopped` events for
+> processes that exited during the pause (it re-bases on the live process set).
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System
