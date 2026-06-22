@@ -46,15 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and two machines querying the same Baseline name legitimately see different Guards.
   `total_guards` is that applicable count. A not-yet-deployed Baseline returns
   `deployed:false` with empty guards (consumer renders "No Baseline Deployed"), and
-  member edits appear only after a re-deploy. Designed for embedding Guardian compliance
-  into an external CMDB / ITSM CI record (e.g. ServiceNow).
+  member edits appear only after a re-deploy. A *deployed* Baseline returning
+  `total_guards:0` with `last_updated:null` is **not assessable** (the device is
+  offline / newly-enrolled, or every Guard is out of its scope), **not compliant** — a
+  CMDB consumer must cross-reference device liveness and never render `0/0` as green.
+  Designed for embedding Guardian compliance into an external CMDB / ITSM CI record
+  (e.g. ServiceNow).
   Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
   fleet-wide; a management-group-scoped principal must hold `Read` via a group the
   device is in — a previously group-scoped token now gets `403` for out-of-scope
   devices, where a flat global check would have passed them; global tokens are
   unaffected). Audited `guardian.device.view` on access (denials audited at the auth
-  layer as `auth.scoped_permission_required`). Both query params are required and
-  length-capped (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` bodies use
+  layer as `auth.scoped_permission_required`). Both query params are required,
+  length-capped (`256` / `auth::kMaxAgentIdLength`), and rejected if they contain
+  control characters (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use
   the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
   body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
 - **Live-query bundles — one instruction → several plugin actions on one device,

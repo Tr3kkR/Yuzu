@@ -247,17 +247,28 @@ std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& n
     std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
-    sqlite3_stmt* s = nullptr;
     // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE name = ? LIMIT 1;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII (sqlite_raii.hpp): finalizes on every exit including an
+    // exception thrown by read_baseline_row's std::string construction between
+    // prepare and finalize — mirrors deployed_member_rule_ids, the safer sibling.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        // Observability (SRE): a prepare failure (DB locked/corrupt) otherwise returns
+        // the SAME std::nullopt as a genuine not-found, so the REST route 404s and a
+        // CMDB consumer reads it as "no such baseline" — masking a store fault as
+        // benign with no signal. Log it so a degraded read is visible; the legitimate
+        // not-found path stays quiet. Name omitted (prepare failure is name-independent
+        // and the value is caller-influenced).
+        spdlog::error("BaselineStore::get_baseline_by_name: prepare failed: {}",
+                      sqlite3_errmsg(db_));
         return std::nullopt;
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(s.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<Baseline> result;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        result = read_baseline_row(s);
-    sqlite3_finalize(s);
+    if (sqlite3_step(s.get()) == SQLITE_ROW)
+        result = read_baseline_row(s.get());
     return result;
 }
 

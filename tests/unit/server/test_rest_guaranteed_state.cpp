@@ -940,6 +940,17 @@ TEST_CASE("REST gs.device-compliance: per-machine variation from one shared base
                  "?baseline=ServiceNow%20Compliance&agent_id=WS-1")
             ->body);
     CHECK(j1["data"]["total_guards"].get<int>() == 1); // only r1 applies to WS-1
+    // Identity, not just count: WS-1's applicable set is EXACTLY {r1} — a route that
+    // returned the wrong guard (r2/r3) would pass a count-only check.
+    {
+        bool ws1_r1 = false, ws1_other = false;
+        for (auto& g : j1["data"]["guards"]) {
+            if (g["rule_id"].get<std::string>() == "r1") ws1_r1 = true;
+            else ws1_other = true;
+        }
+        CHECK(ws1_r1);
+        CHECK_FALSE(ws1_other);
+    }
 
     auto j2 = nlohmann::json::parse(
         h.sink
@@ -948,6 +959,19 @@ TEST_CASE("REST gs.device-compliance: per-machine variation from one shared base
             ->body);
     CHECK(j2["data"]["total_guards"].get<int>() == 3); // all three apply to WS-2
     CHECK(j2["data"]["drifted"].get<int>() == 1);
+    // Identity: WS-2 sees {r1,r2,r3} and r3 specifically is the drifted one.
+    {
+        std::string s_r1, s_r2, s_r3;
+        for (auto& g : j2["data"]["guards"]) {
+            const auto id = g["rule_id"].get<std::string>();
+            if (id == "r1") s_r1 = g["status"].get<std::string>();
+            else if (id == "r2") s_r2 = g["status"].get<std::string>();
+            else if (id == "r3") s_r3 = g["status"].get<std::string>();
+        }
+        CHECK(s_r1 == "compliant");
+        CHECK(s_r2 == "compliant");
+        CHECK(s_r3 == "drifted");
+    }
 }
 
 TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE agent_id)",
@@ -980,6 +1004,34 @@ TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE age
     CHECK(d2["errored"].get<int>() == 2);
     CHECK(d2["compliant"].get<int>() == 0);
     CHECK(d2["pending"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.device-compliance: a reported guard NOT in the deployed snapshot is excluded",
+          "[rest][guaranteed_state][baseline]") {
+    // The denominator is deployed_snapshot ∩ reported. This exercises the OTHER side
+    // of the intersection: a guard the device REPORTED but that is NOT a member of the
+    // deployed Baseline (left over from a prior Baseline, or retired post-deploy) must
+    // be excluded. An implementation that filtered only by agent_id — forgetting the
+    // snapshot filter — would wrongly include r-extra and pass every other test here.
+    RestGsHarness h;
+    h.seed_rule("r1", "In snapshot");
+    h.seed_rule("r-extra", "Reported but not a member");
+    h.seed_deployed_baseline("B", {"r1"}); // snapshot = {r1} ONLY
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("a2", "WS-1", "r-extra", "guard.compliant", "2026-06-20T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 1); // only r1 — the snapshot bounds it
+    CHECK(d["compliant"].get<int>() == 1);
+    bool saw_extra = false;
+    for (auto& g : d["guards"])
+        if (g["rule_id"].get<std::string>() == "r-extra")
+            saw_extra = true;
+    CHECK_FALSE(saw_extra); // reported-but-not-a-member guard is excluded
 }
 
 TEST_CASE("REST gs.device-compliance: unknown agent on a deployed baseline → empty applicable set",
@@ -1163,6 +1215,33 @@ TEST_CASE("REST gs.device-compliance: query-param validation — required + leng
         h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=" + a256);
     REQUIRE(ok_a);
     CHECK(ok_a->status == 200);
+}
+
+TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no audit",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_deployed_baseline("B", {"r1"});
+
+    // A newline (%0A) in the name would forge lines in the guardian.device.view audit
+    // detail; the route swapped a charset-restricted path regex for arbitrary query
+    // bytes, so control bytes (< 0x20) are re-rejected before the scope gate / store.
+    auto crlf = h.sink.Get(
+        "/api/v1/guaranteed-state/device-compliance?baseline=ok%0Aevil&agent_id=WS-1");
+    REQUIRE(crlf);
+    CHECK(crlf->status == 400);
+    auto j = nlohmann::json::parse(crlf->body);
+    CHECK(j["error"]["code"].get<int>() == 400);
+    CHECK(j["error"].contains("correlation_id"));
+    // Rejected before the scoped-perm gate and the audit emit → no audit row.
+    CHECK(h.audit_log.empty());
+
+    // A NUL (%00) in agent_id — would truncate the SQL bind while the audit logged the
+    // full string; also rejected.
+    auto nul = h.sink.Get(
+        "/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS%00x");
+    REQUIRE(nul);
+    CHECK(nul->status == 400);
 }
 
 TEST_CASE("REST gs.device-compliance: 404 uses the A4 envelope (code + correlation_id)",

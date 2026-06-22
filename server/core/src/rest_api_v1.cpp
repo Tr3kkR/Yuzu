@@ -359,7 +359,7 @@ const std::string& openapi_spec() {
           "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
           "deployed": {"type": "boolean", "description": "lifecycle == deployed; false => consumer shows 'No Baseline Deployed'"},
           "agent_id": {"type": "string"},
-          "total_guards": {"type": "integer", "description": "Guards APPLICABLE to this device — the deployed_snapshot intersected with the Guards this device has actually reported (report-driven), NOT the snapshot size. Out-of-scope Guards are absent, so each machine's count reflects its own applicable set."},
+          "total_guards": {"type": "integer", "description": "Guards APPLICABLE to this device — the deployed_snapshot intersected with the Guards this device has actually reported (report-driven), NOT the snapshot size. Out-of-scope Guards are absent, so each machine's count reflects its own applicable set. NOT-ASSESSABLE: deployed:true with total_guards:0 and last_updated:null means NO applicable Guard has reported yet (device offline / newly-enrolled / all out-of-scope) — treat as 'not assessable', do NOT compute a compliance percentage or render it as compliant."},
           "compliant": {"type": "integer"},
           "drifted": {"type": "integer"},
           "errored": {"type": "integer"},
@@ -5599,6 +5599,30 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Reject control characters (bytes < 0x20: NUL, TAB, CR, LF, …) in both
+            // params. The replaced path route's regex ([A-Za-z0-9._-]+) excluded
+            // these; the query-param route accepts arbitrary bytes, so re-floor it.
+            // Closes two charset-removal hazards: (1) an embedded NUL truncates the
+            // SQL bind (sqlite3_bind_text(...,-1,...) stops at NUL) while the audit
+            // detail records the full string — diverging queried-name from
+            // audited-name; (2) a CR/LF forges lines in the guardian.device.view
+            // audit detail. Printable names pass — spaces ("ServiceNow Compliance")
+            // and UTF-8 continuation bytes (≥0x80) are not < 0x20.
+            const auto has_control_char = [](const std::string& s) {
+                for (unsigned char c : s)
+                    if (c < 0x20)
+                        return true;
+                return false;
+            };
+            if (has_control_char(baseline_name) || has_control_char(agent_id)) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(
+                        400, "query parameter contains control characters", cid),
+                    "application/json");
+                return;
+            }
             // Per-device VISIBILITY scope (management-group aware), matching the
             // dashboard Guardian device lens (device_routes.cpp): a global
             // GuaranteedState:Read passes fleet-wide, otherwise the principal must hold
@@ -5698,7 +5722,10 @@ void RestApiV1::register_routes(
                 if (s == "compliant") { status = s; ++compliant; }
                 else if (s == "drifted") { status = s; ++drifted; }
                 else if (s == "errored") { status = s; ++errored; }
-                // any unexpected stored state falls through to "pending" (no timestamp)
+                // any unexpected stored state falls through to "pending" (no
+                // timestamp) — also the forward-compat path: a future verdict token
+                // this build doesn't recognize stays counted in total_guards as
+                // pending, never silently dropped from the denominator.
                 if (status != "pending") {
                     updated_at = it->second.updated_at;
                     if (updated_at > last_updated)
