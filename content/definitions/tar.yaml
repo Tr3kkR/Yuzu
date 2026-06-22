@@ -333,7 +333,9 @@ spec:
           has its cmdline replaced with "[REDACTED by TAR]". At most 256
           elements of at most 256 characters each; over-cap elements are
           dropped at load. Default patterns: ["*password*", "*secret*",
-          "*token*", "*api_key*", "*credential*"].
+          "*token*", "*api_key*", "*credential*"]. These defaults are ALWAYS
+          MERGED IN — your patterns are ADDED to them, never replace them, so an
+          empty or all-invalid array cannot disable the baseline redaction.
       process_enabled:
         type: string
         displayName: Process Collector Enabled
@@ -378,14 +380,16 @@ spec:
         description: >
           TCP capture mechanism. "polling" (always accepted) drives the
           collector via the platform polling API at fast_interval cadence and
-          is the only mechanism wired today. Validation is OS-AWARE: besides
-          "polling", only methods valid on the RUNNING host's OS are accepted
-          (e.g. iphlpapi/etw on Windows, procfs on Linux, proc_pidfdinfo/
-          endpoint_security on macOS — run the `compatibility` action for the
-          live list). A method belonging to a DIFFERENT OS is rejected, so a
-          Linux agent can no longer store "iphlpapi". A host-valid future
-          method is accepted for pre-staging; the agent emits a warn line and
-          continues polling until that collector lands. Requires agent v0.12.0+.
+          is the only mechanism wired today. Validation is OS-AWARE and scoped to
+          the NETWORK (tcp) source: besides "polling", only the tcp-source method
+          valid on the RUNNING host's OS is accepted — iphlpapi on Windows, procfs
+          on Linux, proc_pidfdinfo on macOS (run the `compatibility` action for the
+          live list). Process-source methods such as "etw" / "endpoint_security"
+          are NOT network_capture_method values and are rejected even on their own
+          OS. A method belonging to a DIFFERENT OS is also rejected, so a Linux
+          agent can no longer store "iphlpapi". A host-valid future method is
+          accepted for pre-staging; the agent emits a warn line and continues
+          polling until that collector lands. Requires agent v0.12.0+.
       process_stabilization_exclusions:
         type: string
         displayName: Process Stabilization Exclusions

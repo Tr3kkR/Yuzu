@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -310,6 +311,42 @@ TEST_CASE("TAR diff: process with sensitive cmdline is redacted in events", "[ta
     REQUIRE(events.size() == 1);
     CHECK(events[0].detail_json.find("[REDACTED by TAR]") != std::string::npos);
     CHECK(events[0].detail_json.find("hunter2") == std::string::npos);
+}
+
+TEST_CASE("TAR redaction: ensure_redaction_defaults is fail-closed for every input (#1532)",
+          "[tar][diff][redaction][issue1532]") {
+    // fjarvis HIGH: no loaded set may disable the baseline redaction. load_redaction_patterns
+    // routes the parse_pattern_config result through ensure_redaction_defaults; the fail-open
+    // was that a valid array whose elements all get dropped (`[]`, `[1,2,3]`, all-over-long, or
+    // `["*"]`) yields an EMPTY loaded vector. Prove every such loaded vector still redacts.
+    auto contains_all_defaults = [](const std::vector<std::string>& v) {
+        for (const auto& def : kDefaultRedactionPatterns)
+            if (std::find(v.begin(), v.end(), def) == v.end())
+                return false;
+        return true;
+    };
+
+    SECTION("empty loaded set (the all-dropped / empty-array fail-open) still redacts") {
+        auto merged = ensure_redaction_defaults({});
+        CHECK(contains_all_defaults(merged));
+        CHECK(should_redact("myapp --password=hunter2", merged));
+        CHECK(should_redact("export API_KEY=abc123", merged));
+        CHECK(should_redact("vault read secret/database", merged));
+    }
+
+    SECTION("operator-custom patterns are ADDED to, never REPLACE, the defaults") {
+        auto merged = ensure_redaction_defaults({"*myorg_session*"});
+        CHECK(contains_all_defaults(merged));
+        CHECK(std::find(merged.begin(), merged.end(), "*myorg_session*") != merged.end());
+        CHECK(should_redact("svc --myorg_session=xyz", merged)); // custom still applies
+        CHECK(should_redact("svc --password=p", merged));        // default still applies
+    }
+
+    SECTION("a loaded set already holding a default is not duplicated") {
+        auto merged = ensure_redaction_defaults({"*password*"});
+        CHECK(contains_all_defaults(merged));
+        CHECK(std::count(merged.begin(), merged.end(), std::string{"*password*"}) == 1);
+    }
 }
 
 // =============================================================================

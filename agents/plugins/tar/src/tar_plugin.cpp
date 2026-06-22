@@ -199,19 +199,27 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
-    static const std::vector<std::string> kDefaults = {"*password*", "*secret*", "*token*",
-                                                       "*api_key*", "*credential*"};
-    auto stored = db.get_config("redaction_patterns");
-    if (stored.empty())
-        return kDefaults;
-    // #541 — bound + sanitise at load: configure caps the array at write time,
-    // but this runs every fast-collect cycle, so a value written before the cap
-    // or mutated outside the plugin must still be clamped here. parse_pattern_config
-    // drops non-string/empty/over-long elements and truncates to the element cap;
-    // a non-array stored value (nullopt) falls back to the safe built-in set.
-    if (auto v = yuzu::tar::parse_pattern_config(stored))
-        return std::move(*v);
-    return kDefaults;
+    // The built-in patterns (`kDefaultRedactionPatterns` — password/secret/token/
+    // api_key/credential) are the baseline content-protection layer for
+    // process_live, and they MUST always apply: an operator can ADD patterns via
+    // configure but can never fully DISABLE redaction. So union the defaults into
+    // whatever is stored — fail-closed (fjarvis HIGH). A bare `parse_pattern_config`
+    // fallback was fail-OPEN: it returns the safe built-in set only for an empty or
+    // non-array value, but a *valid array whose elements all get dropped* (`[]`,
+    // `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is empty) returns an
+    // EMPTY vector — silently disabling redaction so `password`/`token`/`secret`
+    // land in process_live in plaintext. collect_fast and procperf called this
+    // without the union do_fleet_snapshot already applied; centralising it here
+    // closes all three paths at once and removes the divergent local default list.
+    // #541 — parse_pattern_config still bounds + sanitises at load (drops
+    // non-string/empty/over-long, truncates to the element cap), because this runs
+    // every fast-collect cycle on whatever is stored. ensure_redaction_defaults
+    // then unions the built-ins — the single, unit-tested home of the fail-closed
+    // guarantee, shared with do_fleet_snapshot.
+    std::vector<std::string> result;
+    if (auto v = yuzu::tar::parse_pattern_config(db.get_config("redaction_patterns")))
+        result = std::move(*v);
+    return yuzu::tar::ensure_redaction_defaults(std::move(result));
 }
 
 // Per-source enable/disable (issue #59). The default for a source with no
@@ -1384,9 +1392,10 @@ private:
     // disabled, the corresponding list is emitted empty with truncated_*=false
     // and the snapshot carries `source_paused.process` / `.tcp` markers.
     //
-    // Redaction: kDefaultRedactionPatterns is unioned with the operator-loaded
-    // patterns so an empty config does NOT disable redaction
-    // (governance round 1, sec-M1 + compliance-F3).
+    // Redaction: load_redaction_patterns now unions kDefaultRedactionPatterns
+    // (via ensure_redaction_defaults) internally, so an empty/all-dropped config
+    // does NOT disable redaction on ANY collect path — this snapshot included
+    // (governance round 1, sec-M1 + compliance-F3; #1532 fail-closed).
     int do_fleet_snapshot(yuzu::CommandContext& ctx) {
         std::lock_guard lock(collect_mu_);
         auto ts = now_epoch_seconds();
@@ -1430,15 +1439,12 @@ private:
             connections = yuzu::tar::merge_live_and_recent_connections(live, recent, ts);
         }
 
-        // Defence-in-depth: union operator patterns with the compiled-in
-        // defaults so an empty/missing config still applies *password*, *secret*,
-        // *token*, *api_key*, *credential*. The `should_redact` matcher returns
-        // true on the first hit, so duplicates are harmless.
+        // Redaction defaults are now unioned inside load_redaction_patterns (so
+        // every collect path — collect_fast, procperf, and this snapshot — is
+        // uniformly fail-closed; no stored value can disable *password*/*secret*/
+        // *token*/*api_key*/*credential*). The previously-separate union here is
+        // therefore redundant; keep the single source of truth in the loader.
         auto redaction = load_redaction_patterns(*db_);
-        for (const auto& def : yuzu::tar::kDefaultRedactionPatterns) {
-            if (std::find(redaction.begin(), redaction.end(), def) == redaction.end())
-                redaction.push_back(def);
-        }
 
         spdlog::info("tar.fleet_snapshot host={} procs={} conns={} ips={} "
                      "process_on={} tcp_on={}",

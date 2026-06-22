@@ -528,6 +528,13 @@ TEST_CASE("TAR parse_pattern_config clamps + sanitises at load (#541 UP-1)",
     auto clamped = parse_pattern_config(big);
     REQUIRE(clamped.has_value());
     CHECK(clamped->size() == yuzu::tar::kMaxPatternArrayElements);
+
+    // Pre-parse byte cap (gov MEDIUM): a blob larger than kMaxPatternConfigBytes is
+    // rejected as unparseable (nullopt) BEFORE json::parse, so a multi-MB tampered/
+    // legacy value can't be fully parsed + copied every fast cycle. A maximal valid
+    // array (just under the cap) still parses.
+    std::string oversized = "[\"" + std::string(yuzu::tar::kMaxPatternConfigBytes, 'x') + "\"]";
+    CHECK_FALSE(parse_pattern_config(oversized).has_value());
 }
 
 TEST_CASE("TAR parse_pattern_config enforces the min-core floor on the LOAD path (#541)",

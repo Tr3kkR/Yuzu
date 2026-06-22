@@ -218,6 +218,13 @@ std::optional<std::vector<std::string>> parse_pattern_config(std::string_view js
     // redaction scan. Parse, drop non-string / empty / over-long elements, and
     // truncate to the element cap. Returns nullopt only when the stored value is
     // not a JSON array at all (caller falls back to its own default).
+    //
+    // Cap the raw text BEFORE parsing (gov MEDIUM): the element/length caps only
+    // bite after the array is materialised, so without this a multi-MB tampered or
+    // legacy value would be fully parsed + copied every fast cycle. A blob over the
+    // cap is treated as unparseable → caller's safe default.
+    if (json_text.size() > kMaxPatternConfigBytes)
+        return std::nullopt;
     nlohmann::json arr;
     try {
         arr = nlohmann::json::parse(json_text);
@@ -232,7 +239,8 @@ std::optional<std::vector<std::string>> parse_pattern_config(std::string_view js
             break; // element cap — ignore the overflow tail
         if (!elem.is_string())
             continue;
-        auto s = elem.get<std::string>();
+        // get_ref avoids copying the element until it has passed the length check.
+        const auto& s = elem.get_ref<const std::string&>();
         if (s.empty() || s.size() > kMaxPatternLength)
             continue; // skip empty / over-long elements rather than failing
         // #541 load-path floor: drop a sub-floor exclusion the same way configure
@@ -242,7 +250,7 @@ std::optional<std::vector<std::string>> parse_pattern_config(std::string_view js
         // only over-redacts a command line; it never drops an event).
         if (require_min_core_len && stripped_core(s).size() < kMinExclusionCoreLength)
             continue;
-        patterns.push_back(std::move(s));
+        patterns.push_back(s); // copy: `s` is a borrowed ref into the json element
     }
     return patterns;
 }

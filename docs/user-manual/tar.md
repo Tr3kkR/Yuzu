@@ -92,7 +92,7 @@ Use the `configure` action to adjust TAR behavior.
 | `retention_days` | 1-365 | 7 | Days to keep events before automatic purge |
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
-| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive) |
+| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive). **Merged with** the built-in defaults — added to, never replacing them; the defaults cannot be disabled. |
 | `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
@@ -109,7 +109,7 @@ Use the `configure` action to adjust TAR behavior.
 
 - When both `fast_interval` and `slow_interval` are provided, `fast_interval` must be less than `slow_interval`.
 - `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings, with at most **256 elements** of at most **256 characters** each (both feed an O(patterns × command-line-length) scan per process per cycle).
-- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`).
+- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`). Matching is on the **process name only**, so a binary renamed to contain an approved substring evades capture — exclusions are a noise-reduction convenience, **not a threat-hunting control**.
 - `network_capture_method` is validated against the **running host's OS** accept-list, not the union across all platforms — e.g. a Linux agent rejects the Windows-only `iphlpapi`. `polling` is always accepted (the platform default). Run the `compatibility` action to see the live accepted list for a given agent.
 - Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
   - The interval samplers (`perf` and the opt-in `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory), which is off by default for privacy: no usage row ever spans the period it was disabled.
@@ -174,6 +174,8 @@ Default redaction patterns:
 ```
 
 Patterns use case-insensitive substring matching. Leading and trailing `*` are **optional** — they are stripped before matching, so the effective match is always a bare substring (`*password*`, `password*`, and `password` all match any command line containing "password" in any case). Interior `?` and `[abc]` are treated as literals, not glob metacharacters.
+
+**The built-in default patterns always apply and cannot be disabled.** `configure` lets you **add** patterns, but the baseline set (`password`, `secret`, `token`, `api_key`, `credential`) is enforced on every collect path regardless of what is stored. If `redaction_patterns` is set to an array whose elements are all invalid (over-long, non-string) or to `[]`, the built-in defaults are silently restored as the active list rather than leaving redaction disabled — so a corrupt, tampered, or empty config can never cause secrets to be written in plaintext.
 
 To customize:
 

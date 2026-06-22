@@ -23,6 +23,7 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -111,6 +112,26 @@ std::string redact_cmdline(const std::string& cmdline, const std::vector<std::st
  */
 inline const std::vector<std::string> kDefaultRedactionPatterns = {
     "*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
+
+/**
+ * Guarantee the built-in redaction defaults are present in `loaded`, appending
+ * any that are absent (order-preserving, de-duplicated). This is the fail-closed
+ * redaction invariant: an operator can ADD patterns via `tar.configure` but can
+ * never DISABLE the baseline protection, so no stored value — empty, a non-array,
+ * a valid array whose elements were all dropped by parse_pattern_config (`[]`,
+ * `[1,2,3]`, all-over-long), or one whose only entry has an empty stripped core
+ * (`["*"]`) — can ever cause `password`/`token`/`secret` to be written to
+ * `process_live` in plaintext. Every collect path (collect_fast, procperf,
+ * fleet_snapshot) routes its loaded patterns through here. (fjarvis #1532 HIGH.)
+ */
+inline std::vector<std::string>
+ensure_redaction_defaults(std::vector<std::string> loaded) {
+    for (const auto& def : kDefaultRedactionPatterns) {
+        if (std::find(loaded.begin(), loaded.end(), def) == loaded.end())
+            loaded.push_back(def);
+    }
+    return loaded;
+}
 
 // ── Diff functions ───────────────────────────────────────────────────────────
 

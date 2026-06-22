@@ -30,6 +30,13 @@ namespace yuzu::tar {
 inline constexpr std::size_t kMaxPatternArrayElements = 256;
 inline constexpr std::size_t kMaxPatternLength = 256;
 inline constexpr std::size_t kMinExclusionCoreLength = 3;
+// Pre-parse byte cap for parse_pattern_config (load path, runs every fast cycle).
+// The element/length caps only apply AFTER the whole array is materialised, so a
+// multi-MB tampered/legacy stored value would otherwise be fully parsed + copied
+// each cycle. A maximal *valid* array is 256 × 256 chars plus JSON punctuation
+// (~66 KiB); 128 KiB admits any valid config with headroom while rejecting a
+// pathological blob, which is treated as "not parseable" → caller's safe default.
+inline constexpr std::size_t kMaxPatternConfigBytes = 128 * 1024;
 
 // Validate a single configure pattern. Returns an error message (suitable for
 // the `error|...` configure response) or std::nullopt if valid. Always enforces

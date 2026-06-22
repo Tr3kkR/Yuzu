@@ -473,7 +473,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the 256/256/3 limits), and the stale "glob" comments are corrected to
   "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
   pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
-  (#544).
+  (#544). (d) **Command-line redaction is now fail-closed on every collect path.**
+  `load_redaction_patterns` previously returned the safe built-in patterns only
+  when the stored value was empty or a non-array; a *valid array whose elements all
+  got dropped* (`[]`, `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is
+  empty) returned an empty set, silently disabling redaction so `password`/`token`/
+  `secret` were written to `process_live` in plaintext — `collect_fast` and
+  `procperf` lacked the defaults-union that `fleet_snapshot` already applied. The
+  built-in defaults are now unioned inside `load_redaction_patterns` via the shared
+  `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
+  can never DISABLE the baseline protection on any path. The load-path JSON parse
+  also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
+  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
+  metadata for `network_capture_method` no longer advertises the process-source
+  `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
 - **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
   `tar.configure <source>_enabled=false` wrote the disable flag without serialising
   against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
