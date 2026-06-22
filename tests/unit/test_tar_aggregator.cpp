@@ -275,7 +275,8 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
           "[tar][paused_at][issue538]") {
     struct Case { const char* source; const char* state_key; };
     const Case cases[] = {{"process", "process"}, {"tcp", "network"},
-                          {"service", "service"}, {"user", "user"}};
+                          {"service", "service"}, {"user", "user"},
+                          {"arp", "arp"}, {"dns", "dns"}}; // ADR-0011 snapshot-diff sources
 
     yuzu::test::TempDbFile tmp{std::string_view{"tar-538-parity-"}};
     auto opened = TarDatabase::open(tmp.path);
@@ -286,6 +287,12 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
     for (const auto& c : cases) {
         // Distinct {source,state_key} per row and a fresh source each iteration,
         // so a single shared db is safe (no _enabled carry-over between rows).
+        // Seed enabled first: the opt-in sources (arp/dns, default_enabled=false)
+        // would otherwise see their first `=false` as a no-op (already off), so
+        // the disable leg never fires and the baseline is never cleared. Setting
+        // `<source>_enabled=true` makes the subsequent disable a real transition
+        // for every source uniformly.
+        db.set_config(std::format("{}_enabled", c.source), "true");
         REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
         REQUIRE_FALSE(db.get_state(c.state_key).empty());
 
@@ -388,6 +395,8 @@ TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth",
     CHECK(diff_state_key("tcp") == "network"); // NOT "tcp"
     CHECK(diff_state_key("service") == "service");
     CHECK(diff_state_key("user") == "user");
+    CHECK(diff_state_key("arp") == "arp"); // ADR-0011
+    CHECK(diff_state_key("dns") == "dns"); // ADR-0011
     // No snapshot-diff baseline: disabling these is a state no-op.
     CHECK(diff_state_key("perf").empty());
     CHECK(diff_state_key("procperf").empty());
@@ -402,7 +411,8 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // map it here, diff_state_key would return empty → the disable-clear becomes
     // a silent no-op and #538 silently regresses for the new source. Pin every
     // registered source to an explicit classification so a new one fails loudly.
-    const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user"};
+    const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user",
+                                                      "arp", "dns"};
     // module is a stream-drained source (EventRing, like the process ETW/ES
     // stream) with no snapshot-diff baseline, so diff_state_key("module") is
     // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
