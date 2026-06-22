@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — DEX single-observation detail (click a history row)</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile).
+
+  ASK: from the device DEX history, click ONE event row and get everything we
+  hold about THAT event. No fleet rollups, no root-cause speculation.
+
+  PRINCIPLE: observations are FACTS, not alerts. Yuzu shows what it observed and
+  describes what the signal TYPE is; it never infers why THIS event happened or
+  which event "caused" another. No "likely related", no cause ranking.
+
+  This deepens the existing device Signal-history table (render_dex_device_fragment):
+  each row becomes clickable -> opens a detail panel for that single observation
+  (keyed by event_id). Everything shown is data we ALREADY hold:
+   - the captured projection columns (obs_type / subject / reason / symbolic /
+     component / metric / observed_at / platform / agent_id / event_id), plus
+   - STATIC catalogue knowledge for the obs_type (friendly label, a neutral
+     plain-English description of the signal type, the source provider/channel,
+     the privacy note) — server-side enrichment, no agent change, no new capture.
+  The panel also states honestly what is NOT captured (the per-event HRESULT /
+  parameters) — that boundary is Lever B, surfaced at the grain it matters.
+
+  Built on the product .gp-* system (guardian_page_ui.cpp + yuzu.css), dark only.
+  Fake-but-shaped data; OS-neutral vocabulary.
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#16263d; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff;
+    --orange:#ffa64d; --mono:'JetBrains Mono',Consolas,monospace;
+    --state-hover:#223450;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:0}
+  .gp-wrap{max-width:1000px;margin:1.5rem auto;padding:0 1.5rem 3rem}
+  .gp-back{font-size:.78rem;color:var(--accent);display:inline-block;text-decoration:none;margin-bottom:.7rem}
+  .gp-back:hover{text-decoration:underline}
+
+  .gp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;border-bottom:1px solid var(--border);padding-bottom:.8rem}
+  .gp-head h1{font-size:1.25rem;font-weight:700;margin:0;font-family:var(--mono)}
+  .gp-titleline{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}
+  .gp-sub{font-size:.78rem;color:var(--muted);margin-top:.3rem}
+  .gp-pill{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;border-radius:.3rem;padding:.1rem .45rem;border:1px solid var(--border);color:var(--lightblue)}
+  .gp-pill.ok{color:var(--green);border-color:rgba(78,210,126,.5)}
+
+  .gp-sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.25rem 0 .5rem;display:flex;align-items:baseline;gap:.5rem}
+  .gp-sech .hint{color:var(--muted);font-size:.58rem;font-weight:400;text-transform:none;letter-spacing:0}
+
+  .gp-table{width:100%;border-collapse:collapse;font-size:.78rem;margin-top:.2rem}
+  .gp-table th{text-align:left;padding:.42rem .55rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
+  .gp-table td{padding:.42rem .55rem;border-bottom:1px solid var(--border)}
+  .gp-table tr.click{cursor:pointer} .gp-table tr.click:hover td{background:var(--state-hover)}
+  .gp-table tr.open td{background:var(--surface2);border-bottom:0}
+  .gp-table tr.open td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  .gp-mute{color:var(--muted)} .mono{font-family:var(--mono)}
+  .what{color:var(--yellow)} .code{font-family:var(--mono);color:var(--lightblue)}
+  .chev{color:var(--accent);font-size:.7rem}
+
+  /* the expanded single-observation detail */
+  .detail{background:var(--surface2);border:1px solid var(--border);border-top:0;border-radius:0 0 .5rem .5rem;
+          padding:.2rem 1rem 1rem;margin:0 0 1rem}
+  .detail-h{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.7rem .1rem .6rem;border-bottom:1px solid var(--border)}
+  .detail-h .ttl{font-size:.96rem;font-weight:700}
+  .detail-h .ts{font-family:var(--mono);font-size:.74rem;color:var(--lightblue)}
+  .detail-h .rel{color:var(--muted);font-size:.66rem}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:.28rem 1.1rem;font-size:.78rem;margin:.3rem 0}
+  .kv .k{color:var(--muted);white-space:nowrap}
+  .kv .v{font-family:var(--mono);color:var(--fg);overflow-wrap:anywhere}
+  .kv .v.lb{color:var(--lightblue)} .kv .v.dim{color:var(--muted);font-family:inherit;font-style:italic}
+
+  .prose{font-size:.8rem;color:var(--fg);max-width:64ch}
+  .prose .src{color:var(--muted);font-size:.72rem;margin-top:.2rem}
+
+  .cap{background:var(--surface);border:1px solid var(--border);border-radius:.45rem;padding:.55rem .7rem;font-size:.76rem}
+  .cap .row{display:flex;gap:.5rem;padding:.12rem 0}
+  .cap .yes{color:var(--green);font-weight:700;flex-shrink:0;width:1rem;text-align:center}
+  .cap .no{color:var(--orange);font-weight:700;flex-shrink:0;width:1rem;text-align:center}
+  .cap b{color:var(--fg)}
+  .leverb{font-size:.7rem;color:var(--orange);margin-top:.45rem}
+  .leverb b{color:var(--orange)}
+
+  .links{display:flex;gap:1.1rem;flex-wrap:wrap;font-size:.76rem;margin-top:.2rem}
+  .links a{color:var(--accent);text-decoration:none} .links a:hover{text-decoration:underline}
+  .gp-note{margin-top:1.6rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .gp-note b{color:var(--lightblue)}
+  .cols{display:flex;gap:1.5rem;flex-wrap:wrap} .cols>div{flex:1;min-width:280px}
+</style>
+</head>
+<body>
+<div class="gp-wrap">
+  <a class="gp-back" href="#">&larr; WS-00472 &middot; device</a>
+
+  <div class="gp-head">
+    <div>
+      <div class="gp-titleline"><h1>WS-00472</h1><span class="gp-pill">Windows 11 &middot; 26100</span><span class="gp-pill ok">&#10003; observer armed</span></div>
+      <div class="gp-sub">Signal history &middot; click any event for full detail</div>
+    </div>
+  </div>
+
+  <div class="gp-sech">Signal history <span class="hint">last 7 days &middot; newest first</span></div>
+  <table class="gp-table">
+    <thead><tr><th style="width:1.4rem"></th><th>When</th><th>Signal</th><th>Subject</th><th>What happened</th><th>Component</th></tr></thead>
+    <tbody>
+      <!-- the clicked / open row -->
+      <tr class="click open"><td><span class="chev">&#9662;</span></td>
+        <td class="mono">2026-06-22T11:27:41Z</td><td class="name">App repository error</td>
+        <td class="gp-mute">app state repository</td><td><span class="what">STATEREPO_ERROR</span> <span class="code">sr-100</span></td><td class="gp-mute">&mdash;</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ─────────── SINGLE-OBSERVATION DETAIL (what the click opens) ─────────── -->
+  <div class="detail">
+    <div class="detail-h">
+      <div class="ttl">App repository error <span class="mono gp-mute" style="font-size:.74rem;font-weight:500">app.staterepo_error</span></div>
+      <div style="text-align:right"><div class="ts">2026-06-22T11:27:41Z</div><div class="rel">3 minutes ago</div></div>
+    </div>
+
+    <div class="cols">
+      <div>
+        <div class="gp-sech" style="margin-top:.7rem">What we captured</div>
+        <div class="kv">
+          <span class="k">Signal</span><span class="v">App repository error</span>
+          <span class="k">Type</span><span class="v lb">app.staterepo_error</span>
+          <span class="k">Subject</span><span class="v">app state repository</span>
+          <span class="k">Code</span><span class="v lb">sr-100</span>
+          <span class="k">Symbolic</span><span class="v">STATEREPO_ERROR</span>
+          <span class="k">Component</span><span class="v dim">not provided</span>
+          <span class="k">Metric</span><span class="v dim">none</span>
+          <span class="k">Device</span><span class="v">WS-00472</span>
+          <span class="k">Platform</span><span class="v">Windows 11 &middot; 26100</span>
+          <span class="k">Event ref</span><span class="v" style="font-size:.7rem">e1f3c9a4&hellip; (dedup key)</span>
+        </div>
+      </div>
+      <div>
+        <div class="gp-sech" style="margin-top:.7rem">Where it came from</div>
+        <div class="kv">
+          <span class="k">Provider</span><span class="v">Microsoft-Windows-StateRepository</span>
+          <span class="k">Channel</span><span class="v">&hellip;/Operational</span>
+          <span class="k">Event ID</span><span class="v lb">100</span>
+          <span class="k">Observed at</span><span class="v">edge agent, on-device</span>
+        </div>
+
+        <div class="gp-sech" style="margin-top:.9rem">What this signal is <span class="hint">about the type, not this event</span></div>
+        <div class="prose">
+          The State Repository is the Windows database behind the Start menu, Search and app
+          identities. This signal records that the repository reported an error. It is a fact that
+          the error occurred &mdash; it does <b>not</b> identify which app, which operation, or a cause.
+          <div class="src">Source: signal catalogue (static description for <span class="mono">app.staterepo_error</span>).</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gp-sech" style="margin-top:1rem">What's captured vs not <span class="hint">the honest boundary</span></div>
+    <div class="cap">
+      <div class="row"><span class="yes">&#10003;</span><div><b>Captured:</b> that the error occurred, the provider <b>event id (100)</b>, the exact time, and the device.</div></div>
+      <div class="row"><span class="no">&times;</span><div><b>Not captured:</b> the event's own parameters &mdash; the <b>HRESULT</b> and the failing operation
+        the StateRepository event carries are not extracted today, and the specific meaning of code <span class="code">sr-100</span> isn't labeled.</div></div>
+    </div>
+    <div class="leverb">&#9888; Getting the HRESULT / operation, or a plain-English label for <span class="code">sr-100</span>, is <b>Lever&nbsp;B</b>
+      &mdash; richer agent extraction (needs a real specimen) or a documented code&rarr;label map. Everything above is what we hold now.</div>
+
+    <div class="gp-sech" style="margin-top:1rem">Go deeper</div>
+    <div class="links">
+      <a href="#">All 11 occurrences of this signal on WS-00472 &rarr;</a>
+      <a href="#">This signal across the fleet &rarr;</a>
+      <a href="#">Get live info from this device now &rarr;</a>
+    </div>
+  </div>
+
+  <!-- the rest of the history, collapsed -->
+  <table class="gp-table" style="margin-top:-.3rem">
+    <tbody>
+      <tr class="click"><td style="width:1.4rem"><span class="chev" style="color:var(--muted)">&#9656;</span></td>
+        <td class="mono" style="width:auto">2026-06-22T11:20:08Z</td><td class="name">App crash</td>
+        <td class="mono">AcmeCRM.exe</td><td><span class="what">Access violation</span> <span class="code">0xC0000005</span></td><td class="mono">AcmeCRM.dll</td></tr>
+      <tr class="click"><td><span class="chev" style="color:var(--muted)">&#9656;</span></td>
+        <td class="mono">2026-06-22T11:02:55Z</td><td class="name">App repository error</td>
+        <td class="gp-mute">app state repository</td><td><span class="what">STATEREPO_ERROR</span> <span class="code">sr-102</span></td><td class="gp-mute">&mdash;</td></tr>
+      <tr class="click"><td><span class="chev" style="color:var(--muted)">&#9656;</span></td>
+        <td class="mono">2026-06-21T13:07:12Z</td><td class="name">App repository error</td>
+        <td class="gp-mute">app state repository</td><td><span class="what">STATEREPO_ERROR</span> <span class="code">sr-99</span></td><td class="gp-mute">&mdash;</td></tr>
+    </tbody>
+  </table>
+
+  <div class="gp-note">
+    One click on a history row opens this panel for that single observation (keyed by <span class="mono">event_id</span>). Every
+    fact is data we already hold &mdash; the captured columns plus the static catalogue description of the signal <i>type</i>.
+    <b>No inference:</b> Yuzu states what it observed and what the signal is, never why this event happened or what caused it.
+    The orange note is the only forward-looking bit &mdash; the honest <b>Lever&nbsp;B</b> boundary. &nbsp;&mdash;&nbsp;Is this the
+    right "more info"? Anything to add or cut before I port to C++?
+  </div>
+
+</div>
+</body>
+</html>
