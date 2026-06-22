@@ -547,6 +547,27 @@ TEST_CASE("DEX device history rows drill to the observation detail", "[dex][rout
     CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
 }
 
+TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
+    seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
+
+    auto html = render_dex_apps_fragment(&store, "", 7);
+    CHECK(html.find("Applications") != std::string::npos);
+    CHECK(html.find("AcmeCRM.exe") != std::string::npos);
+    CHECK(html.find("chrome.exe") != std::string::npos);
+    // app rows drill to the per-app blast-radius view; the Apps subnav tab is present
+    CHECK(html.find("name=AcmeCRM.exe") != std::string::npos);
+    CHECK(html.find("/fragments/dex/apps") != std::string::npos);
+}
+
+TEST_CASE("DEX apps list: empty store → no-data placeholder", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    auto html = render_dex_apps_fragment(&store, "", 7);
+    CHECK(html.find("No data") != std::string::npos);
+}
+
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");

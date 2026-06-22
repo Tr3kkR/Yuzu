@@ -187,6 +187,15 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
 /// (This is the panel Option-D enrichment later extends with `extra{}` fields.)
 std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
 
+/// Applications list — the dedicated app-centric DEX lens (a new top-level
+/// subnav tab). Ranks apps by reliability signals (crashes + hangs) keyed on the
+/// process image, each row drilling to the per-app blast-radius view. `since` is
+/// the ISO cutoff; `window_days` drives the chips + drill links. Pure + free so
+/// it is unit-testable directly against a seeded store. (Per-app performance,
+/// version, and non-crash signal attribution are follow-on slices.)
+std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                     int window_days);
+
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
 /// One agent's stored response to a dispatched command — the narrow seam the
