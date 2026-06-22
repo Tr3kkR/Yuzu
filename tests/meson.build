@@ -114,6 +114,7 @@ agent_test_exe = executable(
     'unit/test_guardian_engine.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
+    'unit/test_guard_service.cpp',
     'unit/test_guard_systemd.cpp',
     'unit/test_dex_signals.cpp',
     'unit/test_dex_macos.cpp',
@@ -129,6 +130,8 @@ agent_test_exe = executable(
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
+    'unit/test_cert_discovery.cpp',
+    'unit/test_env_util.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -228,6 +231,9 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
+      'unit/server/test_bundle_service.cpp',
+      'unit/server/test_bundle_orchestrator.cpp',
+      'unit/server/test_rest_bundle.cpp',
       'unit/server/test_audit_store.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',

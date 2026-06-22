@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -114,5 +115,44 @@ private:
     std::thread thread_;
     void* stop_event_{nullptr}; ///< HANDLE (void* keeps windows.h out of this header)
 };
+
+// ── Pure state / compliance / edge helpers (compiled + tested on every platform) ──
+//
+// These carry the guard's decision logic with NO Windows dependency, so the
+// compliant-edge behaviour is unit-tested off-Windows exactly as guard_systemd.hpp
+// exposes SystemdState + systemd_decide_emit. (The Windows SCM watch itself has no
+// unit harness — these pure helpers are how its logic is regression-protected.)
+
+/// Detected TERMINAL run-state of a watched service, normalised to the classes the
+/// guard reasons about. The watch loop HOLDS on *_PENDING transitional states, so
+/// they never reach the classifier. `Absent` = the service does not exist / deleted.
+enum class ServiceState { Running, Stopped, Paused, Absent };
+
+/// Diagnostic token for GuardDrift.detected_value (free-form string, NOT a schema
+/// enum). Pure.
+YUZU_EXPORT std::string_view service_state_token(ServiceState s);
+
+/// Compliance of a detected terminal state against the rule's desired run state.
+/// `service-running` is satisfied only by Running; `service-stopped` by Stopped AND
+/// by Absent (a service that does not exist is, definitionally, not running, so it
+/// does not drift a "must be stopped" rule). Pure.
+YUZU_EXPORT bool service_is_compliant(ServiceGuard::Desired want, ServiceState got);
+
+/// What the pure compliant-edge classifier decided for one terminal observation.
+enum class ServiceEmit {
+    CompliantEdge,   ///< transition INTO compliant — emit guard.compliant ONCE
+    CompliantSteady, ///< already compliant — silent (NFR / network-kindness)
+    Drift,           ///< not compliant — report drift
+};
+
+/// PURE compliant-edge classifier (compiled + tested on every platform). Emits a
+/// compliant signal only on the transition INTO compliant (incl. the first compare,
+/// `last_compliant == nullopt`); steady compliant is silent; any non-compliant
+/// terminal state is a drift. Mutates `last_compliant` to the new edge. Mirrors the
+/// RegistryGuard / FileGuard Slice-B behaviour so a compliant service produces a
+/// guard.compliant census signal instead of reading "pending" forever in the
+/// per-(agent,rule) status table.
+YUZU_EXPORT ServiceEmit service_classify_edge(ServiceGuard::Desired want, ServiceState got,
+                                              std::optional<bool>& last_compliant);
 
 } // namespace yuzu::agent

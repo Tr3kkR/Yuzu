@@ -70,7 +70,12 @@ RUN rebar3 as prod release
 FROM alpine:3.24@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
-    && adduser -D -s /sbin/nologin yuzu-gw
+    && adduser -D -s /sbin/nologin yuzu-gw \
+    # Shared cert group (PKI #1289): FIXED gid 2000, identical across server/
+    # gateway/agent so the gateway (a different uid) reads the shared CA + its leaf
+    # key out of /etc/yuzu/certs when the server runs with --cert-group yuzu-pki.
+    && addgroup -g 2000 yuzu-pki \
+    && addgroup yuzu-gw yuzu-pki
 
 COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /opt/yuzu_gw/
 RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
