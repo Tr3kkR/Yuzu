@@ -208,3 +208,25 @@ TEST_CASE("procperf: live columns carry name but never a cmdline", "[tar][procpe
     CHECK(table_ddl.find("cmdline") == std::string::npos);
     CHECK(table_ddl.find("user") == std::string::npos);
 }
+
+TEST_CASE("procperf #538: a reset baseline (post-disable) emits no off-period-spanning row",
+          "[tar][procperf][source-lifecycle]") {
+    // do_collect_perf's procperf disable branch installs a default-constructed
+    // ProcSnapshot as prev_proc_ (valid=false). On the first tick after a
+    // re-enable, deriving against that reset baseline must yield NO samples (it
+    // re-baselines) even though the app accrued CPU during the paused window — so
+    // the first post-re-enable row never covers the opt-out window. Without the
+    // reset, prev_proc_ would still hold the pre-disable snapshot and this call
+    // would emit a per-app row spanning the gap (the privacy leak on the opt-in
+    // source procperf, off by default for exactly this reason).
+    auto after_gap = snap(100'000);                                 // long pause elapsed
+    after_gap.procs.push_back(proc(10, 1, 900 * kSec100ns, 100, "a.exe")); // lots of CPU
+
+    // The disable branch's reset == a default-constructed prev → no rows.
+    CHECK(derive_proc_samples(ProcSnapshot{}, after_gap, kNoRedaction).empty());
+    // Sanity: against a real pre-gap baseline it WOULD emit a row — the
+    // off-period leak the reset prevents.
+    auto prev = snap(1000);
+    prev.procs.push_back(proc(10, 1, 0, 100, "a.exe"));
+    CHECK_FALSE(derive_proc_samples(prev, after_gap, kNoRedaction).empty());
+}

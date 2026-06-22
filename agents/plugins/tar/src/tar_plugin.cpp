@@ -548,6 +548,10 @@ private:
             pending_stream_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
         if (process_enabled) {
+            // #538: single source of truth for the diff-baseline state key (see
+            // diff_state_key) — the same key apply_source_enabled_transition
+            // clears on disable, so the two can't drift.
+            const std::string proc_key{yuzu::tar::diff_state_key("process")};
             if (stream_active_) {
                 // Gap-free stream (ETW/Windows or Endpoint Security/macOS)
                 // supersedes the snapshot-diff poll. Same process_live schema +
@@ -643,7 +647,7 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state("process", processes_to_json(current).dump());
+                    db_->set_state(proc_key, processes_to_json(current).dump());
                 }
             } else {
                 // No active stream (poll-only platform, or stream unavailable):
@@ -662,7 +666,7 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state("process");
+                auto prev_json = db_->get_state(proc_key);
                 auto previous = json_to_processes(prev_json);
 
                 auto typed =
@@ -676,14 +680,16 @@ private:
                     total_events += static_cast<int>(typed.size());
                 }
 
-                db_->set_state("process", processes_to_json(current).dump());
+                db_->set_state(proc_key, processes_to_json(current).dump());
             }
         }
 
         // Network diff
         if (source_enabled(*db_, "tcp")) {
+            // #538: tcp's diff baseline lives under "network" (see diff_state_key).
+            const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
-            auto prev_json = db_->get_state("network");
+            auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
             auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
@@ -696,7 +702,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("network", connections_to_json(current).dump());
+            db_->set_state(net_key, connections_to_json(current).dump());
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -757,13 +763,24 @@ private:
             if (!cur.valid) {
                 ctx.write_output("tar|collect_perf|0|unsupported_platform");
             } else {
+                bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
                 {
-                    std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
-                    sample = yuzu::tar::derive_sample(prev_perf_, cur);
-                    prev_perf_ = cur;
+                    std::lock_guard lock(collect_mu_); // prev_perf_ RMW + disable re-check
+                    // The enabled gate above ran WITHOUT the lock; a disable could
+                    // have landed (and reset prev_perf_) since. Re-check here so a
+                    // disable racing a mid-flight sample never commits a post-disable
+                    // row, and leave prev_perf_ untouched when disabled so the reset
+                    // in the disable branch stands. (#538)
+                    perf_enabled_now = source_enabled(*db_, "perf");
+                    if (perf_enabled_now) {
+                        sample = yuzu::tar::derive_sample(prev_perf_, cur);
+                        prev_perf_ = cur;
+                    }
                 }
-                if (!sample.valid) {
+                if (!perf_enabled_now) {
+                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                } else if (!sample.valid) {
                     ctx.write_output("tar|collect_perf|0|baseline");
                 } else {
                     yuzu::tar::PerfRow row;
@@ -809,11 +826,24 @@ private:
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
+        bool procperf_enabled_now = true;
         std::vector<yuzu::tar::ProcPerfSample> samples;
         {
-            std::lock_guard lock(collect_mu_); // prev_proc_ read-modify-write only
-            samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
-            prev_proc_ = std::move(proc_cur);
+            std::lock_guard lock(collect_mu_); // prev_proc_ RMW + disable re-check
+            // The procperf gate above ran WITHOUT the lock; re-check here so a
+            // disable that raced this tick (and already reset prev_proc_) cannot
+            // commit a post-disable row. Leave prev_proc_ as the disable branch
+            // reset it so a later re-enable re-baselines instead of diffing across
+            // the opt-out window. (#538)
+            procperf_enabled_now = (db_->get_config("procperf_enabled", "false") == "true");
+            if (procperf_enabled_now) {
+                samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
+                prev_proc_ = std::move(proc_cur);
+            }
+        }
+        if (!procperf_enabled_now) {
+            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            return rc;
         }
         if (samples.empty()) {
             ctx.write_output("tar|collect_procperf|0|baseline");
@@ -849,8 +879,9 @@ private:
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
+            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
             auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state("service");
+            auto prev_json = db_->get_state(svc_key);
             auto previous = json_to_services(prev_json);
 
             auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
@@ -863,13 +894,14 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("service", services_to_json(current).dump());
+            db_->set_state(svc_key, services_to_json(current).dump());
         }
 
         // User diff
         if (source_enabled(*db_, "user")) {
+            const std::string usr_key{yuzu::tar::diff_state_key("user")}; // #538
             auto current = yuzu::tar::enumerate_users();
-            auto prev_json = db_->get_state("user");
+            auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
@@ -882,7 +914,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("user", users_to_json(current).dump());
+            db_->set_state(usr_key, users_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -1416,7 +1448,49 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            bool transition_ok;
+            {
+                // #538: collect_fast/slow hold collect_mu_ for their whole
+                // enumerate→diff→set_state cycle. Taking it here makes the
+                // enabled-flag write + baseline clear atomic w.r.t. a collection
+                // tick: the tick either fully precedes the disable (its set_state
+                // is then wiped by the baseline clear) or sees enabled=false and
+                // skips. No interleaving ⇒ no post-disable snapshot, no ghost
+                // "stopped" events on re-enable. No deadlock: do_configure runs
+                // without collect_mu_ held and the helper re-acquires nothing.
+                std::lock_guard lock(collect_mu_);
+                transition_ok =
+                    yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+                if (transition_ok && v == "false") {
+                    // The interval samplers (perf / procperf) keep their previous
+                    // reading in memory, not in a diff-state row, so the
+                    // diff_state_key clear inside apply_source_enabled_transition
+                    // does not reach them (diff_state_key is empty for both). Reset
+                    // the in-memory baseline under the SAME lock the collect legs
+                    // take so a later re-enable diffs against a fresh reading instead
+                    // of one from before the pause — otherwise the first
+                    // post-re-enable row would cover the entire disabled window (a
+                    // privacy leak on opt-in procperf, and contradicts the
+                    // "re-enabling starts from a clean baseline" promise in
+                    // docs/user-manual/tar.md). default-constructed → valid=false,
+                    // which derive_sample/derive_proc_samples treat as "no baseline"
+                    // (records nothing on the next tick).
+                    if (src.name == "perf")
+                        prev_perf_ = yuzu::tar::PerfCounters{};
+                    else if (src.name == "procperf")
+                        prev_proc_ = yuzu::tar::ProcSnapshot{};
+                }
+            }
+            if (!transition_ok) {
+                // #538/UP-1: a disable that could not clear the baseline leaves
+                // the source ENABLED (fail-safe). Report it so the operator can
+                // retry rather than believing the source was stopped.
+                ctx.write_output(std::format(
+                    "error|{} disable failed: could not clear collection baseline "
+                    "(database busy); source left enabled",
+                    key));
+                return 1;
+            }
             ctx.write_output(std::format("config|{}|{}", key, v));
             // Echo the resulting paused_at so the operator/dashboard sees the
             // transition timestamp without an extra status round-trip. We
