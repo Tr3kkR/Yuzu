@@ -63,6 +63,15 @@ fi
 
 # ── 2. Docker (self-hosted Linux) ────────────────────────────────────────
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/tmp/yuzu-ci-postgres.lock
+    if ! flock -w 120 9; then
+      echo "::error::ensure-postgres: timed out waiting for /tmp/yuzu-ci-postgres.lock — another runner may be stuck managing ${CONTAINER}" >&2
+      exit "$SOFT_EXIT"
+    fi
+  else
+    echo "::warning::ensure-postgres: flock not available; shared docker container lifecycle is not serialized" >&2
+  fi
   # Digest-drift guard: the container is persistent (--restart
   # unless-stopped), so a PG_IMAGE pin bump would otherwise never reach
   # runners that already have one — tests would silently keep running the

@@ -1,10 +1,49 @@
 # CI cutover runbook — Shulgi (Ubuntu 24.04) → Big Tam (Ubuntu 26.04)
 
-Status: **ci.yml linux leg FLIPPED + validated on Big Tam** (2026-06-20). Remaining:
-sanitizer-tests → nightly → codeql still on Shulgi.
+Status: **CUTOVER COMPLETE** (2026-06-20/21). **Every** self-hosted job has moved
+off the old single-host runners: all Linux → Big Tam (`yuzu-bigtam-linux`), all
+Windows → Wee Tam (`yuzu-weetam-windows`). Sequence: `ci.yml` linux (#1609,
+merged) → `sanitizer-tests` + `nightly` + `codeql` Linux → **`release.yml` Linux
+legs + the remaining Windows stragglers + build-speed** (PR #1615). **`yuzu-wsl2-linux`
+(Shulgi) and `yuzu-local-windows` are retired** — remove them from
+`.github/runner-inventory.json` (item 6) to silence the inventory sentinel.
+`proto-compat` / `cache-prune-linux` keep the bare `[self-hosted, Linux, X64]`
+label (no compiler) and land on Big Tam.
 
-Branch `ci/ubuntu-2604-cutover`. Two extra shared-host fixes were needed beyond the
-plan, both because Big Tam runs **4 runners on one host** (Shulgi was one):
+The sections below are the historical runbook + per-file record; the future-tense
+"deferred" / "pre-flip" framing is preserved as the record of how the flip was
+sequenced.
+
+Branches: `ci/ubuntu-2604-cutover` (ci.yml, merged),
+`ci/bigtam-followup-self-hosted-legs` (sanitizer/nightly/codeql), and
+`ci/retire-shulgi-localwindows` (#1615 — release + Windows stragglers +
+build-speed). Several extra fixes were
+needed beyond the plan — some because Big Tam runs **4 runners on one host**
+(Shulgi was one), two surfaced only by the **cold from-source rebuild** Big Tam
+forces (its caches start empty):
+
+- **meson not on the default PATH (follow-up discovery).** ci.yml installs meson
+  via `pip3 install --user` (→ `~/.local/bin`) and adds it to `$GITHUB_PATH`
+  **per-job**; that PATH addition does NOT persist to other workflows. The
+  sanitizer-tests + codeql Linux legs were *verify-only* (asserted tools on
+  PATH, installed nothing) on the assumption the toolchain was baked into the
+  host — true on the long-lived Shulgi WSL2 runner, FALSE on Big Tam. Fix: give
+  those legs a real flock-wrapped `Install system packages` step (apt toolchain
+  + `pip3 install ... requirements-ci.txt` + `echo ~/.local/bin >> $GITHUB_PATH`),
+  mirroring ci.yml. nightly already installed, so it only needed the flock wrap.
+- **libpq breaks the sanitizer triplets when built from source (cold-build
+  discovery).** The `x64-linux-{asan,tsan}` overlay triplets are
+  `LIBRARY_LINKAGE dynamic`, so vcpkg built libpq as a `.so`. libpq is a recent
+  dep (Postgres substrate, ADR-0006) and the sanitizer caches hadn't been rebuilt
+  since it landed, so this only bit on Big Tam's cold build (would bite Shulgi
+  too on a cold rebuild). Two failures: TSan — PostgreSQL's shared-lib
+  `libpq-refs-stamp` check rejects the injected `__tsan_func_exit` ("must not
+  call exit") → vcpkg install fails; ASan — a dynamic libpq.so emits no
+  standalone `libpgcommon.a`, so `meson.build:320`'s `find_library('pgcommon',
+  required:true)` fails. Fix: per-port `if(PORT STREQUAL "libpq") set(...static)`
+  in both sanitizer triplets (matches stock x64-linux); vcpkg's libpq Makefile
+  builds the `.so`/runs refs-stamp only on the `all-shared-lib` path, so the
+  static path sidesteps both. Commit on the follow-up branch.
 - **apt lock:** the matrix legs race `apt-get`. `DPkg::Lock::Timeout` does NOT cover
   `apt-get update`'s lists lock, so the install step is wrapped in `flock -w 600 9 …
   9>/tmp/yuzu-ci-apt.lock`. **The sanitizer/nightly/codeql legs must add the SAME
@@ -96,26 +135,53 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    (no compiler — needs no pin). The GHA-hosted **canary** stays on
    `ubuntu-24.04`/gcc-13 per the "keep GHA-hosted on 24.04" decision, so it no
    longer mirrors the primary toolchain (a known, accepted divergence).
-2. **`.github/workflows/sanitizer-tests.yml`** — repin
-   `[self-hosted, Linux, X64, yuzu-shulgi]` → `…, yuzu-bigtam-linux`; bump the
-   `gcc-13`/`g++-13` tool-presence checks + `CC: ccache gcc-13`. Add a
-   `bigtam_pool_healthy` gate (it currently has none). Leave `ImageOS: ubuntu24`.
-3. **`.github/workflows/nightly.yml`** — ASan + TSan legs repin
-   `yuzu-shulgi` → `yuzu-bigtam-linux`; the generic coverage leg is already
-   pool-labelled; bump every `gcc-13 g++-13` apt line and `CC: ccache gcc-13`.
-   Leave `ImageOS: ubuntu24`.
-4. **`.github/workflows/codeql.yml`** — Linux leg repin `yuzu-shulgi` →
-   `yuzu-bigtam-linux`; bump the `TOOLS=` list and `CC: ccache gcc-13`.
-   Leave `ImageOS: ubuntu24`.
-5. **`.github/workflows/release.yml`** — the `[self-hosted, Linux]` legs match
-   both boxes. Decide deliberately: keep release on gcc-13 (Shulgi) until the PR
-   matrix has soaked on gcc-15, **or** move it. If moving, bump the `gcc-13 g++-13`
-   tool-check + `CC: ccache gcc-13` and pin to Big Tam.
-6. **`.github/runner-inventory.json`** — update the Shulgi role (no longer the
-   live Linux runner) and the Big Tam roles (now live); if Shulgi is retired from
-   Linux CI, reflect that.
-7. **`docs/ci-architecture.md`** — update the runner-topology table + flip this
-   doc's status to "flipped".
+2. **`.github/workflows/sanitizer-tests.yml`** — **DONE (2026-06-21).** Both legs
+   repinned to `…, yuzu-bigtam-linux`; new `preflight` job gates both on
+   `bigtam_pool_healthy`; gcc-15/g++-15 + `linux-gcc15.ini`;
+   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. The *verify-only* toolchain step was
+   replaced with a real flock-wrapped `Install system packages` step (meson is
+   not on Big Tam's default PATH — see shared-host fixes above).
+3. **`.github/workflows/nightly.yml`** — **DONE (2026-06-21).** ASan + TSan +
+   Coverage all repinned to `…, yuzu-bigtam-linux` (coverage was the generic
+   pool, but a gcc-15 build can't land on the Shulgi/gcc-13 fallback, so it is
+   pinned too; renamed "Coverage (GCC 13)"→"(GCC 15)"); new `preflight` job gates
+   all three on `bigtam_pool_healthy`; every apt line flock-wrapped (incl. the
+   best-effort `gdb` install in the TSan gdb step); gcc-15 + `linux-gcc15.ini`;
+   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`.
+4. **`.github/workflows/codeql.yml`** — **DONE (2026-06-21).** Linux matrix leg
+   repinned to `…, yuzu-bigtam-linux`; new Linux-only flock-wrapped
+   `Install system packages` step (same meson-PATH reason); `TOOLS=` +
+   `CC`/`CXX` → gcc-15, `linux-gcc15.ini`; Windows leg unchanged. **No
+   `bigtam_pool_healthy` gate** — a job-level `if` can't reference `matrix`, so
+   gating just the Linux leg of this Linux+Windows matrix job would require
+   splitting it (out of scope; CodeQL is not a required check).
+5. **`.github/workflows/release.yml`** — **DONE (2026-06-21, #1615).** All 5
+   self-hosted Linux legs (`build-linux`, `build-gateway`,
+   `docker-publish{,-postgres,-chisel}`) pinned to `…, yuzu-bigtam-linux`;
+   `build-linux` → gcc-15 (CC/CXX, verify-deps, `linux-gcc15.ini`);
+   `build-windows` → `yuzu-weetam-windows`. The docker buildx local cache moved off
+   the Shulgi-only `/mnt/d/docker-buildcache` mount to
+   `${runner.tool_cache}/yuzu-docker-buildcache`. `CCACHE_MAXSIZE=30G` added so the
+   build doesn't inherit the host default. (An interim pin to `yuzu-wsl2-linux` —
+   the runner NAME, not a label — would have queued forever; Shulgi's label is
+   `yuzu-shulgi`. release.yml only runs at tag time, so the first Big Tam release
+   is its real validation; note Big Tam ships RPM 6.0 vs Shulgi's 4.x.)
+6. **`.github/runner-inventory.json`** — **PENDING.** Remove `yuzu-wsl2-linux` and
+   `yuzu-local-windows` entirely (both retired); confirm the Big Tam + Wee Tam
+   roles are marked live. Until this lands the inventory sentinel flags the retired
+   runners as missing. No workflow gate depends on it — the pool gates are
+   label-driven, so retired runners just drop out (nothing gates on `all_healthy`).
+7. **`docs/ci-architecture.md`** — **DONE (2026-06-21, #1615).** Runner-topology
+   table consolidated (Big Tam = all Linux, Wee Tam = all Windows, both retired
+   runners listed under "Retired"), tier summary + "Ubuntu 26.04 migration" marked
+   COMPLETE, and a "Build speed" section added.
+8. **Big Tam host provisioning (build speed)** — **DONE (2026-06-21).** On the
+   `runner` user (shared `HOME=/home/runner` across r0–r3): ccache `max_size=50G`
+   (host default 5 GiB is far too small); `mold` (`apt install mold`) wired via
+   `-fuse-ld=mold` in the gcc-15/clang-21 native files; `rpm` (rpmbuild) for
+   release packaging (absent on fresh 26.04 — was the first-release blocker);
+   `requirements-ci.txt` (incl. meson 1.11.1) pre-installed in `~/.local` so the
+   per-job `pip --user --require-hashes` is a no-op (no re-download).
 
 ## Rollback
 
