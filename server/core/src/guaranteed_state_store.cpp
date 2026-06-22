@@ -140,7 +140,7 @@ namespace {
 // projection rows, never events).
 constexpr const char* kGobsDdl = R"(
     -- DEX read-model PROJECTION of ruleless signal observations (the
-    -- 103-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
+    -- 110-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
     -- guaranteed_state_events (the single source of truth): written in the
     -- SAME transaction as the event, so a redelivered event_id fails the
     -- event PK and rolls back both → the projection inherits the dedup and

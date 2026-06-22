@@ -25,6 +25,11 @@ TEST_CASE("dex_obs_cap_per_hour: resolves the catalogue cap, 60 for an uncatalog
     CHECK(dex_obs_cap_per_hour("memory.exhausted") == 12);
     CHECK(dex_obs_cap_per_hour("os.uptime_report") == 4);
     CHECK(dex_obs_cap_per_hour("service.crashed") == 60);
+    // Wave-4 caps pinned so a future obs_type can't gain a second, differently-capped
+    // spec without this failing (the cap-collision class cpp-expert flagged).
+    CHECK(dex_obs_cap_per_hour("hw.battery_error") == 12);
+    CHECK(dex_obs_cap_per_hour("service.unresponsive") == 30);
+    CHECK(dex_obs_cap_per_hour("network.adapter_reset") == 60);
     // Linux poll-derived types are not in the (Windows-event-log) catalogue → default 60;
     // they are already hysteresis/latch-bounded so the cap never bites.
     CHECK(dex_obs_cap_per_hour("totally.unknown.type") == 60);

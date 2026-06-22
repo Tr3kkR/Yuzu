@@ -70,9 +70,14 @@ static const char* kAllObsTypes[] = {
     "security.threat_action_failed", "security.rtp_error", "security.bitlocker_error",
     "security.cert_enroll_failed", "update.check_failed", "update.download_failed",
     "gpo.cse_failed", "mgmt.mdm_error",
+    // wave 4 (2026-06-22) — power-management + driver reliability
+    "os.modern_standby_exit", "network.adapter_driver_dump", "hw.driver_load_failed",
+    "hw.battery_error",
+    // wave 4 batch 2 — cheap additions on already-armed channels
+    "service.unresponsive", "service.shutdown_failed", "network.adapter_reset",
 };
 
-TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catalog]") {
+TEST_CASE("catalogue: 110 distinct obs_types, every spec complete", "[dex][catalog]") {
     const auto& cat = dex_signal_catalog();
     std::set<std::string> types;
     for (const auto& s : cat) {
@@ -87,14 +92,14 @@ TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catal
         if (s.event_ids.empty())
             CHECK(s.max_level > 0);
     }
-    // The Windows AGENT event catalogue contract: exactly 103 obs_types. The
-    // SERVER's display catalogue (dex_signal_groups(), pinned at 107 by
+    // The Windows AGENT event catalogue contract: exactly 110 obs_types. The
+    // SERVER's display catalogue (dex_signal_groups(), pinned at 114 by
     // test_dex_routes.cpp) is intentionally larger — it adds the POLL-sourced
     // types that never enter this EvtSubscribe catalogue: `storage.low`
     // (macOS df poll + Windows state poll) and the three A3 `perf.*` breach
     // types (dex_perf_breach via the state poller). The two counts therefore
     // differ BY DESIGN; each side's drift-net still bites for its own additions.
-    CHECK(types.size() == std::size(kAllObsTypes)); // 103 Windows signals
+    CHECK(types.size() == std::size(kAllObsTypes)); // 110 Windows signals
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
 }
@@ -102,14 +107,24 @@ TEST_CASE("catalogue: 103 distinct obs_types, every spec complete", "[dex][catal
 TEST_CASE("catalogue: every extractor degrades gracefully on empty fields",
           "[dex][catalog]") {
     // A drifted/forged event yields empty or reordered fields — every extractor
-    // must produce a well-formed observation (never throw; obs_type stamped by
-    // extract_signal) so the occurrence still counts.
+    // must NEVER THROW. The norm is a well-formed observation (obs_type stamped by
+    // extract_signal) so the occurrence still counts. A few extractors are
+    // intentionally selective: a matched event that empty fields cannot confirm as
+    // a real signal (the benign-mostly types below) cleanly SUPPRESSES (nullopt)
+    // rather than counting a non-event. Both outcomes are valid; a throw is not.
+    static const std::set<std::string> kMaySuppressOnEmpty = {
+        "hw.battery_error", // KP521 fires on every battery-count change; only Error/
+                            // Abandoned > 0 is a signal — empty fields ⇒ not a fault
+    };
     for (const auto& s : dex_signal_catalog()) {
         const int id = s.event_ids.empty() ? 1 : s.event_ids.front();
         const int level = s.max_level > 0 ? s.max_level : 2;
         std::optional<SignalObservation> o;
         REQUIRE_NOTHROW(o = extract_signal(s.channel, s.provider, id, level, {}));
-        REQUIRE(o);
+        if (!o) {
+            CHECK(kMaySuppressOnEmpty.count(s.obs_type) == 1); // only the listed types may suppress
+            continue;
+        }
         CHECK(o->obs_type == s.obs_type);
         CHECK_FALSE(o->sentence.empty()); // detected_value never blank
     }
@@ -586,6 +601,92 @@ constexpr const char* kRealDisk11 =
     "<Level>2</Level><Channel>System</Channel></System><EventData>"
     "<Data>\\Device\\Harddisk1\\DR1</Data><Binary>0F008000</Binary></EventData></Event>";
 
+// ── Wave 4 (2026-06-22): real records captured from a live HP ZBook Firefly 14
+// G8 (Win11 26100). Power-button hang, modern-standby exit, Intel Wi-Fi D3 dump,
+// PnP driver-load failure, battery-count change. ──
+
+// Kernel-Power 41 with a NON-ZERO PowerButtonTimestamp — the machine was held off
+// by the power button after a hard hang (vs kReal41's pure power loss, ts 0).
+constexpr const char* kReal41Button =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/>"
+    "<EventID>41</EventID><Version>10</Version><Level>1</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='BugcheckCode'>0</Data><Data Name='SleepInProgress'>0</Data>"
+    "<Data Name='PowerButtonTimestamp'>134266075744470540</Data>"
+    "<Data Name='LongPowerButtonPressDetected'>false</Data>"
+    "<Data Name='LidState'>1</Data></EventData></Event>";
+
+// Kernel-Power 507 — a real Modern-standby exit. DripsResidencyInUs 0 of a
+// 17.37 s DurationInUs ⇒ 0% deep-idle residency (the platform never reached deep
+// idle while "asleep").
+constexpr const char* kReal507 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/>"
+    "<EventID>507</EventID><Version>12</Version><Level>4</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='EnergyDrain'>21552</Data><Data Name='DripsResidencyInUs'>0</Data>"
+    "<Data Name='DurationInUs'>17371560</Data><Data Name='Reason'>32</Data>"
+    "<Data Name='ExitLatencyInUs'>450115</Data></EventData></Event>";
+
+// Netwtw10 7025 — a real Intel Wi-Fi D3 diagnostic dump. CLASSIC source: UNNAMED
+// positional Data ([0]=NDIS device, [1]=adapter) + a Binary the parser skips.
+// Qualifiers attr + no Provider Guid (the classic-source shape).
+constexpr const char* kRealNetwtw7025 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Netwtw10'/><EventID Qualifiers='16384'>7025</EventID><Version>0</Version>"
+    "<Level>4</Level><Channel>System</Channel></System><EventData>"
+    "<Data>\\Device\\NDMP5</Data><Data>Intel(R) Wi-Fi 6 AX201 160MHz</Data>"
+    "<Binary>000004000200340000000000711B0040</Binary></EventData></Event>";
+
+// Kernel-PnP 219 — a real driver-load failure (WUDFRd failed to load for a HID
+// device; Status decimal 3221226341 = 0xC0000365).
+constexpr const char* kRealPnP219 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Kernel-PnP' Guid='{9c205a39-1250-487d-abd7-e831c6290539}'/>"
+    "<EventID>219</EventID><Version>0</Version><Level>3</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='DriverNameLength'>39</Data>"
+    "<Data Name='DriverName'>HID\\Vid_8087&amp;Pid_0AC2\\6&amp;11d64d0d&amp;0&amp;0000</Data>"
+    "<Data Name='Status'>3221226341</Data><Data Name='FailureNameLength'>14</Data>"
+    "<Data Name='FailureName'>\\Driver\\WUDFRd</Data><Data Name='Version'>0</Data>"
+    "</EventData></Event>";
+
+// Kernel-Power 521 — a real (healthy) battery-count change: all-zero error counts,
+// which the extractor SUPPRESSES (not a signal).
+constexpr const char* kReal521Healthy =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/>"
+    "<EventID>521</EventID><Version>0</Version><Level>4</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='ValidBatteryCount'>1</Data><Data Name='ErrorBatteryCount'>0</Data>"
+    "<Data Name='AbandonedBatteryCount'>0</Data></EventData></Event>";
+
+// SCM 7011 — service unresponsive. Params REVERSED (param1 = timeout ms, param2 =
+// service), like 7009 — pins that the extractor reads param2, not param1.
+constexpr const char* kRealScm7011 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Service Control Manager' Guid='{555908d1-a6d7-4695-8e1e-26931d2012f4}' "
+    "EventSourceName='Service Control Manager'/><EventID Qualifiers='49152'>7011</EventID>"
+    "<Version>0</Version><Level>2</Level><Channel>System</Channel></System><EventData>"
+    "<Data Name='param1'>30000</Data><Data Name='param2'>HPAudioAnalytics</Data></EventData></Event>";
+
+// SCM 7043 — service did not shut down properly. Normal layout (param1 = service),
+// plus a Binary the parser must skip.
+constexpr const char* kRealScm7043 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Service Control Manager' Guid='{555908d1-a6d7-4695-8e1e-26931d2012f4}' "
+    "EventSourceName='Service Control Manager'/><EventID Qualifiers='49152'>7043</EventID>"
+    "<Version>0</Version><Level>2</Level><Channel>System</Channel></System><EventData>"
+    "<Data Name='param1'>Windows Biometric Service</Data>"
+    "<Binary>5700620069006F0053007200760063000000</Binary></EventData></Event>";
+
+// NDIS 10317 — a network miniport fatal/reset event (named fields). Vendor-neutral.
+constexpr const char* kRealNdis10317 =
+    "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+    "<Provider Name='Microsoft-Windows-NDIS' Guid='{cdead503-17f5-4a3e-b7ae-df8cc2902eb9}'/>"
+    "<EventID>10317</EventID><Version>0</Version><Level>2</Level><Channel>System</Channel></System>"
+    "<EventData><Data Name='IfGuid'>{ece3eb1c-2f80-47a2-b40c-1a5906358546}</Data>"
+    "<Data Name='IfIndex'>21</Data><Data Name='IfLuid'>19985273135824896</Data>"
+    "<Data Name='AdapterName'>Microsoft Wi-Fi Direct Virtual Adapter #2</Data>"
+    "<Data Name='MiniportEventEnum'>74</Data></EventData></Event>";
+
 // Run one real record through the FULL chain, exactly as the engine does.
 std::optional<SignalObservation> run_chain(const char* xml) {
     const auto sys = extract_system_fields(xml);
@@ -608,6 +709,118 @@ TEST_CASE("REAL records: kernel-power 41 power loss (full chain)", "[dex][parse]
     CHECK(o->obs_type == "os.power_loss");
     CHECK(o->reason == "power loss"); // BugcheckCode 0 -> the pure power-loss path
     CHECK(o->symbolic == "UNEXPECTED_REBOOT");
+}
+
+TEST_CASE("REAL records: kernel-power 41 power button held — hard-hang discriminator",
+          "[dex][parse][real]") {
+    // BugcheckCode 0 + a NON-ZERO PowerButtonTimestamp ⇒ the button was pressed
+    // (the classic hold-to-recover from a hard hang), distinct from pure power
+    // loss. We surface the FACT; we never infer WHY it hung.
+    const auto o = run_chain(kReal41Button);
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.power_loss");
+    CHECK(o->reason == "power button");
+    CHECK(o->sentence.find("power button pressed") != std::string::npos); // not a 4s force hold
+    CHECK(o->symbolic == "UNEXPECTED_REBOOT");
+}
+
+TEST_CASE("REAL records: kernel-power 507 modern standby exit carries DRIPS residency %",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kReal507);
+    REQUIRE(o);
+    CHECK(o->obs_type == "os.modern_standby_exit");
+    CHECK(o->metric == 0.0); // DripsResidencyInUs 0 / DurationInUs 17371560 -> 0% deep idle
+    CHECK(o->reason == "32"); // provider exit-reason code, verbatim
+    CHECK(o->sentence.find("DRIPS") != std::string::npos);
+    CHECK(o->sentence.find("17s") != std::string::npos); // 17371560 us -> 17 s
+
+    // A drifted/forged residency > duration is clamped to 100, never absurd.
+    const auto clamped = extract_signal(
+        "System", "Microsoft-Windows-Kernel-Power", 507, 4,
+        {{"DripsResidencyInUs", "200"}, {"DurationInUs", "100"}, {"Reason", "0"}});
+    REQUIRE(clamped);
+    CHECK(clamped->metric == 100.0);
+}
+
+TEST_CASE("REAL records: Netwtw10 7025 adapter D3 dump (positional, vendor-coupled)",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kRealNetwtw7025);
+    REQUIRE(o);
+    CHECK(o->obs_type == "network.adapter_driver_dump");
+    CHECK(o->subject == "Intel(R) Wi-Fi 6 AX201 160MHz"); // positional Data[1]
+    CHECK(o->component == "\\Device\\NDMP5");              // positional Data[0]
+    CHECK(o->reason == "d3-dump");
+    CHECK(o->symbolic == "ADAPTER_DRIVER_DUMP");
+    // 7026 is the paired completion — deliberately NOT catalogued (would double-count).
+    CHECK_FALSE(extract_signal("System", "Netwtw10", 7026, 4, {}).has_value());
+}
+
+TEST_CASE("REAL records: Kernel-PnP 219 driver-load failure (status hexified)",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kRealPnP219);
+    REQUIRE(o);
+    CHECK(o->obs_type == "hw.driver_load_failed");
+    CHECK(o->subject == "WUDFRd");          // FailureName basename
+    CHECK(o->reason == "0xC0000365");       // decimal 3221226341 -> hex
+    CHECK(o->symbolic == "DRIVER_LOAD_FAILED");
+    CHECK(o->component.find("Vid_8087") != std::string::npos); // device id kept (hw identity)
+    // Distinct from the device-START-failure signal (PnP 411).
+    CHECK(o->obs_type != "hw.device_start_failed");
+}
+
+TEST_CASE("REAL records: Kernel-Power 521 battery — healthy change suppressed, fault emits",
+          "[dex][parse][real]") {
+    // The real captured record is a healthy battery-count change (all-zero error
+    // counts) → suppressed, no observation.
+    CHECK_FALSE(run_chain(kReal521Healthy).has_value());
+
+    // A non-zero error/abandoned count IS a signal.
+    const auto err = extract_signal("System", "Microsoft-Windows-Kernel-Power", 521, 4,
+                                    {{"ValidBatteryCount", "1"},
+                                     {"ErrorBatteryCount", "1"},
+                                     {"AbandonedBatteryCount", "0"}});
+    REQUIRE(err);
+    CHECK(err->obs_type == "hw.battery_error");
+    CHECK(err->subject == "battery");
+    CHECK(err->reason == "error");
+    CHECK(err->metric == 1.0);
+
+    const auto aband = extract_signal("System", "Microsoft-Windows-Kernel-Power", 521, 4,
+                                      {{"ValidBatteryCount", "0"},
+                                       {"ErrorBatteryCount", "0"},
+                                       {"AbandonedBatteryCount", "2"}});
+    REQUIRE(aband);
+    CHECK(aband->reason == "abandoned");
+    CHECK(aband->metric == 2.0);
+}
+
+TEST_CASE("REAL records: SCM 7011 service unresponsive — params reversed (param2=service)",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kRealScm7011);
+    REQUIRE(o);
+    CHECK(o->obs_type == "service.unresponsive");
+    CHECK(o->subject == "HPAudioAnalytics");   // param2 — NOT param1 (which is the timeout)
+    CHECK(o->reason == "timeout 30000 ms");
+    CHECK(o->symbolic == "SERVICE_UNRESPONSIVE");
+}
+
+TEST_CASE("REAL records: SCM 7043 service shutdown failure — param1=service, Binary skipped",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kRealScm7043);
+    REQUIRE(o);
+    CHECK(o->obs_type == "service.shutdown_failed");
+    CHECK(o->subject == "Windows Biometric Service");
+    CHECK(o->symbolic == "SERVICE_SHUTDOWN_FAILED");
+}
+
+TEST_CASE("REAL records: NDIS 10317 adapter reset — vendor-neutral, named AdapterName",
+          "[dex][parse][real]") {
+    const auto o = run_chain(kRealNdis10317);
+    REQUIRE(o);
+    CHECK(o->obs_type == "network.adapter_reset");
+    CHECK(o->subject == "Microsoft Wi-Fi Direct Virtual Adapter #2");
+    CHECK(o->reason == "miniport-event 74");
+    CHECK(o->symbolic == "ADAPTER_RESET");
 }
 
 TEST_CASE("REAL records: boot 100 duration metric (full chain)", "[dex][parse][real]") {

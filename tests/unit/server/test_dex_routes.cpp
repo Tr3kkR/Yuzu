@@ -80,7 +80,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quiet ones too",
+TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quiet ones too",
           "[dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -102,7 +102,7 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
         html += render_dex_catalogue_group_fragment(&store, "", 7, family, all_os);
 
-    // All 107 labels.
+    // All 114 labels.
     for (const char* label :
          {// wave 1
           "App crash", "App hang", "Service crash", "Service start failure",
@@ -141,25 +141,30 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
           "Certificate enrollment failure", "Update check failure", "Update download failure",
           "Policy extension failure", "MDM/Intune error",
           // A3 sustained perf breaches (Windows state poll, dex_perf_breach)
-          "Sustained high CPU", "Memory pressure", "High disk latency"})
+          "Sustained high CPU", "Memory pressure", "High disk latency",
+          // wave 4 (2026-06-22) — power-management + driver reliability
+          "Modern standby exit", "Adapter driver dump", "Driver load failure",
+          "Battery error",
+          // wave 4 batch 2 — cheap additions on already-armed channels
+          "Service unresponsive", "Service shutdown failure", "Adapter reset"})
         CHECK(html.find(label) != std::string::npos);
 
     // No fabricated numbers: quiet rows carry a literal zero count. (The "All
-    // 107 monitored signal types" headline is asserted on Catalogue View 1 by
+    // 114 monitored signal types" headline is asserted on Catalogue View 1 by
     // the "lists every family + the sub-nav" test below.)
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
 
 TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    // windows connected → all 107 catalogue types are monitored (coverage-first).
+    // windows connected → all 114 catalogue types are monitored (coverage-first).
     const auto html =
         render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
     CHECK(html.find("actively monitored") != std::string::npos);
-    CHECK(html.find("of 107 signal types") != std::string::npos);
+    CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -297,8 +302,8 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
     CHECK(html.find("Signal families over time") != std::string::npos);  // small-multiples
     CHECK(html.find("Activity heatmap") != std::string::npos);           // heatmap
     CHECK(html.find("App reliability") != std::string::npos);            // a family row
-    // DERIVED-LIVE scope caption — "of 107 signal types", not the mockup's stale 6
-    CHECK(html.find("of 107 signal types") != std::string::npos);
+    // DERIVED-LIVE scope caption — "of 114 signal types", not the mockup's stale 6
+    CHECK(html.find("of 114 signal types") != std::string::npos);
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
@@ -384,6 +389,13 @@ TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=
     seed_signal(store, "e2", "BENIGN-1", "os.uptime_report",
                 R"({"subject":"host","platform":"windows"})", kDayA + "T10:00:00Z");
     CHECK(dex_device_score(&store, "BENIGN-1", "") == 100);
+    // os.modern_standby_exit (wave 4) fires on EVERY resume — it lives in the
+    // benign "Boot, start-up & shutdown" family, so a laptop that sleeps a lot
+    // must NOT have its score dragged down (mirrors os.uptime_report above).
+    seed_signal(store, "e3", "SLEEPER-1", "os.modern_standby_exit",
+                R"({"subject":"modern standby","reason":"32","metric":0,"platform":"windows"})",
+                kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "SLEEPER-1", "") == 100);
 }
 
 TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
@@ -586,10 +598,11 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         return false;
     };
     auto fleet = []() { return DexFleet{4, 5}; };
-    std::string audited;
+    std::string audited, audited_detail;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
-                     const std::string& ttype, const std::string& tid, const std::string&) {
+                     const std::string& ttype, const std::string& tid, const std::string& detail) {
         audited = a + "|" + ttype + "|" + tid; // capture target_type to pin the PascalCase fix
+        audited_detail = detail;               // capture detail to pin obs_type (works-council)
     };
 
     SECTION("authed shell + permitted fragments render") {
@@ -640,6 +653,84 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(sig->body.find("Collected on") != std::string::npos);
         CHECK(sig->body.find("Windows + Linux + macOS") != std::string::npos);
         CHECK(sig->body.find("Windows only") == std::string::npos);
+    }
+
+    // Per-event observation route: the novel security-load-bearing logic (scope
+    // gate before audit, binding-404 against a foreign event_id, audit-on-success
+    // with the obs_type in the detail) must be exercised THROUGH the route, not
+    // just via the store/render fns (gov QE BLOCKING; F1 works-council).
+    SECTION("per-event /observation: permitted opens audit obs_type; foreign id is an opaque 404") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+
+        // (1) Permitted open of the seeded WS-1 crash (event_id "e1") → 200 + audit,
+        //     and the detail carries the obs_type so usage-class opens stay countable.
+        auto ok = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(audited == "dex.observation.view|Agent|WS-1");
+        CHECK(audited_detail.find("process.crashed") != std::string::npos); // F1
+
+        // (2) Binding-404: the event exists but on a DIFFERENT device → 404, and an
+        //     unknown event_id → the SAME 404, with NO audit (no enumeration oracle).
+        audited.clear();
+        auto foreign = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=e1");
+        REQUIRE(foreign);
+        CHECK(foreign->status == 404);
+        auto unknown = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=nope");
+        REQUIRE(unknown);
+        CHECK(unknown->status == 404);
+        CHECK(foreign->body == unknown->body); // indistinguishable
+        CHECK(audited.empty());                // a 404 never audits
+    }
+
+    SECTION("per-event /observation + /apps: perm gate runs before audit/render") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, noPerm, &store, fleet, audit);
+
+        auto obsv = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obsv);
+        CHECK(obsv->status == 403);
+        CHECK(audited.empty()); // perm gate before audit
+
+        auto apps = sink.Get("/fragments/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 403);
+    }
+
+    SECTION("per-event /observation is management-scoped: out-of-scope device → 403 before audit") {
+        seed_crash(store, "e9", "WS-OTHER", "chrome.exe", "ntdll.dll", "windows",
+                   kDayA + "T12:00:00Z");
+        auto scopedPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                             const std::string&, const std::string& id) {
+            if (id == "WS-OTHER") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm);
+        auto other = sink.Get("/fragments/dex/observation?agent_id=WS-OTHER&event_id=e9");
+        REQUIRE(other);
+        CHECK(other->status == 403);
+        CHECK(audited.empty()); // scoped denial neither audits nor renders
+        auto mine = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(mine);
+        CHECK(mine->status == 200);
+    }
+
+    SECTION("/fragments/dex/apps renders the ranked app table when permitted") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto apps = sink.Get("/fragments/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 200);
+        CHECK(apps->body.find("chrome.exe") != std::string::npos); // the seeded crasher ranks
     }
 
     SECTION("unauthenticated shell redirects to /login") {

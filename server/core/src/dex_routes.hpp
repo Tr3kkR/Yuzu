@@ -2,7 +2,7 @@
 
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
-/// 103-signal catalogue (crashes, hangs, service failures, device stability,
+/// 110-signal catalogue (crashes, hangs, service failures, device stability,
 /// boot/resume performance, network/identity/security/update/print signals;
 /// docs/dex-signal-catalog.md).
 /// A capability-limited READ MODEL over the one Guardian event store

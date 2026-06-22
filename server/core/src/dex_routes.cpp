@@ -50,7 +50,7 @@ std::string num(int64_t n) { return std::to_string(n); }
   // dex_routes.hpp) since F1: the Settings → DEX alerts panel renders the
   // routable-type list from the same single source of truth.
 
-// The catalogued signal types (107 today), GROUPED for display — the server-side mirror
+// The catalogued signal types (114 today), GROUPED for display — the server-side mirror
 // of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
 // signal). The All-signals panel renders EVERY entry, fired or not, so
 // operators see what the fleet is monitoring — not just what happened to fire
@@ -69,28 +69,32 @@ const std::vector<DexSignalGroup>& dex_signal_groups() {
          {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
           "boot.degraded_device", "boot.fast_startup_failed", "os.shutdown",
           "shutdown.degraded", "os.restart_initiated", "os.standby", "os.standby_degraded",
-          "os.resume_report", "os.uptime_report"}},
+          "os.modern_standby_exit", "os.resume_report", "os.uptime_report"}},
         {"Service health",
          {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
-          "service.logon_failed", "service.recovery_failed", "service.dependency_failed"}},
+          "service.unresponsive", "service.logon_failed", "service.recovery_failed",
+          "service.shutdown_failed", "service.dependency_failed"}},
         {"System stability",
          {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
           "os.activation_failed", "os.vss_error", "os.shadow_copies_lost",
           "os.crashdump_disabled", "display.driver_reset", "display.dwm_exited",
           "memory.exhausted"}},
         {"Hardware & storage",
-         {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
-          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset", "storage.low"}},
+         {"hw.error", "hw.device_start_failed", "hw.driver_load_failed", "hw.user_driver_error",
+          "hw.cpu_throttled", "hw.battery_error", "hw.tpm_error", "disk.error",
+          "disk.smart_failure", "disk.port_reset", "storage.low"}},
         {"Performance",
          {"perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high"}},
         {"File system",
          {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
           "fs.hive_recovered", "fs.autochk_ran"}},
         {"Network",
-         {"network.wifi_drop", "network.wifi_connect_failed", "network.dns_timeout",
-          "network.dns_register_failed", "network.dhcp_failed", "network.vpn_failed",
-          "network.smb_failed", "network.smb_write_lost", "network.ip_conflict",
-          "network.name_conflict", "network.port_exhaustion", "session.rdp_disconnected"}},
+         {"network.wifi_drop", "network.wifi_connect_failed", "network.adapter_driver_dump",
+          "network.adapter_reset", "network.dns_timeout", "network.dns_register_failed",
+          "network.dhcp_failed",
+          "network.vpn_failed", "network.smb_failed", "network.smb_write_lost",
+          "network.ip_conflict", "network.name_conflict", "network.port_exhaustion",
+          "session.rdp_disconnected"}},
         {"Identity & logon",
          {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
           "logon.folder_redirect_failed", "logon.no_dc", "logon.winlogon_terminated",
@@ -279,6 +283,14 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "perf.cpu_sustained") return "Sustained high CPU";
     if (obs_type == "perf.memory_pressure") return "Memory pressure";
     if (obs_type == "perf.disk_latency_high") return "High disk latency";
+    // Wave 4 (2026-06-22) — power-management + driver reliability
+    if (obs_type == "os.modern_standby_exit") return "Modern standby exit";
+    if (obs_type == "network.adapter_driver_dump") return "Adapter driver dump";
+    if (obs_type == "hw.driver_load_failed") return "Driver load failure";
+    if (obs_type == "hw.battery_error") return "Battery error";
+    if (obs_type == "service.unresponsive") return "Service unresponsive";
+    if (obs_type == "service.shutdown_failed") return "Service shutdown failure";
+    if (obs_type == "network.adapter_reset") return "Adapter reset";
     return esc(obs_type); // forward-compatible fallback
 }
 
@@ -2651,8 +2663,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  }
                  if (audit_fn_)
+                     // Record the obs_type in the detail so usage-class opens (e.g.
+                     // process.crashed/hung — what a person ran) stay SEPARATELY
+                     // COUNTABLE from machine-class opens in the audit log (the
+                     // works-council co-determination requirement; cf.
+                     // dex.device.procperf.query). obs_type is a controlled catalogue
+                     // string, never user input.
                      audit_fn_(req, "dex.observation.view", "success", "Agent", id,
-                               "DEX single-observation detail");
+                               "DEX single-observation detail: " + obs->obs_type);
                  res.set_content(render_dex_observation_fragment(*obs),
                                  "text/html; charset=utf-8");
              });
