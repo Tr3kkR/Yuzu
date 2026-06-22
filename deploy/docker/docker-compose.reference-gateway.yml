@@ -1,0 +1,154 @@
+## Yuzu — Reference Docker Compose (server + Erlang gateway + agent, TLS)
+##
+## SECURE-BY-DEFAULT multi-container topology (PKI #1289). Demonstrates the
+## scale-out plane fully encrypted:
+##   - server auto-generates a per-install CA + leaves (no operator certs)
+##   - dashboard over HTTPS (8443)
+##   - gateway↔server upstream is MUTUAL TLS; agent↔gateway is one-way TLS
+##   - agents enrol through the gateway and are issued PER-AGENT mTLS certs
+##
+## Cross-container cert sharing (the crux): the three containers run as
+## DIFFERENT non-root uids but share one /etc/yuzu/certs volume. The server is
+## launched with `--cert-group yuzu-pki`, which chgrp's the cert dir (0750) and
+## the gateway's leaf key (0640) to the FIXED gid 2000 `yuzu-pki` group baked
+## into all three images — so the gateway (a different uid) can read its key.
+## The server/CA/HTTPS private keys stay 0600 owner-only.
+##
+## Gateway TLS config: the gateway's grpcbox reads its OWN config, not the
+## YUZU_GW_* env vars, so we MOUNT reference-gateway-sys.config (upstream points
+## at the `server` service, listener is one-way TLS). Env-driven gateway TLS is
+## tracked in #1291.
+##
+## --cert-san: the default leaves are minted with SANs for the in-compose
+## service names so SNI verification succeeds (agent→`gateway`, gateway→`server`).
+##
+## Mgmt-plane reachability: the gateway co-hosts the agent edge (:50051) and the
+## privileged mgmt plane (:50063) on 0.0.0.0, so on this single demo bridge an
+## agent could reach :50063 at the network layer. Strict mutual TLS (#1314) is the
+## control that rejects it (no CA-issued cert → no handshake). A *production*
+## deployment additionally isolates/firewalls the mgmt plane from agents at the
+## infra layer; binding the enrolled-agent residual to the server's identity (not
+## just any CA cert) is tracked as #1422.
+##
+## Usage:
+##   export YUZU_VERSION=0.12.0
+##   # the server REQUIRES Postgres (fails closed otherwise) — set the two
+##   # DISTINCT db passwords (superuser + app role):
+##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+##   export YUZU_DB_PASSWORD="$(openssl rand -hex 24)"
+##   # seed an admin into ./yuzu-server.cfg (user:admin:<salt>:<pbkdf2> — see
+##   # scripts/start-demo.sh for the one-liner), then (depends_on pulls in postgres):
+##   docker compose -f docker-compose.reference-gateway.yml up -d server gateway
+##   # create an enrollment token via the dashboard / REST, then start agents:
+##   YUZU_ENROLL_TOKEN=<token> docker compose -f docker-compose.reference-gateway.yml up -d agent
+##
+## CAUTION: `down -v` deletes the CA (the `certs` volume) — agents would re-trust
+## a fresh CA. The agent-data volume persists each agent's issued leaf.
+
+services:
+  server:
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-server
+    restart: unless-stopped
+    command:
+      - "--listen=0.0.0.0:50051"
+      - "--gateway-upstream=0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr=gateway:50063"
+      - "--web-address=0.0.0.0"
+      - "--https-port=8443"
+      - "--cert-san=dns:gateway"      # agent→gateway SNI
+      - "--cert-san=dns:server"       # gateway→server SNI
+      - "--cert-group=yuzu-pki"       # share the cert volume across the uids
+      - "--config=/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir=/var/lib/yuzu"
+    environment:
+      # Postgres substrate (ADR-0006/0007): the server REQUIRES Postgres and
+      # FAILS CLOSED without a reachable DSN. The DSN carries the APP role
+      # password (YUZU_DB_PASSWORD), never the superuser's. Point at an
+      # external/managed Postgres instead by replacing this DSN and dropping
+      # the postgres service + depends_on below.
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD; no insecure default in the reference template)}@postgres:5432/yuzu
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8443:8443"     # Dashboard + REST API (HTTPS)
+    volumes:
+      - ./yuzu-server.cfg:/etc/yuzu/yuzu-server.cfg:ro
+      - certs:/etc/yuzu/certs
+      - server-data:/var/lib/yuzu
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8443"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  gateway:
+    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-gateway
+    restart: unless-stopped
+    environment:
+      # Single-node, ephemeral — accept the default Erlang distribution cookie
+      # (the gateway fail-closes on it otherwise). NEVER set this in a clustered
+      # production gateway; set a strong YUZU_GW_COOKIE instead.
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
+    volumes:
+      # grpcbox reads its own config — mount the TLS sys.config (#1291 follow-up).
+      - ./reference-gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+      - certs:/etc/yuzu/certs:ro      # reads default-ca/-gateway via the yuzu-pki group
+    depends_on:
+      server: { condition: service_healthy }
+
+  agent:
+    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.12.0}
+    command:
+      - "--server=gateway:50051"
+      # No --ca-cert: the agent auto-discovers the install CA at
+      # /etc/yuzu/certs/default-ca.pem (mounted below). No --no-tls.
+      - "--cert-dir=/var/lib/yuzu-agent/certs"   # persists its issued leaf
+      - "--data-dir=/var/lib/yuzu-agent"
+      - "--enrollment-token=${YUZU_ENROLL_TOKEN:?set YUZU_ENROLL_TOKEN to an enrollment token}"
+    volumes:
+      - certs:/etc/yuzu/certs:ro
+      - agent-data:/var/lib/yuzu-agent
+    depends_on:
+      gateway: { condition: service_started }
+
+  # ── PostgreSQL (server storage substrate, ADR-0006/0007) ─────────────
+  # The server REQUIRES Postgres and fails closed without it. Release-pinned,
+  # signed yuzu-postgres image (PG18 + pgvector + first-boot app role/db
+  # init); per-store schemas are created at runtime by the migration runner.
+  # An external/managed Postgres is first-class — point the server's
+  # YUZU_POSTGRES_DSN at it and drop this service + the server depends_on.
+  postgres:
+    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.12.0}
+    container_name: yuzu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:?set YUZU_POSTGRES_PASSWORD (superuser; no insecure default in the reference template)}
+      # App role password — DISTINCT from the superuser password above.
+      # First-boot init refuses to run if they are equal or if this is unset.
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD)}
+      # PG18 defaults PGDATA to a version-pinned subdir (/var/lib/postgresql/18/
+      # docker); pin it back to the mounted /data path so the data lands in the
+      # named volume below (else PG18 treats the /data mount as unused and aborts).
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is liveness; the psql SELECT 1 over the app DSN proves the
+      # app credential authenticates. $$ defers expansion to the container
+      # shell so the password never appears in `docker compose config`.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu && psql \"postgresql://yuzu:$${YUZU_DB_PASSWORD}@$$(hostname):5432/yuzu\" -tA -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  certs:         # per-install CA + leaves — DO NOT delete (down -v re-roots)
+  server-data:
+  agent-data:    # each agent's issued per-agent mTLS leaf
+  postgres-data: # PostgreSQL substrate state — back it up; never `down -v`

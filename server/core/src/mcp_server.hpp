@@ -27,6 +27,10 @@
 #include <optional>
 #include <string>
 
+namespace yuzu {
+class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
+}
+
 namespace yuzu::server::mcp {
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
@@ -99,7 +103,8 @@ public:
                             const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
                             CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
-                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                            yuzu::MetricsRegistry* metrics = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -114,7 +119,8 @@ public:
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         yuzu::MetricsRegistry* metrics = nullptr);
 };
 
 } // namespace yuzu::server::mcp

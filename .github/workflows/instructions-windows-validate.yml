@@ -2,8 +2,8 @@ name: Instructions gate (Windows validate)
 
 # One-shot workflow_dispatch to validate the instructions runner + plugin
 # fixes (PR `feat/viz-engine` bucket A/B/D/E/F/C work) on a real Windows
-# host without needing inbound SSH. Runs on `yuzu-local-windows`
-# self-hosted runner (Shulgi), which polls GitHub over outbound HTTPS so
+# host without needing inbound SSH. Runs on the `yuzu-weetam-windows`
+# self-hosted pool (Wee Tam), which polls GitHub over outbound HTTPS so
 # corporate / guest WiFi that blocks Tailscale doesn't matter.
 #
 # Builds debug, stands up server + agent on non-default ports (host has
@@ -19,7 +19,7 @@ permissions:
 jobs:
   windows-instructions:
     name: Windows MSVC — Instructions gate
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 60
     defaults:
       run:
