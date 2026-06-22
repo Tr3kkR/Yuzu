@@ -11,15 +11,15 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 ## Tier summary (mirrors CLAUDE.md)
 
 - **Tier 1 — PR fast-path** (`ci.yml` on `pull_request`): one Linux variant
-  (gcc-13 debug on `yuzu-wsl2-linux`), one Windows variant (MSVC debug on
-  `yuzu-local-windows`), one macOS variant (appleclang debug on GHA-hosted
+  (gcc-15 debug on the `yuzu-bigtam-linux` pool), one Windows variant (MSVC debug on
+  the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on GHA-hosted
   `macos-15`), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-13 / clang-19 × debug / release), 2-way Windows, 2-way macOS. **No
+  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
   sanitizers, no coverage** — those moved out (#410).
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
-  `workflow_dispatch`): ASan+UBSan, TSan, coverage on the self-hosted Linux
-  runner. On any leg failure, the `alert` job auto-opens or comments on a
+  `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
+  (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`). On any leg failure, the `alert` job auto-opens or comments on a
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
@@ -49,9 +49,66 @@ dormant until merged.
 
 | Runner | Host | Jobs |
 |---|---|---|
-| `yuzu-wsl2-linux` | Shulgi 5950X WSL2 Ubuntu 24.04 | proto-compat, linux matrix, nightly (asan/tsan/coverage), cache-prune-linux |
-| `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows |
+| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. |
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `macos-15` | GitHub-hosted | macos matrix |
+
+**Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
+`yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
+Big Tam and Wee Tam. Remove them from `.github/runner-inventory.json` to silence
+the inventory sentinel. `proto-compat` and `cache-prune-linux` use the bare
+`[self-hosted, Linux, X64]` label (no compiler), so they resolve to Big Tam.
+
+### Ubuntu 26.04 migration (Big Tam) — COMPLETE
+
+Big Tam is a native **Ubuntu 26.04 (Resolute)** box, default toolchain **GCC 15 /
+Clang 21** (vs Shulgi's 24.04 GCC 13 / Clang 19). **Every self-hosted Linux job
+runs on Big Tam**: ci.yml `linux` (#1609), then sanitizer-tests / nightly / codeql
+Linux, then release.yml + the remaining Windows→Wee Tam stragglers (#1615). The
+supporting scaffolding:
+
+- Native files `meson/native/linux-gcc15.ini` + `linux-clang21.ini` are the live
+  toolchain files (they also set `-fuse-ld=mold`; see Build speed below). The
+  24.04 `linux-gcc13.ini`/`linux-clang19.ini` stay only for the GHA-hosted
+  ubuntu-24.04 canary.
+- The CI runner image (`Dockerfile.ci-linux`), the local `Dockerfile.ci`, and the
+  four sanitizer images (`Dockerfile.{server,agent}-{asan,tsan}`) are on
+  `ubuntu:26.04` + gcc-15/clang-21. `gcc-13`/`clang-19` stay installable from the
+  archive but are not the defaults.
+- `pre-release.yml`'s `install-deb` smoke matrix has an `ubuntu:26.04` leg.
+
+`ImageOS` stays `ubuntu24` on every leg (setup-beam has no `ubuntu26` prebuilt
+OTP; the 24.04 OTP runs fine on 26.04 — same `libcrypto.so.3` soname). Big Tam
+runs 4 runners on one host, so every apt step is `flock`-serialized on
+`/tmp/yuzu-ci-apt.lock`, the shared CI Postgres container is flock-serialized too
+(`scripts/ci/ensure-postgres.sh`), and meson is installed per-job via
+`pip --user` (it is not a host default). Full history + per-file detail:
+**`docs/ci-ubuntu-2604-cutover.md`**.
+
+### Build speed (Big Tam)
+
+The `runner` user (shared `HOME=/home/runner` across r0–r3) is provisioned once
+for fast, download-free builds:
+
+- **ccache** `max_size=50G`, compression on — the host default is 5 GiB, far too
+  small for ~700 TUs × variants. ci.yml/nightly cap at 30G via the
+  `CCACHE_MAXSIZE` env; release.yml now sets `CCACHE_MAXSIZE=30G` too (it had been
+  inheriting the host default).
+- **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
+  clang-21 native files — large cut in link time on the big `yuzu-server` /
+  `yuzu-agent` binaries and the release LTO link.
+- **meson** 1.11.1 + the rest of `requirements-ci.txt` persist in the runner
+  user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
+  no-op (no re-download).
+- **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a
+  fresh 26.04 (it was the first-Big-Tam-release blocker). Note: Big Tam ships RPM
+  **6.0** vs Shulgi's 4.x — watch the first release.
+
+The Windows toolchain is codified in [`deploy/windows/`](../deploy/windows/README.md)
+(the native-Windows analog of `deploy/docker/Dockerfile.ci-linux`): a versioned
+provisioning spec, a manifest, and a runner self-test. All four runners share one
+vcpkg binary cache via `RUNNER_TOOL_CACHE=D:\ci\tool_cache` (mirroring
+`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -80,12 +137,14 @@ Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — trusted
    as-is. The escape hatch for any bespoke runner setup.
-2. **Docker** (self-hosted Linux: `yuzu-wsl2-linux` / `yuzu-shulgi`) —
+2. **Docker** (self-hosted Linux: the `yuzu-bigtam-linux` pool) —
    idempotent persistent container `yuzu-ci-postgres` on
    `127.0.0.1:15432` (`docker start` || `docker run --restart
    unless-stopped`, image pinned to the same digest as
    `deploy/docker/Dockerfile.postgres`'s base). One-time cost per runner;
    port 15432 avoids colliding with native clusters or UAT rigs on 5432.
+   Big Tam runs 4 runners on one host, so the create path is
+   `flock`-serialized (one shared container, not four).
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -101,18 +160,14 @@ Resolution order inside the script:
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
 
-   **`yuzu-local-windows` (Shulgi) as bootstrapped 2026-06-12 uses
-   path 1, not path 4:** the box already ran a foreign PostgreSQL 15 on
-   5432 (unknown credentials, left untouched), and the EDB GUI installer
-   fails in non-interactive SSH sessions — so PG **16.14 binaries-zip**
-   lives at `C:\yuzu-ci\pg16`, data dir `C:\yuzu-ci\pgdata16`, service
-   `postgresql-x64-16-yuzu-ci` (auto-start, `NT AUTHORITY\NetworkService`),
-   loopback-only on **5433**, superuser `yuzu`/`yuzu` (initdb-time, scram),
-   database `yuzu_test`. The machine-level
-   `YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test`
-   feeds resolution path 1 — which always wins before the docker probe,
-   so the leg stays deterministic whether or not the box's (usually
-   headless-down) Docker Desktop engine happens to be running.
+   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
+   provides a native PostgreSQL **18** service (`postgresql-x64-18-yuzu-ci`)
+   and a machine-level `YUZU_TEST_POSTGRES_DSN` that wins before the docker
+   probe, so the leg stays deterministic regardless of any Docker engine
+   state. Provisioning specifics live in
+   [`deploy/windows/`](../deploy/windows/README.md). (The retired
+   `yuzu-local-windows` box ran a PG 16 binaries-zip service on 5433 — see
+   git history if that bootstrap pattern is ever needed again.)
 5. Nothing found → `::error`, exit 1.
 
 **Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
@@ -126,7 +181,7 @@ credential failure when `psql` is available (path 4), and nothing found
 probe alone produces a `::warning` and still exports the conventional
 DSN (credential **unverified** — wrong credentials then surface as
 downstream `[pg]` test failures; install `psql` on the runner's PATH,
-e.g. `C:\Program Files\PostgreSQL\16\bin` on `yuzu-local-windows`, to
+e.g. `C:\Program Files\PostgreSQL\18\bin` on the `yuzu-weetam-windows` runners, to
 get the authenticated gate instead). Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.

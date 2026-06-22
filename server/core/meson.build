@@ -285,6 +285,8 @@ yuzu_server_core_lib = static_library(
     'src/nvd_sync.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/bundle_service.cpp',
+    'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
