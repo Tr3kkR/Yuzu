@@ -263,7 +263,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev \
+              bison flex libsystemd-dev autoconf automake libtool \
               ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -1030,7 +1030,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev
+            bison flex libsystemd-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
