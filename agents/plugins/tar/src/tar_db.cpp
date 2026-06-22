@@ -427,10 +427,10 @@ std::string TarDatabase::get_state(const std::string& collector) {
     return {};
 }
 
-void TarDatabase::set_state(const std::string& collector, const std::string& json) {
+bool TarDatabase::set_state(const std::string& collector, const std::string& json) {
     std::lock_guard lock(mu_);
     if (!db_)
-        return;
+        return false;
 
     const char* sql = R"(
         INSERT INTO tar_state (collector, state_json, updated_at)
@@ -443,7 +443,7 @@ void TarDatabase::set_state(const std::string& collector, const std::string& jso
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("TarDatabase::set_state prepare failed: {}", sqlite3_errmsg(db_));
-        return;
+        return false;
     }
     StmtPtr stmt(raw_stmt);
 
@@ -455,7 +455,9 @@ void TarDatabase::set_state(const std::string& collector, const std::string& jso
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE) {
         spdlog::error("TarDatabase::set_state step failed: {}", sqlite3_errmsg(db_));
+        return false;
     }
+    return true;
 }
 
 // ── Config management ────────────────────────────────────────────────────────
