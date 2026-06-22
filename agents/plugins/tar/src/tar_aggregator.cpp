@@ -120,7 +120,7 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
-void apply_source_enabled_transition(TarDatabase& db,
+bool apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view source,
                                       std::string_view new_value,
                                       int64_t now_epoch) {
@@ -129,17 +129,54 @@ void apply_source_enabled_transition(TarDatabase& db,
     // fresh DB is only a transition when it differs from that default. For an
     // opt-in source (module/procperf/netqual, default false) the first
     // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
-    // does not write a spurious paused_at.
+    // does not write a spurious paused_at. The `_enabled` flag itself is written
+    // below (in-branch), not here, so the #538 fail-safe ordering holds: on a
+    // disable the flag flips only after the baseline clear persists.
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
-    db.set_config(enabled_key, std::string{new_value});
-
     auto paused_at_key = std::format("{}_paused_at", source);
+
     if (new_value == "false" && prev != "false") {
+        // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
+        // `_enabled` flag only if the clear actually persisted. `set_state` can
+        // fail silently (SQLITE_BUSY / disk full); if we flipped the flag first
+        // and the clear then failed, we'd have a DISABLED source with a STALE
+        // baseline — and a later re-enable would emit exactly the ghost "stopped"
+        // events this fix exists to prevent, while the operator saw success.
+        // Clearing first makes the disable fail-safe: a failed clear leaves the
+        // source ENABLED (its baseline still valid, collection continues) and we
+        // report failure so the operator can retry. No-op for sources without a
+        // snapshot-diff baseline (perf/procperf/netqual). The caller serialises
+        // this whole call against the collectors via collect_mu_ (see do_configure).
+        if (auto key = diff_state_key(source); !key.empty()) {
+            if (!db.set_state(std::string{key}, ""))
+                return false; // baseline NOT cleared → do not disable
+        }
+        db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
-    } else if (new_value == "true" && prev == "false") {
+        return true;
+    }
+
+    // All other transitions (idempotent set, disable→enable, first-ever set):
+    // no baseline clear, so the flag write cannot leave inconsistent state.
+    db.set_config(enabled_key, std::string{new_value});
+    if (new_value == "true" && prev == "false") {
         db.set_config(paused_at_key, "0");
     }
+    return true;
+}
+
+std::string_view diff_state_key(std::string_view source) {
+    // Mapping is NOT 1:1 with the source name: tcp's baseline lives under
+    // "network" (historical). Keep this the ONE home for the mapping — the
+    // collectors (collect_fast/slow) and apply_source_enabled_transition both
+    // route through here so the on-disable clear can never target the wrong key.
+    if (source == "process") return "process";
+    if (source == "tcp")     return "network";
+    if (source == "service") return "service";
+    if (source == "user")    return "user";
+    // perf/procperf keep an in-memory previous reading; netqual is stateless.
+    return {};
 }
 
 namespace {
