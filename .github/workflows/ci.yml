@@ -473,7 +473,7 @@ jobs:
     # finishes in a fraction of that and avoids the GitHub Actions minute
     # drain. Per-PR turnaround on the dependabot rollout is the
     # optimization target. See issue #374 for the full migration rationale.
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 120
     defaults:
       run:
