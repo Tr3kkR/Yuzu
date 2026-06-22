@@ -186,6 +186,38 @@ TEST_CASE("TAR paused_at: disabled→enabled clears the timestamp to \"0\"",
     CHECK(db.get_config("tcp_paused_at", "0") == "0");
 }
 
+TEST_CASE("TAR paused_at: recovering an errored source via =true clears the timestamp (#560)",
+          "[tar][paused_at][source-lifecycle]") {
+    // Regression for the fjarvis-review asymmetry: the disable leg fires on any
+    // non-"false" prev ("errored" included), but the re-enable leg used to reset
+    // paused_at ONLY on prev == "false". So recovering a corrupt/tampered source
+    // — `configure <src>_enabled=true` from an "errored" value — resumed
+    // collection yet left a stale non-zero paused_at, and `status` then reported
+    // enabled=true alongside a paused timestamp (dashboard renders a collecting
+    // source as paused). Both legs now gate on the canonical tri-state, so the
+    // recovery clears paused_at. Pre-fix this CHECK held the stale 1735689600.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-errored-reenable-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // 1) Pause the source for real → paused_at records the wall-clock now.
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+    REQUIRE(db.get_config("process_paused_at", "0") == "1735689600");
+
+    // 2) The on-disk _enabled value is then clobbered to a value the plugin
+    //    never writes (corruption / tampering) → canonicalises to "errored".
+    db.set_config("process_enabled", "maybe");
+    REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
+
+    // 3) Operator recovers the source: configure process_enabled=true.
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+
+    CHECK(db.get_config("process_enabled", "true") == "true");
+    CHECK(db.get_config("process_paused_at", "0") == "0");
+}
+
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
           "[tar][paused_at][pr-a]") {
     // If the operator submits configure with the same value the source

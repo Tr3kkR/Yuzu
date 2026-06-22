@@ -162,6 +162,16 @@ plugin change.
 > `canonical_source_enabled` is tracked as a follow-up; until then, the perf and
 > always-on collect legs are canonical and the two opt-in legs are raw-but-
 > equivalent.
+>
+> **`paused_at` is cleared on any non-`true` → `true` re-enable.**
+> `apply_source_enabled_transition` (`tar_aggregator.cpp`) canonicalises the
+> previous stored value before **both** legs, so the disable leg fires on
+> `prev_canon != "false"` and the re-enable leg clears `<source>_paused_at` on
+> `prev_canon != "true"`. The two are exact mirrors over the tri-state: an
+> `errored → true` recovery clears `paused_at` to `"0"` identically to a
+> `false → true` re-enable, so a recovered source never reports `enabled=true`
+> with a stale paused timestamp (#560). Idempotent `true → true` is a no-op and
+> does not touch `paused_at`.
 
 ---
 

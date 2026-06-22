@@ -469,6 +469,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`source_enabled`) and `run_retention` both gate on that same canonical
   tri-state, so a corrupt or tampered `<source>_enabled` value fails closed —
   collection stops *and* the source's rows are preserved (not pruned).
+  Recovering such a source via `configure <source>_enabled=true` now also clears
+  its `paused_at`: the enable/disable transition canonicalises the previous value
+  before both legs, so an `errored`→`true` recovery no longer leaves a stale
+  `paused_at` that made `tar.status` report a now-collecting source as paused.
 - **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
   `tar.configure <source>_enabled=false` wrote the disable flag without serialising
   against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
