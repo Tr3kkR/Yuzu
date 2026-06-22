@@ -171,7 +171,13 @@ std::string_view diff_state_key(std::string_view source) {
     if (source == "tcp")     return "network";
     if (source == "service") return "service";
     if (source == "user")    return "user";
-    // perf/procperf keep an in-memory previous reading; netqual is stateless.
+    // software is a snapshot-diff source too: collect_software keeps an installed-
+    // inventory baseline under this exact key (get_state/set_state "software"), so
+    // the on-disable clear must reach it or a re-enable would emit ghost
+    // install/remove/upgrade events for everything that changed while paused (#538).
+    if (source == "software") return "software";
+    // perf/procperf keep an in-memory previous reading; netqual is stateless;
+    // module is a stream-drained source (no snapshot-diff baseline).
     return {};
 }
 
