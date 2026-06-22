@@ -53,7 +53,9 @@ constexpr const char* kProfileListKey =
     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
 
 // RAII owner for an HKEY. Closes on destruction so an exception between open and
-// the (former) manual RegCloseKey cannot leak the handle. Move-only.
+// the (former) manual RegCloseKey cannot leak the handle. Non-copyable and
+// non-movable (the user-declared dtor suppresses the implicit move; a defaulted
+// move would copy the raw HKEY and double-close — we never need to move one).
 class RegKey {
 public:
     RegKey() = default;

@@ -494,3 +494,23 @@ TEST_CASE("TAR software diff: empty snapshots produce no events (cold-start cont
 
     CHECK(events.empty());
 }
+
+TEST_CASE("TAR software diff: carried-forward entries are inert while a sibling changes",
+          "[tar][diff][software]") {
+    // This is the load-bearing invariant behind the plugin's carry-forward of
+    // logged-off users: an entry that is byte-identical in previous and current
+    // (a carried offline user) must emit NO event, even when another entry in the
+    // same snapshot genuinely changes. A spurious event here would be the
+    // logon/logoff "flapping" the carry-forward design exists to prevent.
+    std::vector<SoftwareInfo> prev = {sw("OfflineApp", "1.0", "user", "bob"),  // logged-off → carried
+                                      sw("7-Zip", "23.01", "machine")};
+    std::vector<SoftwareInfo> curr = {sw("OfflineApp", "1.0", "user", "bob"),  // carried unchanged
+                                      sw("7-Zip", "24.00", "machine")};        // real upgrade
+
+    auto events = compute_software_events(prev, curr, 8000, 8);
+
+    REQUIRE(events.size() == 1); // only the machine upgrade — the carried user is inert
+    CHECK(events[0].action == "upgraded");
+    CHECK(events[0].scope == "machine");
+    CHECK(events[0].name == "7-Zip");
+}
