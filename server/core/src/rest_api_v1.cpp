@@ -353,7 +353,7 @@ const std::string& openapi_spec() {
       },)json"
         // Split literal: MSVC caps a single string literal at ~16 KB (C2026).
         R"json(
-      "GuaranteedStateBaselineDeviceStatus": {
+      "GuaranteedStateDeviceComplianceStatus": {
         "type": "object",
         "properties": {
           "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
@@ -616,7 +616,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
     "/guaranteed-state/device-compliance": {
-      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found). Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
+      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found). Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -5687,10 +5687,13 @@ void RestApiV1::register_routes(
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
             const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
 
-            // rule_id -> Guard name (name-only read; never materializes the rule
-            // body blobs). Falls back to the rule_id when a snapshot member Guard
-            // has since been deleted.
-            const auto rule_names = guaranteed_state_store->rule_names();
+            // rule_id -> Guard name, resolved ONLY for this baseline's deployed
+            // members (name-only read; never materializes the rule body blobs).
+            // Bounded WHERE rule_id IN (guard_ids) rather than the full authored
+            // catalogue — this is per-request on the fleet-polled device-compliance
+            // path. Falls back to the rule_id when a snapshot member Guard has since
+            // been deleted (absent from the map).
+            const auto rule_names = guaranteed_state_store->rule_names_for(guard_ids);
 
             // rule_id -> last reported verdict for THIS device.
             std::unordered_map<std::string, GuardianAgentRuleStatus> dev;

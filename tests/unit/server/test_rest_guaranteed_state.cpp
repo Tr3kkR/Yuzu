@@ -1244,6 +1244,31 @@ TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no 
     CHECK(nul->status == 400);
 }
 
+TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids",
+          "[guaranteed_state][store][rule_names]") {
+    // Backs the perf fix: the device-compliance handler resolves guard names with
+    // rule_names_for(guard_ids) instead of the full-catalogue rule_names(). Confirm
+    // the bounded WHERE rule_id IN (...) returns names for exactly the requested ids.
+    RestGsHarness h;
+    h.seed_rule("r1", "Name One");
+    h.seed_rule("r2", "Name Two");
+    h.seed_rule("r3", "Name Three");
+
+    auto m = h.store->rule_names_for({"r1", "r3"});
+    CHECK(m.size() == 2);
+    CHECK(m["r1"] == "Name One");
+    CHECK(m["r3"] == "Name Three");
+    CHECK(m.find("r2") == m.end()); // r2 not requested → absent (scoped, not full read)
+
+    CHECK(h.store->rule_names_for({}).empty()); // empty input → empty map, no query
+
+    // An unknown id simply has no row — the map omits it (the handler then falls
+    // back to rendering the rule_id).
+    auto m2 = h.store->rule_names_for({"r1", "nope"});
+    CHECK(m2.size() == 1);
+    CHECK(m2["r1"] == "Name One");
+}
+
 TEST_CASE("REST gs.device-compliance: 404 uses the A4 envelope (code + correlation_id)",
           "[rest][guaranteed_state][baseline]") {
     RestGsHarness h;
@@ -1271,7 +1296,7 @@ TEST_CASE("REST gs.device-compliance: route + schema are in the OpenAPI spec (A1
     CHECK(spec["paths"].contains("/guaranteed-state/device-compliance"));
     REQUIRE(spec.contains("components"));
     REQUIRE(spec["components"].contains("schemas"));
-    CHECK(spec["components"]["schemas"].contains("GuaranteedStateBaselineDeviceStatus"));
+    CHECK(spec["components"]["schemas"].contains("GuaranteedStateDeviceComplianceStatus"));
 }
 
 TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pending (invariant holds)",

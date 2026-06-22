@@ -399,6 +399,12 @@ public:
     // For per-request name resolution on read paths like the baseline-anchored
     // per-device status route, where the full rule body is never needed.
     std::unordered_map<std::string, std::string> rule_names() const;
+    // Bounded variant of rule_names(): resolve names ONLY for the given rule_ids
+    // (e.g. a baseline's deployed members) via WHERE rule_id IN (?,…), so the
+    // fleet-polled per-device read path does not materialize the whole authored
+    // catalogue per request. Empty input → empty map.
+    std::unordered_map<std::string, std::string>
+    rule_names_for(const std::vector<std::string>& rule_ids) const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;

@@ -1834,6 +1834,34 @@ std::unordered_map<std::string, std::string> GuaranteedStateStore::rule_names() 
     return out;
 }
 
+std::unordered_map<std::string, std::string>
+GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, std::string> out;
+    if (!db_ || rule_ids.empty())
+        return out;
+    // Bounded variant of rule_names(): WHERE rule_id IN (?,?,…) with one positional
+    // placeholder per id (ids are bound, never interpolated into the SQL). The id
+    // count is the baseline's deployed-snapshot size — operator-authored, well under
+    // SQLITE_MAX_VARIABLE_NUMBER — so a single IN-list is safe. Pure SELECT (#1033-safe).
+    std::string sql = "SELECT rule_id, name FROM guaranteed_state_rules WHERE rule_id IN (";
+    for (std::size_t i = 0; i < rule_ids.size(); ++i)
+        sql += (i == 0 ? "?" : ",?");
+    sql += ");";
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("GuaranteedStateStore::rule_names_for: prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return out;
+    }
+    for (std::size_t i = 0; i < rule_ids.size(); ++i)
+        sqlite3_bind_text(s.get(), static_cast<int>(i + 1), rule_ids[i].c_str(), -1,
+                          SQLITE_TRANSIENT);
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.emplace(col_text(s.get(), 0), col_text(s.get(), 1));
+    return out;
+}
+
 std::vector<GuardianDayCount>
 GuaranteedStateStore::daily_remediations(const std::string& since) const {
     std::shared_lock lock(mtx_);

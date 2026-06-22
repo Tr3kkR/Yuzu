@@ -230,16 +230,20 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
     std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE baseline_id = ?;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        // A prepare failure (DB locked/corrupt) otherwise reads as a benign
+        // not-found — log so a degraded read is visible.
+        spdlog::error("BaselineStore::get_baseline: prepare failed: {}", sqlite3_errmsg(db_));
         return std::nullopt;
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<Baseline> result;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        result = read_baseline_row(s);
-    sqlite3_finalize(s);
+    if (sqlite3_step(s.get()) == SQLITE_ROW)
+        result = read_baseline_row(s.get());
     return result;
 }
 
@@ -277,14 +281,16 @@ std::vector<Baseline> BaselineStore::list_baselines() const {
     std::vector<Baseline> out;
     if (!db_)
         return out;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines ORDER BY name;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("BaselineStore::list_baselines: prepare failed: {}", sqlite3_errmsg(db_));
         return out;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s));
-    sqlite3_finalize(s);
+    }
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.push_back(read_baseline_row(s.get()));
     return out;
 }
 
@@ -606,15 +612,18 @@ std::vector<Baseline> BaselineStore::list_deployed_baselines() const {
     std::vector<Baseline> out;
     if (!db_)
         return out;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE lifecycle = ? ORDER BY name;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("BaselineStore::list_deployed_baselines: prepare failed: {}",
+                      sqlite3_errmsg(db_));
         return out;
-    sqlite3_bind_text(s, 1, kBaselineDeployed, -1, SQLITE_STATIC);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s));
-    sqlite3_finalize(s);
+    }
+    sqlite3_bind_text(s.get(), 1, kBaselineDeployed, -1, SQLITE_STATIC);
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.push_back(read_baseline_row(s.get()));
     return out;
 }
 
