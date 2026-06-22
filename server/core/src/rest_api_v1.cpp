@@ -359,13 +359,13 @@ const std::string& openapi_spec() {
           "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
           "deployed": {"type": "boolean", "description": "lifecycle == deployed; false => consumer shows 'No Baseline Deployed'"},
           "agent_id": {"type": "string"},
-          "total_guards": {"type": "integer"},
+          "total_guards": {"type": "integer", "description": "Guards APPLICABLE to this device — the deployed_snapshot intersected with the Guards this device has actually reported (report-driven), NOT the snapshot size. Out-of-scope Guards are absent, so each machine's count reflects its own applicable set."},
           "compliant": {"type": "integer"},
           "drifted": {"type": "integer"},
           "errored": {"type": "integer"},
-          "pending": {"type": "integer", "description": "deployed Guards with no recognized verdict for this device (not yet reported / offline / unsupported); equals total_guards - (compliant+drifted+errored)"},
+          "pending": {"type": "integer", "description": "applicable Guards reported with an unrecognized verdict; equals total_guards - (compliant+drifted+errored). Out-of-scope Guards are ABSENT (not pending) in the report-driven model — usually 0 here."},
           "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null if none reported"},
-          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when pending"}}}}
+          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when status is pending"}}}}
         }
       },)json"
         R"json(
@@ -615,8 +615,8 @@ const std::string& openapi_spec() {
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
-    "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
-      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
+    "/guaranteed-state/device-compliance": {
+      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found). Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Missing baseline/agent_id or over-length query parameter (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -5543,44 +5543,59 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    // ── Baseline-anchored per-device Guardian status (ServiceNow CI record) ──
+    // ── Name-anchored, device-applicable Guardian compliance (ServiceNow CI) ──
     //
-    // GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}
+    // GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}
     //
-    // Machine-readable A1 sibling of the dashboard baseline page: for ONE Baseline
-    // + ONE device, return the Baseline's DEPLOYED Guards each with this device's
-    // last reported (Observe-mode) verdict. The denominator is the deployed set
-    // (deployed_snapshot — the enforced set captured at last deploy), so a Guard
-    // that has not reported yet still shows, as "pending". A not-deployed Baseline
-    // returns deployed:false + empty guards (consumer renders "No Baseline
-    // Deployed"). No liveness fold — "pending" conflates never-reported / offline /
-    // platform-unsupported; updated_at carries staleness. Per-device behavioral
-    // read → per-device-SCOPED GuaranteedState:Read (management-group aware, mirroring
-    // the dashboard Guardian device lens, so a group-scoped operator isn't fail-closed
-    // out of in-scope devices) + guardian.device.view audit.
+    // Machine-readable A1 sibling of the dashboard baseline page: for the Baseline
+    // identified by NAME + ONE device, return the Guards ACTUALLY APPLICABLE to that
+    // device, each with the device's last reported (Observe-mode) verdict.
     //
-    // Applicability note (Baseline assignment): management-group assignment is
-    // DEFERRED product-wide (deploy is fleet-wide), so a *deployed* Baseline applies
-    // to every device and the verdict here is the device's compliance against that
-    // deployed Baseline's guards. When assignment lands, this must become
-    // assignment-aware (return not-applicable for an out-of-scope device) — tracked
-    // as a follow-up; an assignment filter now would diverge from fleet-wide enforce.
+    // Keyed by NAME, not baseline_id: an integration (ServiceNow) pins one stable
+    // constant ("ServiceNow Compliance") that survives reseeds — never a churning id.
+    //
+    // Device-applicable subset (report-driven): the Baseline's members are a SUPERSET
+    // of all relevant Guards, each carrying its own scope_expr; the push fan-out
+    // (agent_in_scope) arms a DIFFERENT subset per machine. So the denominator here is
+    // the intersection of the deployed_snapshot with the Guards this device has
+    // reported — an out-of-scope Guard (never armed → never reported) is absent, and
+    // each machine shows only its applicable Guards from the one shared Baseline.
+    // A not-deployed Baseline returns deployed:false + empty guards (consumer renders
+    // "No Baseline Deployed"). updated_at carries staleness.
+    //
+    // Tradeoff (deferred upgrade): report-driven can't tell "out of scope" from
+    // "in-scope but offline/slow" (both absent). The honest version evaluates each
+    // member's scope_expr against the device (scope engine + device tags/OS) so an
+    // in-scope-unreported Guard shows "pending"; deferred — registry/service guards
+    // emit compliant-on-arm quickly and the consumer tracks device online/offline.
+    //
+    // Per-device behavioral read → per-device-SCOPED GuaranteedState:Read (management-
+    // group aware, mirroring the dashboard Guardian device lens, so a group-scoped
+    // operator isn't fail-closed out of in-scope devices) + guardian.device.view audit.
     sink.Get(
-        R"(/api/v1/guaranteed-state/baselines/([A-Za-z0-9._\-]+)/devices/([A-Za-z0-9._\-]+))",
+        "/api/v1/guaranteed-state/device-compliance",
         [scoped_perm_fn, audit_fn, guaranteed_state_store,
          baseline_store](const httplib::Request& req, httplib::Response& res) {
-            const std::string baseline_id = req.matches[1].str();
-            const std::string agent_id = req.matches[2].str();
-            // The route regex caps the charset but not the length; bound it to the
-            // canonical enrolled-agent-id limit (auth::kMaxAgentIdLength, 256 — the
-            // same ceiling enrollment enforces) so a legitimately-enrolled device with
-            // an operator-set long --agent-id is never falsely rejected by THIS route
-            // alone. A4 400 only past that ceiling.
-            if (baseline_id.size() > auth::kMaxAgentIdLength ||
+            const std::string baseline_name = req.get_param_value("baseline");
+            const std::string agent_id = req.get_param_value("agent_id");
+            // Both query params are required. Bound their length to the canonical
+            // enrolled-agent-id limit (auth::kMaxAgentIdLength, 256 — the ceiling
+            // enrollment enforces) so an over-long value is rejected by THIS route
+            // before it reaches the store. A4 400 on missing or over-length.
+            if (baseline_name.empty() || agent_id.empty()) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(
+                        400, "baseline and agent_id query parameters required", cid),
+                    "application/json");
+                return;
+            }
+            if (baseline_name.size() > auth::kMaxAgentIdLength ||
                 agent_id.size() > auth::kMaxAgentIdLength) {
                 const auto cid = detail::make_correlation_id();
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, "path parameter too long", cid),
+                res.set_content(detail::error_json_a4(400, "query parameter too long", cid),
                                 "application/json");
                 return;
             }
@@ -5620,7 +5635,7 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            const auto baseline = baseline_store->get_baseline(baseline_id);
+            const auto baseline = baseline_store->get_baseline_by_name(baseline_name);
 
             // Per-device behavioral-data access audit — emitted for EVERY authorized
             // attempt (found or not), so enumerating baseline_ids against a device
@@ -5634,7 +5649,8 @@ void RestApiV1::register_routes(
             // auth layer as auth.scoped_permission_required, not by this verb.
             if (audit_fn)
                 audit_fn(req, "guardian.device.view", baseline ? "success" : "not_found", "Agent",
-                         agent_id, "baseline " + baseline_id + " per-device guard status via REST");
+                         agent_id,
+                         "baseline '" + baseline_name + "' per-device guard status via REST");
 
             if (!baseline) {
                 const auto cid = detail::make_correlation_id();
@@ -5645,7 +5661,7 @@ void RestApiV1::register_routes(
             }
 
             const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline_id);
+            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
 
             // rule_id -> Guard name (name-only read; never materializes the rule
             // body blobs). Falls back to the rule_id when a snapshot member Guard
@@ -5661,21 +5677,32 @@ void RestApiV1::register_routes(
             // max reported updated_at; ISO-8601 sorts lexically (all stamps are UTC
             // 'Z', written by the store's format_iso_utc, so the byte compare is correct).
             std::string last_updated;
+            // Report-driven device-applicable subset: emit ONLY the deployed-snapshot
+            // members this device has actually reported a verdict for. A member that
+            // is out of scope for this device (its scope_expr excludes it → the push
+            // never armed it → it never reported) is correctly ABSENT, so each machine
+            // shows only its applicable Guards even though they share one Baseline.
+            // (Honest in-scope-but-unreported "pending" needs scope-engine evaluation
+            // per device — deferred; see the route header.) guard_ids is the snapshot
+            // order, so the emitted subset keeps a stable order.
             JArr guards;
+            int64_t total_guards = 0;
             for (const auto& rid : guard_ids) {
+                const auto it = dev.find(rid);
+                if (it == dev.end())
+                    continue;  // not applicable to this device
+                ++total_guards;
                 std::string status = "pending";
                 std::string updated_at;
-                if (auto it = dev.find(rid); it != dev.end()) {
-                    const std::string& s = it->second.state;
-                    if (s == "compliant") { status = s; ++compliant; }
-                    else if (s == "drifted") { status = s; ++drifted; }
-                    else if (s == "errored") { status = s; ++errored; }
-                    // any unexpected stored state falls through to "pending"
-                    if (status != "pending") {
-                        updated_at = it->second.updated_at;
-                        if (updated_at > last_updated)
-                            last_updated = updated_at;
-                    }
+                const std::string& s = it->second.state;
+                if (s == "compliant") { status = s; ++compliant; }
+                else if (s == "drifted") { status = s; ++drifted; }
+                else if (s == "errored") { status = s; ++errored; }
+                // any unexpected stored state falls through to "pending" (no timestamp)
+                if (status != "pending") {
+                    updated_at = it->second.updated_at;
+                    if (updated_at > last_updated)
+                        last_updated = updated_at;
                 }
                 const auto nit = rule_names.find(rid);
                 JObj g;
@@ -5690,7 +5717,6 @@ void RestApiV1::register_routes(
                 guards.add(std::move(g));
             }
 
-            const int64_t total_guards = static_cast<int64_t>(guard_ids.size());
             const int64_t pending = total_guards - (compliant + drifted + errored);
 
             JObj b;

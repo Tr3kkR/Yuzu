@@ -104,6 +104,11 @@ public:
     // map it to HTTP 409 via is_conflict_error() — see store_errors.hpp.
     std::expected<std::string, std::string> create_baseline(const Baseline& b);
     std::optional<Baseline> get_baseline(const std::string& baseline_id) const;
+    // Look up a Baseline by its unique human-authored name (names are unique —
+    // create_baseline reports a dup with kConflictPrefix). Backs the name-keyed
+    // per-device compliance REST view so an integration (ServiceNow) can reference
+    // a stable constant ("ServiceNow Compliance") instead of a churning baseline_id.
+    std::optional<Baseline> get_baseline_by_name(const std::string& name) const;
     std::vector<Baseline> list_baselines() const;
     // Updates the mutable scalar fields (name, description, lifecycle,
     // deployed_snapshot, deployed_by/at, updated_by) of an existing Baseline.

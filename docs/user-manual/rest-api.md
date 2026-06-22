@@ -3514,35 +3514,36 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 
-#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+#### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 
-Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+Name-anchored, device-applicable Guardian compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding a device's compliance against a curated Baseline into an external CMDB / ITSM record. Looks the Baseline up by **name** and returns the Guards **actually applicable to the device**, each with that device's last reported verdict.
 
+- **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
-- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
-- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`403`** if the caller lacks `Read` on the device's scope; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
+- **Query params:** `baseline` (the Baseline **name**, unique; URL-encode spaces, e.g. `ServiceNow%20Compliance`), `agent_id` (the device). Both required.
+- **`400`** if either param is missing or exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`404`** if no Baseline has that name; **`403`** if the caller lacks `Read` on the device's scope; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
 - **Response keys:**
   - `baseline` — `{ baseline_id, name, lifecycle }`.
   - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
   - `agent_id`.
-  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Guards **applicable to this device** (see Semantics). Invariant: `total_guards == compliant + drifted + errored + pending`.
   - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
-  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per **applicable** Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
 
-**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+**Semantics — device-applicable subset.** One Baseline can carry a **superset** of Guards, each with its own `scope_expr`; the push fan-out arms a **different subset on each machine**. This endpoint returns only the Guards **actually applicable to the device** — the Baseline's `deployed_snapshot` intersected with the Guards the device has reported. A Guard that is out of scope for this device (never armed → never reported) is **absent** (not `pending`), so `total_guards` and `guards[]` reflect *this machine's* applicable set: different machines, querying the **same** Baseline name, legitimately see different Guards. (`pending` therefore means a Guard the device reported with an unrecognized verdict — normally `0`.) Verdicts are the device's last *reported*, Observe-mode state, with no device-liveness fold.
 
-**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State → Assignment](guaranteed-state.md#assignment)). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
+> **Report-driven caveats.** Applicability is inferred from what the device has *reported*, with two consequences: (1) an in-scope Guard on an **offline** device is absent (not `pending`) until it reports — track device online/offline yourself and use `last_updated` for freshness; (2) a Guard that was **re-scoped out and re-deployed** keeps its last reported row, so it lingers on the CI until that row is overwritten or cleared (the forward direction — tag a device so a Guard *starts* applying — appears promptly; the reverse lags). The honest fix for both — evaluating each Guard's `scope_expr` against the device so in-scope-unreported shows `pending` and out-of-scope never shows — is a tracked computed-denominator upgrade.
 
-Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
-
-Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+**Setup.** The Baseline must be **deployed** (a draft returns `deployed: false`), and **member edits appear here only after a re-deploy** rewrites the `deployed_snapshot`. Branch on the **`deployed`** flag (not `total_guards`) to decide "No Baseline Deployed": a deployed Baseline with zero applicable Guards legitimately returns `deployed: true, total_guards: 0`. Per-machine variation is driven by each Guard's `scope_expr` (tag / OS / group) — see [Guaranteed State](guaranteed-state.md).
 
 **Example:**
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+curl -s -H "Authorization: Bearer $TOKEN" --get \
+  "$YUZU_URL/api/v1/guaranteed-state/device-compliance" \
+  --data-urlencode "baseline=ServiceNow Compliance" \
+  --data-urlencode "agent_id=$AGENT_ID"
 ```
 
 ```json

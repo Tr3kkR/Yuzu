@@ -243,6 +243,24 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
     return result;
 }
 
+std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& name) const {
+    std::shared_lock lock(mtx_);
+    if (!db_)
+        return std::nullopt;
+    sqlite3_stmt* s = nullptr;
+    // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
+    const std::string sql = std::string("SELECT ") + kBaselineColumns +
+                            " FROM guaranteed_state_baselines WHERE name = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    std::optional<Baseline> result;
+    if (sqlite3_step(s) == SQLITE_ROW)
+        result = read_baseline_row(s);
+    sqlite3_finalize(s);
+    return result;
+}
+
 std::vector<Baseline> BaselineStore::list_baselines() const {
     std::shared_lock lock(mtx_);
     std::vector<Baseline> out;
