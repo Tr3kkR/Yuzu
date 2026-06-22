@@ -367,6 +367,11 @@ public:
     std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
                                                            const std::string& since = "",
                                                            int limit = 100) const;
+    // Single projected observation by event_id — the per-event detail drill (the
+    // device-history row click target). std::nullopt if the id is unknown. The
+    // caller binds it to a scoped agent_id before rendering, so a guessed id can
+    // never reveal another device's row.
+    std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
     // Per-device obs_type rollup — the per-device analog of dex_signal_summary
     // (one GROUP BY pass, indexed by agent_id). Drives the per-device DEX score.
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,

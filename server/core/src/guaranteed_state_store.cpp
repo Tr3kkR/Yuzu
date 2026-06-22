@@ -1616,6 +1616,41 @@ GuaranteedStateStore::dex_device_history(const std::string& agent_id, const std:
     return out;
 }
 
+std::optional<GuardianObservationRow>
+GuaranteedStateStore::dex_observation(const std::string& event_id) const {
+    std::shared_lock lock(mtx_);
+    if (!db_ || event_id.empty())
+        return std::nullopt;
+    // Single-row read of the SAME projection columns the device history lists —
+    // the per-event detail drill. event_id is the projection PK (it shares the
+    // event journal dedup key), so this is an indexed point lookup.
+    const char* sql = R"(
+        SELECT event_id, agent_id, observed_at, obs_type, subject,
+               reason, symbolic, component, metric, platform
+        FROM guardian_observations
+        WHERE event_id = ?1
+        LIMIT 1
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(st.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st.get()) != SQLITE_ROW)
+        return std::nullopt;
+    GuardianObservationRow r;
+    r.event_id = col_text(st.get(), 0);
+    r.agent_id = col_text(st.get(), 1);
+    r.observed_at = col_text(st.get(), 2);
+    r.obs_type = col_text(st.get(), 3);
+    r.subject = col_text(st.get(), 4);
+    r.reason = col_text(st.get(), 5);
+    r.symbolic = col_text(st.get(), 6);
+    r.component = col_text(st.get(), 7);
+    r.metric = sqlite3_column_double(st.get(), 8);
+    r.platform = col_text(st.get(), 9);
+    return r;
+}
+
 std::vector<GuaranteedStateEventRow>
 GuaranteedStateStore::query_events(const GuaranteedStateEventQuery& q) const {
     std::shared_lock lock(mtx_);

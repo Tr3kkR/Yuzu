@@ -2036,13 +2036,48 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     h += "<table class=\"gp-table\"><thead><tr><th>When</th><th>Signal</th><th>Subject</th>"
          "<th>What happened</th><th>Component</th></tr></thead><tbody>";
     for (const auto& r : history) {
-        h += "<tr><td class=\"gp-mute\">" + esc(r.observed_at) + "</td><td>" +
+        // Each row drills to its single-observation detail (hx-get → the
+        // #dex-obs-detail slot). event_id is the projection PK; agent_id rides
+        // along so the route can scope-check before revealing the row.
+        h += "<tr class=\"click\" hx-get=\"/fragments/dex/observation?agent_id=" +
+             url_encode(agent_id) + "&amp;event_id=" + url_encode(r.event_id) +
+             "\" hx-target=\"#dex-obs-detail\" hx-swap=\"innerHTML\">"
+             "<td class=\"gp-mute\">" + esc(r.observed_at) + "</td><td>" +
              dex_signal_label(r.obs_type) + "</td><td>" + esc(r.subject) +
              "</td><td class=\"gp-drift\">" + history_detail(r) + "</td><td>" + esc(r.component) +
              "</td></tr>";
     }
     h += "</tbody></table>";
+    // The per-event detail panel swaps in here when a history row is clicked
+    // (hx-get /fragments/dex/observation). Empty until then.
+    h += "<div id=\"dex-obs-detail\"></div>";
     h += perf_panel;
+    return h;
+}
+
+std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
+    // The per-event detail: every captured projection field for one observation.
+    // Behavioral PII — the route gates + audits each open. No inference, just the
+    // facts we hold (Option-D enrichment later adds the event's own ErrorCode /
+    // operation / app into the same panel).
+    std::string h = "<div class=\"gp-sech\">" + dex_signal_label(r.obs_type) +
+                    " <span class=\"gp-mute\" style=\"font-family:var(--mono);"
+                    "text-transform:none;letter-spacing:0\">" + esc(r.obs_type) + "</span></div>";
+    h += "<div class=\"gp-spec\">";
+    auto row = [&](const char* k, const std::string& v) {
+        h += "<span class=\"k\">" + std::string(k) + "</span><code>" +
+             (v.empty() ? std::string("&mdash;") : esc(v)) + "</code>";
+    };
+    row("When", r.observed_at);
+    row("Subject", r.subject);
+    row("Code", r.reason);
+    row("Symbolic", r.symbolic);
+    row("Component", r.component);
+    row("Metric", r.metric > 0.0 ? std::format("{:g}", r.metric) : std::string{});
+    row("Device", r.agent_id);
+    row("Platform", r.platform);
+    row("Event id", r.event_id);
+    h += "</div>";
     return h;
 }
 
@@ -2541,6 +2576,38 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
                         "text/html; charset=utf-8");
     });
+
+    // -- Per-event detail (single observation; behavioral PII → audit each open).
+    //    ?agent_id=<id>&event_id=<id> — the device-history row click target. --
+    sink.Get("/fragments/dex/observation",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 const std::string event_id =
+                     req.has_param("event_id") ? req.get_param_value("event_id") : "";
+                 // Same per-device scope as /fragments/dex/device: an operator can
+                 // only drill an event on a device inside their scope.
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 std::optional<GuardianObservationRow> obs;
+                 if (store_)
+                     obs = store_->dex_observation(event_id);
+                 // Bind the event to the SCOPED agent — a guessed or foreign
+                 // event_id reveals nothing (defence in depth over the scope gate).
+                 if (!obs || obs->agent_id != id) {
+                     res.status = 404;
+                     res.set_content(
+                         placeholder("Observation not found", "No such event on this device."),
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 if (audit_fn_)
+                     audit_fn_(req, "dex.observation.view", "success", "Agent", id,
+                               "DEX single-observation detail");
+                 res.set_content(render_dex_observation_fragment(*obs),
+                                 "text/html; charset=utf-8");
+             });
 
     // -- F2a: fleet Performance tab (now-view over registry heartbeat state) ---
     //

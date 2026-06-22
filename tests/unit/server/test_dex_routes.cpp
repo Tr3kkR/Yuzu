@@ -495,6 +495,58 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
 
+TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "ev-100", "WS-7", "app.staterepo_error",
+                R"({"subject":"app state repository","reason":"sr-100",)"
+                R"("symbolic":"STATEREPO_ERROR","platform":"windows"})",
+                kDayA + "T11:27:41Z");
+
+    // store: indexed point lookup by event_id; unknown / empty id → nullopt
+    auto obs = store.dex_observation("ev-100");
+    REQUIRE(obs.has_value());
+    CHECK(obs->agent_id == "WS-7");
+    CHECK(obs->obs_type == "app.staterepo_error");
+    CHECK(obs->reason == "sr-100");
+    CHECK(obs->symbolic == "STATEREPO_ERROR");
+    CHECK_FALSE(store.dex_observation("nope").has_value());
+    CHECK_FALSE(store.dex_observation("").has_value());
+
+    // render: friendly label + the raw obs_type + every captured field
+    auto html = render_dex_observation_fragment(*obs);
+    CHECK(html.find("App repository error") != std::string::npos);
+    CHECK(html.find("app.staterepo_error") != std::string::npos);
+    CHECK(html.find("sr-100") != std::string::npos);
+    CHECK(html.find("STATEREPO_ERROR") != std::string::npos);
+    CHECK(html.find("WS-7") != std::string::npos);
+}
+
+TEST_CASE("DEX single-observation detail: escapes fields (no XSS)",
+          "[dex][routes][security]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "ev-x", "WS-7", "process.crashed",
+                R"({"subject":"<img src=x>","reason":"0x1",)"
+                R"("symbolic":"<b>evil</b>","platform":"windows"})",
+                kDayA + "T10:00:00Z");
+    auto obs = store.dex_observation("ev-x");
+    REQUIRE(obs.has_value());
+    auto html = render_dex_observation_fragment(*obs);
+    CHECK(html.find("<img src=x>") == std::string::npos);
+    CHECK(html.find("<b>evil</b>") == std::string::npos);
+    CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
+}
+
+TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
+               kDayA + "T10:00:00Z");
+    auto html = render_dex_device_fragment(&store, "WS-7", "all");
+    // each row hx-gets its single-observation detail into the slot div
+    CHECK(html.find("/fragments/dex/observation?agent_id=WS-7&amp;event_id=ev-1") !=
+          std::string::npos);
+    CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
+}
+
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
