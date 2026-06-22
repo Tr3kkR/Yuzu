@@ -437,6 +437,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
+  per-source enable check could commit one extra snapshot **after** the operator's
+  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
+  diffed against that stale baseline and emitted ghost "stopped" events for every
+  process/connection/service/user that had exited during the pause, breaking the
+  documented "re-enabling starts from a clean baseline" contract. The disable
+  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
+  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
+  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
+  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
+  disable is refused (the source stays enabled and `configure` returns an error)
+  rather than leaving a disabled source with a stale baseline. The
+  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
+  centralised in `diff_state_key()`, used by both the collectors and the disable path
+  so it cannot drift. **Operator-visible change:** the first collection cycle after a
+  re-enable emits a `started` event for every entity currently running/open (an
+  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
+  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
+  row, so the same race is closed for them too: disabling resets the in-memory
+  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
+  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
+  commits no post-disable row, and a re-enable re-baselines instead of emitting a
+  first row whose rate-average covers the entire paused window (a privacy concern on
+  the opt-in, default-off `procperf` per-application source).
 - **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
   The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
   opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
