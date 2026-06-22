@@ -285,7 +285,7 @@ Browser           Yuzu Server               IdP (Entra ID)
 
 When the IdP includes group claims (e.g., Entra ID `groups` claim), Yuzu checks whether the user belongs to the admin group specified by `--oidc-admin-group`. If the user's group list contains that group ID, they receive the `admin` role. Otherwise they receive the default `user` role.
 
-If the OIDC user's email or display name matches a local admin account, they are also granted admin regardless of group membership.
+Admin via OIDC is granted **only** through explicit membership in the configured admin group. Email and display name are **never** used to elevate privileges — they are attacker-controllable values, so a match against a local admin account's name does **not** grant admin (enforced in `create_oidc_session`).
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 

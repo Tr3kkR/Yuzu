@@ -42,6 +42,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from erlang_toolchain import base_env, rebar3_prefix  # noqa: E402
+
 # Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
 # system PATH which may still point at the distro's older OTP 25 packages).
 _extra_paths = [
@@ -73,7 +76,7 @@ app_ebin = Path(_base) / "test" / "lib" / "yuzu_gw" / "ebin"
 if app_ebin.exists():
     shutil.rmtree(app_ebin)
 
-cmd = ["rebar3", "as", "test", suite]
+cmd = rebar3_prefix() + ["as", "test", suite]
 if suite == "eunit":
     cmd += ["--dir", "apps/yuzu_gw/test"]
 
@@ -107,10 +110,11 @@ if suite == "eunit":
 # and a 300-second endurance test — far too long for CI.
 # Run full perf tests explicitly with default env vars:
 #   cd gateway && rebar3 ct --suite=yuzu_gw_perf_SUITE
-env = None
+# base_env() carries the Windows temp-dir fix (TEMP/TMP/TMPDIR -> a native
+# path) so the test path's cold _build can't hit the gpb-plugin \\tmp\
+# robocopy hang either. See scripts/erlang_toolchain.py.
+env = base_env()
 if suite == "ct":
-    import os
-    env = os.environ.copy()
     env["YUZU_PERF_AGENTS"] = "10"
     env["YUZU_PERF_HEARTBEATS"] = "100"
     env["YUZU_PERF_FANOUT"] = "10"
@@ -139,7 +143,7 @@ def run_with_retry(args, label, max_attempts=4):
         result = subprocess.run(
             args,
             cwd=gateway_dir,
-            env=env if env is not None else os.environ,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

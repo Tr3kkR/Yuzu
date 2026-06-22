@@ -120,23 +120,29 @@
                                 cacertfile => "/etc/yuzu/certs/default-ca.pem",
                                 verify => verify_none,
                                 fail_if_no_peer_cert => false}},
-            %% Mgmt listener (:50063): the PRIVILEGED operator/command plane. Do
-            %% NOT use one-way TLS here — that would encrypt but leave the plane
-            %% UNAUTHENTICATED (anyone trusting the gateway cert could push
-            %% commands). Keep it on a trusted network, OR require client certs with
-            %% STRICT mTLS (omit verify/fail_if_no_peer_cert so the patched grpcbox
-            %% falls back to its verify_peer + fail_if_no_peer_cert=true defaults) —
-            %% the server's command-forwarding client presents a cert, so mTLS works
-            %% here without a bootstrap problem:
-            %%   transport_opts => #{ssl => true,
-            %%                       certfile   => "/etc/yuzu/certs/default-gateway.pem",
-            %%                       keyfile    => "/etc/yuzu/certs/default-gateway.key",
-            %%                       cacertfile => "/etc/yuzu/certs/default-ca.pem"}
+            %% Mgmt listener (:50063): the PRIVILEGED operator/command plane.
+            %% STRICT mTLS (#1314, HIGH-2). This listener binds 0.0.0.0, so a
+            %% one-way or plaintext posture would leave the command-fan-out plane
+            %% UNAUTHENTICATED (anyone routing to it could push commands to the
+            %% fleet). By OMITTING verify / fail_if_no_peer_cert below, the patched
+            %% grpcbox uses its strict defaults (verify_peer + fail_if_no_peer_cert=
+            %% true) so a client MUST present a CA-issued cert. The C++ server's
+            %% command-forwarding client presents its leaf, so mTLS works here with
+            %% no bootstrap problem, and a container with no CA-issued cert (e.g. a
+            %% compromised agent) is rejected at the TLS layer.
+            %% NOTE: verify_peer authenticates to the CA, not to the server's
+            %% identity, so ANY holder of a CA-issued cert (any agent's leaf, the
+            %% gateway/server leaves) passes; pinning the mgmt peer to the server's
+            %% identity is the PKI-ladder follow-up (#1314 residual).
             #{grpc_opts => #{
                 service_protos => [management_pb],
                 services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}
             },
-            listen_opts => #{port => 50063, ip => {0,0,0,0}}}
+            listen_opts => #{port => 50063, ip => {0,0,0,0}},
+            transport_opts => #{ssl => true,
+                                certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                                keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                                cacertfile => "/etc/yuzu/certs/default-ca.pem"}}
         ]}
     ]},
 

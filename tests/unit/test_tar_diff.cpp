@@ -383,3 +383,29 @@ TEST_CASE("TAR should_redact: case-insensitive substring, not glob", "[tar][diff
     // A pattern that strips to an empty core matches nothing (no-op).
     CHECK_FALSE(should_redact("anything", {"*"}));
 }
+
+// =============================================================================
+// Typed warehouse events — macOS names-only (B-heavy)
+// =============================================================================
+
+TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhere",
+          "[tar][diff][process]") {
+    // On macOS the poll path blanks cmdline (parity with the Endpoint Security
+    // stream and the works-council / data-minimization posture); Linux/Windows keep
+    // the (redacted) command line. Locks the #if defined(__APPLE__) branch in
+    // compute_process_events so the macOS names-only guarantee can't silently regress.
+    std::vector<ProcessInfo> prev; // empty previous → current process is a 'started'
+    std::vector<ProcessInfo> curr = {
+        {4242, 1, "python3", "/usr/bin/python3 --token=secret", "alice"}};
+
+    auto events = compute_process_events(prev, curr, 1000, 7, /*redaction_patterns=*/{});
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "started");
+    CHECK(events[0].pid == 4242);
+    CHECK(events[0].name == "python3");
+#if defined(__APPLE__)
+    CHECK(events[0].cmdline.empty()); // names-only on macOS — both ES stream and poll
+#else
+    CHECK(events[0].cmdline == "/usr/bin/python3 --token=secret"); // populated on Linux/Windows
+#endif
+}

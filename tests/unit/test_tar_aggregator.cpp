@@ -343,3 +343,93 @@ TEST_CASE("TAR parse_pattern_config enforces the min-core floor on the LOAD path
     REQUIRE(redact.has_value());
     CHECK(redact->size() == 3);
 }
+
+// ── $Module rollup wiring (M1 hardening — governance UP-1 / architect BLOCKING) ─
+
+TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
+          "[tar][module][rollup]") {
+    // run_aggregation is now data-driven over capture_sources(); this proves the
+    // $Module hourly rollup actually executes (the old hand-maintained steps[]
+    // array omitted it, so the registered rollup SQL was dead code) AND that
+    // load_count counts only the 'loaded' action — a 'blocked' BYOVD load stays
+    // full-fidelity in module_live but is excluded from the aggregate count.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-module-rollup-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (an hour boundary)
+    auto insert_module = [&](std::string_view action) {
+        REQUIRE(db.execute_sql(std::format(
+            "INSERT INTO module_live "
+            "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
+            "signed_state,signer,is_kernel) "
+            "VALUES ({}, 1, '{}', 100, 'app.exe', 'evil.dll', 'appdir', "
+            "'unsigned', '', 0)",
+            t0, action)));
+    };
+    insert_module("loaded");
+    insert_module("loaded");
+    insert_module("loaded");
+    // Every non-'loaded' action must be EXCLUDED from load_count while staying
+    // full-fidelity in module_live: a 'blocked' BYOVD load, a boot-gap 'seed',
+    // and an 'unloaded' event. They share evil.dll's GROUP-BY tuple (module_name,
+    // signer, signed_state, is_kernel), so they fold into the same hourly row —
+    // proving the rollup's `action='loaded'` predicate, not just row identity,
+    // is what filters them.
+    insert_module("blocked");
+    insert_module("seed");
+    insert_module("unloaded");
+
+    REQUIRE(row_count(db, "module_live") == 6);
+    REQUIRE(row_count(db, "module_hourly") == 0);
+
+    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
+
+    REQUIRE(row_count(db, "module_hourly") == 1);
+    auto res = db.execute_query("SELECT load_count FROM module_hourly");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'; blocked/seed/unloaded excluded
+}
+
+// ── Default-off opt-in sources (review R1 — module/procperf/netqual) ─────────
+
+TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition",
+          "[tar][module][paused_at][default-off]") {
+    // The required M1 fix: `module` (and procperf/netqual) default DISABLED on a
+    // fresh DB. apply_source_enabled_transition routes the `prev` default through
+    // CaptureSourceDef::default_enabled, so the first-ever `module_enabled=false`
+    // is NOT an enabled→disabled transition and must write NO paused_at — whereas
+    // the same call for the always-on `process` IS a real transition. This is the
+    // testable proxy for "tar.status reports module disabled while default-on
+    // sources stay enabled" (do_status itself reads the same default_enabled
+    // field but is not compiled into the unit-test exe).
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-off-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t_now = 1'735'689'600;
+
+    // Opt-in sources default false → first disable is idempotent, no paused_at.
+    for (const auto* src : {"module", "procperf", "netqual"}) {
+        INFO("opt-in source=" << src);
+        CHECK_FALSE(source_default_enabled(src));
+        apply_source_enabled_transition(db, src, "false", t_now);
+        CHECK(db.get_config(std::format("{}_paused_at", src), "0") == "0");
+    }
+
+    // An always-on source defaults true → first disable is a real transition.
+    CHECK(source_default_enabled("process"));
+    apply_source_enabled_transition(db, "process", "false", t_now);
+    CHECK(db.get_config("process_paused_at", "0") == std::to_string(t_now));
+
+    // And enabling an opt-in source IS a transition from its default-off state:
+    // it clears paused_at to "0" (present, not absent).
+    apply_source_enabled_transition(db, "module", "true", t_now + 100);
+    CHECK(db.get_config("module_enabled", "false") == "true");
+    CHECK(db.get_config("module_paused_at", "0") == "0");
+}

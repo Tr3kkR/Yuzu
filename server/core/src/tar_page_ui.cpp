@@ -221,8 +221,149 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       border-radius: 0.25rem;
     }
     .tar-sql-result.error { color: var(--mds-color-theme-indicator-error); }
+
+    /* ── Process tree viewer (Phase 15.H) ───────────────────────────────── */
+    .tar-tree-toolbar {
+      display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+    }
+    .tar-tree-presets { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+    .tar-tree-custom { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+    .tar-tree-custom label {
+      font-size: 0.7rem; color: var(--mds-color-theme-text-tertiary);
+      display: flex; align-items: center; gap: 0.3rem;
+    }
+    .tar-tree-custom input[type="datetime-local"] {
+      background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 0.25rem;
+      padding: 0.25rem 0.4rem; font-size: 0.75rem;
+    }
+    .tar-chip {
+      display: inline-block; cursor: pointer; user-select: none;
+      background: var(--mds-color-state-hover); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 1rem;
+      padding: 0.25rem 0.7rem; font-size: 0.75rem;
+    }
+    .tar-chip:hover { border-color: var(--accent); }
+    .tar-chip.on { background: var(--accent); color: var(--mds-color-text-on-accent); border-color: var(--accent); }
+    /* Filter bar (state + anomalies + text) */
+    .tar-tree-filterbar {
+      display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+      margin: 0.5rem 0 0.6rem; padding-top: 0.5rem; border-top: 1px solid var(--border);
+    }
+    .tt-filter-label {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--mds-color-theme-text-tertiary); font-weight: 600;
+    }
+    .tt-anom-toggle {
+      font-size: 0.72rem; color: var(--mds-color-theme-text-tertiary);
+      display: flex; align-items: center; gap: 0.3rem;
+    }
+    .tar-tree-filter {
+      flex: 1 1 12rem; min-width: 10rem;
+      background: var(--surface); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 0.25rem;
+      padding: 0.3rem 0.5rem; font-size: 0.78rem;
+    }
+    .tar-tree-banner, .tar-tree-note, .tar-tree-warn, .tar-tree-empty, .tar-tree-loading,
+    .tar-tree-nomatch {
+      font-size: 0.78rem; color: var(--mds-color-theme-text-tertiary); margin: 0.3rem 0;
+    }
+    .tar-tree-note code, .tar-tree-banner b { color: var(--fg); }
+    .tar-tree-warn { color: var(--mds-color-theme-indicator-warning, #d6a500); }
+    .tar-tree-mute { color: var(--mds-color-theme-text-tertiary); }
+
+    /* Tree */
+    .tar-tree { font-family: var(--mono, monospace); font-size: 0.8rem; margin-top: 0.4rem; line-height: 1.5; }
+    .tar-tree-node { margin: 0; }
+    .tar-tree-node > summary {
+      display: flex; align-items: center; list-style: none; cursor: pointer; padding: 0.05rem 0;
+    }
+    .tar-tree-node > summary::-webkit-details-marker { display: none; }
+    .tar-tree-node > summary::before {
+      content: "\25B8"; flex: 0 0 1rem; text-align: center;
+      color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem;
+    }
+    .tar-tree-node[open] > summary::before { content: "\25BE"; }
+    .tar-tree-children {
+      margin-left: 0.5rem; padding-left: 0.7rem; border-left: 1px solid var(--border);
+    }
+    .tar-tree-leaf { display: flex; align-items: center; padding: 0.05rem 0 0.05rem 1rem; }
+    .tar-tree-row {
+      display: inline-flex; align-items: center; gap: 0.45rem; flex: 1 1 auto; min-width: 0;
+      color: var(--fg); text-decoration: none; cursor: pointer;
+      padding: 0.05rem 0.3rem; border-radius: 0.2rem;
+    }
+    .tar-tree-row:hover { background: var(--mds-color-state-hover); }
+    .tar-tree-row[data-anom="1"] { box-shadow: inset 2px 0 0 var(--mds-color-theme-indicator-error); }
+    .tar-tree-row[data-state="exited"] { opacity: 0.78; }
+    .tt-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; flex: 0 0 auto; }
+    .tt-dot-run { background: var(--green); box-shadow: 0 0 4px rgba(60,200,120,0.5); }
+    .tt-dot-exit { background: var(--mds-color-theme-text-tertiary); }
+    .tt-pid {
+      color: var(--mds-color-theme-text-tertiary); flex: 0 0 auto; min-width: 3.4rem;
+      text-align: right; font-variant-numeric: tabular-nums;
+    }
+    .tt-name { color: var(--fg); font-weight: 600; white-space: nowrap; }
+    .tar-tree-row[data-state="exited"] .tt-name { font-weight: 500; color: var(--mds-color-theme-text-tertiary); }
+    .tt-user { color: var(--accent); font-size: 0.72rem; white-space: nowrap; }
+    .tt-meta { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; white-space: nowrap; }
+    .tt-anom { color: var(--mds-color-theme-indicator-error); }
+    /* Inline network summary */
+    .tt-net {
+      display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.68rem;
+      color: var(--mds-color-theme-text-tertiary); min-width: 0; overflow: hidden;
+    }
+    .tt-net-ico { color: var(--accent); }
+    .tt-net-pub .tt-net-ico { color: var(--mds-color-theme-indicator-warning, #d6a500); }
+    .tt-ep {
+      background: var(--mds-color-state-hover); border-radius: 0.6rem; padding: 0 0.35rem;
+      white-space: nowrap; font-variant-numeric: tabular-nums;
+    }
+    .tt-ep-pub { color: var(--mds-color-theme-indicator-warning, #d6a500); }
+    .tt-ep-more { opacity: 0.7; }
+    /* Same-name sibling group ("svchost.exe ×42") */
+    .tt-group { color: var(--mds-color-theme-text-tertiary); }
+    .tt-group-ico { color: var(--accent); flex: 0 0 auto; font-size: 0.7rem; }
+    .tt-group .tt-name { color: var(--fg); }
+    .tt-group-count {
+      color: var(--fg); font-weight: 600; background: var(--mds-color-state-hover);
+      border-radius: 0.6rem; padding: 0 0.4rem; font-size: 0.7rem;
+    }
+
+    /* Two-column layout: scrollable tree + sticky right-hand detail panel */
+    .tar-tree-layout { display: flex; gap: 1rem; align-items: flex-start; margin-top: 0.5rem; }
+    .tar-tree-main { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
+    .tar-tree-side {
+      flex: 0 0 23rem; position: sticky; top: 0.5rem;
+      max-height: calc(100vh - 6rem); overflow: auto;
+    }
+    @media (max-width: 1000px) {
+      .tar-tree-layout { flex-direction: column; }
+      .tar-tree-side { position: static; flex-basis: auto; width: 100%; max-height: none; }
+    }
+
+    /* Detail panel */
+    .tar-detail {
+      margin-top: 0.75rem; padding: 0.75rem;
+      background: var(--mds-color-state-hover); border: 1px solid var(--border);
+      border-radius: 0.25rem; font-size: 0.8rem;
+    }
+    .tar-detail-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.5rem; }
+    .tar-kv { display: flex; gap: 0.6rem; padding: 0.15rem 0; }
+    .tar-kv-k { flex: 0 0 9rem; color: var(--mds-color-theme-text-tertiary); }
+    .tar-kv-v { color: var(--fg); word-break: break-all; }
+    .tar-detail-section { font-weight: 600; margin: 0.7rem 0 0.3rem; }
+    .tar-detail-anom { margin: 0.5rem 0; color: var(--mds-color-theme-indicator-error); }
+    .tar-detail-conns { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+    .tar-detail-conns th, .tar-detail-conns td {
+      text-align: left; padding: 0.2rem 0.4rem; border-bottom: 1px solid var(--border);
+    }
+    .tar-detail-conns th { color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
   </style>
-</head>
+)HTM"
+// Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals are
+// concatenated by the compiler, so the rendered HTML is byte-identical.
+R"HTM(</head>
 <body>
 
   <nav class="nav-bar">
@@ -318,17 +459,17 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- ── Process tree viewer (Phase 15.H — pending) ───────────────── -->
+    <!-- ── Process tree viewer (Phase 15.H) ─────────────────────────── -->
     <div class="tar-frame" id="frame-process-tree">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Process tree viewer</h2>
       </div>
       <div class="tar-frame-body">
-        <div class="tar-frame-coming-soon">
-          Reconstructed from <code>process_live</code> seed + events.
-          Lands in
-          <a href="https://github.com/Tr3kkR/Yuzu/issues/554" target="_blank">issue #554</a>
-          (Phase 15.H), gated on agent service-install hardening.
+        <!-- No hx-target here: the default target is this element itself. An
+             explicit hx-target="this" would be INHERITED by descendants (the poll
+             div), making their swaps clobber this whole frame body. -->
+        <div hx-get="/fragments/tar/process-tree" hx-trigger="load" hx-swap="innerHTML">
+          <div class="tar-tree-loading">Loading process tree viewer&hellip;</div>
         </div>
       </div>
     </div>
@@ -362,6 +503,59 @@ function showToast(message, level) {
 document.body.addEventListener('showToast', function(e) {
   var d = e.detail || {};
   showToast(d.message || 'Done', d.level || 'success');
+});
+
+// ── Process tree viewer: client-side filters (no round-trip) ─────────────
+// Combines a state filter (all/running/exited), an anomalies-only toggle, and a
+// text query over each row. A row is shown if it matches ALL active filters; its
+// ancestor branches are revealed + expanded so the tree stays navigable. Re-applied
+// after every tree swap (htmx:afterSettle) since the toolbar lives outside #tar-tree.
+window.__ttState = 'all';
+function tarTreeState(s, el) {
+  window.__ttState = s;
+  if (el && el.parentElement) {
+    el.parentElement.querySelectorAll('[data-statechip]').forEach(function(c){
+      c.classList.toggle('on', c === el);
+    });
+  }
+  applyTarTreeFilters();
+}
+function applyTarTreeFilters() {
+  var tree = document.querySelector('#tar-tree .tar-tree');
+  if (!tree) return;
+  var state = window.__ttState || 'all';
+  var anomEl = document.getElementById('tar-tree-anom-only');
+  var anomOnly = anomEl && anomEl.checked;
+  var qEl = document.getElementById('tar-tree-filter');
+  var q = (qEl && qEl.value ? qEl.value : '').trim().toLowerCase();
+  var active = state !== 'all' || anomOnly || q;
+  var nomatch = document.querySelector('#tar-tree .tar-tree-nomatch');
+  var nodes = tree.querySelectorAll('.tar-tree-node, .tar-tree-leaf');
+  if (!active) { nodes.forEach(function(el){ el.style.display = ''; }); if (nomatch) nomatch.style.display = 'none'; return; }
+  nodes.forEach(function(el){ el.style.display = 'none'; });
+  var shown = 0;
+  tree.querySelectorAll('.tar-tree-row').forEach(function(row){
+    if (state === 'running' && row.getAttribute('data-state') !== 'running') return;
+    if (state === 'exited' && row.getAttribute('data-state') !== 'exited') return;
+    if (anomOnly && row.getAttribute('data-anom') !== '1') return;
+    if (q && row.textContent.toLowerCase().indexOf(q) === -1) return;
+    shown++;
+    var el = row.closest('.tar-tree-leaf, .tar-tree-node');
+    while (el && tree.contains(el)) {
+      el.style.display = '';
+      if (el.tagName === 'DETAILS') el.open = true;
+      el = el.parentElement ? el.parentElement.closest('.tar-tree-node') : null;
+    }
+  });
+  if (nomatch) nomatch.style.display = shown === 0 ? '' : 'none';
+}
+// The toolbar persists across tree swaps; re-apply the active filters whenever a new
+// tree settles into #tar-tree.
+document.body.addEventListener('htmx:afterSettle', function(e) {
+  if (e.target && (e.target.id === 'tar-tree' ||
+      (e.target.closest && e.target.closest('#tar-tree')))) {
+    applyTarTreeFilters();
+  }
 });
 fetch('/api/me').then(function(r){return r.json()}).then(function(d){
   document.getElementById('nav-user').textContent = d.username;
