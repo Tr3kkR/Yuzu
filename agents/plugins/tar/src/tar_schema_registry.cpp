@@ -476,13 +476,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
             // paused_at transition all agree the source starts disabled.
             .default_enabled = false,
             .os_support = {
-                {"windows", OsSupportStatus::kPlanned, "etw",
-                 "Microsoft-Windows-Kernel-Process image-load events (image "
-                 "keyword 0x40, event ID 5) on the SAME ETW session the process "
-                 "source already runs; driver loads surface as kernel image-loads. "
-                 "CodeIntegrity/Operational (3033/3034) overlays signing verdicts. "
-                 "Signing verified out-of-band at drain (WinVerifyTrust, cached). "
-                 "Wired in M2/M3."},
+                {"windows", OsSupportStatus::kSupported, "etw",
+                 "Microsoft-Windows-Kernel-Process image-load events (IMAGE "
+                 "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
+                 "loads surface as kernel image-loads (System pid). Signing is "
+                 "verified out-of-band at drain (WinVerifyTrust + CryptQueryObject "
+                 "signer, cached); module_dir is scrubbed of user-profile prefixes "
+                 "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
+                 "overlay is M3."},
                 {"linux", OsSupportStatus::kPlanned, "auditd",
                  "Kernel-module loads via auditd init_module/finit_module (kmod "
                  "only in v1; /proc/modules seed). Shared-object (.so) loads need "
