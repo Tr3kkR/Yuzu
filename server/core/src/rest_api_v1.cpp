@@ -2488,9 +2488,25 @@ void RestApiV1::register_routes(
         [perm_fn, audit_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AuditLog", "Read"))
                 return;
-            if (!audit_store) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            // A broken/closed audit store must FAIL LOUD, not return an empty
+            // 200 — on a CC7.2 evidence endpoint an empty sample reads as "no
+            // authentication activity" when the truth is "the store is down".
+            // !is_open() is the platform-wide store-down guard
+            // (docs/observability-conventions.md), the 15+ peer routes in this
+            // file all carry it, and docs/user-manual/rest-api.md promises 503
+            // when the audit store is unavailable. Checking only the pointer
+            // (store wired but DB never opened) let a null handle return an
+            // empty query result as 200 — misleading evidence, not missing.
+            if (!audit_store || !audit_store->is_open()) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "audit store unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the audit store opens during "
+                                          "startup or after a config reload"),
+                    "application/json");
                 return;
             }
 
@@ -2523,14 +2539,18 @@ void RestApiV1::register_routes(
             if (!parse_epoch(req.get_param_value("from"), q.since) ||
                 !parse_epoch(req.get_param_value("to"), q.until)) {
                 res.status = 400;
-                res.set_content(error_json("from/to must be non-negative epoch seconds", 400),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(400, "from/to must be non-negative epoch seconds", cid,
+                                          "pass from/to as non-negative integer epoch seconds"),
+                    "application/json");
                 return;
             }
             // Inverted window is a client bug, not "no data" (Hermes L-3).
             if (q.since > 0 && q.until > 0 && q.since > q.until) {
                 res.status = 400;
-                res.set_content(error_json("from must be <= to", 400), "application/json");
+                res.set_content(detail::error_json_a4(400, "from must be <= to", cid,
+                                                      "ensure from <= to"),
+                                "application/json");
                 return;
             }
             // Malformed limit is a 400, not a silent fallback to the default
@@ -2550,7 +2570,9 @@ void RestApiV1::register_routes(
                 // Narrow catches only (Hermes L-2) — std::bad_alloc propagates.
                 if (limit_bad) {
                     res.status = 400;
-                    res.set_content(error_json("limit must be an integer", 400), "application/json");
+                    res.set_content(detail::error_json_a4(400, "limit must be an integer", cid,
+                                                          "pass limit as a positive integer"),
+                                    "application/json");
                     return;
                 }
             }

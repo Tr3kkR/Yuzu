@@ -18,8 +18,11 @@ evidence export".
   MFA enrol/login/step-up, session revocation). Noise (e.g. `instruction.*`,
   `tag.*`, `ca.*`) is excluded.
 - **Data layer:** `AuditQuery` gains `action_prefixes` (parameterised
-  `action LIKE ?||'%'` OR-group) and `random_sample` (`ORDER BY RANDOM()`),
-  both in `audit_store.{hpp,cpp}`. All SQL parameterised.
+  `action LIKE ?||'%'` OR-group) and `random_sample`, both in
+  `audit_store.{hpp,cpp}`. `random_sample` is a bounded indexed scan
+  (`ORDER BY timestamp DESC LIMIT <=10000`) followed by an in-memory C++
+  `std::shuffle` + truncate — **not** `ORDER BY RANDOM()` (see M-1 below). All
+  SQL parameterised.
 
 ## Control / authz decision
 
@@ -33,7 +36,7 @@ evidence export".
   weakening: `AuditLog:Read` is itself a privileged, RBAC-gated permission and
   the sibling audit-query endpoint already uses it.
 - **Evidence access is itself audited** — every export emits
-  `audit.auth_sample.exported` (`result=ok`, target `AuditLog/auth-sample`,
+  `audit.auth_sample.exported` (`result=success`, target `AuditLog/auth-sample`,
   detail = `from`/`to`/`limit`/`returned` count). So pulling evidence is on the
   audit chain (CC7.2 chain-of-custody). Emission is best-effort and never fails
   the read.

@@ -41,8 +41,15 @@ struct AuthSampleHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
-    explicit AuthSampleHarness(bool with_store = true) {
-        if (with_store) {
+    // store_opens=false constructs a wired-but-closed store (is_open()==false)
+    // by pointing it at an unopenable path, to exercise the store-down 503 guard.
+    explicit AuthSampleHarness(bool with_store = true, bool store_opens = true) {
+        if (with_store && !store_opens) {
+            // SQLITE_CANTOPEN on a path whose parent directory does not exist —
+            // sqlite3_open_v2 fails, leaving db_ == nullptr → is_open() false.
+            audit_store =
+                std::make_unique<AuditStore>("/nonexistent-yuzu-test-dir/audit-closed.db");
+        } else if (with_store) {
             audit_store = std::make_unique<AuditStore>(":memory:");
             auto log = [&](const std::string& action, int64_t ts) {
                 AuditEvent e;
@@ -163,6 +170,21 @@ TEST_CASE("auth-sample: no audit store → 503", "[auth-sample][rest]") {
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
     REQUIRE(res);
     CHECK(res->status == 503);
+}
+
+// CC7.2 evidence honesty: a wired-but-closed store (DB failed to open/migrate)
+// must FAIL LOUD with 503 — never a 200-empty that an auditor would read as
+// "no authentication activity". Regression guard for the review High finding.
+TEST_CASE("auth-sample: store wired but not open → 503, not 200-empty", "[auth-sample][rest]") {
+    AuthSampleHarness h{/*with_store=*/true, /*store_opens=*/false};
+    REQUIRE(h.audit_store);
+    REQUIRE_FALSE(h.audit_store->is_open());
+    auto res = h.sink.Get("/api/v1/audit/auth-sample");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // A4 envelope shape: carries a correlation_id and never an empty data set.
+    CHECK(res->body.find("correlation_id") != std::string::npos);
+    CHECK(res->body.find("\"total\":0") == std::string::npos);
 }
 
 TEST_CASE("auth-sample: malformed from/to → 400", "[auth-sample][rest]") {
