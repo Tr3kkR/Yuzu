@@ -102,7 +102,7 @@ Use the `configure` action to adjust TAR behavior.
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). Set to `0` to disable the perf trigger entirely. |
-| `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
+| `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. The `status` action reports `network_capture_method_effective` alongside the configured value so the configured-vs-active discrepancy is always explicit. |
 | `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
 **Validation rules:**
@@ -219,6 +219,7 @@ config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
 config|network_capture_method|polling
+config|network_capture_method_effective|polling
 ```
 
 A block is emitted for every capture source. The opt-in sources report
@@ -249,6 +250,8 @@ When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agen
 - **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
+
+`network_capture_method` is the **configured** value (which may be a value pre-staged ahead of a forthcoming kernel-event collector, or a cross-OS platform API); `network_capture_method_effective` is the mechanism **actually collecting**, which is always `polling` today — no kernel-event collector is wired yet, so every configured value currently collects via polling. The two are reported side by side so `status` can never misrepresent the active capture mechanism to a forensic analyst.
 
 ## TAR dashboard page
 

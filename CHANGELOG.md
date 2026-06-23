@@ -473,6 +473,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `paused_at`: the enable/disable transition canonicalises the previous value
   before both legs, so an `errored`→`true` recovery no longer leaves a stale
   `paused_at` that made `tar.status` report a now-collecting source as paused.
+- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
+  `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
+  on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
+  `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
+  was capturing via a kernel-event method when it was really polling. `do_status` now
+  emits `network_capture_method_effective` (the mechanism actually in force — always
+  `polling` today) alongside the configured `network_capture_method`, computed through a
+  single `effective_network_capture_method()` helper in the schema registry that is the
+  obvious place to wire the runtime check when a kernel-event collector lands. The
+  pre-staging affordance is preserved (the configured value is still stored and reported).
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
+  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
+  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
 - **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
   `tar.configure <source>_enabled=false` wrote the disable flag without serialising
   against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
