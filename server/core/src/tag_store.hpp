@@ -89,8 +89,11 @@ private:
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
     void create_tables();
 
-    // Internal variants called under existing lock (no re-lock)
-    void set_tag_impl(const std::string& agent_id, const std::string& key,
+    // Internal variants called under existing lock (no re-lock).
+    // set_tag_impl returns false if the row was not written (no db, rejected by
+    // validation, prepare/step failure) — sync_agent_tags relies on this to keep
+    // the agent re-sync atomic (governance UP-1).
+    bool set_tag_impl(const std::string& agent_id, const std::string& key,
                       const std::string& value, const std::string& source);
     std::string get_tag_impl(const std::string& agent_id, const std::string& key) const;
 };

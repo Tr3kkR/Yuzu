@@ -1148,6 +1148,10 @@ TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
     // #1470 Gate-4 consistency: tier-denials carry an actionable remediation hint
     // (parity with the cohort-diff sibling), not a bare null.
     CHECK(denied["error"]["data"]["remediation"].is_string());
+    // Full A4 field set present — retry_after_ms is always emitted (null here),
+    // parity with the REST sibling (Gate-4 consistency N2).
+    REQUIRE(denied["error"]["data"].contains("retry_after_ms"));
+    CHECK(denied["error"]["data"]["retry_after_ms"].is_null());
 }
 
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",

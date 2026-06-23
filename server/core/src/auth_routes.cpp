@@ -223,8 +223,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         }
         // Approval-gated operations (supervised tier on destructive ops) cannot
         // proceed because the approval workflow re-dispatch path is Phase 2 work.
-        // mcp_server.cpp returns kApprovalRequired for the same reason; mirror
-        // that behavior here so the REST transport cannot bypass it (#520).
+        // mcp_server.cpp denies the same case with kTierDenied (it deliberately
+        // does NOT return kApprovalRequired — A4 reserves that for a pollable
+        // approval it cannot produce yet); mirror that denial here so the REST
+        // transport cannot bypass it (#520).
         if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +

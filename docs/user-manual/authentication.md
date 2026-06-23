@@ -532,7 +532,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
-| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from approval-gated operation (Phase 2 re-dispatch not yet implemented) |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on the REST transport** (Phase 2 re-dispatch not yet implemented). The MCP **tool** transport audits the same denial as `mcp.<tool_name>` / `denied` (see `mcp.md`), and returns JSON-RPC `-32004` (`TierDenied`), not `-32006`. |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
@@ -543,7 +543,7 @@ All `denied` results include a `detail` field explaining the reason. Examples pe
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
 - `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
 - `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
-- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"`
+- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"` (REST transport; the MCP tool path instead emits `mcp.<tool_name>` / `denied` with detail `"approval-gated execution not implemented"`)
 
 ### JSON Error Envelope
 

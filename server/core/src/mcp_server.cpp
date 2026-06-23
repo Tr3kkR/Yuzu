@@ -2066,7 +2066,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         o.add("retry_after_ms", retry_ms);
                     else
                         o.raw("retry_after_ms", "null");
-                    o.add("remediation", remediation);
+                    // Emit null (not "") when empty, matching a4_error — keeps the
+                    // MCP A4 surfaces' nullable-remediation shape uniform (Gate-4
+                    // consistency S4). All current callers pass a non-empty hint.
+                    if (remediation.empty())
+                        o.raw("remediation", "null");
+                    else
+                        o.add("remediation", remediation);
                     return o.str();
                 };
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
