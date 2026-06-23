@@ -582,6 +582,12 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
     // DRIPS residency is a PERCENT, not a duration — must NOT render as "75 ms".
     CHECK(render("os.modern_standby_exit", 75.0).find("Metric</span><code>75%</code>") !=
           std::string::npos);
+    // 0% DRIPS is a REAL reading (never reached deep idle) — it must render "0%",
+    // NOT the "no metric" em-dash (grill #1: the signal's headline value was hidden).
+    CHECK(render("os.modern_standby_exit", 0.0).find("Metric</span><code>0%</code>") !=
+          std::string::npos);
+    CHECK(render("os.modern_standby_exit", 0.0).find("Metric</span><code>&mdash;</code>") ==
+          std::string::npos);
     // Duration metrics humanize ms → s.
     CHECK(render("os.boot", 64934.0).find("Metric</span><code>64.9 s</code>") != std::string::npos);
     // A long boot never flips to scientific notation (the bare-{:g} hazard).

@@ -421,10 +421,15 @@ std::string fmt_secs(double s) {
 // degrades to a bare, fixed-notation number — never a WRONG unit, and never the
 // scientific-notation a bare {:g} flips to on a >16-min boot.
 std::string dex_metric_display(const std::string& obs_type, double metric) {
-    if (!(metric > 0.0))
-        return {}; // "no metric" — the caller renders an em-dash
+    // DRIPS residency is a percentage where **0% is a REAL reading** — the worst
+    // case: the platform never reached deep idle while "asleep" (the exact symptom
+    // this signal was built to surface). It must NOT collapse to the "no metric"
+    // em-dash, so the percent branch runs BEFORE the >0 guard. (Extractor clamps to
+    // [0,100]; guard only NaN/negative.)
     if (obs_type == "os.modern_standby_exit")
-        return std::format("{:.0f}%", metric); // DRIPS residency %, not a duration
+        return metric >= 0.0 ? std::format("{:.0f}%", metric) : std::string{};
+    if (!(metric > 0.0))
+        return {}; // other types: 0 / absent → em-dash
     static constexpr std::string_view kMs[] = {
         "os.boot",          "os.shutdown",          "os.standby",
         "os.standby_degraded", "os.resume_report",  "shutdown.degraded",
