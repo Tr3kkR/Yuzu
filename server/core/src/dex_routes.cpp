@@ -2464,9 +2464,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  // open, mirroring /fragments/dex/device, so the "audit-logged on
                  // open" banner the fragment shows is true and the SOC 2
                  // compensating control applies (governance B4).
-                 if (audit_fn_)
-                     audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
-                               "DEX per-signal most-affected devices");
+                 // Capture the audit bool (#1549 review): a dropped evidence row on
+                 // this PII drill-down is a works-council/SOC 2 gap. HTML surface →
+                 // flag via Sec-Audit-Failed but STILL render (a transient audit
+                 // hiccup must not blank the dashboard); the REST sibling fails closed.
+                 if (audit_fn_ && !audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
+                                             "DEX per-signal most-affected devices"))
+                     res.set_header("Sec-Audit-Failed", "true");
                  const auto vis = resolve_visible(req); // scope the most-affected-devices list
                  res.set_content(
                      render_dex_catalogue_signal_fragment(store_, since, window_days, type, os,
@@ -2530,9 +2534,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string w =
             window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
                                                                 : "7d"));
-        if (audit_fn_)
-            audit_fn_(req, "dex.device.view", "success", "Agent", id,
-                      "DEX per-device signal history");
+        // Capture the audit bool (#1549 review): surface a dropped evidence row on
+        // this PII drill-down via Sec-Audit-Failed; HTML surface still renders.
+        if (audit_fn_ && !audit_fn_(req, "dex.device.view", "success", "Agent", id,
+                                    "DEX per-device signal history"))
+            res.set_header("Sec-Audit-Failed", "true");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
         std::optional<DexPerfSnapshot> snap;

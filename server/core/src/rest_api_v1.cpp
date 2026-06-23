@@ -4921,6 +4921,10 @@ void RestApiV1::register_routes(
                                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
+            // Echo the correlation id on EVERY response path (success + error), the
+            // same posture as /api/v1/events — agentic callers correlate the header
+            // with the body's correlation_id (A3).
+            res.set_header("X-Correlation-Id", cid);
             // Per-device scope is mandatory — fail CLOSED if the gate is unwired
             // rather than silently widening to a global Read (production always wires
             // it from server.cpp; sibling DeviceRoutes likewise refuses without it).
@@ -4950,9 +4954,24 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            if (audit_fn)
-                audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
-                         "REST per-device DEX read model");
+            // Audit-on-open is FAIL-CLOSED for this PII read: capture the AuditFn
+            // bool and refuse to serve the device's behavioral data when the evidence
+            // row is KNOWN to have failed to persist (audit DB locked/full/corrupt).
+            // Serving audited PII while the audit row is known-lost is exactly the
+            // failure audit-on-open exists to prevent (SOC 2 CC7.2 / works-council).
+            // A null audit_fn means no audit callback wired (test / audit-off config),
+            // not a persistence failure — that path serves, per the AuditFn contract.
+            if (audit_fn && !audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
+                                      "REST per-device DEX read model")) {
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                return;
+            }
             const std::string since = dex_iso_since(dex_window_to_days(window));
             const int score = dex_device_score(guaranteed_state_store, agent_id, since);
             JArr signals;
@@ -5001,6 +5020,9 @@ void RestApiV1::register_routes(
             const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
+            // Echo the correlation id on EVERY response path (A3), parity with the
+            // read model above and /api/v1/events.
+            res.set_header("X-Correlation-Id", cid);
             const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
             // Count every live-read by kind + terminal HTTP status at handler exit
             // (RAII, so all return paths — 200/400/403/429/500/502/503/504 — are
@@ -5066,16 +5088,32 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Audit the REQUEST BEFORE the side-effect (audit-on-open / UP-8): the
+            // works-council-relevant event is "the operator requested live data on this
+            // device" — known here, before dispatch. FAIL-CLOSED: when the evidence row
+            // is KNOWN to have failed to persist, do NOT dispatch the (usage-class)
+            // probe. Dispatching while the audit row is known-lost is exactly what
+            // audit-on-open prevents (SOC 2 CC7.2). result="requested" (not the old
+            // post-dispatch "dispatched"/"no_agents"): whether an agent was reached is
+            // reported by the response itself (503 below when none) — command_id is
+            // minted by dispatch, so it surfaces in metrics / the response store, not
+            // the pre-dispatch audit. A null audit_fn is test / audit-off, not a
+            // persistence failure, and dispatches per the AuditFn contract.
+            // Usage-class read (processes) stays separately auditable from machine-
+            // health (uptime) via the per-kind audit_action.
+            if (audit_fn && !audit_fn(req, audit_action, "requested", "Agent", agent_id,
+                                      "REST live " + plugin + "/" + action)) {
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to dispatch "
+                                               "without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                return;
+            }
             const auto [command_id, sent] =
                 command_dispatch_fn(plugin, action, {agent_id}, "", {}, /*execution_id=*/"");
-            // Audit the DISPATCH (the works-council-relevant event — the operator
-            // requested live data on this device), with an HONEST result: "dispatched"
-            // when it reached an agent, "no_agents" when it didn't. NOT "success" —
-            // the outcome (502/504/empty) isn't known yet (UP-8). Usage-class read
-            // (processes) stays separately auditable from machine-health (uptime).
-            if (audit_fn)
-                audit_fn(req, audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent", agent_id,
-                         "REST live " + plugin + "/" + action + " command_id=" + command_id);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

@@ -65,8 +65,10 @@ struct LiveHarness {
         };
         auto responses = [this](const std::string&) { return fake_rows; };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
             audited = a + "|" + r + "|" + tid;
+            return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
         };
         // store is unused by the live routes — pass nullptr deliberately.
         routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
@@ -259,8 +261,10 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
@@ -343,8 +347,10 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     auto responses = [](const std::string&) { return std::vector<DexAgentResponse>{}; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;

@@ -771,8 +771,10 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
     auto fleet = []() { return DexFleet{}; };
     std::vector<std::string> audited;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
-                     const std::string&, const std::string& tid,
-                     const std::string&) { audited.push_back(a + "|" + tid); };
+                     const std::string&, const std::string& tid, const std::string&) -> bool {
+        audited.push_back(a + "|" + tid);
+        return true;
+    };
     std::string dispatched_sql;
     DexRoutes::DispatchFn dispatch =
         [&](const std::string&, const std::string&, const std::vector<std::string>&,

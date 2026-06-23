@@ -317,8 +317,16 @@ public:
     using FleetFn = std::function<DexFleet()>;
 
     /// Audit hook — used to log per-device drill-down opens (behavioral PII).
-    /// May be empty (audit then degrades to a no-op).
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    /// May be empty (audit then degrades to a no-op). **Bool-returning** (was
+    /// void pre-#1549 review): returns true iff the event was persisted (or the
+    /// deployment runs audit-off — both look the same to a caller), false on a
+    /// silent persistence failure. PII-emitting drill-downs capture this and
+    /// surface the gap to the operator (Sec-Audit-Failed header) so a dropped
+    /// works-council/SOC 2 evidence row is visible. The dashboard is an HTML/HTMX
+    /// surface served to a browser, so on a failure it STILL renders the fragment
+    /// (a transient audit hiccup must not blank the dashboard) but flags the gap —
+    /// unlike the strict-fail-closed REST per-device endpoints.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
