@@ -65,7 +65,7 @@ Every failure response — REST, MCP, gRPC error — includes:
 - `message` — human-readable summary (one sentence)
 - `correlation_id` — server-issued ID that ties the error to the audit log entry
 - `retry_after_ms` — nullable; if non-null, the agent should wait at least this long before retrying
-- `remediation` — nullable URL or natural-language hint (e.g. `"request the missing permission via POST /api/v1/approvals"`)
+- `remediation` — optional/nullable URL or natural-language hint (e.g. `"request the missing permission via POST /api/v1/approvals"`). When there is no hint, a surface MAY either emit `"remediation": null` (the MCP envelopes) or omit the key entirely (the REST envelope — absence carries the same "no recovery hint" meaning); both are conformant for this nullable field.
 
 Two specialisations:
 
