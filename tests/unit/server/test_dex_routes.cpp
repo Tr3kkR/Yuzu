@@ -548,6 +548,26 @@ TEST_CASE("DEX single-observation detail: escapes fields (no XSS)",
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
 
+TEST_CASE("DEX observation render: metric 0 → em-dash; unknown obs_type → escaped fallback",
+          "[dex][routes]") {
+    GuardianObservationRow r;
+    r.event_id = "ev-z";
+    r.agent_id = "WS-1";
+    r.obs_type = "<weird>future.type"; // uncatalogued + hostile
+    r.subject = "x";
+    r.platform = "windows";
+    r.metric = 0.0; // "no metric" sentinel — the Metric cell shows an em-dash, not "0"
+    const auto html = render_dex_observation_fragment(r);
+    CHECK(html.find("Metric</span><code>&mdash;</code>") != std::string::npos);
+    // unknown obs_type falls back to the escaped raw label (no XSS, no crash)
+    CHECK(html.find("<weird>") == std::string::npos);
+    CHECK(html.find("&lt;weird&gt;future.type") != std::string::npos);
+    // a real metric DOES render (no sci-notation for in-range values)
+    r.metric = 75.0;
+    const auto html2 = render_dex_observation_fragment(r);
+    CHECK(html2.find("Metric</span><code>75</code>") != std::string::npos);
+}
+
 TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
@@ -659,30 +679,42 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     // gate before audit, binding-404 against a foreign event_id, audit-on-success
     // with the obs_type in the detail) must be exercised THROUGH the route, not
     // just via the store/render fns (gov QE BLOCKING; F1 works-council).
-    SECTION("per-event /observation: permitted opens audit obs_type; foreign id is an opaque 404") {
+    SECTION("per-event /observation: permitted opens audit obs_type+event; foreign id is an opaque placeholder") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
 
-        // (1) Permitted open of the seeded WS-1 crash (event_id "e1") → 200 + audit,
-        //     and the detail carries the obs_type so usage-class opens stay countable.
+        // (1) Permitted open of the seeded WS-1 crash (event_id "e1") → 200 + audit;
+        //     the detail carries the obs_type (usage-class countability) + the event id.
         auto ok = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
         REQUIRE(ok);
         CHECK(ok->status == 200);
         CHECK(audited == "dex.observation.view|Agent|WS-1");
-        CHECK(audited_detail.find("process.crashed") != std::string::npos); // F1
+        CHECK(audited_detail.find("process.crashed") != std::string::npos); // F1 obs_type
+        CHECK(audited_detail.find("e1") != std::string::npos);              // event id traceable
 
-        // (2) Binding-404: the event exists but on a DIFFERENT device → 404, and an
-        //     unknown event_id → the SAME 404, with NO audit (no enumeration oracle).
+        // (2) Binding case: the event exists but on a DIFFERENT device → the same
+        //     "Observation not found" placeholder as a genuinely-unknown id, with NO
+        //     foreign data leaked. Status is 200 NOT 404 — the dashboard htmx config
+        //     drops 4xx bodies (swap:false), so a 404 would blank the slot; 200 still
+        //     closes the enumeration oracle (foreign == absent, indistinguishable) and
+        //     the not-found branch does NOT audit.
         audited.clear();
         auto foreign = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=e1");
         REQUIRE(foreign);
-        CHECK(foreign->status == 404);
+        CHECK(foreign->status == 200);
+        CHECK(foreign->body.find("Observation not found") != std::string::npos);
+        CHECK(foreign->body.find("chrome.exe") == std::string::npos); // WS-1's data does not leak
         auto unknown = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=nope");
         REQUIRE(unknown);
-        CHECK(unknown->status == 404);
-        CHECK(foreign->body == unknown->body); // indistinguishable
-        CHECK(audited.empty());                // a 404 never audits
+        CHECK(unknown->status == 200);
+        CHECK(foreign->body == unknown->body); // indistinguishable — oracle closed
+        // Empty event_id (the degenerate guard) also lands on the placeholder, not a 500.
+        auto empty = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=");
+        REQUIRE(empty);
+        CHECK(empty->status == 200);
+        CHECK(empty->body.find("Observation not found") != std::string::npos);
+        CHECK(audited.empty()); // none of the not-found paths audit
     }
 
     SECTION("per-event /observation + /apps: perm gate runs before audit/render") {

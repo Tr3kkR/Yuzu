@@ -1632,8 +1632,13 @@ GuaranteedStateStore::dex_observation(const std::string& event_id) const {
         LIMIT 1
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK) {
+        // A store fault here would otherwise be indistinguishable from "not found"
+        // at the route — log it so it's diagnosable.
+        spdlog::warn("GuaranteedStateStore::dex_observation: prepare failed: {}",
+                     sqlite3_errmsg(db_));
         return std::nullopt;
+    }
     sqlite3_bind_text(st.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st.get()) != SQLITE_ROW)
         return std::nullopt;

@@ -2650,13 +2650,21 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
                                      : !perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
+                 // Degenerate empty ids can't identify an event — fall through to the
+                 // same opaque placeholder (defence-in-depth vs a malformed empty-
+                 // agent_id row, which an enrolled agent can't produce). After the perm
+                 // gate, so a denied caller still gets 403, never a 200 placeholder.
                  std::optional<GuardianObservationRow> obs;
-                 if (store_)
+                 if (store_ && !id.empty() && !event_id.empty())
                      obs = store_->dex_observation(event_id);
-                 // Bind the event to the SCOPED agent — a guessed or foreign
-                 // event_id reveals nothing (defence in depth over the scope gate).
+                 // Bind the event to the SCOPED agent — a guessed or foreign event_id
+                 // reveals nothing (defence in depth over the scope gate). Return 200
+                 // (NOT 404): the dashboard htmx config sets swap:false for 4xx, so a
+                 // 404 body never renders into #dex-obs-detail and the operator's click
+                 // on a stale row leaves the slot empty. 200 + the identical placeholder
+                 // both renders AND keeps the enumeration oracle closed (foreign-id and
+                 // genuinely-absent are indistinguishable). Cf. guardian_routes 200-placeholder.
                  if (!obs || obs->agent_id != id) {
-                     res.status = 404;
                      res.set_content(
                          placeholder("Observation not found", "No such event on this device."),
                          "text/html; charset=utf-8");
@@ -2670,7 +2678,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      // dex.device.procperf.query). obs_type is a controlled catalogue
                      // string, never user input.
                      audit_fn_(req, "dex.observation.view", "success", "Agent", id,
-                               "DEX single-observation detail: " + obs->obs_type);
+                               "DEX single-observation detail: " + obs->obs_type + " (event " +
+                                   obs->event_id + ")");
                  res.set_content(render_dex_observation_fragment(*obs),
                                  "text/html; charset=utf-8");
              });
