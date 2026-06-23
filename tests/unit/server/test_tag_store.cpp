@@ -8,9 +8,19 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sqlite3.h>
+
 #include <string>
 
 using namespace yuzu::server;
+
+namespace yuzu::server {
+// Test-only access to TagStore's connection (declared `friend` in tag_store.hpp)
+// so a test can install a sqlite3 authorizer for deterministic fault injection.
+struct TagStoreFaultHook {
+    static sqlite3* db(TagStore& s) { return s.db_; }
+};
+} // namespace yuzu::server
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -133,6 +143,53 @@ TEST_CASE("TagStore: agent sync cannot clobber an operator tag for the same key 
     CHECK(store.get_tag("agent-2", "model") == "agent-guess");
     store.set_tag("agent-2", "model", "operator-final", "server");
     CHECK(store.get_tag("agent-2", "model") == "operator-final");
+}
+
+// Authorizer callback: deny INSERT into `tags`, allow everything else. A plain
+// file-static function — sqlite3_set_authorizer takes a C function pointer.
+static int deny_tag_insert(void*, int action, const char* arg1, const char*, const char*,
+                           const char*) {
+    if (action == SQLITE_INSERT && arg1 && std::string(arg1) == "tags")
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+TEST_CASE("TagStore: sync_agent_tags rolls back to the prior set on a mid-sync write failure "
+          "(UP-1 / CH-R)",
+          "[tag_store][atomicity][security]") {
+    TagStore store(":memory:");
+
+    // Seed the agent's prior COMPLETE set + an operator row for the same device.
+    store.set_tag("agent-1", "model", "X1", "agent");
+    store.set_tag("agent-1", "ring", "fast", "agent");
+    store.set_tag("agent-1", "cohort", "ops", "server"); // operator/API row
+    REQUIRE(store.get_tag("agent-1", "model") == "X1");
+
+    // Inject a deterministic mid-sync failure: deny INSERTs into `tags`. The
+    // DELETE-all-agent-tags inside sync_agent_tags still runs, then the first
+    // reinsert fails (set_tag_impl returns false) → sync returns WITHOUT
+    // committing → SqliteTxn rolls back the DELETE → the prior set is restored.
+    sqlite3* db = TagStoreFaultHook::db(store);
+    REQUIRE(db != nullptr);
+    sqlite3_set_authorizer(db, deny_tag_insert, nullptr);
+
+    store.sync_agent_tags("agent-1", {{"model", "X2"}, {"ring", "slow"}});
+
+    // Lift the authorizer so verification reads succeed.
+    sqlite3_set_authorizer(db, nullptr, nullptr);
+
+    // The prior COMPLETE set survived intact — nothing partial committed, the
+    // failed sync did not wipe-without-reinsert.
+    CHECK(store.get_tag("agent-1", "model") == "X1");   // not the failed X2
+    CHECK(store.get_tag("agent-1", "ring") == "fast");  // not the failed slow
+    CHECK(store.get_tag("agent-1", "cohort") == "ops"); // operator row untouched
+
+    // The connection is not wedged by the rolled-back transaction: a subsequent
+    // clean sync commits normally.
+    store.sync_agent_tags("agent-1", {{"model", "X3"}});
+    CHECK(store.get_tag("agent-1", "model") == "X3");
+    CHECK(store.get_tag("agent-1", "ring").empty()); // X3-only set replaced the old agent keys
+    CHECK(store.get_tag("agent-1", "cohort") == "ops"); // operator row still authoritative
 }
 
 TEST_CASE("TagStore: delete_all_tags", "[tag_store]") {
