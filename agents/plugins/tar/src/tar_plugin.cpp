@@ -218,9 +218,18 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
 // config row yet comes from CaptureSourceDef::default_enabled (true for
 // always-on sources, false for opt-in module/procperf/netqual), so a fresh
 // agent agrees with tar.status / retention / the paused_at transition.
+//
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
     const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
-    return db.get_config(std::format("{}_enabled", source), def) != "false";
+    return yuzu::tar::canonical_source_enabled(
+               db.get_config(std::format("{}_enabled", source), def)) == "true";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
@@ -1064,8 +1073,14 @@ private:
             // Default to the source's declared default (false for opt-in
             // module/procperf/netqual) so a fresh agent does not misreport an
             // opt-in source as enabled.
-            auto enabled_val =
-                db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            auto stored = db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            // #560 — emit a strict tri-state (true/false/errored). do_configure
+            // only ever persists "true"/"false"; any other stored value was
+            // written outside the plugin (corruption, disk tampering, a
+            // downgrade/upgrade) and is surfaced as the explicit "errored"
+            // sentinel so the dashboard renders a value-error badge instead of
+            // silently omitting the source. Never coerced/guessed.
+            auto enabled_val = yuzu::tar::canonical_source_enabled(stored);
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);
