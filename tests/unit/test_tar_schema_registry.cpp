@@ -182,6 +182,50 @@ TEST_CASE("TAR schema: current_platform_os is one of the supported triplet",
     CHECK_FALSE(accepted_capture_methods_for_os("tcp", os).empty());
 }
 
+TEST_CASE("TAR schema: effective network capture method is always polling today",
+          "[tar][schema][issue1528]") {
+    // `do_configure` stores any `network_capture_method` in
+    // accepted_capture_methods("tcp") (plus the "polling" sentinel), but
+    // collect_fast always polls via enumerate_connections() regardless.
+    // effective_network_capture_method() is the single source of truth the
+    // `status` action reports so it can never claim a stored-but-unwired method
+    // is the active mechanism. Until a kernel-event collector lands, every
+    // configured value must collapse to "polling".
+
+    // Round-trip: the documented default maps to itself.
+    CHECK(effective_network_capture_method("polling") == "polling");
+
+    // Core invariant (issue #1528 acceptance): EVERY value `do_configure` will
+    // accept for network_capture_method must report effective "polling" and must
+    // NOT be reported back as the active mechanism. The tcp accept-list is the
+    // exact configurable set; the kSupported platform APIs (procfs / iphlpapi /
+    // proc_pidfdinfo) ARE the polling implementation, so the status field
+    // reports the logical "polling" rather than the underlying API -- and a
+    // cross-OS value (e.g. iphlpapi stored on a Linux box reading /proc/net) can
+    // never masquerade as the active mechanism.
+    auto configurable = accepted_capture_methods("tcp");
+    REQUIRE_FALSE(configurable.empty());  // guard against a vacuous loop
+    for (const auto& method : configurable) {
+        INFO("configurable network_capture_method=" << method);
+        CHECK(effective_network_capture_method(method) == "polling");
+        CHECK(effective_network_capture_method(method) != method);
+    }
+
+    // Forward-looking: etw / endpoint_security are named in the issue and the
+    // tar.yaml/tar.md prose as the kernel-event methods that would be pre-staged
+    // once their collectors land (they are NOT in the tcp accept-list today, so
+    // they appear here as explicit literals, not via the registry). The helper
+    // is total -- it must collapse them to "polling" too until those collectors
+    // are wired, which is when this function gains its runtime branch.
+    CHECK(effective_network_capture_method("etw") == "polling");
+    CHECK(effective_network_capture_method("endpoint_security") == "polling");
+
+    // Total-function contract: empty and unknown inputs are inert (the helper
+    // ignores `configured` today) and still report the truthful mechanism.
+    CHECK(effective_network_capture_method("") == "polling");
+    CHECK(effective_network_capture_method("not_a_real_method") == "polling");
+}
+
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
 
 TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",

@@ -677,6 +677,20 @@ std::vector<std::string> accepted_capture_methods_for_os(std::string_view source
     return methods;
 }
 
+std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
+    // Polling is the only wired network capture mechanism on every OS today.
+    // `enumerate_connections()` (the collect_fast network leg) always polls,
+    // regardless of the stored `network_capture_method`: the per-OS platform
+    // APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling implementation,
+    // and the kPlanned kernel-event methods (etw / endpoint_security) are
+    // accepted for pre-staging but not yet collected. So every configured value
+    // maps to an effective mechanism of "polling". When a kernel-event collector
+    // lands, branch on `configured` (and the live session state, as the process
+    // collector does with `etw_active_`) here -- this is the single source of
+    // truth the `status` action reports (issue #1528).
+    return "polling";
+}
+
 std::string generate_warehouse_ddl() {
     std::ostringstream ddl;
     for (const auto& src : build_sources()) {

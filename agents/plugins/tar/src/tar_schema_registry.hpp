@@ -106,6 +106,21 @@ struct CaptureSourceDef {
 [[nodiscard]] std::vector<std::string>
 accepted_capture_methods_for_os(std::string_view source_name, std::string_view os);
 
+// ── Effective (actually-wired) network capture mechanism (issue #1528) ─────
+//
+// Returns the capture mechanism the TAR collector ACTUALLY uses, given the
+// configured `network_capture_method`. Only polling is wired today: the
+// per-OS platform APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling
+// implementation, and the kPlanned kernel-event methods (etw /
+// endpoint_security) are accepted for pre-staging but not yet collected. So
+// the effective mechanism is "polling" for every configured value until a
+// kernel-event collector lands -- at which point this is where the runtime
+// availability check goes (mirroring the process collector's `etw_active_`
+// gate in tar_plugin.cpp's do_status). The `status` action reports this
+// alongside the configured value so it can never misrepresent the active
+// mechanism.
+[[nodiscard]] std::string effective_network_capture_method(std::string_view configured);
+
 // ── Per-source default-enabled lookup ──────────────────────────────────────
 //
 // Returns `CaptureSourceDef::default_enabled` for the named source — the value
