@@ -2,6 +2,7 @@
 
 #include "agent_registry.hpp"
 #include "fleet_topology_store.hpp"
+#include "offline_endpoint_store.hpp"
 
 #include "agent.grpc.pb.h"
 
@@ -9,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -24,6 +26,33 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     }
     if (metrics_) {
         metrics_->counter("yuzu_heartbeats_received_total", {{"via", via_str}}).increment();
+    }
+
+    // Durable last-known endpoint state (#1320 PR 3, Postgres substrate):
+    // persist who this agent is + that we just heard from it, so a host that
+    // ages out of the in-memory 60 s topology cache renders stale-flagged on
+    // /viz/fleet instead of vanishing. Best-effort and OFF the gRPC hot-path
+    // lock — a slow/blipping database never blocks the heartbeat (the in-memory
+    // stores stay authoritative). Does not touch the executions-ladder
+    // invariants (cmd_execution_ids_ / polchk-): those live on the
+    // CommandResponse path, not here.
+    if (offline_store_) {
+        std::string hostname;
+        std::string os;
+        if (auto sess = registry_.get_session(agent_id_str)) {
+            hostname = sess->hostname;
+            os = sess->os;
+        }
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        // agent_ts is RESERVED: the schema/struct carry it for a future
+        // agent-emitted snapshot timestamp, but the heartbeat path has no such
+        // value today, so it is always 0 in production (gov consistency
+        // SHOULD-1). Staleness is driven entirely by the server-side
+        // last_heartbeat_ms. Wire a real agent ts here when one exists, or drop
+        // the column — tracked as a follow-up.
+        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0);
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

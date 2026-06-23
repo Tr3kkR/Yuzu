@@ -34,10 +34,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "if the ETW session cannot start. No command line is captured."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
-                {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
-                 "KERN_PROC_ALL via sysctl. Cmdline requires SIP-respecting "
-                 "KERN_PROCARGS2 — empty for hardened-runtime processes that "
-                 "the agent cannot inspect."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
+                 "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
+                 "path, accurate ppid, owning user from the audit token) where the "
+                 "framework + entitlement are present (full Xcode SDK build, "
+                 "com.apple.developer.endpoint-security.client, root). Falls back to "
+                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
+                 "— no command line (works-council posture); the poll blanks the "
+                 "proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
@@ -353,6 +357,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "procperf",
             .dollar_name = "ProcPerf",
+            // Opt-in (works-council posture): a fresh agent reports it disabled
+            // on tar.status, matching the explicit "false" collection gate.
+            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,  "ntsysinfo",
                  "One NtQuerySystemInformation(SystemProcessInformation) "
@@ -407,6 +414,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "netqual",
             .dollar_name = "NetQual",
+            // Opt-in (usage-class per-connection telemetry): disabled on a fresh
+            // agent, matching the explicit "false" collection gate.
+            .default_enabled = false,
             .os_support = {
                 {"linux",   OsSupportStatus::kSupported, "inetdiag",
                  "netlink SOCK_DIAG / INET_DIAG TCP_INFO dump (the interface "
@@ -441,6 +451,108 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"retrans",       "INTEGER"},
                         {"segs_out",      "INTEGER"},
                         {"ca_state",      "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── Module / image loads (M1 — docs/tar-module-loads.md) ──────────
+        // What loads INTO a process: DLL / dylib / .so + driver / kext / kmod
+        // loads, each with a signing verdict — the DLL-search-order-hijack,
+        // injection, and BYOVD surface $Process cannot answer. `module_dir` IS
+        // captured (the hijack signal is the path, not a command line — a narrow,
+        // deliberate divergence from the names-only process posture; no cmdline).
+        // M1 registers the schema queryable-empty; collectors are kPlanned until
+        // M2 (Windows ETW), M4/M5 (macOS ES), M6 (Linux auditd kmod). The high-
+        // volume edge risk-filter that really bounds module_live ships with the
+        // first collector; opt-in (module_enabled, default off) like procperf.
+        {
+            .name = "module",
+            .dollar_name = "Module",
+            // Opt-in (~100× process volume; ships disabled until an operator
+            // turns it on). default_enabled=false is what discharges the M1 §13
+            // condition that module_enabled must NOT read as true before a
+            // collector exists — it makes tar.status, retention, and the
+            // paused_at transition all agree the source starts disabled.
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "etw",
+                 "Microsoft-Windows-Kernel-Process image-load events (IMAGE "
+                 "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
+                 "loads surface as kernel image-loads (System pid). Signing is "
+                 "verified out-of-band at drain (WinVerifyTrust + CryptQueryObject "
+                 "signer, cached); module_dir is scrubbed of user-profile prefixes "
+                 "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
+                 "overlay is M3."},
+                {"linux", OsSupportStatus::kPlanned, "auditd",
+                 "Kernel-module loads via auditd init_module/finit_module (kmod "
+                 "only in v1; /proc/modules seed). Shared-object (.so) loads need "
+                 "eBPF and are deferred to a separate track. Wired in M6."},
+                {"macos", OsSupportStatus::kPlanned, "endpoint_security",
+                 "ES NOTIFY_KEXTLOAD/KEXTUNLOAD (first-class) plus user-space "
+                 "dylibs via NOTIFY_MMAP (constrained) on the SAME ES client the "
+                 "process source uses; code-signing identity (team id / cdhash) "
+                 "rides the message, so signing needs no extra call. Wired in "
+                 "M4/M5."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // The edge risk-filter (unsigned/kernel/blocked at full
+                    // fidelity; signed system modules first-seen-then-count) is
+                    // the real bound; this row cap is the deterministic backstop.
+                    .retention_default = 100000,
+                    .columns = {
+                        {"ts",            "INTEGER"},
+                        {"snapshot_id",   "INTEGER"},
+                        {"action",        "TEXT"},
+                        {"pid",           "INTEGER"},
+                        {"process_name",  "TEXT"},
+                        {"module_name",   "TEXT"},
+                        {"module_dir",    "TEXT"},
+                        {"signed_state",  "TEXT"},
+                        {"signer",        "TEXT"},
+                        {"is_kernel",     "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days
+                    .columns = {
+                        {"day_ts",       "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "monthly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 31536000, // 12 months (~365 days)
+                    .columns = {
+                        {"month_ts",     "INTEGER"},
+                        {"module_name",  "TEXT"},
+                        {"signer",       "TEXT"},
+                        {"signed_state", "TEXT"},
+                        {"is_kernel",    "INTEGER"},
+                        {"load_count",   "INTEGER"},
                     },
                 },
             },
@@ -507,6 +619,14 @@ const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();
 }
 
+bool source_default_enabled(std::string_view source_name) {
+    for (const auto& src : build_sources()) {
+        if (src.name == source_name)
+            return src.default_enabled;
+    }
+    return true; // unknown source → the always-on default
+}
+
 std::vector<std::string> accepted_capture_methods(std::string_view source_name) {
     std::vector<std::string> methods;
     for (const auto& src : build_sources()) {
@@ -523,6 +643,20 @@ std::vector<std::string> accepted_capture_methods(std::string_view source_name) 
     }
     std::sort(methods.begin(), methods.end());
     return methods;
+}
+
+std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
+    // Polling is the only wired network capture mechanism on every OS today.
+    // `enumerate_connections()` (the collect_fast network leg) always polls,
+    // regardless of the stored `network_capture_method`: the per-OS platform
+    // APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling implementation,
+    // and the kPlanned kernel-event methods (etw / endpoint_security) are
+    // accepted for pre-staging but not yet collected. So every configured value
+    // maps to an effective mechanism of "polling". When a kernel-event collector
+    // lands, branch on `configured` (and the live session state, as the process
+    // collector does with `etw_active_`) here -- this is the single source of
+    // truth the `status` action reports (issue #1528).
+    return "polling";
 }
 
 std::string generate_warehouse_ddl() {
@@ -558,6 +692,16 @@ std::string generate_warehouse_ddl() {
             if (g.suffix == "live" && src.name == "tcp") {
                 ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_remote ON {0}(remote_addr);\n",
                                    table_name);
+            }
+            if (g.suffix == "live" && src.name == "module") {
+                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(module_name);\n",
+                                   table_name);
+                // The canonical "unsigned image loaded in the last 24h" query
+                // filters signed_state; index it so that scan stays cheap once a
+                // collector populates module_live.
+                ddl << std::format(
+                    "CREATE INDEX IF NOT EXISTS idx_{0}_signed_state ON {0}(signed_state);\n",
+                    table_name);
             }
 
             ddl << "\n";
@@ -734,6 +878,37 @@ SELECT (ts / 3600) * 3600, name, COUNT(*), MAX(instances),
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 3600) * 3600, name)";
+        }
+    }
+
+    // ── Module / image-load rollups (M1) — per (module, signer, sig, kernel) ──
+    // load_count counts 'loaded' events only; 'seed'/'blocked'/'unloaded' stay
+    // visible at full fidelity in module_live and are not folded into the count.
+    if (source_name == "module") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO module_hourly (hour_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel,
+       SUM(CASE WHEN action = 'loaded' THEN 1 ELSE 0 END)
+FROM module_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel)";
+        }
+        if (target_suffix == "daily") {
+            return R"(INSERT INTO module_daily (day_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel,
+       SUM(load_count)
+FROM module_hourly
+WHERE hour_ts >= ? AND hour_ts < ?
+GROUP BY (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel)";
+        }
+        if (target_suffix == "monthly") {
+            return R"(INSERT INTO module_monthly (month_ts, module_name, signer, signed_state, is_kernel, load_count)
+SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
+       module_name, signer, signed_state, is_kernel,
+       SUM(load_count)
+FROM module_daily
+WHERE day_ts >= ? AND day_ts < ?
+GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_state, is_kernel)";
         }
     }
 

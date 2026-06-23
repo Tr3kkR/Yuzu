@@ -237,3 +237,78 @@ TEST_CASE("parse_proc_uptime: rejects malformed / non-finite / negative",
     // A large-but-plausible uptime (~31 years, well under the 1e12 s ceiling) is kept.
     CHECK(parse_proc_uptime("999999999.0 1.0\n").has_value());
 }
+
+// ── /proc/diskstats → disk latency (perf.disk_latency_high) ──────────────────────
+
+TEST_CASE("diskstats: is_whole_disk includes physical disks, excludes partitions/virtual",
+          "[guardian][dex][linux][proc][diskstats]") {
+    CHECK(is_whole_disk("sda"));      // SATA/SCSI whole disk
+    CHECK(is_whole_disk("vda"));      // virtio
+    CHECK(is_whole_disk("xvdb"));     // Xen
+    CHECK(is_whole_disk("nvme0n1"));  // NVMe namespace = whole disk
+    CHECK(is_whole_disk("mmcblk0"));  // eMMC/SD whole disk
+    CHECK_FALSE(is_whole_disk("sda1"));      // partition (would double-count its parent)
+    CHECK_FALSE(is_whole_disk("nvme0n1p1")); // NVMe partition
+    CHECK_FALSE(is_whole_disk("mmcblk0p1")); // eMMC partition
+    CHECK_FALSE(is_whole_disk("loop0"));     // pseudo
+    CHECK_FALSE(is_whole_disk("ram0"));
+    CHECK_FALSE(is_whole_disk("zram0"));
+    CHECK_FALSE(is_whole_disk("sr0"));       // optical
+    CHECK_FALSE(is_whole_disk("dm-0"));      // LVM/crypt mapper (aggregates members)
+    CHECK_FALSE(is_whole_disk("md0"));       // software RAID (aggregates members)
+}
+
+TEST_CASE("diskstats: parse_diskstats sums whole disks only (real field layout)",
+          "[guardian][dex][linux][proc][diskstats]") {
+    // Real /proc/diskstats layout: major minor name reads rd_merged sectors_rd ms_read
+    // writes wr_merged sectors_wr ms_write … (the trailing discard/flush fields ignored).
+    // sda: reads=100 ms_read=500 writes=50 ms_write=250 → ios 150, time 750.
+    // nvme0n1: reads=200 ms_read=1000 writes=100 ms_write=600 → ios 300, time 1600.
+    // loop0 / sda1 / dm-0 are excluded.
+    const std::string ds =
+        "   7       0 loop0 15 0 42 10 0 0 0 0 0 10 10 0 0 0 0 0 0\n"
+        "   8       0 sda 100 0 2000 500 50 0 800 250 0 700 750 0 0 0 0 0 0\n"
+        "   8       1 sda1 90 0 1800 450 40 0 700 200 0 650 690 0 0 0 0 0 0\n"
+        " 259       0 nvme0n1 200 0 4000 1000 100 0 1600 600 0 1500 1600 0 0 0 0 0 0\n"
+        " 259       1 nvme0n1p1 10 0 20 5 5 0 8 3 0 8 8 0 0 0 0 0 0\n"
+        " 253       0 dm-0 999 0 9 9 999 0 9 9 0 9 9 0 0 0 0 0 0\n";
+    const DiskIoTotals t = parse_diskstats(ds);
+    REQUIRE(t.valid);
+    CHECK(t.ios == 450);      // 150 (sda) + 300 (nvme0n1)
+    CHECK(t.time_ms == 2350); // 750 (sda) + 1600 (nvme0n1)
+}
+
+TEST_CASE("diskstats: parse_diskstats with no whole disk is invalid (re-baseline, not 0)",
+          "[guardian][dex][linux][proc][diskstats]") {
+    CHECK_FALSE(parse_diskstats("   7  0 loop0 1 0 2 3 0 0 0 0 0 3 3 0 0 0 0 0 0\n").valid);
+    CHECK_FALSE(parse_diskstats("").valid);
+}
+
+TEST_CASE("diskstats: a short row (<11 fields) is skipped, not parsed",
+          "[guardian][dex][linux][proc][diskstats]") {
+    // A truncated/garbage line must never index past the available tokens. A whole-disk
+    // row with fewer than the 11 base fields is skipped; a valid full row in the same
+    // file is still summed (the short row must not poison the aggregate).
+    const std::string ds =
+        "   8   0 sda 100\n"                                  // truncated sda → skipped
+        "   8   0 sda 100 0 2000 500 50 0 800 250 0 700 750\n" // full sda → counted
+        "   8   1 sdb garbage x y z\n";                        // non-numeric short → skipped
+    const DiskIoTotals t = parse_diskstats(ds);
+    REQUIRE(t.valid);
+    CHECK(t.ios == 150);      // only the full sda row (100 reads + 50 writes)
+    CHECK(t.time_ms == 750);  // 500 ms_read + 250 ms_write
+}
+
+TEST_CASE("diskstats: disk_await_ms is ms-per-IO over the interval",
+          "[guardian][dex][linux][proc][diskstats]") {
+    const DiskIoTotals prev{true, 450, 2350};
+    // +100 IOs took +2000 ms → 20 ms/IO (a slow disk: above the 15 ms exit, below 25 enter).
+    CHECK_THAT(disk_await_ms(prev, DiskIoTotals{true, 550, 4350}).value(), WithinAbs(20.0, 1e-9));
+    // No I/O this interval → 0 ms (idle disk is healthy, not slow).
+    CHECK_THAT(disk_await_ms(prev, DiskIoTotals{true, 450, 2350}).value(), WithinAbs(0.0, 1e-9));
+    // Counter regression (reboot / hotplug) → nullopt (re-baseline, never a garbage rate).
+    CHECK_FALSE(disk_await_ms(prev, DiskIoTotals{true, 400, 2000}).has_value());
+    // An invalid reading on either side → nullopt.
+    CHECK_FALSE(disk_await_ms(DiskIoTotals{}, DiskIoTotals{true, 550, 4350}).has_value());
+    CHECK_FALSE(disk_await_ms(prev, DiskIoTotals{}).has_value());
+}

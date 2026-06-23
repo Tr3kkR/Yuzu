@@ -192,3 +192,27 @@ TEST_CASE("perf: DDL declares the perf tables with numeric defaults", "[tar][per
     // REAL columns must default 0, not '' (generator fix shipped with A1).
     CHECK(ddl.find("cpu_pct REAL NOT NULL DEFAULT 0") != std::string::npos);
 }
+
+TEST_CASE("perf #538: a reset baseline (post-disable) emits no off-period-spanning row",
+          "[tar][perf][source-lifecycle]") {
+    // When `perf` is disabled, do_collect_perf's disable branch installs a
+    // default-constructed PerfCounters as prev_perf_ (valid=false). This models
+    // the first tick AFTER a re-enable: even though the live counters advanced a
+    // lot during the paused window, deriving against the reset baseline must
+    // produce NO sample (it re-baselines), so the first post-re-enable row never
+    // covers the off-period. Without the reset, prev_perf_ would still hold the
+    // pre-disable reading and this same call would emit a delta spanning the gap.
+    PerfCounters after_gap = baseline();
+    after_gap.ts_epoch = 100'000;             // long pause elapsed
+    after_gap.cpu_idle += 50'000'000'000;     // counters advanced across the gap
+    after_gap.cpu_kernel += 80'000'000'000;
+    after_gap.cpu_user += 30'000'000'000;
+    after_gap.disk_read_bytes += 9'000'000'000;
+    after_gap.net_rx_bytes += 9'000'000'000;
+
+    // The disable branch's reset == a default-constructed prev → no row.
+    CHECK(!derive_sample(PerfCounters{}, after_gap).valid);
+    // Sanity: against the real pre-gap baseline it WOULD have emitted a row —
+    // exactly the off-period leak the reset prevents.
+    CHECK(derive_sample(baseline(), after_gap).valid);
+}

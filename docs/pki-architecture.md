@@ -181,7 +181,7 @@ source:
 |---|---|---|
 | gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
 | agent → gateway (:50051) | **one-way TLS (PR5c; live-wired in PR5b)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod`; distributing the CA to agents + the deployed-compose wiring land in PR5b (the shipped composes are still plaintext until then). Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
-| operator → gateway mgmt (:50063) | **plaintext / strict mTLS** | The privileged operator/command plane. Do NOT one-way-TLS it (would be encrypted-but-unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (the patched grpcbox's defaults — omit `verify`/`fail_if_no_peer_cert`); the server's command client presents a cert, so mTLS works here with no bootstrap problem. |
+| server → gateway mgmt (:50063) | **strict mutual TLS (#1314)** | The privileged command-fan-out plane. The reference-gateway topology now ships it as **strict mTLS**: the gateway mgmt listener requires a CA-issued client cert (the patched grpcbox's `verify_peer`+`fail_if_no_peer_cert` defaults), and the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). A container with no CA-issued cert — including a compromised agent — is rejected at the TLS layer, instead of the previous plaintext+unauthenticated plane. **Residual (#1314 M-1):** `verify_peer` authenticates to the **CA, not to the server's identity**, so *any* holder of *any* CA-issued cert passes — not only an enrolled agent's per-agent leaf, but also another agent's stolen leaf+key, or the `default-server`/`default-gateway` leaves. A compromised enrolled agent that extracts its own cert+key from its data dir can therefore still reach the mgmt plane. Pinning the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) is the cryptographic-identity-binding follow-up (QUIC-era, like the agent edge). A plaintext stack (`--no-tls`) keeps it insecure and must stay on a trusted network. |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
 > network.** The gateway is the command fan-out plane: it pushes
@@ -379,6 +379,62 @@ wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
 `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses the
 internal CA entirely for that surface — supported, unchanged, independent of CA
 mode. ACME and a configurable RSA key algorithm remain explicitly out of scope.
+
+## Secure-by-default deployment (PKI #1289)
+
+The PR2 engine generates the CA + leaves on first boot, but the **shipped Docker
+images** historically baked `--no-tls`/`--no-https` into their default CMD, so a
+container off the published image was plaintext. #1289 flips that: the
+`yuzu-server(-chisel)` and `yuzu-agent(-chisel)` images drop those flags, so a
+container is encrypted + mutually authenticated with zero configuration —
+dashboard over **HTTPS:8443** (8080 → HTTP→HTTPS redirect), agent/management/
+gateway listeners over (m)TLS. Demo/UAT/test composes keep `--no-tls`
+deliberately; native installs (deb/systemd, the Windows installer's opt-in
+disable checkbox) were already secure-by-default.
+
+**Agent CA auto-discovery.** The agent connects over TLS by default. With no
+`--ca-cert` it checks the standard install-CA path
+(`/etc/yuzu/certs/default-ca.pem`, or the Windows ProgramData path) **before**
+grpc falls back to the system trust store — a Yuzu self-signed CA is not in the
+system roots, so without this an agent pointed at a default-cert server silently
+fails the handshake.
+
+**Fail-closed when no CA can be pinned (#1303).** If neither an explicit `--ca-cert`
+nor a discovered install CA is present, the agent **refuses to start** (logs the
+remediation and exits non-zero) rather than connecting against the system trust
+store — which does *not* trust a Yuzu self-signed install CA, so with the gateway
+one-way-TLS edge live an empty root set is a fail-open MITM window on the command
+fan-out plane. The deliberate escape hatch is **`--tls-system-roots` /
+`YUZU_TLS_SYSTEM_ROOTS`** (value-aware: `1/true/yes/on` enables, anything else incl.
+unset/`0` disables), for the case where the server leaf chains to a public/corporate
+CA already in the system store; it logs a loud warning and is never the default.
+`--no-tls` remains the dev/demo opt-out.
+
+**Cross-container cert sharing — `--cert-group`.** A multi-container deploy
+(server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids but
+shares ONE `/etc/yuzu/certs` volume. The server creates that dir `0700` and each
+leaf key `0600` owned by itself, so a different-uid sibling can neither traverse
+the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
+**`--cert-group <name|gid>`** flag (`YUZU_CERT_GROUP`) fixes this at cert-gen
+time: it chgrp's the cert dir (`0750`) and **only** `default-gateway.key`
+(`0640`) to a shared group — the FIXED gid 2000 `yuzu-pki` group baked into all
+three images, of which each image's user is a member. The CA key, server key,
+and HTTPS key stay `0600` owner-only — never group-shared; the CA + leaf certs
+are public `0644`. Empty (the default, single-host) keeps the tight 0700/0600
+posture. POSIX-only (Windows uses ACLs). This is `apply_cert_group_share()` in
+`default_certs.cpp`, applied on both the generate and idempotent-restart paths.
+
+**Gateway TLS config** still comes from the grpcbox block (`{grpcbox,
+client|servers}`), which grpcbox reads itself — the `YUZU_GW_*` env vars do NOT
+drive it (#1291). The secure reference mounts a TLS `sys.config`
+(`reference-gateway-sys.config`: upstream mutual TLS to the `server` service,
+one-way TLS agent listener). `--cert-san dns:gateway dns:server` puts the service
+names on the default leaves so SNI verification succeeds across the hops.
+
+**Reference composes:** `deploy/docker/docker-compose.reference.yml` (single
+server, HTTPS + persistent CA volume) and
+`deploy/docker/docker-compose.reference-gateway.yml` (server + gateway + agent,
+the full mTLS topology with `--cert-group` + the mounted gateway sys.config).
 
 ## Key custody + threat model
 

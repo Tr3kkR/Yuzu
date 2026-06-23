@@ -2,8 +2,8 @@
 # Yuzu CI entrypoint — run configure + build + test matching ci.yml
 #
 # Usage:
-#   ci-entrypoint.sh gcc-13 debug     # GCC 13 debug build
-#   ci-entrypoint.sh clang-18 release # Clang 18 release build
+#   ci-entrypoint.sh gcc-15 debug     # GCC 15 debug build
+#   ci-entrypoint.sh clang-21 release # Clang 21 release build
 #   ci-entrypoint.sh bash             # interactive shell
 
 set -euo pipefail
@@ -13,7 +13,7 @@ if [[ "${1:-}" == "bash" || "${1:-}" == "sh" ]]; then
     exec "$@"
 fi
 
-COMPILER="${1:-gcc-13}"
+COMPILER="${1:-gcc-15}"
 BUILD_TYPE="${2:-debug}"
 
 echo "════════════════════════════════════════════════════════"
@@ -37,18 +37,18 @@ cp -r /opt/vcpkg_installed ./vcpkg_installed
 
 # ── Set compiler ─────────────────────────────────────────────────────────
 case "$COMPILER" in
-    gcc-13)
-        export CC="ccache gcc-13"
-        export CXX="ccache g++-13"
-        NATIVE_FILE="meson/native/linux-gcc13.ini"
+    gcc-15)
+        export CC="ccache gcc-15"
+        export CXX="ccache g++-15"
+        NATIVE_FILE="meson/native/linux-gcc15.ini"
         ;;
-    clang-18)
-        export CC="ccache clang-18"
-        export CXX="ccache clang++-18"
-        NATIVE_FILE="meson/native/linux-clang18.ini"
+    clang-21)
+        export CC="ccache clang-21"
+        export CXX="ccache clang++-21"
+        NATIVE_FILE="meson/native/linux-clang21.ini"
         ;;
     *)
-        echo "Unknown compiler: $COMPILER (use gcc-13 or clang-18)"
+        echo "Unknown compiler: $COMPILER (use gcc-15 or clang-21)"
         exit 1
         ;;
 esac

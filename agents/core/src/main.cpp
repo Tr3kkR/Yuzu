@@ -12,6 +12,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
@@ -84,6 +85,18 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA certificate for server verification")
         ->envname("YUZU_CA_CERT");
+    // NOTE: no ->envname() here — CLI11 binds an env var as PRESENT/ABSENT and ignores
+    // its value, so YUZU_TLS_SYSTEM_ROOTS=0 would still ENABLE the fallback (#1303 — a
+    // footgun for a security flag). The env var is handled value-aware below (env_truthy),
+    // seeded before parse so this CLI flag still wins (it can only ever opt IN, the secure
+    // direction).
+    app.add_flag("--tls-system-roots",
+                 "Allow TLS verification against the SYSTEM trust store when no CA is pinned "
+                 "(no --ca-cert and no install CA found). Use ONLY when the server certificate "
+                 "chains to a public/corporate CA already in the system store — otherwise the "
+                 "agent fails closed (#1303). Env: YUZU_TLS_SYSTEM_ROOTS=1/true/yes/on enables; "
+                 "0/false/no/off/unset disables.")
+        ->each([&cfg](const std::string&) { cfg.tls_allow_system_trust = true; });
     app.add_option("--client-cert", cfg.tls_client_cert, "PEM client certificate for mTLS")
         ->envname("YUZU_CLIENT_CERT");
     app.add_option("--client-key", cfg.tls_client_key, "PEM client private key for mTLS")
@@ -158,6 +171,12 @@ int main(int argc, char* argv[]) {
     bool remove_service = false;
     app.add_flag("--install-service", install_service, "Install as Windows service and exit");
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
+
+    // #1303: seed the security fallback from a VALUE-AWARE env var BEFORE parse so a
+    // passed --tls-system-roots CLI flag still wins (it only opts in). Without this,
+    // CLI11's presence-only envname would treat YUZU_TLS_SYSTEM_ROOTS=0 as "enabled" and
+    // silently re-open the fail-open posture the operator believes is off.
+    cfg.tls_allow_system_trust = yuzu::agent::env_truthy(std::getenv("YUZU_TLS_SYSTEM_ROOTS"));
 
     CLI11_PARSE(app, argc, argv);
 
@@ -269,6 +288,12 @@ int main(int argc, char* argv[]) {
     auto agent = yuzu::agent::Agent::create(std::move(cfg));
     g_agent.store(agent.get(), std::memory_order_release);
     agent->run();
+
+    // #1303: a fatal STARTUP failure (e.g. the fail-closed TLS posture refused to
+    // connect with no pinnable CA) must surface as a non-zero exit so systemd
+    // Restart= / Docker / Windows SCM react, instead of a silent EXIT_SUCCESS.
+    if (agent->startup_failed())
+        return EXIT_FAILURE;
 
     return EXIT_SUCCESS;
 }

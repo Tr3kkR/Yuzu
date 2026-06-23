@@ -364,3 +364,40 @@ no decryption oracle to external callers, KEK zeroization inside the provider, z
 return types for secret-returning store methods, checked `RAND_bytes`. LOW: purge-overwrite
 honesty note. (His other MEDIUMs — canonical AAD encoding, universal fail-closed — were
 already fixed in the governance amendment round, which his review predates.)
+
+## Amendment — implementation deltas (#1320 PR 4, PR #1396, 2026-06-12)
+
+The first implementation PR ships the mechanism as specified, with four recorded
+deltas (none weakens a normative rule):
+
+1. **The seam is its own interface.** The six KEK methods live on a separate
+   `KekProvider` interface rather than growing `KeyProvider` (interface
+   segregation): the raw-PEM CA/TLS custody contract and the wrap/unwrap secrets
+   contract are disjoint, and the realistic split deployment — KMS/PKCS#11 for
+   secrets, file for the CA root — needs them separable. `FileKeyProvider`
+   implements both; `SecretCodec` takes a `KekProvider&`.
+2. **`resolve_kek(key_id) → optional<key_ref>` is a fifth seam method** (plus a
+   sixth, `delete_kek`, whose only sanctioned caller is
+   `SecretCodec::retire_kek`). Boot verification needs it: `kek_meta` records
+   versions + check values only — never refs — so the codec re-derives each
+   version's opaque ref through the provider (file path / PKCS#11 `CKA_LABEL` /
+   KMS alias). Any future provider must implement it.
+3. **Per-value codec errors are typed**, `std::expected<T, SecretCodec::Error>`
+   with a `FailureClass` enum (`tag_mismatch`/`kek_unresolvable`/
+   `malformed_blob`/`crypto_failure`) instead of the `std::string` this ADR
+   sketched — the enum is load-bearing for the metric label and makes the
+   collapse-to-generic-"unavailable" rule mechanically checkable. Boot errors
+   are likewise typed (`InitError::Kind`, adding the distinct
+   `kek_unresolvable`/`kek_corrupt` operator tokens). Lifecycle operations keep
+   `std::string` (the `PgMigrationRunner` convention).
+4. **`kek_meta` carries `kcv_alg` (default `'sha256'`)** so versions minted by a
+   future non-exportable provider, whose check values derive differently, can
+   coexist with file-provider versions across a provider swap.
+
+One forward rule for the per-store migration ADRs, recorded here so four stores
+don't invent it divergently: because the AAD binds the row PK, **serial-PK
+tables must allocate the key before encrypting** (`nextval('<seq>')` first,
+then INSERT the encrypted blob with that id) — never INSERT-then-UPDATE, which
+would transiently write a non-blob value to a secret column in violation of
+§Decision 4. The wiring PRs should also share ONE `Error → A4-envelope`
+mapping helper, not per-store ad hoc collapses.

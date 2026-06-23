@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -366,6 +367,10 @@ public:
     std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
                                                            const std::string& since = "",
                                                            int limit = 100) const;
+    // Per-device obs_type rollup — the per-device analog of dex_signal_summary
+    // (one GROUP BY pass, indexed by agent_id). Drives the per-device DEX score.
+    std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
+                                                          const std::string& since = "") const;
 
     // ── Overview aggregations (read-only GROUP BY; no event materialisation) ──
     // Each takes an ISO-8601 `since` cutoff (empty = all retained events) and
@@ -380,6 +385,20 @@ public:
     // visible. Pass a `rule_id` to get just that Guard's per-device rows (the Slice C
     // drill-down, served by idx_gars_rule); empty = the whole fleet. Read-only.
     std::vector<GuardianAgentRuleStatus> agent_rule_statuses(const std::string& rule_id = "") const;
+
+    // One agent's current per-rule compliance verdicts (every rule it has reported
+    // on) — the per-agent analog of agent_rule_statuses(rule_id), read via the
+    // (agent_id, rule_id) PK index. Backs the baseline-anchored per-device status
+    // REST view; the caller intersects the returned rule_ids with a Baseline's
+    // deployed members. Read-only (last-reported state, not a live probe).
+    std::vector<GuardianAgentRuleStatus>
+    agent_rule_statuses_for_agent(const std::string& agent_id) const;
+
+    // rule_id -> name for the whole catalogue, reading ONLY the two small columns
+    // (not yaml_source / spec_json / signature blobs that list_rules() materializes).
+    // For per-request name resolution on read paths like the baseline-anchored
+    // per-device status route, where the full rule body is never needed.
+    std::unordered_map<std::string, std::string> rule_names() const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;

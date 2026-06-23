@@ -95,42 +95,84 @@ bool rollup_tier(TarDatabase& db, std::string_view source_name,
 int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     int ops = 0;
 
-    struct RollupStep { std::string_view source; std::string_view target; };
-    static const RollupStep steps[] = {
-        {"process", "hourly"},
-        {"process", "daily"},
-        {"process", "monthly"},
-        {"tcp", "hourly"},
-        {"tcp", "daily"},
-        {"tcp", "monthly"},
-        {"service", "hourly"},
-        {"user", "daily"},
-        {"perf", "hourly"},
-        {"procperf", "hourly"},
-    };
-
-    for (const auto& step : steps) {
-        if (rollup_tier(db, step.source, step.target, now_epoch))
-            ++ops;
+    // Data-driven over the registry — symmetric with run_retention() below, which
+    // also walks capture_sources(). Every source's non-live granularities roll up
+    // in declaration order (hourly → daily → monthly), so the Live→Hourly→Daily→
+    // Monthly chain runs in dependency order within a tick (daily reads hourly,
+    // monthly reads daily). rollup_tier() is a no-op when the (source, tier) pair
+    // has no rollup_sql, so a source that lacks a tier — or has none, e.g. the
+    // single-tier netqual — is skipped automatically. This replaces a
+    // hand-maintained steps[] array that silently omitted any newly-registered
+    // source: the $Module rollup SQL was dead until this loop (governance UP-1).
+    for (const auto& src : capture_sources()) {
+        for (const auto& g : src.granularities) {
+            if (g.suffix == "live")
+                continue;
+            if (rollup_tier(db, src.name, g.suffix, now_epoch))
+                ++ops;
+        }
     }
 
     return ops;
 }
 
-void apply_source_enabled_transition(TarDatabase& db,
+bool apply_source_enabled_transition(TarDatabase& db,
                                       std::string_view source,
                                       std::string_view new_value,
                                       int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
-    std::string prev = db.get_config(enabled_key, "true");
-    db.set_config(enabled_key, std::string{new_value});
-
+    // Default `prev` to the source's declared default so the first-ever set on a
+    // fresh DB is only a transition when it differs from that default. For an
+    // opt-in source (module/procperf/netqual, default false) the first
+    // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
+    // does not write a spurious paused_at. The `_enabled` flag itself is written
+    // below (in-branch), not here, so the #538 fail-safe ordering holds: on a
+    // disable the flag flips only after the baseline clear persists.
+    const char* prev_def = source_default_enabled(source) ? "true" : "false";
+    std::string prev = db.get_config(enabled_key, prev_def);
     auto paused_at_key = std::format("{}_paused_at", source);
+
     if (new_value == "false" && prev != "false") {
+        // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
+        // `_enabled` flag only if the clear actually persisted. `set_state` can
+        // fail silently (SQLITE_BUSY / disk full); if we flipped the flag first
+        // and the clear then failed, we'd have a DISABLED source with a STALE
+        // baseline — and a later re-enable would emit exactly the ghost "stopped"
+        // events this fix exists to prevent, while the operator saw success.
+        // Clearing first makes the disable fail-safe: a failed clear leaves the
+        // source ENABLED (its baseline still valid, collection continues) and we
+        // report failure so the operator can retry. No-op for sources without a
+        // snapshot-diff baseline (perf/procperf/netqual). The caller serialises
+        // this whole call against the collectors via collect_mu_ (see do_configure).
+        if (auto key = diff_state_key(source); !key.empty()) {
+            if (!db.set_state(std::string{key}, ""))
+                return false; // baseline NOT cleared → do not disable
+        }
+        db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
-    } else if (new_value == "true" && prev == "false") {
+        return true;
+    }
+
+    // All other transitions (idempotent set, disable→enable, first-ever set):
+    // no baseline clear, so the flag write cannot leave inconsistent state.
+    db.set_config(enabled_key, std::string{new_value});
+    if (new_value == "true" && prev == "false") {
         db.set_config(paused_at_key, "0");
     }
+    return true;
+}
+
+std::string_view diff_state_key(std::string_view source) {
+    // Mapping is NOT 1:1 with the source name: tcp's baseline lives under
+    // "network" (historical). Keep this the ONE home for the mapping — the
+    // collectors (collect_fast/slow) and apply_source_enabled_transition both
+    // route through here so the on-disable clear can never target the wrong key.
+    if (source == "process") return "process";
+    if (source == "tcp")     return "network";
+    if (source == "service") return "service";
+    if (source == "user")    return "user";
+    // perf/procperf keep an in-memory previous reading; netqual is stateless.
+    return {};
 }
 
 void run_retention(TarDatabase& db, int64_t now_epoch) {
@@ -144,7 +186,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
         auto enabled_key = std::format("{}_enabled", src.name);
-        if (db.get_config(enabled_key, "true") == "false")
+        if (db.get_config(enabled_key, src.default_enabled ? "true" : "false") == "false")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);

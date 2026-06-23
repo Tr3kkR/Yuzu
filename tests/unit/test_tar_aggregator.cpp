@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <format>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -157,7 +158,7 @@ TEST_CASE("TAR paused_at: enabled→disabled writes the timestamp",
     REQUIRE(db.get_config("process_paused_at", "0") == "0");
 
     const int64_t t_now = 1'735'689'600;
-    apply_source_enabled_transition(db, "process", "false", t_now);
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", t_now));
 
     CHECK(db.get_config("process_enabled", "true") == "false");
     CHECK(db.get_config("process_paused_at", "0") ==
@@ -176,10 +177,10 @@ TEST_CASE("TAR paused_at: disabled→enabled clears the timestamp to \"0\"",
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
-    apply_source_enabled_transition(db, "tcp", "false", 1'735'689'600);
+    REQUIRE(apply_source_enabled_transition(db, "tcp", "false", 1'735'689'600));
     REQUIRE(db.get_config("tcp_paused_at", "0") == "1735689600");
 
-    apply_source_enabled_transition(db, "tcp", "true", 1'735'700'000);
+    REQUIRE(apply_source_enabled_transition(db, "tcp", "true", 1'735'700'000));
 
     CHECK(db.get_config("tcp_enabled", "true") == "true");
     CHECK(db.get_config("tcp_paused_at", "0") == "0");
@@ -197,10 +198,10 @@ TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
-    apply_source_enabled_transition(db, "service", "false", 1'735'689'600);
+    REQUIRE(apply_source_enabled_transition(db, "service", "false", 1'735'689'600));
     REQUIRE(db.get_config("service_paused_at", "0") == "1735689600");
 
-    apply_source_enabled_transition(db, "service", "false", 1'735'700'000);
+    REQUIRE(apply_source_enabled_transition(db, "service", "false", 1'735'700'000));
 
     CHECK(db.get_config("service_paused_at", "0") == "1735689600");
 }
@@ -215,12 +216,226 @@ TEST_CASE("TAR paused_at: per-source isolation",
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
-    apply_source_enabled_transition(db, "process", "false", 1'735'689'600);
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
 
     CHECK(db.get_config("process_paused_at", "0") == "1735689600");
     CHECK(db.get_config("tcp_paused_at", "0") == "0");
     CHECK(db.get_config("service_paused_at", "0") == "0");
     CHECK(db.get_config("user_paused_at", "0") == "0");
+}
+
+// ── #538: enabled→disabled clears the snapshot-diff baseline ──────────────
+// The lock that serialises this against the collectors lives in the plugin
+// (collect_mu_, do_configure) and is not unit-testable here; what IS
+// deterministically verifiable — and what fails on pre-fix code — is that the
+// transition wipes the diff baseline (so a later re-enable starts clean instead
+// of emitting ghost "stopped" events) AND that it wipes the CORRECT key
+// (tcp→"network", the easy-to-get-wrong mapping).
+
+TEST_CASE("TAR #538: enabled→disabled clears the diff baseline state",
+          "[tar][paused_at][issue538]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-clear-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // Seed a non-empty process baseline (as a live collect cycle would).
+    REQUIRE(db.set_state("process", R"([{"pid":1,"name":"init"}])"));
+    REQUIRE_FALSE(db.get_state("process").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+
+    CHECK(db.get_config("process_enabled", "true") == "false");
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");
+    // The baseline is gone — re-enable will rebuild from a clean snapshot.
+    CHECK(db.get_state("process").empty());
+}
+
+TEST_CASE("TAR #538: disabling tcp clears the 'network' baseline key, not 'tcp'",
+          "[tar][paused_at][issue538]") {
+    // tcp's snapshot-diff baseline lives under "network" (diff_state_key). A
+    // clear that targeted the literal source name "tcp" would be a silent no-op
+    // and the ghost-death bug would survive — pin the mapping here.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-tcpmap-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("network", R"([{"laddr":"0.0.0.0:22"}])"));
+    REQUIRE_FALSE(db.get_state("network").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "tcp", "false", 1'735'689'600));
+
+    CHECK(db.get_state("network").empty());
+}
+
+TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
+          "[tar][paused_at][issue538]") {
+    struct Case { const char* source; const char* state_key; };
+    const Case cases[] = {{"process", "process"}, {"tcp", "network"},
+                          {"service", "service"}, {"user", "user"}};
+
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-parity-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    for (const auto& c : cases) {
+        // Distinct {source,state_key} per row and a fresh source each iteration,
+        // so a single shared db is safe (no _enabled carry-over between rows).
+        REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
+        REQUIRE_FALSE(db.get_state(c.state_key).empty());
+
+        REQUIRE(apply_source_enabled_transition(db, c.source, "false", 1'735'689'600));
+
+        CHECK(db.get_state(c.state_key).empty());
+    }
+}
+
+TEST_CASE("TAR #538: disabling one source does not clear another's baseline",
+          "[tar][paused_at][issue538]") {
+    // Cross-source isolation: a regression that cleared ALL keys instead of the
+    // targeted one would still pass the per-source parity test above. Seed all
+    // four side-by-side, disable one, assert only its key is wiped.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-xsrc-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(db.set_state("network", R"([{"laddr":"0.0.0.0:22"}])"));
+    REQUIRE(db.set_state("service", R"([{"name":"sshd"}])"));
+    REQUIRE(db.set_state("user", R"([{"name":"root"}])"));
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+
+    CHECK(db.get_state("process").empty());          // targeted source cleared
+    CHECK_FALSE(db.get_state("network").empty());    // others untouched
+    CHECK_FALSE(db.get_state("service").empty());
+    CHECK_FALSE(db.get_state("user").empty());
+}
+
+TEST_CASE("TAR #538: a failed baseline clear leaves the source ENABLED (UP-1)",
+          "[tar][paused_at][issue538]") {
+    // Fail-safe ordering: if the baseline clear cannot persist, the disable must
+    // NOT take effect — otherwise we'd have a disabled source with a stale
+    // baseline, which reintroduces ghost "stopped" events on re-enable while the
+    // operator saw success. Inject a clear failure by dropping tar_state so the
+    // set_state INSERT prepare fails.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-clearfail-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    db.execute_sql("DROP TABLE tar_state");
+
+    // The disable must report failure and leave the flag enabled.
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+    CHECK(db.get_config("process_enabled", "true") == "true"); // still enabled
+    CHECK(db.get_config("process_paused_at", "0") == "0");      // never paused
+}
+
+TEST_CASE("TAR #538: only the enable→disable TRANSITION clears (idempotent)",
+          "[tar][paused_at][issue538]") {
+    // The clear must fire on the transition, not on every false-write — a
+    // repeated `configure ..._enabled=false` after a re-seed must NOT wipe a
+    // freshly-rebuilt baseline (that would re-introduce the race by another door).
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-idem-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600)); // clears
+    REQUIRE(db.get_state("process").empty());
+
+    // Something re-seeds the baseline; a second false-write is NOT a transition.
+    REQUIRE(db.set_state("process", R"([{"pid":2}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'700'000));
+
+    CHECK_FALSE(db.get_state("process").empty());                   // untouched
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600"); // not advanced
+}
+
+TEST_CASE("TAR #538: re-enable neither clears nor resurrects the baseline",
+          "[tar][paused_at][issue538]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-reenable-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600)); // clears
+    REQUIRE(db.get_state("process").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+
+    CHECK(db.get_config("process_enabled", "true") == "true");
+    CHECK(db.get_config("process_paused_at", "0") == "0");
+    CHECK(db.get_state("process").empty()); // clean baseline preserved
+}
+
+TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth",
+          "[tar][issue538]") {
+    CHECK(diff_state_key("process") == "process");
+    CHECK(diff_state_key("tcp") == "network"); // NOT "tcp"
+    CHECK(diff_state_key("service") == "service");
+    CHECK(diff_state_key("user") == "user");
+    // No snapshot-diff baseline: disabling these is a state no-op.
+    CHECK(diff_state_key("perf").empty());
+    CHECK(diff_state_key("procperf").empty());
+    CHECK(diff_state_key("netqual").empty());
+    CHECK(diff_state_key("nonsense").empty());
+}
+
+TEST_CASE("TAR #538: every registered capture source is classified by diff_state_key",
+          "[tar][issue538]") {
+    // Drift guard: diff_state_key and capture_sources() are independent lists.
+    // If someone adds a 5th snapshot-diff source to the registry but forgets to
+    // map it here, diff_state_key would return empty → the disable-clear becomes
+    // a silent no-op and #538 silently regresses for the new source. Pin every
+    // registered source to an explicit classification so a new one fails loudly.
+    const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user"};
+    // module is a stream-drained source (EventRing, like the process ETW/ES
+    // stream) with no snapshot-diff baseline, so diff_state_key("module") is
+    // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
+    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module"};
+
+    for (const auto& src : capture_sources()) {
+        const bool is_diff = diff_sources.contains(src.name);
+        const bool is_non_diff = non_diff_sources.contains(src.name);
+        INFO("source: " << src.name);
+        // Every registered source must be explicitly classified as one or the
+        // other — a brand-new source matches neither set and fails here.
+        CHECK(is_diff != is_non_diff);
+        // …and diff_state_key must agree with that classification.
+        CHECK(diff_state_key(src.name).empty() == is_non_diff);
+    }
+}
+
+TEST_CASE("TAR #538: disabling perf/procperf does not touch any baseline state",
+          "[tar][paused_at][issue538]") {
+    // perf/procperf keep an in-memory previous reading (out of scope for #538);
+    // the transition must not error and must leave the state store untouched.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-perf-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])")); // unrelated baseline must survive
+    REQUIRE(apply_source_enabled_transition(db, "perf", "false", 1'735'689'600));
+    REQUIRE(apply_source_enabled_transition(db, "procperf", "false", 1'735'689'600));
+
+    CHECK(db.get_config("perf_enabled", "true") == "false");
+    CHECK_FALSE(db.get_state("process").empty());
 }
 
 TEST_CASE("TAR retention: disabling one source does not pause others",
@@ -247,4 +462,94 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     auto tcp_remaining = row_count(db, "tcp_hourly");
     CHECK(tcp_remaining > 0);                       // enabled, partially aged
     CHECK(tcp_remaining < 48);
+}
+
+// ── $Module rollup wiring (M1 hardening — governance UP-1 / architect BLOCKING) ─
+
+TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
+          "[tar][module][rollup]") {
+    // run_aggregation is now data-driven over capture_sources(); this proves the
+    // $Module hourly rollup actually executes (the old hand-maintained steps[]
+    // array omitted it, so the registered rollup SQL was dead code) AND that
+    // load_count counts only the 'loaded' action — a 'blocked' BYOVD load stays
+    // full-fidelity in module_live but is excluded from the aggregate count.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-module-rollup-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (an hour boundary)
+    auto insert_module = [&](std::string_view action) {
+        REQUIRE(db.execute_sql(std::format(
+            "INSERT INTO module_live "
+            "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
+            "signed_state,signer,is_kernel) "
+            "VALUES ({}, 1, '{}', 100, 'app.exe', 'evil.dll', 'appdir', "
+            "'unsigned', '', 0)",
+            t0, action)));
+    };
+    insert_module("loaded");
+    insert_module("loaded");
+    insert_module("loaded");
+    // Every non-'loaded' action must be EXCLUDED from load_count while staying
+    // full-fidelity in module_live: a 'blocked' BYOVD load, a boot-gap 'seed',
+    // and an 'unloaded' event. They share evil.dll's GROUP-BY tuple (module_name,
+    // signer, signed_state, is_kernel), so they fold into the same hourly row —
+    // proving the rollup's `action='loaded'` predicate, not just row identity,
+    // is what filters them.
+    insert_module("blocked");
+    insert_module("seed");
+    insert_module("unloaded");
+
+    REQUIRE(row_count(db, "module_live") == 6);
+    REQUIRE(row_count(db, "module_hourly") == 0);
+
+    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
+
+    REQUIRE(row_count(db, "module_hourly") == 1);
+    auto res = db.execute_query("SELECT load_count FROM module_hourly");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'; blocked/seed/unloaded excluded
+}
+
+// ── Default-off opt-in sources (review R1 — module/procperf/netqual) ─────────
+
+TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition",
+          "[tar][module][paused_at][default-off]") {
+    // The required M1 fix: `module` (and procperf/netqual) default DISABLED on a
+    // fresh DB. apply_source_enabled_transition routes the `prev` default through
+    // CaptureSourceDef::default_enabled, so the first-ever `module_enabled=false`
+    // is NOT an enabled→disabled transition and must write NO paused_at — whereas
+    // the same call for the always-on `process` IS a real transition. This is the
+    // testable proxy for "tar.status reports module disabled while default-on
+    // sources stay enabled" (do_status itself reads the same default_enabled
+    // field but is not compiled into the unit-test exe).
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-off-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t_now = 1'735'689'600;
+
+    // Opt-in sources default false → first disable is idempotent, no paused_at.
+    for (const auto* src : {"module", "procperf", "netqual"}) {
+        INFO("opt-in source=" << src);
+        CHECK_FALSE(source_default_enabled(src));
+        apply_source_enabled_transition(db, src, "false", t_now);
+        CHECK(db.get_config(std::format("{}_paused_at", src), "0") == "0");
+    }
+
+    // An always-on source defaults true → first disable is a real transition.
+    CHECK(source_default_enabled("process"));
+    apply_source_enabled_transition(db, "process", "false", t_now);
+    CHECK(db.get_config("process_paused_at", "0") == std::to_string(t_now));
+
+    // And enabling an opt-in source IS a transition from its default-off state:
+    // it clears paused_at to "0" (present, not absent).
+    apply_source_enabled_transition(db, "module", "true", t_now + 100);
+    CHECK(db.get_config("module_enabled", "false") == "true");
+    CHECK(db.get_config("module_paused_at", "0") == "0");
 }
