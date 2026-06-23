@@ -14,10 +14,12 @@
 //      {name, type}. It is an UNDOCUMENTED dnsapi.dll export, so it is resolved
 //      at runtime via GetProcAddress (no import-lib dependency on it). If it
 //      cannot be resolved the collector degrades to an empty result.
-//   2. For each cached name+type, DnsQuery_W(..., DNS_QUERY_NO_WIRE_QUERY, ...)
-//      reads the record DATA + TTL from the cache ONLY — the NO_WIRE_QUERY flag
-//      guarantees we never issue a real DNS query (no network amplification, no
-//      privacy leak from the collector itself).
+//   2. For each cached name+type, DnsQuery_W with DNS_QUERY_NO_WIRE_QUERY (0x10)
+//      plus the undocumented cache-read flag 0x8000 reads the record DATA + TTL
+//      from the cache ONLY — NO_WIRE_QUERY guarantees we never issue a real DNS
+//      query (no network amplification, no privacy leak from the collector
+//      itself); 0x8000 is required to surface cached records on many Win10/11
+//      builds (see the call site for the muhdnscache rationale).
 // Linux (systemd-resolved / /etc/hosts) and macOS (dscacheutil) are kPlanned and
 // return an empty vector.
 
