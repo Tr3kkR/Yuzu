@@ -49,7 +49,7 @@
 // explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
-// Baseline-anchored per-device Guardian status route borrows the BaselineStore.
+// Name-anchored per-device Guardian status route borrows the BaselineStore.
 // Forward-declared (used only as a pointer in register_routes); the .cpp includes
 // baseline_store.hpp for the definition.
 class BaselineStore;
@@ -187,7 +187,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
-        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 
@@ -217,7 +217,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
-        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 };
