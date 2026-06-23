@@ -470,14 +470,15 @@ proposes.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier).
-2. The MCP server creates an **approval request** with status `pending`.
-3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
-   containing the approval ID and a `status_url` to poll.
+2. The MCP server **will** create an **approval request** with status `pending`.
+3. The server **will** return a JSON-RPC error with code `-32006`
+   (`ApprovalRequired`) carrying the approval ID and a `status_url` to poll.
+   *(Today this path returns `-32004` — see the callout above.)*
 4. The AI assistant can inform the operator that approval is needed.
 5. An administrator reviews the request via the dashboard or REST API
    (`GET /api/approvals`, `POST /api/approvals/{id}/approve`,
    `POST /api/approvals/{id}/reject`).
-6. Once approved, the operation can be retried.
+6. Once approved, the operation **will** be retriable.
 
 ### What requires approval
 

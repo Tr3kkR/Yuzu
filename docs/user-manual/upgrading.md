@@ -36,6 +36,22 @@ each key is `server`- (operator/API) or `agent`-sourced.
 via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
 the agent reports that the operator never set are unaffected.
 
+## Behaviour change: MCP approval-gated calls now return -32004, not -32006 (#1470)
+
+Supervised-tier MCP tokens that attempt an approval-gated operation now receive
+JSON-RPC error code `-32004` (`TierDenied`) instead of `-32006` (`ApprovalRequired`).
+The A4 contract reserves `-32006` for a response that carries a pollable `approval_id`
++ `status_url`; because approval re-dispatch (Phase 2) is not yet implemented,
+returning `-32006` would violate that contract. The operation is still denied and
+audited; the `error.data.remediation` field points to the REST API / dashboard
+approval workflow.
+
+**Who this affects:** any MCP client that explicitly matched on `-32006` to detect an
+approval-required state. After upgrade those handlers receive `-32004` instead; update
+the match to `-32004` and leave `-32006` reserved for the future Phase 2 envelope (see
+`docs/user-manual/mcp.md` → "-32004: Tier denied (including approval-gated operations)").
+`operator`-tier executions are auto-approved and are unaffected.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and
