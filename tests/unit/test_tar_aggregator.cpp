@@ -186,6 +186,38 @@ TEST_CASE("TAR paused_at: disabled→enabled clears the timestamp to \"0\"",
     CHECK(db.get_config("tcp_paused_at", "0") == "0");
 }
 
+TEST_CASE("TAR paused_at: recovering an errored source via =true clears the timestamp (#560)",
+          "[tar][paused_at][source-lifecycle]") {
+    // Regression for the fjarvis-review asymmetry: the disable leg fires on any
+    // non-"false" prev ("errored" included), but the re-enable leg used to reset
+    // paused_at ONLY on prev == "false". So recovering a corrupt/tampered source
+    // — `configure <src>_enabled=true` from an "errored" value — resumed
+    // collection yet left a stale non-zero paused_at, and `status` then reported
+    // enabled=true alongside a paused timestamp (dashboard renders a collecting
+    // source as paused). Both legs now gate on the canonical tri-state, so the
+    // recovery clears paused_at. Pre-fix this CHECK held the stale 1735689600.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-errored-reenable-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // 1) Pause the source for real → paused_at records the wall-clock now.
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+    REQUIRE(db.get_config("process_paused_at", "0") == "1735689600");
+
+    // 2) The on-disk _enabled value is then clobbered to a value the plugin
+    //    never writes (corruption / tampering) → canonicalises to "errored".
+    db.set_config("process_enabled", "maybe");
+    REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
+
+    // 3) Operator recovers the source: configure process_enabled=true.
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+
+    CHECK(db.get_config("process_enabled", "true") == "true");
+    CHECK(db.get_config("process_paused_at", "0") == "0");
+}
+
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
           "[tar][paused_at][pr-a]") {
     // If the operator submits configure with the same value the source
@@ -552,4 +584,45 @@ TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition"
     apply_source_enabled_transition(db, "module", "true", t_now + 100);
     CHECK(db.get_config("module_enabled", "false") == "true");
     CHECK(db.get_config("module_paused_at", "0") == "0");
+}
+
+TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
+          "[tar][retention][source-lifecycle]") {
+    // The collect-time gate (source_enabled) fails closed on a non-canonical
+    // _enabled value, mapping it to "errored". Retention MUST agree and preserve
+    // that source's rows — otherwise a tampered or bit-flipped value would stop
+    // collection (per the gate) yet still let run_retention prune the forensic
+    // window the operator believes is paused, the exact breach #560/#559 guard.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-retention-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    seed_tcp_hourly(db, t_now);
+
+    // A value the plugin never writes — canonical_source_enabled => "errored".
+    db.set_config("process_enabled", "maybe");
+    REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
+    // tcp_enabled left at default => "true" (actively, validly enabled).
+    run_retention(db, t_now);
+
+    CHECK(row_count(db, "process_hourly") == 48);   // errored => preserved, not pruned
+    auto tcp_remaining = row_count(db, "tcp_hourly");
+    CHECK(tcp_remaining > 0);                       // enabled => aged normally
+    CHECK(tcp_remaining < 48);
+}
+
+TEST_CASE("TAR canonical_source_enabled is a strict tri-state (#560)",
+          "[tar][source-lifecycle]") {
+    CHECK(canonical_source_enabled("true") == "true");
+    CHECK(canonical_source_enabled("false") == "false");
+    // Anything the plugin never writes is flagged, never coerced/guessed.
+    CHECK(canonical_source_enabled("FALSE") == "errored");
+    CHECK(canonical_source_enabled("0") == "errored");
+    CHECK(canonical_source_enabled(" false ") == "errored");
+    CHECK(canonical_source_enabled("yes") == "errored");
+    CHECK(canonical_source_enabled("") == "errored");
 }
