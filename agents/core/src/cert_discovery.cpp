@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -89,6 +90,45 @@ std::optional<DiscoveredCert> discover_client_cert() {
 #endif
 
     return std::nullopt;
+}
+
+namespace {
+
+bool is_nonempty_regular_file(const std::filesystem::path& p) {
+    std::error_code ec;
+    // Reject a symlink at the leaf (#1314 M-2, defense-in-depth): the trust anchor
+    // must be a real file. The shared cert volume is not agent-writable in the
+    // reference topology, but if it were ever loosened, a planted symlink to an
+    // attacker-controlled CA must not be silently adopted. symlink_status does NOT
+    // follow the link, so a symlinked default-ca.pem is treated as not-a-file.
+    auto link_status = std::filesystem::symlink_status(p, ec);
+    if (ec || std::filesystem::is_symlink(link_status) ||
+        !std::filesystem::is_regular_file(link_status))
+        return false;
+    auto size = std::filesystem::file_size(p, ec);
+    return !ec && size > 0;
+}
+
+} // anonymous namespace
+
+std::optional<std::filesystem::path>
+discover_install_ca_path(std::span<const std::filesystem::path> candidates) {
+    for (const auto& p : candidates) {
+        if (is_nonempty_regular_file(p))
+            return p;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> discover_install_ca_path() {
+    static const std::array<std::filesystem::path, 1> kInstallCaPaths = {{
+#ifdef _WIN32
+        std::filesystem::path{"C:/ProgramData/Yuzu/certs/default-ca.pem"},
+#else
+        std::filesystem::path{"/etc/yuzu/certs/default-ca.pem"},
+#endif
+    }};
+    return discover_install_ca_path(std::span<const std::filesystem::path>{kInstallCaPaths});
 }
 
 } // namespace yuzu::agent

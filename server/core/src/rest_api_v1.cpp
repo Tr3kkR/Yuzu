@@ -1,4 +1,7 @@
 #include "rest_api_v1.hpp"
+#include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
+#include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
+#include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -29,10 +32,13 @@
 #include <cstring>
 #include <ctime>
 #include <format>
+#include <memory>
+#include <random>
 #include <regex>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -344,7 +350,25 @@ const std::string& openapi_spec() {
           "drifted_rules": {"type": "integer"},
           "errored_rules": {"type": "integer"}
         }
-      },
+      },)json"
+        // Split literal: MSVC caps a single string literal at ~16 KB (C2026).
+        R"json(
+      "GuaranteedStateBaselineDeviceStatus": {
+        "type": "object",
+        "properties": {
+          "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
+          "deployed": {"type": "boolean", "description": "lifecycle == deployed; false => consumer shows 'No Baseline Deployed'"},
+          "agent_id": {"type": "string"},
+          "total_guards": {"type": "integer"},
+          "compliant": {"type": "integer"},
+          "drifted": {"type": "integer"},
+          "errored": {"type": "integer"},
+          "pending": {"type": "integer", "description": "deployed Guards with no recognized verdict for this device (not yet reported / offline / unsupported); equals total_guards - (compliant+drifted+errored)"},
+          "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null if none reported"},
+          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when pending"}}}}
+        }
+      },)json"
+        R"json(
       "GuaranteedStateEvent": {
         "type": "object",
         "properties": {
@@ -525,6 +549,14 @@ const std::string& openapi_spec() {
     },
     "/inventory/query": {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
+    },)json"
+        // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
+        R"json(
+    "/bundles": {
+      "post": {"summary": "Dispatch a live-query bundle: fan one instruction into up to 32 plugin actions on one device (ADR-0011)", "tags": ["Bundles"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id", "steps"], "properties": {"agent_id": {"type": "string", "description": "The single target device"}, "steps": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "required": ["plugin", "action"], "properties": {"plugin": {"type": "string"}, "action": {"type": "string"}, "params": {"type": "object", "additionalProperties": {"type": "string"}}}}}}}}}}, "responses": {"202": {"description": "Accepted; returns {bundle_id, agent_id, expected}. Poll GET /bundles/{id} to collate."}, "400": {"description": "Invalid JSON, missing/empty agent_id, missing/empty steps, >32 steps, unsafe identifier, or param size caps"}, "403": {"description": "Requires Execution:Execute"}, "500": {"description": "Authenticated session has no principal"}, "503": {"description": "Dispatch unavailable"}}}
+    },
+    "/bundles/{id}": {
+      "get": {"summary": "Collate a dispatched bundle", "tags": ["Bundles"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^bundle-[a-f0-9]+$"}}], "responses": {"200": {"description": "Server-grouped {complete, received, succeeded, expected, steps[]} in request order. complete is terminal, NOT success — check succeeded==expected. Invalid-UTF-8 bytes in step output are replaced with U+FFFD."}, "403": {"description": "Requires Response:Read"}, "404": {"description": "Not found, expired, or not owned (no enumeration oracle)"}, "503": {"description": "Service unavailable"}}}
     },
     "/users/{username}/unlock": {
       "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
@@ -586,6 +618,9 @@ const std::string& openapi_spec() {
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
+    "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
+      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
+    },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },
@@ -612,11 +647,14 @@ const std::string& openapi_spec() {
     "/dex/perf/cohorts": {
       "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
     },
+    "/dex/perf/cohort-diff": {
+      "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
+    },
     "/dex/perf/devices": {
       "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
     },
     "/network/fleet": {
-      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — the same numbers as the yuzu_fleet_net_* Prometheus gauges and the /network Overview cards. A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
     },
     "/network/devices": {
       "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
@@ -804,7 +842,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    LockoutClearFn lockout_clear_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -814,7 +852,8 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn), std::move(lockout_clear_fn));
+                    std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
+                    std::move(scoped_perm_fn));
 }
 
 void RestApiV1::register_routes(
@@ -830,7 +869,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    LockoutClearFn lockout_clear_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -871,6 +910,139 @@ void RestApiV1::register_routes(
         }
         res.set_content(ok_json(data.str()), "application/json");
     });
+
+    // ── Live-query bundle (/api/v1/bundles) — ADR-0011 ───────────────────
+    // One instruction → several plugin actions on ONE device → collated
+    // results, via server-side async fan-out. The agent is unchanged (it only
+    // sees ordinary commands). The same BundleOrchestrator backs the MCP tools
+    // (slice 3) — REST/MCP parity by construction. v1 manifest is in-memory;
+    // migrating it to a durable Postgres store is a committed follow-up for HA +
+    // assurance (ADR-0011 "Future — durable manifest in Postgres").
+    std::shared_ptr<BundleOrchestrator> bundle_orch;
+    if (command_dispatch_fn && response_store) {
+        bundle_orch = std::make_shared<BundleOrchestrator>(
+            command_dispatch_fn, response_store,
+            [] {
+                std::random_device rd;
+                const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(r));
+                return std::string(buf);
+            },
+            metrics_registry, /*surface=*/"rest");
+    }
+
+    // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
+    // GET /api/v1/bundles/{id} for the collated result.
+    sink.Post("/api/v1/bundles",
+              [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
+                                                        httplib::Response& res) {
+                  if (!perm_fn(req, res, "Execution", "Execute"))
+                      return;
+                  if (!bundle_orch) {
+                      res.status = 503;
+                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      return;
+                  }
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded()) {
+                      res.status = 400;
+                      res.set_content(error_json("invalid JSON"), "application/json");
+                      return;
+                  }
+                  if (!body.contains("agent_id") || !body["agent_id"].is_string() ||
+                      body["agent_id"].get<std::string>().empty()) {
+                      res.status = 400;
+                      res.set_content(
+                          error_json("agent_id (non-empty string) is required — a bundle "
+                                     "targets one device"),
+                          "application/json");
+                      return;
+                  }
+                  if (!body.contains("steps")) {
+                      res.status = 400;
+                      res.set_content(error_json("steps is required"), "application/json");
+                      return;
+                  }
+                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  if (!specs) {
+                      res.status = 400;
+                      res.set_content(error_json("steps: " + specs.error()), "application/json");
+                      return;
+                  }
+                  auto session = auth_fn(req, res);
+                  const std::string principal = session ? session->username : std::string{};
+                  // A bundle is owned by its dispatcher (collate gates on it). An
+                  // empty principal would be un-attributable and collatable by any
+                  // other empty-principal caller — refuse it, matching the
+                  // self-target/empty-principal guard used elsewhere in this file
+                  // (governance sec-M2 / comp-S1).
+                  if (principal.empty()) {
+                      res.status = 500;
+                      res.set_content(error_json("authenticated session has no principal", 500),
+                                      "application/json");
+                      return;
+                  }
+                  const std::string agent_id = body["agent_id"].get<std::string>();
+                  // Per-step audit bound to this request; the orchestrator stays req-free.
+                  auto audit = [&audit_fn, &req](const std::string& verb, const std::string& result,
+                                                 const std::string& type, const std::string& id,
+                                                 const std::string& detail) {
+                      audit_fn(req, verb, result, type, id, detail);
+                  };
+                  // dispatch fans N gRPC writes; a throw must not leave a
+                  // half-written 202 — audit the failure and return 503 (parity
+                  // with the MCP wrapper; governance UP-1 / sec-M1 / comp-S2).
+                  BundleOrchestrator::DispatchResult r;
+                  try {
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit);
+                  } catch (const std::exception& e) {
+                      audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
+                               std::string("agent=") + agent_id + " error=" + e.what());
+                      res.status = 503;
+                      res.set_content(error_json("bundle dispatch failed", 503), "application/json");
+                      return;
+                  }
+                  audit_fn(req, "bundle.dispatch", "success", "Execution", r.correlation_id,
+                           "agent=" + agent_id + " steps=" + std::to_string(r.expected));
+                  res.status = 202; // accepted — collect via GET /api/v1/bundles/{id}
+                  res.set_content(ok_json(JObj()
+                                              .add("bundle_id", r.correlation_id)
+                                              .add("agent_id", agent_id)
+                                              .add("expected", static_cast<int64_t>(r.expected))
+                                              .str()),
+                                  "application/json");
+              });
+
+    // GET /api/v1/bundles/{id} — collate (poll). Server-grouped result.
+    sink.Get(R"(/api/v1/bundles/(bundle-[a-f0-9]+))",
+             [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
+                                                       httplib::Response& res) {
+                 if (!perm_fn(req, res, "Response", "Read"))
+                     return;
+                 if (!bundle_orch) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto session = auth_fn(req, res);
+                 const std::string principal = session ? session->username : std::string{};
+                 const bool is_admin = session && session->role == auth::Role::admin;
+                 const auto id = req.matches[1].str();
+                 auto agg = bundle_orch->collate(id, principal, is_admin);
+                 if (!agg) {
+                     // not-found and not-owned return the same 404 so existence
+                     // isn't an enumeration oracle; the real reason is audited.
+                     audit_fn(req, "bundle.collate", "denied", "Execution", id,
+                              "not found or not owned");
+                     res.status = 404;
+                     res.set_content(error_json("bundle not found"), "application/json");
+                     return;
+                 }
+                 audit_fn(req, "bundle.collate", "success", "Execution", id,
+                          std::string("complete=") + (agg->complete ? "1" : "0"));
+                 res.set_content(ok_json(aggregate_to_json(*agg)), "application/json");
+             });
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
@@ -5137,6 +5309,107 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // GET /dex/perf/cohort-diff?key=&a=&b= — F2c (BRD 99/103): the direct
+    // A-vs-B cohort comparison (e.g. image_type vanilla vs layered, or model X
+    // vs Y). F2a benchmarks each cohort against the FLEET; this diffs two
+    // cohorts head-to-head. delta_pct is A's p50 relative to B's p50 (B the
+    // baseline), present only when BOTH cohorts expose the metric (neither
+    // suppressed below the floor). Aggregate — NOT audited. (The fleet-per-app
+    // half of the BRD F2c residual, row 100, is deferred: per-app data is
+    // device-drill-only, not fleet render-time — see dex_perf_model.hpp.)
+    sink.Get("/api/v1/dex/perf/cohort-diff",
+             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!dex_perf_fn) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
+                     return;
+                 }
+                 const std::string key =
+                     req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
+                 if (!TagStore::validate_key(key)) {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid,
+                                                           "key must match [A-Za-z0-9_.:-]{1,64}"),
+                                     "application/json");
+                     return;
+                 }
+                 // Both cohort values are required. A value of "" is the
+                 // legitimate untagged residual, so "missing" must be tested by
+                 // has_param, not by emptiness.
+                 if (!req.has_param("a") || !req.has_param("b")) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "cohort params 'a' and 'b' are required", cid,
+                                               "supply both a= and b= cohort values (an empty "
+                                               "value selects the untagged residual)"),
+                         "application/json");
+                     return;
+                 }
+                 const auto a = req.get_param_value("a");
+                 const auto b = req.get_param_value("b");
+                 // Validate the cohort VALUES too (only `key` was checked before):
+                 // the 448-byte tag-value cap. Empty stays valid (untagged residual).
+                 if (!TagStore::validate_value(a) || !TagStore::validate_value(b)) {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400, "cohort value too long", cid,
+                                                           "cohort values must be <= 448 bytes"),
+                                     "application/json");
+                     return;
+                 }
+                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                 auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
+                     if (!found)
+                         return "null";
+                     JObj o;
+                     o.add("cohort", c.cohort).add("devices", c.devices).add("suppressed",
+                                                                             c.suppressed);
+                     if (!c.suppressed)
+                         o.raw("cpu_pct", perf_stat_json(c.cpu))
+                             .raw("commit_pct", perf_stat_json(c.commit))
+                             .raw("disk_lat_ms", perf_stat_json(c.disk_lat));
+                     return o.str();
+                 };
+                 // delta_pct.<metric> is a number when present, JSON null when
+                 // absent — built via JObj so the double formatting matches the
+                 // stats above (and avoids a std::format dependency here).
+                 auto delta_obj = [&] {
+                     JObj o;
+                     if (d.cpu_delta_pct)
+                         o.add("cpu_pct", *d.cpu_delta_pct);
+                     else
+                         o.raw("cpu_pct", "null");
+                     if (d.commit_delta_pct)
+                         o.add("commit_pct", *d.commit_delta_pct);
+                     else
+                         o.raw("commit_pct", "null");
+                     if (d.disk_lat_delta_pct)
+                         o.add("disk_lat_ms", *d.disk_lat_delta_pct);
+                     else
+                         o.raw("disk_lat_ms", "null");
+                     return o.str();
+                 };
+                 res.set_content(ok_json(JObj()
+                                             .add("key", key)
+                                             .add("floor", kDexCohortFloor)
+                                             .add("found_a", d.found_a)
+                                             .add("found_b", d.found_b)
+                                             .raw("a", cohort_obj(d.found_a, d.a))
+                                             .raw("b", cohort_obj(d.found_b, d.b))
+                                             .raw("delta_pct", delta_obj())
+                                             .str()),
+                                 "application/json");
+             });
+
     // GET /dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=&limit= —
     // the ONE device list behind every Performance drill: worst-by-metric
     // (default), the not-reporting complement (filter=not_reporting), or a
@@ -5228,8 +5501,9 @@ void RestApiV1::register_routes(
     };
 
     // GET /network/fleet — fleet-now RTT / retransmit / throughput stats + the
-    // honest denominators + the measured co-occurrence counts (the same numbers
-    // the yuzu_fleet_net_* gauges carry and the /network Overview cards show).
+    // honest denominators + the measured co-occurrence counts. OS-blended over the
+    // same per-device facts the per-OS yuzu_fleet_net_* gauges carry (a gauge
+    // series, split by os, differs from this blended number on a mixed fleet).
     sink.Get("/api/v1/network/fleet",
              [perm_fn, net_perf_fn, net_stat_json](const httplib::Request& req,
                                                    httplib::Response& res) {
@@ -5366,6 +5640,179 @@ void RestApiV1::register_routes(
                                              .str()),
                                  "application/json");
              });
+
+    // ── Baseline-anchored per-device Guardian status (ServiceNow CI record) ──
+    //
+    // GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}
+    //
+    // Machine-readable A1 sibling of the dashboard baseline page: for ONE Baseline
+    // + ONE device, return the Baseline's DEPLOYED Guards each with this device's
+    // last reported (Observe-mode) verdict. The denominator is the deployed set
+    // (deployed_snapshot — the enforced set captured at last deploy), so a Guard
+    // that has not reported yet still shows, as "pending". A not-deployed Baseline
+    // returns deployed:false + empty guards (consumer renders "No Baseline
+    // Deployed"). No liveness fold — "pending" conflates never-reported / offline /
+    // platform-unsupported; updated_at carries staleness. Per-device behavioral
+    // read → per-device-SCOPED GuaranteedState:Read (management-group aware, mirroring
+    // the dashboard Guardian device lens, so a group-scoped operator isn't fail-closed
+    // out of in-scope devices) + guardian.device.view audit.
+    //
+    // Applicability note (Baseline assignment): management-group assignment is
+    // DEFERRED product-wide (deploy is fleet-wide), so a *deployed* Baseline applies
+    // to every device and the verdict here is the device's compliance against that
+    // deployed Baseline's guards. When assignment lands, this must become
+    // assignment-aware (return not-applicable for an out-of-scope device) — tracked
+    // as a follow-up; an assignment filter now would diverge from fleet-wide enforce.
+    sink.Get(
+        R"(/api/v1/guaranteed-state/baselines/([A-Za-z0-9._\-]+)/devices/([A-Za-z0-9._\-]+))",
+        [scoped_perm_fn, audit_fn, guaranteed_state_store,
+         baseline_store](const httplib::Request& req, httplib::Response& res) {
+            const std::string baseline_id = req.matches[1].str();
+            const std::string agent_id = req.matches[2].str();
+            // The route regex caps the charset but not the length; bound it to the
+            // canonical enrolled-agent-id limit (auth::kMaxAgentIdLength, 256 — the
+            // same ceiling enrollment enforces) so a legitimately-enrolled device with
+            // an operator-set long --agent-id is never falsely rejected by THIS route
+            // alone. A4 400 only past that ceiling.
+            if (baseline_id.size() > auth::kMaxAgentIdLength ||
+                agent_id.size() > auth::kMaxAgentIdLength) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "path parameter too long", cid),
+                                "application/json");
+                return;
+            }
+            // Per-device VISIBILITY scope (management-group aware), matching the
+            // dashboard Guardian device lens (device_routes.cpp): a global
+            // GuaranteedState:Read passes fleet-wide, otherwise the principal must hold
+            // Read via a management group the agent is in — so a group-scoped operator
+            // (or integration service account) is not fail-closed out of the devices
+            // they can legitimately see. agent_id must be in hand before the gate,
+            // hence the reorder above. The scoped fn is a REQUIRED dependency for this
+            // route: if a call site fails to wire it, fail loud (503) rather than
+            // silently fall back to the flat global gate that re-introduces the
+            // group-scoped lockout this route exists to fix. Production wires it in
+            // server.cpp; the in-process test harness wires its own.
+            if (!scoped_perm_fn) {
+                const auto cid = detail::make_correlation_id();
+                // Distinct message from the store-null 503 below so log triage
+                // identifies the defect (unwired call site) without reading source.
+                spdlog::error("guardian.device.baseline: scoped_perm_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return;
+            if (!guaranteed_state_store || !baseline_store) {
+                const auto cid = detail::make_correlation_id();
+                spdlog::error("guardian.device.baseline: store null "
+                              "(guaranteed_state_store/baseline_store) — "
+                              "registration-order defect; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const auto baseline = baseline_store->get_baseline(baseline_id);
+
+            // Per-device behavioral-data access audit — emitted for EVERY authorized
+            // attempt (found or not), so enumerating baseline_ids against a device
+            // leaves a trail on misses too; `result` reflects the outcome so a 404
+            // probe stream is distinguishable from genuine reads (matches the
+            // /guaranteed-state/events?agent_id= sibling). Same verb the dashboard
+            // Guardian device lens emits, so one SIEM filter catches both surfaces.
+            // The pre-auth rejections above (400 over-length, 503 unwired/store-null)
+            // return before this point and are intentionally NOT audited here — they
+            // carry no authorized access; a scoped-permission DENIAL is audited at the
+            // auth layer as auth.scoped_permission_required, not by this verb.
+            if (audit_fn)
+                audit_fn(req, "guardian.device.view", baseline ? "success" : "not_found", "Agent",
+                         agent_id, "baseline " + baseline_id + " per-device guard status via REST");
+
+            if (!baseline) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "baseline not found", cid),
+                                "application/json");
+                return;
+            }
+
+            const bool deployed = (baseline->lifecycle == kBaselineDeployed);
+            const auto guard_ids = baseline_store->deployed_member_rule_ids(baseline_id);
+
+            // rule_id -> Guard name (name-only read; never materializes the rule
+            // body blobs). Falls back to the rule_id when a snapshot member Guard
+            // has since been deleted.
+            const auto rule_names = guaranteed_state_store->rule_names();
+
+            // rule_id -> last reported verdict for THIS device.
+            std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
+            for (auto& st : guaranteed_state_store->agent_rule_statuses_for_agent(agent_id))
+                dev[st.rule_id] = std::move(st);
+
+            int64_t compliant = 0, drifted = 0, errored = 0;
+            // max reported updated_at; ISO-8601 sorts lexically (all stamps are UTC
+            // 'Z', written by the store's format_iso_utc, so the byte compare is correct).
+            std::string last_updated;
+            JArr guards;
+            for (const auto& rid : guard_ids) {
+                std::string status = "pending";
+                std::string updated_at;
+                if (auto it = dev.find(rid); it != dev.end()) {
+                    const std::string& s = it->second.state;
+                    if (s == "compliant") { status = s; ++compliant; }
+                    else if (s == "drifted") { status = s; ++drifted; }
+                    else if (s == "errored") { status = s; ++errored; }
+                    // any unexpected stored state falls through to "pending"
+                    if (status != "pending") {
+                        updated_at = it->second.updated_at;
+                        if (updated_at > last_updated)
+                            last_updated = updated_at;
+                    }
+                }
+                const auto nit = rule_names.find(rid);
+                JObj g;
+                g.add("rule_id", rid)
+                    .add("name",
+                         (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid)
+                    .add("status", status);
+                if (updated_at.empty())
+                    g.raw("updated_at", "null");
+                else
+                    g.add("updated_at", updated_at);
+                guards.add(std::move(g));
+            }
+
+            const int64_t total_guards = static_cast<int64_t>(guard_ids.size());
+            const int64_t pending = total_guards - (compliant + drifted + errored);
+
+            JObj b;
+            b.add("baseline_id", baseline->baseline_id)
+                .add("name", baseline->name)
+                .add("lifecycle", baseline->lifecycle);
+
+            JObj data;
+            data.raw("baseline", b.str())
+                .add("deployed", deployed)
+                .add("agent_id", agent_id)
+                .add("total_guards", total_guards)
+                .add("compliant", compliant)
+                .add("drifted", drifted)
+                .add("errored", errored)
+                .add("pending", pending);
+            if (last_updated.empty())
+                data.raw("last_updated", "null");
+            else
+                data.add("last_updated", last_updated);
+            data.raw("guards", guards.str());
+
+            res.set_content(ok_json(data.str()), "application/json");
+        });
 
     sink.Get("/api/v1/guaranteed-state/alerts",
              [perm_fn](const httplib::Request& req, httplib::Response& res) {

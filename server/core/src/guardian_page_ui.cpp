@@ -233,7 +233,6 @@ extern const char* const kGuardianDetailPageHtml =
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/guardian" class="nav-link active">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
-    <a href="/network" class="nav-link">Network</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
@@ -280,6 +279,29 @@ extern const char* const kGuardianDetailPageHtml =
       for (var i = 0; i < rows.length; i++) {
         var name = rows[i].getAttribute('data-gpname') || '';
         rows[i].style.display = (!q || name.indexOf(q) !== -1) ? '' : 'none';
+      }
+    }
+    /* Like gpSearch, but collapses to the first data-gplimit rows when the box is
+       empty (so a long live list shows a preview, full list searchable). Updates
+       an optional counter element carrying data-gpcount="<group>". */
+    function gpSearchTopN(input) {
+      var group = input.getAttribute('data-gpf');
+      var limit = parseInt(input.getAttribute('data-gplimit') || '10', 10);
+      var q = (input.value || '').toLowerCase().trim();
+      var rows = document.querySelectorAll('tr[data-gpf="' + group + '"]');
+      var shown = 0, matches = 0, total = rows.length;
+      for (var i = 0; i < rows.length; i++) {
+        var name = rows[i].getAttribute('data-gpname') || '';
+        var hit = !q || name.indexOf(q) !== -1;
+        if (!hit) { rows[i].style.display = 'none'; continue; }
+        matches++;
+        if (!q && shown >= limit) { rows[i].style.display = 'none'; }
+        else { rows[i].style.display = ''; shown++; }
+      }
+      var note = document.querySelector('[data-gpcount="' + group + '"]');
+      if (note) {
+        note.textContent = q ? (matches + ' of ' + total + ' match')
+                             : ('Showing ' + Math.min(limit, total) + ' of ' + total);
       }
     }
 

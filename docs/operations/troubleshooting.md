@@ -64,6 +64,7 @@ yuzu-agent --server yuzu-server:50051 --no-tls --log-level debug
 | Wrong CA | Agent's `--ca-cert` must match server's signing CA |
 | SAN mismatch | Server cert SAN must include the hostname agents connect to |
 | Windows cert store | Verify thumbprint: `certutil -store MY` |
+| "Refusing to connect with the SYSTEM trust store" | Agent has TLS on but no CA pinned (#1303 fail-closed). Pass `--ca-cert /etc/yuzu/certs/default-ca.pem`, ensure the install CA exists at that path, add `--tls-system-roots` only if the server cert chains to a public/corporate CA already in the system store, or `--no-tls` for a dev/demo stack. |
 
 ## Log Diagnosis
 

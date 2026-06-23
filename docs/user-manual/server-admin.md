@@ -813,11 +813,17 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 
 ## PostgreSQL Substrate
 
-The server's storage substrate is moving from SQLite to **PostgreSQL** (ADR-0006; the agent stays SQLite). Today the database is **inert-but-ready**: the bundled containers, the provisioning helper, and the backup procedure below all exist so that deployments are Postgres-ready *before* the release that makes the server require a DSN at boot (#1320 — a **breaking** change; the CHANGELOG entry for that release will say so explicitly).
+The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
+
+> **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_in_use` / `yuzu_pg_pool_size` gauges and the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+
+**`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 
 ### Provisioning a native (non-container) install
 
-Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 16 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
 
 | Install method | Helper location | Invocation |
 |---|---|---|
@@ -880,7 +886,26 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
 
 Schedule the dump alongside the existing SQLite/cert-dir backups; verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
 
-> **The restore-pairing invariant (ADR-0010 — forward reference).** Once envelope-encrypted secrets land (ADR-0010), `pg_dump` output and volume snapshots will contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching `KeyProvider` keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and treat the KEK file like the CA root key (separate, offline copy). The restore-verification drill must restore both halves and confirm a clean fingerprint check at boot. The full key-management runbook (rotation, DR drill) is tracked in #1341. Plan your backup automation for this pairing **now** so the secrets migration doesn't invalidate your procedure.
+### Key management (secrets KEK)
+
+Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
+
+> The encryption machinery ships ahead of its consumers: as of this release **no store writes secret columns yet** — the gated stores (`auth` TOTP secrets, `webhooks`, `offload_targets`, the OIDC client secret) adopt it as each migrates to Postgres. Set your backup procedure up for the pairing below **now** so those migrations don't invalidate it.
+
+**The restore-pairing invariant.** `pg_dump` output and volume snapshots contain **ciphertext and wrapped DEKs only** — a database backup alone recovers no secrets, and a database restore is unusable without the matching keys directory. DB backups and keys-dir backups are a *pair*: back them up on the same schedule, restore them **together**, and keep a separate offline copy of the KEK file exactly like the CA root key. The restore-verification drill must restore both halves and confirm a clean boot — the server checks every registered KEK fingerprint at startup and **fails closed** rather than serving with unreadable secrets. The failure classes below are stable error *prefixes* at the start of the fatal startup message (match the prefix in the message text when writing log-scraping alerts; they are not structured log fields):
+
+| Startup error prefix | Meaning | Recovery |
+|---|---|---|
+| `kek_unresolvable` | A registered KEK version has no key file. Causes: keys dir older than the DB (backup skew), wrong keys directory, or a second server instance pointed at the same database (unsupported — one KEK per database). | Restore the keys directory from the backup *paired* with this database. |
+| `kek_corrupt` | The key file exists but does not match its registered fingerprint (torn/corrupt file or foreign key material — **not** row tamper). | Same: restore the paired keys directory. |
+| `provider_failure` | CSPRNG or key-storage failure during KEK generation or check-value computation (first boot / rotation). | Check the keys directory is writable and system entropy is healthy; if a prior first boot crashed, the message names the torn file to delete. |
+| `db_error` | Postgres connection/transaction failure during the `secrets` schema migration or `kek_meta` read/write. | Check the DSN and Postgres service health — triage as "DB down", not key loss. |
+
+**Rotation** mints `secrets-kek-v<N+1>` and re-wraps only the small wrapped-DEK header of each stored blob — payloads are untouched, so rotation is cheap, incremental, and interruptible (a crash resumes by re-running the re-wrap; already-rotated rows are detected by the blob header; a crash *before* the new version's fingerprint registers leaves an orphan key file that the next rotation attempt safely adopts). Rotation is complete when no stored blob references the old version (`oldest_kek_version_in_use`); only then may the old version be **retired** — the server refuses to retire a version that is active or still referenced, and records retirement in `kek_meta` as destruction evidence. Do not delete an old KEK file by hand while any backup you intend to honour still contains blobs wrapped under it — a restored backup needs the KEK versions its rows reference. The operator-facing rotation procedure (CLI/REST surface + DR drill cadence) lands with the first secret-bearing store migration and is tracked in #1341.
+
+Decrypt failures are counted per store and failure class as `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes: `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`) once the codec is wired into a serving store. A sustained non-zero `kek_unresolvable` rate after a deployment or restore is the primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper signal and warrants investigation, not retry.
+
+**Break-glass (KEK permanently lost).** KEK loss is painful, never a total lockout: admin sign-in survives by design (MFA recovery codes are verify-only hashes and need no KEK — sign in with a recovery code and re-enroll TOTP), and every gated secret class is re-enrollable/re-issuable (webhook secrets re-issued, offload credentials re-issued, OIDC client secret re-pasted). The explicit voided-secrets boot flag described in ADR-0010 ships with the first secret-bearing store migration.
 
 ---
 

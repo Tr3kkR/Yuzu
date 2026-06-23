@@ -383,6 +383,41 @@ Standing rules:
   falls back to dispatch for gateway-routed agents — visible only
   as `yuzu_viz_topology_pushed_total{via="gateway"} == 0`.
 
+## Durable offline-host invariants — #1320 PR 3 (Postgres substrate)
+
+The flip wired the born-on-Postgres `OfflineEndpointStore` (schema
+`endpoint_state`) into `/viz/fleet` so a host that ages out of the in-memory
+60 s topology cache renders **stale-flagged instead of vanishing**. Standing
+rules for the `viz_routes.cpp::handle_topology` merge:
+
+- **Merge, never replace.** After `store_->get()` returns the live snapshot,
+  the handler queries `OfflineEndpointStore::query_stale_within(kOfflineStaleWindowSecs)`
+  (7-day retention) and appends a `MachineNode` ONLY for an `agent_id` present
+  in `endpoint_state` but **absent** from the live snapshot. A host the live
+  store still has is never duplicated.
+- **Stale placeholders are empty.** A merged offline node is `stale=true` with
+  **empty `processes` / `connections` / `listeners`** and `ts=0` — it carries
+  identity (`agent_id`/`hostname`/`os`) only. `procs.length == 0 && stale` is
+  the renderer's tell that a cube is durable-offline rather than live. (Tests
+  and the renderer must treat `ts: 0` as "unknown", not "epoch".)
+- **Copy-on-write.** The snapshot is only deep-copied when there is ≥1 offline
+  node to add (the all-online steady state pays only the PG round-trip, no
+  copy).
+- **The DoS cap counts merged nodes.** `machines_max` is enforced on the
+  merged total (`live + offline`), so the offline merge can never smuggle the
+  response past the cap.
+- **Fail-soft, and currently silent.** A PG error on the offline query returns
+  an empty set → the page renders live-only with no stale cubes and **no
+  operator-visible signal** (the known UP-13 gap; a degraded-marker/metric is a
+  tracked follow-up). Do not "fix" this by hard-failing the request.
+- **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
+  the `server.cpp` viz metric block — keep it described, `promtool`-clean).
+- **`/readyz` brief-200 caveat.** The substrate `pg_pool` readyz check reads
+  the connect-breaker, which can momentarily read closed between backoff
+  windows during a sustained outage — a deliberate tradeoff (don't evict a
+  busy-but-healthy server); operators should page on `YuzuPgConnectFailing`,
+  not solely on `/readyz`.
+
 ## Cross-references
 
 - REST API surface: `docs/user-manual/rest-api.md` § Fleet Visualization

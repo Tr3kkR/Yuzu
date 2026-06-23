@@ -138,4 +138,20 @@ private:
                                const std::string& op) const;
 };
 
+/// Visibility policy for device-listing call sites (e.g. the TAR fleet scan via
+/// ManagementGroupStore::get_visible_agents) that fall back to the full enrolled
+/// fleet when RBAC enforcement is OFF.
+///
+/// Returns true when RBAC enforcement is IN EFFECT — the caller must use its
+/// role-scoped path, which fails closed (an unroled caller sees nothing).
+/// Returns false only to PERMIT the full-fleet fallback, and only for a store
+/// that is loaded AND explicitly disabled (`is_open() && !is_rbac_enabled()`).
+///
+/// #1498 — a null `store`, or one that failed to load (open/migration failure
+/// leaves `db_` null, so `is_open()` is false while the default-false enabled
+/// flag would otherwise be indistinguishable from an intentional disable),
+/// returns true and so fails CLOSED. A corrupt rbac.db can never widen
+/// fleet-scan visibility to the whole fleet.
+[[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
+
 } // namespace yuzu::server

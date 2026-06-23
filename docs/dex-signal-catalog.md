@@ -351,26 +351,58 @@ identically under Hardware without a server change. A dedicated
 `hw.battery_degraded` obs_type + label remains a future polish (needs a
 `dex_signal_groups()` + drift-net edit).
 
-## Linux collector (shipped — `dex_linux_collector.cpp`, `dex_linux_proc.cpp`, `dex_linux_storage.cpp`)
+## Linux collector (shipped — `dex_linux_collector.cpp`, `dex_linux_proc.cpp`, `dex_linux_storage.cpp`, `dex_linux_journal.cpp`, `dex_linux_kmsg.cpp`)
 
 A drop-in `ISignalObserver` behind `make_dex_observer()` (`__linux__` branch), targeting
-**headless Linux servers** with two privilege-light mechanisms (no elevated access):
+**headless Linux servers** with three privilege-light mechanisms (no elevated access):
 
-1. a **periodic `/proc` poll** (`dex_linux_proc.cpp`): `/proc/stat` busy% and `/proc/meminfo`
-   commit% feed `perf.cpu_sustained` and `perf.memory_pressure` on the SAME sustained-breach
-   hysteresis + thresholds as the Windows state poll (reused `dex_perf_breach`);
+1. a **periodic `/proc` poll** (`dex_linux_proc.cpp`): `/proc/stat` busy%, `/proc/meminfo`
+   commit%, and `/proc/diskstats` per-I/O service time (await, summed over whole physical
+   disks) feed `perf.cpu_sustained`, `perf.memory_pressure` and `perf.disk_latency_high` on the
+   SAME sustained-breach hysteresis + thresholds as the Windows state poll (reused
+   `dex_perf_breach`, incl. the 25 ms disk threshold) — completing the Windows cpu/mem/disk perf
+   trio on Linux; `/proc/uptime` feeds the hourly `os.uptime_report` reboot/uptime heartbeat (the
+   same cross-platform `uptime_observation` builder macOS/Windows use);
+1b. a **`/sys` thermal poll** (`dex_linux_sysfs.cpp`): the per-core
+   `thermal_throttle/core_throttle_count` counters, summed across CPUs — an increase since the
+   last poll latches `hw.cpu_throttled` (poll-and-latch on entry, the Windows
+   Kernel-Processor-Power 37 analogue); no thermal-throttle interface (VM / non-x86) simply never
+   emits;
 2. a **`statvfs` storage poll** (`dex_linux_storage.cpp`): `storage.low` (>=90% used or <5 GiB
    free) over real local block-backed filesystems (ext*/xfs/btrfs/zfs/f2fs; pseudo, read-only
-   and network fstypes excluded).
+   and network fstypes excluded);
+3. a **journald reader** (`dex_linux_journal.cpp` + `dex_linux_kmsg.cpp`): a slow-cadence
+   `journalctl --after-cursor -o json` poll (cursor-checkpointed, no libsystemd). Two record
+   families are classified onto EXISTING obs_types. **systemd-structured** records (keyed on a
+   stable `MESSAGE_ID`, `dex_linux_journal.cpp`): `service.crashed` (a unit failed: the "Failed
+   with result" / unit-failed messages), `service.hung` (the SAME unit-failed entry routed by
+   `UNIT_RESULT="watchdog"` — a `WatchdogSec` timeout is a hang, not a crash; one entry, no
+   double-emit) and `process.crashed` (a `systemd-coredump` entry — coverage depends on
+   systemd-coredump being the active core handler). A low-volume `SYSLOG_IDENTIFIER=chronyd`
+   clause adds `os.time_unsynced` (chrony's "Can't synchronise: no selectable sources" / large-step
+   markers — the noisy source online/offline lines produce no observation; the raw message, which
+   carries NTP source IPs, is never shipped). **kernel ring-buffer**
+   lines (`_TRANSPORT=kernel`, free text with NO `MESSAGE_ID`, so classified by anchored substring
+   markers in `dex_linux_kmsg.cpp`): `memory.exhausted` (OOM-killer), `os.bugcheck` (a fatal
+   `Kernel panic - not syncing` only — a survivable Oops/soft-lockup is deliberately NOT mapped, to
+   keep the BSOD-equivalent rate honest), `os.dirty_shutdown` (ext4/xfs journal-recovery at mount =
+   the prior shutdown was unclean — the reliable "did it die" evidence, since a panic line rarely
+   survives the reboot), `disk.error` (block-layer / buffer I/O error, subject = backing device),
+   `fs.corruption` (ext4/xfs/btrfs metadata error, subject = device), and `process.hung` (the
+   hung-task watchdog). A per-`(type, subject)` debounce collapses a flapping unit/process/device;
+   the dedup map is age-evicted each poll so it stays bounded by the trailing window, not daemon
+   uptime.
 
 It reuses the existing obs_type strings, uniform `detail_json` keys and wire mapping, so the
-signals render in the same `/dex` display groups with **zero server or dashboard change**,
-`platform="linux"` driving the by-OS panel. Disk-latency (`perf.disk_latency_high`) is not yet
-emitted on Linux; crash/hang/journald reliability signals are a later slice.
+signals render in the same `/dex` display groups with **no change to the live rendering path**
+(`dex_signal_groups()` / `dex_signal_label()` already carry every reused type), `platform="linux"`
+driving the by-OS panel. The one server-side touch is the curated per-OS **coverage map**
+`dex_obs_platforms()` (`dex_routes.cpp`), which gains the new Linux obs_types so the Catalogue
+attributes them to Linux even before they fire — keep it in sync with these collectors.
 
-**Coverage is Performance + Hardware/storage.** Workstation-only headings (battery, Wi-Fi,
-display/WM, GUI app dialogs, .NET) are **N/A on a headless server**, not gaps — score against the
-server-applicable denominator.
+**Coverage is Performance + Hardware/storage + App/Service reliability + System stability +
+Boot/uptime.** Workstation-only headings (battery, Wi-Fi, display/WM, GUI app dialogs, .NET) are
+**N/A on a headless server**, not gaps — score against the server-applicable denominator.
 
 **`storage.low` subject is the backing-device identifier, NEVER the mount path** — a mount path
 carries usernames / tenant / project names (`/home/alice/...`), which must not leave the device
@@ -380,17 +412,62 @@ carries usernames / tenant / project names (`/home/alice/...`), which must not l
 `storage_low_observation` chokepoint the collector calls (subject / sentence / `detail_json`
 asserted free of any path component).
 
+**journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
+`COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`
+ships the OOM **victim comm**, never the kernel memory figures (total-vm / anon-rss / file-rss) or
+the rest of the raw `MESSAGE`; `service.crashed` ships the unit name + `UNIT_RESULT` code only.
+Pinned by `[dex][linux][journal][privacy]` tests asserting subject / sentence / `detail_json` are
+free of the EXE path and the memory figures.
+
+The **kernel ring-buffer** signals are the same: only infra-safe fields leave the device — the
+backing-**device** identifier (`disk.error` / `fs.corruption` / `os.dirty_shutdown`), the blocked
+process **comm** (`process.hung`), a short reason code (`io-error`, `medium-error`, `fs-error`,
+`journal-recovery`, `machine-check`, `panic`). The raw kernel `MESSAGE` — which carries inode/block
+numbers, sector/op detail, the accessing `comm`, and kernel addresses — is NEVER shipped. Pinned by
+`[dex][linux][kmsg][privacy]` tests.
+
 **Deployment notes:** `storage.low` uses a fixed 5 GiB-free floor, so small cloud/VM root volumes
 can read as low until thresholds are operator-configurable (F1). Inside an **unmodified
 container** `/proc` reflects the *host*, so the collector targets host/VM deployment. `statvfs`
 excludes network *fstypes*, but a hung local block device (iSCSI/NBD/failing disk) can still stall
-the poll — a bounded statvfs is a tracked follow-up.
+the poll — a bounded statvfs is a tracked follow-up. The journald source **no-ops on a non-systemd
+host** (the `journalctl` shell-out yields nothing); `process.crashed` specifically requires
+**systemd-coredump** as the active core handler — on a host using `apport` (the Ubuntu default)
+coredumps are not journaled, so that signal stays silent until the core handler is changed (this is
+host configuration, not a Yuzu setting). `os.time_unsynced` covers **chrony** today; the
+`systemd-timesyncd` "sync lost" state has no stable journal marker and is a follow-up.
+`service.dependency_failed` is deferred: the "Dependency failed for X" line carries no `MESSAGE_ID`,
+so catching it needs either a high-volume all-`systemd` fetch or a separate `--grep` pipe, and the
+**root** failure is already captured as `service.crashed`.
+
+**Status legend (Linux) — narrower than macOS.** On the Linux rows "live" means the
+**agent-emit or pure-parser was verified on a real event** (via safe error injection or a
+real watchdog timeout), NOT seen end-to-end on `/dex` — the Linux collector has **not yet
+been observed landing on `/dex`** during a live-fire (the live-fires ran the agent against
+an offline server to pass the enrollment gate, so the emit was proven but the dashboard
+arrival was not). This is deliberately narrower than the macOS "live" = end-to-end-on-`/dex`
+definition; the per-row parenthetical states the exact evidence. `fixture` rows use the
+documented kernel format string and await a real specimen.
 
 | Heading | obs_type | Linux source | Status |
 |---|---|---|---|
 | Performance | `perf.cpu_sustained` | `/proc/stat` busy% >=90% sustained | live |
 | Performance | `perf.memory_pressure` | `/proc/meminfo` commit% >=90% | live |
+| Performance | `perf.disk_latency_high` | `/proc/diskstats` await >=25 ms/IO sustained (whole disks) | live (parser + real-field-layout verified; sustained-state, not single-fired) |
 | Hardware & storage | `storage.low` | `statvfs` >=90% used; subject = device/pool | live |
+| Boot / uptime | `os.uptime_report` | `/proc/uptime` (hourly scalar) | live |
+| App / service reliability | `service.crashed` | journald unit-failed / "Failed with result" | live |
+| App / service reliability | `service.hung` | journald unit-failed `UNIT_RESULT="watchdog"` (WatchdogSec timeout) | live (agent emit verified on a real watchdog timeout) |
+| System stability | `os.time_unsynced` | journald chronyd "Can't synchronise: no selectable sources" | live (chrony format captured; not single-fired) |
+| App / service reliability | `process.crashed` | journald `systemd-coredump` (where active handler) | live |
+| System stability | `memory.exhausted` | journald kernel OOM-killer | live |
+| System stability | `os.bugcheck` | journald kernel `Kernel panic - not syncing` (fatal only) | fixture (panic reboots — can't self-fire) |
+| System stability | `os.dirty_shutdown` | journald ext4/xfs journal-recovery at mount | live (loopback-snapshot injection) |
+| Hardware & storage | `disk.error` | journald block-layer / buffer I/O error; subject = device | live (dm-error + scsi_debug injection; agent emit verified) |
+| Hardware & storage | `hw.error` | journald `mce: [Hardware Error]` / machine-check | fixture (no `mce-inject` on the dev box) |
+| Hardware & storage | `hw.cpu_throttled` | `/sys` `core_throttle_count` increase (poll-and-latch) | live (parser + real-field-layout verified; counter rarely increments) |
+| File system | `fs.corruption` | journald ext4/xfs/btrfs metadata error; subject = device | live (debugfs corruption injection) |
+| App / service reliability | `process.hung` | journald kernel hung-task watchdog | fixture (documented format) |
 
 ## macOS: what more is possible with ESF / Network Extension / other entitlements
 
@@ -441,8 +518,8 @@ per-flow network + complete process/file telemetry; they do **not** add headings
 and are **not required** for the ~10/11 unprivileged coverage. The one hard ceiling
 is clean per-app APM (MetricKit), which no entitlement crosses.
 
-Linux: journald-based collectors (coredumpctl, systemd unit failures, OOM
-killer) follow the same catalogue pattern.
+Linux: the journald reliability signals (systemd unit failures, `systemd-coredump`
+crashes, the OOM-killer) are **shipped** — see the Linux collector section above.
 
 ## Wire + read-model invariants
 

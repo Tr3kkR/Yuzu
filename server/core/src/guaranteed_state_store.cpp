@@ -13,6 +13,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string_view>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -1151,6 +1152,38 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     return out;
 }
 
+std::vector<DexSignalCount>
+GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
+                                                const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexSignalCount> out;
+    if (!db_)
+        return out;
+    // Per-device analog of dex_signal_summary — one row per obs_type this device
+    // emitted in the window. Indexed by agent_id; distinct_devices is 1 by build.
+    const char* sql = R"(
+        SELECT obs_type, COUNT(*), MAX(observed_at)
+        FROM guardian_observations
+        WHERE agent_id = ?1 AND observed_at >= ?2
+        GROUP BY obs_type
+        ORDER BY COUNT(*) DESC, obs_type ASC
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexSignalCount c;
+        c.obs_type = col_text(st.get(), 0);
+        c.count = sqlite3_column_int64(st.get(), 1);
+        c.distinct_devices = 1;
+        c.last_seen = col_text(st.get(), 2);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
 std::vector<DexSubjectCount>
 GuaranteedStateStore::dex_signal_subjects(const std::string& obs_type, const std::string& since,
                                           int limit) const {
@@ -1753,6 +1786,51 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
+    return out;
+}
+
+std::vector<GuardianAgentRuleStatus>
+GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianAgentRuleStatus> out;
+    if (!db_)
+        return out;
+    // One agent's current per-rule verdicts. Rides the (agent_id, rule_id) PK
+    // auto-index (agent_id leading), so it scans only this agent's rows — the
+    // baseline-anchored per-device REST view's denominator is small. Pure SELECT,
+    // so no sqlite3_changes()/#1033 concern.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT agent_id, rule_id, state, updated_at "
+                           "FROM guardian_agent_rule_status WHERE agent_id = ?1",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(s.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        GuardianAgentRuleStatus r;
+        r.agent_id = col_text(s.get(), 0);
+        r.rule_id = col_text(s.get(), 1);
+        r.state = col_text(s.get(), 2);
+        r.updated_at = col_text(s.get(), 3);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::unordered_map<std::string, std::string> GuaranteedStateStore::rule_names() const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, std::string> out;
+    if (!db_)
+        return out;
+    // Two-column read only — avoids materializing the yaml_source / spec_json /
+    // signature blobs list_rules() carries (governance UP-2 / sre / architect-I2:
+    // this is per-request on the baseline-anchored read path). Pure SELECT (#1033-safe).
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, "SELECT rule_id, name FROM guaranteed_state_rules", -1, s.addr(),
+                           nullptr) != SQLITE_OK)
+        return out;
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.emplace(col_text(s.get(), 0), col_text(s.get(), 1));
     return out;
 }
 

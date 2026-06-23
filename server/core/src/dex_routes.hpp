@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -48,6 +49,15 @@ class HttpRouteSink;
 struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
+    /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
+    /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
+    /// lens. Empty when nothing is connected.
+    std::vector<std::string> connected_os;
+    /// CONNECTED agents as (agent_id, normalized-os: "windows"/"linux"/"macos").
+    /// The Overview computes a per-device DEX score for each (window-respecting) to
+    /// build the experience distribution AND groups by os for the segment breakdown.
+    /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
+    std::vector<std::pair<std::string, std::string>> connected_agents;
 };
 
 /// One display family of the server-side signal catalogue. PUBLIC since F1:
@@ -86,26 +96,54 @@ std::string dex_iso_since(int days);
 /// ill-defined). `fleet` supplies the cross-store denominator. `store` may be null
 /// (renders the no-data placeholder). Pure + free so it is unit-testable directly.
 std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
-                                         const std::string& since, int window_days,
-                                         DexFleet fleet);
+                                         const std::string& since, int window_days, DexFleet fleet,
+                                         const std::set<std::string>* visible = nullptr);
 
-/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue.html), each a drill
-/// into its family. Reuses dex_signal_summary + dex_signal_groups. Pure + free.
+/// Per-obs_type platform coverage: which OSes collect this signal type today
+/// (windows = the whole catalogue; linux/macos = the collector subsets). The thin
+/// explicit map the Catalogue's coverage view reads; keep in sync with the agent
+/// collectors (a schema↔catalogue cross-check test guards drift — H2/G9 style).
+std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
+
+/// Per-device DEX experience score (0–100) — the per-device projection of the
+/// canonical severity-weighted composite (100 − Σ family deductions over the
+/// device's OWN observations; benign families don't deduct, events gently scaled).
+/// Cheap server-side read (dex_device_signal_summary); returns -1 when `store` is
+/// null. The fleet-scale path (heartbeat rollup) is a follow-up.
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since);
+
+/// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
+/// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
+/// "all"|"windows"|"linux"|"macos") collects one of its types — not merely when a
+/// signal fired. Each card carries a roll-up health score (100 − the family's
+/// dex_compute_health deduction). `fleet.connected_os` is the "all" scope. Pure + free.
 std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
-                                          const std::string& since, int window_days);
+                                          const std::string& since, int window_days,
+                                          const DexFleet& fleet, const std::string& os_filter);
 
-/// Catalogue View 2 — one family's signals (visibility contract: every catalogued
-/// type, quiet ones muted). `group_name` is allowlisted against dex_signal_groups().
+/// Catalogue View 2 — one family's signals. COVERAGE-first, like the grid: every
+/// catalogued type is shown, marked MONITORED (a connected platform in scope
+/// collects it — lit even at zero events) or NOT COLLECTED (no platform in view
+/// emits it — dimmed, never read as "healthy"). `group_name` is allowlisted
+/// against dex_signal_groups(); `fleet.connected_os` is the "all" coverage scope;
+/// `os_filter` ("all"|"windows"|"linux"|"macos") is the OS lens — shown as in-view
+/// chips so it both persists across the drill AND is changeable in place.
 std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* store,
                                                 const std::string& since, int window_days,
-                                                const std::string& group_name);
+                                                const std::string& group_name,
+                                                const DexFleet& fleet,
+                                                const std::string& os_filter = "all");
 
 /// Catalogue View 3 — one signal type's drill-down (subjects, OS split, devices,
 /// trend), over the generic per-obs_type read-model. `obs_type` is SQL-bound +
 /// HTML-escaped; cross-OS captions are derived live (no stale coverage counts).
+/// `os_filter` is carried only to restore the family grid's OS lens on the back-link.
 std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* store,
                                                  const std::string& since, int window_days,
-                                                 const std::string& obs_type);
+                                                 const std::string& obs_type,
+                                                 const std::string& os_filter = "all",
+                                                 const std::set<std::string>* visible = nullptr);
 
 /// Health score — the derived/SECONDARY composite (score = 100 − Σ weighted
 /// per-family deductions; every deduction traces to a measured rate). `weighting`
@@ -127,7 +165,8 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
 /// linked here — counts match (governance C-S1/UP-11). Pure + free so it is
 /// unit-testable directly against a seeded store.
 std::string render_dex_app_fragment(const GuaranteedStateStore* store,
-                                    const std::string& process_name, const std::string& window);
+                                    const std::string& process_name, const std::string& window,
+                                    const std::set<std::string>* visible = nullptr);
 
 /// Per-device drill-down fragment for `agent_id` — the unified multi-signal
 /// history (closes the deferred UP-4: friendly labelled rows, not raw
@@ -225,13 +264,22 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
 /// the page is a now-view (trend charts are F2b, Postgres-gated).
 std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_days);
 
+/// F2c: the A-vs-B cohort comparison result (the table the two cohort pickers
+/// on the Performance tab load into). Renders each metric's p50 for both
+/// cohorts + the delta (A relative to B, B the baseline), honouring
+/// found/suppressed; pure render over dex_perf_cohort_diff.
+std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
+                                                 const std::string& cohort_a,
+                                                 const std::string& cohort_b, int window_days);
+
 /// PURE: the /fragments/dex/perf/devices drill — the ONE device list serving
 /// every Performance-page drill (worst-by-metric / not-reporting / cohort
 /// membership). Rows link to the per-device drill-down.
 std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
                                              bool not_reporting,
                                              const std::optional<std::string>& cohort_filter,
-                                             int limit, int window_days);
+                                             int limit, int window_days,
+                                             const std::set<std::string>* visible = nullptr);
 
 /// DEX routes — /dex (page shell) + /fragments/dex/overview (HTMX fragment).
 class DexRoutes {
@@ -241,6 +289,27 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+
+    /// Per-device tier + management-group scope gate (wraps
+    /// require_scoped_permission). Gates every PER-DEVICE drill (`/fragments/dex/device`
+    /// + `/perf` + `/procperf`) so an operator can only open a device inside their
+    /// management scope — the same gate the `/device` routes use. May be empty → the
+    /// per-device routes fall back to the global `perm_fn` gate (legacy posture).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
+
+    /// Resolve the set of agent_ids VISIBLE to `username`, following the SAME policy
+    /// as `/api/agents` (`get_visible_agents_json`): returns `std::nullopt` when the
+    /// caller sees the whole fleet (global Infrastructure:Read OR RBAC disabled), else
+    /// the set of agent_ids in the caller's management groups. Used to filter the
+    /// device-id-rendering lists so an out-of-scope operator can't enumerate other
+    /// teams' device ids. MUST replicate the global-read branch — a bare
+    /// `get_visible_agents` would blank an admin who is in no management group. May be
+    /// empty → no list filtering (legacy posture).
+    using VisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
 
     /// Supplies the cross-store fleet denominator (avoids an AgentRegistry
     /// incomplete-type dep — same callback trick GuardianRoutes uses for agents
@@ -280,7 +349,8 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {});
+                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -288,11 +358,14 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {});
+                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    ScopedPermFn scoped_perm_fn_;
+    VisibleSetFn visible_set_fn_;
     GuaranteedStateStore* store_{};
     FleetFn fleet_fn_;
     AuditFn audit_fn_;

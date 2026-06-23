@@ -11,12 +11,14 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The five views
+## The six views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into four deep pages. A shared sub-nav switches between **Overview ·
-Catalogue · Health score · Trends · Performance**; the window selector (below)
-applies to the signal views (Performance is a now-view — see below).
+links* into five deep pages. A shared sub-nav switches between **Overview ·
+Catalogue · Health score · Trends · Performance · Network**; the window selector
+(below) applies to the signal views (Performance and Network are now-views — see
+below). The Network view also has its own URL, `/network`, but it is a DEX
+sub-view, not a standalone top-level nav item.
 
 ### Overview (the hub)
 
@@ -51,16 +53,23 @@ and links, it does not duplicate their detail.
 Every monitored signal type, organised into 13 families (App reliability,
 Boot/start-up & shutdown, Service health, System stability, Hardware & storage,
 Performance, File system, Network, Identity & logon, Security & protection,
-Updates & installs, Policy & management, Printing). A family card shows how
-many of its
-types are active; opening a family lists **every** type — one that fired shows
-its event and device counts, a quiet one shows a dashed zero, because
-**monitored, nothing happened** is real information, not a gap. (Signal sources
-that don't exist on a given OS or SKU simply stay at zero on those endpoints.)
-Each type drills into a per-type view: top subjects, the live OS split, the
-most-affected devices, and an activity trend. Any signal a newer agent emits
-that isn't catalogued yet appears under **Other**, so nothing the fleet reports
-is hidden.
+Updates & installs, Policy & management, Printing). The Catalogue is
+**coverage-first**: a family card shows how many of its types are **monitored**
+(collected by a connected platform — lit even when nothing has fired) and a
+0–100 **health score** (the family's slice of the fleet health composite). A
+monitored type with no events reads as **watched, nothing happened** — real
+information, not a gap; a type that **no connected platform collects** shows
+dimmed as **not collected**, never as healthy. (A type is *not collected* when no
+currently-connected platform in your fleet emits it — e.g. a Linux-only signal on
+an all-Windows fleet; it lights automatically when the first eligible device
+connects, so this is a coverage fact, not a broken collector.) An **OS filter** (All connected /
+Windows / Linux / macOS) narrows coverage to one platform and **persists** when
+you open a family or drill into a type. Opening a family lists **every** type
+with its coverage (which platforms collect it) and, for the ones that fired,
+event and device counts. Each type drills into a per-type view: top subjects,
+the live OS split, the most-affected devices, and an activity trend. Any signal
+a newer agent emits that isn't catalogued yet appears under **Other**, so
+nothing the fleet reports is hidden.
 
 ### Health score
 
@@ -104,6 +113,20 @@ server-side series store).
   metric; the Reporting card opens the devices *not* reporting; each cohort
   row opens that cohort's device list — and every device row opens the
   per-device drill-down.
+
+### Network
+
+The fleet's TCP **network quality**, measured on each endpoint from kernel
+counters (no packet capture, no flow export). A **now-view** like Performance:
+fleet-now cards for round-trip time, the interval retransmit rate, and device
+throughput — each with its own reporting population — plus a worst-devices
+drill. It is **device / local-link health**, not localization: a bad local link
+(Wi-Fi, congested uplink) shows up cleanly across every connection, but *which*
+destination or app is affected is a later per-destination slice. Linux agents
+report all three metrics; Windows reports throughput and retransmit rate (RTT
+deferred — needs ESTATS); macOS is a later slice. Full detail,
+platform coverage, and the privacy model are on the
+[Network quality dashboard](network.md) page.
 
 **Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
 Drill-downs opened from a panel inherit the window you were viewing, so the
@@ -171,6 +194,9 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/cohorts?key=`** — the cohort benchmarking table
   (suppression and the untagged residual included in the response shape, plus
   `available_keys` for picker UIs).
+- **`GET /api/v1/dex/perf/cohort-diff?key=&a=&b=`** — the direct A-vs-B cohort
+  comparison (both cohort values required; `found_a`/`found_b`, the two cohort
+  rows, and `delta_pct` with B as the baseline — null unless both clear the floor).
 - **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
   — the one device list behind every Performance drill (worst-by-metric,
   not-reporting, cohort members).
@@ -180,10 +206,10 @@ endpoints are now-views (no window). All are gated on `GuaranteedState:Read`.
 The per-signal drill-down returns a most-affected **devices** list
 (behavioral) and is **audit-logged** (`dex.signal.view`) on every call,
 exactly like the dashboard view; the rollup, scope and perf endpoints are
-aggregates / machine-health telemetry and are not audited. The same six reads
+aggregates / machine-health telemetry and are not audited. The same seven reads
 are exposed as MCP tools (`list_dex_signals`, `get_dex_signal_scope`,
 `get_dex_signal_detail`, `get_dex_perf_fleet`, `get_dex_perf_cohorts`,
-`list_dex_perf_devices`). Full request/response shapes are in
+`get_dex_perf_cohort_diff`, `list_dex_perf_devices`). Full request/response shapes are in
 [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

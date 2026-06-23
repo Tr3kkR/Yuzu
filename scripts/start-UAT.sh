@@ -545,6 +545,29 @@ start_all() {
     info "Dashboard http://localhost:8080"
     info "Direct agent gRPC :50054  |  Gateway upstream :50055  |  Mgmt :50052"
 
+    # #1454 — seed a management-group role binding the admin to the root "All
+    # Devices" group. With #1453 the default RBAC-disabled rig already shows the
+    # full fleet to the admin (TAR fleet scan, /api/me), so this is NOT required
+    # out of the box; it is here so the rig is ALSO correct if an operator later
+    # ENABLES RBAC — without it the role-scoped visibility join would return
+    # "no agents in scope" under enforcement. The root group + the
+    # management_group_roles table are created during server init, which finishes
+    # before :8080 binds, so the DB is ready now. With no --data-dir, the
+    # server's db_dir() resolves to the --config parent (= $UAT_DIR).
+    local mgmt_db="$UAT_DIR/management-groups.db"
+    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$mgmt_db" ]; then
+        if sqlite3 "$mgmt_db" \
+            "INSERT OR IGNORE INTO management_group_roles
+                 (group_id, principal_type, principal_id, role_name)
+             VALUES ('000000000000', 'user', '${ADMIN_USER}', 'ITServiceOwner');" 2>/dev/null; then
+            ok "Seeded admin → root-group ITServiceOwner role (#1454; for RBAC-enabled mode)"
+        else
+            warn "Could not seed admin management-group role (#1454) — TAR scan still works with RBAC disabled (#1453)"
+        fi
+    else
+        warn "sqlite3 not found or $mgmt_db missing — skipping admin role seed (#1454)"
+    fi
+
     # ── 3. Gateway ──────────────────────────────────────────────────────
     echo ""
     echo "[3/4] Starting Erlang gateway..."

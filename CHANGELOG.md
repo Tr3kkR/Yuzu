@@ -7,12 +7,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
+### Fixed
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
 ### Added
 
-- **Network quality dashboard (`/network`).** A new top-level page surfaces
-  fleet-wide TCP network quality measured continuously on each endpoint from
-  kernel counters (no packet capture, no flow export) — a **device / local-link
-  health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
+- **Guardian — baseline-anchored per-device compliance REST.**
+  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+  returns one Baseline's deployed Guards each with the device's last reported verdict
+  (`compliant` | `drifted` | `errored` | `pending`), plus counts and a `last_updated`
+  freshness stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced
+  set, not the live member list); a not-yet-deployed Baseline returns `deployed:false`
+  with empty guards (consumer renders "No Baseline Deployed"), and member edits
+  appear only after a re-deploy. Designed for embedding Guardian compliance into an
+  external CMDB / ITSM CI record (e.g. ServiceNow).
+  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
+  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
+  device is in — a previously group-scoped token now gets `403` for out-of-scope
+  devices, where a flat global check would have passed them; global tokens are
+  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
+  layer as `auth.scoped_permission_required`). Path params are length-capped
+  (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
+  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
+  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
+- **Live-query bundles — one instruction → several plugin actions on one device,
+  collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
+  returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
+  (collate, `Response:Read`, returns `{complete, received, succeeded, expected,
+  steps[]}` in request order), with MCP parity via the `execute_bundle` /
+  `get_bundle_result` tools. Collapses the N round-trips of refreshing one device
+  (e.g. a ServiceNow CI sync) to a single dispatch plus a poll. The server expands
+  the bundle into N ordinary plugin commands under one `bundle-…` correlation id
+  and fans them out **async** (a slow step never withholds the others); **the agent
+  is unchanged** — it never sees a "bundle". `bundle_id` is deliberately not an
+  `execution_id` (a bundle is not a tracked execution; it is not in the live
+  executions drawer). `complete` means terminal, **not** success — check
+  `succeeded == expected` (an all-offline bundle completes with `succeeded=0`). Each
+  step emits its own `bundle.<plugin>.<action>` device-access audit
+  (`target_type=Agent`), so a bundle is exactly as auditable as the N executions it
+  replaces; collate enforces an ownership guard (a non-owner gets the same 404 as an
+  unknown id). Observable via `yuzu_bundle_{dispatched,collated,manifests,evictions}`
+  metrics plus a `yuzu_bundle_dispatch_duration_seconds` histogram (labelled by
+  surface). v1 bundle state is per-surface and in-memory; a
+  durable Postgres manifest for HA + cross-surface collation is a committed
+  follow-up (ADR-0011).
+- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+  populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
+  (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
+  code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
+  cached by file+mtime) and the loaded-image directory scrubbed of user-profile
+  prefixes before storage. Opt-in (`module_enabled`, default off; enabling takes
+  effect on the next collection tick — no restart). Signing uses the local
+  Authenticode chain **without online CRL/OCSP revocation checking** (no per-load
+  network I/O), so a revoked driver may read as `signed`; authoritative
+  revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
+  risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
+  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
+  Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
+  `docs/tar-module-loads.md`.
+- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
+  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  image-load activity (module name + directory + code-signing verdict) — the
+  DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
+  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
+  opt-in (`module_enabled`, default off). The process-stream ring is promoted to
+  a reusable `EventRing<T>` template (no behaviour change for the `process`
+  source), and `run_aggregation` is now data-driven over the capture-source
+  registry so a newly-registered source's rollups can no longer be silently
+  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
+- **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
+  The TAR `process` source on macOS now feeds from the Endpoint Security
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl
+  poll), reaching Windows-ETW parity: short-lived processes the poll missed are
+  captured, with accurate timestamps, ppid, image name, and owning user from the
+  audit token (names-only — no command line). Requires a **full Xcode SDK** build
+  (the Command Line Tools SDK omits `EndpointSecurity.framework`), the
+  `com.apple.developer.endpoint-security.client` entitlement, and root; the agent
+  automatically **falls back to the sysctl poll** when any of these is absent, and
+  **self-heals** to the poll if the ES client goes silent for an extended period
+  (a NOTIFY-only client has no liveness API — the idle threshold is deliberately
+  long to avoid abandoning a healthy stream on a quiet host). The active path is
+  reported by `tar.status` as `process_capture_method` (`endpoint_security` or
+  `polling`), alongside two drop counters — `process_stream_dropped` (userspace
+  ring overflow) and `process_stream_kernel_dropped` (Endpoint Security `seq_num`
+  gaps). The ES handler is `noexcept` and drops malformed / zero-pid / zero-ts
+  events, mirroring the ETW peer. **Boot gap:** processes that start *and* exit
+  before the agent opens its ES session are not captured — macOS has no
+  AutoLogger-equivalent backfill. **Fork gap:** the stream subscribes
+  `NOTIFY_EXEC`/`NOTIFY_EXIT` only, so a fork-without-exec child is invisible until
+  it exits (`NOTIFY_FORK` capture deferred, #1455). Both collectors now share a
+  cross-platform `ProcStreamCollector` interface. See `docs/user-manual/tar.md` and
+  `docs/darwin-compat.md`. **Not yet active in shipped builds:** the Apple
+  entitlement and the codesign/notarization release pipeline are pending
+  (#1455), so current macOS agents transparently use the **sysctl poll** until
+  that lands — confirm the live path per device via `process_capture_method` in
+  `tar.status` (`endpoint_security` = streaming, `polling` = fallback).
+
+- **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
+  collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
+  `/proc/uptime`) — the cross-platform reboot/uptime signal (Windows EventLog 6013 /
+  macOS boottime equivalent), reusing the same observation builder for an identical
+  shape across OSes. Unprivileged, reused obs_type → no server change.
+
+- **Linux server DEX: reliability signals from the systemd journal.** The Linux
+  DEX collector now reads the journal on a slow cadence (`journalctl --after-cursor
+  -o json`, cursor-checkpointed) and emits, on the **existing** obs_types,
+  `service.crashed` (a unit failed — the systemd "Failed with result" / unit-failed
+  journal messages),
+  `process.crashed` (a `systemd-coredump` entry — `SD_MESSAGE_COREDUMP`; coverage
+  depends on systemd-coredump being the active core handler), and `memory.exhausted`
+  (the kernel OOM-killer). Only safe fields leave the device — process comm, unit
+  name, signal/result code, never the raw message — and a flapping unit/process is
+  collapsed by a per-`(type, subject)` debounce. No new dependency: `journalctl` is
+  a runtime shell-out (no libsystemd), the source no-ops on non-systemd hosts, and
+  the agent account already has `systemd-journal`/`adm` read access. Reusing the
+  existing obs_types means a Linux server lights up the same `/dex` buckets as
+  Windows/macOS with no server change; obeys the same `--dex-disable` kill switch.
+
+- **Windows network-quality collection.** The agent now emits network facts on
+  Windows, not only Linux: device throughput via `GetIfTable2` and a system-wide
+  interval retransmit rate via `GetTcpStatisticsEx` (fed through the same
+  `RetransWindow` ΔΣretrans/ΔΣsegs model as Linux). RTT stays unimplemented on
+  Windows — per-connection smoothed RTT needs ESTATS
+  (`GetPerTcpConnectionEStats`: enable + admin + overhead), a deferred slice. Two
+  honest caveats: the Windows retransmit counter is **system-wide** (no
+  per-interface TCP MIB, so it includes loopback) and is **measurement-first,
+  unvalidated on Windows** (the netem separation-under-loss test was Linux-only).
+  The `/network` dashboard now populates on a Windows-only fleet, and Windows
+  throughput reaches the `yuzu_fleet_net_*` gauges. The net gauges carry an `os`
+  label (per-OS, never blended). The Windows **retransmit** rate is system-wide,
+  biased low, and not yet loss-validated, so it is **withheld from the
+  `yuzu_fleet_net_retrans_pct` gauge** (it still shows on the `/network` page +
+  REST, caveated) until #1465 validates it — the gauge carries loss-validated OSes
+  only (Linux today). The `os` gauge label is **allowlisted** to the values a real
+  agent emits (`windows`/`linux`/`darwin`, else `other`) so an agent-controlled tag
+  can't spray unbounded series (the same raw-tag exposure on
+  `yuzu_fleet_agents_by_arch`/`by_version` is tracked in #1472). See
+  `docs/user-manual/network.md` and `docs/user-manual/metrics.md`.
+- **OS capability matrix (`docs/os-capability-matrix.md`).** A per-capability ×
+  per-OS snapshot of what the agent collects/enforces on Windows, Linux, and
+  macOS, each row citing its in-code source of truth — so a platform gap (such as
+  the previously Linux-only network collector) is visible in one place. Flags the
+  durable follow-up: generate the matrix from the existing machine-readable per-OS
+  metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
+  signal catalogue) rather than hand-maintaining it.
+
+- **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
+  tab's cohort benchmarking compared each cohort against the whole fleet; it now
+  also does the direct **A-vs-B** diff (e.g. `image_type` vanilla vs layered, or
+  `model` X vs Y) — closing the cohort-vs-cohort half of the benchmarking gap. A
+  "Compare two cohorts" section with two cohort pickers auto-loads the top-two
+  comparison; each metric shows both cohorts' p50 plus the delta (A relative to
+  B). Pure render-time over existing heartbeat state — **zero new storage**, no
+  Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
+  `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
+  rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
+  perf across the fleet) is **not** included — per-app data is device-drill-only
+  (federated), not fleet render-time; it remains deferred. See
+  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+
+- **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
+  under DEX (the Network tab in the DEX sub-nav, also reachable directly at
+  `/network`), not a standalone top-level nav item — surfaces fleet-wide TCP
+  network quality measured continuously on each endpoint from kernel counters (no
+  packet capture, no flow export) — a **device / local-link health** view. Fleet-now cards show RTT p50/p90/max, the **interval retransmit
   rate**, and device throughput. The retransmit rate is ΔΣretransmits /
   ΔΣsegments smoothed over the last few heartbeats (recent-window loss), **not**
   the lifetime ratio — empirically the lifetime ratio is diluted to noise while
@@ -22,8 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the degraded classification and the device/app co-occurrence headline it gates
   are a later slice (the model stays wired but unfed). **Linux** agents report
   via netlink `INET_DIAG` (smoothed RTT + retransmit counters) + `/proc/net/dev`
-  throughput; **Windows and macOS emit nothing yet** (later slices — absent
-  metrics are omitted, never zeroed). Device-aggregate heartbeat tags
+  throughput; **Windows** reports throughput + retransmit (RTT deferred — see the
+  Windows entry above); **macOS emits nothing yet** (absent metrics are omitted,
+  never zeroed). Device-aggregate heartbeat tags
   `yuzu.net_{rtt_p50_ms,retrans_pct,throughput_bps}` (no per-destination data;
   gated by `--dex-disable`) and Prometheus gauges
   `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
@@ -42,6 +226,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within the unreleased cycle (absolute lifetime ratio → interval delta) and
   `yuzu.net_degraded` stopped being emitted — recalibrate any dev-build
   Prometheus alerts built on the earlier 4a semantics.
+
 - **Linux server DEX collector — `/proc` perf + `statvfs` storage signals.** Linux
   agents now emit `perf.cpu_sustained`, `perf.memory_pressure`, and `storage.low`
   into the DEX pipeline via privilege-light `/proc/stat`, `/proc/meminfo`, and
@@ -101,6 +286,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
+  `process_stream_kernel_dropped` added.** The Windows-specific
+  `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
+  meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
+  both platforms. A new `process_stream_kernel_dropped` key reports
+  **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
+  macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
+  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
+  `process_etw_dropped` will find no value after upgrade — update it to
+  `process_stream_dropped`.
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
   server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
   Postgres substrate move and generated a server with no database to talk to.
@@ -138,16 +333,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control with `--auth-lockout-threshold=0`. SSO/OIDC and API tokens are
   unaffected. See `docs/user-manual/upgrading.md` § Account lockout and the
   full feature entry under **Added** below.
+- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
+  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
+  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
+  container started from the published image is **encrypted + mutually
+  authenticated out of the box**: the server auto-generates a per-install CA and
+  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
+  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
+  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
+  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
+  **refuses to start** (exits non-zero) instead of silently verifying against the
+  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
+  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
+  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
+  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
+  the dashboard cert is signed by the per-install CA, so a browser shows an
+  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
+  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
+  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
+  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
+  with the `yuzu-pki` group baked into all three images, so the
+  different-uid containers can read the shared certs (the CA/server/HTTPS private
+  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
+  Native installs (deb/systemd, Windows installer) were already secure-by-default.
+  New secure reference composes: `docker-compose.reference.yml` (single server) and
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
+  gateway topology the **privileged server→gateway command plane (`:50063`) is now
+  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
+  CA-issued client cert, so a container with no Yuzu cert — including a compromised
+  agent — can no longer push commands to the fleet over that plane (previously it
+  was plaintext + unauthenticated). To run the old insecure posture, pass
+  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
+  "Secure-by-default deployment".
 - **Windows TAR process events no longer carry a command line (`cmdline` is
   empty).** With the Windows `process` source moving from the snapshot-diff poll
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
   names-only — the ETW start event carries no command line. Any dashboard, SIEM
   export, `tar.sql` query, or Guardian rule that read `cmdline` from
-  `$Process_*` on Windows now sees an empty string. Linux/macOS are unaffected
-  (the poll still captures command lines). This is intentional
-  (works-council / data-minimization posture) and not reversible by
-  configuration; `process_enabled=false` disables Windows process capture
-  entirely (ETW and poll) if required. Command-line redaction patterns
+  `$Process_*` on Windows now sees an empty string. **macOS process rows are now
+  names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
+  Added): the stream carries no command line, and the poll fallback (a Command Line
+  Tools SDK build, or a host without the ES entitlement/root) now blanks the
+  `proc_pidpath` image path it previously placed in `cmdline`. **Linux is
+  unaffected** (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not
+  reversible by configuration; `process_enabled=false` disables process capture
+  entirely (stream and poll) if required. Command-line redaction patterns
   consequently have no effect on Windows process rows (there is nothing to
   redact). The boot-window AutoLogger backfill is configured by the production
   InnoSetup installer (scoped to the `advanced` component) and by the developer
@@ -230,6 +462,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR source enable/disable is now corruption-resilient and reports a strict
+  state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
+  corrupt `tar.db` was opened and trusted, and since `get_config` returns the
+  caller default on a read failure, every `<source>_enabled` key read as its
+  default — silently re-enabling sources an operator had paused for forensic
+  preservation and defeating the #539 retention guard with no telemetry (#559);
+  (b) `tar.status` echoed the raw stored enable value, so a garbage value
+  (corruption, tampering, a downgrade/upgrade) was passed through instead of
+  flagged, and the collect-time `!= "false"` gate treated any non-`false` value
+  as enabled (#560). Fixes: `TarDatabase::open` runs `PRAGMA integrity_check` and
+  quarantines a corrupt DB aside (`tar.db.corrupt-<epoch>`, with its `-wal`/`-shm`
+  sidecars) before re-initialising a fresh one — failing **closed** if the corrupt
+  file cannot be moved aside rather than re-opening and trusting it; `status` now
+  emits a strict tri-state (`true`/`false`/`errored`); and the collect-time gate
+  (`source_enabled`) and `run_retention` both gate on that same canonical
+  tri-state, so a corrupt or tampered `<source>_enabled` value fails closed —
+  collection stops *and* the source's rows are preserved (not pruned).
+  Recovering such a source via `configure <source>_enabled=true` now also clears
+  its `paused_at`: the enable/disable transition canonicalises the previous value
+  before both legs, so an `errored`→`true` recovery no longer leaves a stale
+  `paused_at` that made `tar.status` report a now-collecting source as paused.
+- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
+  `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
+  on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
+  `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
+  was capturing via a kernel-event method when it was really polling. `do_status` now
+  emits `network_capture_method_effective` (the mechanism actually in force — always
+  `polling` today) alongside the configured `network_capture_method`, computed through a
+  single `effective_network_capture_method()` helper in the schema registry that is the
+  obvious place to wire the runtime check when a kernel-event collector lands. The
+  pre-staging affordance is preserved (the configured value is still stored and reported).
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
+  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
+  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
+- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
+  per-source enable check could commit one extra snapshot **after** the operator's
+  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
+  diffed against that stale baseline and emitted ghost "stopped" events for every
+  process/connection/service/user that had exited during the pause, breaking the
+  documented "re-enabling starts from a clean baseline" contract. The disable
+  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
+  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
+  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
+  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
+  disable is refused (the source stays enabled and `configure` returns an error)
+  rather than leaving a disabled source with a stale baseline. The
+  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
+  centralised in `diff_state_key()`, used by both the collectors and the disable path
+  so it cannot drift. **Operator-visible change:** the first collection cycle after a
+  re-enable emits a `started` event for every entity currently running/open (an
+  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
+  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
+  row, so the same race is closed for them too: disabling resets the in-memory
+  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
+  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
+  commits no post-disable row, and a re-enable re-baselines instead of emitting a
+  first row whose rate-average covers the entire paused window (a privacy concern on
+  the opt-in, default-off `procperf` per-application source).
+- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
+  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
+  on `tar.status` because every source defaulted its enabled flag to `true`.
+  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
+  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
+  transition from a single source of truth — so status, retention, and the
+  retention-paused list all agree the source starts disabled (and the first
+  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
+  an agent that never set these keys now reports `<source>_enabled|false` on
+  `tar.status` where it previously reported `true`; **no data collection
+  changes** (collection was already gated off), so this only affects automation
+  that parses `tar.status` to inventory active sources.
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
 - **macOS agents are no longer counted as Windows in DEX denominators.** The
   OS check used a substring match, and "darwin" contains "win" — so on mixed
   fleets every macOS agent inflated the Windows-online denominator behind the
@@ -253,6 +577,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth.lockout.cleared` (successful login or admin unlock); new metrics
   `yuzu_auth_lockout_applied_total` / `yuzu_auth_lockout_blocked_total`. Scope is
   local-password login only — OIDC/SSO and API tokens are unaffected.
+- **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
+  `KekProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
+  no store writes secret columns yet).** Secret columns in PostgreSQL are
+  AES-256-GCM-encrypted app-side under a fresh per-value DEK; the DEK is
+  wrapped by the install's KEK, which lives behind the `KekProvider` seam
+  (a dedicated interface implemented by `FileKeyProvider` alongside the CA
+  `KeyProvider` contract)
+  (`secrets-kek-v<N>.key`, 0600, generated on first codec init with a
+  temp-fsync-rename atomic write) and never enters the database. Identity-
+  bound AAD makes blobs non-relocatable across rows/columns (canonical
+  length-prefixed serialization; kek_version rides the wrap layer only, so
+  rotation re-wraps DEK headers without touching payloads). The `secrets`
+  schema's `kek_meta` table registers non-secret KEK fingerprints; boot
+  verification fails closed with distinct `kek_unresolvable` / `kek_corrupt`
+  operator tokens (backup-skew and dual-server misconfigurations refuse
+  loudly). KEK lifecycle: rotation (incremental, interruptible, per-row CAS),
+  `oldest_kek_version_in_use` completion signal, retirement refused while a
+  version is active or referenced with `retired_at` destruction evidence.
+  Audit verbs `kek.generated`/`kek.rotated`/`kek.retired`/
+  `secret.decrypt_failure` and per-store failure-class counters are defined
+  as wiring seams — no audit events or metrics are emitted until the
+  per-store migration PRs wire them. Operator guidance (the
+  DB+keys-dir restore-pairing invariant, rotation, break-glass) lives in
+  `docs/user-manual/server-admin.md` "Key management (secrets KEK)". The
+  gated stores (`auth` TOTP, `webhooks`, `offload_targets`, OIDC client
+  secret) adopt the codec as each migrates to Postgres.
+
 - **Guardian: Linux systemd service guard (observe-only).** The
   `service-status-change` Guardian Spark now arms on Linux hosts with systemd,
   watching each unit's `ActiveState` over sd-bus (`Subscribe` + `PropertiesChanged`
