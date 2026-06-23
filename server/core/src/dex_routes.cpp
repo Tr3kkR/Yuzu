@@ -402,6 +402,42 @@ std::string fmt_ms(double ms) {
     return std::format("{:.0f} ms", ms);
 }
 
+// Human form for a seconds-valued metric (uptime, unsynced clock).
+std::string fmt_secs(double s) {
+    if (s >= 86400.0)
+        return std::format("{:.1f} d", s / 86400.0);
+    if (s >= 3600.0)
+        return std::format("{:.1f} h", s / 3600.0);
+    if (s >= 60.0)
+        return std::format("{:.1f} min", s / 60.0);
+    return std::format("{:.0f} s", s);
+}
+
+// Human form for the per-event detail "Metric" cell. The metric column is
+// POLYMORPHIC — its unit depends on the obs_type (durations in ms, a residency %,
+// a count) — so a single formatter can't assume ms (that would mis-render a 75%
+// DRIPS residency as "75 ms"). Keep these sets in sync with the agent extractors'
+// `o.metric =` sites (dex_signal_catalog.cpp); a metric-bearing type missing here
+// degrades to a bare, fixed-notation number — never a WRONG unit, and never the
+// scientific-notation a bare {:g} flips to on a >16-min boot.
+std::string dex_metric_display(const std::string& obs_type, double metric) {
+    if (!(metric > 0.0))
+        return {}; // "no metric" — the caller renders an em-dash
+    if (obs_type == "os.modern_standby_exit")
+        return std::format("{:.0f}%", metric); // DRIPS residency %, not a duration
+    static constexpr std::string_view kMs[] = {
+        "os.boot",          "os.shutdown",          "os.standby",
+        "os.standby_degraded", "os.resume_report",  "shutdown.degraded",
+        "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
+        "boot.degraded_device"};
+    for (std::string_view t : kMs)
+        if (obs_type == t)
+            return fmt_ms(metric); // milliseconds → "12.3 s"
+    if (obs_type == "os.uptime_report" || obs_type == "os.time_unsynced")
+        return fmt_secs(metric); // seconds → humanized
+    return std::format("{:.0f}", metric); // counts + any future type: plain, no sci
+}
+
 // The per-row "What happened" cell of the device history: prefer the symbolic
 // name (+ reason when it adds information); os.boot rows show the duration.
 std::string history_detail(const GuardianObservationRow& r) {
@@ -2086,7 +2122,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
     row("Code", r.reason);
     row("Symbolic", r.symbolic);
     row("Component", r.component);
-    row("Metric", r.metric > 0.0 ? std::format("{:g}", r.metric) : std::string{});
+    row("Metric", dex_metric_display(r.obs_type, r.metric));
     row("Device", r.agent_id);
     row("Platform", r.platform);
     row("Event id", r.event_id);

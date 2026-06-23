@@ -568,6 +568,32 @@ TEST_CASE("DEX observation render: metric 0 → em-dash; unknown obs_type → es
     CHECK(html2.find("Metric</span><code>75</code>") != std::string::npos);
 }
 
+TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymorphic)",
+          "[dex][routes]") {
+    auto render = [](const std::string& obs_type, double metric) {
+        GuardianObservationRow r;
+        r.event_id = "e";
+        r.agent_id = "WS-1";
+        r.platform = "windows";
+        r.obs_type = obs_type;
+        r.metric = metric;
+        return render_dex_observation_fragment(r);
+    };
+    // DRIPS residency is a PERCENT, not a duration — must NOT render as "75 ms".
+    CHECK(render("os.modern_standby_exit", 75.0).find("Metric</span><code>75%</code>") !=
+          std::string::npos);
+    // Duration metrics humanize ms → s.
+    CHECK(render("os.boot", 64934.0).find("Metric</span><code>64.9 s</code>") != std::string::npos);
+    // A long boot never flips to scientific notation (the bare-{:g} hazard).
+    const auto big = render("os.boot", 1200000.0);
+    CHECK(big.find("e+0") == std::string::npos);
+    CHECK(big.find("Metric</span><code>1200.0 s</code>") != std::string::npos);
+    // Seconds-valued (uptime) humanizes; counts + uncatalogued render as plain integers.
+    CHECK(render("os.uptime_report", 90000.0).find("Metric</span><code>1.0 d</code>") !=
+          std::string::npos);
+    CHECK(render("hw.battery_error", 2.0).find("Metric</span><code>2</code>") != std::string::npos);
+}
+
 TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
