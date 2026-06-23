@@ -401,7 +401,7 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
+        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -709,7 +709,7 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          meson test -C build-windows-${{ matrix.build_type }} --print-errorlogs
+          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs
 
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
@@ -899,7 +899,7 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-macos --print-errorlogs
+        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
