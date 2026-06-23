@@ -1734,6 +1734,11 @@ void RestApiV1::register_routes(
         R"(/api/v1/users/([^/]+)/unlock)",
         [auth_fn, perm_fn, audit_fn, step_up_fn, lockout_clear_fn](const httplib::Request& req,
                                                                    httplib::Response& res) {
+            // Brand-new route — emit the structured A4 error envelope
+            // (correlation_id / retry_after_ms / remediation) so new code moves
+            // the REST surface toward the agentic-first idiom.
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
             if (!perm_fn(req, res, "UserManagement", "Write"))
                 return;
             auto session = auth_fn(req, res);
@@ -1743,7 +1748,8 @@ void RestApiV1::register_routes(
                 // sec-M1: an empty caller username would mis-attribute the
                 // audit row; never proceed past it.
                 res.status = 500;
-                res.set_content(error_json("session has empty username", 500), "application/json");
+                res.set_content(detail::error_json_a4(500, "session has empty username", cid),
+                                "application/json");
                 return;
             }
             // High-risk admin action on another principal's access state —
@@ -1752,13 +1758,20 @@ void RestApiV1::register_routes(
                 return;
             if (!lockout_clear_fn) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "lockout subsystem unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "account lockout requires the persistent auth.db; start "
+                                          "the server with --data-dir"),
+                    "application/json");
                 return;
             }
             const auto username = req.matches[1].str();
             if (username.empty() || !is_valid_username(username)) {
                 res.status = 400;
-                res.set_content(error_json("invalid username format", 400), "application/json");
+                res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                      "username must match the allowed format"),
+                                "application/json");
                 return;
             }
             // Audit emission wrapper — parity with the sessions-revoke route
@@ -1787,7 +1800,8 @@ void RestApiV1::register_routes(
                 // in the CC6.3 evidence chain.
                 if (!try_audit("error", "admin_unlock"))
                     res.set_header("Sec-Audit-Failed", "true");
-                res.set_content(error_json("failed to clear lockout", 500), "application/json");
+                res.set_content(detail::error_json_a4(500, "failed to clear lockout", cid),
+                                "application/json");
                 return;
             }
             const bool audit_emitted = try_audit("ok", "admin_unlock");

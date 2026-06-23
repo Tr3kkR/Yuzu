@@ -21,8 +21,21 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 This release adds account lockout for failed **local-password** logins (SOC 2
 CC6.3) and it is **active by default** (`--auth-lockout-threshold=5`,
-`--auth-lockout-window-secs=900`). No config change is required to opt in — an
-existing deployment gains the behavior the instant you start the new build.
+`--auth-lockout-window-secs=900`) **on any deployment that runs with a
+persistent auth database** — i.e. one started with `--data-dir`.
+
+> **⚠️ `--data-dir` is required.** Lockout state lives in the persistent
+> `auth.db`, which only exists when the server is started with `--data-dir`.
+> The shipped **container images and compose files** pass `--data-dir
+> /var/lib/yuzu`, so lockout genuinely is on by default there. The
+> **systemd/.deb** unit now also passes `--data-dir /var/lib/yuzu` (added in
+> this release) — but if you run a **custom invocation** without `--data-dir`,
+> the server falls back to in-memory auth and lockout (and session persistence)
+> is silently **off**. The server logs a loud startup `WARN` in that state.
+> Set `--data-dir` to make the control active.
+
+No further config change is required to opt in — a deployment that already runs
+with `--data-dir` gains the behavior the instant you start the new build.
 
 What changes on upgrade:
 
