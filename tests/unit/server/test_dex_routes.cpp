@@ -588,6 +588,10 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
           std::string::npos);
     CHECK(render("os.modern_standby_exit", 0.0).find("Metric</span><code>&mdash;</code>") ==
           std::string::npos);
+    // A forged negative DRIPS can't arise (extractor clamps [0,100]) but pins the
+    // new guard's negative arm → em-dash, never a bogus "-1%".
+    CHECK(render("os.modern_standby_exit", -1.0).find("Metric</span><code>&mdash;</code>") !=
+          std::string::npos);
     // Duration metrics humanize ms → s.
     CHECK(render("os.boot", 64934.0).find("Metric</span><code>64.9 s</code>") != std::string::npos);
     // A long boot never flips to scientific notation (the bare-{:g} hazard).
