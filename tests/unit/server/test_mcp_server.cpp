@@ -568,6 +568,18 @@ struct McpTestServer {
     /// Default empty keeps existing tests on the unavailable path.
     yuzu::server::NetPerfFn net_perf_fn_for_test{};
 
+    /// ADR-0011: optionally wire a ResponseStore so the live-query bundle tools
+    /// (execute_bundle / get_bundle_result) can collate. Default nullptr keeps
+    /// existing tests on the unavailable path.
+    yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
+    /// Auth identity the mock auth_fn returns. Read at CALL time (not install
+    /// time) so a test can change the principal between two calls — used to drive
+    /// the bundle collate IDOR path (dispatch as owner, collate as a stranger).
+    /// Defaults preserve the historical "admin test-user" behavior.
+    std::string mock_username{"test-user"};
+    yuzu::server::auth::Role mock_role{yuzu::server::auth::Role::admin};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
@@ -615,8 +627,8 @@ private:
                 return std::nullopt;
             }
             yuzu::server::auth::Session s;
-            s.username = "test-user";
-            s.role = yuzu::server::auth::Role::admin;
+            s.username = mock_username;
+            s.role = mock_role;
             s.mcp_tier = mock_tier;
             return s;
         };
@@ -657,7 +669,7 @@ private:
             /*rbac_store=*/nullptr,
             /*instruction_store=*/nullptr,
             /*execution_tracker=*/execution_tracker_for_test,
-            /*response_store=*/nullptr,
+            /*response_store=*/response_store_for_test,
             /*audit_store=*/nullptr,
             /*tag_store=*/nullptr,
             /*inventory_store=*/nullptr,
@@ -2257,4 +2269,241 @@ TEST_CASE("MCP CA: revoke_certificate on supervised tier is approval-gated (not 
     // Destructive op must NOT execute without approval: cert stays valid, no CRL.
     CHECK_FALSE(store.is_revoked("BEEF"));
     CHECK(ts.crl_publish_calls_ == 0);
+}
+
+// ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────
+// execute_bundle (async dispatch) + get_bundle_result (collate) wrap the SAME
+// BundleOrchestrator as POST/GET /api/v1/bundles — MCP/REST parity by
+// construction. The orchestration logic is covered exhaustively in
+// test_bundle_orchestrator.cpp; these cases assert the MCP wiring: tool
+// registration via tools/call, per-step dispatch fan-out + audit verbs, the
+// collated result, the ownership (IDOR) guard, and validation errors.
+
+namespace {
+// Parse the JSON payload carried in result.content[0].text of an MCP tool reply.
+nlohmann::json bundle_payload(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+
+bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
+    for (const auto& e : log)
+        if (e == entry)
+            return true;
+    return false;
+}
+
+// A fake per-command dispatcher: returns a deterministic command_id per
+// (plugin,action), one agent reached.
+yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
+    return [](const std::string& plugin, const std::string& action,
+              const std::vector<std::string>&, const std::string&,
+              const std::unordered_map<std::string, std::string>&,
+              const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-" + plugin + "-" + action, 1};
+    };
+}
+} // namespace
+
+TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id",
+          "[mcp][bundle]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    struct Call {
+        std::string plugin, action, correlation;
+    };
+    std::vector<Call> calls;
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch([&calls](const std::string& plugin, const std::string& action,
+                                    const std::vector<std::string>&, const std::string&,
+                                    const std::unordered_map<std::string, std::string>&,
+                                    const std::string& correlation) -> std::pair<std::string, int> {
+        calls.push_back({plugin, action, correlation});
+        return {"cmd-" + plugin + "-" + action, 1};
+    });
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
+    REQUIRE(res);
+    auto p = bundle_payload(res);
+    auto exec_id = p["bundle_id"].get<std::string>();
+    CHECK(exec_id.rfind("bundle-", 0) == 0); // bundle- prefix → notify_exec_tracker skips it
+    CHECK(p["expected"] == 2);
+    CHECK(p["agent_id"] == "agent-1"); // REST/MCP response parity (governance arch-S2)
+
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[0].plugin == "os_info");
+    CHECK(calls[0].correlation == exec_id); // all steps share the correlation id
+    CHECK(calls[1].correlation == exec_id);
+
+    // Per-step device-access audit verbs (governance F1) + the tool-level audit.
+    CHECK(audit_has(ts.audit_log, "bundle.os_info.uptime|dispatched"));
+    CHECK(audit_has(ts.audit_log, "bundle.os_info.os_name|dispatched"));
+    CHECK(audit_has(ts.audit_log, "mcp.execute_bundle|success"));
+}
+
+TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp][bundle]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    auto inject = [&](const std::string& cmd, const std::string& out) {
+        yuzu::server::StoredResponse r;
+        r.execution_id = exec_id;
+        r.instruction_id = cmd;
+        r.agent_id = "agent-1";
+        r.status = 1;
+        r.output = out;
+        r.timestamp = 100;
+        store.store(r);
+    };
+    inject("cmd-os_info-os_name", "os_name|Win");
+    inject("cmd-os_info-uptime", "up 3d");
+
+    auto get = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})");
+    auto p = bundle_payload(get);
+    CHECK(p["complete"] == true);
+    CHECK(p["received"] == 2);
+    REQUIRE(p["steps"].size() == 2);
+    CHECK(p["steps"][0]["action"] == "uptime"); // request order, not arrival
+    CHECK(p["steps"][0]["output"] == "up 3d");
+}
+
+TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    // Owner is the default admin "test-user".
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+
+    // A different, non-admin principal → error (indistinguishable from not-found).
+    ts.mock_username = "mallory";
+    ts.mock_role = yuzu::server::auth::Role::user;
+    auto denied = nlohmann::json::parse(ts.call(get_call)->body);
+    CHECK(denied.contains("error"));
+
+    // Owner still gets it.
+    ts.mock_username = "test-user";
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    auto ok = nlohmann::json::parse(ts.call(get_call)->body);
+    CHECK(ok.contains("result"));
+}
+
+TEST_CASE("MCP execute_bundle validation errors", "[mcp][bundle][unhappy]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto is_err = [&](const std::string& body) {
+        return nlohmann::json::parse(ts.call(body)->body).contains("error");
+    };
+    // missing agent_id
+    CHECK(is_err(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"execute_bundle","arguments":{"steps":[{"plugin":"os_info","action":"uptime"}]}}})"));
+    // empty steps
+    CHECK(is_err(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[]}}})"));
+    // unsafe identifier
+    CHECK(is_err(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":87,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"p p","action":"x"}]}}})"));
+}
+
+TEST_CASE("MCP bundle tools error when the orchestrator is unwired", "[mcp][bundle][unhappy]") {
+    // governance QE-N2: no response store wired → bundle_orch is null → both
+    // tools must return a structured error, not crash.
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto e1 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]}}})")
+            ->body);
+    CHECK(e1.contains("error"));
+    auto e2 = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"get_bundle_result","arguments":{"bundle_id":"bundle-x"}}})")
+            ->body);
+    CHECK(e2.contains("error"));
+}
+
+TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp][bundle]") {
+    // governance QE-S2 (MCP surface).
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch([](const std::string&, const std::string&, const std::vector<std::string>&,
+                              const std::string&,
+                              const std::unordered_map<std::string, std::string>&,
+                              const std::string&) -> std::pair<std::string, int> {
+        return {std::string{}, 0}; // reached no agent
+    });
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto bid = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto get = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bid + R"("}}})");
+    auto p = bundle_payload(get);
+    CHECK(p["complete"] == true);
+    CHECK(p["succeeded"] == 0);
+    REQUIRE(p["steps"].size() == 1);
+    CHECK(p["steps"][0]["state"] == "dispatch_failed");
+}
+
+TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope throw)",
+          "[mcp][bundle]") {
+    // governance review #1593 blocker 1: on MCP the strict-dump throw ESCAPED the
+    // JSON-RPC envelope; with the replace handler collate must return a result.
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"files","action":"read"}]}}})");
+    auto bid = bundle_payload(disp)["bundle_id"].get<std::string>();
+    yuzu::server::StoredResponse r;
+    r.execution_id = bid;
+    r.instruction_id = "cmd-files-read";
+    r.agent_id = "a";
+    r.status = 1;
+    r.output = std::string(1, '\xff') + "binary";
+    r.timestamp = 100;
+    store.store(r);
+    auto resp = ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        bid + R"("}}})");
+    auto body = nlohmann::json::parse(resp->body);
+    REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
+    auto p = bundle_payload(resp);
+    CHECK(p["steps"][0]["state"] == "responded");
 }

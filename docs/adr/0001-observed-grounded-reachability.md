@@ -6,6 +6,8 @@ owner: "@lesault (Andy Younie)"
 
 # 0001 — The reachability graph is observed-grounded, not potential-based
 
+> **Implementation status (2026-06-18 conformance audit):** Accepted decision; the reachability/attack-path engine is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
+
 ## Context
 
 The vulnerability engine's differentiator is attack-path-aware prioritisation, which needs

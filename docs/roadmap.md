@@ -130,7 +130,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | Open |
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
 | | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
-| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
+| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Shipped** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
 | **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** (PRs 1-2 shipped) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open (gated on 16.A soak) |
 | | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
@@ -154,9 +154,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 12: Remaining Agent Capabilities | 0 | 13 | 13 | 0% |
 | 13: Security Hardening & Operational Polish | 0 | 5 | 5 | 0% |
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
-| 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
+| 15: TAR Dashboard & Scope Walking | 1 | 7 | 8 | 13% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
-| **Total** | **74** | **52** | **126** | **59%** |
+| **Total** | **75** | **51** | **126** | **60%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -1540,13 +1540,18 @@ Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep ever
 **Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
 
 ### Issue 15.H: TAR Process Tree Viewer
-**Capability:** new (forensic) | **Scope:** TAR plugin + Server (renderer) | **Status:** Open (gated on agent service-install hardening readiness)
+**Capability:** new (forensic) | **Scope:** Server (engine + routes + UI) | **Status:** **Shipped** 2026-06-18 ([#1551](https://github.com/Tr3kkR/Yuzu/pull/1551)) — as-built: local-TAR-data-only, deviates from the original seed-snapshot design below.
 
-`tar.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `tar_plugin.cpp` `load_redaction_patterns`.
+**As-built (shipped).** Reconstructs a per-host process tree entirely from that host's **local TAR warehouse** (`$Process_Live` + `$TCP_Live`, via the read-only `tar.sql` action) — **no seed**, no `/proc`/`CreateToolhelp32Snapshot`/`proc_listallpids` walk, no server-side mirror, no live probe. The tree is built server-side in C++ from the flat event stream (recursive CTEs are blocked on the agent). Collapsible two-column tree + sticky detail panel, inline remote-`IP:port` per row, same-name sibling grouping, client-side All/Running/Exited + anomalies-only + text filters, and a name-based suspicious parent→child spawn heuristic. Timescale is a preset (On boot · On agent install · Last minute · 10m · hour · day) or a custom From/To (UTC) window — **not** `?as_of`. Honest in-page limitations: no seed → aged-out-of-the-live-cap processes may not appear; **Windows is names-only** (ETW Kernel-Process — no path/cmdline; populated on Linux/macOS); "On boot"/"On agent install" are TAR-derived proxies. `Infrastructure:Read` to view; reconstruction dispatches a live `tar.sql` so it also requires `Execution:Execute` + device scope; the detail cache is keyed by a CSPRNG token bound to the originating operator. Audit verbs `tar.process_tree.read` (dispatch + success + `csprng_unavailable` failure) and `tar.process_tree.detail`.
 
-Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder (`docs/yuzu-guardian-windows-implementation-plan.md` and successors). The viewer ships with honest "observation window" badging; the hardening track does not block this issue.
+**Deliberate deviation.** The original design (next paragraph) reconstructed from a seed snapshot taken at agent install / first start, which depended on the agent service-install-hardening track. The as-built drops that dependency by reading only retained TAR events; the honesty banner states the resulting completeness limit. REST/MCP parity (`GET /api/v1/tar/process-tree/{id}`) is a tracked follow-up ([#1562](https://github.com/Tr3kkR/Yuzu/issues/1562)).
 
-**Files:** `agents/plugins/tar/src/tar_plugin.cpp` (new `do_process_tree`), new `agents/plugins/tar/src/tar_process_tree_collector.{cpp,hpp}` (cross-platform walks), `server/core/src/dashboard_routes.cpp` (renderer), new `server/core/src/tar_process_tree_reconstruct.{cpp,hpp}`. Design: `docs/tar-dashboard.md` §5.
+<details><summary>Original seed-based design (superseded — kept for history)</summary>
+
+`tar.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `tar_plugin.cpp` `load_redaction_patterns`. Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder.
+</details>
+
+**Files (as-built):** `server/core/src/tar_process_tree.{hpp,cpp}` (pure engine), `server/core/src/tar_tree_routes.{hpp,cpp}` (routes), `server/core/src/tar_page_ui.cpp` (frame wiring), `tests/unit/server/test_tar_process_tree.cpp` + `test_tar_tree_routes.cpp`. Design: `docs/tar-dashboard.md` §5.
 
 ---
 
@@ -1853,7 +1858,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 | 12: Agent Capabilities | 13 | 13 |
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
-| 15: TAR Dashboard & Scope Walking | 8 | 8 |
+| 15: TAR Dashboard & Scope Walking | 7 | 8 |
 | 16: System Guardian (Real-Time GS) | 3 | 10 |
 | **Total** | **126** | **159** |
 

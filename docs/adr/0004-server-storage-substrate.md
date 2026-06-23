@@ -11,6 +11,8 @@ generalised-by: ADR-0006 — the 2026-06-09 widening made Postgres the standard 
 
 # 0004 — Introduce server-side PostgreSQL; agent SQLite stays the federated edge warehouse
 
+> **Implementation status (2026-06-18 conformance audit):** The server-side PostgreSQL substrate this ADR introduced is **shipped** (generalised by ADR-0006/0007/0008; the server now runs on Postgres and fails closed without it — behaviorally verified). The reachability-graph–specific application (scored graph + pgvector identity matching) is **not yet built** — spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
+
 ## Context
 
 Yuzu's stated architecture is "SQLite for embedded storage," and the server already runs

@@ -71,6 +71,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -227,21 +228,12 @@ struct ScopedKeyZero {
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
-// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
-// every control byte and structural delimiter (space, '=', ',') with '_'; the
-// identity is preserved verbatim in its own audit columns (principal/target_id)
-// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
-[[nodiscard]] inline std::string audit_token(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
-            out.push_back('_');
-        else
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
+// #1290 adds (field confusion), and a CRLF could split the audit line. The
+// canonical implementation now lives in web_utils.hpp so the same neutralizer
+// guards every structured-audit call site (here + tar_tree_routes.cpp) without
+// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// spellings below resolving unchanged.
+using yuzu::server::audit_token;
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -807,13 +799,11 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Create gateway management client for command forwarding
-        if (!cfg_.gateway_command_address.empty()) {
-            gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address,
-                                                   grpc::InsecureChannelCredentials());
-            gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-            spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
-        }
+        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // built in run(), AFTER bootstrap_default_certs() — for a default-cert
+        // install the client cert/key paths are empty here and only populated by
+        // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
+        // pre-bootstrap-empty reason the per-agent mTLS wiring is deferred to run().
 
         // Load auto-approve policies
         auto approve_path = cfg_.db_dir() / "auto-approve.cfg";
@@ -2018,7 +2008,7 @@ public:
             spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
-                                  cfg_.cert_sans)) {
+                                  cfg_.cert_sans, cfg_.cert_group)) {
             spdlog::error("default certificates were required but generation failed");
             default_certs_failed_ = true;
             return;
@@ -2122,6 +2112,38 @@ public:
                           "--no-default-certs to opt out.");
             startup_failed_ = true;
             return;
+        }
+
+        // Gateway command-forwarding client — built HERE (post-bootstrap) so the
+        // mutual-TLS dial sees the now-populated server leaf + CA (HIGH-2 #1314).
+        // When TLS is on, dial the gateway's privileged command plane over MUTUAL
+        // TLS (server presents its leaf, verifies the gateway against the install
+        // CA). The gateway's mgmt listener requires the client cert, so an
+        // unauthenticated container — including a compromised agent with no
+        // CA-issued cert — can no longer push commands to the fleet. Only a
+        // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
+        if (!cfg_.gateway_command_address.empty()) {
+            std::shared_ptr<grpc::ChannelCredentials> gw_creds;
+            if (cfg_.tls_enabled) {
+                gw_creds = build_gateway_command_credentials();
+                if (!gw_creds)
+                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
+                                  "build mutual-TLS credentials.",
+                                  cfg_.gateway_command_address);
+            } else {
+                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.",
+                             cfg_.gateway_command_address);
+                gw_creds = grpc::InsecureChannelCredentials();
+            }
+            if (gw_creds) {
+                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
+                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
+                spdlog::info("Gateway command forwarding enabled: {} ({})",
+                             cfg_.gateway_command_address,
+                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+            }
         }
 
         // PKI PR3: per-agent mTLS issuance + enforcement, wired AFTER the
@@ -2847,6 +2869,68 @@ private:
         for (auto& kc : ssl_opts.pem_key_cert_pairs) {
             yuzu::secure_zero(kc.private_key);
         }
+        return creds;
+    }
+
+    // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
+    // plane (ManagementService at --gateway-command-addr). The gateway's mgmt
+    // listener is the PRIVILEGED command-fan-out plane; without mTLS it is an
+    // unauthenticated fleet-RCE surface reachable by any container that can route
+    // to it (incl. a compromised agent). Here the server PRESENTS its own leaf as
+    // the client cert and VERIFIES the gateway against the install CA, so the
+    // gateway can require a client cert (strict mTLS) and reject anyone who can't
+    // present a CA-issued cert. Returns nullptr (fail-closed — caller disables
+    // command forwarding) if the required cert material is missing/unreadable.
+    //
+    // The two directions are NOT symmetric. Server→gateway (here): grpc verifies
+    // the gateway's identity by SNI/SAN against the dialled host, so the server
+    // talks only to the real gateway. Gateway→server (the listener's acceptance
+    // policy): verify_peer authenticates to the CA, NOT to a specific identity.
+    //
+    // Residual (tracked, PKI-ladder): because the gateway side authenticates to
+    // the CA only, ANY holder of ANY CA-issued cert+key passes — an enrolled
+    // agent's stolen per-agent leaf, or the default-server/default-gateway leaves
+    // (0600, need filesystem compromise to extract). There is also no CRL/OCSP
+    // check on this path yet, so a revoked-but-stolen leaf still passes. Pinning
+    // the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) + mgmt
+    // revocation is the cryptographic-identity-binding item that lands with the
+    // QUIC-era rework; through-gateway identity stays app-layer until then. mTLS
+    // still closes the far larger hole: the plaintext, no-cert-required plane.
+    [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
+    build_gateway_command_credentials() const {
+        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
+                          "client cert/key to present for mutual TLS — command forwarding "
+                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
+            return nullptr;
+        }
+        if (cfg_.tls_ca_cert.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
+                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
+            return nullptr;
+        }
+        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
+            return nullptr;
+        }
+        grpc::SslCredentialsOptions ssl_opts;
+        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
+        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
+        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
+        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
+            ssl_opts.pem_private_key.empty()) {
+            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
+                          "command forwarding DISABLED (fail-closed).");
+            yuzu::secure_zero(ssl_opts.pem_private_key);
+            return nullptr;
+        }
+        auto creds = grpc::SslCredentials(ssl_opts);
+        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
+        // key is the sensitive one, the CA/cert are public, but zeroing all three
+        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
+        // metadata resident longer than needed.
+        yuzu::secure_zero(ssl_opts.pem_private_key);
+        yuzu::secure_zero(ssl_opts.pem_cert_chain);
+        yuzu::secure_zero(ssl_opts.pem_root_certs);
         return creds;
     }
 
@@ -8386,6 +8470,34 @@ private:
             },
             audit_fn);
 
+        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
+        // untracked dispatch (execution_id="" → not in the executions drawer, like the
+        // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
+        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
+        // agent). Per-host only; data from the agent's local tar.db only.
+        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
+        tar_tree_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -8799,7 +8911,14 @@ private:
             // N1: the shared network-quality snapshot provider — the same closure
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
-            net_perf_fn);
+            net_perf_fn,
+            // Baseline-anchored per-device Guardian status route (trailing optional deps).
+            baseline_store_.get(),
+            // Per-device-scoped permission (management-group aware) for that route —
+            // the SAME named closure DeviceRoutes already uses for the dashboard
+            // Guardian device lens (defined once above), not a re-inlined duplicate
+            // that two copies would have to keep in sync.
+            scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -8914,7 +9033,10 @@ private:
                 // three surfaces — fragments, REST, MCP).
                 dex_perf_fn,
                 // N1: the shared network-quality provider (fragments + REST + MCP).
-                net_perf_fn);
+                net_perf_fn,
+                // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
+                // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
+                &metrics_);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -9238,6 +9360,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

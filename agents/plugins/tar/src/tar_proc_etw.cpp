@@ -11,30 +11,8 @@
 
 #include "tar_proc_etw.hpp"
 
-#include <utility>
-
-namespace yuzu::tar {
-
-// ── ProcEventRing (cross-platform) ───────────────────────────────────────────
-
-bool ProcEventRing::push(ProcEvent ev) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (buf_.size() >= cap_) {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    buf_.push_back(std::move(ev));
-    return true;
-}
-
-std::vector<ProcEvent> ProcEventRing::drain() {
-    std::vector<ProcEvent> out;
-    std::lock_guard<std::mutex> lk(mu_);
-    out.swap(buf_);
-    return out;
-}
-
-} // namespace yuzu::tar
+// ProcEventRing / ProcEvent live in tar_proc_stream.{hpp,cpp}, shared with the
+// macOS Endpoint Security collector.
 
 #ifdef _WIN32
 
@@ -57,6 +35,7 @@ std::vector<ProcEvent> ProcEventRing::drain() {
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <utility> // std::move (used below; no longer pulled in via tar_proc_stream)
 #include <vector>
 
 #pragma comment(lib, "tdh.lib")
