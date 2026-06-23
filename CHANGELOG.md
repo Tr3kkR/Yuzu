@@ -73,6 +73,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface). v1 bundle state is per-surface and in-memory; a
   durable Postgres manifest for HA + cross-surface collation is a committed
   follow-up (ADR-0011).
+- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+  populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
+  (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
+  code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
+  cached by file+mtime) and the loaded-image directory scrubbed of user-profile
+  prefixes before storage. Opt-in (`module_enabled`, default off; enabling takes
+  effect on the next collection tick — no restart). Signing uses the local
+  Authenticode chain **without online CRL/OCSP revocation checking** (no per-load
+  network I/O), so a revoked driver may read as `signed`; authoritative
+  revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
+  risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
+  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
+  Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
+  `docs/tar-module-loads.md`.
 - **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
   `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
@@ -437,6 +452,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
+  `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
+  on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
+  `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
+  was capturing via a kernel-event method when it was really polling. `do_status` now
+  emits `network_capture_method_effective` (the mechanism actually in force — always
+  `polling` today) alongside the configured `network_capture_method`, computed through a
+  single `effective_network_capture_method()` helper in the schema registry that is the
+  obvious place to wire the runtime check when a kernel-event collector lands. The
+  pre-staging affordance is preserved (the configured value is still stored and reported).
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
+  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
+  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
 - **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
   `tar.configure <source>_enabled=false` wrote the disable flag without serialising
   against the collectors, so a `collect_fast`/`collect_slow` cycle already past its

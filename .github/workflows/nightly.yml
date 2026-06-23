@@ -115,7 +115,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build gcc-15 g++-15 \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev
+              bison flex libsystemd-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -248,7 +248,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build gcc-15 g++-15 \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev
+              bison flex libsystemd-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -499,7 +499,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build gcc-15 g++-15 \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev
+              bison flex libsystemd-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           # requirements-ci.txt is hash-pinned (includes gcovr for the
           # coverage report).

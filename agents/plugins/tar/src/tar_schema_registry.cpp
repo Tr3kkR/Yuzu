@@ -476,13 +476,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
             // paused_at transition all agree the source starts disabled.
             .default_enabled = false,
             .os_support = {
-                {"windows", OsSupportStatus::kPlanned, "etw",
-                 "Microsoft-Windows-Kernel-Process image-load events (image "
-                 "keyword 0x40, event ID 5) on the SAME ETW session the process "
-                 "source already runs; driver loads surface as kernel image-loads. "
-                 "CodeIntegrity/Operational (3033/3034) overlays signing verdicts. "
-                 "Signing verified out-of-band at drain (WinVerifyTrust, cached). "
-                 "Wired in M2/M3."},
+                {"windows", OsSupportStatus::kSupported, "etw",
+                 "Microsoft-Windows-Kernel-Process image-load events (IMAGE "
+                 "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
+                 "loads surface as kernel image-loads (System pid). Signing is "
+                 "verified out-of-band at drain (WinVerifyTrust + CryptQueryObject "
+                 "signer, cached); module_dir is scrubbed of user-profile prefixes "
+                 "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
+                 "overlay is M3."},
                 {"linux", OsSupportStatus::kPlanned, "auditd",
                  "Kernel-module loads via auditd init_module/finit_module (kmod "
                  "only in v1; /proc/modules seed). Shared-object (.so) loads need "
@@ -642,6 +643,20 @@ std::vector<std::string> accepted_capture_methods(std::string_view source_name) 
     }
     std::sort(methods.begin(), methods.end());
     return methods;
+}
+
+std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
+    // Polling is the only wired network capture mechanism on every OS today.
+    // `enumerate_connections()` (the collect_fast network leg) always polls,
+    // regardless of the stored `network_capture_method`: the per-OS platform
+    // APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling implementation,
+    // and the kPlanned kernel-event methods (etw / endpoint_security) are
+    // accepted for pre-staging but not yet collected. So every configured value
+    // maps to an effective mechanism of "polling". When a kernel-event collector
+    // lands, branch on `configured` (and the live session state, as the process
+    // collector does with `etw_active_`) here -- this is the single source of
+    // truth the `status` action reports (issue #1528).
+    return "polling";
 }
 
 std::string generate_warehouse_ddl() {

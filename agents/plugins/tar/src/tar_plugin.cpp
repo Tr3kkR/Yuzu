@@ -24,6 +24,7 @@
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
 #include "tar_proc_stream.hpp"
+#include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_perf.hpp"
@@ -418,6 +419,21 @@ public:
             spdlog::info("TAR: no gap-free process stream active — using snapshot-diff poll");
         }
 
+        // M2: seed the opt-in module_enabled key so the configure / retention /
+        // retention-paused-list machinery (which default a MISSING key to ENABLED
+        // via source_enabled) agrees with the collector's explicit default-off.
+        if (db_->get_config("module_enabled", "").empty()) {
+            db_->set_config("module_enabled", "false");
+        }
+#ifdef _WIN32
+        // Construct the Windows ETW image-load collector; the session is STARTED
+        // LAZILY by collect_fast on the first tick where module_enabled is true (so
+        // enabling takes effect on the next tick — no restart — matching
+        // procperf/netqual, and a transient session death auto-re-arms). Null on
+        // non-Windows (M4/M5 add macOS Endpoint Security, M6 adds Linux auditd).
+        module_stream_ = std::make_unique<yuzu::tar::ModuleEtwCollector>();
+#endif
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
         return {};
@@ -441,6 +457,11 @@ public:
                 // macOS: es_unsubscribe_all + es_delete_client (blocks until any
                 // in-flight handler returns, so no handler touches the ring after).
                 proc_stream_->stop();
+            }
+            if (module_stream_) {
+                // Windows: closes the module-load ETW session + joins its
+                // consumer thread (idempotent; safe if never started).
+                module_stream_->stop();
             }
         }
         db_.reset();
@@ -510,6 +531,23 @@ private:
     // High-water mark of ProcEventRing::dropped() already logged, so the overflow
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
+
+    // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
+    // Unlike the always-on process stream, this is OPT-IN (module_enabled,
+    // default off) and high-volume, so the session is started LAZILY by
+    // collect_fast on the first tick where module_enabled is true (enabling takes
+    // effect on the next tick — no restart — and a transient session death
+    // auto-re-arms). When active, collect_fast drains it; there is NO poll
+    // fallback (no snapshot-diff equivalent for image loads). Drained only under
+    // collect_mu_.
+    std::unique_ptr<yuzu::tar::ImageStreamCollector> module_stream_;
+    std::atomic<bool> module_stream_active_{false};
+    std::vector<yuzu::tar::ModuleEvent> pending_module_evs_;
+    std::uint64_t last_module_dropped_{0};
+    // Latches a failed start() so collect_fast does not retry every tick (start
+    // storm) when the ETW session is genuinely unavailable; reset when the source
+    // is disabled, so a later re-enable retries. Guarded by collect_mu_.
+    bool module_start_failed_{false};
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -718,6 +756,93 @@ private:
                     total_events += static_cast<int>(rows.size());
                 else
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
+            }
+        }
+
+        // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
+        // off) — like procperf/netqual this reads the explicit "true" rather than
+        // source_enabled. The session is only running if it was enabled at init.
+        const bool module_enabled = db_->get_config("module_enabled", "false") == "true";
+        // Lazy start / re-arm: start the session on the first enabled tick (so
+        // enabling takes effect next tick — like procperf/netqual, no restart) and
+        // re-arm after a transient session death. module_start_failed_ prevents a
+        // start-storm when the session is genuinely unavailable; it is reset on
+        // disable so a later re-enable retries.
+        if (module_stream_ && module_enabled && !module_stream_active_ && !module_start_failed_) {
+            module_stream_active_ = module_stream_->start();
+            if (module_stream_active_) {
+                spdlog::info("TAR: module stream active ({})", module_stream_->method_name());
+            } else {
+                module_start_failed_ = true;
+                spdlog::warn("TAR: module ETW session failed to start — module capture "
+                             "unavailable (retries if module_enabled is toggled off then on)");
+            }
+        }
+        if (!module_enabled) {
+            module_start_failed_ = false; // re-enable should retry a previously-failed start
+        }
+        if (module_stream_active_ && !module_enabled) {
+            // Disabled mid-run (a true→false toggle): drain-and-discard so the
+            // paused window is never stored, keeping the session warm. Mirrors
+            // the process forensic-pause contract.
+            module_stream_->drain();
+            pending_module_evs_.clear();
+        } else if (module_stream_active_ && module_enabled) {
+            // drain() resolves signing (cached) and redacts module_dir off the
+            // ETW thread, so events arrive fully populated + privacy-scrubbed.
+            auto mevs = module_stream_->drain();
+            if (!pending_module_evs_.empty()) {
+                mevs.insert(mevs.begin(), std::make_move_iterator(pending_module_evs_.begin()),
+                            std::make_move_iterator(pending_module_evs_.end()));
+                pending_module_evs_.clear();
+            }
+            // §5 edge risk-filter: keep every risky load, dedup + cap signed.
+            mevs = yuzu::tar::apply_module_risk_filter(std::move(mevs));
+            std::vector<yuzu::tar::ModuleRow> mrows;
+            mrows.reserve(mevs.size());
+            for (const auto& e : mevs) {
+                yuzu::tar::ModuleRow r;
+                r.ts = e.ts_unix;
+                r.snapshot_id = snap_id;
+                r.action = std::string{yuzu::tar::module_action_token(e.action)};
+                r.pid = e.pid;
+                r.process_name = e.process_name;
+                r.module_name = e.module_name;
+                r.module_dir = e.module_dir; // already redacted by the collector
+                r.signed_state = std::string{yuzu::tar::module_signed_token(e.signed_state)};
+                r.signer = e.signer;
+                r.is_kernel = e.is_kernel;
+                mrows.push_back(std::move(r));
+            }
+            if (!mrows.empty()) {
+                if (!db_->insert_module_events(mrows)) {
+                    // OPT-IN source: like netqual, do NOT fail the whole tick (the
+                    // always-on legs already committed). Re-queue the filtered
+                    // batch for the next tick, bounded, and log.
+                    spdlog::error("TAR: module stream insert failed — re-queuing {} events",
+                                  mevs.size());
+                    pending_module_evs_ = std::move(mevs);
+                    if (pending_module_evs_.size() > kPendingStreamCap) {
+                        const auto excess = pending_module_evs_.size() - kPendingStreamCap;
+                        pending_module_evs_.erase(
+                            pending_module_evs_.begin(),
+                            pending_module_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                    }
+                } else {
+                    total_events += static_cast<int>(mrows.size());
+                }
+            }
+            if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
+                spdlog::warn("TAR: module stream ring overflow — {} dropped (+{} since last drain)",
+                             d, d - last_module_dropped_);
+                last_module_dropped_ = d;
+            }
+            // Self-heal: no poll fallback for modules — if the session ended, stop
+            // and report module_capture_method=none (vs going silently blind).
+            if (!module_stream_->running()) {
+                spdlog::warn("TAR: module stream ended — module capture stopped (no poll fallback)");
+                module_stream_->stop();
+                module_stream_active_ = false;
             }
         }
 
@@ -973,6 +1098,13 @@ private:
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
 
+        // Mechanism actually in force. Only polling is wired today regardless of
+        // the configured method (kPlanned methods like etw / endpoint_security are
+        // accepted for pre-staging but not collected), so status can never
+        // misrepresent the active capture mechanism to a forensic analyst (#1528).
+        ctx.write_output(std::format("config|network_capture_method_effective|{}",
+                                     yuzu::tar::effective_network_capture_method(net_method)));
+
         // Process stream health. capture_method reflects the LIVE path: the
         // stream's method_name() ("etw" on Windows, "endpoint_security" on macOS)
         // while the stream runs, "polling" if it never started or self-healed to
@@ -995,6 +1127,17 @@ private:
                                      proc_stream_ ? proc_stream_->dropped() : 0));
         ctx.write_output(std::format("config|process_stream_kernel_dropped|{}",
                                      proc_stream_ ? proc_stream_->kernel_dropped() : 0));
+
+        // M2 module-stream health — emitted UNCONDITIONALLY (same contract as the
+        // process keys) so agentic consumers read by key presence without a
+        // presence check. "none" when there is no live session: off-Windows, or
+        // when module_enabled was false at start so the session never started.
+        ctx.write_output(std::format("config|module_capture_method|{}",
+                                     (module_stream_active_ && module_stream_)
+                                         ? module_stream_->method_name()
+                                         : "none"));
+        ctx.write_output(std::format("config|module_stream_dropped|{}",
+                                     module_stream_ ? module_stream_->dropped() : 0));
         return 0;
     }
 
