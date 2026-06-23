@@ -41,12 +41,12 @@ inline constexpr std::size_t kMaxPatternConfigBytes = 128 * 1024;
 // Validate a single configure pattern. Returns an error message (suitable for
 // the `error|...` configure response) or std::nullopt if valid. Always enforces
 // the per-element length cap. When `require_min_core_len` is set (process
-// stabilization exclusions), a bare substring with no `*` wildcard shorter than
-// kMinExclusionCoreLength is rejected — the operator must lengthen it or signal
-// explicit wildcard intent with `*`. The empty/ is_string checks are done by the
-// caller during JSON parsing.
-[[nodiscard]] std::optional<std::string>
-validate_config_pattern(std::string_view pattern, bool require_min_core_len);
+// stabilization exclusions), an effective match core shorter than
+// kMinExclusionCoreLength is rejected after stripping leading/trailing `*` —
+// the operator must use a longer substring. The empty/is_string checks are done
+// by the caller during JSON parsing.
+[[nodiscard]] std::optional<std::string> validate_config_pattern(std::string_view pattern,
+                                                                 bool require_min_core_len);
 
 // Parse a stored pattern-array config value (redaction_patterns /
 // process_stabilization_exclusions) into a bounded, sanitised vector. This is
@@ -131,10 +131,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  *         not clear the baseline (the source is left enabled). Non-disabling
  *         transitions always return true.
  */
-[[nodiscard]] bool apply_source_enabled_transition(TarDatabase& db,
-                                                    std::string_view source,
-                                                    std::string_view new_value,
-                                                    int64_t now_epoch);
+[[nodiscard]] bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
+                                                   std::string_view new_value, int64_t now_epoch);
 
 /**
  * Map a capture source to its snapshot-diff baseline key in the TAR state store
@@ -149,5 +147,19 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  * clear can never target the wrong key (a silent no-op).
  */
 [[nodiscard]] std::string_view diff_state_key(std::string_view source);
+
+/**
+ * Canonicalise a stored `<source>_enabled` value to a strict tri-state for the
+ * `status` surface (#560). do_configure only ever persists "true"/"false", so
+ * any other stored value indicates the row was mutated outside the plugin
+ * (corruption, disk tampering, downgrade/upgrade) and is reported as the
+ * explicit "errored" sentinel — never coerced/guessed — so the dashboard can
+ * render a value-error badge instead of silently omitting the source.
+ *
+ * Both the collect-time gate (`source_enabled`, tar_plugin.cpp) and
+ * `run_retention` gate on this canonical value, so a non-canonical value fails
+ * closed: collection stops AND the source's rows are preserved (not pruned).
+ */
+[[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
 
 } // namespace yuzu::tar

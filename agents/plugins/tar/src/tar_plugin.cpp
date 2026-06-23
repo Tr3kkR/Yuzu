@@ -226,9 +226,18 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
 // config row yet comes from CaptureSourceDef::default_enabled (true for
 // always-on sources, false for opt-in module/procperf/netqual), so a fresh
 // agent agrees with tar.status / retention / the paused_at transition.
+//
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
     const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
-    return db.get_config(std::format("{}_enabled", source), def) != "false";
+    return yuzu::tar::canonical_source_enabled(
+               db.get_config(std::format("{}_enabled", source), def)) == "true";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
@@ -259,10 +268,9 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",       "query",         "snapshot",
-                                     "export",       "configure",     "collect_fast",
-                                     "collect_slow", "collect_perf",  "rollup",
-                                     "sql",          "compatibility", "fleet_snapshot",
+        static const char* acts[] = {"status",    "query",        "snapshot",      "export",
+                                     "configure", "collect_fast", "collect_slow",  "collect_perf",
+                                     "rollup",    "sql",          "compatibility", "fleet_snapshot",
                                      nullptr};
         return acts;
     }
@@ -379,7 +387,8 @@ public:
             if (source_enabled(*db_, "process")) {
                 const auto boot_key = std::to_string(yuzu::tar::boot_time_unix());
                 if (db_->get_config("last_backfill_boot_ts", "") == boot_key) {
-                    spdlog::info("TAR: boot-backfill already done this boot (agent restart) — skipped");
+                    spdlog::info(
+                        "TAR: boot-backfill already done this boot (agent restart) — skipped");
                 } else {
                     const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
                     std::error_code ec;
@@ -407,12 +416,14 @@ public:
                             typed.push_back(std::move(pe));
                         }
                         if (typed.empty()) {
-                            spdlog::info("TAR: boot AutoLogger trace had no pre-session process events");
+                            spdlog::info(
+                                "TAR: boot AutoLogger trace had no pre-session process events");
                             db_->set_config("last_backfill_boot_ts", boot_key);
                         } else if (db_->insert_process_events(typed)) {
                             db_->set_config("last_backfill_boot_ts", boot_key);
-                            spdlog::info("TAR: boot-backfilled {} process events from the ETW AutoLogger",
-                                         typed.size());
+                            spdlog::info(
+                                "TAR: boot-backfilled {} process events from the ETW AutoLogger",
+                                typed.size());
                         } else {
                             // Leave the key unset so the next restart retries.
                             spdlog::warn("TAR: boot-backfill insert failed (continuing; "
@@ -635,9 +646,9 @@ private:
                         pending_stream_evs_ = std::move(evs);
                         if (pending_stream_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_stream_evs_.size() - kPendingStreamCap;
-                            pending_stream_evs_.erase(
-                                pending_stream_evs_.begin(),
-                                pending_stream_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                            pending_stream_evs_.erase(pending_stream_evs_.begin(),
+                                                      pending_stream_evs_.begin() +
+                                                          static_cast<std::ptrdiff_t>(excess));
                         }
                         ctx.write_output("error|process insert failed");
                         return 1;
@@ -651,8 +662,9 @@ private:
                 // the agent's lifetime after a single burst). Also surfaced via
                 // the `status` action (process_stream_dropped).
                 if (auto d = proc_stream_->dropped(); d > last_logged_dropped_) {
-                    spdlog::warn("TAR: process stream ring overflow — {} dropped (+{} since last drain)",
-                                 d, d - last_logged_dropped_);
+                    spdlog::warn(
+                        "TAR: process stream ring overflow — {} dropped (+{} since last drain)", d,
+                        d - last_logged_dropped_);
                     last_logged_dropped_ = d;
                 }
 
@@ -752,8 +764,8 @@ private:
         // dropped there and never persisted. Empty off Linux (collector stub).
         if (db_->get_config("netqual_enabled", "false") == "true") {
             auto samples = yuzu::tar::collect_tcp_quality();
-            auto rows = yuzu::tar::select_netqual_rows(samples, ts, snap_id,
-                                                       yuzu::tar::kNetQualTopN);
+            auto rows =
+                yuzu::tar::select_netqual_rows(samples, ts, snap_id, yuzu::tar::kNetQualTopN);
             if (!rows.empty()) {
                 // OPT-IN source: a netqual insert failure must NOT fail the whole
                 // collect_fast tick — the always-on tcp/process legs already
@@ -832,9 +844,9 @@ private:
                     pending_module_evs_ = std::move(mevs);
                     if (pending_module_evs_.size() > kPendingStreamCap) {
                         const auto excess = pending_module_evs_.size() - kPendingStreamCap;
-                        pending_module_evs_.erase(
-                            pending_module_evs_.begin(),
-                            pending_module_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                        pending_module_evs_.erase(pending_module_evs_.begin(),
+                                                  pending_module_evs_.begin() +
+                                                      static_cast<std::ptrdiff_t>(excess));
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
@@ -848,7 +860,8 @@ private:
             // Self-heal: no poll fallback for modules — if the session ended, stop
             // and report module_capture_method=none (vs going silently blind).
             if (!module_stream_->running()) {
-                spdlog::warn("TAR: module stream ended — module capture stopped (no poll fallback)");
+                spdlog::warn(
+                    "TAR: module stream ended — module capture stopped (no poll fallback)");
                 module_stream_->stop();
                 module_stream_active_ = false;
             }
@@ -1072,8 +1085,14 @@ private:
             // Default to the source's declared default (false for opt-in
             // module/procperf/netqual) so a fresh agent does not misreport an
             // opt-in source as enabled.
-            auto enabled_val =
-                db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            auto stored = db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            // #560 — emit a strict tri-state (true/false/errored). do_configure
+            // only ever persists "true"/"false"; any other stored value was
+            // written outside the plugin (corruption, disk tampering, a
+            // downgrade/upgrade) and is surfaced as the explicit "errored"
+            // sentinel so the dashboard renders a value-error badge instead of
+            // silently omitting the source. Never coerced/guessed.
+            auto enabled_val = yuzu::tar::canonical_source_enabled(stored);
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);
@@ -1140,10 +1159,9 @@ private:
         // process keys) so agentic consumers read by key presence without a
         // presence check. "none" when there is no live session: off-Windows, or
         // when module_enabled was false at start so the session never started.
-        ctx.write_output(std::format("config|module_capture_method|{}",
-                                     (module_stream_active_ && module_stream_)
-                                         ? module_stream_->method_name()
-                                         : "none"));
+        ctx.write_output(std::format(
+            "config|module_capture_method|{}",
+            (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
         return 0;
@@ -1597,18 +1615,18 @@ private:
             // C-1 / QA Finding 2 round-trip). #540 — validate any other value
             // against THIS host's OS accept-list, not the OS-blind union, so a
             // Linux agent cannot store 'iphlpapi' nor a Windows agent 'procfs'.
-            auto accepted = yuzu::tar::accepted_capture_methods_for_os(
-                "tcp", yuzu::tar::current_platform_os());
+            auto accepted =
+                yuzu::tar::accepted_capture_methods_for_os("tcp", yuzu::tar::current_platform_os());
             if (std::find(accepted.begin(), accepted.end(), net_method) == accepted.end()) {
                 std::string list = "polling";
                 for (const auto& m2 : accepted) {
                     list += ",";
                     list += m2;
                 }
-                ctx.write_output(std::format(
-                    "error|network_capture_method '{}' is not accepted on this OS "
-                    "(must be one of: {})",
-                    net_method, list));
+                ctx.write_output(
+                    std::format("error|network_capture_method '{}' is not accepted on this OS "
+                                "(must be one of: {})",
+                                net_method, list));
                 return 1;
             }
         }
@@ -1686,8 +1704,8 @@ private:
                 // "stopped" events on re-enable. No deadlock: do_configure runs
                 // without collect_mu_ held and the helper re-acquires nothing.
                 std::lock_guard lock(collect_mu_);
-                transition_ok =
-                    yuzu::tar::apply_source_enabled_transition(*db_, src_name, v, now_epoch_seconds());
+                transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
+                                                                           now_epoch_seconds());
                 if (transition_ok && v == "false") {
                     // The interval samplers (perf / procperf) keep their previous
                     // reading in memory, not in a diff-state row, so the
