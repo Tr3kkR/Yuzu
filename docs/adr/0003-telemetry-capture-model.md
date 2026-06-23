@@ -7,6 +7,8 @@ scope: platform — viz, vuln-scan graph, and IOC all depend on this
 
 # 0003 — Telemetry capture: event-driven, edge-aggregated, federated edge warehouse
 
+> **Implementation status (2026-06-18 conformance audit):** Accepted decision; the event-driven flow-telemetry engine is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
+
 ## Context
 
 Connection telemetry today is **poll-based** (`/proc/net/tcp`, `GetExtendedTcpTable`,

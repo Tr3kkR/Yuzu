@@ -9,6 +9,8 @@
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -121,6 +123,43 @@ TEST_CASE("RbacStore: enable and disable RBAC", "[rbac_store]") {
     CHECK(store.is_rbac_enabled());
     store.set_rbac_enabled(false);
     CHECK_FALSE(store.is_rbac_enabled());
+}
+
+// #1498 — the device-visibility fallback must distinguish a store that is
+// loaded-and-explicitly-disabled (full-fleet fallback OK) from one that is
+// missing or failed to load (fail CLOSED). The probe wired into
+// ManagementGroupStore is exactly rbac_enforcement_in_effect(rbac_store_.get()),
+// so this exercises the real predicate, not a stand-in lambda.
+TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
+          "[rbac_store][visibility]") {
+    SECTION("null store → enforcement in effect (fail closed)") {
+        CHECK(rbac_enforcement_in_effect(nullptr));
+    }
+
+    SECTION("load-failed store (is_open()==false) → fail closed, not full-fleet") {
+        // A db path whose PARENT directory does not exist: sqlite3_open_v2 with
+        // SQLITE_OPEN_CREATE creates the file but never the parent, so the open
+        // fails and db_ is left null — the same state an open/migration failure
+        // produces, and indistinguishable by the enabled flag alone.
+        const auto bogus = yuzu::test::unique_temp_path("rbac-loadfail-") / "rbac.db";
+        RbacStore broken(bogus);
+        REQUIRE_FALSE(broken.is_open());
+        CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
+    }
+
+    SECTION("loaded + explicitly disabled → full-fleet fallback permitted") {
+        RbacStore store(":memory:");
+        REQUIRE(store.is_open());
+        REQUIRE_FALSE(store.is_rbac_enabled()); // disabled by default
+        CHECK_FALSE(rbac_enforcement_in_effect(&store));
+    }
+
+    SECTION("loaded + enabled → enforcement in effect (role-scoped path)") {
+        RbacStore store(":memory:");
+        store.set_rbac_enabled(true);
+        REQUIRE(store.is_rbac_enabled());
+        CHECK(rbac_enforcement_in_effect(&store));
+    }
 }
 
 // ── Role CRUD ────────────────────────────────────────────────────────────────

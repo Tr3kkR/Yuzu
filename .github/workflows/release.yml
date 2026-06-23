@@ -30,12 +30,20 @@ env:
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
+  # ccache sizing — mirror ci.yml. Without this the self-hosted build-linux
+  # leg inherits the host default (5 GiB on Big Tam), far too small for ~700
+  # TUs and a full release+LTO build → cache thrash → slow release. 30G covers
+  # the working set with headroom. (Harmless on the Wee Tam Windows / hosted
+  # macOS build ccaches too.)
+  CCACHE_MAXSIZE: "30G"
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
   build-linux:
     name: "Build Linux x64"
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     permissions:
       contents: read
       id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
@@ -75,7 +83,7 @@ jobs:
           # bison/flex: vcpkg's libpq port builds postgresql from source and
           # cannot auto-acquire them on Linux (gov #1331 — do not rely on the
           # machine-wide side effect of ci.yml's apt step).
-          for cmd in gcc-13 g++-13 cmake ninja meson ccache pkg-config rpmbuild bison flex; do
+          for cmd in gcc-15 g++-15 cmake ninja meson ccache pkg-config rpmbuild bison flex; do
             command -v "$cmd" >/dev/null 2>&1 || MISSING="$MISSING $cmd"
           done
           if [ -n "$MISSING" ]; then
@@ -126,13 +134,13 @@ jobs:
 
       - name: Configure (Meson release)
         env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
+          CC: ccache gcc-15
+          CXX: ccache g++-15
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static/lib/pkgconfig
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static
         run: |
           meson setup build-linux \
-            --native-file meson/native/linux-gcc13.ini \
+            --native-file meson/native/linux-gcc15.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-static \
             -Dbuild_tests=false
@@ -276,7 +284,7 @@ jobs:
   build-gateway:
     name: "Build Gateway (Erlang)"
     needs: [build-linux]
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     permissions:
       contents: read
       id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
@@ -441,11 +449,11 @@ jobs:
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
-  # No needs: — runs on a separate self-hosted runner (same physical box,
-  # different OS) so it can build in parallel with build-linux + build-gateway.
+  # No needs: — runs on the Wee Tam Windows pool (a separate host from the Big
+  # Tam Linux build) so it can build in parallel with build-linux + build-gateway.
   build-windows:
     name: "Build Windows x64"
-    runs-on: [self-hosted, Windows]
+    runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     permissions:
       contents: read
       id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
@@ -1081,7 +1089,7 @@ jobs:
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
     needs: [build-linux, build-gateway]
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:
       contents: read
@@ -1167,8 +1175,8 @@ jobs:
             TRIPLET=x64-linux
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
-          cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}
-          cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }},mode=max
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
+          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }},mode=max
           # Disable buildx's own provenance/sbom attestation — we emit
           # GitHub-native attestations + cosign signatures below so
           # customers have a single verification path via `gh
@@ -1271,7 +1279,7 @@ jobs:
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
       contents: read
@@ -1323,7 +1331,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=yuzu-postgres
-            org.opencontainers.image.description=Yuzu server storage substrate — PostgreSQL 16 + pgvector (ADR-0006)
+            org.opencontainers.image.description=Yuzu server storage substrate — PostgreSQL 18 + pgvector (ADR-0006)
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -1341,8 +1349,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Distinct local buildcache path — never collides with the
           # server/gateway/chisel caches on this runner.
-          cache-from: type=local,src=/mnt/d/docker-buildcache/postgres
-          cache-to: type=local,dest=/mnt/d/docker-buildcache/postgres,mode=max
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/postgres
+          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/postgres,mode=max
           # Disable buildx's own provenance/sbom attestation — we emit
           # GitHub-native attestations + cosign signatures below (single
           # verification path, same as docker-publish).
@@ -1438,7 +1446,7 @@ jobs:
     # Mirror docker-publish's needs (core builds must pass) but stay OUT
     # of the release job's needs: so this never gates the release.
     needs: [build-linux, build-gateway]
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
     # in-flight 6 h QEMU build instead of wedging the single self-hosted
     # Linux runner slot behind a stale emulated arm64 compile. The
@@ -1571,8 +1579,8 @@ jobs:
           # the non-chisel docker-publish cache. mode=max caches
           # intermediate layers too (best hit rate) — important given the
           # full vcpkg-from-source compile.
-          cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel
-          cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel,mode=max
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
+          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel,mode=max
           # Disable buildx's own provenance/sbom attestation — we emit
           # GitHub-native attestations + cosign signatures below so
           # customers have a single verification path via `gh

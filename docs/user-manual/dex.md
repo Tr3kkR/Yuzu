@@ -53,16 +53,23 @@ and links, it does not duplicate their detail.
 Every monitored signal type, organised into 13 families (App reliability,
 Boot/start-up & shutdown, Service health, System stability, Hardware & storage,
 Performance, File system, Network, Identity & logon, Security & protection,
-Updates & installs, Policy & management, Printing). A family card shows how
-many of its
-types are active; opening a family lists **every** type — one that fired shows
-its event and device counts, a quiet one shows a dashed zero, because
-**monitored, nothing happened** is real information, not a gap. (Signal sources
-that don't exist on a given OS or SKU simply stay at zero on those endpoints.)
-Each type drills into a per-type view: top subjects, the live OS split, the
-most-affected devices, and an activity trend. Any signal a newer agent emits
-that isn't catalogued yet appears under **Other**, so nothing the fleet reports
-is hidden.
+Updates & installs, Policy & management, Printing). The Catalogue is
+**coverage-first**: a family card shows how many of its types are **monitored**
+(collected by a connected platform — lit even when nothing has fired) and a
+0–100 **health score** (the family's slice of the fleet health composite). A
+monitored type with no events reads as **watched, nothing happened** — real
+information, not a gap; a type that **no connected platform collects** shows
+dimmed as **not collected**, never as healthy. (A type is *not collected* when no
+currently-connected platform in your fleet emits it — e.g. a Linux-only signal on
+an all-Windows fleet; it lights automatically when the first eligible device
+connects, so this is a coverage fact, not a broken collector.) An **OS filter** (All connected /
+Windows / Linux / macOS) narrows coverage to one platform and **persists** when
+you open a family or drill into a type. Opening a family lists **every** type
+with its coverage (which platforms collect it) and, for the ones that fired,
+event and device counts. Each type drills into a per-type view: top subjects,
+the live OS split, the most-affected devices, and an activity trend. Any signal
+a newer agent emits that isn't catalogued yet appears under **Other**, so
+nothing the fleet reports is hidden.
 
 ### Health score
 

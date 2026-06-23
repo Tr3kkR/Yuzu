@@ -18,6 +18,7 @@
 
 #include <cctype>
 #include <format>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -415,7 +416,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
 std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPerfMetric metric,
                                              bool not_reporting,
                                              const std::optional<std::string>& cohort_filter,
-                                             int limit, int window_days) {
+                                             int limit, int window_days,
+                                             const std::set<std::string>* visible) {
     const std::string w = dex_window_token(window_days);
     const auto rows = dex_perf_device_list(snap, metric, not_reporting, cohort_filter, limit);
 
@@ -456,6 +458,8 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
          "</th><th>CPU</th><th>Commit</th><th>Disk lat</th><th>vs fleet</th></tr></thead><tbody>";
     int i = 1;
     for (const auto& r : rows) {
+        if (visible && !visible->count(r.agent_id))
+            continue; // out-of-scope device — don't enumerate its id to this operator
         auto cell = [](const std::optional<double>& v, bool lat) {
             return v ? (lat ? fmt_lat(*v) : fmt_pct(*v)) : std::string("&mdash;");
         };

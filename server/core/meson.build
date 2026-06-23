@@ -232,6 +232,29 @@ qrcodegen_dep = declare_dependency(
   include_directories: include_directories('vendor/qrcodegen'),
 )
 
+# KeyProvider leaf target (ADR-0010, #1320 PR 4, governance arch-S3).
+# key_provider.{hpp,cpp} is extracted from yuzu_server_core_lib so the pg/
+# substrate (SecretCodec takes a KekProvider&) can grow into its own library
+# later without a meson graph cycle: pg → key_provider is a leaf edge, while
+# key_provider → server_core would have been a back edge. OpenSSL is required
+# here unconditionally (AES-256-GCM KEK wrap/unwrap + SHA-256 check values +
+# OPENSSL_cleanse zeroization). A disabler would NOT fail loudly — it would
+# silently disable this target and everything that links it (the whole
+# server), so guard explicitly (governance build-S1).
+if is_disabler(openssl_dep) or not openssl_dep.found()
+  error('OpenSSL is required for yuzu_key_provider (ADR-0010 secrets seam); '
+        + 'vcpkg.json makes it an unconditional dependency on every platform')
+endif
+yuzu_key_provider_lib = static_library(
+  'yuzu_key_provider',
+  files('src/key_provider.cpp'),
+  dependencies: [spdlog_dep, openssl_dep],
+)
+yuzu_key_provider_dep = declare_dependency(
+  link_with: yuzu_key_provider_lib,
+  dependencies: [openssl_dep],
+)
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
@@ -262,6 +285,8 @@ yuzu_server_core_lib = static_library(
     'src/nvd_sync.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/bundle_service.cpp',
+    'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
@@ -318,6 +343,10 @@ yuzu_server_core_lib = static_library(
     'src/network_perf_model.cpp',
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/device_routes.cpp',
+    'src/device_ui.cpp',
+    'src/tar_process_tree.cpp',
+    'src/tar_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
@@ -335,6 +364,7 @@ yuzu_server_core_lib = static_library(
     'src/workflow_engine.cpp',
     'src/product_pack_store.cpp',
     'src/inventory_store.cpp',
+    'src/offline_endpoint_store.cpp',
     'src/notification_store.cpp',
     'src/webhook_store.cpp',
     'src/offload_target_store.cpp',
@@ -363,10 +393,14 @@ yuzu_server_core_lib = static_library(
     # header-only; canary_main.cpp is the separate yuzu_pg_canary exe below.
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
+    # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
+    # secret columns. Depends on the yuzu_key_provider leaf target above.
+    'src/pg/secret_codec.cpp',
     'src/rate_limiter.cpp',
     'src/cert_reloader.cpp',
     'src/x509_ca.cpp',
-    'src/key_provider.cpp',
+    # key_provider.cpp lives in the yuzu_key_provider leaf target above
+    # (ADR-0010 arch-S3); the dep below carries it.
     'src/ca_store.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
@@ -376,7 +410,7 @@ yuzu_server_core_lib = static_library(
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep] + auth_crypto_deps + https_deps,
+                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
@@ -384,7 +418,7 @@ yuzu_server_core_dep = declare_dependency(
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep] + auth_crypto_deps + https_deps,
+                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps,
 )
 
 executable(

@@ -22,6 +22,9 @@
 
 #include "tar_collectors.hpp"
 #include "tar_proc_etw.hpp"
+#include "tar_proc_es.hpp"
+#include "tar_proc_stream.hpp"
+#include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_perf.hpp"
@@ -211,9 +214,22 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
     }
 }
 
-// Per-source enable/disable (issue #59). Default = enabled.
+// Per-source enable/disable (issue #59). The default for a source with no
+// config row yet comes from CaptureSourceDef::default_enabled (true for
+// always-on sources, false for opt-in module/procperf/netqual), so a fresh
+// agent agrees with tar.status / retention / the paused_at transition.
+//
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
-    return db.get_config(std::format("{}_enabled", source), "true") != "false";
+    const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
+    return yuzu::tar::canonical_source_enabled(
+               db.get_config(std::format("{}_enabled", source), def)) == "true";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
@@ -319,16 +335,23 @@ public:
             R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})");
         ctx.register_trigger("tar.rollup", "interval", rollup_config);
 
-        // Gap-free process events via ETW (Windows). On success, collect_fast
-        // drains it instead of polling; on failure / off-Windows it stays
-        // inactive and the poll handles processes (no silent loss).
-        proc_etw_ = std::make_unique<yuzu::tar::ProcEtwCollector>();
+        // Gap-free process events: ETW on Windows, Endpoint Security on macOS. On
+        // success, collect_fast drains the stream instead of polling; on failure
+        // (wrong platform, missing entitlement/privilege, no session) it stays
+        // inactive and the poll handles processes (no silent loss). On platforms
+        // with no stream the pointer is null and we go straight to the poll.
+#ifdef _WIN32
+        proc_stream_ = std::make_unique<yuzu::tar::ProcEtwCollector>();
+#elif defined(__APPLE__)
+        proc_stream_ = std::make_unique<yuzu::tar::ProcEsCollector>();
+#endif
         // Boundary for boot backfill: events before this instant came from the
         // pre-session boot window; the live session owns everything from here on.
         const auto t_live = now_epoch_seconds();
-        etw_active_ = proc_etw_->start();
-        if (etw_active_) {
-            spdlog::info("TAR: ETW Kernel-Process collector active (process poll superseded)");
+        stream_active_ = proc_stream_ && proc_stream_->start();
+        if (stream_active_) {
+            spdlog::info("TAR: {} process stream active (process poll superseded)",
+                         proc_stream_->method_name());
 
             // Boot-window backfill: replay the AutoLogger .etl (configured at
             // install time WITH a FlushTimer so it's continuously written to
@@ -399,11 +422,26 @@ public:
                     }
                 }
             } else {
-                spdlog::info("TAR: process source disabled — ETW boot-backfill skipped");
+                spdlog::info("TAR: process source disabled — boot-backfill skipped");
             }
         } else {
-            spdlog::info("TAR: ETW process collector inactive — using snapshot-diff poll");
+            spdlog::info("TAR: no gap-free process stream active — using snapshot-diff poll");
         }
+
+        // M2: seed the opt-in module_enabled key so the configure / retention /
+        // retention-paused-list machinery (which default a MISSING key to ENABLED
+        // via source_enabled) agrees with the collector's explicit default-off.
+        if (db_->get_config("module_enabled", "").empty()) {
+            db_->set_config("module_enabled", "false");
+        }
+#ifdef _WIN32
+        // Construct the Windows ETW image-load collector; the session is STARTED
+        // LAZILY by collect_fast on the first tick where module_enabled is true (so
+        // enabling takes effect on the next tick — no restart — matching
+        // procperf/netqual, and a transient session death auto-re-arms). Null on
+        // non-Windows (M4/M5 add macOS Endpoint Security, M6 adds Linux auditd).
+        module_stream_ = std::make_unique<yuzu::tar::ModuleEtwCollector>();
+#endif
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
@@ -416,15 +454,23 @@ public:
         ctx.unregister_trigger("tar.perf");
         ctx.unregister_trigger("tar.rollup");
         // Take collect_mu_ around the collector teardown: a collect_fast tick may
-        // still be draining proc_etw_ (reads impl_ via drain()/running()), and
+        // still be draining proc_stream_ (reads impl_ via drain()/running()), and
         // stop() resets impl_. The host quiesces the trigger engine before
-        // shutdown, but the lock makes the ordering safe regardless. The ETW
-        // worker (on_event) never takes collect_mu_, so joining it here cannot
-        // deadlock.
+        // shutdown, but the lock makes the ordering safe regardless. The stream's
+        // worker (ETW consumer thread / ES handler queue) never takes collect_mu_,
+        // so joining it here cannot deadlock.
         {
             std::lock_guard lock(collect_mu_);
-            if (proc_etw_) {
-                proc_etw_->stop(); // closes the ETW session + joins the consumer thread
+            if (proc_stream_) {
+                // Windows: closes the ETW session + joins the consumer thread.
+                // macOS: es_unsubscribe_all + es_delete_client (blocks until any
+                // in-flight handler returns, so no handler touches the ring after).
+                proc_stream_->stop();
+            }
+            if (module_stream_) {
+                // Windows: closes the module-load ETW session + joins its
+                // consumer thread (idempotent; safe if never started).
+                module_stream_->stop();
             }
         }
         db_.reset();
@@ -473,25 +519,44 @@ private:
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
 
-    // Gap-free process start/stop via ETW (Windows). When the session starts,
-    // etw_active_ is true and collect_fast DRAINS this instead of polling; if it
-    // fails to start (or off-Windows, where start() is a no-op), etw_active_
-    // stays false and collect_fast falls back to the snapshot-diff poll — so a
-    // process source is always present. Drained only under collect_mu_.
-    std::unique_ptr<yuzu::tar::ProcEtwCollector> proc_etw_;
+    // Gap-free process start/stop stream: ETW on Windows, Endpoint Security on
+    // macOS (one concrete collector per platform behind the ProcStreamCollector
+    // interface; null where no stream exists). When it starts, stream_active_ is
+    // true and collect_fast DRAINS this instead of polling; if it fails to start
+    // (wrong platform, missing entitlement/privilege, session-open failure),
+    // stream_active_ stays false and collect_fast falls back to the snapshot-diff
+    // poll — so a process source is always present. Drained only under collect_mu_.
+    std::unique_ptr<yuzu::tar::ProcStreamCollector> proc_stream_;
     // Atomic: written under collect_mu_ (init + self-heal in collect_fast) but
     // also read WITHOUT the lock by the `status` action (do_status), which runs
     // on a different command thread — a plain bool there would be a data race.
-    std::atomic<bool> etw_active_{false};
-    // Events drained from the ETW ring but not yet persisted because a prior
+    std::atomic<bool> stream_active_{false};
+    // Events drained from the stream ring but not yet persisted because a prior
     // insert failed (DB locked/full); retried on the next collect_fast tick so a
     // transient failure does not lose the batch (UP-2). Guarded by collect_mu_;
     // bounded so a persistently failing DB cannot grow memory without limit.
-    std::vector<yuzu::tar::ProcEvent> pending_etw_evs_;
-    static constexpr std::size_t kPendingEtwCap = 100000;
+    std::vector<yuzu::tar::ProcEvent> pending_stream_evs_;
+    static constexpr std::size_t kPendingStreamCap = 100000;
     // High-water mark of ProcEventRing::dropped() already logged, so the overflow
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
+
+    // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
+    // Unlike the always-on process stream, this is OPT-IN (module_enabled,
+    // default off) and high-volume, so the session is started LAZILY by
+    // collect_fast on the first tick where module_enabled is true (enabling takes
+    // effect on the next tick — no restart — and a transient session death
+    // auto-re-arms). When active, collect_fast drains it; there is NO poll
+    // fallback (no snapshot-diff equivalent for image loads). Drained only under
+    // collect_mu_.
+    std::unique_ptr<yuzu::tar::ImageStreamCollector> module_stream_;
+    std::atomic<bool> module_stream_active_{false};
+    std::vector<yuzu::tar::ModuleEvent> pending_module_evs_;
+    std::uint64_t last_module_dropped_{0};
+    // Latches a failed start() so collect_fast does not retry every tick (start
+    // storm) when the ETW session is genuinely unavailable; reset when the source
+    // is disabled, so a later re-enable retries. Guarded by collect_mu_.
+    bool module_start_failed_{false};
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -516,26 +581,31 @@ private:
         // Drain-and-DISCARD each disabled tick so nothing from the paused window is
         // ever stored. (Keeps the session warm — no stop/re-arm gap; the kernel
         // session keeps running, events are captured-then-dropped, never inserted.)
-        if (etw_active_ && !process_enabled) {
-            proc_etw_->drain();       // flush + discard; never inserted
-            pending_etw_evs_.clear(); // and drop any pre-disable insert-retry backlog
+        if (stream_active_ && !process_enabled) {
+            proc_stream_->drain();       // flush + discard; never inserted
+            pending_stream_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
         if (process_enabled) {
-            if (etw_active_) {
-                // Windows: gap-free ETW stream supersedes the snapshot-diff poll.
-                // Same process_live schema + 'started'/'stopped' so rollups and
-                // the $Process_* query surface are unchanged. Names-only (no
-                // cmdline — ETW event 1 carries none, and that matches the
-                // works-council posture); user resolved from the SID at drain.
-                auto evs = proc_etw_->drain();
-                // Prepend events held over from a prior failed insert. ETW has no
-                // re-diff self-heal like the poll, so a transient insert failure
-                // (DB locked/full) must not silently drop the drained batch
-                // (UP-2). Bounded below by kPendingEtwCap.
-                if (!pending_etw_evs_.empty()) {
-                    evs.insert(evs.begin(), std::make_move_iterator(pending_etw_evs_.begin()),
-                               std::make_move_iterator(pending_etw_evs_.end()));
-                    pending_etw_evs_.clear();
+            // #538: single source of truth for the diff-baseline state key (see
+            // diff_state_key) — the same key apply_source_enabled_transition
+            // clears on disable, so the two can't drift.
+            const std::string proc_key{yuzu::tar::diff_state_key("process")};
+            if (stream_active_) {
+                // Gap-free stream (ETW/Windows or Endpoint Security/macOS)
+                // supersedes the snapshot-diff poll. Same process_live schema +
+                // 'started'/'stopped' so rollups and the $Process_* query surface
+                // are unchanged. Names-only (no cmdline — matches the works-council
+                // posture); user resolved at drain (SID on Windows, audit-token uid
+                // on macOS).
+                auto evs = proc_stream_->drain();
+                // Prepend events held over from a prior failed insert. The stream
+                // has no re-diff self-heal like the poll, so a transient insert
+                // failure (DB locked/full) must not silently drop the drained batch
+                // (UP-2). Bounded below by kPendingStreamCap.
+                if (!pending_stream_evs_.empty()) {
+                    evs.insert(evs.begin(), std::make_move_iterator(pending_stream_evs_.begin()),
+                               std::make_move_iterator(pending_stream_evs_.end()));
+                    pending_stream_evs_.clear();
                 }
                 std::vector<yuzu::tar::ProcessEvent> typed;
                 typed.reserve(evs.size());
@@ -556,47 +626,51 @@ private:
                 }
                 if (!typed.empty()) {
                     if (!db_->insert_process_events(typed)) {
-                        spdlog::error("TAR: ETW process insert failed — re-queuing {} events "
+                        spdlog::error("TAR: process stream insert failed — re-queuing {} events "
                                       "for the next tick",
                                       evs.size());
                         // Retain the drained events (pre-redaction source) and
                         // retry next tick; bound the backlog so a persistently
                         // failing DB cannot grow memory without limit (drops the
                         // oldest, mirroring the ring's overflow posture).
-                        pending_etw_evs_ = std::move(evs);
-                        if (pending_etw_evs_.size() > kPendingEtwCap) {
-                            const auto excess = pending_etw_evs_.size() - kPendingEtwCap;
-                            pending_etw_evs_.erase(
-                                pending_etw_evs_.begin(),
-                                pending_etw_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                        pending_stream_evs_ = std::move(evs);
+                        if (pending_stream_evs_.size() > kPendingStreamCap) {
+                            const auto excess = pending_stream_evs_.size() - kPendingStreamCap;
+                            pending_stream_evs_.erase(
+                                pending_stream_evs_.begin(),
+                                pending_stream_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
                         }
                         ctx.write_output("error|process insert failed");
                         return 1;
                     }
                     total_events += static_cast<int>(typed.size());
                 }
-                // No state save — ETW is a continuous stream, not a snapshot.
+                // No state save — the stream is continuous, not a snapshot.
 
                 // Ring-overflow visibility: dropped() is cumulative, so warn only
                 // on the delta since the last drain (else it spams every tick for
                 // the agent's lifetime after a single burst). Also surfaced via
-                // the `status` action (process_etw_dropped).
-                if (auto d = proc_etw_->dropped(); d > last_logged_dropped_) {
-                    spdlog::warn("TAR: ETW process ring overflow — {} dropped (+{} since last drain)",
+                // the `status` action (process_stream_dropped).
+                if (auto d = proc_stream_->dropped(); d > last_logged_dropped_) {
+                    spdlog::warn("TAR: process stream ring overflow — {} dropped (+{} since last drain)",
                                  d, d - last_logged_dropped_);
                     last_logged_dropped_ = d;
                 }
 
-                // Self-heal: if the ETW session died (ProcessTrace returned —
-                // another tool stopped it, buffer loss, quota), running() is
-                // false. The batch above is already persisted; fall back to the
-                // snapshot-diff poll so the process source does not go silently
-                // blind (UP-1). `status` then reports process_capture_method=polling.
-                if (!proc_etw_->running()) {
-                    spdlog::warn("TAR: ETW process session ended — falling back to "
+                // Self-heal: fall back to the snapshot-diff poll if the stream is no
+                // longer delivering, so the process source does not go silently blind
+                // (UP-1). Two triggers: running()==false (Windows ETW ProcessTrace
+                // returned — another tool stopped it, buffer loss, quota), or
+                // stalled()==true (macOS Endpoint Security exposes no liveness API, so
+                // a prolonged TOTAL silence is treated as presumed-dead — see
+                // ProcEsCollector::stalled and its quiet-host caveat). The batch above
+                // is already persisted; `status` then reports
+                // process_capture_method=polling.
+                if (!proc_stream_->running() || proc_stream_->stalled()) {
+                    spdlog::warn("TAR: process stream ended/stalled — falling back to "
                                  "snapshot-diff poll");
-                    proc_etw_->stop();
-                    etw_active_ = false;
+                    proc_stream_->stop();
+                    stream_active_ = false;
                     // Prime the poll's process baseline with the CURRENT process
                     // set, WITHOUT emitting events. Otherwise the first poll tick
                     // would diff every running process against an empty snapshot
@@ -611,10 +685,11 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state("process", processes_to_json(current).dump());
+                    db_->set_state(proc_key, processes_to_json(current).dump());
                 }
             } else {
-                // Non-Windows (or ETW unavailable): snapshot-diff poll.
+                // No active stream (poll-only platform, or stream unavailable):
+                // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
 
                 // Stabilization exclusions: drop processes whose name matches any
@@ -629,7 +704,7 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state("process");
+                auto prev_json = db_->get_state(proc_key);
                 auto previous = json_to_processes(prev_json);
 
                 auto typed =
@@ -643,14 +718,16 @@ private:
                     total_events += static_cast<int>(typed.size());
                 }
 
-                db_->set_state("process", processes_to_json(current).dump());
+                db_->set_state(proc_key, processes_to_json(current).dump());
             }
         }
 
         // Network diff
         if (source_enabled(*db_, "tcp")) {
+            // #538: tcp's diff baseline lives under "network" (see diff_state_key).
+            const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
-            auto prev_json = db_->get_state("network");
+            auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
             auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
@@ -663,7 +740,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("network", connections_to_json(current).dump());
+            db_->set_state(net_key, connections_to_json(current).dump());
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -688,6 +765,93 @@ private:
                     total_events += static_cast<int>(rows.size());
                 else
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
+            }
+        }
+
+        // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
+        // off) — like procperf/netqual this reads the explicit "true" rather than
+        // source_enabled. The session is only running if it was enabled at init.
+        const bool module_enabled = db_->get_config("module_enabled", "false") == "true";
+        // Lazy start / re-arm: start the session on the first enabled tick (so
+        // enabling takes effect next tick — like procperf/netqual, no restart) and
+        // re-arm after a transient session death. module_start_failed_ prevents a
+        // start-storm when the session is genuinely unavailable; it is reset on
+        // disable so a later re-enable retries.
+        if (module_stream_ && module_enabled && !module_stream_active_ && !module_start_failed_) {
+            module_stream_active_ = module_stream_->start();
+            if (module_stream_active_) {
+                spdlog::info("TAR: module stream active ({})", module_stream_->method_name());
+            } else {
+                module_start_failed_ = true;
+                spdlog::warn("TAR: module ETW session failed to start — module capture "
+                             "unavailable (retries if module_enabled is toggled off then on)");
+            }
+        }
+        if (!module_enabled) {
+            module_start_failed_ = false; // re-enable should retry a previously-failed start
+        }
+        if (module_stream_active_ && !module_enabled) {
+            // Disabled mid-run (a true→false toggle): drain-and-discard so the
+            // paused window is never stored, keeping the session warm. Mirrors
+            // the process forensic-pause contract.
+            module_stream_->drain();
+            pending_module_evs_.clear();
+        } else if (module_stream_active_ && module_enabled) {
+            // drain() resolves signing (cached) and redacts module_dir off the
+            // ETW thread, so events arrive fully populated + privacy-scrubbed.
+            auto mevs = module_stream_->drain();
+            if (!pending_module_evs_.empty()) {
+                mevs.insert(mevs.begin(), std::make_move_iterator(pending_module_evs_.begin()),
+                            std::make_move_iterator(pending_module_evs_.end()));
+                pending_module_evs_.clear();
+            }
+            // §5 edge risk-filter: keep every risky load, dedup + cap signed.
+            mevs = yuzu::tar::apply_module_risk_filter(std::move(mevs));
+            std::vector<yuzu::tar::ModuleRow> mrows;
+            mrows.reserve(mevs.size());
+            for (const auto& e : mevs) {
+                yuzu::tar::ModuleRow r;
+                r.ts = e.ts_unix;
+                r.snapshot_id = snap_id;
+                r.action = std::string{yuzu::tar::module_action_token(e.action)};
+                r.pid = e.pid;
+                r.process_name = e.process_name;
+                r.module_name = e.module_name;
+                r.module_dir = e.module_dir; // already redacted by the collector
+                r.signed_state = std::string{yuzu::tar::module_signed_token(e.signed_state)};
+                r.signer = e.signer;
+                r.is_kernel = e.is_kernel;
+                mrows.push_back(std::move(r));
+            }
+            if (!mrows.empty()) {
+                if (!db_->insert_module_events(mrows)) {
+                    // OPT-IN source: like netqual, do NOT fail the whole tick (the
+                    // always-on legs already committed). Re-queue the filtered
+                    // batch for the next tick, bounded, and log.
+                    spdlog::error("TAR: module stream insert failed — re-queuing {} events",
+                                  mevs.size());
+                    pending_module_evs_ = std::move(mevs);
+                    if (pending_module_evs_.size() > kPendingStreamCap) {
+                        const auto excess = pending_module_evs_.size() - kPendingStreamCap;
+                        pending_module_evs_.erase(
+                            pending_module_evs_.begin(),
+                            pending_module_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                    }
+                } else {
+                    total_events += static_cast<int>(mrows.size());
+                }
+            }
+            if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
+                spdlog::warn("TAR: module stream ring overflow — {} dropped (+{} since last drain)",
+                             d, d - last_module_dropped_);
+                last_module_dropped_ = d;
+            }
+            // Self-heal: no poll fallback for modules — if the session ended, stop
+            // and report module_capture_method=none (vs going silently blind).
+            if (!module_stream_->running()) {
+                spdlog::warn("TAR: module stream ended — module capture stopped (no poll fallback)");
+                module_stream_->stop();
+                module_stream_active_ = false;
             }
         }
 
@@ -724,13 +888,24 @@ private:
             if (!cur.valid) {
                 ctx.write_output("tar|collect_perf|0|unsupported_platform");
             } else {
+                bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
                 {
-                    std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
-                    sample = yuzu::tar::derive_sample(prev_perf_, cur);
-                    prev_perf_ = cur;
+                    std::lock_guard lock(collect_mu_); // prev_perf_ RMW + disable re-check
+                    // The enabled gate above ran WITHOUT the lock; a disable could
+                    // have landed (and reset prev_perf_) since. Re-check here so a
+                    // disable racing a mid-flight sample never commits a post-disable
+                    // row, and leave prev_perf_ untouched when disabled so the reset
+                    // in the disable branch stands. (#538)
+                    perf_enabled_now = source_enabled(*db_, "perf");
+                    if (perf_enabled_now) {
+                        sample = yuzu::tar::derive_sample(prev_perf_, cur);
+                        prev_perf_ = cur;
+                    }
                 }
-                if (!sample.valid) {
+                if (!perf_enabled_now) {
+                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                } else if (!sample.valid) {
                     ctx.write_output("tar|collect_perf|0|baseline");
                 } else {
                     yuzu::tar::PerfRow row;
@@ -776,11 +951,24 @@ private:
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
+        bool procperf_enabled_now = true;
         std::vector<yuzu::tar::ProcPerfSample> samples;
         {
-            std::lock_guard lock(collect_mu_); // prev_proc_ read-modify-write only
-            samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
-            prev_proc_ = std::move(proc_cur);
+            std::lock_guard lock(collect_mu_); // prev_proc_ RMW + disable re-check
+            // The procperf gate above ran WITHOUT the lock; re-check here so a
+            // disable that raced this tick (and already reset prev_proc_) cannot
+            // commit a post-disable row. Leave prev_proc_ as the disable branch
+            // reset it so a later re-enable re-baselines instead of diffing across
+            // the opt-out window. (#538)
+            procperf_enabled_now = (db_->get_config("procperf_enabled", "false") == "true");
+            if (procperf_enabled_now) {
+                samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
+                prev_proc_ = std::move(proc_cur);
+            }
+        }
+        if (!procperf_enabled_now) {
+            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            return rc;
         }
         if (samples.empty()) {
             ctx.write_output("tar|collect_procperf|0|baseline");
@@ -816,8 +1004,9 @@ private:
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
+            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
             auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state("service");
+            auto prev_json = db_->get_state(svc_key);
             auto previous = json_to_services(prev_json);
 
             auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
@@ -830,13 +1019,14 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("service", services_to_json(current).dump());
+            db_->set_state(svc_key, services_to_json(current).dump());
         }
 
         // User diff
         if (source_enabled(*db_, "user")) {
+            const std::string usr_key{yuzu::tar::diff_state_key("user")}; // #538
             auto current = yuzu::tar::enumerate_users();
-            auto prev_json = db_->get_state("user");
+            auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
@@ -849,7 +1039,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("user", users_to_json(current).dump());
+            db_->set_state(usr_key, users_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -880,7 +1070,17 @@ private:
         // from the per-source `*_live` table; an empty table reports 0 / 0.
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
-            auto enabled_val = db_->get_config(enabled_key, "true");
+            // Default to the source's declared default (false for opt-in
+            // module/procperf/netqual) so a fresh agent does not misreport an
+            // opt-in source as enabled.
+            auto stored = db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            // #560 — emit a strict tri-state (true/false/errored). do_configure
+            // only ever persists "true"/"false"; any other stored value was
+            // written outside the plugin (corruption, disk tampering, a
+            // downgrade/upgrade) and is surfaced as the explicit "errored"
+            // sentinel so the dashboard renders a value-error badge instead of
+            // silently omitting the source. Never coerced/guessed.
+            auto enabled_val = yuzu::tar::canonical_source_enabled(stored);
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);
@@ -913,20 +1113,46 @@ private:
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
 
-#ifdef _WIN32
-        // ETW process collector health (Windows). capture_method reflects the
-        // live path: "etw" while the session runs, "polling" if ETW never started
-        // or self-healed to the poll after a session death. dropped is the
-        // cumulative ring-overflow count (NFR visibility — there is no agent
-        // /metrics endpoint; this action is the operator/agentic surface).
-        ctx.write_output(
-            std::format("config|process_capture_method|{}", etw_active_ ? "etw" : "polling"));
-        if (proc_etw_) {
-            // dropped() reads the ring's own atomic (independent of the session
-            // lifecycle) so it is safe without collect_mu_.
-            ctx.write_output(std::format("config|process_etw_dropped|{}", proc_etw_->dropped()));
-        }
-#endif
+        // Mechanism actually in force. Only polling is wired today regardless of
+        // the configured method (kPlanned methods like etw / endpoint_security are
+        // accepted for pre-staging but not collected), so status can never
+        // misrepresent the active capture mechanism to a forensic analyst (#1528).
+        ctx.write_output(std::format("config|network_capture_method_effective|{}",
+                                     yuzu::tar::effective_network_capture_method(net_method)));
+
+        // Process stream health. capture_method reflects the LIVE path: the
+        // stream's method_name() ("etw" on Windows, "endpoint_security" on macOS)
+        // while the stream runs, "polling" if it never started or self-healed to
+        // the poll after a session death. dropped is the cumulative ring-overflow
+        // count (NFR visibility — there is no agent /metrics endpoint; this action
+        // is the operator/agentic surface).
+        ctx.write_output(std::format("config|process_capture_method|{}",
+                                     (stream_active_ && proc_stream_) ? proc_stream_->method_name()
+                                                                      : "polling"));
+        // dropped() reads the ring's own atomic (independent of the session
+        // lifecycle) so it is safe without collect_mu_. Emit unconditionally — 0 on
+        // a poll-only platform (null proc_stream_) — so the key is always present and
+        // agentic consumers can read it without a presence check.
+        //
+        // process_stream_dropped is the USERSPACE ring-overflow count (events the
+        // drain tick could not keep up with). process_stream_kernel_dropped is the
+        // distinct kernel/provider-side drop count (Endpoint Security seq_num gaps;
+        // 0 on ETW, which exposes no per-message sequence to inspect here).
+        ctx.write_output(std::format("config|process_stream_dropped|{}",
+                                     proc_stream_ ? proc_stream_->dropped() : 0));
+        ctx.write_output(std::format("config|process_stream_kernel_dropped|{}",
+                                     proc_stream_ ? proc_stream_->kernel_dropped() : 0));
+
+        // M2 module-stream health — emitted UNCONDITIONALLY (same contract as the
+        // process keys) so agentic consumers read by key presence without a
+        // presence check. "none" when there is no live session: off-Windows, or
+        // when module_enabled was false at start so the session never started.
+        ctx.write_output(std::format("config|module_capture_method|{}",
+                                     (module_stream_active_ && module_stream_)
+                                         ? module_stream_->method_name()
+                                         : "none"));
+        ctx.write_output(std::format("config|module_stream_dropped|{}",
+                                     module_stream_ ? module_stream_->dropped() : 0));
         return 0;
     }
 
@@ -1365,7 +1591,49 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+            bool transition_ok;
+            {
+                // #538: collect_fast/slow hold collect_mu_ for their whole
+                // enumerate→diff→set_state cycle. Taking it here makes the
+                // enabled-flag write + baseline clear atomic w.r.t. a collection
+                // tick: the tick either fully precedes the disable (its set_state
+                // is then wiped by the baseline clear) or sees enabled=false and
+                // skips. No interleaving ⇒ no post-disable snapshot, no ghost
+                // "stopped" events on re-enable. No deadlock: do_configure runs
+                // without collect_mu_ held and the helper re-acquires nothing.
+                std::lock_guard lock(collect_mu_);
+                transition_ok =
+                    yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+                if (transition_ok && v == "false") {
+                    // The interval samplers (perf / procperf) keep their previous
+                    // reading in memory, not in a diff-state row, so the
+                    // diff_state_key clear inside apply_source_enabled_transition
+                    // does not reach them (diff_state_key is empty for both). Reset
+                    // the in-memory baseline under the SAME lock the collect legs
+                    // take so a later re-enable diffs against a fresh reading instead
+                    // of one from before the pause — otherwise the first
+                    // post-re-enable row would cover the entire disabled window (a
+                    // privacy leak on opt-in procperf, and contradicts the
+                    // "re-enabling starts from a clean baseline" promise in
+                    // docs/user-manual/tar.md). default-constructed → valid=false,
+                    // which derive_sample/derive_proc_samples treat as "no baseline"
+                    // (records nothing on the next tick).
+                    if (src.name == "perf")
+                        prev_perf_ = yuzu::tar::PerfCounters{};
+                    else if (src.name == "procperf")
+                        prev_proc_ = yuzu::tar::ProcSnapshot{};
+                }
+            }
+            if (!transition_ok) {
+                // #538/UP-1: a disable that could not clear the baseline leaves
+                // the source ENABLED (fail-safe). Report it so the operator can
+                // retry rather than believing the source was stopped.
+                ctx.write_output(std::format(
+                    "error|{} disable failed: could not clear collection baseline "
+                    "(database busy); source left enabled",
+                    key));
+                return 1;
+            }
             ctx.write_output(std::format("config|{}|{}", key, v));
             // Echo the resulting paused_at so the operator/dashboard sees the
             // transition timestamp without an extra status round-trip. We
