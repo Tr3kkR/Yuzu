@@ -807,6 +807,20 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         CHECK(dispatched_sql.find("$ProcPerf_Hourly") != std::string::npos);
         CHECK(dispatched_sql.find("GROUP BY name") != std::string::npos);
     }
+    SECTION("audit-persist failure → Sec-Audit-Failed header, panel still renders (#1549)") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        // A dropped evidence row on this usage-class dispatch must surface the gap.
+        auto failAudit = [](const httplib::Request&, const std::string&, const std::string&,
+                            const std::string&, const std::string&, const std::string&) -> bool {
+            return false;
+        };
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, failAudit, dispatch, responses);
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1&window=7d");
+        REQUIRE(r);
+        CHECK(r->status == 200); // HTML surface still renders
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
     SECTION("read-only operator gets the honest in-panel note, nothing dispatched/audited") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;

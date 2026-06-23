@@ -666,7 +666,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/devices/{id}/live": {
-      "post": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The dispatch is audited per kind (device.live.uptime / device.live.processes) with result=dispatched. Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
+      "post": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The request is audited per kind (device.live.uptime / device.live.processes) with result=requested BEFORE the command is dispatched; if the audit row cannot persist the request is rejected with 503 + Sec-Audit-Failed: true and NO command is dispatched (audit-on-open, fail-closed). Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
     },
     "/dex/perf/fleet": {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
@@ -4816,9 +4816,23 @@ void RestApiV1::register_routes(
         // audits as dex.device.view. Emit the SAME verb so a SIEM filter catches
         // both surfaces. A query with NO agent_id filter is a bulk operational
         // query (not individual-identifying) and is deliberately not audited here.
-        if (!q.agent_id.empty())
-            audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
-                     "DEX per-device events via REST /api/v1/guaranteed-state/events");
+        // FAIL-CLOSED (governance #1549 consistency-B1): an agent-scoped query serves
+        // individual-identifying behavioral PII, so refuse to serve when the evidence
+        // row is KNOWN to have failed to persist — parity with GET /dex/devices/{id}.
+        // A null audit_fn (audit-off) serves, per the AuditFn contract.
+        if (!q.agent_id.empty() && audit_fn &&
+            !audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
+                      "DEX per-device events via REST /api/v1/guaranteed-state/events")) {
+            res.status = 503;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(error_json("audit subsystem unavailable; refusing to serve device "
+                                       "data without durable evidence",
+                                       503),
+                            "application/json");
+            spdlog::warn("dex.device.view (events) audit fail-closed (503) agent_id={}",
+                         q.agent_id);
+            return;
+        }
         if (req.has_param("limit")) {
             int v = 0;
             auto s = req.get_param_value("limit");
@@ -4962,7 +4976,7 @@ void RestApiV1::register_routes(
             // A null audit_fn means no audit callback wired (test / audit-off config),
             // not a persistence failure — that path serves, per the AuditFn contract.
             if (audit_fn && !audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
-                                      "REST per-device DEX read model")) {
+                                      "REST per-device DEX read model cid=" + cid)) {
                 res.status = 503;
                 res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
@@ -4970,6 +4984,8 @@ void RestApiV1::register_routes(
                                                "device data without durable evidence",
                                           cid, 5000, "retry the request"),
                     "application/json");
+                spdlog::warn("dex.device.view audit fail-closed (503) cid={} agent_id={}", cid,
+                             agent_id);
                 return;
             }
             const std::string since = dex_iso_since(dex_window_to_days(window));
@@ -5102,7 +5118,7 @@ void RestApiV1::register_routes(
             // Usage-class read (processes) stays separately auditable from machine-
             // health (uptime) via the per-kind audit_action.
             if (audit_fn && !audit_fn(req, audit_action, "requested", "Agent", agent_id,
-                                      "REST live " + plugin + "/" + action)) {
+                                      "REST live " + plugin + "/" + action + " cid=" + cid)) {
                 res.status = 503;
                 res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
@@ -5110,6 +5126,8 @@ void RestApiV1::register_routes(
                                                "without durable evidence",
                                           cid, 5000, "retry the request"),
                     "application/json");
+                spdlog::warn("{} audit fail-closed (503, no dispatch) cid={} agent_id={}",
+                             audit_action, cid, agent_id);
                 return;
             }
             const auto [command_id, sent] =
@@ -5269,8 +5287,21 @@ void RestApiV1::register_routes(
                  // Behavioral-PII access audit: the devices[] list below names the
                  // agent_ids exhibiting this signal. Emit the same verb the
                  // dashboard per-signal view does so a SIEM filter catches both.
-                 audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
-                          "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}");
+                 // FAIL-CLOSED (governance #1549 consistency-B1): refuse to serve the
+                 // device list when the evidence row is KNOWN-lost — parity with GET
+                 // /dex/devices/{id}. Null audit_fn (audit-off) serves per contract.
+                 if (audit_fn &&
+                     !audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
+                               "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}")) {
+                     res.status = 503;
+                     res.set_header("Sec-Audit-Failed", "true");
+                     res.set_content(error_json("audit subsystem unavailable; refusing to serve "
+                                                "device data without durable evidence",
+                                                503),
+                                     "application/json");
+                     spdlog::warn("dex.signal.view audit fail-closed (503) obs_type={}", obs_type);
+                     return;
+                 }
 
                  JArr subjects;
                  for (const auto& s : guaranteed_state_store->dex_signal_subjects(obs_type, since,

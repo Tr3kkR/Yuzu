@@ -358,9 +358,13 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         const auto [command_id, sent] =
             dispatch_fn_(lk->plugin, lk->action, {id}, "", {});
         // Audit the DISPATCH with an honest result: "dispatched" (not "success") —
-        // the outcome isn't known yet (the browser polls /result separately). Keeps
-        // this in lockstep with the REST sibling so a SIEM result= query and the
-        // audit-result Prometheus bucket don't split one operation across surfaces.
+        // the outcome isn't known yet (the browser polls /result separately).
+        // NOTE (#1549): the REST sibling now audits "requested" PRE-dispatch
+        // (fail-closed audit-on-open); this dashboard emitter still audits
+        // post-dispatch "dispatched" — a deliberate, tracked divergence (see
+        // audit-log.md "Two emitters, by design") pending alignment of this path to
+        // the pre-dispatch model. Until then a SIEM result= query for device.live.*
+        // must match BOTH tokens.
         if (audit_fn_)
             audit_fn_(req, lk->audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent", id,
                       lk->plugin + "/" + lk->action + " -> " + std::to_string(sent) +

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
+
 ### Added
 
 - **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
@@ -40,7 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the machine-readable "Get live info": dispatches a read-only instruction now and returns the
   result synchronously (~20s). **POST, not GET** (it dispatches a command — a side effect);
   `GuaranteedState:Read` + `Execution:Execute` scoped to the device; audited per kind
-  (`device.live.uptime` / `device.live.processes`, `result=dispatched`). Concurrent live polls
+  (`device.live.uptime` / `device.live.processes`, audited `result=requested` pre-dispatch — see
+  the Security entry above; the dashboard "Get live info" emitter still audits post-dispatch
+  `result=dispatched`, a tracked alignment follow-up). Concurrent live polls
   are capped server-wide (over-budget → `429`); offline → `503`, timeout → `504`, device error
   → `502`, all with `retry_after_ms` where applicable.
 - **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The

@@ -1070,11 +1070,15 @@ TEST_CASE("REST dex/devices/{id}: audit persistence failure → 503, no PII serv
     // to have been lost (SOC 2 CC7.2 / works-council).
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty()); // echoed on the error path too
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["code"].get<int>() == 503);
-    // No device data leaked onto the body.
+    // No device data leaked onto the body — assert the structural keys AND the actual
+    // seeded PII content (an app-identity leak under a different key would harm the
+    // works-council/SOC 2 evidence review).
     CHECK(res->body.find("\"signals\"") == std::string::npos);
     CHECK(res->body.find("\"score\"") == std::string::npos);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
 }
 
 TEST_CASE("REST dex/devices/{id}: success echoes X-Correlation-Id header",
@@ -1097,6 +1101,7 @@ TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dis
     // The probe must NOT be dispatched without durable evidence.
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty()); // echoed on the error path too
     CHECK(h.last_live_plugin.empty()); // audit failed BEFORE dispatch → no command sent
 }
 
@@ -1195,12 +1200,56 @@ TEST_CASE("REST dex/devices/{id}: scoped denial carries the A4 envelope (correla
     // for the gate and writes only a 403 status — so this test asserts the handler
     // surfaces the gate's status untouched (no data leak); the A4 *body* shape is
     // pinned at the helper level in test_auth_routes.cpp.
+    // KNOWN GAP (governance #1549 QE-SHOULD): this test does NOT prove the
+    // /api/v1/dex/devices/{id} handler is wired to the A4-emitting
+    // require_scoped_permission — that binding is accepted as untested at this unit
+    // boundary (the harness stub stands in for the gate).
     RestGsHarness h;
     h.deny_scoped_agent = "WS-9";
     auto res = h.sink.Get("/api/v1/dex/devices/WS-9?window=all");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty());
+}
+
+// #1549 governance consistency-B1: the per-device PII REST siblings must fail closed
+// on a dropped audit row, same as GET /dex/devices/{id}.
+
+TEST_CASE("REST guaranteed-state/events: agent-scoped audit failure → 503, no PII, Sec-Audit-Failed",
+          "[rest][dex][events][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false;
+    // agent_id filter = individual-identifying behavioral PII → audited + fail-closed.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events?agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos); // no PII leaked
+}
+
+TEST_CASE("REST guaranteed-state/events: NO agent_id filter is a bulk query — not gated by audit",
+          "[rest][dex][events][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false; // would fail-close IF it were audited
+    // No agent_id → bulk operational query, deliberately not individual-audited → serves.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+}
+
+TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, Sec-Audit-Failed",
+          "[rest][dex][signals][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("WS-1") == std::string::npos); // the agent_id list must not leak
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {

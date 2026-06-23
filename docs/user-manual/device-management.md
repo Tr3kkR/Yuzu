@@ -231,7 +231,7 @@ Both panels require **`Execution:Execute`** in addition to `GuaranteedState:Read
 
 On a host with many distinct large executables the process panel can take up to ~30 seconds (it hashes each on-disk image); a "Waiting for the device to respond…" message followed by a timeout with a *Reload to retry* prompt is normal, not a failure.
 
-The machine-readable equivalents (for agentic workers and automation) are `GET /api/v1/dex/devices/{id}` (the per-device DEX read model) and `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` (the live dispatch — POST because it has a side effect). They enforce the same scoped permissions and emit the same audit verbs as these panels. See [REST API — DEX](rest-api.md).
+The machine-readable equivalents (for agentic workers and automation) are `GET /api/v1/dex/devices/{id}` (the per-device DEX read model) and `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` (the live dispatch — POST because it has a side effect). They enforce the same scoped permissions and emit the same audit verbs as these panels. **They differ in failure mode, though:** the REST endpoints are **audit-fail-closed** — if the audit row cannot persist they return `503` + `Sec-Audit-Failed: true` and serve no data (or, for `/live`, dispatch nothing), whereas these dashboard panels set `Sec-Audit-Failed: true` on the response but continue to render (a transient audit hiccup must not blank the dashboard). Alert on `Sec-Audit-Failed: true` from **either** surface as a SOC 2 CC7.2 evidence-gap signal. See [REST API — DEX](rest-api.md).
 
 ### REST API
 

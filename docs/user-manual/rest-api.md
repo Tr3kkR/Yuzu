@@ -154,6 +154,8 @@ All REST API v1 responses use a standard JSON envelope.
 
 HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
 
+Newer agentic-first surfaces enrich `error` with two optional fields: `correlation_id` (a `req-<hex>` token also echoed on the `X-Correlation-Id` response header, for joining the response to server logs/audit rows) and, on `401`/`403` denials from per-device scoped-permission gates, `permission` — the `"SecurableType:Operation"` the caller was denied (e.g. `"GuaranteedState:Read"`). These fields are **additive**; clients parsing only `code`/`message` are unaffected. They are not yet emitted on every denial path (the admin-only / unscoped gates still return the bare envelope — a tracked follow-up), so automation must treat `correlation_id`/`permission` as present-when-available, not guaranteed.
+
 ---
 
 ## REST API v1 Endpoints
@@ -3381,7 +3383,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 - **4xx:** `400` on non-integer or negative `limit` / `offset`.
 - **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
-- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. A query with no `agent_id` filter is a bulk operational query and is not individually audited.
+- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. **Fail-closed:** the audit fires before the data is serialized; if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no data (parity with `GET /api/v1/dex/devices/{id}`). A query with no `agent_id` filter is a bulk operational query, not individually audited, and is unaffected by this gate.
 
 #### `GET /api/v1/guaranteed-state/status`
 
@@ -3445,7 +3447,7 @@ One signal type's drill-down.
 - **Query parameters:** `window`; `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
 - **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
-- **Audit (behavioral PII):** emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) on every successful access — see the audit boundary note above.
+- **Audit (behavioral PII):** the `devices[]` array names the `agent_id`s exhibiting this signal, so the endpoint emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) before serving — see the audit boundary note above. **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list (parity with `GET /api/v1/dex/devices/{id}`).
 
 #### `GET /api/v1/dex/perf/fleet`
 
@@ -3485,8 +3487,9 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group (a REST worker is held to the same per-device scope as the dashboard lens).
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameters:** `window` — one of `24h` / `7d` / `30d` / `all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable.
-- **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`) on every successful access — behavioral PII.
+- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, **or** `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below).
+- **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
+- **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the behavioral PII is served (audit-on-open). **Fail-closed:** if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves **no** device data — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council).
 
 #### `POST /api/v1/dex/devices/{id}/live`
 
@@ -3496,8 +3499,9 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
-- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent). `504` — the device did not respond within the timeout (`retry_after_ms`).
-- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=dispatched`) — the dispatch is the works-council-relevant event, kept separately countable per kind.
+- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
+- **Headers:** `X-Correlation-Id` is echoed on **every** response path.
+- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=requested`, `detail` carries `cid=<correlation_id>`) **before** the command is dispatched — the operator's *request* is the works-council-relevant event, kept separately countable per kind. **Fail-closed:** if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and the command is **not** dispatched (no usage-class probe without durable evidence). The dispatch outcome (reached an agent / offline) is carried by the HTTP response, not the audit row; `command_id` is recoverable from the response store / metrics by `cid`.
 
 > **Scope boundary.** This is the **interactive, single-device** probe and is **concurrency-capped server-wide** (over-budget callers get `429`). It is **not** the fleet-scale path — do not fan a synchronous `/live` call out across thousands of devices. To read many devices at once, dispatch the equivalent read-only instruction to a *scope* via the async execution surface and collect results by `execution_id` (the cap deliberately keeps fan-out off this endpoint).
 
