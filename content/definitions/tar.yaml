@@ -13,7 +13,10 @@ metadata:
     Returns the current status of the TAR database including record count,
     oldest and newest event timestamps, database size on disk, and the
     configured retention period. Use this to verify TAR is collecting data
-    and to monitor disk usage.
+    and to monitor disk usage. Also reports both the configured
+    network_capture_method and the network_capture_method_effective (the
+    mechanism actually collecting — always polling today), so status never
+    misrepresents the active capture mechanism.
   tags: [tar, timeline, monitoring, diagnostics]
 
 spec:
@@ -403,7 +406,9 @@ spec:
           cadence. Other values (iphlpapi, procfs, lsof, etw,
           endpoint_security) can be pre-staged for forthcoming
           kernel-event collectors but are accepted-but-not-yet-implemented;
-          the agent emits a warn line. Requires agent v0.12.0+.
+          the agent emits a warn line. The mechanism actually in force is
+          observable via network_capture_method_effective in the status
+          action (always polling today). Requires agent v0.12.0+.
       process_stabilization_exclusions:
         type: string
         displayName: Process Stabilization Exclusions

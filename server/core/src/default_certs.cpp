@@ -606,7 +606,13 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
     // Leaves are sized to the CA's exact notAfter so they never outlive the
     // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
-    const pki::Validity leaf_validity{std::chrono::system_clock::now(), ca_info->not_after};
+    // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
+    // and the per-agent client leaf (sign_agent_csr, PR3 H-2). Without this, an
+    // agent whose clock lags the server at first connect sees these freshly-minted
+    // server leaves as not-yet-valid and rejects the TLS handshake, and the retry
+    // paths don't recover a "valid cert, skewed clock" until the skew elapses.
+    const pki::Validity leaf_validity{
+        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info->not_after};
 
     pki::SubjectAltNames san;
     san.dns = {"localhost"};

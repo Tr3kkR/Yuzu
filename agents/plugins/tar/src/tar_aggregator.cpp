@@ -130,9 +130,21 @@ bool apply_source_enabled_transition(TarDatabase& db,
     // disable the flag flips only after the baseline clear persists.
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
+    // Canonicalise `prev` to the strict tri-state before BOTH transition checks
+    // (#560 / fjarvis review). do_configure only ever writes "true"/"false"; a
+    // corrupt or tampered value canonicalises to "errored", which is neither
+    // "true" nor "false". The two legs must agree on what "errored" means:
+    //   - disable leg already fired on any non-"false" prev (errored included),
+    //   - the re-enable leg used to reset paused_at ONLY on prev == "false",
+    // so recovering a tampered source via `configure <src>_enabled=true` from an
+    // "errored" value resumed collection but left a STALE paused_at — `status`
+    // then reported enabled=true alongside a paused timestamp and the dashboard
+    // rendered a collecting source as paused. Gating both legs on the canonical
+    // tri-state ("errored" is "not validly enabled") makes the recovery clear it.
+    const std::string_view prev_canon = canonical_source_enabled(prev);
     auto paused_at_key = std::format("{}_paused_at", source);
 
-    if (new_value == "false" && prev != "false") {
+    if (new_value == "false" && prev_canon != "false") {
         // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
         // `_enabled` flag only if the clear actually persisted. `set_state` can
         // fail silently (SQLITE_BUSY / disk full); if we flipped the flag first
@@ -153,10 +165,15 @@ bool apply_source_enabled_transition(TarDatabase& db,
         return true;
     }
 
-    // All other transitions (idempotent set, disable→enable, first-ever set):
+    // All other transitions (idempotent set, disable/errored→enable, first set):
     // no baseline clear, so the flag write cannot leave inconsistent state.
     db.set_config(enabled_key, std::string{new_value});
-    if (new_value == "true" && prev == "false") {
+    // Clear paused_at whenever we become enabled from a NOT-validly-enabled state
+    // — "false" (paused) OR "errored" (corrupt/tampered). `prev_canon != "true"`
+    // is the mirror of the disable leg's `prev_canon != "false"`, so an
+    // errored→true recovery no longer leaves a stale paused_at. An idempotent
+    // true→true is a no-op here (paused_at is already "0").
+    if (new_value == "true" && prev_canon != "true") {
         db.set_config(paused_at_key, "0");
     }
     return true;
@@ -182,6 +199,14 @@ std::string_view diff_state_key(std::string_view source) {
     return {};
 }
 
+std::string_view canonical_source_enabled(std::string_view stored_value) {
+    if (stored_value == "true")
+        return "true";
+    if (stored_value == "false")
+        return "false";
+    return "errored"; // anything else was written outside the plugin
+}
+
 void run_retention(TarDatabase& db, int64_t now_epoch) {
     // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
     db.execute_sql("BEGIN TRANSACTION");
@@ -192,8 +217,15 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // queryable." Without this guard, time-based retention drains hourly
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
+        // #539/#560 — preserve rows whenever the source is NOT actively-and-
+        // validly enabled. Gating on the canonical tri-state (not `== "false"`)
+        // means a paused source ("false") AND a corrupt/tampered one ("errored")
+        // both skip retention, so the forensic window an operator paused — or one
+        // whose `_enabled` value was clobbered — is never pruned. This matches the
+        // collect-time source_enabled() gate, which also fails closed on "errored".
         auto enabled_key = std::format("{}_enabled", src.name);
-        if (db.get_config(enabled_key, src.default_enabled ? "true" : "false") == "false")
+        if (canonical_source_enabled(
+                db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);

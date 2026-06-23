@@ -28,8 +28,11 @@ document.querySelectorAll('.step').forEach(btn => {
 });
 
 // Toggle visibility for optional sections
-document.getElementById('enable-tls').addEventListener('change', e => {
-  document.querySelectorAll('.tls-field').forEach(f => f.style.display = e.target.checked ? '' : 'none');
+document.getElementById('tls-mode').addEventListener('change', e => {
+  const mode = e.target.value;
+  document.getElementById('tls-default-fields').style.display = mode === 'default' ? '' : 'none';
+  document.getElementById('tls-operator-fields').style.display = mode === 'operator' ? '' : 'none';
+  document.getElementById('tls-plaintext-fields').style.display = mode === 'plaintext' ? '' : 'none';
 });
 
 document.getElementById('pg-mode').addEventListener('change', e => {
@@ -60,6 +63,12 @@ function val(id) { return document.getElementById(id).value.trim(); }
 function num(id) { return parseInt(document.getElementById(id).value) || 0; }
 function chk(id) { return document.getElementById(id).checked; }
 
+function tlsModeLabel(mode) {
+  if (mode === 'operator') return '🔐 Operator certs';
+  if (mode === 'plaintext') return '⚠️ Plaintext (insecure)';
+  return '✅ Default certs (auto-generated)';
+}
+
 // Fill a field with a cryptographically-random 24-byte hex secret. Used for
 // the Postgres credentials so operators can avoid weak / shared passwords —
 // the secret only ever lands in the generated .env, never in the compose YAML.
@@ -68,22 +77,6 @@ function genSecret(id) {
   crypto.getRandomValues(bytes);
   document.getElementById(id).value =
     Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// ── Admin password hash ──
-// Yuzu uses: username:password:salt in a specific format
-// Format: user:pass:salt_hash where salt_hash = sha256(username + ":" + password + ":" + salt)
-// The compose file uses a pre-computed hash. We'll note that users need to generate one.
-function computeAdminHash(user, pass) {
-  // The default in the original compose is:
-  // admin:admin:ab3585560da45a7b7da0a220c922dd72:25e957743ebefd48d938b30cdd117ef4487897da209e0e8883dd473363dceb8a
-  // This is user:salt:md5_of_salt:sha256_of_salt_pass
-  // For simplicity, we'll use a random salt and compute the hashes
-  // NOTE: In production, users should generate this via yuzu-server CLI
-  const salt = 'auto' + Math.random().toString(36).slice(2, 10);
-  // We can't do SHA-256 synchronously in browser without SubtleCrypto (async)
-  // So we'll provide a placeholder and a note
-  return `${user}:${pass}:${salt}:RUN_yuzu-server_hash_command`;
 }
 
 // ── Port conflict detection ──
@@ -153,7 +146,7 @@ function buildReview() {
     ['Admin User', val('admin-user')],
     ['Dashboard Port', num('dashboard-port')],
     ['Agent gRPC Port', num('grpc-port')],
-    ['TLS', chk('enable-tls') ? '✅ Enabled' : '❌ Disabled'],
+    ['TLS', tlsModeLabel(val('tls-mode'))],
     ['PostgreSQL', pgBundled ? '✅ Bundled container' : '🔗 External / managed'],
     ['ClickHouse', chk('include-clickhouse') ? '✅ Included' : '❌ Skipped'],
     ['Prometheus', chk('include-prometheus') ? '✅ Included' : '❌ Skipped'],
@@ -181,6 +174,25 @@ function buildReview() {
     }
   } else if (!val('pg-dsn')) {
     warnings.push('⚠️ External Postgres selected but no DSN supplied — the server will have no database to talk to.');
+  }
+
+  // TLS sanity checks
+  const tlsMode = val('tls-mode');
+  if (tlsMode === 'operator') {
+    if (!val('tls-cert') || !val('tls-key')) {
+      warnings.push('⚠️ Operator certs selected but the cert and/or key path is blank — supply both, or switch to Default certs.');
+    }
+    if (!val('tls-ca-cert')) {
+      warnings.push('⚠️ Operator certs need a CA path — the server refuses to start with operator certs and no CA (mandatory mTLS client verification).');
+    }
+  } else if (tlsMode === 'plaintext') {
+    warnings.push('⚠️ Plaintext TLS mode: the agent↔server channel is unencrypted (--no-tls --no-https). Dev only — do not internet-expose port 50051.');
+  } else if (tlsMode === 'default' && !chk('persist-certs')) {
+    warnings.push('ℹ️ Default certs without persistence: the per-install CA will be regenerated on every container recreate, breaking already-enrolled agents. Enable "Persist generated certs".');
+  }
+  // Gateway + TLS is not generated yet (secure gateway topology is #1314).
+  if (chk('include-gateway') && tlsMode !== 'plaintext') {
+    warnings.push('⛔ Gateway + ' + tlsMode + ' certs can\'t be generated yet (secure gateway wiring is in flight, #1314). Pick Plaintext for the gateway, or disable the gateway for a TLS server-only stack.');
   }
   const warnEl = document.getElementById('port-warnings');
   if (warnings.length) {

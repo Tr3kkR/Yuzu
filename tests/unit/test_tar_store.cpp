@@ -15,8 +15,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h> // geteuid — the unmovable-quarantine test is POSIX-only
+#endif
 
 namespace fs = std::filesystem;
 using namespace yuzu::tar;
@@ -880,3 +885,189 @@ TEST_CASE("TarDatabase: insert and query dns events (ADR-0011)", "[tar][store][c
     CHECK(r->rows[0][3] == "60");
     CHECK(r->rows[0][4] == "cache");
 }
+
+// ── #559: corrupt-DB quarantine on open ────────────────────────────────────
+
+TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    auto tmp = yuzu::test::unique_temp_path("tar_corrupt_");
+
+    // 1. Create a real DB and persist a deliberately-paused source. This is the
+    //    forensic-preservation state a corrupt read must NOT silently undo.
+    {
+        auto opened = TarDatabase::open(tmp);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        REQUIRE(db.create_warehouse_tables());
+        db.set_config("process_enabled", "false");
+        CHECK(db.get_config("process_enabled", "true") == "false");
+    } // connection closed; WAL checkpointed into the main file on close
+
+    // 2. Corrupt it: drop any WAL/SHM sidecars and clobber the whole file with
+    //    non-SQLite bytes so PRAGMA integrity_check fails deterministically.
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{tmp.string() + suffix}, ec);
+    }
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db for #559";
+    }
+
+    // 3. Re-open: must succeed with a FRESH database (not refuse, not trust the
+    //    garbage), and quarantine the corrupt file aside for forensic review.
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    TarDatabase db2 = std::move(*reopened);
+    REQUIRE(db2.create_warehouse_tables());
+
+    // Fresh DB → the paused config is gone; the default "true" comes from a
+    // CLEAN database, not a silent read-failure default over corrupt bytes.
+    CHECK(db2.get_config("process_enabled", "true") == "true");
+
+    // A timestamped quarantine sidecar exists next to the original path.
+    bool found_quarantine = false;
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) {
+            found_quarantine = true;
+            std::error_code ec;
+            fs::remove(entry.path(), ec); // tidy up the quarantine artifact
+        }
+    }
+    CHECK(found_quarantine);
+}
+
+TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
+          "[tar][store][lifecycle][corruption]") {
+    // Quarantine names are 1-second granular; two corruptions in the same wall
+    // second (or after a backward clock step) must NOT rename over each other —
+    // that would shred preserved forensic evidence. Drive two corrupt-open
+    // cycles back-to-back (same second) and assert TWO distinct `.corrupt-*`
+    // files survive.
+    auto tmp = yuzu::test::unique_temp_path("tar_collide_");
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+
+    auto corrupt_then_open = [&]() {
+        for (const char* suffix : {"-wal", "-shm"}) {
+            std::error_code ec;
+            fs::remove(fs::path{tmp.string() + suffix}, ec);
+        }
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            REQUIRE(f.is_open());
+            f << "corrupt tar.db -- collision test #559";
+        }
+        auto reopened = TarDatabase::open(tmp);
+        REQUIRE(reopened.has_value()); // quarantined + fresh DB each time
+    };
+
+    corrupt_then_open();
+    corrupt_then_open(); // same wall-second as the first → must not clobber it
+
+    int quarantine_count = 0;
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) {
+            ++quarantine_count;
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+    CHECK(quarantine_count >= 2); // both quarantines preserved, neither overwritten
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    // The happy path: integrity_ok returns true, so a previously-written DB is
+    // re-opened in place with its data intact and NO `.corrupt-*` sidecar minted
+    // (guards against an integrity_ok that wrongly fails every open).
+    auto tmp = yuzu::test::unique_temp_path("tar_valid_");
+    {
+        auto opened = TarDatabase::open(tmp);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        db.set_config("process_enabled", "false");
+    }
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    TarDatabase db = std::move(*reopened);
+    // Data survived — NOT reset to the default.
+    CHECK(db.get_config("process_enabled", "true") == "false");
+    // No quarantine sidecar was created for a healthy DB.
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path()))
+        CHECK(entry.path().filename().string().rfind(prefix, 0) != 0);
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+#ifndef _WIN32
+TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primary)",
+          "[tar][store][lifecycle][corruption]") {
+    // The PRIMARY #559 safety property: when a corrupt tar.db CANNOT be moved
+    // aside (read-only mount, locked file, permissions), open() must REFUSE
+    // (std::unexpected) rather than re-open-and-trust the still-corrupt file —
+    // doing so would serve the "true" get_config default for every
+    // <source>_enabled key and silently re-enable an operator-paused source.
+    // POSIX-only: modelled with a read-only parent dir so the quarantine rename
+    // fails. (Windows reparse/rename behaviour is a separate, static-reviewed
+    // path with no CI here.)
+    if (::geteuid() == 0) {
+        SKIP("root bypasses directory permissions; cannot make the rename fail");
+    }
+
+    auto dir = yuzu::test::unique_temp_path("tar_unmovable_");
+    REQUIRE(fs::create_directory(dir));
+    // RAII: re-add write perms and remove the dir even if an assertion throws,
+    // so a read-only temp dir never leaks onto a CI box that reuses workspaces.
+    struct DirGuard {
+        fs::path dir;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::permissions(dir, fs::perms::owner_all, fs::perm_options::add, ec);
+            fs::remove_all(dir, ec);
+        }
+    } dir_guard{dir};
+    const auto db_path = dir / "tar.db";
+
+    // 1. Create a valid DB with a deliberately-paused source, then corrupt it.
+    {
+        auto opened = TarDatabase::open(db_path);
+        REQUIRE(opened.has_value());
+        TarDatabase db = std::move(*opened);
+        REQUIRE(db.create_warehouse_tables());
+        db.set_config("process_enabled", "false");
+    }
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db_path.string() + suffix}, ec);
+    }
+    {
+        std::ofstream f(db_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "not a valid sqlite database -- corrupt + unmovable (#559)";
+    }
+
+    // 2. Strip write permission from the parent dir so the .corrupt-<epoch>
+    //    rename inside it fails → quarantine returns nullopt → fail closed.
+    std::error_code perm_ec;
+    fs::permissions(dir,
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, perm_ec);
+    REQUIRE_FALSE(perm_ec);
+
+    // 3. open() must REFUSE — not silently re-init a fresh DB over the corruption.
+    auto reopened = TarDatabase::open(db_path);
+    CHECK_FALSE(reopened.has_value());
+    if (!reopened.has_value())
+        CHECK(reopened.error().find("corrupt and unmovable") != std::string::npos);
+    // dir_guard restores perms + removes the dir.
+}
+#endif // _WIN32
