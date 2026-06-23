@@ -32,6 +32,7 @@
 #include "../test_helpers.hpp"
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,14 @@ struct RestGsHarness {
     // handed the scoped check (proves the route scopes by the right device).
     std::string scoped_deny_agent;
     std::string last_scoped_agent_id;
+
+    // Audit-persistence simulation for the AuditFn-failure contract (CC6.6). Default
+    // true keeps every existing test unchanged. audit_succeeds=false → audit_fn
+    // returns false (silent persist failure); audit_throws=true → audit_fn raises
+    // (audit store that throws). Either must surface Sec-Audit-Failed: true while the
+    // read still serves (set-and-proceed), and the throw must be caught (never 500).
+    bool audit_succeeds{true};
+    bool audit_throws{false};
 
     std::vector<AuditRecord> audit_log;
 
@@ -139,8 +148,10 @@ struct RestGsHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
+            if (audit_throws)
+                throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
-            return true;
+            return audit_succeeds;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -1242,6 +1253,51 @@ TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no 
         "/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS%00x");
     REQUIRE(nul);
     CHECK(nul->status == 400);
+}
+
+TEST_CASE("REST gs.device-compliance: audit-persist failure → Sec-Audit-Failed header, still serves",
+          "[rest][guaranteed_state][baseline][audit]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_deployed_baseline("B", {"r1"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.audit_succeeds = false; // guardian.device.view row silently fails to persist
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    // Set-and-proceed (mirrors /api/v1/events): the read still serves, but the
+    // out-of-band header lets SRE/SIEM detect the missing evidence row (CC6.6).
+    CHECK(res->status == 200);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST gs.device-compliance: a throwing audit_fn is caught → Sec-Audit-Failed, not 500",
+          "[rest][guaranteed_state][baseline][audit]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_deployed_baseline("B", {"r1"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.audit_throws = true; // audit store raises mid-call
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200); // caught, not surfaced as a 500
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST gs.device-compliance: audit success → no Sec-Audit-Failed header",
+          "[rest][guaranteed_state][baseline][audit]") {
+    RestGsHarness h; // default audit_succeeds == true
+    h.seed_rule("r1", "G1");
+    h.seed_deployed_baseline("B", {"r1"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
 }
 
 TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids",
