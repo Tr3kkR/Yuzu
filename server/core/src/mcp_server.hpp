@@ -47,6 +47,21 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
     using AgentsJsonFn = std::function<nlohmann::json()>;
 
+    /// Per-agent response-scope predicate (#1550 HIGH-1 / #1634). Returns true iff
+    /// the request's caller may read responses for `agent_id`. Production wires it
+    /// to rbac_store->check_scoped_permission(user,"Response","Read",agent_id,mgmt_store)
+    /// — the same chokepoint the per-device REST/dashboard routes use — so an
+    /// operator collecting an execution's rows by execution_id sees only the agents
+    /// inside their management groups. Empty (unwired) or RBAC-off → no filtering
+    /// (legacy-open, matching require_scoped_permission). The filter is applied
+    /// AFTER the store's LIMIT, so a fan-out wider than the row cap that spans
+    /// out-of-scope agents may truncate the caller's in-scope view — completeness
+    /// for >cap collection is the keyset-pagination follow-up (#1634); the
+    /// cross-operator ISOLATION guarantee (never another operator's rows) holds
+    /// regardless.
+    using ResponseScopeFn =
+        std::function<bool(const httplib::Request&, const std::string& agent_id)>;
+
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     ///
     /// `execution_id` is the pre-created `ExecutionTracker` row id, threaded
@@ -99,7 +114,8 @@ public:
                             const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
                             CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
-                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                            ResponseScopeFn response_scope_fn = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -114,7 +130,8 @@ public:
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         ResponseScopeFn response_scope_fn = {});
 };
 
 } // namespace yuzu::server::mcp

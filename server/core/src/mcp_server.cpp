@@ -528,7 +528,7 @@ McpServer::HandlerFn McpServer::build_handler(
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -801,9 +801,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 return *cached_agents;
             };
 
-            // Audit helper
-            auto mcp_audit = [&](const std::string& result_status, const std::string& detail = {}) {
-                audit_fn(req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
+            // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
+            // surface a dropped evidence row (audit_persisted:false), mirroring the
+            // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
+            // the return are unaffected.
+            auto mcp_audit = [&](const std::string& result_status,
+                                 const std::string& detail = {}) -> bool {
+                return audit_fn(req, "mcp." + tool_name, result_status, "mcp_tool", tool_name,
+                                detail);
             };
 
             // ── C7: read_only_mode enforcement ──────────────────────────
@@ -1090,9 +1095,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto exec_id = param_str(args, "execution_id");
                 auto instr_id = param_str(args, "instruction_id");
                 if (exec_id.empty() && instr_id.empty()) {
+                    // A4 error.data: correlation_id + remediation (#1550 review MEDIUM —
+                    // sibling MCP tools build A4 error.data; this validation error omitted it).
+                    auto a4 = JObj()
+                                  .add("correlation_id", yuzu::server::detail::make_correlation_id())
+                                  .add("remediation",
+                                       "pass execution_id (from execute_instruction) or "
+                                       "instruction_id")
+                                  .str();
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "one of execution_id / instruction_id is required"),
+                                       "one of execution_id / instruction_id is required", a4),
                         "application/json");
                     return;
                 }
@@ -1110,7 +1123,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // non-unique `timestamp DESC` order silently skips/duplicates
                 // agents (UP-1). Correct >1000-row collection is the keyset-
                 // pagination follow-up, not offset.
-                rq.limit = std::clamp(param_int32(args, "limit", 100), 1, 1000);
+                // Clamp in 64-bit BEFORE narrowing (#1550 review LOW): param_int32's
+                // int64->int cast wraps a limit > INT_MAX negative, which std::clamp
+                // would then pin to 1 (silently under-serving). Read the raw int64,
+                // clamp to [1,1000] first; the result always fits an int.
+                rq.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
                 // When execution_id is supplied, route to the exact-correlation
                 // path so the agentic dispatch->collect loop closes cleanly:
                 // execute_instruction mints the execution_id, stamps it onto
@@ -1122,6 +1140,44 @@ McpServer::HandlerFn McpServer::build_handler(
                 // folding in another execution's responses.
                 auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
                                                    : response_store->query(instr_id, rq);
+                // Audit target is the primary correlation key actually used:
+                // execution_id when present (the exact-correlation path), else
+                // instruction_id. When both are supplied execution_id wins, so
+                // a dual-id call is recorded under the execution_id it served —
+                // deliberate (execution_id is the agentic-dispatch unit).
+                const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+
+                // #1550 HIGH-1 / #1634: management-group scope. The flat Response:Read
+                // gate above is NOT an ownership check (dispatched_by is display-only),
+                // so without this an operator could collect ANOTHER operator's execution
+                // rows by execution_id. Filter per-agent through the injected scope
+                // predicate (production: check_scoped_permission, the same chokepoint the
+                // per-device REST/dashboard routes use). Dedupe the check per distinct
+                // agent_id — an execution fans out to a bounded agent set even with many
+                // response rows. Unwired/RBAC-off → no filter (legacy-open), matching
+                // require_scoped_permission. NOTE: the filter runs AFTER the store LIMIT,
+                // so a fan-out wider than the cap that spans out-of-scope agents may
+                // truncate the in-scope view (keyset follow-up #1634); the isolation
+                // guarantee — never another operator's rows — holds regardless.
+                bool scope_filtered = false;
+                if (response_scope_fn) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(responses.size());
+                    for (auto& r : responses) {
+                        auto it = memo.find(r.agent_id);
+                        const bool allowed =
+                            it != memo.end()
+                                ? it->second
+                                : (memo[r.agent_id] = response_scope_fn(req, r.agent_id));
+                        if (allowed)
+                            visible.push_back(std::move(r));
+                        else
+                            scope_filtered = true;
+                    }
+                    responses.swap(visible);
+                }
+
                 JArr arr;
                 for (const auto& r : responses) {
                     arr.add(JObj()
@@ -1131,18 +1187,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("output", r.output)
                                 .add("timestamp", r.timestamp));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
-                // Audit target is the primary correlation key actually used:
-                // execution_id when present (the exact-correlation path), else
-                // instruction_id. When both are supplied execution_id wins, so
-                // a dual-id call is recorded under the execution_id it served —
-                // deliberate (execution_id is the agentic-dispatch unit).
-                mcp_audit("success", !exec_id.empty() ? exec_id : instr_id);
-                res.set_content(success_response(id, result), "application/json");
+                // A dropped-by-scope read is a security-relevant event — audit it
+                // distinctly (#1634) so an operator reaching outside their groups is
+                // visible in the chain, separate from the served-set success row.
+                if (scope_filtered)
+                    mcp_audit("denied",
+                              "scope: filtered out-of-management-group response rows for " + key);
+                // #1550 HIGH-2: observe the success-audit bool — a dropped evidence row
+                // on this SOC 2 read surface is surfaced to the caller via
+                // audit_persisted:false (mirrors the CA-revoke handler below).
+                const bool audit_ok = mcp_audit("success", key);
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
 
@@ -2657,7 +2717,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn) {
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                ResponseScopeFn response_scope_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -2665,7 +2726,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
                            mcp_disabled, std::move(dispatch_fn), ca_store,
                            std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn), std::move(net_perf_fn)));
+                           std::move(dex_perf_fn), std::move(net_perf_fn),
+                           std::move(response_scope_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

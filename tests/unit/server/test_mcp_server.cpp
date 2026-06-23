@@ -574,6 +574,13 @@ struct McpTestServer {
     /// Default empty keeps existing tests on the unavailable path.
     yuzu::server::NetPerfFn net_perf_fn_for_test{};
 
+    /// #1550 HIGH-1: optionally wire a per-agent response-scope predicate so the
+    /// query_responses{execution_id} management-group filter is exercised. Default
+    /// empty = no filter (legacy-open), so every existing query_responses test sees
+    /// all rows. A two-principal test sets a lambda that returns true only for the
+    /// caller's in-scope agents.
+    yuzu::server::mcp::McpServer::ResponseScopeFn response_scope_fn_for_test{};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
@@ -681,7 +688,8 @@ private:
             },
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
             /*dex_perf_fn=*/dex_perf_fn_for_test,
-            /*net_perf_fn=*/net_perf_fn_for_test);
+            /*net_perf_fn=*/net_perf_fn_for_test,
+            /*response_scope_fn=*/response_scope_fn_for_test);
     }
 };
 
@@ -2215,6 +2223,11 @@ TEST_CASE("MCP query_responses: rejects when neither id provided",
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(body["error"]["message"].get<std::string>().find("execution_id") != std::string::npos);
+    // #1550 review MEDIUM: the validation error now carries A4 error.data —
+    // a correlation_id and a remediation hint (sibling MCP tools build A4 data).
+    REQUIRE(body["error"].contains("data"));
+    CHECK_FALSE(body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(body["error"]["data"].contains("remediation"));
 }
 
 TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no cap bypass)",
@@ -2317,6 +2330,119 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     CHECK(rows[0]["execution_id"] == exec_id);
     CHECK(rows[0]["agent_id"] == "agent-1");
     CHECK(rows[0]["output"] == "Windows 11");
+}
+
+// ── #1550 HIGH-1/HIGH-2 + review hardening ───────────────────────────────────
+
+TEST_CASE("MCP query_responses: management-group scope filters another operator's rows (#1550)",
+          "[mcp][integration][response][fanout][scope]") {
+    // Bob must not collect Alice's execution rows by execution_id. exec-S fans out
+    // to two agents; the injected scope predicate (production: check_scoped_permission)
+    // admits only agent-1 (the caller's). agent-2's row is dropped and the drop is
+    // audited distinctly.
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-S", "instr-1", "agent-1", 0, "mine", 400));
+    store.store(mk_resp("exec-S", "instr-1", "agent-2", 0, "not-mine", 401));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.response_scope_fn_for_test = [](const httplib::Request&,
+                                       const std::string& agent_id) -> bool {
+        return agent_id == "agent-1"; // caller's management group contains only agent-1
+    };
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"query_responses","arguments":{"execution_id":"exec-S"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto rows = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0]["agent_id"] == "agent-1");
+    CHECK(rows[0]["output"] == "mine");
+    // The out-of-scope drop is a security-relevant event → a distinct "denied" audit
+    // row alongside the served-set success row.
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.query_responses|denied")
+            saw_denied = true;
+        if (a == "mcp.query_responses|success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legacy-open)",
+          "[mcp][integration][response][fanout][scope]") {
+    // RBAC-off / unwired predicate → every authenticated caller sees all rows
+    // (matches require_scoped_permission's legacy posture). No denied audit.
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-T", "instr-1", "agent-1", 0, "a", 410));
+    store.store(mk_resp("exec-T", "instr-1", "agent-2", 0, "b", 411));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store; // response_scope_fn_for_test left empty
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"query_responses","arguments":{"execution_id":"exec-T"}}})");
+    REQUIRE(res);
+    auto rows = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(rows.size() == 2);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.query_responses|denied");
+}
+
+TEST_CASE("MCP query_responses: dropped success-audit surfaces audit_persisted:false (#1550)",
+          "[mcp][integration][response][fanout][audit]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-U", "instr-1", "agent-1", 0, "x", 420));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.audit_succeeds_ = false; // the success-audit row cannot persist
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"query_responses","arguments":{"execution_id":"exec-U"}}})");
+    REQUIRE(res);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    REQUIRE(result.contains("audit_persisted"));
+    CHECK(result["audit_persisted"] == false);
+    // The rows are still returned (the read succeeded); only the evidence gap is flagged.
+    auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    CHECK(rows.size() == 1);
+}
+
+TEST_CASE("MCP query_responses: limit > INT_MAX clamps to the cap, not to 1 (#1550 LOW)",
+          "[mcp][integration][response][fanout]") {
+    // The int32 cast wrapped a > INT_MAX limit negative, which then clamped to 1
+    // (under-serving). The 64-bit clamp pins it to the 1000 cap instead, so a huge
+    // limit returns all matching rows up to the cap (here, all 3).
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-V", "instr-1", "agent-1", 0, "V1", 430));
+    store.store(mk_resp("exec-V", "instr-1", "agent-2", 0, "V2", 431));
+    store.store(mk_resp("exec-V", "instr-1", "agent-3", 0, "V3", 432));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // 5_000_000_000 > INT_MAX (2_147_483_647).
+    auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":83,)"
+                                   R"("params":{"name":"query_responses","arguments":)") +
+                       R"({"execution_id":"exec-V","limit":5000000000}}})");
+    REQUIRE(res);
+    auto rows = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(rows.size() == 3); // NOT 1 (the pre-fix wrap would have clamped to 1)
 }
 
 // ── PR4 B-2: internal-CA MCP tools (MCP/REST parity for /api/v1/ca/*) ─────────
