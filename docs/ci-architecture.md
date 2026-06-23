@@ -246,6 +246,37 @@ Matrix: `build-{linux,windows,macos}`. Nightly variants:
 `pre-release.yml` follow the same convention so the warm asan binary cache
 is shared. Closes #406.
 
+## Flaky-test retry (`flake-retry`)
+
+`scripts/ci/flake-retry.py` wraps the `meson test` step on `ci.yml`'s three
+test legs (PR fast-path + push matrix; **not** nightly/sanitizer, which stay
+fail-loud so a real ASan/TSan race is never masked). On a clean run it does
+nothing. On failure it isolates the failed **Catch2 case(s)** — it re-runs the
+failed suite binary (located via `meson introspect --tests`) with Catch2's own
+junit reporter, since meson's junit is only suite-level — then:
+
+- any failed case **not** in `tests/known-flaky.json` (scoped to this OS) →
+  the job **fails** (real regressions stay blocking);
+- a failed suite that can't be classified per-case (non-Catch2, e.g. the
+  gateway eunit/ct legs, or a crash/timeout with no junit) → **fails** (never
+  mask);
+- a **listed** case is retried in isolation up to 2× (`--retries`); the job
+  passes only if it recovers, and a listed case that fails every retry still
+  **fails** (a regression *inside* a flaky test is caught too).
+
+`tests/known-flaky.json` is the static, in-repo, PR-curated source of truth —
+one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform and
+**must** carry an `issue`), `reason`, and `added`. Cross-platform flakes emit a
+loud `::warning` (they signal a genuinely nondeterministic test, not an env
+quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
+`::warning` nag (never a hard fail). The wrapper validates the list up front and
+fails fast on a malformed one.
+
+No DB: visibility is the job summary + annotations; a per-case trend store is
+deferred to a future `ci-ingest`-style step (the junit artifacts are the raw
+data source). This is reversible test tooling — no ADR (rationale in the wrapper
+header).
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches
