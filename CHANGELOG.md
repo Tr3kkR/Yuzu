@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Guardian ingest-drop counter.** New `/metrics` gauge
+- **Guardian ingest-drop counter.** New `/metrics` counter
   `yuzu_server_guardian_events_dropped_total` counts cumulative Guardian events dropped at
   ingest on an `event_id` PK/UNIQUE conflict (redelivery, an agent `event_seq_` reset, clock
   skew, or a forged-id pre-claim). `> 0` distinguishes "no drift observed" from "drift observed
@@ -379,10 +379,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A4 error envelope on MCP tier-denied paths and dex-perf REST endpoints.** MCP tier-denied
   errors (read-only mode, tier policy, approval-required) now carry
-  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":null}`, and
-  `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on every 400/503
-  branch and an `X-Correlation-Id` response header (on success and error), matching the
-  `cohort-diff` sibling. (#1470)
+  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":"…"}` (the
+  remediation is an actionable hint, not `null`), the dex-perf MCP validation errors
+  (`get_dex_perf_cohorts`/`list_dex_perf_devices` invalid key/cohort_key/limit) carry the same
+  `error.data`, and `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on
+  every 400/503 branch and an `X-Correlation-Id` response header (on success and error), matching
+  the `cohort-diff` sibling. The shared REST A4 helper now always emits the spec-required nullable
+  `retry_after_ms` field. **Behaviour change:** an approval-gated MCP operation on the `supervised`
+  tier is now denied with `kTierDenied` (-32004) instead of `kApprovalRequired` (-32006) — A4
+  reserves -32006 for an envelope carrying a pollable `approval_id` + `status_url`, which the
+  unimplemented re-dispatch path (Phase 2) cannot honestly provide; the operation is still denied
+  and the remediation points at the REST API / dashboard. (#1470)
 
 - **DEX catalogue family tile labelled honestly.** The family device figure is the *largest
   single signal's* distinct-device count, not the family union (two disjoint 50-device signals

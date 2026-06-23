@@ -761,8 +761,15 @@ std::string make_correlation_id() {
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::string_view remediation) {
-    auto err =
-        JObj().add("code", code).add("message", message).add("correlation_id", correlation_id);
+    // A4 (docs/agentic-first-principle.md) lists retry_after_ms as a REQUIRED,
+    // nullable envelope field. This no-retry overload emits it as null so every
+    // REST A4 error body carries the full field set (matching the MCP a4_data
+    // sibling); the second overload below supplies a concrete value. #1470.
+    auto err = JObj()
+                   .add("code", code)
+                   .add("message", message)
+                   .add("correlation_id", correlation_id)
+                   .raw("retry_after_ms", "null");
     if (!remediation.empty()) {
         err.add("remediation", remediation);
     }

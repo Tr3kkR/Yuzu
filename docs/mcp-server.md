@@ -25,10 +25,18 @@ CLAUDE.md keeps only the load-bearing invariants (embed point, tier-before-RBAC 
 JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy, approval-required) carry a structured `error.data` field (A4, per `docs/agentic-first-principle.md`):
 
 ```json
-{ "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null, "remediation": null }
+{ "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null, "remediation": "use a higher-tier MCP token, or the REST API / dashboard" }
 ```
 
-`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. `retry_after_ms` and `remediation` are `null` on tier-denial errors; per-tool validation errors may populate them. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
+> **Supervised-tier / approval-gated operations.** An operation that requires
+> approval is **denied** with `kTierDenied` (-32004), not `kApprovalRequired`
+> (-32006). Approval re-dispatch is Phase 2 (below): there is no pollable
+> approval to return, and the A4 contract reserves `kApprovalRequired` for the
+> case where the envelope can carry `approval_id` + `status_url`. The denial's
+> `remediation` points the caller at the REST API / dashboard, where the
+> supervised tier's approval workflow is wired.
+
+`correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. `retry_after_ms` is `null` on tier/approval-denial errors (the denial is not retryable as-is); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
 
 ## Phase 1 (Implemented)
 

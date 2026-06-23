@@ -473,6 +473,16 @@ TEST_CASE("PR5: enforce service-stopped on a security service is denied at every
                                   "svc", 1, true, "enforce");
         CHECK(r.error.has_value());
     }
+    SECTION("create path: enforce service-stopped on WdFilter / BFE rejected (#1285)") {
+        // The #1285 additions (Defender minifilter, firewall WFP engine) must be
+        // refused on the operator-facing author path, not only the raw helper.
+        for (const char* svc : {"WdFilter", "BFE"}) {
+            INFO("service=" << svc);
+            auto r = derive_rule_spec(service_rule_body("service-stopped", svc, "enforce"), "svc", 1,
+                                      true, "enforce");
+            CHECK(r.error.has_value());
+        }
+    }
     SECTION("create path: enforce service-RUNNING on WinDefend allowed (protective)") {
         auto r = derive_rule_spec(service_rule_body("service-running", "WinDefend", "enforce"),
                                   "svc", 1, true, "enforce");

@@ -883,9 +883,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (remediation.empty()) {
                     data += "null";
                 } else {
-                    data += '"';
-                    data += remediation;
-                    data += '"';
+                    // JSON-escape rather than raw-embed: callers pass server
+                    // literals today, but routing through the shared escaper closes
+                    // the injection footgun for any future caller-derived hint.
+                    // json_quoted_string returns a fully-quoted, escaped JSON string.
+                    data += json_quoted_string(remediation);
                 }
                 data += "}";
                 return error_response(id, code, message, data);
@@ -923,18 +925,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (requires_approval(tier, sec_type, sec_op)) {
                     // Approval-gated MCP execution is not yet implemented:
                     // the approval workflow can record the request but has no
-                    // re-dispatch path to resume execution after admin approval.
-                    // Return an explicit error rather than silently queuing.
+                    // re-dispatch path to resume execution after admin approval
+                    // (Phase 2 — see docs/mcp-server.md). Return an explicit error
+                    // rather than silently queuing.
+                    //
+                    // Deliberately NOT kApprovalRequired (-32006): the A4 contract
+                    // (docs/agentic-first-principle.md) requires that code's envelope
+                    // to carry `approval_id` + `status_url` so the agent can poll the
+                    // workflow. With no re-dispatch path there is nothing pollable —
+                    // minting an approval that can never resume would be a worse
+                    // contract lie than denying outright. The operation IS denied
+                    // here, so a tier-denial (whose data promises no pollable
+                    // approval) is the honest shape; the remediation points the
+                    // caller at the surfaces where the supervised tier does work.
                     res.set_content(
                         a4_error(
-                            kApprovalRequired,
+                            kTierDenied,
                             "This operation requires approval, but approval-gated "
                             "MCP execution is not yet implemented. Use the REST API "
                             "or dashboard for operations that require the supervised tier.",
                             "approval-gated MCP execution is not implemented; perform this "
                             "operation via the REST API or dashboard"),
                         "application/json");
-                    mcp_audit("approval_required", "approval-gated execution not implemented");
+                    mcp_audit("denied", "approval-gated execution not implemented");
                     return;
                 }
             }
@@ -2098,8 +2111,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 } else if (tool_name == "get_dex_perf_cohorts") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);
                     if (!TagStore::validate_key(key)) {
-                        res.set_content(error_response(id, kInvalidParams, "invalid tag key"),
-                                        "application/json");
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid tag key",
+                                           a4_data(0, "key must match [A-Za-z0-9_.:-]{1,64}")),
+                            "application/json");
                         return;
                     }
                     const auto snap = dex_perf_fn(key);
@@ -2202,8 +2217,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (default "model"); filtering only when cohort_value given.
                     std::string cohort_key = param_str(args, "cohort_key", kDexDefaultCohortKey);
                     if (!TagStore::validate_key(cohort_key)) {
-                        res.set_content(error_response(id, kInvalidParams, "invalid cohort_key"),
-                                        "application/json");
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid cohort_key",
+                                           a4_data(0, "cohort_key must match [A-Za-z0-9_.:-]{1,64}")),
+                            "application/json");
                         return;
                     }
                     std::optional<std::string> cohort_filter;
@@ -2213,8 +2230,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // claims to "mirror" it must not silently clamp to 1.
                     const int raw_limit = param_int32(args, "limit", 50);
                     if (raw_limit <= 0) {
-                        res.set_content(error_response(id, kInvalidParams, "invalid limit"),
-                                        "application/json");
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid limit",
+                                           a4_data(0, "limit must be a positive integer "
+                                                      "(values above 500 are clamped)")),
+                            "application/json");
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);

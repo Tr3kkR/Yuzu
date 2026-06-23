@@ -130,22 +130,29 @@ void TagStore::set_tag_impl(const std::string& agent_id, const std::string& key,
                 INSERT OR REPLACE INTO tags (agent_id, key, value, source, updated_at)
                 VALUES (?, ?, ?, ?, ?)
               )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
         return;
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
 
-    sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, key.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, value.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, source.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, now);
+    sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, source.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 5, now);
 
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    // Check the step result: inside sync_agent_tags' DELETE+reinsert
+    // transaction a silent step failure would leave partial state. The
+    // ON CONFLICT … WHERE-false no-op still returns SQLITE_DONE, so only a
+    // genuine failure logs. (SqliteStmt finalizes on scope exit — no manual
+    // finalize, exception-safe.)
+    if (int rc = sqlite3_step(stmt.get()); rc != SQLITE_DONE) {
+        spdlog::warn("TagStore::set_tag: step failed for ({}, {}): {} ({})", agent_id, key,
+                     sqlite3_errmsg(db_), rc);
+    }
 }
 
 std::string TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
