@@ -588,9 +588,16 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
     const auto big = render("os.boot", 1200000.0);
     CHECK(big.find("e+0") == std::string::npos);
     CHECK(big.find("Metric</span><code>1200.0 s</code>") != std::string::npos);
-    // Seconds-valued (uptime) humanizes; counts + uncatalogued render as plain integers.
+    // Seconds-valued (uptime) humanizes across all fmt_secs branches (d / h / min / s).
     CHECK(render("os.uptime_report", 90000.0).find("Metric</span><code>1.0 d</code>") !=
           std::string::npos);
+    CHECK(render("os.uptime_report", 7200.0).find("Metric</span><code>2.0 h</code>") !=
+          std::string::npos);
+    CHECK(render("os.uptime_report", 300.0).find("Metric</span><code>5.0 min</code>") !=
+          std::string::npos);
+    CHECK(render("os.uptime_report", 30.0).find("Metric</span><code>30 s</code>") !=
+          std::string::npos);
+    // Counts + uncatalogued render as plain integers (no unit, no sci).
     CHECK(render("hw.battery_error", 2.0).find("Metric</span><code>2</code>") != std::string::npos);
 }
 
@@ -739,8 +746,8 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         auto empty = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=");
         REQUIRE(empty);
         CHECK(empty->status == 200);
-        CHECK(empty->body.find("Observation not found") != std::string::npos);
-        CHECK(audited.empty()); // none of the not-found paths audit
+        CHECK(empty->body == unknown->body); // complete oracle closure: empty ≡ unknown ≡ foreign
+        CHECK(audited.empty());              // none of the not-found paths audit
     }
 
     SECTION("per-event /observation + /apps: perm gate runs before audit/render") {
