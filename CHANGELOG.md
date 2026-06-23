@@ -57,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that one event (subject, reason, symbolic name, component, metric, platform,
   exact timestamp, event ID). Fields already in the store — no agent or wire change.
   Per-device-scoped (`GuaranteedState:Read`), bound to the event's own device (a
-  foreign event ID returns an opaque 404), and audit-logged (`dex.observation.view`,
+  foreign event ID returns an opaque 200 placeholder, indistinguishable from a
+  missing event), and audit-logged (`dex.observation.view`,
   recording the obs_type for works-council countability).
 
 - **DEX: Applications lens (Apps tab).** A new top-level DEX tab ranks fleet

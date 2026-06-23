@@ -413,6 +413,19 @@ std::string fmt_secs(double s) {
     return std::format("{:.0f} s", s);
 }
 
+// Sanitize an AGENT-CONTROLLED identifier (obs_type, event_id) before it enters an
+// audit detail: strip C0 control bytes + DEL and cap the length. The audit detail is
+// bound via sqlite3_bind_text(..,-1,..), so an embedded NUL would silently TRUNCATE
+// the audit row, and control chars are log-injection into the audit trail (and a
+// non-UTF-8 byte throws on a later strict-JSON SIEM export — the #1593 class).
+// esc() handles HTML metachars but NOT control bytes, so this is a separate guard.
+std::string clean_audit_id(std::string s, std::size_t max = 96) {
+    std::erase_if(s, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    if (s.size() > max)
+        s.resize(max);
+    return s;
+}
+
 // Human form for the per-event detail "Metric" cell. The metric column is
 // POLYMORPHIC — its unit depends on the obs_type (durations in ms, a residency %,
 // a count) — so a single formatter can't assume ms (that would mis-render a 75%
@@ -421,15 +434,21 @@ std::string fmt_secs(double s) {
 // degrades to a bare, fixed-notation number — never a WRONG unit, and never the
 // scientific-notation a bare {:g} flips to on a >16-min boot.
 std::string dex_metric_display(const std::string& obs_type, double metric) {
-    // DRIPS residency is a percentage where **0% is a REAL reading** — the worst
-    // case: the platform never reached deep idle while "asleep" (the exact symptom
-    // this signal was built to surface). It must NOT collapse to the "no metric"
-    // em-dash, so the percent branch runs BEFORE the >0 guard. (Extractor clamps to
-    // [0,100]; guard only NaN/negative.)
+    // Reject NaN / +-inf / negative / absurd up front (defence-in-depth — the
+    // projection store already range-guards on write, but keep the formatter robust
+    // independent of that): all → the "no metric" em-dash. The `!(0<=m<=1e12)` form
+    // is NaN-safe (any comparison with NaN is false → the negation is true → reject)
+    // and +inf-safe (inf<=1e12 is false). 0.0 survives (it's a valid reading).
+    if (!(metric >= 0.0 && metric <= 1.0e12))
+        return {};
+    // DRIPS residency is a percentage where 0% is a REAL reading — the worst case:
+    // the platform never reached deep idle while "asleep" (the exact symptom this
+    // signal was built to surface). It must NOT collapse to the em-dash, so it runs
+    // before the "0 = no data" guard below. (Negatives/NaN already excluded above.)
     if (obs_type == "os.modern_standby_exit")
-        return metric >= 0.0 ? std::format("{:.0f}%", metric) : std::string{};
-    if (!(metric > 0.0))
-        return {}; // other types: 0 / absent → em-dash
+        return std::format("{:.0f}%", metric);
+    if (metric <= 0.0)
+        return {}; // other types: 0 = "no data" → em-dash
     static constexpr std::string_view kMs[] = {
         "os.boot",          "os.shutdown",          "os.standby",
         "os.standby_degraded", "os.resume_report",  "shutdown.degraded",
@@ -2718,9 +2737,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      // works-council co-determination requirement; cf.
                      // dex.device.procperf.query). obs_type is a controlled catalogue
                      // string, never user input.
+                     // obs_type + event_id are AGENT-controlled — sanitize before the
+                     // audit detail (a compromised agent could embed NUL/control chars;
+                     // see clean_audit_id). Parameterized binding stops SQL injection;
+                     // this stops audit-trail truncation/log-injection.
                      audit_fn_(req, "dex.observation.view", "success", "Agent", id,
-                               "DEX single-observation detail: " + obs->obs_type + " (event " +
-                                   obs->event_id + ")");
+                               "DEX single-observation detail: " +
+                                   clean_audit_id(obs->obs_type, 64) + " (event " +
+                                   clean_audit_id(obs->event_id) + ")");
                  res.set_content(render_dex_observation_fragment(*obs),
                                  "text/html; charset=utf-8");
              });

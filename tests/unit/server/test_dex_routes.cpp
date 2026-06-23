@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -609,6 +610,14 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
           std::string::npos);
     // Counts + uncatalogued render as plain integers (no unit, no sci).
     CHECK(render("hw.battery_error", 2.0).find("Metric</span><code>2</code>") != std::string::npos);
+    // NaN / +inf / absurd are rejected defensively → em-dash, never "inf%" / "inf d"
+    // / a 300-digit blob (UP-4/UP-5). The store range-guards on write; this keeps the
+    // formatter robust independent of that.
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(render("os.modern_standby_exit", inf).find("inf") == std::string::npos);
+    CHECK(render("os.modern_standby_exit", inf).find("Metric</span><code>&mdash;</code>") !=
+          std::string::npos);
+    CHECK(render("os.boot", 1e300).find("Metric</span><code>&mdash;</code>") != std::string::npos);
 }
 
 TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
@@ -758,6 +767,25 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(empty->status == 200);
         CHECK(empty->body == unknown->body); // complete oracle closure: empty ≡ unknown ≡ foreign
         CHECK(audited.empty());              // none of the not-found paths audit
+    }
+
+    SECTION("per-event /observation: agent-controlled obs_type/event_id sanitized in the audit detail") {
+        // A compromised/buggy agent could emit an obs_type/event_id with control
+        // chars or an embedded NUL; appended raw to the audit detail that would
+        // truncate the audit row (sqlite3_bind_text -1) or inject into the trail
+        // (UP-3). The event_id is clean here so the URL lookup resolves; the obs_type
+        // carries a control byte that must be STRIPPED before it reaches the detail.
+        seed_signal(store, "ev-ctrl", "WS-1", std::string("bad\x01type", 8),
+                    R"({"subject":"x","platform":"windows"})", kDayA + "T10:00:00Z");
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=ev-ctrl");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(audited == "dex.observation.view|Agent|WS-1");
+        CHECK(audited_detail.find('\x01') == std::string::npos); // control byte stripped
+        CHECK(audited_detail.find("badtype") != std::string::npos); // rest of obs_type intact
     }
 
     SECTION("per-event /observation + /apps: perm gate runs before audit/render") {

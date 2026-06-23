@@ -183,7 +183,8 @@ numbers match.
   **event detail panel**: every captured projection field for that one event
   (subject, reason, symbolic name, component, metric, platform, exact timestamp,
   event ID). A point lookup bound to the event's own device — a guessed event ID
-  scoped to the wrong device returns an opaque 404. Each open is audit-logged
+  scoped to the wrong device returns an opaque 200 placeholder (byte-identical to
+  "no such event" — 200 so the htmx swap renders it). Each open is audit-logged
   (`dex.observation.view`, with the obs_type recorded for works-council
   countability).
 
