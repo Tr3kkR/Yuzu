@@ -177,14 +177,21 @@ std::vector<DnsEntry> enumerate_dns() {
         DnsCacheEntryW* next = p->pNext;
 
         if (!capped && p->pszName) {
-            // Cache-only read of the record data + TTL (DNS_QUERY_NO_WIRE_QUERY
-            // guarantees no network query is issued).
+            // Cache-only read of the record data + TTL.
+            //   DNS_QUERY_NO_WIRE_QUERY (0x10) guarantees no network query is issued.
+            //   0x8000 is an undocumented DNS_QUERY_* flag which — per reverse-engineering
+            //   of `ipconfig /displaydns` (the "muhdnscache" research) — is required to
+            //   actually read the resolver cache on many Win10/11 builds; with 0x10 alone
+            //   DnsQuery_W can fail/return empty for every cached entry, defeating the
+            //   whole source. OR it in defensively (ADR-0011 review HIGH-B). 0x10 is the
+            //   documented-but-insufficient subset, so this only ever adds cache visibility.
             // windns.h declares DnsQuery_W with the GENERIC PDNS_RECORD* (= ANSI
             // PDNS_RECORDA* without /DUNICODE) even though the _W function returns
             // wide records. Take the out-param as the generic type to satisfy the
             // prototype, then view it as wide — the data really is DNS_RECORDW.
+            constexpr DWORD kDnsQueryCacheOnly = DNS_QUERY_NO_WIRE_QUERY | 0x8000;
             PDNS_RECORD rec_generic = nullptr;
-            DNS_STATUS st = DnsQuery_W(p->pszName, p->wType, DNS_QUERY_NO_WIRE_QUERY,
+            DNS_STATUS st = DnsQuery_W(p->pszName, p->wType, kDnsQueryCacheOnly,
                                        nullptr, &rec_generic, nullptr);
             if (st == ERROR_SUCCESS && rec_generic) {
                 auto* rec = reinterpret_cast<PDNS_RECORDW>(rec_generic);

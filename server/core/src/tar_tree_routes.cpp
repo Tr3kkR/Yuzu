@@ -615,11 +615,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             return;
         }
         auto dns_rows = (!dns.failed && !dns.output.starts_with("error|") &&
-                         dns.output.size() <= kMaxTarTcpOutputBytes)
+                         dns.output.size() <= kMaxTarDeviceNetOutputBytes)
                             ? parse_tar_dns_output(dns.output)
                             : std::vector<TarDnsCacheEntry>{};
         auto arp_rows = (!arp.failed && !arp.output.starts_with("error|") &&
-                         arp.output.size() <= kMaxTarTcpOutputBytes)
+                         arp.output.size() <= kMaxTarDeviceNetOutputBytes)
                             ? parse_tar_arp_output(arp.output)
                             : std::vector<TarArpEntry>{};
         const std::string body = "<div class=\"devnet-row\">" + render_tar_dns_panel(dns_rows) +
@@ -779,7 +779,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                 audit_fn_(req, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
                           "Agent", device,
                           std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
-            ++applied;
+            // Only count a change the operator can observe as applied: when the dispatch
+            // reached no agents (sent==0) the audit records `no_agents`, so the toast must
+            // not claim it was pushed (ADR-0011 review LOW-D).
+            if (sent > 0)
+                ++applied;
         }
         res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
                                     applied),

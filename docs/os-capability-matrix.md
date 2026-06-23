@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-06-15._
+_Last hand-updated: 2026-06-23._
 
 ## Matrix
 
@@ -29,6 +29,8 @@ _Last hand-updated: 2026-06-15._
 | **DEX — performance telemetry** (CPU/mem/disk levels) | ✅ | ✅ | ⛔ | `tar_perf.cpp` (Win: GetSystemTimes/IOCTL_DISK_PERFORMANCE/GetIfTable2; Linux: `/proc`). macOS absent from the rollup |
 | **Network quality** (`/network`: throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | ⛔ | `net_quality_sampler.cpp`; per-OS detail in `docs/user-manual/network.md` "Platform coverage" |
 | **TAR warehouse capture sources** (per source) | varies | varies | varies | **Authoritative & machine-readable:** `tar_schema_registry.cpp` `OsSupportStatus::{kSupported,kPlanned}` per source, with a notes string |
+| **TAR — ARP table** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `arp` def (Win `kSupported` via `iphlpapi`; Linux `kPlanned` `/proc/net/arp`; macOS `kPlanned` route sysctl); collector `tar_arp_collector.cpp` (ADR-0011, opt-in) |
+| **TAR — DNS cache** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `dns` def (Win `kSupported` via `dnsapi`; Linux `kPlanned` systemd-resolved; macOS `kPlanned` `dscacheutil`); collector `tar_dns_collector.cpp` (ADR-0011, opt-in; device-level usage-class PII, names-only) |
 | **Process enumeration / live capture** | ✅ (ETW / Win32) | ✅ (`/proc`) | 🟡 | `process_enum.cpp`; ETW workstream is Windows-specific |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits

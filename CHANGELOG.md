@@ -45,7 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Capture sources" frame** (staged-then-push guardrail + category filter). The
   process-tree pane gains device-level **DNS-cache + ARP-table panels**
   (audit verbs `tar.dns.read`/`tar.arp.read`). Linux/macOS collectors are planned
-  (schema registered, queryable-empty). The Windows agent links `dnsapi`.
+  (schema registered, queryable-empty) and recorded per-OS in
+  `docs/os-capability-matrix.md`. The Windows agent links `dnsapi`; the resolver-cache
+  read combines `DNS_QUERY_NO_WIRE_QUERY` with the additional cache-read flag required
+  to surface cached records on current Windows 10/11 builds.
 - **Guardian — baseline-anchored per-device compliance REST.**
   New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
   returns one Baseline's deployed Guards each with the device's last reported verdict

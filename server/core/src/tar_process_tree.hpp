@@ -140,6 +140,10 @@ inline constexpr int kTarRenderDepthCap = 256;
 /// output), not inside the pure parsers.
 inline constexpr std::size_t kMaxTarProcOutputBytes = 16ull * 1024 * 1024; // 16 MiB
 inline constexpr std::size_t kMaxTarTcpOutputBytes = 4ull * 1024 * 1024;   //  4 MiB
+/// Same 4 MiB ceiling as the TCP path, but a distinct name for the DNS/ARP device-net
+/// fragment so a future change to either cap can't silently move the other (ADR-0011
+/// review LOW-E).
+inline constexpr std::size_t kMaxTarDeviceNetOutputBytes = 4ull * 1024 * 1024; //  4 MiB
 
 /// Canonicalize a `preset` query token to one of the known window tokens
 /// {on_boot, on_install, 1m, 10m, 1h, 1d, custom}, mapping any empty/unrecognized
