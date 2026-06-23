@@ -443,7 +443,7 @@ const std::string& openapi_spec() {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
               "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
-              "retry_after_ms": {"type": "integer", "format": "int64", "description": "Optional. Advises the worker to back off this many milliseconds before retrying. Currently emitted on 503 (warmup) only."},
+              "retry_after_ms": {"type": ["integer", "null"], "format": "int64", "description": "Always present in an A4 error body; null unless the condition is retryable, in which case it advises the worker to back off this many milliseconds before retrying (e.g. 503 warmup)."},
               "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
             }
           },
@@ -761,8 +761,15 @@ std::string make_correlation_id() {
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::string_view remediation) {
-    auto err =
-        JObj().add("code", code).add("message", message).add("correlation_id", correlation_id);
+    // A4 (docs/agentic-first-principle.md) lists retry_after_ms as a REQUIRED,
+    // nullable envelope field. This no-retry overload emits it as null so every
+    // REST A4 error body carries the full field set (matching the MCP a4_data
+    // sibling); the second overload below supplies a concrete value. #1470.
+    auto err = JObj()
+                   .add("code", code)
+                   .add("message", message)
+                   .add("correlation_id", correlation_id)
+                   .raw("retry_after_ms", "null");
     if (!remediation.empty()) {
         err.add("remediation", remediation);
     }
@@ -5148,9 +5155,18 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): match the cohort-diff sibling — a correlation
+                 // id on every response + the A4 error envelope on failures.
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
@@ -5173,16 +5189,25 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const std::string key =
                      req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid tag key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid),
+                                     "application/json");
                      return;
                  }
                  const auto snap = dex_perf_fn(key);
@@ -5320,9 +5345,17 @@ void RestApiV1::register_routes(
              [perm_fn, dex_perf_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const DexPerfMetric metric = dex_perf_metric_from_token(
@@ -5338,7 +5371,8 @@ void RestApiV1::register_routes(
                                                  : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(cohort_key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid cohort_key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid cohort_key", cid),
+                                     "application/json");
                      return;
                  }
                  std::optional<std::string> cohort_filter;
@@ -5352,7 +5386,8 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v <= 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::error_json_a4(400, "invalid limit", cid),
+                                         "application/json");
                          return;
                      }
                      limit = std::min(v, 500);

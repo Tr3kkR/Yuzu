@@ -17,6 +17,41 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: operator/API tags now beat agent self-report (#1411)
+
+An agent's self-reported tags (`scopable_tags`, synced on every Register) can no
+longer overwrite an operator- or API-set tag for the same `(agent_id, key)` — the
+operator/API value is now authoritative. This closes a path where a rogue or
+misconfigured agent could self-assign into an operator-declared benchmark cohort.
+
+**Who this affects:** only an operator who *deliberately* relied on agent-reported
+values winning over an operator/API-set tag for the same key. After upgrade those
+agent values stop overriding — silently (no error, no log line); an affected device
+simply drops out of the cohort the operator-set value defines.
+
+**Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
+each key is `server`- (operator/API) or `agent`-sourced.
+
+**Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
+via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
+the agent reports that the operator never set are unaffected.
+
+## Behaviour change: MCP approval-gated calls now return -32004, not -32006 (#1470)
+
+Supervised-tier MCP tokens that attempt an approval-gated operation now receive
+JSON-RPC error code `-32004` (`TierDenied`) instead of `-32006` (`ApprovalRequired`).
+The A4 contract reserves `-32006` for a response that carries a pollable `approval_id`
++ `status_url`; because approval re-dispatch (Phase 2) is not yet implemented,
+returning `-32006` would violate that contract. The operation is still denied and
+audited; the `error.data.remediation` field points to the REST API / dashboard
+approval workflow.
+
+**Who this affects:** any MCP client that explicitly matched on `-32006` to detect an
+approval-required state. After upgrade those handlers receive `-32004` instead; update
+the match to `-32004` and leave `-32006` reserved for the future Phase 2 envelope (see
+`docs/user-manual/mcp.md` → "-32004: Tier denied (including approval-gated operations)").
+`operator`-tier executions are auto-approved and are unaffected.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and
