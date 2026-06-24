@@ -839,6 +839,53 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
 
+TEST_CASE("TarDatabase: insert and query arp events (ADR-0015)", "[tar][store][crud][arp]") {
+    auto t = make_test_db();
+    ArpEvent ev;
+    ev.ts = 3000;
+    ev.snapshot_id = 1;
+    ev.action = "appeared";
+    ev.iface = "Ethernet"; // bound to the SQL column 'interface'
+    ev.ip_address = "192.168.1.1";
+    ev.mac_address = "aa:bb:cc:dd:ee:ff";
+    ev.entry_type = "dynamic";
+    REQUIRE(t.db.insert_arp_events({ev}));
+    CHECK(t.db.insert_arp_events({})); // empty input is a no-op success
+
+    auto r = t.db.execute_query(
+        "SELECT interface, ip_address, mac_address, entry_type, action FROM arp_live");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == "Ethernet");
+    CHECK(r->rows[0][1] == "192.168.1.1");
+    CHECK(r->rows[0][2] == "aa:bb:cc:dd:ee:ff");
+    CHECK(r->rows[0][4] == "appeared");
+}
+
+TEST_CASE("TarDatabase: insert and query dns events (ADR-0015)", "[tar][store][crud][dns]") {
+    auto t = make_test_db();
+    DnsEvent ev;
+    ev.ts = 3100;
+    ev.snapshot_id = 1;
+    ev.action = "appeared";
+    ev.name = "example.com";
+    ev.record_type = "A";
+    ev.data = "93.184.216.34";
+    ev.ttl_remaining_s = 60;
+    ev.source = "cache";
+    REQUIRE(t.db.insert_dns_events({ev}));
+    CHECK(t.db.insert_dns_events({})); // empty input is a no-op success
+
+    auto r = t.db.execute_query(
+        "SELECT name, record_type, data, ttl_remaining_s, source FROM dns_live");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == "example.com");
+    CHECK(r->rows[0][2] == "93.184.216.34");
+    CHECK(r->rows[0][3] == "60");
+    CHECK(r->rows[0][4] == "cache");
+}
+
 // ── #559: corrupt-DB quarantine on open ────────────────────────────────────
 
 TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh (#559)",

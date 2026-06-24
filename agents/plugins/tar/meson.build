@@ -7,6 +7,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('ws2_32')
   tar_deps += cxx.find_library('wtsapi32')
   tar_deps += cxx.find_library('tdh')      # ETW event decoding (tar_proc_etw, tar_module_etw)
+  tar_deps += cxx.find_library('dnsapi')   # DnsQuery_W / DnsRecordListFree (tar_dns_collector)
   tar_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (tar_module_etw)
   tar_deps += cxx.find_library('crypt32')  # CryptQueryObject — signer extraction (tar_module_etw)
 elif host_machine.system() == 'darwin'
@@ -40,6 +41,8 @@ shared_library(
     'src/tar_aggregator.cpp',
     'src/tar_sql_executor.cpp',
     'src/tar_network_collector.cpp',
+    'src/tar_arp_collector.cpp',
+    'src/tar_dns_collector.cpp',
     'src/tar_perf.cpp',
     'src/tar_proc_perf.cpp',
     'src/tar_proc_stream.cpp',

@@ -95,6 +95,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
+  (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
+  via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS
+  resolver-cache state via `DnsGetCacheDataTable` → `$DNS_Live`/`$DNS_Hourly` —
+  device-level, **no per-process attribution**; DNS is usage-class PII, enabling is
+  audited). Queryable via `tar.sql`, the `query`/`export` actions (`type: arp|dns`),
+  and the `crossplatform.tar.recent_arp`/`recent_dns` canned instructions; toggled
+  via `crossplatform.tar.configure` (`arp_enabled`/`dns_enabled`) or the new **/tar
+  "Capture sources" frame** (staged-then-push guardrail + category filter). The
+  process-tree pane gains device-level **DNS-cache + ARP-table panels**
+  (audit verbs `tar.dns.read`/`tar.arp.read`). Linux/macOS collectors are planned
+  (schema registered, queryable-empty) and recorded per-OS in
+  `docs/os-capability-matrix.md`. The Windows agent links `dnsapi`; the resolver-cache
+  read combines `DNS_QUERY_NO_WIRE_QUERY` with the additional cache-read flag required
+  to surface cached records on current Windows 10/11 builds.
 - **MCP `query_responses` closes the dispatch→collect loop by `execution_id`.** The tool now
   accepts an `execution_id` argument (routed to `ResponseStore::query_by_execution`) so an
   agentic worker that dispatched via `execute_instruction` can collect exactly that run's

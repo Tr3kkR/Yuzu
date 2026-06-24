@@ -963,6 +963,121 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
     return true;
 }
 
+bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_arp_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO arp_live (ts, snapshot_id, action, interface, ip_address, mac_address, entry_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_arp_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.iface.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.ip_address.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.mac_address.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 7, ev.entry_type.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_arp_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_arp_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
+bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_dns_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO dns_live (ts, snapshot_id, action, name, record_type, data, ttl_remaining_s, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_dns_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.record_type.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.data.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt.get(), 7, ev.ttl_remaining_s);
+        sqlite3_bind_text(stmt.get(), 8, ev.source.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_dns_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_dns_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
 bool TarDatabase::insert_perf_sample(const PerfRow& row) {
     std::lock_guard lock(mu_);
     if (!db_)
