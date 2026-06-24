@@ -340,8 +340,13 @@ public:
 
     /// A4: read the stored responses for a command_id (narrow ResponseStore
     /// seam). May be empty → the perf panel renders "unavailable".
-    using ResponsesFn =
-        std::function<std::vector<DexAgentResponse>(const std::string& command_id)>;
+    // #1634 seam-scoping: the poll reads are scoped to the originating agent AT THE
+    // STORE SEAM (the lambda passes ResponseQuery{.agent_id=...} to ResponseStore),
+    // not only post-filtered in the route. A dropped/refactored post-filter therefore
+    // cannot become a cross-agent disclosure. Every caller passes the agent_id it
+    // already validated for scope.
+    using ResponsesFn = std::function<std::vector<DexAgentResponse>(
+        const std::string& command_id, const std::string& agent_id)>;
 
     /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
     /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be

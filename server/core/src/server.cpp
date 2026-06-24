@@ -8246,11 +8246,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8463,11 +8466,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8491,11 +8497,14 @@ private:
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },

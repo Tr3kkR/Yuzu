@@ -837,7 +837,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         return {"tar-deadbeef", fake_sent};
     };
     std::vector<DexAgentResponse> fake_rows;
-    auto responses = [&](const std::string& command_id) {
+    auto responses = [&](const std::string& command_id, const std::string& /*agent_id*/) {
         CHECK(command_id == "tar-deadbeef");
         return fake_rows;
     };

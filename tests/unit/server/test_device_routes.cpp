@@ -67,7 +67,9 @@ struct LiveHarness {
             // command_id prefix MUST be <plugin>- so the result route accepts it.
             return {plugin + "-test", fake_sent};
         };
-        auto responses = [this](const std::string& cmd) {
+        auto responses = [this](const std::string& cmd, const std::string& /*agent_id*/) {
+            // #1634: production scopes by agent_id at the store seam; the stub returns
+            // by command_id and relies on the route's post-filter for isolation tests.
             auto it = rows_by_cmd.find(cmd);
             return it != rows_by_cmd.end() ? it->second : fake_rows;
         };
@@ -278,7 +280,9 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         REQUIRE(r);
         CHECK(h.seen_plugin == c.plugin);
         CHECK(h.seen_action == c.action);
-        CHECK(h.audited == std::string(c.verb) + "|success|a-1");
+        // Post-dispatch audit result is "dispatched" (dev's #1549 convention; the
+        // browser polls /result separately), uniform across all live kinds.
+        CHECK(h.audited == std::string(c.verb) + "|dispatched|a-1");
     }
 }
 
@@ -296,7 +300,7 @@ TEST_CASE("device live process_tree: dual-dispatch (list_tree + connections), jo
         }
         CHECK(tree);
         CHECK(conns);
-        CHECK(h.audited == "device.live.process_tree|success|a-1");
+        CHECK(h.audited == "device.live.process_tree|dispatched|a-1");
         // The poll URL carries BOTH command ids so the result can join them.
         CHECK(r->body.find("command_id=processes-test") != std::string::npos);
         CHECK(r->body.find("command_id2=network_diag-test") != std::string::npos);
@@ -510,7 +514,9 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         ++dispatched;
         return {plugin + "-x", 1};
     };
-    auto responses = [](const std::string&) { return std::vector<DexAgentResponse>{}; };
+    auto responses = [](const std::string&, const std::string&) {
+        return std::vector<DexAgentResponse>{};
+    };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
                             const std::string&, const std::string& tid,

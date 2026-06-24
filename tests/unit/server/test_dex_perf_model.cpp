@@ -837,7 +837,8 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
         "Teams.exe|2880|6|8.4|41.2|2040109465|3328599654|24\n";
     DexRoutes::ResponsesFn responses =
-        [&](const std::string& command_id) -> std::vector<DexAgentResponse> {
+        [&](const std::string& command_id, const std::string& /*agent_id*/)
+        -> std::vector<DexAgentResponse> {
         if (command_id == "tar-abc123")
             return {{"WS-1", 0, output, ""}};
         return {};
