@@ -79,10 +79,11 @@ public:
 
 private:
     struct State {
-        std::int64_t next_fire{0};   ///< epoch s of the next scheduled sync
-        std::int64_t last_full{0};   ///< epoch s of the last full payload sent
-        std::string last_hash;       ///< last successfully-synced content hash
-        bool force_full{false};      ///< server asked for a resend (need_full)
+        std::int64_t next_fire{0};      ///< epoch s of the next scheduled sync
+        std::int64_t last_full{0};      ///< epoch s of the last full payload sent
+        std::string last_hash;          ///< last successfully-synced content hash
+        bool force_full{false};         ///< server asked for a resend (need_full)
+        int needfull_streak{0};         ///< consecutive need_full nacks (backoff, UP-5)
         bool loaded{false};
     };
 

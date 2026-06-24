@@ -257,7 +257,9 @@ TEST_CASE("SyncScheduler: per-agent phase offset spreads the fleet, stable per a
     std::set<std::int64_t> fires;
     for (int i = 0; i < 50; ++i)
         fires.insert(first_fire_for("agent-" + std::to_string(i)));
-    CHECK(fires.size() > 20); // negligible collision probability over a 600 s window
+    // FNV-1a over the fixed ids "agent-0".."agent-49" is deterministic — this is
+    // not a probabilistic check; it yields the same distinct count every run.
+    CHECK(fires.size() > 20);
     for (auto f : fires) {
         CHECK(f >= 1000);
         CHECK(f < 1000 + SyncScheduler::kStartupJitterWindow.count());
@@ -335,4 +337,68 @@ TEST_CASE("SyncScheduler: collect returning nothing sends no RPC and retries nex
     // Retry is rescheduled one interval out (now + interval), not hammered.
     CHECK(std::strtoll(kv["sync.installed_software.next_fire"].c_str(), nullptr, 10) ==
           1700 + 86400);
+}
+
+TEST_CASE("SyncScheduler: consecutive need_full nacks back off, reset on clean sync",
+          "[sync][scheduler]") {
+    // UP-5: a sustained server cold-cache / store outage must NOT resend full at a
+    // flat 30s cadence forever. Each consecutive need_full doubles the delay; a
+    // clean sync resets it. The per-(agent,source) jitter is constant across ticks
+    // (same FNV input), so the delay GROWS monotonically across nacks.
+    std::map<std::string, std::string> kv;
+    auto g = [&](const std::string& k) {
+        auto it = kv.find(k);
+        return it == kv.end() ? std::string{} : it->second;
+    };
+    auto s = [&](const std::string& k, const std::string& v) { kv[k] = v; };
+    bool nack = true;
+    auto sender = [&](const std::vector<std::pair<std::string, std::string>>&,
+                      const std::vector<std::pair<std::string, std::string>>&)
+        -> std::optional<std::vector<std::string>> {
+        return nack ? std::vector<std::string>{"installed_software"} : std::vector<std::string>{};
+    };
+    SyncSource src;
+    src.name = "installed_software";
+    src.interval = std::chrono::seconds{86400};
+    src.collect = []() -> std::optional<std::pair<std::string, std::string>> {
+        return std::make_pair(std::string{"b"}, std::string{"h"});
+    };
+    SyncScheduler sched("agent-backoff", g, s, sender);
+    sched.add_source(src);
+
+    auto next_fire = [&]() {
+        return std::strtoll(kv["sync.installed_software.next_fire"].c_str(), nullptr, 10);
+    };
+
+    sched.tick(1000); // schedule first-run fire
+
+    // Drive consecutive nacks, each tick exactly at the scheduled fire, recording
+    // the rescheduled delay (next_fire - now).
+    std::vector<std::int64_t> delays;
+    std::int64_t t = next_fire();
+    for (int i = 0; i < 4; ++i) {
+        sched.tick(t);
+        std::int64_t nf = next_fire();
+        delays.push_back(nf - t);
+        t = nf;
+    }
+    // Strictly increasing: 30+J, 60+J, 120+J, 240+J (jitter J constant).
+    REQUIRE(delays.size() == 4);
+    CHECK(delays[0] < delays[1]);
+    CHECK(delays[1] < delays[2]);
+    CHECK(delays[2] < delays[3]);
+    // Bounded: never exceeds kMaxTickSeconds.
+    for (auto d : delays)
+        CHECK(d <= SyncScheduler::kMaxTickSeconds.count());
+
+    // A clean sync resets the ladder back to zero.
+    nack = false;
+    sched.tick(t); // clean → streak reset, next_fire jumps ~a day out
+    CHECK(std::strtoll(kv["sync.installed_software.nf_streak"].c_str(), nullptr, 10) == 0);
+    // The next nack restarts the ladder at the floor (streak 1), not where it left off.
+    nack = true;
+    std::int64_t after_reset = next_fire();
+    sched.tick(after_reset);
+    CHECK(std::strtoll(kv["sync.installed_software.nf_streak"].c_str(), nullptr, 10) == 1);
+    CHECK((next_fire() - after_reset) == delays[0]); // same delay as the very first nack
 }

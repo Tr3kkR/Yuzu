@@ -4292,10 +4292,20 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca.db isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
+            // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
+            // not here, so /healthz could report "healthy" with a degraded store —
+            // the same gap the Guardian/CA rows above closed. The server fails
+            // closed at boot if PG is unreachable, so on a running server these are
+            // normally open; the row catches a post-boot store-level failure.
+            bool offline_endpoint_ok =
+                offline_endpoint_store_ && offline_endpoint_store_->is_open();
+            bool software_inventory_ok =
+                software_inventory_store_ && software_inventory_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok;
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                                 offline_endpoint_ok && software_inventory_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4310,7 +4320,9 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
-                  {"ca", ca_ok ? "ok" : "error"}}},
+                  {"ca", ca_ok ? "ok" : "error"},
+                  {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
+                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.

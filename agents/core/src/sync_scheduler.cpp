@@ -77,6 +77,8 @@ SyncScheduler::State& SyncScheduler::load_state(const SyncSource& src, std::int6
         st.last_full = std::strtoll(kv_get_(kv_key(src.name, "last_full")).c_str(), nullptr, 10);
         st.last_hash = kv_get_(kv_key(src.name, "last_hash"));
         st.force_full = kv_get_(kv_key(src.name, "force_full")) == "1";
+        st.needfull_streak =
+            static_cast<int>(std::strtoll(kv_get_(kv_key(src.name, "nf_streak")).c_str(), nullptr, 10));
     }
     st.loaded = true;
     return st;
@@ -87,6 +89,7 @@ void SyncScheduler::save_state(const SyncSource& src, const State& st) {
     kv_set_(kv_key(src.name, "last_full"), std::to_string(st.last_full));
     kv_set_(kv_key(src.name, "last_hash"), st.last_hash);
     kv_set_(kv_key(src.name, "force_full"), st.force_full ? "1" : "0");
+    kv_set_(kv_key(src.name, "nf_streak"), std::to_string(st.needfull_streak));
 }
 
 std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
@@ -144,18 +147,32 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
                 const SyncSource& src = sources_[due_idx[k]];
                 State& st = states_[due_idx[k]];
                 if (needs_full(src.name)) {
-                    // Server could not materialise from a hash-only report
-                    // (cold cache / drift): resend full promptly, but spread the
-                    // resend by a stable per-(agent,source) offset so a fleet-wide
-                    // cold cache doesn't stampede full payloads at once.
+                    // Server could not materialise from a hash-only report (cold
+                    // cache / drift) OR hit a transient store error — either way
+                    // it nacked. Resend full, but with EXPONENTIAL BACKOFF on
+                    // consecutive nacks so a sustained fleet-wide cold cache or a
+                    // store outage does not resend at a flat 30s cadence forever
+                    // (governance UP-5). Each nack doubles the delay from
+                    // kMinTickSeconds, capped so backoff + the per-(agent,source)
+                    // jitter stays within kMaxTickSeconds; reset on the next clean
+                    // sync (the else branch). The jitter still de-stampedes a
+                    // synchronized fleet-wide nack (e.g. a server DB restore).
                     st.force_full = true;
+                    st.needfull_streak += 1;
+                    const std::int64_t jitter_cap = kNeedFullJitterWindow.count();
+                    const std::int64_t max_backoff = kMaxTickSeconds.count() - jitter_cap;
+                    std::int64_t backoff = kMinTickSeconds.count();
+                    for (int s = 1; s < st.needfull_streak && backoff < max_backoff; ++s)
+                        backoff *= 2;
+                    backoff = std::min(backoff, max_backoff);
                     const std::int64_t nf_jitter = static_cast<std::int64_t>(
                         fnv1a(agent_id_ + ":needfull:" + src.name) %
-                        static_cast<std::uint64_t>(kNeedFullJitterWindow.count()));
-                    st.next_fire = now_secs + kMinTickSeconds.count() + nf_jitter;
+                        static_cast<std::uint64_t>(jitter_cap));
+                    st.next_fire = now_secs + backoff + nf_jitter;
                 } else {
                     st.last_hash = due_hash[k];
                     st.force_full = false;
+                    st.needfull_streak = 0; // clean sync → reset the backoff ladder
                     if (sent_full[k])
                         st.last_full = now_secs;
                     st.next_fire = next_slot(now_secs, src.interval.count(),

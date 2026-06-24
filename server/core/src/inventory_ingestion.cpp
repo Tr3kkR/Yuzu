@@ -22,9 +22,14 @@ namespace pb = ::yuzu::agent::v1;
 constexpr const char* kSourceInstalledSoftware = "installed_software";
 
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
-// is rejected (neither stored nor nacked); entries/fields beyond the cap are
+// is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
-constexpr std::size_t kMaxBlobBytes = 4u * 1024 * 1024; // 4 MiB per source
+// kMaxBlobBytes MUST equal the agent source's kMaxBlobBytes
+// (agents/core/src/sync_source_installed_software.cpp) — comment-coordinated, a
+// one-sided bump reintroduces the agent-sends/server-drops tight loop (UP-7).
+// Set below the gRPC 4 MiB receive ceiling for the wire-framing reason
+// documented agent-side (UP-6).
+constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024; // 3 MiB per source
 constexpr std::size_t kMaxEntries = 20000;
 constexpr std::size_t kMaxFieldLen = 1024;
 

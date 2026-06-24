@@ -19,11 +19,18 @@ namespace {
 // parse does not truncate/drop differently from what this source hashed.
 constexpr std::size_t kMaxEntries = 20000;
 constexpr std::size_t kMaxFieldLen = 1024;
-// Total canonical-blob ceiling — MUST match the server seam's kMaxBlobBytes
-// (inventory_ingestion.cpp). The agent drops a cycle whose blob exceeds this so
-// it never (a) records success on a payload the server will drop, nor (b) trips
-// the gRPC message-size limit into a tight retry loop (governance UP-4).
-constexpr std::size_t kMaxBlobBytes = 4u * 1024 * 1024;
+// Total canonical-blob ceiling — MUST equal the server seam's kMaxBlobBytes
+// (inventory_ingestion.cpp); the two are comment-coordinated. Deliberately set
+// BELOW the gRPC default 4 MiB max-receive-message limit (no SetMaxReceiveMessageSize
+// override exists on the agent channel, the server, or the gateway hop), with
+// headroom for the InventoryReport's proto/map framing + content_hashes +
+// collected_at on top of the blob. At 4 MiB the wire message would exceed the
+// 4 MiB receive ceiling and the RPC would be rejected before the handler runs —
+// a permanent tight retry loop (governance UP-6). A 3 MiB canonical blob is
+// ~60k entries; no real machine reaches it, and an over-cap host is dropped
+// (governance UP-4) rather than looping. Lowering this trades "outlier host
+// skips" for "outlier host loops" — the right call for installed software.
+constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
 
 std::string clamp_field(std::string_view f) {
     if (f.size() > kMaxFieldLen)

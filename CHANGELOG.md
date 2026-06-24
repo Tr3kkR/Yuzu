@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like "which devices run X" are first-class), via a shared ingest seam wired identically on the
   direct and gateway paths. Reads are gated on a new **`Inventory` RBAC securable** (`Inventory:Read`).
   Reuses the existing `installed_apps` plugin (Windows/Linux/macOS) in-process — no new collector.
+  Hardened for fleet-scale resilience: a per-source blob cap sized below the gRPC message ceiling,
+  exponential agent-side backoff on consecutive `need_full` resends (so a server cold-cache or store
+  outage cannot drive a flat-cadence full-resend storm), a `yuzu_inventory_ingest_total{source,outcome}`
+  metric, and the store wired into both `/readyz` and `/healthz`.
 
 ### Security
 
