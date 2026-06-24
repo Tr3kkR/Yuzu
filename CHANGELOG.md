@@ -57,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device is in — a previously group-scoped token now gets `403` for out-of-scope
   devices, where a flat global check would have passed them; global tokens are
   unaffected). Audited `guardian.device.view` on access (denials audited at the auth
-  layer as `auth.scoped_permission_required`). Both query params are required,
+  layer as `auth.scoped_permission_required`); an audit-persistence failure surfaces
+  `Sec-Audit-Failed: true` and still serves the read (set-and-proceed, CC6.6). Both query params are required,
   length-capped (`256` / `auth::kMaxAgentIdLength`), and rejected if they contain
   control characters (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use
   the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
