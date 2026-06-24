@@ -228,6 +228,18 @@ Before upgrading any component:
   project treats the *capability to observe* as the works-council co-determination
   trigger, so EU deployments should note the new Windows coverage as they did for
   the DEX signals. See [Network Quality](network.md) → Collection & privacy.
+- [ ] **New daily installed-software sync (ADR-0016):** on agent upgrade, agents
+  begin syncing their **machine-wide installed-software** inventory to the server
+  once per ~24 h over the existing gRPC channel (hash-skip keeps unchanged hosts
+  to a tiny hash, not the full list). Three operator-visible effects: (a) new daily
+  outbound `ReportInventory` traffic per agent — adjust egress baselines/firewall
+  expectations; (b) the data lands in a **new Postgres schema**
+  (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
+  the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
+  (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
+  debug). Machine-scope only, no end-user PII (no works-council trigger). Reads are
+  gated on the new `Inventory:Read` RBAC securable; today the data is queryable via
+  direct SQL (see [Installed-Software Inventory](inventory.md)).
 
 ## Upgrading the Server
 
