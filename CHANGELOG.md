@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
+  route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
+  failed to persist (audit DB locked/full, or a `bad_alloc`-class throw) could previously look like
+  a clean, audited read. Every such route now routes through one shared helper
+  (`server/core/src/rest_audit.hpp`) that captures the `AuditFn` result behind a `try/catch` (the
+  throw arm was previously silent on several routes), logs the gap, and surfaces it per surface:
+  - **Dashboard fragments** (`/fragments/device/dex`, `/fragments/device/guardian`, and the `/dex`
+    drill-downs) set the `Sec-Audit-Failed: true` response header and **still render** — a transient
+    audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
+    **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
+  - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
+    `/api/v1/guaranteed-state/events?agent_id=`, and now
+    `/api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`) **fails closed** with
+    `503` + `Sec-Audit-Failed: true` and serves no PII. The baseline-device route previously
+    discarded the result and served regardless — it now matches its `dex.device.view` siblings.
+  - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
+    `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
+    matching the `query_responses` / `revoke_certificate` convention.
+
+  Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
+  evidence-gap signal.
+
 - **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
   previously gated only flat `Response:Read` and then returned **any** execution's response rows
   (`dispatched_by` was display-only, never an access check), so an operator could collect another
