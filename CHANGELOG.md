@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
+  previously gated only flat `Response:Read` and then returned **any** execution's response rows
+  (`dispatched_by` was display-only, never an access check), so an operator could collect another
+  operator's rows by id. Results are now filtered per-agent through the same
+  `check_scoped_permission` management-group chokepoint the per-device REST/dashboard routes use —
+  a caller sees only rows for agents inside their groups; out-of-scope rows are dropped and audited
+  `result=denied` (with the distinct dropped-agent count). The `denied` row's persistence failure,
+  like the success row's, surfaces `audit_persisted:false` on the result. RBAC-off → legacy-open
+  (no filter), matching `require_scoped_permission`. **Behavior change for agentic-worker
+  integrators:** results may now be a subset of an execution's total rows. The filter runs after
+  the 1000-row cap, so a result that hit the cap before filtering carries
+  `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
+  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(Partial: the
+  REST/dashboard/workflow siblings that read the same response store and the `aggregate_responses`
+  MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
+  token creator's RBAC, not the service tag.)*
+
 ### Changed
 
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
@@ -54,6 +73,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `query_responses` closes the dispatch→collect loop by `execution_id`.** The tool now
+  accepts an `execution_id` argument (routed to `ResponseStore::query_by_execution`) so an
+  agentic worker that dispatched via `execute_instruction` can collect exactly that run's
+  responses — exact-correlation, no cross-execution bleed — instead of the definition-wide
+  `instruction_id` collect. At least one of `execution_id`/`instruction_id` is now required (was
+  `instruction_id`-only); when both are given, `execution_id` wins. Each returned row now echoes
+  its `execution_id`. The advertised `status` filter is corrected to `integer` in the tool schema
+  (the handler always read it as the `CommandResponse` status enum; the prior `string` declaration
+  was wrong), and `limit` is now clamped to `[1,1000]` (a negative limit previously bound as an
+  unbounded SQLite `LIMIT -1`, and `limit:0` returned zero rows a worker could misread as "done").
+  Foundation for fleet-scale agentic fan-out across tens of thousands of devices. *(Scope: `limit`
+  caps a page at 1000 rows; correct collection of executions that fan out to more than 1000 devices
+  is a keyset-pagination follow-up — offset paging is deliberately not exposed, as it skips/dupes
+  rows while responses are still arriving. The sibling `aggregate_responses` tool still keys on
+  `instruction_id` only; an `execution_id` aggregate is a follow-up. MCP-first: the streaming REST
+  surface `GET /api/v1/events?execution_id=` already exists; a non-streaming polling REST collect
+  by `execution_id` is a deferred follow-up slice.)*
 - **Sampled authentication-log evidence export (SOC 2 CC7.2).** New
   `GET /api/v1/audit/auth-sample?from=&to=&limit=` returns a pseudo-random
   sample of authentication-surface audit events (action prefixes `auth.`,

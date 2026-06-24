@@ -46,6 +46,17 @@ Every audit event contains the following fields:
 The following actions are recorded automatically. No operator configuration is
 required.
 
+> **MCP `mcp.query_responses` emits a pair of rows on a scope-filtered call.** When
+> an agentic worker collects responses it is only partly entitled to (some agents
+> outside its management groups), the tool writes a `result=denied` row (the
+> access-boundary event — `detail` carries the distinct dropped-agent count) **and**
+> a `result=success` row (the served, possibly-empty set), both under the same
+> principal + correlation key. A SIEM rule must treat these as a pair for one call:
+> the `denied` row is informational CC6.1 access-boundary evidence (an operator
+> reached toward agents outside its scope and was filtered), **not** a failed call —
+> do not alert on `mcp.query_responses` denials as errors on a scoped multi-operator
+> deployment.
+
 | Action | Target type | When |
 |---|---|---|
 | `auth.login` | Session | Operator logs in via the dashboard or API |

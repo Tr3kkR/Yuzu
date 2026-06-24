@@ -253,7 +253,7 @@ for the tool to execute.
 | 3 | `query_audit_log` | Query the audit log with filters (principal, action, target, time range). | `AuditLog:Read` |
 | 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). | `InstructionDefinition:Read` |
 | 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. | `InstructionDefinition:Read` |
-| 6 | `query_responses` | Query command response data with filters (requires instruction_id). | `Response:Read` |
+| 6 | `query_responses` | Query command response data. Pass `execution_id` to collect exactly the responses from one `execute_instruction` dispatch (closes the dispatch→collect loop), or `instruction_id` for all responses to a definition. At least one required (execution_id wins if both given); returns up to `limit` rows (max 1000). **Results are management-group scoped** — only rows for agents inside your groups are returned; out-of-scope rows are silently dropped (and audited `result=denied`). The result object may carry two outer fields: `audit_persisted:false` if the access-audit row could not be written (SOC 2 evidence gap — investigate), and `result_truncated_by_cap:true` if the raw query hit the 1000-row cap (the page is incomplete — do **not** treat `count<limit` as "done"; paginate via the keyset follow-up). | `Response:Read` |
 | 7 | `aggregate_responses` | Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. | `Response:Read` |
 | 8 | `query_inventory` | Query inventory data across agents (filterable by agent, plugin). | `Infrastructure:Read` |
 | 9 | `list_inventory_tables` | List available inventory data types with agent counts. | `Infrastructure:Read` |
@@ -305,6 +305,8 @@ for the tool to execute.
 > 2. Open `GET /api/v1/events?execution_id=<execution_id>` with `Accept: text/event-stream`.
 > 3. Stream JSON envelopes until the `execution-completed` event arrives.
 >
+> For a non-streaming collect (e.g. batch fan-out across tens of thousands of devices), poll `query_responses` with that same `execution_id` instead of subscribing — it returns exactly the rows produced by that dispatch (exact-correlation; no cross-execution bleed). Use `get_execution_status` (or watch for the `execution-completed` SSE event) to decide when the run is terminal: an **empty** `query_responses` result means "no responses have landed *yet*", not necessarily "done with zero responses". `limit` caps the page at 1000 rows; collecting an execution that fans out to more than 1000 devices is a keyset-pagination follow-up (offset-based paging is intentionally not offered — it would skip/duplicate rows while responses are still arriving). **Results are management-group scoped**: you receive only rows for agents inside your groups, so on a multi-operator deployment the count you collect may be a subset of `agents_reached`. **Do not treat `count < limit` as "done"** — if the result object carries `result_truncated_by_cap: true`, the raw query hit the 1000-row cap before scoping and the page is incomplete (wait for the keyset follow-up to collect the remainder). A `result_truncated_by_cap` absent + an `execution-completed` SSE event (or terminal `get_execution_status`) is the reliable "done" signal. This is the canonical fleet-scale dispatch→collect loop.
+>
 > `execution_id` is an empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
 
 > **Live-query bundle (`execute_bundle` / `get_bundle_result`) — ADR-0011:**
@@ -326,7 +328,10 @@ Required parameters are validated server-side; missing required fields return a
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
   `get_tags`.
-- `instruction_id` (string) -- required by `query_responses`.
+- `execution_id` / `instruction_id` (string) -- `query_responses` requires at
+  least one. `execution_id` collects a single dispatch's responses exactly;
+  `instruction_id` collects all responses to a definition. If both are supplied,
+  `execution_id` takes precedence (the `instruction_id` filter is ignored).
 - `agent_id` + `steps` -- required by `execute_bundle`. `steps` is an array of
   `{plugin, action, params?}` objects (1–32, in request order; duplicate
   `(plugin, action)` allowed — each gets its own command_id);
@@ -679,8 +684,8 @@ principal, or create a new token from an account with the required permissions.
 **Symptom**: A tool call returns error code `-32602`.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
-`get_agent_details` without `agent_id`, or calling `query_responses` without
-`instruction_id`.
+`get_agent_details` without `agent_id`, or calling `query_responses` with
+neither `execution_id` nor `instruction_id`.
 
 **Fix**: Include all required parameters in the `arguments` object. See the
 [Available Tools](#available-tools) section for parameter requirements.
