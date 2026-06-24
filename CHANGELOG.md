@@ -101,7 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Sec-Audit-Failed: true` and **withholds** the compliance body (parity with
   `GET /api/v1/dex/devices/{id}`, governance #1549) — the `503` is returned before the
   `404`, so an audit outage never reveals baseline existence without durable evidence
-  (CC7.2). Both query params are required, length-capped (`256` /
+  (CC7.2). **Behaviour change for API consumers:** an audit-store outage now yields
+  `503` where this unreleased route previously returned `200`; on the fleet-polled
+  CMDB path a *sustained* outage 503s every poll fleet-wide (no degraded-serve
+  fallback). Both query params are required, length-capped (`256` /
   `auth::kMaxAgentIdLength`), and rejected if they contain control characters
   (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use the A4 envelope
   (`correlation_id`), while the `403` is the auth/RBAC layer's denial body (not the A4
