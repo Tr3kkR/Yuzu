@@ -86,7 +86,7 @@ struct UserEvent {
     std::string session_id;
 };
 
-/// One arp_live row (ADR-0011 — host ARP / neighbour table). One row per
+/// One arp_live row (ADR-0015 — host ARP / neighbour table). One row per
 /// appeared/removed transition of an (interface, ip_address, mac_address)
 /// binding; `entry_type` is a value field, not part of the diff key.
 struct ArpEvent {
@@ -99,7 +99,7 @@ struct ArpEvent {
     std::string entry_type; // dynamic, static, incomplete, other, unknown
 };
 
-/// One dns_live row (ADR-0011 — host DNS resolver-cache state, NOT per-process
+/// One dns_live row (ADR-0015 — host DNS resolver-cache state, NOT per-process
 /// queries). One row per appeared/removed transition of a (name, record_type,
 /// data) resolution; `ttl_remaining_s` is a value field, not part of the diff
 /// key (it decrements every tick). `source` ∈ {cache, hosts_file, unknown}.

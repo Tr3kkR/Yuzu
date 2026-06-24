@@ -839,7 +839,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
 
-TEST_CASE("TarDatabase: insert and query arp events (ADR-0011)", "[tar][store][crud][arp]") {
+TEST_CASE("TarDatabase: insert and query arp events (ADR-0015)", "[tar][store][crud][arp]") {
     auto t = make_test_db();
     ArpEvent ev;
     ev.ts = 3000;
@@ -862,7 +862,7 @@ TEST_CASE("TarDatabase: insert and query arp events (ADR-0011)", "[tar][store][c
     CHECK(r->rows[0][4] == "appeared");
 }
 
-TEST_CASE("TarDatabase: insert and query dns events (ADR-0011)", "[tar][store][crud][dns]") {
+TEST_CASE("TarDatabase: insert and query dns events (ADR-0015)", "[tar][store][crud][dns]") {
     auto t = make_test_db();
     DnsEvent ev;
     ev.ts = 3100;

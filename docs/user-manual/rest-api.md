@@ -4679,7 +4679,7 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 
 #### `GET /fragments/tar/capture-sources`
 
-Render the **Capture sources** frame body for `/tar` (ADR-0011): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
+Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
 
 **Permission:** `Infrastructure:Read`.
 
@@ -4703,7 +4703,7 @@ Apply staged capture-source enable/disable changes. The dashboard stages toggles
 
 #### `GET /fragments/tar/process-tree/device-net`
 
-Self-re-issuing poll that dispatches read-only `tar.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0011). **Device-level, not per-process** (the DNS cache carries no pid).
+Self-re-issuing poll that dispatches read-only `tar.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
 
 **Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `tar.dns.read` **and** `tar.arp.read` (distinct verbs — DNS is usage-class PII, separately countable) at dispatch.
 

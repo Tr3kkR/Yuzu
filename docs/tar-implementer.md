@@ -282,7 +282,7 @@ rollup, no plumbing changes — the registry is the contract.
 ## 8. Adding a capture source
 
 A **capture source** is a snapshot-and-diff observer (births/deaths of host
-state) — like `process`, `tcp`, `service`, `user`. ARP and DNS (ADR-0011) are the
+state) — like `process`, `tcp`, `service`, `user`. ARP and DNS (ADR-0015) are the
 worked example. Follow the **core capture-source pattern** below — do **not** copy
 the self-contained *tier* files (`tar_perf.*`, `tar_proc_perf.*`, `tar_netqual.*`),
 which are derived-metric samplers with their own headers and pure helpers, a

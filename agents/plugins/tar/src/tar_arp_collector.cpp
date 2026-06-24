@@ -1,5 +1,5 @@
 // tar_arp_collector.cpp — host ARP / neighbour-table enumeration for the TAR
-// `arp` capture source (ADR-0011). The impure platform shell only: the snapshot
+// `arp` capture source (ADR-0015). The impure platform shell only: the snapshot
 // is diffed in tar_diff.cpp (compute_arp_events) and persisted in tar_db.cpp
 // (insert_arp_events). Follows the core capture-source pattern (no per-source
 // header; types + decls in tar_collectors.hpp) — see docs/tar-implementer.md

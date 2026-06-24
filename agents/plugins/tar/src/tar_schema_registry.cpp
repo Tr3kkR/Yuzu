@@ -558,7 +558,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
             },
         },
 
-        // ── ARP / address-resolution table (ADR-0011) ─────────────────────
+        // ── ARP / address-resolution table (ADR-0015) ─────────────────────
         // Host L2 adjacency: IP<->MAC bindings per interface. Snapshot-diff
         // appeared/removed keyed on the (interface, ip_address, mac_address)
         // binding — a changing entry_type on the same binding is a value update,
@@ -614,7 +614,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
             },
         },
 
-        // ── DNS resolution cache (ADR-0011) ───────────────────────────────
+        // ── DNS resolution cache (ADR-0015) ───────────────────────────────
         // Host DNS resolver-cache STATE (not per-process queries — the cache is
         // system-wide and carries no pid; per-process attribution via the
         // Microsoft-Windows-DNS-Client ETW provider is a deferred follow-up, so
@@ -1027,7 +1027,7 @@ GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_sta
         }
     }
 
-    // ── ARP rollups (ADR-0011) — per (interface, ip, mac) binding ────────
+    // ── ARP rollups (ADR-0015) — per (interface, ip, mac) binding ────────
     if (source_name == "arp") {
         if (target_suffix == "hourly") {
             return R"(INSERT INTO arp_hourly (hour_ts, interface, ip_address, mac_address, appear_count, remove_count)
@@ -1040,7 +1040,7 @@ GROUP BY (ts / 3600) * 3600, interface, ip_address, mac_address)";
         }
     }
 
-    // ── DNS rollups (ADR-0011) — per (name, record_type) ─────────────────
+    // ── DNS rollups (ADR-0015) — per (name, record_type) ─────────────────
     if (source_name == "dns") {
         if (target_suffix == "hourly") {
             return R"(INSERT INTO dns_hourly (hour_ts, name, record_type, appear_count, remove_count)

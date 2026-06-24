@@ -56,7 +56,7 @@ struct TarTcpConn {
     std::string state;
 };
 
-/// One row out of `$DNS_Live` — device DNS resolver-cache state (ADR-0011).
+/// One row out of `$DNS_Live` — device DNS resolver-cache state (ADR-0015).
 /// Device-level: the cache carries NO pid, so this is never joined to a process.
 /// `action` (appeared|removed) lets the panel reduce the event stream to the
 /// current cache. All string fields agent-controlled → HTML-escape at render.
@@ -70,7 +70,7 @@ struct TarDnsCacheEntry {
     std::string action; ///< appeared | removed
 };
 
-/// One row out of `$ARP_Live` — device ARP / neighbour table (ADR-0011). Host
+/// One row out of `$ARP_Live` — device ARP / neighbour table (ADR-0015). Host
 /// L2 adjacency; no pid. All string fields agent-controlled → HTML-escape at render.
 struct TarArpEntry {
     std::int64_t ts = 0;
@@ -141,7 +141,7 @@ inline constexpr int kTarRenderDepthCap = 256;
 inline constexpr std::size_t kMaxTarProcOutputBytes = 16ull * 1024 * 1024; // 16 MiB
 inline constexpr std::size_t kMaxTarTcpOutputBytes = 4ull * 1024 * 1024;   //  4 MiB
 /// Same 4 MiB ceiling as the TCP path, but a distinct name for the DNS/ARP device-net
-/// fragment so a future change to either cap can't silently move the other (ADR-0011
+/// fragment so a future change to either cap can't silently move the other (ADR-0015
 /// review LOW-E).
 inline constexpr std::size_t kMaxTarDeviceNetOutputBytes = 4ull * 1024 * 1024; //  4 MiB
 
@@ -177,14 +177,14 @@ std::vector<TarProcEvent> parse_tar_process_output(const std::string& output,
 std::vector<TarTcpConn> parse_tar_tcp_output(const std::string& output,
                                              std::size_t max_rows = 20000);
 
-/// Parse `$DNS_Live` rows (ADR-0011). Required columns: name, record_type, data
+/// Parse `$DNS_Live` rows (ADR-0015). Required columns: name, record_type, data
 /// (ttl_remaining_s, source, ts, action optional). Same defensive `__schema__`
 /// contract as the process/tcp parsers — torn rows and an `error|` payload are
 /// skipped, columns located by name. Bounded to `max_rows`.
 std::vector<TarDnsCacheEntry> parse_tar_dns_output(const std::string& output,
                                                    std::size_t max_rows = 20000);
 
-/// Parse `$ARP_Live` rows (ADR-0011). Required columns: ip_address, mac_address
+/// Parse `$ARP_Live` rows (ADR-0015). Required columns: ip_address, mac_address
 /// (interface, entry_type, ts, action optional). Bounded to `max_rows`.
 std::vector<TarArpEntry> parse_tar_arp_output(const std::string& output,
                                               std::size_t max_rows = 20000);
@@ -254,18 +254,18 @@ std::string render_tar_tree_fragment(const TarProcTree& tree, const std::vector<
 std::string render_tar_proc_detail(const TarProcNode& node, const std::vector<TarTcpConn>& conns,
                                    const std::string& os);
 
-/// Render the device DNS-cache panel (ADR-0011) — a collapsible `<details>` with a
+/// Render the device DNS-cache panel (ADR-0015) — a collapsible `<details>` with a
 /// compact table. Device-level, NOT per process. The event stream (rows assumed
 /// newest-first) is reduced to the current cache: newest row per (name, type, data)
 /// wins, and a binding whose newest action is `removed` is omitted. Agent fields are
 /// HTML-escaped. Pure (no DB/HTTP) so it is unit-testable directly.
 std::string render_tar_dns_panel(const std::vector<TarDnsCacheEntry>& rows);
 
-/// Render the device ARP-table panel (ADR-0011). Same current-state reduction keyed
+/// Render the device ARP-table panel (ADR-0015). Same current-state reduction keyed
 /// on (interface, ip_address, mac_address).
 std::string render_tar_arp_panel(const std::vector<TarArpEntry>& rows);
 
-/// Render the Capture-sources table body (ADR-0011) from a device's `tar status`
+/// Render the Capture-sources table body (ADR-0015) from a device's `tar status`
 /// output (per-source `<src>_enabled` / `<src>_live_rows`) + its `tar compatibility`
 /// output (per-(src,os) support). Produces the filter chips + the table with staged
 /// (not-yet-pushed) toggles + the push/discard bar — the page JS handles staging and

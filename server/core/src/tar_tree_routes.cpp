@@ -125,7 +125,7 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
          "Select a process to see its path, user, connections and anomaly evidence.</div></div></aside>";
     h += "</div>";
 
-    // Device-level DNS cache + ARP table panels (ADR-0011). Loaded when the host
+    // Device-level DNS cache + ARP table panels (ADR-0015). Loaded when the host
     // picker changes — htmx `from:` selector fires this alongside the tree run, with
     // no hx-on (CSP-safe). Device view, NOT per-process (the DNS cache carries no pid).
     h += "<div id=\"tar-devnet\" hx-get=\"/fragments/tar/process-tree/device-net\" "
@@ -149,7 +149,7 @@ std::string tree_pending(const std::string& device, const std::string& preset,
            "class=\"tar-tree-loading\">Reconstructing the process tree\xE2\x80\xA6</div>";
 }
 
-// Self-re-issuing poll for the device-net (DNS cache + ARP table) panels (ADR-0011).
+// Self-re-issuing poll for the device-net (DNS cache + ARP table) panels (ADR-0015).
 // Carries both dispatched command_ids; ready when DNS + ARP queries both complete.
 std::string devnet_pending(const std::string& device, const std::string& dcmd,
                            const std::string& acmd, int attempt) {
@@ -161,7 +161,7 @@ std::string devnet_pending(const std::string& device, const std::string& dcmd,
 }
 
 // Capture-sources frame body: device picker (operator-scoped) + a target the table
-// loads into on host change. Mirrors render_frame's picker (ADR-0011).
+// loads into on host change. Mirrors render_frame's picker (ADR-0015).
 std::string render_cap_frame(const std::vector<DeviceRow>& devices) {
     std::string h = "<div class=\"picker-row\"><label for=\"cap-host\">Device</label>";
     h += "<select id=\"cap-host\" name=\"device\" class=\"scope-chip-select\" "
@@ -533,7 +533,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         res.set_content(body, "text/html; charset=utf-8");
     });
 
-    // -- Device-net panels: DNS cache + ARP table for the selected host (ADR-0011).
+    // -- Device-net panels: DNS cache + ARP table for the selected host (ADR-0015).
     // Dispatches two canned read-only tar.sql ($DNS_Live, $ARP_Live), polls, renders
     // DEVICE-level panels (never per-process — the DNS cache has no pid). Same scoped
     // Read + Execute-probe tier as the tree run; audits tar.dns.read / tar.arp.read as
@@ -627,7 +627,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         res.set_content(body, "text/html; charset=utf-8");
     });
 
-    // ── Capture-sources frame (ADR-0011): the /tar enable/disable surface. The
+    // ── Capture-sources frame (ADR-0015): the /tar enable/disable surface. The
     // frame route renders an operator-scoped device picker; /load dispatches
     // `tar status` + `tar compatibility` and renders the table; /push dispatches
     // `tar configure <src>_enabled=<bool>` per staged change. Same scoped Read +
@@ -781,7 +781,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                           std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
             // Only count a change the operator can observe as applied: when the dispatch
             // reached no agents (sent==0) the audit records `no_agents`, so the toast must
-            // not claim it was pushed (ADR-0011 review LOW-D).
+            // not claim it was pushed (ADR-0015 review LOW-D).
             if (sent > 0)
                 ++applied;
         }

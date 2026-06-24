@@ -564,7 +564,7 @@ TEST_CASE("tar normalize_tar_os: maps to a closed audit-safe set", "[tar][tree][
 }
 
 // =============================================================================
-// Device DNS / ARP panels (ADR-0011) — parsers + current-state reduction + escape
+// Device DNS / ARP panels (ADR-0015) — parsers + current-state reduction + escape
 // =============================================================================
 
 TEST_CASE("parse_tar_dns_output: schema-located, skips torn/error rows", "[tar][dns][panel]") {
@@ -638,7 +638,7 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
 }
 
-TEST_CASE("render_tar_dns_panel: newest-first input is a load-bearing invariant (ADR-0011)",
+TEST_CASE("render_tar_dns_panel: newest-first input is a load-bearing invariant (ADR-0015)",
           "[tar][dns][panel]") {
     // The route feeds rows ORDER BY ts DESC; the reduction is newest-wins. Pin that
     // the ORDER BY is load-bearing — a future refactor dropping it would corrupt the

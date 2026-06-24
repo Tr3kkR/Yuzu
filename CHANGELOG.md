@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **ARP + DNS capture sources (TAR, ADR-0011) — Windows.** Two new **opt-in**
+- **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
   (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
   via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS
   resolver-cache state via `DnsGetCacheDataTable` → `$DNS_Live`/`$DNS_Hourly` —

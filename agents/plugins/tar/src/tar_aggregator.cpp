@@ -188,7 +188,7 @@ std::string_view diff_state_key(std::string_view source) {
     if (source == "tcp")     return "network";
     if (source == "service") return "service";
     if (source == "user")    return "user";
-    // ADR-0011 — arp/dns are snapshot-diff sources too: the collect legs keep a
+    // ADR-0015 — arp/dns are snapshot-diff sources too: the collect legs keep a
     // baseline under these exact keys (get_state/set_state "arp"/"dns"), so the
     // on-disable clear must reach them or a re-enable would emit ghost
     // removed/added neighbour + cache deltas for the paused window (#538).

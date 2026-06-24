@@ -1,5 +1,5 @@
 // tar_dns_collector.cpp — host DNS resolver-cache enumeration for the TAR `dns`
-// capture source (ADR-0011). Impure platform shell only: the snapshot is diffed
+// capture source (ADR-0015). Impure platform shell only: the snapshot is diffed
 // in tar_diff.cpp (compute_dns_events) and persisted in tar_db.cpp
 // (insert_dns_events). Core capture-source pattern — types/decls in
 // tar_collectors.hpp. See docs/tar-implementer.md "Adding a capture source".
@@ -185,7 +185,7 @@ std::vector<DnsEntry> enumerate_dns() {
             //   of `ipconfig /displaydns` (the "muhdnscache" research) — is required to
             //   actually read the resolver cache on many Win10/11 builds; with 0x10 alone
             //   DnsQuery_W can fail/return empty for every cached entry, defeating the
-            //   whole source. OR it in defensively (ADR-0011 review HIGH-B). 0x10 is the
+            //   whole source. OR it in defensively (ADR-0015 review HIGH-B). 0x10 is the
             //   documented-but-insufficient subset, so this only ever adds cache visibility.
             // windns.h declares DnsQuery_W with the GENERIC PDNS_RECORD* (= ANSI
             // PDNS_RECORDA* without /DUNICODE) even though the _W function returns

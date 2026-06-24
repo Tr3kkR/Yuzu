@@ -62,7 +62,7 @@ struct UserSession {
     std::string session_id;
 };
 
-// One host ARP / neighbour-table entry (ADR-0011). Snapshot type for the `arp`
+// One host ARP / neighbour-table entry (ADR-0015). Snapshot type for the `arp`
 // capture source; diffed into ArpEvent rows. Diff key = (interface, ip_address,
 // mac_address); entry_type is a value field. All fields agent-controlled.
 struct ArpEntry {
@@ -72,7 +72,7 @@ struct ArpEntry {
     std::string entry_type; // dynamic, static, incomplete, other, unknown
 };
 
-// One host DNS resolver-cache entry (ADR-0011). Snapshot type for the `dns`
+// One host DNS resolver-cache entry (ADR-0015). Snapshot type for the `dns`
 // capture source; diffed into DnsEvent rows. Diff key = (name, record_type,
 // data); ttl_remaining_s is a value field (changes every tick, never keyed).
 // The cache is system-wide and carries NO pid — there is no process attribution.
@@ -118,20 +118,20 @@ std::vector<ServiceInfo> enumerate_services();
 std::vector<UserSession> enumerate_users();
 
 /**
- * Enumerate the host ARP / neighbour table (ADR-0011). Windows: GetIpNetTable2
+ * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
  * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
  * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
  */
 std::vector<ArpEntry> enumerate_arp();
 
 /**
- * Enumerate the host DNS resolver cache (ADR-0011). Windows: DnsGetCacheDataTable.
+ * Enumerate the host DNS resolver cache (ADR-0015). Windows: DnsGetCacheDataTable.
  * Hard-capped at kDnsEntryCap entries (warn on truncation). The cache is
  * system-wide (no process attribution). Returns `{}` off Windows for now.
  */
 std::vector<DnsEntry> enumerate_dns();
 
-/// Per-cycle collection caps (ADR-0011 §"Memory bound"). The collector resizes to
+/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector resizes to
 /// the cap and logs a truncation warning rather than growing unbounded.
 inline constexpr std::size_t kArpEntryCap = 2048;
 inline constexpr std::size_t kDnsEntryCap = 4096;

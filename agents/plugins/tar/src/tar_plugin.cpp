@@ -833,7 +833,7 @@ private:
             }
         }
 
-        // ARP diff (ADR-0011). Opt-in: default_enabled=false in the registry, so
+        // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
         // source_enabled returns false until an operator turns it on. Windows-only
         // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
         // failure — the always-on legs above already committed, so a failure here
@@ -855,7 +855,7 @@ private:
                 db_->set_state("arp", arp_to_json(current).dump());
         }
 
-        // DNS-cache diff (ADR-0011). Opt-in (usage-class PII — visited domains).
+        // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
         // Device-level resolver-cache state; NOT per-process (no pid). Same
         // non-fatal / advance-on-success discipline as the arp leg.
         if (source_enabled(*db_, "dns")) {
@@ -1383,7 +1383,7 @@ private:
                   "'' AS detail_json FROM user_live" +
                   where + tail;
         } else if (type_filter == "arp") {
-            // ADR-0011. detail_json carries a human summary (ip @ mac [iface]); the
+            // ADR-0015. detail_json carries a human summary (ip @ mac [iface]); the
             // full row is available via tar.sql over $ARP_Live.
             sql = "SELECT ts, 'arp' AS event_type, action, snapshot_id, "
                   "(ip_address || ' @ ' || mac_address || ' [' || interface || ']') AS detail_json "
@@ -1493,9 +1493,9 @@ private:
                 table = "service_live";
             else if (type_filter == "user")
                 table = "user_live";
-            else if (type_filter == "arp") // ADR-0011
+            else if (type_filter == "arp") // ADR-0015
                 table = "arp_live";
-            else if (type_filter == "dns") // ADR-0011
+            else if (type_filter == "dns") // ADR-0015
                 table = "dns_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));

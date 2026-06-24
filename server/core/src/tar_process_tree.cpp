@@ -6,7 +6,7 @@
 
 #include "web_utils.hpp" // html_escape, format_iso_utc, format_relative_time
 
-#include <unordered_set> // device-net panel current-state reduction (ADR-0011)
+#include <unordered_set> // device-net panel current-state reduction (ADR-0015)
 
 #include <algorithm>
 #include <array>
@@ -1061,7 +1061,7 @@ std::string render_tar_proc_detail(const TarProcNode& node, const std::vector<Ta
     return h;
 }
 
-// ── Device DNS/ARP panels (ADR-0011) — device-level, NOT per process ──────────
+// ── Device DNS/ARP panels (ADR-0015) — device-level, NOT per process ──────────
 
 std::string render_tar_dns_panel(const std::vector<TarDnsCacheEntry>& rows) {
     // Reduce the appeared/removed event stream (rows assumed newest-first) to the
@@ -1152,7 +1152,7 @@ std::string render_tar_arp_panel(const std::vector<TarArpEntry>& rows) {
     return h;
 }
 
-// ── Capture-sources frame (ADR-0011) ─────────────────────────────────────────
+// ── Capture-sources frame (ADR-0015) ─────────────────────────────────────────
 
 std::string render_tar_capture_sources(const std::string& device, const std::string& status_output,
                                        const std::string& compat_output) {

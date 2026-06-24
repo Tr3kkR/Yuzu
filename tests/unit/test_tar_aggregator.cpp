@@ -308,7 +308,7 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
     struct Case { const char* source; const char* state_key; };
     const Case cases[] = {{"process", "process"}, {"tcp", "network"},
                           {"service", "service"}, {"user", "user"},
-                          {"arp", "arp"}, {"dns", "dns"}}; // ADR-0011 snapshot-diff sources
+                          {"arp", "arp"}, {"dns", "dns"}}; // ADR-0015 snapshot-diff sources
 
     yuzu::test::TempDbFile tmp{std::string_view{"tar-538-parity-"}};
     auto opened = TarDatabase::open(tmp.path);
@@ -427,8 +427,8 @@ TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth",
     CHECK(diff_state_key("tcp") == "network"); // NOT "tcp"
     CHECK(diff_state_key("service") == "service");
     CHECK(diff_state_key("user") == "user");
-    CHECK(diff_state_key("arp") == "arp"); // ADR-0011
-    CHECK(diff_state_key("dns") == "dns"); // ADR-0011
+    CHECK(diff_state_key("arp") == "arp"); // ADR-0015
+    CHECK(diff_state_key("dns") == "dns"); // ADR-0015
     // No snapshot-diff baseline: disabling these is a state no-op.
     CHECK(diff_state_key("perf").empty());
     CHECK(diff_state_key("procperf").empty());

@@ -1,4 +1,4 @@
-# ADR-0011: Add ARP and DNS Capture Sources to the TAR Plugin
+# ADR-0015: Add ARP and DNS Capture Sources to the TAR Plugin
 
 **Date:** 2026-06-19
 **Status:** Accepted

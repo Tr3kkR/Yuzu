@@ -363,7 +363,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate
 // (still one continuous <style> block in the rendered HTML).
 R"HTM(
-    /* Device DNS/ARP panels (ADR-0011) — embedded below the process tree */
+    /* Device DNS/ARP panels (ADR-0015) — embedded below the process tree */
     .devnet-row { display: flex; gap: 1rem; margin-top: 1rem; padding-top: 0.85rem;
       border-top: 1px solid var(--border); flex-wrap: wrap; }
     .devnet-panel { flex: 1 1 22rem; min-width: 18rem; border: 1px solid var(--border);
@@ -398,7 +398,7 @@ R"HTM(
       background: var(--surface); border-top: 1px solid var(--border); }
     .devnet-empty { padding: 1.5rem; text-align: center; color: var(--mds-color-theme-text-tertiary); font-size: 0.78rem; }
 
-    /* Capture-sources frame (ADR-0011) — toggles, category filter, push guardrail */
+    /* Capture-sources frame (ADR-0015) — toggles, category filter, push guardrail */
     .picker-row { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.9rem; flex-wrap: wrap; }
     .picker-row label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
     .cat-filter { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
@@ -500,7 +500,7 @@ R"HTM(</head>
 
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
-R"HTM(    <!-- ── Capture sources (ADR-0011) ───────────────────────────────── -->
+R"HTM(    <!-- ── Capture sources (ADR-0015) ───────────────────────────────── -->
     <div class="tar-frame" id="frame-capture-sources">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Capture sources</h2>
@@ -511,7 +511,7 @@ R"HTM(    <!-- ── Capture sources (ADR-0011) ──────────�
       </div>
     </div>
     <script>
-    // Capture-sources staged-then-push guardrail + category filter (ADR-0011). Plain
+    // Capture-sources staged-then-push guardrail + category filter (ADR-0015). Plain
     // onclick/onchange handlers (CSP-safe — no hx-on/eval). A toggle only STAGES a
     // change; nothing is dispatched until Push.
     function capDirtyRows(){return Array.prototype.slice.call(document.querySelectorAll('#capTable tbody tr.pending'));}

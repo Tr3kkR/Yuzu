@@ -293,7 +293,7 @@ TEST_CASE("TAR diff: TCP post-restart with empty previous yields all-connected",
     }
 }
 
-TEST_CASE("TAR warehouse rollups: arp/dns are live + hourly only (ADR-0011)",
+TEST_CASE("TAR warehouse rollups: arp/dns are live + hourly only (ADR-0015)",
           "[tar][warehouse][rollup][arp][dns]") {
     // ARP/DNS have a live + hourly tier only — assert the hourly rollup exists and
     // the daily/monthly tiers do NOT (so a future incorrect granularity is caught).

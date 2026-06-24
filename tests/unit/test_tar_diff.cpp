@@ -388,7 +388,7 @@ TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhe
 }
 
 // =============================================================================
-// ARP diff tests (ADR-0011) — keyed on (iface, ip, mac); entry_type not keyed
+// ARP diff tests (ADR-0015) — keyed on (iface, ip, mac); entry_type not keyed
 // =============================================================================
 
 TEST_CASE("ARP diff: appeared and removed bindings", "[tar][diff][arp]") {
@@ -414,7 +414,7 @@ TEST_CASE("ARP diff: entry_type change on same binding is not churn", "[tar][dif
 }
 
 // =============================================================================
-// DNS diff tests (ADR-0011) — keyed on (name, type, data); TTL not keyed
+// DNS diff tests (ADR-0015) — keyed on (name, type, data); TTL not keyed
 // =============================================================================
 
 TEST_CASE("DNS diff: appeared and removed resolutions", "[tar][diff][dns]") {
