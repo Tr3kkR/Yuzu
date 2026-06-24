@@ -595,6 +595,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
+  (a) `network_capture_method` was validated against the OS-blind union of every
+  platform's capture methods, so a Linux agent would accept and store the
+  Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
+  polling — now validated against the running host's OS accept-list via the new
+  `accepted_capture_methods_for_os` (#540). (b) `process_stabilization_exclusions`
+  and `redaction_patterns` had no element-count or length caps (an oversized array
+  degrades the per-process redaction scan), and an over-short exclusion substring
+  (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
+  256 chars, and an exclusion whose EFFECTIVE substring (after stripping
+  leading/trailing `*`) is shorter than 3 chars is rejected at configure **and
+  dropped on the load path** — `*` does not buy a pass (`*a*` strips to core
+  `a`), and the load-path floor matters because the loader re-parses the stored
+  value every fast cycle, so a sub-floor value persisted before the floor existed
+  (a no-tamper upgrade) or written out of band would otherwise reach the redaction
+  scan and suppress events. The loaders skip non-string elements instead of
+  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
+  discovery metadata is synced (substring not glob, OS-aware method rejection,
+  the 256/256/3 limits), and the stale "glob" comments are corrected to
+  "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
+  pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
+  (#544). (d) **Command-line redaction is now fail-closed on every collect path.**
+  `load_redaction_patterns` previously returned the safe built-in patterns only
+  when the stored value was empty or a non-array; a *valid array whose elements all
+  got dropped* (`[]`, `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is
+  empty) returned an empty set, silently disabling redaction so `password`/`token`/
+  `secret` were written to `process_live` in plaintext — `collect_fast` and
+  `procperf` lacked the defaults-union that `fleet_snapshot` already applied. The
+  built-in defaults are now unioned inside `load_redaction_patterns` via the shared
+  `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
+  can never DISABLE the baseline protection on any path. The load-path JSON parse
+  also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
+  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
+  metadata for `network_capture_method` no longer advertises the process-source
+  `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
 - **TAR source enable/disable is now corruption-resilient and reports a strict
   state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
   corrupt `tar.db` was opened and trusted, and since `get_config` returns the

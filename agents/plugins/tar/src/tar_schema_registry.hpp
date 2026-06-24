@@ -93,6 +93,19 @@ struct CaptureSourceDef {
 // landing.
 [[nodiscard]] std::vector<std::string> accepted_capture_methods(std::string_view source_name);
 
+// The compile-time platform this agent was built for: "windows", "linux",
+// "macos", or "" on an unrecognised platform.
+[[nodiscard]] std::string_view current_platform_os();
+
+// Like accepted_capture_methods, but restricted to the `os_support` rows for a
+// single OS. This is what `configure` MUST validate against: the OS-blind union
+// (accepted_capture_methods) lets a Linux agent accept a Windows-only method
+// such as `iphlpapi`, which is then stored and surfaced even though the
+// collector never honours it (#540). Pass `current_platform_os()` for the
+// running host. `kPlanned` rows for that OS are still included (pre-staging).
+[[nodiscard]] std::vector<std::string>
+accepted_capture_methods_for_os(std::string_view source_name, std::string_view os);
+
 // ── Effective (actually-wired) network capture mechanism (issue #1528) ─────
 //
 // Returns the capture mechanism the TAR collector ACTUALLY uses, given the
