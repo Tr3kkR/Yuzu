@@ -44,6 +44,7 @@
 #include <spdlog/spdlog.h>
 
 #include <string>
+#include <type_traits>
 
 namespace yuzu::server::detail {
 
@@ -59,10 +60,21 @@ namespace yuzu::server::detail {
 /// target_type, target_id, detail)>`) binds without this header depending on
 /// any one route class.
 template <class AuditFn>
-inline bool try_persist_audit(const AuditFn& audit_fn, const httplib::Request& req,
-                              const std::string& action, const std::string& result,
-                              const std::string& target_type, const std::string& target_id,
-                              const std::string& detail) {
+[[nodiscard]] inline bool try_persist_audit(const AuditFn& audit_fn, const httplib::Request& req,
+                                            const std::string& action, const std::string& result,
+                                            const std::string& target_type,
+                                            const std::string& target_id,
+                                            const std::string& detail) {
+    // The three route classes all alias the SAME bool(req, 5×string) signature;
+    // the template just avoids depending on any one of them. Pin the contract so a
+    // wrong-arity / void-returning callable fails with a readable message rather
+    // than a deep std::function spew (governance arch-S1 / cpp-expert).
+    static_assert(
+        std::is_invocable_r_v<bool, const AuditFn&, const httplib::Request&, const std::string&,
+                              const std::string&, const std::string&, const std::string&,
+                              const std::string&>,
+        "AuditFn must be bool(const httplib::Request&, action, result, target_type, target_id, "
+        "detail)");
     if (!audit_fn)
         return true; // audit-off deployment — not a persist failure; serve.
     try {

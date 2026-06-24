@@ -500,6 +500,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include <httplib.h>
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -522,6 +523,7 @@ struct McpTestServer {
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
+    bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
 
@@ -655,6 +657,8 @@ private:
                                const std::string& /*target_id*/, const std::string& /*detail*/)
             -> bool {
             audit_log.push_back(action + "|" + result);
+            if (audit_throws_)
+                throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
         };
 
@@ -1024,6 +1028,29 @@ TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persi
     REQUIRE(payload.contains("audit_persisted"));
     CHECK(payload["audit_persisted"] == false);
     CHECK(payload["devices"].size() == 1); // WS-1 still returned
+}
+
+// #1647 item 1: a bad_alloc-class throw out of audit_fn was previously silent on this
+// MCP path (the bool was discarded). The shared kernel catches it → audit_persisted:false,
+// still serves (MCP set-and-proceed), and never lets the throw escape the handler.
+TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_persisted:false",
+          "[mcp][integration][dex][audit]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.audit_throws_ = true; // the audit pipeline throws
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":45,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res); // handler returned a response, the throw did not escape
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",

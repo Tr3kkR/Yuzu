@@ -866,11 +866,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
             // surface a dropped evidence row (audit_persisted:false), mirroring the
             // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
-            // the return are unaffected.
+            // the return are unaffected. Routed through the shared try_persist_audit
+            // kernel (#1647) so a throwing audit_fn (bad_alloc-class) is caught + logged
+            // and returns false rather than escaping the tool handler as a bare 500 —
+            // a strict robustness improvement for every MCP tool.
             auto mcp_audit = [&](const std::string& result_status,
                                  const std::string& detail = {}) -> bool {
-                return audit_fn(req, "mcp." + tool_name, result_status, "mcp_tool", tool_name,
-                                detail);
+                return yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
 
             // A4 error envelope for the MCP layer (#1470). The shared tier /

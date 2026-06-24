@@ -6349,6 +6349,10 @@ void RestApiV1::register_routes(
             // KNOWN-lost, parity with the dex.device.view REST siblings. The shared
             // helper sets Sec-Audit-Failed + logs a throwing audit_fn; a null audit_fn
             // (audit-off) returns true and serves, per the AuditFn contract.
+            // RECONCILIATION (#1623): the unmerged name-anchored guardian-compliance
+            // route lands as set-and-proceed + audit_emitted; when it merges it MUST
+            // match this verb's posture (fail-closed for REST PII) — two routes sharing
+            // guardian.device.view with opposite postures is the drift #1647 closes.
             if (!detail::emit_behavioral_audit(
                     audit_fn, req, res, "guardian.device.view", baseline ? "success" : "not_found",
                     "Agent", agent_id,
