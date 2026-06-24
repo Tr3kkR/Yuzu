@@ -49,12 +49,12 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 19 securable types, plus Push on GuaranteedState (96 permissions) | Server admins, security team leads |
-| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
-| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
+| **Administrator** | All 5 CRUD operations on all 20 securable types, plus Push on GuaranteedState (101 permissions) | Server admins, security team leads |
+| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
+| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 16 securable types, plus Push on GuaranteedState (81 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 18 securable types (all except Infrastructure) (18 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 5 CRUD operations on 17 securable types, plus Push on GuaranteedState (86 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 19 securable types (all except Infrastructure) (19 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
 
@@ -79,6 +79,7 @@ Six roles are created automatically and cannot be deleted:
 | `License` | Enterprise license records |
 | `FileRetrieval` | File upload and download operations |
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
+| `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 
 ## Operations
 

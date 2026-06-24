@@ -38,7 +38,9 @@ cadences.
 The data lands in the Postgres schema **`software_inventory_store`**:
 
 - `installed_software(agent_id, name, version, publisher, install_date)` — one
-  row per installed package per device.
+  row per installed package per device. `version`, `publisher`, and
+  `install_date` may be empty (`''`) — the `installed_apps` plugin does not
+  guarantee them on every platform/package.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping.
 

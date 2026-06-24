@@ -319,16 +319,17 @@ std::vector<SoftwareFleetRow> SoftwareInventoryStore::query_software(const Softw
 void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
         return;
-    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
-    if (!lease)
-        return;
     const std::string id{agent_id};
-    pg::exec_params(lease.get(),
-                    "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
-                    std::vector<std::string>{id});
-    pg::exec_params(lease.get(),
-                    "DELETE FROM software_inventory_store.inventory_state WHERE agent_id = $1",
-                    std::vector<std::string>{id});
+    // Both deletes in one transaction so an agent removal can't leave a parent
+    // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
+    pool_.with_txn([&](PGconn* c) -> bool {
+        pg::exec_params(c,
+                        "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
+                        std::vector<std::string>{id});
+        pg::exec_params(c, "DELETE FROM software_inventory_store.inventory_state WHERE agent_id = $1",
+                        std::vector<std::string>{id});
+        return true;
+    });
 }
 
 } // namespace yuzu::server
