@@ -17,26 +17,47 @@
 %%%===================================================================
 
 health_nf_test_() ->
+    %% Instantiator form: the OS-assigned ephemeral port lives in the
+    %% setup result tuple and is closed over by each test fun. This is the
+    %% only safe way to thread the port through — calling
+    %% yuzu_gw_health:port/0 from inside a test issues a
+    %% gen_server:call(yuzu_gw_health, get_port) that can block up to ~1s
+    %% behind the server's blocking gen_tcp:accept(LSock, 1000) accept
+    %% loop. That latency exceeds the 200ms circuit-breaker reset timeout
+    %% and lets the circuit slip open->half_open before readyz is hit,
+    %% turning the expected 503 into a 200 (readyz_503_circuit_open).
     {setup,
      fun setup/0,
      fun cleanup/1,
-     {timeout, 30,
-      [
-       {"readyz 503 when registry process is dead",
-        fun readyz_503_dead_process/0},
-       {"readyz 503 when circuit breaker is open",
-        fun readyz_503_circuit_open/0},
-       {"concurrent health checks complete without error",
-        fun concurrent_health_checks/0},
-       {"healthz response time is bounded",
-        fun healthz_response_time/0},
-       {"readyz response time is bounded",
-        fun readyz_response_time/0}
-      ]}}.
+     fun({Port, _HealthPid, _UpPid, _MockPids}) ->
+        {timeout, 30,
+         [
+          {"readyz 503 when registry process is dead",
+           fun() -> readyz_503_dead_process(Port) end},
+          {"readyz 503 when circuit breaker is open",
+           fun() -> readyz_503_circuit_open(Port) end},
+          {"concurrent health checks complete without error",
+           fun() -> concurrent_health_checks(Port) end},
+          {"healthz response time is bounded",
+           fun() -> healthz_response_time(Port) end},
+          {"readyz response time is bounded",
+           fun() -> readyz_response_time(Port) end}
+         ]}
+     end}.
 
 setup() ->
-    Port = 18081,
-    application:set_env(yuzu_gw, health_port, Port),
+    %% Bind to port 0 — the OS picks a free ephemeral port. A previous
+    %% version hardcoded 18081, which collides when Big Tam runs 4 CI
+    %% matrix legs concurrently on one host: the second leg's
+    %% yuzu_gw_health:init/1 gets {error, eaddrinuse} from gen_tcp:listen,
+    %% start_link returns {error, {listen_failed, eaddrinuse}}, the
+    %% `{ok, HealthPid} = ...` match in this setup crashes, and eunit
+    %% CANCELS the whole group ("One or more tests were cancelled", 0
+    %% failures). SO_REUSEADDR does not let two live listeners share a
+    %% port, so it cannot save us. Ephemeral binding eliminates the whole
+    %% class — the same fix yuzu_gw_health_tests already carries. Tests
+    %% read the actual port back via health_port/0 (yuzu_gw_health:port/0).
+    application:set_env(yuzu_gw, health_port, 0),
 
     %% Trap exits for the group process. With {setup, ...}, the group
     %% process stays alive while tests run in sub-processes. The upstream
@@ -80,9 +101,12 @@ setup() ->
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
 
-    %% Start the health endpoint.
+    %% Start the health endpoint, then read back the OS-assigned ephemeral
+    %% port. The 100ms sleep keeps the original margin so the accept loop
+    %% is up before any test fires.
     {ok, HealthPid} = yuzu_gw_health:start_link(),
     timer:sleep(100),
+    {ok, Port} = yuzu_gw_health:port(),
     {Port, HealthPid, UpPid, MockPids}.
 
 cleanup({_Port, HealthPid, UpPid, MockPids}) ->
@@ -189,7 +213,7 @@ safe_meck_new(Mod, Opts) ->
 %%% Tests
 %%%===================================================================
 
-readyz_503_dead_process() ->
+readyz_503_dead_process(Port) ->
     %% Kill the registry mock to simulate a dead core process.
     %% Must trap exits to avoid cascading death to the test process.
     process_flag(trap_exit, true),
@@ -203,7 +227,7 @@ readyz_503_dead_process() ->
             timer:sleep(50)
     end,
     drain_exits(),
-    {Status, Body} = http_get(18081, "/readyz"),
+    {Status, Body} = http_get(Port, "/readyz"),
     ?assertEqual(503, Status),
     ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"registry\":false">>) =/= nomatch),
@@ -212,7 +236,7 @@ readyz_503_dead_process() ->
     register(yuzu_gw_registry, NewPid),
     process_flag(trap_exit, false).
 
-readyz_503_circuit_open() ->
+readyz_503_circuit_open(Port) ->
     %% Trip the circuit breaker to open state.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
@@ -223,7 +247,7 @@ readyz_503_circuit_open() ->
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
 
     %% readyz should now return 503.
-    {Status, Body} = http_get(18081, "/readyz"),
+    {Status, Body} = http_get(Port, "/readyz"),
     ?assertEqual(503, Status),
     ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"circuit_breaker\":false">>) =/= nomatch),
@@ -237,12 +261,12 @@ readyz_503_circuit_open() ->
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
-concurrent_health_checks() ->
+concurrent_health_checks(Port) ->
     %% Fire 50 concurrent healthz requests and verify all succeed.
     Self = self(),
     N = 50,
     Workers = [spawn_link(fun() ->
-        Result = http_get(18081, "/healthz"),
+        Result = http_get(Port, "/healthz"),
         Self ! {health_result, I, Result}
     end) || I <- lists:seq(1, N)],
 
@@ -259,11 +283,11 @@ concurrent_health_checks() ->
     %% Workers are linked, will be cleaned up.
     _ = Workers.
 
-healthz_response_time() ->
+healthz_response_time(Port) ->
     %% Measure 20 sequential healthz requests. Average should be < 10ms.
     Timings = [begin
         T0 = erlang:monotonic_time(microsecond),
-        {200, _} = http_get(18081, "/healthz"),
+        {200, _} = http_get(Port, "/healthz"),
         T1 = erlang:monotonic_time(microsecond),
         T1 - T0
     end || _ <- lists:seq(1, 20)],
@@ -271,11 +295,11 @@ healthz_response_time() ->
     %% Average should be well under 10ms (10000 us).
     ?assert(AvgUs < 10000).
 
-readyz_response_time() ->
+readyz_response_time(Port) ->
     %% readyz does process checks + circuit breaker query. Should still be fast.
     Timings = [begin
         T0 = erlang:monotonic_time(microsecond),
-        {200, _} = http_get(18081, "/readyz"),
+        {200, _} = http_get(Port, "/readyz"),
         T1 = erlang:monotonic_time(microsecond),
         T1 - T0
     end || _ <- lists:seq(1, 20)],

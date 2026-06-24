@@ -95,36 +95,69 @@ bool TagStore::validate_value(const std::string& value) {
 void TagStore::set_tag(const std::string& agent_id, const std::string& key,
                        const std::string& value, const std::string& source) {
     std::unique_lock lock(mtx_);
-    set_tag_impl(agent_id, key, value, source);
+    // Best-effort single write; the public contract is void. sync_agent_tags is
+    // the path that needs the bool (atomic re-sync).
+    (void)set_tag_impl(agent_id, key, value, source);
 }
 
-void TagStore::set_tag_impl(const std::string& agent_id, const std::string& key,
+bool TagStore::set_tag_impl(const std::string& agent_id, const std::string& key,
                             const std::string& value, const std::string& source) {
     if (!db_)
-        return;
+        return false;
     if (!validate_key(key) || !validate_value(value))
-        return;
+        return false;
 
-    const char* sql = R"(
-        INSERT OR REPLACE INTO tags (agent_id, key, value, source, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    // Source precedence (#1411). The PK is (agent_id, key) with `source` OUTSIDE
+    // the key, so a blanket INSERT OR REPLACE let an 'agent'-sourced write (agent
+    // self-reported scopable_tags, re-synced on every Register via sync_agent_tags)
+    // overwrite an operator/API row for the same (agent_id, key) — flipping both
+    // value and source and letting a rogue agent self-assign into an
+    // operator-declared benchmark cohort. Fix: an agent write may only upsert when
+    // the existing row is itself agent-sourced (or absent); any non-'agent' source
+    // (operator/API) is authoritative and still wins unconditionally. When the
+    // ON CONFLICT WHERE is false the statement is a clean no-op (no error).
+    const bool agent_sourced = (source == "agent");
+    const char* sql =
+        agent_sourced
+            ? R"(
+                INSERT INTO tags (agent_id, key, value, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id, key) DO UPDATE SET
+                    value = excluded.value,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                WHERE tags.source = 'agent'
+              )"
+            : R"(
+                INSERT OR REPLACE INTO tags (agent_id, key, value, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+              )";
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return false;
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
 
-    sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, key.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, value.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, source.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, now);
+    sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, source.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 5, now);
 
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    // Check the step result: inside sync_agent_tags' DELETE+reinsert
+    // transaction a silent step failure would commit partial state (governance
+    // UP-1), so propagate it to the caller. The ON CONFLICT … WHERE-false no-op
+    // still returns SQLITE_DONE (success), so a legitimate precedence no-op is
+    // NOT reported as failure. (SqliteStmt finalizes on scope exit — no manual
+    // finalize, exception-safe.)
+    if (int rc = sqlite3_step(stmt.get()); rc != SQLITE_DONE) {
+        spdlog::warn("TagStore::set_tag: step failed for ({}, {}): {} ({})", agent_id, key,
+                     sqlite3_errmsg(db_), rc);
+        return false;
+    }
+    return true;
 }
 
 std::string TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
@@ -234,26 +267,44 @@ void TagStore::sync_agent_tags(const std::string& agent_id,
     if (!db_)
         return;
 
-    // Delete all agent-sourced tags, then re-insert
-    sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    // Delete all agent-sourced tags, then re-insert — atomically. RAII rollback
+    // (governance UP-1/UP-2): a throw (e.g. bad_alloc in set_tag_impl), a failed
+    // DELETE step, or a failed per-row upsert between the DELETE and COMMIT must
+    // not leave the agent's tags half-applied or wedge the shared FULLMUTEX
+    // connection with a dangling transaction. On any failure we return WITHOUT
+    // committing, so SqliteTxn rolls back to the agent's PRIOR complete tag set
+    // rather than a partial wipe. The source-precedence guarantee (#1411 —
+    // operator rows survive an agent sync) depends on this DELETE+reinsert being
+    // one all-or-nothing transaction.
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return;
+    SqliteTxn txn(db_);
 
     {
-        sqlite3_stmt* stmt = nullptr;
+        SqliteStmt stmt;
         if (sqlite3_prepare_v2(db_, "DELETE FROM tags WHERE agent_id = ? AND source = 'agent'", -1,
-                               &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
+                               stmt.addr(), nullptr) != SQLITE_OK)
+            return; // rollback
+        sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (int rc = sqlite3_step(stmt.get()); rc != SQLITE_DONE) {
+            spdlog::warn("TagStore::sync_agent_tags: DELETE step failed for {}: {} ({})", agent_id,
+                         sqlite3_errmsg(db_), rc);
+            return; // rollback — keep the prior tag set rather than wipe-without-reinsert
         }
     }
 
     for (const auto& [key, value] : tags) {
         if (!validate_key(key) || !validate_value(value))
-            continue;
-        set_tag_impl(agent_id, key, value, "agent");
+            continue; // skip malformed entries; not a transaction failure
+        if (!set_tag_impl(agent_id, key, value, "agent"))
+            return; // a prepare/step failure — roll the whole sync back (UP-1)
     }
 
-    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+    if (int rc = txn.commit(); rc != SQLITE_OK) {
+        spdlog::warn("TagStore::sync_agent_tags: COMMIT failed for {}: {} ({})", agent_id,
+                     sqlite3_errmsg(db_), rc);
+        // SqliteTxn dtor rolls back; the agent keeps its prior tag set.
+    }
 }
 
 void TagStore::delete_all_tags(const std::string& agent_id) {
@@ -332,7 +383,9 @@ TagStore::set_tag_checked(const std::string& agent_id, const std::string& key,
     }
 
     std::unique_lock lock(mtx_);
-    set_tag_impl(agent_id, key, value, source);
+    // Best-effort write; this path validates the value against the category
+    // schema, not the durability of the write (a transient step failure logs).
+    (void)set_tag_impl(agent_id, key, value, source);
     return {};
 }
 

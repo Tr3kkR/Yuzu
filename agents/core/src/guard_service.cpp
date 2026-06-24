@@ -37,6 +37,45 @@
 
 #include <chrono>
 #include <optional>
+#include <string_view>
+
+// ── Pure state / compliance / edge logic ─────────────────────────────────────
+// Defined OUTSIDE the platform #ifdef so the agent test binary links and exercises
+// them on every platform (the Windows SCM watch itself is integration-tested). These
+// carry the compliant-edge decision that, before the fix, was an inline short-circuit
+// that never reported a compliant service.
+namespace yuzu::agent {
+
+std::string_view service_state_token(ServiceState s) {
+    switch (s) {
+    case ServiceState::Running: return "running";
+    case ServiceState::Stopped: return "stopped";
+    case ServiceState::Paused:  return "paused";
+    case ServiceState::Absent:  return "absent";
+    }
+    return "unknown";
+}
+
+bool service_is_compliant(ServiceGuard::Desired want, ServiceState got) {
+    if (want == ServiceGuard::Desired::Running)
+        return got == ServiceState::Running;
+    return got == ServiceState::Stopped || got == ServiceState::Absent;
+}
+
+ServiceEmit service_classify_edge(ServiceGuard::Desired want, ServiceState got,
+                                  std::optional<bool>& last_compliant) {
+    if (service_is_compliant(want, got)) {
+        // guard.compliant fires ONCE on the edge into compliant (incl. the first
+        // compare, last_compliant == nullopt); steady compliant stays silent.
+        const bool edge = (last_compliant != true);
+        last_compliant = true;
+        return edge ? ServiceEmit::CompliantEdge : ServiceEmit::CompliantSteady;
+    }
+    last_compliant = false;
+    return ServiceEmit::Drift;
+}
+
+} // namespace yuzu::agent
 
 #ifdef _WIN32
 
@@ -47,6 +86,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+// Self-sufficient link (#1287): this TU calls advapi32 directly (OpenSCManagerW,
+// NotifyServiceStatusChangeW, StartServiceW, ControlService). Don't rely on a
+// sibling TU's pragma to carry advapi32 across the whole yuzu_agent_core link
+// line — mirrors updater.cpp / process_enum.cpp / temp_file.cpp.
+#pragma comment(lib, "advapi32.lib")
 
 #include <algorithm>
 #include <cctype>
@@ -142,19 +187,11 @@ bool is_pending(DWORD s) {
            s == SERVICE_CONTINUE_PENDING || s == SERVICE_PAUSE_PENDING;
 }
 
-// What the watch resolved the service to be in, normalised to the terminal classes
-// the guard reasons about. `Absent` = the service does not exist / was deleted.
-enum class Det { Running, Stopped, Paused, Absent };
-
-const char* det_token(Det d) {
-    switch (d) {
-    case Det::Running: return "running";
-    case Det::Stopped: return "stopped";
-    case Det::Paused:  return "paused";
-    case Det::Absent:  return "absent";
-    }
-    return "unknown";
-}
+// The detected terminal class is the public ServiceState (lifted to
+// guard_service.hpp so the pure compliance + compliant-edge logic — service_token /
+// service_is_compliant / service_classify_edge — is unit-tested off-Windows).
+// Aliased so the Windows watch loop keeps its terse `Det::Running` spelling.
+using Det = ServiceState;
 
 Det det_from_state(DWORD s) {
     switch (s) {
@@ -162,15 +199,6 @@ Det det_from_state(DWORD s) {
     case SERVICE_PAUSED:  return Det::Paused;
     default:              return Det::Stopped; // SERVICE_STOPPED (pending handled before here)
     }
-}
-
-// `service-running` is satisfied only by Running. `service-stopped` is satisfied by
-// Stopped AND by Absent — a service that does not exist is, definitionally, not
-// running, so it does not drift a "must be stopped" rule.
-bool is_compliant(ServiceGuard::Desired want, Det got) {
-    if (want == ServiceGuard::Desired::Running)
-        return got == Det::Running;
-    return got == Det::Stopped || got == Det::Absent;
 }
 
 // Same-thread state the APC callback fills and the loop drains. No synchronisation
@@ -250,6 +278,12 @@ void ServiceGuard::run() try {
     std::optional<std::chrono::steady_clock::time_point> last_emit;
     std::uint64_t suppressed = 0;
 
+    // Compliance-edge state (Slice B), mirroring RegistryGuard: nullopt until the
+    // first compare, then tracks the last-reported compliant/drifted state so a
+    // guard.compliant event fires ONCE on the compliant↔drift edge — a steady
+    // compliant service stays silent. Only this run() thread touches it.
+    std::optional<bool> last_compliant;
+
     // C3: per-rule retry policy. Consulted ONLY in enforce mode and ONLY to gate the
     // control call — detection + emission happen regardless. next_wake_ms carries a
     // strategy-scheduled self-wake (Backoff retry / Bounded resume) OR the degraded
@@ -285,18 +319,41 @@ void ServiceGuard::run() try {
         return {ok, "service-stop"};
     };
 
-    // Mirror RegistryGuard::emit(): short-circuit on compliant, build the drift,
-    // resilience-gated enforce (detection still reported when the fix is withheld),
-    // then collapse-with-count debounce before the sink.
+    // Classify the terminal observation via the pure, unit-tested service_classify_edge
+    // (mirrors RegistryGuard's last_compliant edge logic): a compliant EDGE emits
+    // guard.compliant ONCE and bypasses the drift debounce (a compliant edge ends a
+    // drift, it is not another drift to fold); steady compliant is silent (NFR); a
+    // drift is reported through the resilience-gated enforce + collapse-with-count
+    // debounce below. Without the compliant edge a compliant service never produced a
+    // census signal and read as "pending" forever in the per-(agent,rule) status table.
     auto emit = [&](Det got, std::uint64_t latency_us) {
-        if (is_compliant(cfg_.desired, got))
+        const ServiceEmit decision = service_classify_edge(cfg_.desired, got, last_compliant);
+        if (decision == ServiceEmit::CompliantSteady)
+            return; // already compliant — silent
+        if (decision == ServiceEmit::CompliantEdge) {
+            ServiceDrift c;
+            c.guard_type = "service";
+            c.rule_id = cfg_.rule_id;
+            c.rule_name = cfg_.rule_name;
+            c.detected_value = std::string(service_state_token(got));
+            c.expected_value = expected_token;
+            c.detection_latency_us = latency_us;
+            c.compliant = true;
+            if (sink_)
+                sink_(c);
             return;
+        }
+        // decision == ServiceEmit::Drift — service_classify_edge set last_compliant=false.
         ServiceDrift d;
         d.guard_type = "service";
         d.rule_id = cfg_.rule_id;
         d.rule_name = cfg_.rule_name;
-        d.detected_value = det_token(got);
+        d.detected_value = std::string(service_state_token(got));
         d.expected_value = expected_token;
+        // #1286: every caller passes latency_us=0 by design. Unlike RegistryGuard
+        // (which times a steady_clock read), a service run-state change is delivered
+        // by the SCM via NotifyServiceStatusChangeW in an APC — kernel-push, with no
+        // agent-side read step to measure. 0 is honest here, not an unfilled field.
         d.detection_latency_us = latency_us;
         if (cfg_.enforce) {
             const ResilienceDecision dec = strategy.decide(now_ms());
@@ -327,6 +384,12 @@ void ServiceGuard::run() try {
                              dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
+        // A successful control call drove the service to `desired`: the resulting SCM
+        // notify will re-reconcile and read compliant. drift.remediated already carries
+        // that "now compliant" meaning, so pre-set the edge to avoid a redundant
+        // guard.compliant chasing every remediation (mirrors RegistryGuard, Slice B).
+        if (d.remediation_attempted && d.remediation_success)
+            last_compliant = true;
         const auto now = std::chrono::steady_clock::now();
         if (last_emit && (now - *last_emit) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
             ++suppressed;

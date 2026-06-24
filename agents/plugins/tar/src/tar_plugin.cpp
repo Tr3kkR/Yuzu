@@ -24,6 +24,7 @@
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
 #include "tar_proc_stream.hpp"
+#include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_perf.hpp"
@@ -198,28 +199,45 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
-    auto stored = db.get_config("redaction_patterns");
-    if (stored.empty())
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    }
+    // The built-in patterns (`kDefaultRedactionPatterns` — password/secret/token/
+    // api_key/credential) are the baseline content-protection layer for
+    // process_live, and they MUST always apply: an operator can ADD patterns via
+    // configure but can never fully DISABLE redaction. So union the defaults into
+    // whatever is stored — fail-closed (fjarvis HIGH). A bare `parse_pattern_config`
+    // fallback was fail-OPEN: it returns the safe built-in set only for an empty or
+    // non-array value, but a *valid array whose elements all get dropped* (`[]`,
+    // `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is empty) returns an
+    // EMPTY vector — silently disabling redaction so `password`/`token`/`secret`
+    // land in process_live in plaintext. collect_fast and procperf called this
+    // without the union do_fleet_snapshot already applied; centralising it here
+    // closes all three paths at once and removes the divergent local default list.
+    // #541 — parse_pattern_config still bounds + sanitises at load (drops
+    // non-string/empty/over-long, truncates to the element cap), because this runs
+    // every fast-collect cycle on whatever is stored. ensure_redaction_defaults
+    // then unions the built-ins — the single, unit-tested home of the fail-closed
+    // guarantee, shared with do_fleet_snapshot.
+    std::vector<std::string> result;
+    if (auto v = yuzu::tar::parse_pattern_config(db.get_config("redaction_patterns")))
+        result = std::move(*v);
+    return yuzu::tar::ensure_redaction_defaults(std::move(result));
 }
 
 // Per-source enable/disable (issue #59). The default for a source with no
 // config row yet comes from CaptureSourceDef::default_enabled (true for
 // always-on sources, false for opt-in module/procperf/netqual), so a fresh
 // agent agrees with tar.status / retention / the paused_at transition.
+//
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned.
 bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
     const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
-    return db.get_config(std::format("{}_enabled", source), def) != "false";
+    return yuzu::tar::canonical_source_enabled(
+               db.get_config(std::format("{}_enabled", source), def)) == "true";
 }
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
@@ -227,16 +245,16 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     auto stored = db.get_config("process_stabilization_exclusions");
     if (stored.empty())
         return {};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {};
-    }
+    // #541 — bound + sanitise at load (see load_redaction_patterns), AND enforce
+    // the ≥3-char effective-core floor here (require_min_core_len=true): unlike
+    // redaction, a sub-floor exclusion like ["a"] or ["*a*"] silently drops every
+    // process whose name contains that core, so a value persisted before the
+    // floor existed (no-tamper upgrade) or tampered out of band must be filtered
+    // on this hot path, not just rejected at configure. A non-array stored value
+    // yields no exclusions (the safe default — nothing dropped).
+    if (auto v = yuzu::tar::parse_pattern_config(stored, /*require_min_core_len=*/true))
+        return std::move(*v);
+    return {};
 }
 
 } // namespace
@@ -250,10 +268,9 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",       "query",         "snapshot",
-                                     "export",       "configure",     "collect_fast",
-                                     "collect_slow", "collect_perf",  "rollup",
-                                     "sql",          "compatibility", "fleet_snapshot",
+        static const char* acts[] = {"status",    "query",        "snapshot",      "export",
+                                     "configure", "collect_fast", "collect_slow",  "collect_perf",
+                                     "rollup",    "sql",          "compatibility", "fleet_snapshot",
                                      nullptr};
         return acts;
     }
@@ -370,7 +387,8 @@ public:
             if (source_enabled(*db_, "process")) {
                 const auto boot_key = std::to_string(yuzu::tar::boot_time_unix());
                 if (db_->get_config("last_backfill_boot_ts", "") == boot_key) {
-                    spdlog::info("TAR: boot-backfill already done this boot (agent restart) — skipped");
+                    spdlog::info(
+                        "TAR: boot-backfill already done this boot (agent restart) — skipped");
                 } else {
                     const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
                     std::error_code ec;
@@ -398,12 +416,14 @@ public:
                             typed.push_back(std::move(pe));
                         }
                         if (typed.empty()) {
-                            spdlog::info("TAR: boot AutoLogger trace had no pre-session process events");
+                            spdlog::info(
+                                "TAR: boot AutoLogger trace had no pre-session process events");
                             db_->set_config("last_backfill_boot_ts", boot_key);
                         } else if (db_->insert_process_events(typed)) {
                             db_->set_config("last_backfill_boot_ts", boot_key);
-                            spdlog::info("TAR: boot-backfilled {} process events from the ETW AutoLogger",
-                                         typed.size());
+                            spdlog::info(
+                                "TAR: boot-backfilled {} process events from the ETW AutoLogger",
+                                typed.size());
                         } else {
                             // Leave the key unset so the next restart retries.
                             spdlog::warn("TAR: boot-backfill insert failed (continuing; "
@@ -417,6 +437,21 @@ public:
         } else {
             spdlog::info("TAR: no gap-free process stream active — using snapshot-diff poll");
         }
+
+        // M2: seed the opt-in module_enabled key so the configure / retention /
+        // retention-paused-list machinery (which default a MISSING key to ENABLED
+        // via source_enabled) agrees with the collector's explicit default-off.
+        if (db_->get_config("module_enabled", "").empty()) {
+            db_->set_config("module_enabled", "false");
+        }
+#ifdef _WIN32
+        // Construct the Windows ETW image-load collector; the session is STARTED
+        // LAZILY by collect_fast on the first tick where module_enabled is true (so
+        // enabling takes effect on the next tick — no restart — matching
+        // procperf/netqual, and a transient session death auto-re-arms). Null on
+        // non-Windows (M4/M5 add macOS Endpoint Security, M6 adds Linux auditd).
+        module_stream_ = std::make_unique<yuzu::tar::ModuleEtwCollector>();
+#endif
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
@@ -441,6 +476,11 @@ public:
                 // macOS: es_unsubscribe_all + es_delete_client (blocks until any
                 // in-flight handler returns, so no handler touches the ring after).
                 proc_stream_->stop();
+            }
+            if (module_stream_) {
+                // Windows: closes the module-load ETW session + joins its
+                // consumer thread (idempotent; safe if never started).
+                module_stream_->stop();
             }
         }
         db_.reset();
@@ -511,6 +551,23 @@ private:
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
 
+    // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
+    // Unlike the always-on process stream, this is OPT-IN (module_enabled,
+    // default off) and high-volume, so the session is started LAZILY by
+    // collect_fast on the first tick where module_enabled is true (enabling takes
+    // effect on the next tick — no restart — and a transient session death
+    // auto-re-arms). When active, collect_fast drains it; there is NO poll
+    // fallback (no snapshot-diff equivalent for image loads). Drained only under
+    // collect_mu_.
+    std::unique_ptr<yuzu::tar::ImageStreamCollector> module_stream_;
+    std::atomic<bool> module_stream_active_{false};
+    std::vector<yuzu::tar::ModuleEvent> pending_module_evs_;
+    std::uint64_t last_module_dropped_{0};
+    // Latches a failed start() so collect_fast does not retry every tick (start
+    // storm) when the ETW session is genuinely unavailable; reset when the source
+    // is disabled, so a later re-enable retries. Guarded by collect_mu_.
+    bool module_start_failed_{false};
+
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
     int collect_fast_impl(yuzu::CommandContext& ctx) {
@@ -539,6 +596,10 @@ private:
             pending_stream_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
         if (process_enabled) {
+            // #538: single source of truth for the diff-baseline state key (see
+            // diff_state_key) — the same key apply_source_enabled_transition
+            // clears on disable, so the two can't drift.
+            const std::string proc_key{yuzu::tar::diff_state_key("process")};
             if (stream_active_) {
                 // Gap-free stream (ETW/Windows or Endpoint Security/macOS)
                 // supersedes the snapshot-diff poll. Same process_live schema +
@@ -585,9 +646,9 @@ private:
                         pending_stream_evs_ = std::move(evs);
                         if (pending_stream_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_stream_evs_.size() - kPendingStreamCap;
-                            pending_stream_evs_.erase(
-                                pending_stream_evs_.begin(),
-                                pending_stream_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                            pending_stream_evs_.erase(pending_stream_evs_.begin(),
+                                                      pending_stream_evs_.begin() +
+                                                          static_cast<std::ptrdiff_t>(excess));
                         }
                         ctx.write_output("error|process insert failed");
                         return 1;
@@ -601,8 +662,9 @@ private:
                 // the agent's lifetime after a single burst). Also surfaced via
                 // the `status` action (process_stream_dropped).
                 if (auto d = proc_stream_->dropped(); d > last_logged_dropped_) {
-                    spdlog::warn("TAR: process stream ring overflow — {} dropped (+{} since last drain)",
-                                 d, d - last_logged_dropped_);
+                    spdlog::warn(
+                        "TAR: process stream ring overflow — {} dropped (+{} since last drain)", d,
+                        d - last_logged_dropped_);
                     last_logged_dropped_ = d;
                 }
 
@@ -634,7 +696,7 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state("process", processes_to_json(current).dump());
+                    db_->set_state(proc_key, processes_to_json(current).dump());
                 }
             } else {
                 // No active stream (poll-only platform, or stream unavailable):
@@ -642,9 +704,9 @@ private:
                 auto current = yuzu::agent::enumerate_processes();
 
                 // Stabilization exclusions: drop processes whose name matches any
-                // exclusion pattern. The patterns reuse the same glob semantics
-                // as redaction (case-insensitive substring with optional '*' on
-                // either side stripped). Excluded processes never enter the
+                // exclusion pattern. The patterns reuse the same matching as
+                // redaction (case-insensitive substring with optional '*' on
+                // either side stripped — NOT real glob). Excluded processes never enter the
                 // diff, so their birth/death events are silently dropped — the
                 // documented forensic-completeness trade-off.
                 if (!stab_excl.empty()) {
@@ -653,7 +715,7 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state("process");
+                auto prev_json = db_->get_state(proc_key);
                 auto previous = json_to_processes(prev_json);
 
                 auto typed =
@@ -667,14 +729,16 @@ private:
                     total_events += static_cast<int>(typed.size());
                 }
 
-                db_->set_state("process", processes_to_json(current).dump());
+                db_->set_state(proc_key, processes_to_json(current).dump());
             }
         }
 
         // Network diff
         if (source_enabled(*db_, "tcp")) {
+            // #538: tcp's diff baseline lives under "network" (see diff_state_key).
+            const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
-            auto prev_json = db_->get_state("network");
+            auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
             auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
@@ -687,7 +751,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("network", connections_to_json(current).dump());
+            db_->set_state(net_key, connections_to_json(current).dump());
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -700,8 +764,8 @@ private:
         // dropped there and never persisted. Empty off Linux (collector stub).
         if (db_->get_config("netqual_enabled", "false") == "true") {
             auto samples = yuzu::tar::collect_tcp_quality();
-            auto rows = yuzu::tar::select_netqual_rows(samples, ts, snap_id,
-                                                       yuzu::tar::kNetQualTopN);
+            auto rows =
+                yuzu::tar::select_netqual_rows(samples, ts, snap_id, yuzu::tar::kNetQualTopN);
             if (!rows.empty()) {
                 // OPT-IN source: a netqual insert failure must NOT fail the whole
                 // collect_fast tick — the always-on tcp/process legs already
@@ -712,6 +776,94 @@ private:
                     total_events += static_cast<int>(rows.size());
                 else
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
+            }
+        }
+
+        // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
+        // off) — like procperf/netqual this reads the explicit "true" rather than
+        // source_enabled. The session is only running if it was enabled at init.
+        const bool module_enabled = db_->get_config("module_enabled", "false") == "true";
+        // Lazy start / re-arm: start the session on the first enabled tick (so
+        // enabling takes effect next tick — like procperf/netqual, no restart) and
+        // re-arm after a transient session death. module_start_failed_ prevents a
+        // start-storm when the session is genuinely unavailable; it is reset on
+        // disable so a later re-enable retries.
+        if (module_stream_ && module_enabled && !module_stream_active_ && !module_start_failed_) {
+            module_stream_active_ = module_stream_->start();
+            if (module_stream_active_) {
+                spdlog::info("TAR: module stream active ({})", module_stream_->method_name());
+            } else {
+                module_start_failed_ = true;
+                spdlog::warn("TAR: module ETW session failed to start — module capture "
+                             "unavailable (retries if module_enabled is toggled off then on)");
+            }
+        }
+        if (!module_enabled) {
+            module_start_failed_ = false; // re-enable should retry a previously-failed start
+        }
+        if (module_stream_active_ && !module_enabled) {
+            // Disabled mid-run (a true→false toggle): drain-and-discard so the
+            // paused window is never stored, keeping the session warm. Mirrors
+            // the process forensic-pause contract.
+            module_stream_->drain();
+            pending_module_evs_.clear();
+        } else if (module_stream_active_ && module_enabled) {
+            // drain() resolves signing (cached) and redacts module_dir off the
+            // ETW thread, so events arrive fully populated + privacy-scrubbed.
+            auto mevs = module_stream_->drain();
+            if (!pending_module_evs_.empty()) {
+                mevs.insert(mevs.begin(), std::make_move_iterator(pending_module_evs_.begin()),
+                            std::make_move_iterator(pending_module_evs_.end()));
+                pending_module_evs_.clear();
+            }
+            // §5 edge risk-filter: keep every risky load, dedup + cap signed.
+            mevs = yuzu::tar::apply_module_risk_filter(std::move(mevs));
+            std::vector<yuzu::tar::ModuleRow> mrows;
+            mrows.reserve(mevs.size());
+            for (const auto& e : mevs) {
+                yuzu::tar::ModuleRow r;
+                r.ts = e.ts_unix;
+                r.snapshot_id = snap_id;
+                r.action = std::string{yuzu::tar::module_action_token(e.action)};
+                r.pid = e.pid;
+                r.process_name = e.process_name;
+                r.module_name = e.module_name;
+                r.module_dir = e.module_dir; // already redacted by the collector
+                r.signed_state = std::string{yuzu::tar::module_signed_token(e.signed_state)};
+                r.signer = e.signer;
+                r.is_kernel = e.is_kernel;
+                mrows.push_back(std::move(r));
+            }
+            if (!mrows.empty()) {
+                if (!db_->insert_module_events(mrows)) {
+                    // OPT-IN source: like netqual, do NOT fail the whole tick (the
+                    // always-on legs already committed). Re-queue the filtered
+                    // batch for the next tick, bounded, and log.
+                    spdlog::error("TAR: module stream insert failed — re-queuing {} events",
+                                  mevs.size());
+                    pending_module_evs_ = std::move(mevs);
+                    if (pending_module_evs_.size() > kPendingStreamCap) {
+                        const auto excess = pending_module_evs_.size() - kPendingStreamCap;
+                        pending_module_evs_.erase(pending_module_evs_.begin(),
+                                                  pending_module_evs_.begin() +
+                                                      static_cast<std::ptrdiff_t>(excess));
+                    }
+                } else {
+                    total_events += static_cast<int>(mrows.size());
+                }
+            }
+            if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
+                spdlog::warn("TAR: module stream ring overflow — {} dropped (+{} since last drain)",
+                             d, d - last_module_dropped_);
+                last_module_dropped_ = d;
+            }
+            // Self-heal: no poll fallback for modules — if the session ended, stop
+            // and report module_capture_method=none (vs going silently blind).
+            if (!module_stream_->running()) {
+                spdlog::warn(
+                    "TAR: module stream ended — module capture stopped (no poll fallback)");
+                module_stream_->stop();
+                module_stream_active_ = false;
             }
         }
 
@@ -748,13 +900,24 @@ private:
             if (!cur.valid) {
                 ctx.write_output("tar|collect_perf|0|unsupported_platform");
             } else {
+                bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
                 {
-                    std::lock_guard lock(collect_mu_); // prev_perf_ read-modify-write only
-                    sample = yuzu::tar::derive_sample(prev_perf_, cur);
-                    prev_perf_ = cur;
+                    std::lock_guard lock(collect_mu_); // prev_perf_ RMW + disable re-check
+                    // The enabled gate above ran WITHOUT the lock; a disable could
+                    // have landed (and reset prev_perf_) since. Re-check here so a
+                    // disable racing a mid-flight sample never commits a post-disable
+                    // row, and leave prev_perf_ untouched when disabled so the reset
+                    // in the disable branch stands. (#538)
+                    perf_enabled_now = source_enabled(*db_, "perf");
+                    if (perf_enabled_now) {
+                        sample = yuzu::tar::derive_sample(prev_perf_, cur);
+                        prev_perf_ = cur;
+                    }
                 }
-                if (!sample.valid) {
+                if (!perf_enabled_now) {
+                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                } else if (!sample.valid) {
                     ctx.write_output("tar|collect_perf|0|baseline");
                 } else {
                     yuzu::tar::PerfRow row;
@@ -800,11 +963,24 @@ private:
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
+        bool procperf_enabled_now = true;
         std::vector<yuzu::tar::ProcPerfSample> samples;
         {
-            std::lock_guard lock(collect_mu_); // prev_proc_ read-modify-write only
-            samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
-            prev_proc_ = std::move(proc_cur);
+            std::lock_guard lock(collect_mu_); // prev_proc_ RMW + disable re-check
+            // The procperf gate above ran WITHOUT the lock; re-check here so a
+            // disable that raced this tick (and already reset prev_proc_) cannot
+            // commit a post-disable row. Leave prev_proc_ as the disable branch
+            // reset it so a later re-enable re-baselines instead of diffing across
+            // the opt-out window. (#538)
+            procperf_enabled_now = (db_->get_config("procperf_enabled", "false") == "true");
+            if (procperf_enabled_now) {
+                samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
+                prev_proc_ = std::move(proc_cur);
+            }
+        }
+        if (!procperf_enabled_now) {
+            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            return rc;
         }
         if (samples.empty()) {
             ctx.write_output("tar|collect_procperf|0|baseline");
@@ -840,8 +1016,9 @@ private:
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
+            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
             auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state("service");
+            auto prev_json = db_->get_state(svc_key);
             auto previous = json_to_services(prev_json);
 
             auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
@@ -854,13 +1031,14 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("service", services_to_json(current).dump());
+            db_->set_state(svc_key, services_to_json(current).dump());
         }
 
         // User diff
         if (source_enabled(*db_, "user")) {
+            const std::string usr_key{yuzu::tar::diff_state_key("user")}; // #538
             auto current = yuzu::tar::enumerate_users();
-            auto prev_json = db_->get_state("user");
+            auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
@@ -873,7 +1051,7 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state("user", users_to_json(current).dump());
+            db_->set_state(usr_key, users_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -907,8 +1085,14 @@ private:
             // Default to the source's declared default (false for opt-in
             // module/procperf/netqual) so a fresh agent does not misreport an
             // opt-in source as enabled.
-            auto enabled_val =
-                db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            auto stored = db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
+            // #560 — emit a strict tri-state (true/false/errored). do_configure
+            // only ever persists "true"/"false"; any other stored value was
+            // written outside the plugin (corruption, disk tampering, a
+            // downgrade/upgrade) and is surfaced as the explicit "errored"
+            // sentinel so the dashboard renders a value-error badge instead of
+            // silently omitting the source. Never coerced/guessed.
+            auto enabled_val = yuzu::tar::canonical_source_enabled(stored);
             ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
 
             std::string paused_at_key = std::format("{}_paused_at", src.name);
@@ -941,6 +1125,13 @@ private:
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
 
+        // Mechanism actually in force. Only polling is wired today regardless of
+        // the configured method (kPlanned methods like etw / endpoint_security are
+        // accepted for pre-staging but not collected), so status can never
+        // misrepresent the active capture mechanism to a forensic analyst (#1528).
+        ctx.write_output(std::format("config|network_capture_method_effective|{}",
+                                     yuzu::tar::effective_network_capture_method(net_method)));
+
         // Process stream health. capture_method reflects the LIVE path: the
         // stream's method_name() ("etw" on Windows, "endpoint_security" on macOS)
         // while the stream runs, "polling" if it never started or self-healed to
@@ -963,6 +1154,16 @@ private:
                                      proc_stream_ ? proc_stream_->dropped() : 0));
         ctx.write_output(std::format("config|process_stream_kernel_dropped|{}",
                                      proc_stream_ ? proc_stream_->kernel_dropped() : 0));
+
+        // M2 module-stream health — emitted UNCONDITIONALLY (same contract as the
+        // process keys) so agentic consumers read by key presence without a
+        // presence check. "none" when there is no live session: off-Windows, or
+        // when module_enabled was false at start so the session never started.
+        ctx.write_output(std::format(
+            "config|module_capture_method|{}",
+            (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
+        ctx.write_output(std::format("config|module_stream_dropped|{}",
+                                     module_stream_ ? module_stream_->dropped() : 0));
         return 0;
     }
 
@@ -1216,9 +1417,10 @@ private:
     // disabled, the corresponding list is emitted empty with truncated_*=false
     // and the snapshot carries `source_paused.process` / `.tcp` markers.
     //
-    // Redaction: kDefaultRedactionPatterns is unioned with the operator-loaded
-    // patterns so an empty config does NOT disable redaction
-    // (governance round 1, sec-M1 + compliance-F3).
+    // Redaction: load_redaction_patterns now unions kDefaultRedactionPatterns
+    // (via ensure_redaction_defaults) internally, so an empty/all-dropped config
+    // does NOT disable redaction on ANY collect path — this snapshot included
+    // (governance round 1, sec-M1 + compliance-F3; #1532 fail-closed).
     int do_fleet_snapshot(yuzu::CommandContext& ctx) {
         std::lock_guard lock(collect_mu_);
         auto ts = now_epoch_seconds();
@@ -1262,15 +1464,12 @@ private:
             connections = yuzu::tar::merge_live_and_recent_connections(live, recent, ts);
         }
 
-        // Defence-in-depth: union operator patterns with the compiled-in
-        // defaults so an empty/missing config still applies *password*, *secret*,
-        // *token*, *api_key*, *credential*. The `should_redact` matcher returns
-        // true on the first hit, so duplicates are harmless.
+        // Redaction defaults are now unioned inside load_redaction_patterns (so
+        // every collect path — collect_fast, procperf, and this snapshot — is
+        // uniformly fail-closed; no stored value can disable *password*/*secret*/
+        // *token*/*api_key*/*credential*). The previously-separate union here is
+        // therefore redundant; keep the single source of truth in the loader.
         auto redaction = load_redaction_patterns(*db_);
-        for (const auto& def : yuzu::tar::kDefaultRedactionPatterns) {
-            if (std::find(redaction.begin(), redaction.end(), def) == redaction.end())
-                redaction.push_back(def);
-        }
 
         spdlog::info("tar.fleet_snapshot host={} procs={} conns={} ips={} "
                      "process_on={} tcp_on={}",
@@ -1297,7 +1496,17 @@ private:
         int slow_secs = 0;
         int days = 0;
 
-        // M13: Validate ALL parameters BEFORE writing any to the database
+        // M13 contract: validate EVERY parameter in the request in PHASE 1 and
+        // only persist them in PHASE 2 once all pass. A request that mixes a
+        // valid change with a later invalid one is therefore rejected atomically
+        // — nothing is written. (Previously the writes were interleaved with the
+        // validators, so e.g. a request carrying a valid `process_enabled=false`
+        // followed by an invalid exclusion list would persist the disable —
+        // silently turning off capture — yet return an error to the caller.)
+        // No db_->set_config / apply_source_enabled_transition call happens until
+        // the "Phase 2" block below; every path before it only reads + validates.
+
+        // ── Phase 1: validate everything (no writes) ─────────────────────────
         if (!retention.empty()) {
             try {
                 days = std::stoi(std::string{retention});
@@ -1328,37 +1537,24 @@ private:
             }
         }
 
-        // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
             return 1;
         }
 
-        // Now persist all validated values
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
-            changed = true;
-        }
-
-        if (fast_secs > 0) {
-            db_->set_config("fast_interval_seconds", std::string{fast_interval});
-            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-            changed = true;
-        }
-
-        if (slow_secs > 0) {
-            db_->set_config("slow_interval_seconds", std::string{slow_interval});
-            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-            changed = true;
-        }
-
-        if (!redaction.empty()) {
-            // Validate it's a JSON array of non-empty strings
+        // redaction_patterns — validate a JSON array of non-empty strings.
+        const bool have_redaction = !redaction.empty();
+        if (have_redaction) {
             try {
                 auto arr = json::parse(std::string{redaction});
                 if (!arr.is_array()) {
                     ctx.write_output("error|redaction_patterns must be a JSON array of strings");
+                    return 1;
+                }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(std::format("error|redaction_patterns exceeds the {}-element "
+                                                 "limit",
+                                                 yuzu::tar::kMaxPatternArrayElements));
                     return 1;
                 }
                 for (const auto& elem : arr) {
@@ -1367,10 +1563,12 @@ private:
                             "error|redaction_patterns must contain only non-empty strings");
                         return 1;
                     }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/false)) {
+                        ctx.write_output(std::format("error|redaction_patterns: {}", *err));
+                        return 1;
+                    }
                 }
-                db_->set_config("redaction_patterns", std::string{redaction});
-                ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
-                changed = true;
             } catch (...) {
                 ctx.write_output("error|redaction_patterns must be valid JSON array");
                 return 1;
@@ -1378,19 +1576,13 @@ private:
         }
 
         // ── Per-source enable/disable (issue #59) ─────────────────────────────
-        // Operators can disable any of the four collectors on a host without
-        // editing source. Disabled collectors short-circuit in
-        // collect_fast/slow but still permit `query` against existing rows
-        // (so historical data remains readable while new captures stop).
-        //
-        // PR-A: when a transition enable→disable happens, record the wall-clock
-        // timestamp in `<source>_paused_at` so the server-side retention-paused
-        // dashboard list (#547) can render "paused since" without inferring it
-        // from the audit log. The reverse transition clears the value to "0"
-        // (we do not delete keys — a missing key would be ambiguous with "never
-        // paused"). The timestamp is operator-facing wall-clock seconds; clock
-        // skew is acceptable because the surface is "paused since approximately
-        // X" and the ground truth is the agent's view.
+        // Operators can disable any collector on a host without editing source.
+        // Disabled collectors short-circuit in collect_fast/slow but still permit
+        // `query` against existing rows. Collect the validated (source, value)
+        // toggles here; the transition is applied in Phase 2. PR-A: enable→disable
+        // records `<source>_paused_at` (wall-clock) for the retention-paused
+        // dashboard list (#547); the reverse clears it to "0".
+        std::vector<std::pair<std::string, std::string>> source_toggles;
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string key = std::format("{}_enabled", src.name);
             auto val = params.get(key);
@@ -1401,74 +1593,63 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
-            ctx.write_output(std::format("config|{}|{}", key, v));
-            // Echo the resulting paused_at so the operator/dashboard sees the
-            // transition timestamp without an extra status round-trip. We
-            // re-read it post-write rather than re-deriving the transition
-            // here — single source of truth.
-            std::string paused_at_key = std::format("{}_paused_at", src.name);
-            ctx.write_output(
-                std::format("config|{}|{}", paused_at_key, db_->get_config(paused_at_key, "0")));
-            changed = true;
+            // M13 two-phase contract (#1532): collect the validated toggle now;
+            // the actual transition (and its #538 collect_mu_ serialisation +
+            // baseline reset) is applied in Phase 2, so a later invalid parameter
+            // in the same request writes nothing.
+            source_toggles.emplace_back(std::string{src.name}, std::move(v));
         }
 
         // ── Network capture method surface (issue #59) ───────────────────────
         // Today only "polling" is wired. ETW (Windows) and Endpoint Security
         // (macOS) are accepted-and-stored values per the schema registry's
-        // OsSupport metadata so an operator can pre-stage the configuration,
-        // but the collector continues to use polling until the relevant
-        // implementation lands. Validation rejects unknown methods so a typo
-        // does not silently re-default to polling.
-        if (auto m = params.get("network_capture_method"); !m.empty()) {
-            std::string method{m};
-            // "polling" is a sentinel meaning "use the platform default" —
-            // the only mechanism actually wired today. It is intentionally
-            // accepted unconditionally even though no os_support row carries
-            // it as a capture_method (the per-OS rows describe the underlying
-            // platform API: iphlpapi / procfs / proc_pidfdinfo). Without this
-            // special case `tar.status` would report `polling` as the default
-            // but `tar.configure network_capture_method=polling` would be
-            // rejected — the round trip would be broken (governance C-1 /
-            // QA Finding 2).
-            if (method != "polling") {
-                auto accepted = yuzu::tar::accepted_capture_methods("tcp");
-                if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
-                    std::string list = "polling";
-                    for (const auto& m2 : accepted) {
-                        list += ",";
-                        list += m2;
-                    }
-                    ctx.write_output(std::format(
-                        "error|network_capture_method '{}' is not accepted (must be one of: {})",
-                        method, list));
-                    return 1;
+        // OsSupport metadata so an operator can pre-stage the configuration, but
+        // the collector continues to use polling until the implementation lands.
+        const auto net_param = params.get("network_capture_method");
+        const bool have_net = !net_param.empty();
+        std::string net_method{net_param};
+        if (have_net && net_method != "polling") {
+            // "polling" is a sentinel meaning "use the platform default" — the
+            // only mechanism wired today — and is accepted unconditionally even
+            // though no os_support row carries it as a capture_method (governance
+            // C-1 / QA Finding 2 round-trip). #540 — validate any other value
+            // against THIS host's OS accept-list, not the OS-blind union, so a
+            // Linux agent cannot store 'iphlpapi' nor a Windows agent 'procfs'.
+            auto accepted =
+                yuzu::tar::accepted_capture_methods_for_os("tcp", yuzu::tar::current_platform_os());
+            if (std::find(accepted.begin(), accepted.end(), net_method) == accepted.end()) {
+                std::string list = "polling";
+                for (const auto& m2 : accepted) {
+                    list += ",";
+                    list += m2;
                 }
-                // Surface that no kernel-event collector is wired yet so an
-                // operator pre-staging 'etw' / 'endpoint_security' isn't
-                // surprised that the collector keeps polling under the hood.
                 ctx.write_output(
-                    std::format("warn|network_capture_method '{}' accepted but not yet "
-                                "implemented; collector will continue polling",
-                                method));
+                    std::format("error|network_capture_method '{}' is not accepted on this OS "
+                                "(must be one of: {})",
+                                net_method, list));
+                return 1;
             }
-            db_->set_config("network_capture_method", method);
-            ctx.write_output(std::format("config|network_capture_method|{}", method));
-            changed = true;
         }
 
         // ── Process stabilization exclusions (issue #59) ─────────────────────
-        // List of process-name glob patterns whose churn should be excluded
-        // from process events. Useful for noisy short-lived helpers (CI
-        // runners, IDE indexers, telemetry agents) that produce thousands
-        // of birth/death rows per minute and dwarf the actual process
-        // activity an operator wants to see. Trade-off: forensic completeness
-        // is reduced — anything matching these patterns is invisible to TAR.
-        if (auto exc = params.get("process_stabilization_exclusions"); !exc.empty()) {
+        // Case-insensitive substring patterns whose churn is excluded from
+        // process events (noisy short-lived helpers). Validate here; persist in
+        // Phase 2. Trade-off: anything matching is invisible to TAR, hence the
+        // require_min_core_len floor that rejects over-broad 1–2 char patterns.
+        const auto excl_param = params.get("process_stabilization_exclusions");
+        const bool have_excl = !excl_param.empty();
+        if (have_excl) {
             try {
-                auto arr = json::parse(std::string{exc});
+                auto arr = json::parse(std::string{excl_param});
                 if (!arr.is_array()) {
                     ctx.write_output("error|process_stabilization_exclusions must be a JSON array");
+                    return 1;
+                }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(
+                        std::format("error|process_stabilization_exclusions exceeds the {}-element "
+                                    "limit",
+                                    yuzu::tar::kMaxPatternArrayElements));
                     return 1;
                 }
                 for (const auto& elem : arr) {
@@ -1477,16 +1658,119 @@ private:
                                          "non-empty strings");
                         return 1;
                     }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/true)) {
+                        ctx.write_output(
+                            std::format("error|process_stabilization_exclusions: {}", *err));
+                        return 1;
+                    }
                 }
-                db_->set_config("process_stabilization_exclusions", std::string{exc});
-                ctx.write_output(std::format("config|process_stabilization_exclusions|{}", exc));
-                changed = true;
             } catch (...) {
                 ctx.write_output("error|process_stabilization_exclusions must be valid JSON array");
                 return 1;
             }
         }
 
+        // ── Phase 2: persist (every parameter above is already validated) ────
+        if (days > 0) {
+            db_->set_config("retention_days", std::string{retention});
+            ctx.write_output(std::format("config|retention_days|{}", retention));
+            changed = true;
+        }
+        if (fast_secs > 0) {
+            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
+            changed = true;
+        }
+        if (slow_secs > 0) {
+            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
+            changed = true;
+        }
+        if (have_redaction) {
+            db_->set_config("redaction_patterns", std::string{redaction});
+            ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
+            changed = true;
+        }
+        for (const auto& [src_name, v] : source_toggles) {
+            bool transition_ok;
+            {
+                // #538: collect_fast/slow hold collect_mu_ for their whole
+                // enumerate→diff→set_state cycle. Taking it here makes the
+                // enabled-flag write + baseline clear atomic w.r.t. a collection
+                // tick: the tick either fully precedes the disable (its set_state
+                // is then wiped by the baseline clear) or sees enabled=false and
+                // skips. No interleaving ⇒ no post-disable snapshot, no ghost
+                // "stopped" events on re-enable. No deadlock: do_configure runs
+                // without collect_mu_ held and the helper re-acquires nothing.
+                std::lock_guard lock(collect_mu_);
+                transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
+                                                                           now_epoch_seconds());
+                if (transition_ok && v == "false") {
+                    // The interval samplers (perf / procperf) keep their previous
+                    // reading in memory, not in a diff-state row, so the
+                    // diff_state_key clear inside apply_source_enabled_transition
+                    // does not reach them (diff_state_key is empty for both). Reset
+                    // the in-memory baseline under the SAME lock the collect legs
+                    // take so a later re-enable diffs against a fresh reading instead
+                    // of one from before the pause — otherwise the first
+                    // post-re-enable row would cover the entire disabled window (a
+                    // privacy leak on opt-in procperf, and contradicts the
+                    // "re-enabling starts from a clean baseline" promise in
+                    // docs/user-manual/tar.md). default-constructed → valid=false,
+                    // which derive_sample/derive_proc_samples treat as "no baseline"
+                    // (records nothing on the next tick).
+                    if (src_name == "perf")
+                        prev_perf_ = yuzu::tar::PerfCounters{};
+                    else if (src_name == "procperf")
+                        prev_proc_ = yuzu::tar::ProcSnapshot{};
+                }
+            }
+            if (!transition_ok) {
+                // #538/UP-1: a disable that could not clear the baseline leaves
+                // the source ENABLED (fail-safe). This is an apply-time I/O failure
+                // (a busy DB), not a validation failure — Phase 1 already validated
+                // every parameter — so the two-phase atomicity contract still holds:
+                // the only writes that could precede this are the scalar set_config
+                // calls above, and the source stays enabled rather than being left
+                // disabled with a stale baseline. Report it so the operator retries.
+                ctx.write_output(std::format(
+                    "error|{}_enabled disable failed: could not clear collection baseline "
+                    "(database busy); source left enabled",
+                    src_name));
+                return 1;
+            }
+            ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Echo the resulting paused_at so the dashboard sees the transition
+            // timestamp without an extra status round-trip — single source of
+            // truth (re-read, not re-derived).
+            std::string paused_at_key = std::format("{}_paused_at", src_name);
+            ctx.write_output(
+                std::format("config|{}|{}", paused_at_key, db_->get_config(paused_at_key, "0")));
+            changed = true;
+        }
+        if (have_net) {
+            if (net_method != "polling") {
+                // Surface that no kernel-event collector is wired yet so an
+                // operator pre-staging 'etw' / 'endpoint_security' isn't
+                // surprised the collector keeps polling under the hood.
+                ctx.write_output(
+                    std::format("warn|network_capture_method '{}' accepted but not yet "
+                                "implemented; collector will continue polling",
+                                net_method));
+            }
+            db_->set_config("network_capture_method", net_method);
+            ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+            changed = true;
+        }
+        if (have_excl) {
+            db_->set_config("process_stabilization_exclusions", std::string{excl_param});
+            ctx.write_output(std::format("config|process_stabilization_exclusions|{}", excl_param));
+            changed = true;
+        }
+
+        // Phase 1 returns early on any invalid parameter, so reaching here with
+        // nothing changed means the request carried no recognised parameter.
         if (!changed) {
             ctx.write_output("error|no valid configuration parameters provided");
             return 1;

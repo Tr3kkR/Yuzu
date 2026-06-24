@@ -57,11 +57,11 @@ jobs:
         run: |
           set -eu
           # docker-publish-chisel writes a type=local,mode=max buildx cache per
-          # image under /mnt/d/docker-buildcache/<image>-chisel — several GB per
-          # arch with no built-in eviction. buildx rewrites the dir each run, so
-          # an untouched *-chisel dir is genuinely stale. Linux-only (the chisel
-          # C++ builds run on the self-hosted Linux runner).
-          bc="/mnt/d/docker-buildcache"
+          # image under $RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>-chisel —
+          # several GB per arch with no built-in eviction. buildx rewrites the dir
+          # each run, so an untouched *-chisel dir is genuinely stale. Linux-only
+          # (the chisel C++ builds run on the self-hosted Big Tam Linux runner).
+          bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
           if [[ ! -d "$bc" ]]; then
             echo "::notice::buildx cache dir $bc not present — skipping"
             exit 0
@@ -73,7 +73,7 @@ jobs:
 
   prune-windows:
     name: "Prune Windows runner cache"
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 10
     defaults:
       run:

@@ -60,6 +60,7 @@ required.
 | Action | Target type | When |
 |---|---|---|
 | `auth.login` | Session | Operator logs in via the dashboard or API |
+| `audit.auth_sample.exported` | AuditLog | A caller pulled a pseudo-random authentication-surface evidence sample via `GET /api/v1/audit/auth-sample` (SOC 2 CC7.2). `target_id=auth-sample`; `detail=from=<epoch-or-0> to=<epoch-or-0> limit=<N> returned=<N>` so the window + sample size are on the chain. `result=success`. Permission gate: `AuditLog:Read`. Store-unavailable is a 503 (not an audited failure). If the audit-store write itself fails, the response carries `Sec-Audit-Failed: true` (the export still returns). |
 | `auth.logout` | Session | Operator logs out |
 | `auth.login_failed` | Session | Failed login attempt |
 | `session.revoke_all` | User | An admin force-logged out every active cookie session for a named user via `DELETE /api/v1/sessions?username=<name>`. `target_id=<username>`; `detail=count=<N>` (in-memory cookies wiped). `result=partial` with `detail=count=<N> db_error=true` if the AuthDB DELETE failed (operator should retry or restart). API tokens belonging to the user are NOT revoked by this action. |

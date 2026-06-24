@@ -57,6 +57,28 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
+### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`)
+
+`notify_exec_tracker` skips two server-minted correlation-id prefixes that ride
+the `execution_id` column on `responses` (so their rows are retrievable via
+`ResponseStore::query_by_execution`) but are **NOT operator executions** —
+creating a tracker row for them would publish a phantom `agent-transition` SSE
+event and leave an orphan `agent_exec_status` row that the executions drawer /
+`/api/v1/events` would surface:
+
+- **`polchk-`** — minted by `PolicyEvaluator`; compliance-check responses only.
+- **`bundle-`** — minted by `BundleOrchestrator` (ADR-0011); the N ordinary
+  command responses of one live-query bundle. A bundle is N commands to ONE
+  agent, so the agent-counted tracker would mark it complete after the first
+  step — collate (`received`/`succeeded` vs `expected`) is the bundle's sole
+  completion authority, deliberately outside this ladder.
+
+Both ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
+and their namespaces are disjoint from real tracker ids (32-hex, no prefix), so a
+caller cannot collide a real execution into the skip. **Any new correlation-id
+prefix that stamps `responses` for internal retrieval but is not an operator
+execution must be added here and guard `notify_exec_tracker` the same way.**
+
 ### Terminal-frame finalize invariant (UAT 2026-05-06)
 
 A `CommandResponse` with `status` ∈ {`SUCCESS`,`FAILURE`,`TIMEOUT`,`REJECTED`}

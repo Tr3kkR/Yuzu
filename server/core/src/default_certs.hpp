@@ -85,9 +85,16 @@ struct DefaultCertSet {
 /// told to replace defaults. NOTE: adding/removing `extra_sans` does NOT
 /// regenerate an existing set — the marker fast path returns the prior certs
 /// unchanged; rotate (clear the dir or replace certs) for new SANs to take.
+///
+/// `cert_group` (PKI #1289): when non-empty (a group name or numeric gid that the
+/// server, gateway, and agent users all belong to), the shared cert volume is made
+/// group-readable so sibling containers running as different uids can read the CA +
+/// their leaf material — dir 0750 + group, default-gateway.key 0640 + group. Empty
+/// (default) keeps the tight single-host posture (dir 0700, keys 0600). POSIX-only.
 [[nodiscard]] bool ensure_default_certs(const std::filesystem::path& dir,
                                         const std::string& hostname, CaStore* ca_store,
                                         DefaultCertSet& out,
-                                        const std::vector<std::string>& extra_sans = {});
+                                        const std::vector<std::string>& extra_sans = {},
+                                        const std::string& cert_group = {});
 
 } // namespace yuzu::server

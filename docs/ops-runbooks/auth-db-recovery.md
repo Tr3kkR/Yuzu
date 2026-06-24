@@ -191,6 +191,50 @@ cookies return 401 and that they can re-authenticate normally. File a
 manual audit-log entry referencing the incident ticket so the
 unaudited DB-level action is traceable in the SOC 2 evidence chain.
 
+## Account lockout recovery (locked out by failed-login lockout)
+
+Account lockout (SOC 2 CC6.3) locks a local-password account after
+`--auth-lockout-threshold` (default 5) consecutive failed `POST /login`
+attempts, for `--auth-lockout-window-secs` (default 900 s). A locked
+account returns the **same generic 401 as a bad password** — there is no
+"you are locked" message — so a confused user may not realise they are
+locked rather than mistyping. Escalation order:
+
+1. **Standard path (preferred):** another admin clears it immediately via
+   `POST /api/v1/users/{username}/unlock` (`UserManagement:Write` + MFA
+   step-up). This produces the `auth.lockout.cleared` / `admin_unlock`
+   audit row. The dashboard equivalent is on the user's row in
+   Settings → Users.
+2. **Wait it out:** the lock auto-expires after the window (default 15 min)
+   with no action. A subsequent *successful* login also clears the counter.
+3. **Last resort — dashboard/REST unreachable, or the SOLE admin is locked
+   out** (the unlock endpoint needs a second privileged principal). Clear
+   the lockout columns directly in SQLite:
+
+```bash
+# Inspect the lockout state for the target user.
+sqlite3 /var/lib/yuzu/auth.db \
+  "SELECT username, failed_login_count, locked_until FROM users WHERE username = 'alice';"
+
+# Clear the lock (single user).
+sqlite3 /var/lib/yuzu/auth.db \
+  "UPDATE users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE username = 'alice';"
+
+# Mass-unlock — ONLY after a threshold misconfiguration (e.g. accidentally
+# deploying --auth-lockout-threshold=1) locked many/all accounts:
+# sqlite3 /var/lib/yuzu/auth.db \
+#   "UPDATE users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
+```
+
+A restart is **not** required — the lockout state is read from `auth.db`
+on the next `POST /login`, so the clear takes effect immediately. The
+SQL clear produces **no** `auth.lockout.cleared` audit row, so file a
+manual audit-log entry referencing the incident ticket (SOC 2 CC6.3
+evidence chain), and fix the misconfiguration (`--auth-lockout-threshold`)
+before restarting if a too-low threshold caused the mass lockout. There is
+no break-glass CLI for lockout today (unlike `--mfa-reset`); the auto-expiry
+window is the standing safety net.
+
 ## Verifying persistence after a Settings → Revoke sessions click
 
 The dashboard flow is dual-write (in-memory + `auth.db`). If the response

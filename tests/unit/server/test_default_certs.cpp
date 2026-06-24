@@ -16,7 +16,13 @@
 
 #include "../test_helpers.hpp"
 
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +30,12 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h> // stat (--cert-group perm assertions)
+#include <unistd.h>   // getgid
+#include <utility>    // pair
+#endif
 
 using namespace yuzu::server;
 
@@ -51,6 +63,20 @@ bool contains(const std::vector<std::string>& v, const std::string& s) {
 
 std::size_t count_of(const std::vector<std::string>& v, const std::string& s) {
     return static_cast<std::size_t>(std::count(v.begin(), v.end(), s));
+}
+
+// Returns the X509 extended-key-usage flag word (XKU_SSL_SERVER / XKU_SSL_CLIENT
+// bits) for a PEM leaf. UINT32_MAX means "no EKU extension" (all purposes).
+uint32_t leaf_eku_flags(const std::filesystem::path& pem_path) {
+    std::string pem = read_file(pem_path);
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    REQUIRE(bio != nullptr);
+    X509* x = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    REQUIRE(x != nullptr);
+    uint32_t flags = X509_get_extended_key_usage(x); // forces the lazy EKU parse
+    X509_free(x);
+    return flags;
 }
 
 } // namespace
@@ -87,6 +113,52 @@ TEST_CASE("default_certs: first boot generates a full, chained set", "[default_c
 
     // Leaf notAfter must equal the CA notAfter (sized to the issuer).
     REQUIRE(https->not_after == ca_info->not_after);
+}
+
+TEST_CASE("default_certs: leaf EKUs match each role (server is also a client — #1314)",
+          "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+
+    // The server forwards commands to the gateway's mgmt plane over MUTUAL TLS
+    // (#1314), so it acts as a TLS *client* and its leaf MUST carry clientAuth in
+    // addition to serverAuth — otherwise a strict verifier rejects it as a client
+    // cert and the command-forwarding dial fails.
+    const uint32_t server_eku = leaf_eku_flags(set.server_cert);
+    REQUIRE((server_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((server_eku & XKU_SSL_CLIENT) != 0);
+
+    // The gateway is a server to agents AND a client to the server upstream.
+    const uint32_t gateway_eku = leaf_eku_flags(set.gateway_cert);
+    REQUIRE((gateway_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((gateway_eku & XKU_SSL_CLIENT) != 0);
+
+    // The HTTPS dashboard leaf is server-only — no need for clientAuth.
+    const uint32_t https_eku = leaf_eku_flags(set.https_cert);
+    REQUIRE((https_eku & XKU_SSL_SERVER) != 0);
+    REQUIRE((https_eku & XKU_SSL_CLIENT) == 0);
+}
+
+TEST_CASE("default_certs: server leaves backdate notBefore by the clock-skew allowance (#1302)",
+          "[default_certs]") {
+    // An agent whose clock lags the server at first connect must not reject a
+    // freshly-minted server leaf as not-yet-valid. The CA root + per-agent client
+    // leaf already backdate notBefore by kClockSkewBackdate; this pins the same for
+    // the server-facing default leaves (HTTPS / agent-gRPC / gateway), which the
+    // PR3 H-2 fix had missed.
+    TempDir dir;
+    DefaultCertSet set;
+    const auto now = std::chrono::system_clock::now();
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+    // now is captured BEFORE generation, so notBefore <= now - backdate (minus a
+    // little slack for test execution time). Use 280s against the 300s backdate.
+    const auto floor = now - pki::kClockSkewBackdate + std::chrono::seconds(20);
+    for (const auto& leaf : {set.https_cert, set.server_cert, set.gateway_cert}) {
+        auto c = pki::parse_certificate(read_file(leaf));
+        REQUIRE(c);
+        REQUIRE(c->not_before <= floor); // genuinely backdated, not now()
+    }
 }
 
 TEST_CASE("default_certs: --cert-san extra SANs land on every default leaf", "[default_certs]") {
@@ -341,3 +413,64 @@ TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be cre
     std::error_code ec;
     std::filesystem::remove(file_path, ec);
 }
+
+// ── --cert-group (multi-container shared-cert TLS, PKI #1289) ─────────────────
+#ifndef _WIN32
+
+namespace {
+// {permission bits, owning gid} of a path; {0, -1} on stat failure.
+std::pair<unsigned, gid_t> mode_and_gid(const std::filesystem::path& p) {
+    struct stat st{};
+    if (::stat(p.c_str(), &st) != 0)
+        return {0u, static_cast<gid_t>(-1)};
+    return {static_cast<unsigned>(st.st_mode) & 07777u, st.st_gid};
+}
+} // namespace
+
+TEST_CASE("default_certs: --cert-group shares the dir + gateway key, keeps the rest tight",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    // Use the test process's OWN gid: chgrp to a group you belong to always
+    // succeeds, so this drives the real apply_cert_group_share path deterministically.
+    const std::string own_gid = std::to_string(static_cast<unsigned long>(::getgid()));
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, {}, own_gid));
+
+    // Cert dir: 0750 + chgrp'd to the shared group (so a different-uid sibling
+    // container can traverse it).
+    auto [dmode, dgid] = mode_and_gid(dir.path);
+    REQUIRE(dmode == 0750u);
+    REQUIRE(dgid == ::getgid());
+
+    // Gateway leaf key: group-readable (0640) for the gateway uid.
+    auto [gkmode, gkgid] = mode_and_gid(set.gateway_key);
+    REQUIRE(gkmode == 0640u);
+    REQUIRE(gkgid == ::getgid());
+
+    // The server + HTTPS private keys are NEVER group-shared — owner-only 0600.
+    REQUIRE(mode_and_gid(set.server_key).first == 0600u);
+    REQUIRE(mode_and_gid(set.https_key).first == 0600u);
+
+    // Public certs stay world-readable (group + other read bits set).
+    REQUIRE((mode_and_gid(set.ca_cert).first & 044u) == 044u);
+}
+
+TEST_CASE("default_certs: no --cert-group keeps the tight single-host posture (0700/0600)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set)); // empty cert_group
+    REQUIRE(mode_and_gid(dir.path).first == 0700u);             // owner-only dir
+    REQUIRE(mode_and_gid(set.gateway_key).first == 0600u);      // key owner-only
+}
+
+TEST_CASE("default_certs: a bogus --cert-group falls back to tight perms (no boot-fail)",
+          "[default_certs][security]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, {},
+                                 "no-such-group-xyzzy-1289"));
+    REQUIRE(mode_and_gid(dir.path).first == 0700u); // resolves nothing → tight
+}
+
+#endif // !_WIN32

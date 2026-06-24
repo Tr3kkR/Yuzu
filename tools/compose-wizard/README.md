@@ -23,6 +23,19 @@ This wizard walks you through a step-by-step configuration and generates a produ
 | Port conflicts detected | Wizard warns about common conflicts |
 | Hardcoded passwords | All credentials configurable, with production warnings |
 | No `.env` separation | Generated `.env` file separates config from compose |
+| TLS was all-or-files | Three-way TLS mode: **Default certs** (server auto-generates a per-install CA + leaf certs on first boot — no files; needs the secure-by-default release, tracked by `latest`), **Operator certs** (`--cert`/`--key` + **required** `--ca-cert`, bind-mounted from `./certs`), or **Plaintext** (`--no-tls --no-https`, dev only) |
+| Default certs not persisted | Default mode mounts a volume at `/etc/yuzu/certs` so the auto-generated CA survives a recreate — otherwise every `down && up` mints a fresh CA and breaks enrolled-agent trust |
+| Extra cert SANs (`--cert-san`) | Operator-entered DNS/IP names are validated (no breakout payloads) and added to the auto-generated leaves so they validate for the name/IP agents dial |
+| Version pins an image that can't run the flags (#1488 review H1) | Default version is `latest` (tracks the secure-by-default builds); Default-certs/HTTPS-8443 don't exist in 0.12.0, so the TLS header banner says so and Plaintext is the fallback for older images |
+| Gateway crash-loop on default cookie (#1483) | A unique `YUZU_GW_COOKIE` is generated into `.env` and referenced by the gateway service, so it doesn't fail-closed on the insecure default Erlang distribution cookie |
+| HTTPS served on 8443, wizard used 8080 (#1484) | In TLS modes the dashboard/API is published and health-checked on container port **8443** (8080 is the HTTP→HTTPS redirect); plaintext stays on 8080 |
+| Gateway↔server TLS not wired (#1485) | The secure gateway↔server topology (mutual-TLS upstream, shared certs) depends on server features still in flight (PKI go-live, #1314) that no current image ships. The wizard **blocks gateway + TLS** with guidance (use Plaintext for the gateway, or a server-only TLS stack) rather than emit a stack that crash-loops — re-enables once #1314 lands |
+| `--cert-san` flag injection (#1485 review N1) | Each cert-SAN token is validated to DNS/IP shape client-side, so a quote+newline payload can't break out of the YAML list and inject standalone server flags (e.g. silent `--no-tls`) |
+| Operator certs need a CA (#1485 review H2) | The CA path is required in operator mode (the server refuses to start with operator certs and no CA); the UI no longer says it's optional |
+| Gateway healthcheck used bash `/dev/tcp` (#1486) | The gateway image ships busybox `wget` (no bash/curl), so the probe is now `wget --spider /healthz`, matching `docker-compose.uat.yml` |
+| Server healthcheck used `curl` (#1487) | The server image ships no curl. Replaced with a bash `/dev/tcp` TCP-connect probe on the real serving port (8443/8080), matching `docker-compose.uat.yml` |
+| Admin `admin:admin` hash didn't validate (#1488) | The admin credential row is now derived in-browser via SubtleCrypto **PBKDF2-HMAC-SHA256, 100k iters** for the password you enter — matching the server KDF, so login actually works (the old row put the password in the role field and shipped a stale hash) |
+| Named-volumes off + Prometheus/Grafana/ClickHouse on (#1485 review M1) | Those services use anonymous volumes when named volumes are disabled, so `docker compose config` no longer fails on an undefined volume |
 
 ## Usage
 

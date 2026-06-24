@@ -11,7 +11,11 @@
 #       runs-on: ubuntu-24.04
 #       container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
 
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+# Ubuntu 26.04 (Resolute) — matches the native OS of the Big Tam self-hosted
+# Linux runner pool (yuzu-bigtam-linux). GCC 15 / Clang 21 are 26.04 defaults;
+# gcc-13 (24.04 / Shulgi) is retired from this image as part of the runner
+# cutover. Digest is the multi-arch OCI index for ubuntu:26.04.
+FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
 
 ARG MESON_VERSION=1.9.2
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
@@ -20,7 +24,7 @@ ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 RUN apt-get update && apt-get install -y \
     # Build essentials
     cmake ninja-build make pkg-config ccache \
-    gcc-13 g++-13 \
+    gcc-15 g++-15 \
     # Autotools (required by vcpkg ports: c-ares, grpc) + bison/flex (libpq)
     autoconf automake libtool bison flex \
     # sd-bus headers for the Linux Guardian systemd service guard (agent build)
@@ -64,10 +68,10 @@ RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
 ENV VCPKG_ROOT=/opt/vcpkg
 
 # ── Default compiler symlinks (must be before vcpkg install) ──────────
-RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 130 \
-    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 130 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 130
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 150 \
+    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-15 150 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 150
 
 # ── vcpkg packages installed at CI runtime via NuGet/x-gha cache ──────
 # Pre-baking vcpkg into Docker is fragile (OpenSSL download auth,

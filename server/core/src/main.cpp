@@ -190,6 +190,14 @@ int main(int argc, char* argv[]) {
         // own comma loop) and mangle entries. Each CLI/env token reaches the parser
         // whole; the parser owns the comma semantics.
         ->envname("YUZU_CERT_SAN");
+    app.add_option("--cert-group", cfg.cert_group,
+                   "Shared POSIX group (name or gid) for the auto-generated cert volume "
+                   "(PKI #1289). When set, the cert dir (0750) + default-gateway.key (0640) "
+                   "are made group-readable so a gateway/agent running as a different uid in a "
+                   "sibling container can read the shared CA + leaf out of /etc/yuzu/certs. "
+                   "All three users must belong to this group. Empty (default) keeps tight "
+                   "single-host perms (0700/0600). POSIX-only.")
+        ->envname("YUZU_CERT_GROUP");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;
@@ -273,6 +281,25 @@ int main(int argc, char* argv[]) {
                    "success and TOTP submission (default: 120)")
         ->default_val(120)
         ->envname("YUZU_MFA_LOGIN_PENDING_SECS");
+
+    // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
+    app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,
+                   "Consecutive failed local-password attempts before an account is temporarily "
+                   "locked (default: 5). 0 disables lockout. The counter resets on a successful "
+                   "login or an admin unlock.")
+        ->default_val(5)
+        // Fail fast on a negative value rather than silently treating it as
+        // "disabled" (Hermes cyber-review F5 / Codex note). 0 is valid (off).
+        ->check(CLI::NonNegativeNumber)
+        ->envname("YUZU_AUTH_LOCKOUT_THRESHOLD");
+    app.add_option("--auth-lockout-window-secs", cfg.auth_lockout_window_secs,
+                   "Seconds an account stays locked after the threshold is crossed (default: 900). "
+                   "The lock auto-expires after this window — it is never permanent.")
+        ->default_val(900)
+        // Reject 0 / negative at parse time instead of the runtime clamp-to-1s
+        // surprise (Hermes cyber-review F5). A lock window must be >= 1 second.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
@@ -464,6 +491,30 @@ int main(int argc, char* argv[]) {
                      "enrollment at login before a session is issued.",
                      cfg.mfa_enforcement,
                      cfg.mfa_enforcement == "required" ? "users" : "admins");
+    }
+    // Account lockout posture (SOC 2 CC6.3 evidence). Surfaced once at boot
+    // so an operator/auditor can confirm the deployment's brute-force
+    // protection from journald without scraping per-event logs. The posture
+    // is gated on the auth.db store actually being wired (--data-dir set):
+    // lockout state lives in auth.db, so in a config-file-only deployment
+    // (auth_db_ == nullptr, the legacy fallback) every lockout op no-ops.
+    // Claiming "active" there would overstate the deployed control
+    // (governance/adversarial C4) — fail honest instead.
+    if (cfg.auth_lockout_threshold > 0) {
+        if (cfg.data_dir.empty()) {
+            spdlog::warn("Account lockout CONFIGURED (threshold={}) but INACTIVE: failed-login "
+                         "lockout requires the auth.db store, which is created only when "
+                         "--data-dir is set. This config-file-only deployment has NO account "
+                         "lockout. Set --data-dir to activate it.",
+                         cfg.auth_lockout_threshold);
+        } else {
+            spdlog::info("Account lockout active: {} failed local-password attempts → locked "
+                         "for {}s (auto-expiring).",
+                         cfg.auth_lockout_threshold, cfg.auth_lockout_window_secs);
+        }
+    } else {
+        spdlog::warn("Account lockout DISABLED (--auth-lockout-threshold=0) — local-password "
+                     "logins have no brute-force throttle.");
     }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
     // window_secs <= 0 as an "escape hatch" that lets every request
