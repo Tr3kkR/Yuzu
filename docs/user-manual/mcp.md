@@ -457,16 +457,28 @@ proposes.
 
 ### How it works
 
+> **Current behaviour (Phase 1).** Approval **re-dispatch** — resuming an
+> approved operation through MCP — is Phase 2 and not yet implemented. Until it
+> lands, an approval-gated MCP call is **denied** with JSON-RPC code `-32004`
+> (`TierDenied`), **not** `-32006` (`ApprovalRequired`). The A4 error contract
+> reserves `-32006` for a response that can carry a pollable `approval_id` +
+> `status_url`; with no re-dispatch path there is nothing to poll, so returning
+> `-32006` would be a contract lie. The `error.data.remediation` hint points the
+> caller at the REST API or dashboard, where the supervised-tier approval
+> workflow is fully wired. The numbered flow below describes the **Phase 2
+> target**.
+
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier).
-2. The MCP server creates an **approval request** with status `pending`.
-3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
-   containing the approval ID.
+2. The MCP server **will** create an **approval request** with status `pending`.
+3. The server **will** return a JSON-RPC error with code `-32006`
+   (`ApprovalRequired`) carrying the approval ID and a `status_url` to poll.
+   *(Today this path returns `-32004` — see the callout above.)*
 4. The AI assistant can inform the operator that approval is needed.
 5. An administrator reviews the request via the dashboard or REST API
    (`GET /api/approvals`, `POST /api/approvals/{id}/approve`,
    `POST /api/approvals/{id}/reject`).
-6. Once approved, the operation can be retried.
+6. Once approved, the operation **will** be retriable.
 
 ### What requires approval
 
@@ -627,17 +639,29 @@ example, a `readonly` token attempting to execute an instruction.
 **Fix**: Create a new token with a higher tier (`operator` or `supervised`),
 or use a different tool that is within the current tier's permissions.
 
-### -32006: Approval required
+### -32004: Tier denied (including approval-gated operations)
 
-**Symptom**: A tool call returns error code `-32006` with an approval ID.
+**Symptom**: A tool call returns error code `-32004` with an `error.data` object
+carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 
-**Cause**: The operation requires admin approval before it can proceed. This
-is expected behavior for destructive operations on `supervised` tier tokens,
-and for tag deletions on `operator` tier tokens. Note that `operator` tier
-executions are auto-approved and do not trigger this error.
+**Cause**: Either the token's MCP tier does not permit the requested operation,
+or — for a `supervised`-tier token on a destructive operation — the operation is
+approval-gated and Phase 2 re-dispatch is not yet implemented. The A4 contract
+reserves `-32006` (`ApprovalRequired`) for a response that can carry a pollable
+`approval_id` + `status_url`; until that is wired, the denial is returned as
+`-32004` with a remediation hint instead. (`operator`-tier executions are
+auto-approved and do not hit this path.)
 
-**Fix**: An administrator must approve the request via the dashboard or REST
-API. After approval, retry the operation.
+**Fix**: For a tier restriction — create a new token with a higher tier
+(`operator` or `supervised`). For an approval-gated `supervised` operation —
+perform it via the REST API or dashboard, where the approval workflow is wired.
+
+### -32006: Approval required (Phase 2 target — not yet emitted)
+
+**Symptom**: Reserved. The MCP server does **not** currently emit `-32006`;
+approval-gated operations return `-32004` (above) until approval re-dispatch
+ships (Phase 2). Documented here so client error handling can be written
+forward-compatibly.
 
 ### -32003: Permission denied (RBAC)
 

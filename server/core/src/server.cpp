@@ -602,6 +602,12 @@ public:
                           "Total Guaranteed-State events currently persisted", "gauge");
         metrics_.describe("yuzu_server_guardian_events_written_total",
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_dropped_total",
+                          "Cumulative Guaranteed-State events dropped at ingest on an event_id "
+                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
+                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
+                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -2521,6 +2527,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_dropped_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -8904,6 +8912,14 @@ private:
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
             net_perf_fn,
+            // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
+            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
+            // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
+            [this](const std::string& username) -> bool {
+                auto* db = auth_mgr_.auth_db_ptr();
+                return db && db->clear_failed_logins(username).has_value();
+            },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
             // Per-device-scoped permission (management-group aware) for that route —

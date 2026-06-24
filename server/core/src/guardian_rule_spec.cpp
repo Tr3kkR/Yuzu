@@ -236,8 +236,13 @@ std::string dangerous_enforce_service_stop(std::string_view service_name) {
         {"windefend", "the Microsoft Defender Antivirus service"},
         {"wdnissvc", "the Microsoft Defender Network Inspection service"},
         {"sense", "the Microsoft Defender for Endpoint sensor"},
+        {"wdfilter", "Microsoft Defender's filesystem minifilter — stopping it blinds "
+                     "real-time scanning while WinDefend still reads as up (#1285)"},
         {"wscsvc", "the Windows Security Center service"},
         {"mpssvc", "the Windows Defender Firewall service"},
+        {"bfe", "the Base Filtering Engine — the Windows Filtering Platform engine the "
+                "firewall sits on; stopping it tears down the firewall while mpssvc still "
+                "looks protected (#1285)"},
         {"eventlog", "the Windows Event Log service"},
         // Critical infrastructure — enforce-stopping these strands the agent itself
         // and breaks the host's ability to launch/recover services (self-inflicted

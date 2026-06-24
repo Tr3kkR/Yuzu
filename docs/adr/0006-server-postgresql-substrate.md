@@ -88,3 +88,21 @@ this — *"If the server outgrows SQLite, the storage layer can be swapped to Po
 - This is a **multi-quarter program**, not one PR. This ADR records the *mandate and the
   rules*; the per-store migrations are tracked separately (a migration ladder / issues),
   each gated by its own ADR and the governance pipeline.
+
+## Update (2026-06-22) — completeness: every server store migrates; none stays SQLite
+
+The "**Prioritise by the pain ADR-0004 named** … small, isolated, low-traffic stores (e.g.
+server config) may stay on SQLite indefinitely until touched" stance in the Decision above is
+**superseded** on the *whether*, retained on the *order*. As of 2026-06-22 (grill-with-docs
+session) the committed end state is that **every** server-side store reaches Postgres — no store
+stays on SQLite. The agent remains SQLite (unchanged).
+
+Rationale: the project is pre-alpha with zero production customers and one design partner, so the
+migration is cheap to finish now, and a permanent two-engine server is the exact straddle a single
+substrate exists to eliminate — mixed `SqliteTxn`/`PgPool` idioms, two backup stories, two test
+stories, and a forever "is this store Pg or SQLite?" question for every contributor.
+
+**Order** still follows the priorities above (cross-store-join + durable + high-write first,
+trivial config stores last); the ordered queue is `docs/postgres-migration-ladder.md`. What
+changed is that **completeness is no longer optional**. The author-facing store contract is
+ADR-0012; the how-to is `docs/postgres-store-playbook.md`.
