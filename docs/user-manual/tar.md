@@ -92,7 +92,7 @@ Use the `configure` action to adjust TAR behavior.
 | `retention_days` | 1-365 | 7 | Days to keep events before automatic purge |
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
-| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive) |
+| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive). **Merged with** the built-in defaults — added to, never replacing them; the defaults cannot be disabled. |
 | `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
@@ -102,16 +102,17 @@ Use the `configure` action to adjust TAR behavior.
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). Set to `0` to disable the perf trigger entirely. |
-| `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
-| `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
+| `network_capture_method` | `polling` (always accepted) plus the methods accepted on the **running host's OS** — e.g. `iphlpapi` on Windows, `procfs` on Linux, `proc_pidfdinfo` on macOS (run `compatibility` for the live list) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. Methods from a *different* OS are rejected. The `status` action reports `network_capture_method_effective` alongside the configured value so the configured-vs-active discrepancy is always explicit. |
+| `process_stabilization_exclusions` | JSON array (≤256 × ≤256 chars) | `[]` | Process-name **substrings** (case-insensitive; leading/trailing `*` stripped; `?` and `[abc]` are literals; effective substring must be ≥3 chars) to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
 **Validation rules:**
 
 - When both `fast_interval` and `slow_interval` are provided, `fast_interval` must be less than `slow_interval`.
-- `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings.
-- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. A pattern like `"a"` will match every process whose name contains the letter `a` (most of them) — use length-3+ patterns or anchor with explicit substrings (`"-helper"`, `"chrome-helper"`).
-- `network_capture_method` is accepted unconditionally for the literal value `polling` (the platform default). Any other value must appear in the accept-list returned by `accepted_capture_methods("tcp")` (currently `iphlpapi`, `procfs`, `proc_pidfdinfo`); else the configure call is rejected.
-- Disabling a collector (`<source>_enabled=false`) short-circuits new captures but leaves existing rows queryable. Re-enabling later starts from a clean baseline rather than diffing against a stale snapshot.
+- `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings, with at most **256 elements** of at most **256 characters** each (both feed an O(patterns × command-line-length) scan per process per cycle).
+- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`). Matching is on the **process name only**, so a binary renamed to contain an approved substring evades capture — exclusions are a noise-reduction convenience, **not a threat-hunting control**.
+- `network_capture_method` is validated against the **running host's OS** accept-list, not the union across all platforms — e.g. a Linux agent rejects the Windows-only `iphlpapi`. `polling` is always accepted (the platform default). Run the `compatibility` action to see the live accepted list for a given agent.
+- Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
+  - The interval samplers (`perf` and the opt-in `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory), which is off by default for privacy: no usage row ever spans the period it was disabled.
 
 Example:
 
@@ -172,7 +173,9 @@ Default redaction patterns:
 ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]
 ```
 
-Patterns use case-insensitive substring matching. The `*` characters at the start and end indicate substring semantics (e.g., `*password*` matches any command line containing "password" in any case).
+Patterns use case-insensitive substring matching. Leading and trailing `*` are **optional** — they are stripped before matching, so the effective match is always a bare substring (`*password*`, `password*`, and `password` all match any command line containing "password" in any case). Interior `?` and `[abc]` are treated as literals, not glob metacharacters.
+
+**The built-in default patterns always apply and cannot be disabled.** `configure` lets you **add** patterns, but the baseline set (`password`, `secret`, `token`, `api_key`, `credential`) is enforced on every collect path regardless of what is stored. If `redaction_patterns` is set to an array whose elements are all invalid (over-long, non-string) or to `[]`, the built-in defaults are silently restored as the active list rather than leaving redaction disabled — so a corrupt, tampered, or empty config can never cause secrets to be written in plaintext.
 
 To customize:
 
@@ -218,6 +221,7 @@ config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
 config|network_capture_method|polling
+config|network_capture_method_effective|polling
 ```
 
 A block is emitted for every capture source. The opt-in sources report
@@ -226,7 +230,30 @@ A block is emitted for every capture source. The opt-in sources report
 `configure` (see the configuration table above). `module_live_rows` stays `0`
 until a collector for the host's OS ships.
 
-The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
+A `<source>_enabled` value can also read `errored` — automation that scrapes
+this output should match three values, not two:
+
+```
+config|process_enabled|errored
+```
+
+`errored` means the stored value is not the literal `true`/`false` the agent
+ever writes (corruption or tampering); the source is fail-closed until it is
+re-`configure`d. See the tri-state description below.
+
+The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
+
+### Corrupt-database quarantine
+
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
+
+- **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
+- **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
+- **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
+
+If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
+
+`network_capture_method` is the **configured** value (which may be a value pre-staged ahead of a forthcoming kernel-event collector, or a cross-OS platform API); `network_capture_method_effective` is the mechanism **actually collecting**, which is always `polling` today — no kernel-event collector is wired yet, so every configured value currently collects via polling. The two are reported side by side so `status` can never misrepresent the active capture mechanism to a forensic analyst.
 
 ## TAR dashboard page
 
@@ -382,7 +409,10 @@ TAR is designed for minimal performance overhead:
 > `process_enabled=false` via `configure`; there is no separate "disable ETW but
 > keep polling" switch today. While disabled, the live ETW session keeps running
 > but its buffered events are drained-and-discarded each cycle, so no process
-> activity from the paused window is persisted when you re-enable.
+> activity from the paused window is persisted when you re-enable. As with every
+> snapshot-diff source, re-enabling `process_enabled` clears the stored baseline,
+> so the first cycle after re-enable does not emit ghost `stopped` events for
+> processes that exited during the pause (it re-bases on the live process set).
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
 ## Warehouse Query System

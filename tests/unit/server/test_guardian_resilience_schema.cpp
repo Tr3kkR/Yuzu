@@ -459,6 +459,9 @@ TEST_CASE("PR5: enforce service-stopped on a security service is denied at every
         CHECK_FALSE(dangerous_enforce_service_stop("windefend").empty()); // case-insensitive
         CHECK_FALSE(dangerous_enforce_service_stop("Sense").empty());
         CHECK_FALSE(dangerous_enforce_service_stop("wscsvc").empty());
+        CHECK_FALSE(dangerous_enforce_service_stop("WdFilter").empty());   // #1285 Defender minifilter
+        CHECK_FALSE(dangerous_enforce_service_stop("wdfilter").empty());   // case-insensitive
+        CHECK_FALSE(dangerous_enforce_service_stop("BFE").empty());        // #1285 firewall WFP engine
         CHECK_FALSE(dangerous_enforce_service_stop("RpcSs").empty());      // critical infra
         CHECK_FALSE(dangerous_enforce_service_stop("dcomlaunch").empty()); // critical infra
         CHECK_FALSE(dangerous_enforce_service_stop("YuzuAgent").empty()); // self-destruct
@@ -469,6 +472,16 @@ TEST_CASE("PR5: enforce service-stopped on a security service is denied at every
         auto r = derive_rule_spec(service_rule_body("service-stopped", "WinDefend", "enforce"),
                                   "svc", 1, true, "enforce");
         CHECK(r.error.has_value());
+    }
+    SECTION("create path: enforce service-stopped on WdFilter / BFE rejected (#1285)") {
+        // The #1285 additions (Defender minifilter, firewall WFP engine) must be
+        // refused on the operator-facing author path, not only the raw helper.
+        for (const char* svc : {"WdFilter", "BFE"}) {
+            INFO("service=" << svc);
+            auto r = derive_rule_spec(service_rule_body("service-stopped", svc, "enforce"), "svc", 1,
+                                      true, "enforce");
+            CHECK(r.error.has_value());
+        }
     }
     SECTION("create path: enforce service-RUNNING on WinDefend allowed (protective)") {
         auto r = derive_rule_spec(service_rule_body("service-running", "WinDefend", "enforce"),

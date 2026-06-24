@@ -13,6 +13,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string_view>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -692,6 +693,11 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         const int ext = sqlite3_extended_errcode(db_);
         const std::string err = sqlite3_errmsg(db_);
         if (is_sqlite_uniqueness_violation(ext)) {
+            // Silent-drop visibility (#1414, CC7.3): the conflicting event is
+            // discarded here and guardian_ingest only warns. Count it so the loss
+            // is alertable in Prometheus rather than grep-only. Surfaced as
+            // yuzu_server_guardian_events_dropped_total.
+            events_dropped_.fetch_add(1, std::memory_order_relaxed);
             return std::unexpected(
                 format_conflict("event_id '" + row.event_id + "' already exists"));
         }
@@ -1785,6 +1791,51 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
+    return out;
+}
+
+std::vector<GuardianAgentRuleStatus>
+GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianAgentRuleStatus> out;
+    if (!db_)
+        return out;
+    // One agent's current per-rule verdicts. Rides the (agent_id, rule_id) PK
+    // auto-index (agent_id leading), so it scans only this agent's rows — the
+    // baseline-anchored per-device REST view's denominator is small. Pure SELECT,
+    // so no sqlite3_changes()/#1033 concern.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT agent_id, rule_id, state, updated_at "
+                           "FROM guardian_agent_rule_status WHERE agent_id = ?1",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(s.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        GuardianAgentRuleStatus r;
+        r.agent_id = col_text(s.get(), 0);
+        r.rule_id = col_text(s.get(), 1);
+        r.state = col_text(s.get(), 2);
+        r.updated_at = col_text(s.get(), 3);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::unordered_map<std::string, std::string> GuaranteedStateStore::rule_names() const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, std::string> out;
+    if (!db_)
+        return out;
+    // Two-column read only — avoids materializing the yaml_source / spec_json /
+    // signature blobs list_rules() carries (governance UP-2 / sre / architect-I2:
+    // this is per-request on the baseline-anchored read path). Pure SELECT (#1033-safe).
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, "SELECT rule_id, name FROM guaranteed_state_rules", -1, s.addr(),
+                           nullptr) != SQLITE_OK)
+        return out;
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.emplace(col_text(s.get(), 0), col_text(s.get(), 1));
     return out;
 }
 

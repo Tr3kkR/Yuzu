@@ -161,6 +161,13 @@ public:
     // lock (no per-Baseline round-trip).
     std::unordered_set<std::string> deployed_member_rule_ids() const;
 
+    // The deployed member rule_ids of ONE Baseline (its `deployed_snapshot` — the
+    // enforced set captured at last deploy), sorted + de-duplicated. Per-Baseline
+    // analog of the fleet-union overload above; same fail-closed parse (a draft /
+    // never-deployed / empty / malformed snapshot yields {}). Backs the
+    // baseline-anchored per-device Guardian status REST view.
+    std::vector<std::string> deployed_member_rule_ids(const std::string& baseline_id) const;
+
     // ── Counting (metrics / UI) ─────────────────────────────────────────────
     std::size_t baseline_count() const;
     std::size_t member_count(const std::string& baseline_id) const;

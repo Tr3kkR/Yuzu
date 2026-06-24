@@ -72,8 +72,10 @@ struct LiveHarness {
             return it != rows_by_cmd.end() ? it->second : fake_rows;
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
             audited = a + "|" + r + "|" + tid;
+            return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
         };
         // store is unused by the live routes — pass nullptr deliberately.
         routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
@@ -114,8 +116,10 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         CHECK(r->body.find("/fragments/device/live/result?command_id=os_info-test") !=
               std::string::npos);
         CHECK(r->body.find("kind=uptime") != std::string::npos);
-        // Usage vs machine-health audit split (works-council posture).
-        CHECK(h.audited == "device.live.uptime|success|a-1");
+        // Usage vs machine-health audit split (works-council posture). The result
+        // is "dispatched" (not "success") — the outcome isn't known at dispatch time
+        // and this stays in lockstep with the REST sibling.
+        CHECK(h.audited == "device.live.uptime|dispatched|a-1");
     }
     SECTION("processes -> processes/list_hashed, audited as device.live.processes") {
         LiveHarness h;
@@ -123,7 +127,7 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         REQUIRE(r);
         CHECK(h.seen_plugin == "processes");
         CHECK(h.seen_action == "list_hashed"); // hashed variant carries the SHA-256
-        CHECK(h.audited == "device.live.processes|success|a-1");
+        CHECK(h.audited == "device.live.processes|dispatched|a-1");
     }
     SECTION("offline device (sent=0): honest note, no polling, no auto-fire") {
         LiveHarness h;
@@ -423,8 +427,10 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
@@ -507,8 +513,10 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     auto responses = [](const std::string&) { return std::vector<DexAgentResponse>{}; };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;

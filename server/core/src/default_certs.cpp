@@ -21,7 +21,10 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <unistd.h> // gethostname
+#include <cerrno>
+#include <cstring> // strerror
+#include <grp.h>   // getgrnam (--cert-group resolution)
+#include <unistd.h> // gethostname, chown
 #endif
 
 namespace yuzu::server {
@@ -29,6 +32,75 @@ namespace yuzu::server {
 namespace fs = std::filesystem;
 
 namespace {
+
+// Apply the cross-container cert-sharing perms (PKI #1289). Default (empty group)
+// keeps the tight single-host posture: dir 0700, keys 0600. When `cert_group` is
+// set (a name or numeric gid that the server, gateway, AND agent users all belong
+// to), the shared cert volume is opened up *just enough* for sibling containers:
+//   - cert dir → 0750 + group=cert_group   (so a different-uid container can
+//     TRAVERSE in; the server makes it 0700 by default, which blocks that)
+//   - default-gateway.key → 0640 + group=cert_group  (the ONE shared private key:
+//     the gateway runs as a different uid and must read its own leaf key)
+// The CA cert + leaf certs are public (0644); the server/HTTPS private keys stay
+// 0600 owner-only — never group-shared.
+void apply_cert_group_share(const fs::path& dir, const DefaultCertSet& out,
+                            const std::string& cert_group) {
+    std::error_code ec;
+    if (cert_group.empty()) {
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+        // True idempotency: if a prior boot ran with --cert-group, the gateway key
+        // may still carry 0640. Re-tighten it to 0600 so dropping --cert-group fully
+        // reverts the posture (the 0700 dir already blocks traversal, but be explicit).
+        if (fs::exists(out.gateway_key))
+            fs::permissions(out.gateway_key, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec); // 0600
+        return;
+    }
+#ifndef _WIN32
+    gid_t gid = static_cast<gid_t>(-1);
+    char* end = nullptr;
+    const long n = std::strtol(cert_group.c_str(), &end, 10);
+    if (end && *end == '\0' && n >= 0) {
+        gid = static_cast<gid_t>(n);
+    } else if (const struct group* gr = ::getgrnam(cert_group.c_str())) {
+        gid = gr->gr_gid;
+    }
+    if (gid == static_cast<gid_t>(-1)) {
+        spdlog::warn("default_certs: --cert-group '{}' does not resolve to a group — leaving "
+                     "tight 0700/0600 perms (a gateway/agent in another container will NOT be "
+                     "able to read the shared certs)", cert_group);
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+        return;
+    }
+    // Chgrp BEFORE widening: never expose the dir to a group we have not
+    // confirmed ownership of. On chgrp failure the dir stays 0700.
+    if (::chown(dir.c_str(), static_cast<uid_t>(-1), gid) == 0) {
+        fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
+                        fs::perm_options::replace, ec); // 0750
+    } else {
+        spdlog::warn("default_certs: chgrp '{}' on {} failed: {} — leaving 0700 (the server user "
+                     "must be a member of that group to share it)", cert_group, dir.string(),
+                     std::strerror(errno));
+        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+        return; // do not group-share the gateway key either if the dir chgrp failed
+    }
+    if (fs::exists(out.gateway_key)) {
+        if (::chown(out.gateway_key.c_str(), static_cast<uid_t>(-1), gid) == 0)
+            fs::permissions(out.gateway_key,
+                            fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
+                            fs::perm_options::replace, ec); // 0640
+        else
+            spdlog::warn("default_certs: chgrp on gateway key failed: {}", std::strerror(errno));
+    }
+    spdlog::info("default_certs: cert dir + gateway key shared with group '{}' (gid {}) for "
+                 "multi-container TLS", cert_group, static_cast<unsigned long>(gid));
+#else
+    (void)out;
+    spdlog::warn("default_certs: --cert-group is POSIX-only; ignored on Windows (use ACLs / a "
+                 "shared service account). Leaving owner-only perms.");
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+#endif
+}
 
 constexpr int kMarkerVersion = 1;
 
@@ -61,8 +133,15 @@ std::string rand_suffix() {
 }
 
 // Atomic write of a PUBLIC file (certs, marker) — stage to a sibling temp then
-// rename. Public artifacts keep default perms; private keys go through
-// FileKeyProvider (0600) instead.
+// rename. The artifact is set to a DETERMINISTIC 0644 (world-readable), NOT the
+// umask default: the CA cert + leaf certs are public trust material (the CA cert
+// is also served at GET /api/v1/ca/root), and under the secure-by-default
+// multi-container deploy a different-uid agent/gateway container must be able to
+// read the shared default-ca.pem. A strict server umask (e.g. 0077) would
+// otherwise leave it 0600 and break CA auto-discovery even with --cert-group
+// sharing the dir. The 0700/0750 dir still gates who can traverse to it, so 0644
+// on the file never widens access beyond what the dir already allows. Private
+// keys never come through here — they go through FileKeyProvider (0600).
 bool write_public_file(const fs::path& dest, const std::string& contents) {
     std::error_code ec;
     const fs::path tmp = dest.parent_path() / (dest.filename().string() + ".tmp." + rand_suffix());
@@ -81,6 +160,14 @@ bool write_public_file(const fs::path& dest, const std::string& contents) {
             return false;
         }
     }
+    // Set perms on the temp BEFORE the rename so the destination is never briefly
+    // visible at the umask default (and so the public bit is atomic with publish).
+    fs::permissions(tmp,
+                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                        fs::perms::others_read,
+                    fs::perm_options::replace, ec); // 0644
+    if (ec)
+        spdlog::warn("default_certs: chmod 0644 on {} failed: {}", tmp.string(), ec.message());
     fs::rename(tmp, dest, ec);
     if (ec) {
         spdlog::error("default_certs: rename {} -> {} failed: {}", tmp.string(), dest.string(),
@@ -386,7 +473,8 @@ std::string detect_hostname() {
 }
 
 bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
-                          DefaultCertSet& out, const std::vector<std::string>& extra_sans) {
+                          DefaultCertSet& out, const std::vector<std::string>& extra_sans,
+                          const std::string& cert_group) {
     fill_paths(dir, out);
     const fs::path marker = dir / "default-marker.json";
 
@@ -423,6 +511,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                         // Tell the operator if --cert-san now asks for names the
                         // existing certs don't carry (we never auto-rotate).
                         warn_on_san_drift(out.gateway_cert, extra_sans);
+                        // Re-assert the cert-sharing perms on the existing set so a
+                        // restart (or a --cert-group added after first boot) is
+                        // consistent — idempotent.
+                        apply_cert_group_share(dir, out, cert_group);
                         return true;
                     }
                     spdlog::warn("default_certs: existing default certs unusable ({}) — "
@@ -514,7 +606,13 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
     // Leaves are sized to the CA's exact notAfter so they never outlive the
     // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
-    const pki::Validity leaf_validity{std::chrono::system_clock::now(), ca_info->not_after};
+    // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
+    // and the per-agent client leaf (sign_agent_csr, PR3 H-2). Without this, an
+    // agent whose clock lags the server at first connect sees these freshly-minted
+    // server leaves as not-yet-valid and rejects the TLS handshake, and the retry
+    // paths don't recover a "valid cert, skewed clock" until the skew elapses.
+    const pki::Validity leaf_validity{
+        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info->not_after};
 
     pki::SubjectAltNames san;
     san.dns = {"localhost"};
@@ -542,7 +640,12 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
 
     const std::array<LeafSpec, 3> leaves = {{
         {"default-https", "default-https.pem", "https", pki::LeafUsage{.server_auth = true}},
-        {"default-server", "default-server.pem", "server", pki::LeafUsage{.server_auth = true}},
+        // The server is a server to agents/gateway AND a client when it forwards
+        // commands to the gateway's mgmt plane over mutual TLS (#1314), so its leaf
+        // needs clientAuth too — otherwise a strict verifier rejects it as a client
+        // cert and the mTLS command-forwarding dial fails.
+        {"default-server", "default-server.pem", "server",
+         pki::LeafUsage{.server_auth = true, .client_auth = true}},
         // The gateway is a server to agents AND a client to the server upstream.
         {"default-gateway", "default-gateway.pem", "gateway",
          pki::LeafUsage{.server_auth = true, .client_auth = true}},
@@ -633,6 +736,9 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     out.ca_fingerprint_sha256 = *ca_fp;
     out.ca_expires_at = ca_info->not_after;
     out.freshly_generated = true;
+    // Now that the full set (incl. default-gateway.key) exists, apply the
+    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
+    apply_cert_group_share(dir, out, cert_group);
     spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
                  out.ca_fingerprint_sha256, to_epoch(ca_info->not_after));
     return true;

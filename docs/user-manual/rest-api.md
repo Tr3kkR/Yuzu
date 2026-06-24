@@ -66,6 +66,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [OpenAPI Spec](#openapi-spec)
   - [Inventory](#inventory)
   - [Execution Statistics](#execution-statistics)
+  - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
   - [Software Deployment](#software-deployment)
   - [License Management](#license-management)
@@ -153,6 +154,8 @@ All REST API v1 responses use a standard JSON envelope.
 ```
 
 HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
+
+Newer agentic-first surfaces enrich `error` with two optional fields: `correlation_id` (a `req-<hex>` token also echoed on the `X-Correlation-Id` response header, for joining the response to server logs/audit rows) and, on `401`/`403` denials from per-device scoped-permission gates, `permission` — the `"SecurableType:Operation"` the caller was denied (e.g. `"GuaranteedState:Read"`). These fields are **additive**; clients parsing only `code`/`message` are unaffected. They are not yet emitted on every denial path (the admin-only / unscoped gates still return the bare envelope — a tracked follow-up), so automation must treat `correlation_id`/`permission` as present-when-available, not guaranteed.
 
 ---
 
@@ -777,6 +780,47 @@ The caller authenticated with an MCP-tier token (`X-Yuzu-Token` carrying a non-e
 ```
 
 **Audit:** every successful invocation emits `session.revoke_all.self` with `target_type=User`, `target_id=<caller>`, `detail=count=<N> api_tokens_revoked=<M>` (with `db_error=true` appended on partial failure). The dashboard's "Sign out everywhere" button on the operator's own row in Settings → Users uses this endpoint and follows up with a redirect to `/login`.
+
+---
+
+### Users
+
+#### `POST /api/v1/users/{username}/unlock`
+
+Clear a user's account-lockout counter. After `--auth-lockout-threshold` consecutive failed local-password logins an account is temporarily locked (SOC 2 CC6.3 — see the [account-lockout flags](server-admin.md#server-cli-flags) in the server-admin guide). The lock already auto-expires after `--auth-lockout-window-secs`; this endpoint is the operability path for an admin who needs to restore access immediately (e.g. a locked-out VIP who can't wait out the window).
+
+**Permission:** `UserManagement:Write` (plus MFA step-up when MFA is enrolled — parity with `DELETE /api/v1/sessions`).
+
+**Self-target behaviour.** An admin invoking this with their own username is permitted — clearing your own lockout is recoverable. This is the same weaker-than-`#397/#403` guard reasoning as `DELETE /api/v1/sessions`.
+
+**Body:** none.
+
+**Example:**
+
+```bash
+curl -s -X POST \
+  -H "Cookie: yuzu_session=$COOKIE" \
+  "https://yuzu.example.com/api/v1/users/alice/unlock"
+```
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "username": "alice",
+    "unlocked": true,
+    "audit_emitted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
+
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the `auth.db` write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+
+**Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
 ---
 
@@ -1505,10 +1549,65 @@ Query audit events.
 }
 ```
 
+#### `GET /api/v1/audit/auth-sample`
+
+Pseudo-random **sample** of authentication-surface audit events over an optional
+time window — for SOC 2 **CC7.2** sampled-evidence export (auditor pulls a
+representative sample of auth activity rather than the full log). Scoped to the
+`auth.`, `mfa.`, and `session.` action prefixes (logins, MFA, session
+revocation, lockout, admin-gate denials, etc.). Rows are returned in random
+order so a bounded `limit` is a sample across the window, not just the latest N.
+
+> **Sampling caveat (read before using as formal evidence).** The sample is
+> drawn from at most the **10000 most-recent** matching events in the window.
+> When the window holds more than that, the sample is **recency-biased** — it is
+> a uniform sample of the newest 10000 events, *not* of the full window. The
+> response `sampling` object reports this: `candidates_considered` (pool size the
+> sample was drawn from), `scan_cap` (10000), and `recency_capped` (`true` when
+> the pool hit the cap). For a uniform sample of a high-volume period, narrow the
+> `from`/`to` window so it holds ≤ 10000 events. Samples are also
+> **non-reproducible** (no seed) — re-running yields a different draw; the audited
+> `audit.auth_sample.exported` row is the chain-of-custody record of what was pulled.
+
+**Permission:** `AuditLog:Read` — note this is deliberately *not* admin-only, so
+a dedicated read-only auditor role can pull evidence without full admin
+(separation of duties).
+
+The export is itself audited as `audit.auth_sample.exported` (who pulled which
+window, and how many rows) so evidence access stays on the audit chain.
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `from` | integer | No | Window start, epoch seconds, digits only (omit for unbounded) |
+| `to` | integer | No | Window end, epoch seconds, digits only (omit for unbounded) |
+| `limit` | integer | No | Sample size (default 100, max 1000) |
+
+```bash
+curl -s -G \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "from=1717200000" \
+  --data-urlencode "to=1719792000" \
+  --data-urlencode "limit=50" \
+  "https://yuzu.example.com/api/v1/audit/auth-sample" | jq .
+```
+
+**Responses:** `200` sampled list — **same envelope and event field set as
+`GET /api/v1/audit`** (`timestamp`, `principal`, `action`, `result`,
+`target_type`, `target_id`, `detail`); the sample deliberately does **not**
+widen what `AuditLog:Read` discloses (no `session_id` / `source_ip`). The
+envelope additionally carries a `sampling` object (`candidates_considered`,
+`scan_cap`, `recency_capped`). `400` if `from`/`to` are not non-negative
+digits, `from > to`, or `limit` is non-integer; `503` if the audit store is
+unavailable. If the export's own audit row fails to persist, the response
+carries a `Sec-Audit-Failed: true` header (the export still returns).
+
 **Audit action names:**
 
 | Action | Description |
 |---|---|
+| `audit.auth_sample.exported` | Auth evidence sample pulled via `GET /api/v1/audit/auth-sample`. `target_type=AuditLog`, `target_id=auth-sample`; `detail` carries `from=<epoch-or-0> to=<epoch-or-0> limit=<N> returned=<N>`. `result=success`. |
 | `management_group.create` | Group created |
 | `management_group.update` | Group updated (rename, re-parent, membership type change) |
 | `management_group.delete` | Group deleted |
@@ -1522,10 +1621,15 @@ Query audit events.
 | `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
+| `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
+| `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
+| `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
+| `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
+| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`) or `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
@@ -2669,6 +2773,119 @@ See `docs/yaml-dsl-spec.md` § `spec.visualization` for the full configuration s
 
 ---
 
+### Live-Query Bundles
+
+Fan **one** instruction out into several plugin actions on **one** device and collate the results — server-side async fan-out (ADR-0011). Use this instead of issuing N separate `execute_instruction` / `POST /api/instructions/{id}/execute` calls when you need to refresh a single device (e.g. a ServiceNow CI sync): N round-trips collapse to one dispatch plus one (or a few) polls.
+
+The server expands the bundle into N ordinary plugin commands, each dispatched under one shared `bundle-…` correlation id. **The agent is unchanged — it never sees a "bundle", only ordinary commands.** Dispatch is **async**: it returns immediately, and a slow plugin step never withholds the others. The MCP tools `execute_bundle` / `get_bundle_result` are the exact parity of these two endpoints.
+
+#### `POST /api/v1/bundles`
+
+Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bundles/{id}` for the collated result.
+
+**Permission:** `Execution:Execute`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | The single target device — a bundle targets one device. |
+| `steps` | array | Yes | 1–32 step objects, executed in request order. Duplicate `(plugin, action)` is allowed (e.g. two `registry/get_value` reads with different params) — each step gets its own command_id and collates back in order. |
+| `steps[].plugin` | string | Yes | Plugin name, lowercased `[a-z0-9_]`, ≤ 64 chars. |
+| `steps[].action` | string | Yes | Action name, same charset / length rule. |
+| `steps[].params` | object | No | String→string parameter map (non-string values are coerced to strings). |
+
+**Response (202 Accepted):**
+
+```json
+{
+  "data": { "bundle_id": "bundle-1a2b3c4d5e6f7a8b", "agent_id": "agent-001", "expected": 2 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`bundle_id` is the `bundle-…` correlation id — pass it to `GET /api/v1/bundles/{id}` to collate. It is **not** an `ExecutionTracker` `execution_id`: a bundle is deliberately not a tracked execution, so feeding `bundle_id` into `GET /api/v1/events` / execution-status endpoints returns 404. `expected` is the number of steps dispatched.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `400` | Invalid JSON, missing/empty `agent_id`, missing/empty `steps`, more than 32 steps, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
+| `500` | The authenticated session resolved to an empty principal (a bundle must be attributable to its dispatcher). |
+| `503` | Command dispatch or response store unavailable. |
+
+**Audit:** each step emits a `bundle.<plugin>.<action>` event with `target_type=Agent`, `target_id=<agent_id>`, `result=dispatched` (the step reached the agent) or `result=no_agents` (the step reached zero agents — it will read `dispatch_failed` on collate) — the device-access lens, so a bundle is exactly as auditable as the N executions it replaces. One `bundle.dispatch` (`target_type=Execution`) envelope records the dispatch itself (`result=success`, or `result=failure` with the error detail if dispatch threw).
+
+#### `GET /api/v1/bundles/{id}`
+
+Collate a dispatched bundle into a server-grouped result.
+
+**Permission:** `Response:Read`
+
+**Path parameters:**
+
+| Param | Description |
+|---|---|
+| `id` | The `bundle-…` correlation id returned by `POST /api/v1/bundles`. |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "complete": true,
+    "received": 2,
+    "succeeded": 2,
+    "expected": 2,
+    "steps": [
+      { "plugin": "os_info", "action": "uptime",  "state": "responded", "status": 1, "output": "up 3 days" },
+      { "plugin": "os_info", "action": "os_name", "state": "responded", "status": 1, "output": "Windows 11" }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Steps are returned in **request order** (not arrival order), so duplicate or same-plugin steps stay unambiguous. `state` is one of `pending` (no response yet), `responded` (a response landed), or `dispatch_failed` (the step reached no agent — terminal; it does not hold the bundle open). `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame — only meaningful when `state=responded`). `received` counts steps with any response; `succeeded` counts only steps that responded with status SUCCESS. Plugin `output` is transcoded to UTF-8 — any bytes that are not valid UTF-8 (e.g. binary or a non-UTF-8 codepage) are replaced with U+FFFD so the JSON always serializes.
+
+> **`complete` is terminal, NOT success.** A bundle to an **offline device** completes (`complete=true`) with `received=0`, `succeeded=0`, and every step `dispatch_failed`. A caller deciding "did the refresh work" must check `succeeded == expected` (or inspect each `steps[].state`/`status`) — never `complete` alone. Polling `complete` to mark a record refreshed would silently treat an unreachable device as a success.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `404` | Bundle not found, **or** the caller did not dispatch it and is not an admin. The two are deliberately indistinguishable (no enumeration oracle); the real reason is recorded in the audit log. |
+| `503` | Service unavailable. |
+
+**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`) or `result=denied` (not found / not owned).
+
+**Notes:**
+
+- A bundle is **not** a tracked execution — it does not appear in the live executions drawer, and `notify_exec_tracker` skips its `bundle-…` correlation id. The collate poll is the sole completion authority.
+- v1 bundle state (the step map) is **per-surface and in-memory**: a bundle dispatched over REST is collated over REST (MCP→MCP). A server restart mid-bundle loses the in-flight step map (the responses survive in the response store, but attribution does not), and the caller must re-dispatch. A durable Postgres manifest for HA + cross-surface collation is a committed follow-up (ADR-0011).
+
+**Error handling and retry (for integrators):**
+
+- **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
+- **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
+
+**Example:**
+
+```bash
+# dispatch
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent-001","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"os_info","action":"os_name"}]}' \
+  "https://yuzu.example.com/api/v1/bundles"
+# -> {"data":{"bundle_id":"bundle-…","agent_id":"agent-001","expected":2}, ...}
+
+# collate (poll until data.complete == true)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/bundles/bundle-1a2b3c4d5e6f7a8b"
+```
+
+---
+
 ### Device Tokens
 
 Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.
@@ -3381,7 +3598,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
 - **4xx:** `400` on non-integer or negative `limit` / `offset`.
 - **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
-- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. A query with no `agent_id` filter is a bulk operational query and is not individually audited.
+- **Audit (behavioral PII):** a query with a non-empty `agent_id` returns that device's signal history (`detail_json` reveals which apps a person runs) and emits a **`dex.device.view`** audit row (`target_type=Agent`, `target_id=<agent_id>`) — the same verb as the dashboard per-device drill-down. **Fail-closed:** the audit fires before the data is serialized; if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no data (parity with `GET /api/v1/dex/devices/{id}`). A query with no `agent_id` filter is a bulk operational query, not individually audited, and is unaffected by this gate.
 
 #### `GET /api/v1/guaranteed-state/status`
 
@@ -3396,6 +3613,56 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+
+#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+
+Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+
+- **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
+- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
+- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`403`** if the caller lacks `Read` on the device's scope; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
+- **Response keys:**
+  - `baseline` — `{ baseline_id, name, lifecycle }`.
+  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
+  - `agent_id`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+
+**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+
+**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State → Assignment](guaranteed-state.md#assignment)). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
+
+Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
+
+Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+```
+
+```json
+{
+  "data": {
+    "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
+    "deployed": true,
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "total_guards": 3,
+    "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
+    "last_updated": "2026-06-20T13:45:00Z",
+    "guards": [
+      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
+      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},
+      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z"}
+    ]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
 
 #### `GET /api/v1/guaranteed-state/alerts`
 
@@ -3445,7 +3712,7 @@ One signal type's drill-down.
 - **Query parameters:** `window`; `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
 - **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
-- **Audit (behavioral PII):** emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) on every successful access — see the audit boundary note above.
+- **Audit (behavioral PII):** the `devices[]` array names the `agent_id`s exhibiting this signal, so the endpoint emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) before serving — see the audit boundary note above. **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list (parity with `GET /api/v1/dex/devices/{id}`).
 
 #### `GET /api/v1/dex/perf/fleet`
 
@@ -3477,6 +3744,31 @@ The one device list behind every Performance drill: worst devices by a metric (d
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
+
+#### `GET /api/v1/dex/devices/{id}`
+
+Per-device DEX read model — the machine-readable equivalent of the **DEX** lens on the `/device?id=` dashboard page.
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group (a REST worker is held to the same per-device scope as the dashboard lens).
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameters:** `window` — one of `24h` / `7d` / `30d` / `all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, **or** `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below).
+- **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
+- **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the behavioral PII is served (audit-on-open). **Fail-closed:** if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves **no** device data — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council).
+
+#### `POST /api/v1/dex/devices/{id}/live`
+
+Dispatches a read-only instruction to the live agent **now** and synchronously returns the result (~20 s). The machine-readable equivalent of the dashboard **"Get live info"** button. **POST, not GET** — it has a side effect (it dispatches a command), so it must not be fired speculatively by prefetchers/proxies/retry libraries.
+
+- **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
+- **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
+- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
+- **Headers:** `X-Correlation-Id` is echoed on **every** response path.
+- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=requested`, `detail` carries `cid=<correlation_id>`) **before** the command is dispatched — the operator's *request* is the works-council-relevant event, kept separately countable per kind. **Fail-closed:** if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and the command is **not** dispatched (no usage-class probe without durable evidence). The dispatch outcome (reached an agent / offline) is carried by the HTTP response, not the audit row; `command_id` is recoverable from the response store / metrics by `cid`.
+
+> **Scope boundary.** This is the **interactive, single-device** probe and is **concurrency-capped server-wide** (over-budget callers get `429`). It is **not** the fleet-scale path — do not fan a synchronous `/live` call out across thousands of devices. To read many devices at once, dispatch the equivalent read-only instruction to a *scope* via the async execution surface and collect results by `execution_id` (the cap deliberately keeps fan-out off this endpoint).
 
 ---
 
@@ -4638,7 +4930,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `query_audit_log` | Search audit events with filters |
 | `list_definitions` | List instruction definitions |
 | `get_definition` | Get a specific instruction definition |
-| `query_responses` | Query instruction responses |
+| `query_responses` | Collect responses by `execution_id` (one dispatch) or `instruction_id` |
 | `aggregate_responses` | Aggregate response data |
 | `query_inventory` | Query inventory data with filters |
 | `list_inventory_tables` | List available inventory tables |

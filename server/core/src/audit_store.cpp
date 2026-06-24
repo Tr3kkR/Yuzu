@@ -4,7 +4,9 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <chrono>
+#include <random>
 #include <shared_mutex>
 
 namespace yuzu::server {
@@ -161,7 +163,7 @@ uint64_t AuditStore::events_written(const std::string& result) const noexcept {
     return 0;
 }
 
-std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
+std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_pool_size) const {
     std::shared_lock lock(mtx_);
     std::vector<AuditEvent> results;
     if (!db_)
@@ -199,18 +201,56 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
         sql += " AND timestamp <= ?";
         int_binds.emplace_back(bind_idx++, q.until);
     }
+    // Prefix OR-group (e.g. auth./mfa./session. for the auth-log sample, #4).
+    // Prefixes are code-controlled constants, not user input, so they carry no
+    // LIKE metacharacters to escape; each binds as `<prefix>%`.
+    if (!q.action_prefixes.empty()) {
+        sql += " AND (";
+        bool first = true;
+        for (const auto& p : q.action_prefixes) {
+            // Runtime enforcement of the header contract (Hermes M-2): a prefix is
+            // bound into an unescaped `LIKE <p>%`, so a `%`/`_`/`\` in it would be a
+            // wildcard. Prefixes are meant to be literals — drop any that carry LIKE
+            // metacharacters (fails closed for that prefix) rather than trusting the
+            // caller, so a future call site that wires untrusted input cannot smuggle
+            // wildcards.
+            if (p.empty() || p.find_first_of("%_\\") != std::string::npos)
+                continue;
+            sql += first ? "action LIKE ?" : " OR action LIKE ?";
+            text_binds.emplace_back(bind_idx++, p + "%");
+            first = false;
+        }
+        // All prefixes empty → an always-false guard so an explicitly-empty
+        // filter never silently widens to "all actions".
+        sql += first ? "0)" : ")";
+    }
+    // Always order by the indexed timestamp (early-terminating index scan) — never
+    // `ORDER BY RANDOM()`, which would force a full scan of every matching row in
+    // the window while holding the reader lock (Hermes M-1: DoS / cleanup-thread
+    // starvation on a large table). For random_sample we instead bind a bounded
+    // candidate cap here and shuffle+truncate in C++ below. OFFSET is meaningless
+    // under random order, so it is skipped there.
+    const int64_t kRandomSampleScanCap = static_cast<int64_t>(kAuditSampleScanCap);
     sql += " ORDER BY timestamp DESC";
     sql += " LIMIT ?";
     int limit_idx = bind_idx++;
     int offset_idx = 0;
-    if (q.offset > 0) {
+    if (q.offset > 0 && !q.random_sample) {
         sql += " OFFSET ?";
         offset_idx = bind_idx++;
     }
 
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        // UP-5: a prepare failure (corruption, locked-past-timeout, schema drift)
+        // otherwise returns an empty vector indistinguishable from "no rows" — a
+        // false "no audit activity" for an evidence query. Make it observable; a
+        // fully-broken store is already pulled from /readyz, and the error-signaling
+        // query() contract (so the REST layer can 503 instead of 200-empty) is the
+        // tracked follow-up.
+        spdlog::error("AuditStore::query prepare failed: {}", sqlite3_errmsg(db_));
         return results;
+    }
 
     for (const auto& [idx, val] : text_binds) {
         sqlite3_bind_text(stmt, idx, val.c_str(), -1, SQLITE_TRANSIENT);
@@ -218,7 +258,14 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
     for (const auto& [idx, val] : int_binds) {
         sqlite3_bind_int64(stmt, idx, val);
     }
-    sqlite3_bind_int64(stmt, limit_idx, q.limit);
+    // Under random_sample, over-fetch a bounded candidate pool (capped, indexed)
+    // and sample from it in C++ — bounding both CPU and lock-hold. When the window
+    // holds more than the cap, the pool is the most-recent kRandomSampleScanCap
+    // events (a documented recency bias above the cap; true uniform sampling of an
+    // unbounded window would reintroduce the M-1 full-scan).
+    const int64_t fetch_limit =
+        q.random_sample ? std::max(static_cast<int64_t>(q.limit), kRandomSampleScanCap) : q.limit;
+    sqlite3_bind_int64(stmt, limit_idx, fetch_limit);
     if (offset_idx > 0) {
         sqlite3_bind_int64(stmt, offset_idx, q.offset);
     }
@@ -244,6 +291,22 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
         results.push_back(std::move(e));
     }
     sqlite3_finalize(stmt);
+
+    // random_sample: shuffle the bounded candidate pool and truncate to limit, so
+    // the returned rows are a random draw rather than the newest-N (Hermes M-1 —
+    // the randomness is now O(pool) in C++, not an unbounded SQL sort under lock).
+    if (q.random_sample) {
+        // Report the pre-truncation pool size so the caller can detect the
+        // recency cap (pool == kAuditSampleScanCap ⇒ the window held >= cap and
+        // the sample is recency-biased) — evidence honesty, #4.
+        if (out_pool_size)
+            *out_pool_size = results.size();
+        if (results.size() > static_cast<std::size_t>(std::max(q.limit, 0))) {
+            static thread_local std::mt19937_64 rng{std::random_device{}()};
+            std::shuffle(results.begin(), results.end(), rng);
+            results.resize(static_cast<std::size_t>(std::max(q.limit, 0)));
+        }
+    }
     return results;
 }
 

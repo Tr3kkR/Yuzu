@@ -27,6 +27,10 @@
 #include <optional>
 #include <string>
 
+namespace yuzu {
+class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
+}
+
 namespace yuzu::server::mcp {
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
@@ -46,6 +50,35 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using AgentsJsonFn = std::function<nlohmann::json()>;
+
+    /// Per-agent response-scope predicate (#1550 HIGH-1 / #1634). Returns true iff
+    /// the principal `username` may read responses for `agent_id`. Production wires
+    /// it to rbac_store->check_scoped_permission(username,"Response","Read",agent_id,
+    /// mgmt_store) — the same chokepoint the per-device REST/dashboard routes use —
+    /// so an operator collecting an execution's rows by execution_id sees only the
+    /// agents inside their management groups. The handler resolves the principal
+    /// ONCE (it already authed the request) and passes `username` in, so the
+    /// predicate does NOT re-resolve the session per call. RBAC-off → returns true
+    /// (legacy-open, matching require_scoped_permission).
+    ///
+    /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
+    /// predicate applies NO filter. This diverges from DeviceRoutes' required
+    /// ScopedPermFn (which fails closed) because build_handler/register_routes carry
+    /// a long tail of optional `= {}` deps and C++ forbids a required param after a
+    /// defaulted one — so the param cannot be made required without reordering the
+    /// whole signature. The SOLE production caller (server.cpp) always wires it; the
+    /// unwired path is a test-only affordance (legacy-open). Do not add a new
+    /// production registration without wiring this.
+    ///
+    /// The filter is applied AFTER the store's LIMIT, so a fan-out wider than the
+    /// row cap that spans out-of-scope agents may truncate the caller's in-scope
+    /// view; the result then carries `result_truncated_by_cap:true` so the caller
+    /// can detect it. Completeness for >cap collection is the keyset follow-up
+    /// (#1634); the cross-operator ISOLATION guarantee (never another operator's
+    /// rows) holds regardless. NOTE: service-scoped tokens are scoped by the token
+    /// creator's RBAC, not the service tag (pre-existing, tracked in #1634).
+    using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     ///
@@ -99,7 +132,9 @@ public:
                             const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
                             CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
-                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                            ResponseScopeFn response_scope_fn = {},
+                            yuzu::MetricsRegistry* metrics = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -114,7 +149,9 @@ public:
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         ResponseScopeFn response_scope_fn = {},
+                         yuzu::MetricsRegistry* metrics = nullptr);
 };
 
 } // namespace yuzu::server::mcp

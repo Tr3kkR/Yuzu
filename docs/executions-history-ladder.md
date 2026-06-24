@@ -57,6 +57,28 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
+### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`)
+
+`notify_exec_tracker` skips two server-minted correlation-id prefixes that ride
+the `execution_id` column on `responses` (so their rows are retrievable via
+`ResponseStore::query_by_execution`) but are **NOT operator executions** —
+creating a tracker row for them would publish a phantom `agent-transition` SSE
+event and leave an orphan `agent_exec_status` row that the executions drawer /
+`/api/v1/events` would surface:
+
+- **`polchk-`** — minted by `PolicyEvaluator`; compliance-check responses only.
+- **`bundle-`** — minted by `BundleOrchestrator` (ADR-0011); the N ordinary
+  command responses of one live-query bundle. A bundle is N commands to ONE
+  agent, so the agent-counted tracker would mark it complete after the first
+  step — collate (`received`/`succeeded` vs `expected`) is the bundle's sole
+  completion authority, deliberately outside this ladder.
+
+Both ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
+and their namespaces are disjoint from real tracker ids (32-hex, no prefix), so a
+caller cannot collide a real execution into the skip. **Any new correlation-id
+prefix that stamps `responses` for internal retrieval but is not an operator
+execution must be added here and guard `notify_exec_tracker` the same way.**
+
 ### Terminal-frame finalize invariant (UAT 2026-05-06)
 
 A `CommandResponse` with `status` ∈ {`SUCCESS`,`FAILURE`,`TIMEOUT`,`REJECTED`}
@@ -92,6 +114,20 @@ partial-index predicate. Every query against this index must include
 `AND execution_id != ''` redundantly, or SQLite falls back to a full table
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
+
+**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
+SQL.** The MCP `query_responses` collect path filters the returned rows per-agent
+through `check_scoped_permission` (cross-operator isolation, #1550) *after* the
+store has already applied `ORDER BY timestamp DESC LIMIT`. So for an execution
+that fans out wider than the row cap and spans both in- and out-of-scope agents,
+the cap can be consumed by out-of-scope rows and the in-scope caller's view is
+truncated (or a row present in one poll vanishes from the next as newer
+out-of-scope rows shift the window). The isolation guarantee holds regardless
+(never another operator's rows); completeness does not. The handler flags this
+with `result_truncated_by_cap:true` so a collector can detect it; the durable fix
+(scope-aware keyset pagination, and pushing the scope predicate into the WHERE
+clause) is the #1634 follow-up. The same applies to every other operator-facing
+reader of this store once #1634 scopes them.
 
 ## PR 3 — SSE live updates
 

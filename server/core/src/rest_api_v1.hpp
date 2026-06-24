@@ -49,10 +49,15 @@
 // explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
+// Baseline-anchored per-device Guardian status route borrows the BaselineStore.
+// Forward-declared (used only as a pointer in register_routes); the .cpp includes
+// baseline_store.hpp for the definition.
+class BaselineStore;
 }
 
 #include <httplib.h>
 
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <string>
@@ -62,6 +67,18 @@ class ExecutionEventBus;
 
 namespace yuzu::server {
 
+namespace detail {
+// --- /api/v1/dex/devices/{id}/live tuning (TEST SEAM, not a request knob) ---
+// The synchronous live-read handler bounds its blast radius with an in-flight cap
+// (UP-1/2/3: keeps httplib workers free for the dashboard, SSE and health probes)
+// and a bounded poll. These default to production values; unit tests lower them to
+// exercise the 429 (cap) and 504 (timeout) branches without real concurrency or a
+// ~20s wall. Process-global by design — the cap is a whole-server budget.
+std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
+std::atomic<int>& live_poll_max_polls();   // default 40
+std::atomic<int>& live_poll_interval_ms(); // default 500
+} // namespace detail
+
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.
 class RestApiV1 {
 public:
@@ -70,6 +87,20 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    /// Per-device-scoped permission check (mirrors DeviceRoutes::ScopedPermFn): a
+    /// global grant passes fleet-wide, otherwise the principal must hold the
+    /// permission via a management group the agent is in. Per-device REST reads gate
+    /// on this so a management-group-scoped operator is not fail-closed out of
+    /// devices they can legitimately see. The empty/default `{}` exists ONLY for
+    /// source-stability of the other (unrelated) call sites — a route that requires
+    /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED (503); it
+    /// does NOT silently fall back to the flat PermFn (that would re-introduce the
+    /// group-scoped lockout this typedef exists to fix). See the baseline-device route
+    /// in rest_api_v1.cpp for the fail-closed contract.
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -131,6 +162,13 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
+    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
+    /// the underlying auth.db write succeeded. Empty/missing callback =
+    /// `POST /api/v1/users/<name>/unlock` returns 503.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -168,7 +206,11 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -195,7 +237,11 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {});
+        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 };
 
 } // namespace yuzu::server

@@ -1,6 +1,6 @@
 /* ── Compose File Generator ── */
 
-function generate() {
+async function generate() {
   const pgMode = val('pg-mode');
   const pgSuperPass = val('pg-superuser-pass');
   const pgAppPass = val('pg-app-pass');
@@ -23,7 +23,60 @@ function generate() {
     return;
   }
 
+  const tlsMode = val('tls-mode');
+  const gateway = chk('include-gateway');
+
+  if (tlsMode === 'operator' && (!val('tls-cert') || !val('tls-key'))) {
+    alert('Operator certs: set BOTH the certificate and key path on the Core step, or switch to Default certs (the server then auto-generates them).');
+    return;
+  }
+
+  // H2: with operator certs the server requires a CA (require_client_cert =
+  // !using_default_agent_certs = true) and refuses to start without one unless
+  // --insecure-skip-client-verify + YUZU_ALLOW_INSECURE_TLS=1 are set. Don't emit
+  // a non-booting server — require the CA path.
+  if (tlsMode === 'operator' && !val('tls-ca-cert')) {
+    alert('Operator certs: the CA certificate path is required — the server refuses to start with operator certs and no CA (mTLS client verification is mandatory). Supply it, or run the server with --insecure-skip-client-verify + YUZU_ALLOW_INSECURE_TLS=1 yourself.');
+    return;
+  }
+
+  // C1/N2: the secure gateway↔server topology (mutual-TLS upstream, --cert-group
+  // cert sharing, TLS mgmt listener) depends on server features that live in the
+  // PKI go-live PR (#1314) and are NOT on the current images — emitting them
+  // produces a stack that crash-loops at argv parse (--cert-group) or fails command
+  // forwarding (server dials the mgmt port plaintext). Until that ships, the gateway
+  // is only generated for Plaintext mode. (Tracked: re-enable once #1314 lands.)
+  if (gateway && tlsMode !== 'plaintext') {
+    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. For a secure gateway today, follow deploy/docker/docker-compose.reference.yml + gateway/config/sys.config.prod.');
+    return;
+  }
+
+  // N1: cert-san values are interpolated into the server command list; an unescaped
+  // quote+newline payload could break out and inject standalone flags (e.g.
+  // --no-tls → silent plaintext). Validate each token to DNS/IP shape before use.
+  const sanCheck = validateCertSans(val('cert-san'));
+  if (sanCheck.bad.length) {
+    alert('Invalid --cert-san value(s): ' + sanCheck.bad.join(', ') +
+          '\nUse only DNS names / IPs, optionally prefixed dns:/ip: (letters, digits, dot, hyphen, colon). No quotes, spaces, or control characters.');
+    return;
+  }
+
+  // #1488: the admin credential row is PBKDF2-HMAC-SHA256 (100k iters), derived
+  // in-browser via SubtleCrypto. Requires a secure context (https / localhost /
+  // file://) — fail loudly rather than emit a stale, non-validating hash.
+  if (!window.crypto || !crypto.subtle) {
+    alert('Cannot hash the admin password: this browser exposes no Web Crypto Subtle API. Serve the wizard over http://localhost (e.g. `python3 -m http.server`) or open it via file:// in a modern browser, then retry.');
+    return;
+  }
+  const authLine = await computeAuthLine(val('admin-user'), 'admin', val('admin-pass'));
+
+  // #1483: a fresh Erlang distribution cookie so the gateway doesn't fail-closed
+  // on the insecure default. Lands only in .env.
+  const gwCookie = randHex(32);
+
   const config = {
+    authLine: authLine,
+    gwCookie: gwCookie,
     version: val('yuzu-version'),
     adminUser: val('admin-user'),
     adminPass: val('admin-pass'),
@@ -31,9 +84,12 @@ function generate() {
     grpcPort: num('grpc-port'),
     mgmtPort: num('mgmt-port'),
     gwUpstreamPort: num('gateway-upstream-port'),
-    tls: chk('enable-tls'),
+    tlsMode: tlsMode,
     tlsCert: val('tls-cert'),
     tlsKey: val('tls-key'),
+    tlsCaCert: val('tls-ca-cert'),
+    certSans: val('cert-san'),
+    persistCerts: chk('persist-certs'),
     dataDir: val('data-dir'),
     pgMode: pgMode,
     pgBundled: pgMode === 'bundled',
@@ -68,6 +124,29 @@ function generate() {
   document.getElementById('env-output').textContent = env;
   document.getElementById('output').style.display = '';
   document.getElementById('output').scrollIntoView({ behavior: 'smooth' });
+}
+
+// Hex-encode `n` cryptographically-random bytes.
+function randHex(n) {
+  return Array.from(crypto.getRandomValues(new Uint8Array(n)),
+                    b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// #1488: produce a server auth-config row `username:role:salt_hex:hash_hex`
+// matching the server's KDF exactly — PBKDF2-HMAC-SHA256, 100000 iterations,
+// 32-byte derived key, random 16-byte salt (auth.cpp pbkdf2_sha256 /
+// kPbkdf2Iterations). The previous hardcoded row put the *password* in the role
+// field and shipped a hash for no current KDF, so `admin/admin` 401'd.
+async function computeAuthLine(user, role, password) {
+  const enc = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, 256);
+  const hex = buf => Array.from(new Uint8Array(buf),
+                                b => b.toString(16).padStart(2, '0')).join('');
+  return `${user}:${role}:${hex(salt)}:${hex(bits)}`;
 }
 
 function generateEnv(c) {
@@ -112,13 +191,50 @@ ${c.gateway ? `
 YUZU_GW_AGENT_PORT=${c.gwAgentPort}
 YUZU_GW_MGMT_PORT=${c.gwMgmtPort}
 YUZU_GW_HEALTH_PORT=${c.gwHealthPort}
-YUZU_GW_METRICS_PORT=${c.gwMetricsPort}` : ''}`;
+YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
+# Erlang distribution cookie — the gateway fail-closes on the insecure default.
+# Generated unique per stack; keep it out of git. Rotate with: openssl rand -hex 32
+# (Single ephemeral node? You may instead set YUZU_GW_ALLOW_DEFAULT_COOKIE=1.)
+YUZU_GW_COOKIE=${c.gwCookie}` : ''}`;
+}
+
+// N1: validate operator-supplied --cert-san tokens to DNS/IP shape so they can't
+// break out of the YAML scalar / argv list and inject standalone flags. Returns
+// { sans: [valid, deduped], bad: [rejected] }. The server's parse_extra_sans does
+// the authoritative parse; this only stops the pre-server YAML breakout.
+function validateCertSans(raw) {
+  const sans = [], bad = [];
+  for (const piece of (raw || '').split(',')) {
+    const s = piece.trim();
+    if (!s) continue;
+    const m = /^(?:(?:dns|ip):)?(.+)$/i.exec(s);
+    const value = m ? m[1] : s;
+    // DNS-label / IPv4 / IPv6 characters only; reject flag-like leading '-'.
+    const ok = /^[A-Za-z0-9._:-]+$/.test(value) && !value.startsWith('-');
+    if (ok) { if (!sans.includes(s)) sans.push(s); }
+    else bad.push(s);
+  }
+  return { sans, bad };
+}
+
+// Effective (validated) --cert-san set for the auto-generated default certs.
+// Gateway service names aren't added — gateway + TLS isn't generated yet (the
+// secure gateway topology is #1314; see the C1/N2 guard in generate()).
+function effectiveCertSans(c) {
+  return validateCertSans(c.certSans || '').sans;
 }
 
 function generateCompose(c) {
-  // Admin hash - using the default for admin:admin, with a note for custom passwords
-  const adminHash = `admin:admin:ab3585560da45a7b7da0a220c922dd72:25e957743ebefd48d938b30cdd117ef4487897da209e0e8883dd473363dceb8a`;
-  // TODO: For custom passwords, users need to run: yuzu-server hash-password <username> <password>
+  // HTTPS is served unless plaintext mode explicitly disables it. In TLS modes
+  // the dashboard/API is HTTPS on container port 8443 (8080 is an HTTP→HTTPS
+  // redirect); plaintext serves HTTP on 8080 (#1484).
+  const tls = c.tlsMode !== 'plaintext';
+  const webScheme = tls ? 'https' : 'http';
+  const webContainerPort = tls ? 8443 : 8080;
+  // Named cert volume: default mode + persist-certs + named-volumes enabled.
+  // (Gateway + TLS isn't generated — see the C1/N2 guard — so there's no
+  // cross-container cert sharing to force a named volume.)
+  const certVolNamed = c.tlsMode === 'default' && c.persistCerts && c.persistentVolumes;
 
   let y = `## Yuzu Stack — Generated by Yuzu Compose Wizard
 ##
@@ -129,13 +245,23 @@ function generateCompose(c) {
 ##   docker compose logs -f
 ##   docker compose down -v    # ⚠️ -v removes data volumes!
 ##
-## Dashboard:   http://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
+${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
+##    auto-generating a per-install CA + leaf certs on first boot and serving HTTPS
+##    on 8443 — behaviour from the secure-by-default release (v0.13.0+, tracked by
+##    the 'latest' tag). Older images (incl. 0.12.0) don't support it; use Plaintext
+##    mode there. (Plaintext works on any image.)
+##
+` : ``}## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
 ${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / ${c.grafanaPass})` : ''}
 ${c.prometheus ? `## Prometheus:  http://localhost:${c.promPort}` : ''}
 ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser} / ${c.chPass})` : ''}
 ##
 ## Connect an agent:
-##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --no-tls
+${c.tlsMode === 'plaintext'
+  ? `##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --no-tls`
+  : `##   # TLS is on. Give the agent the server's CA so it can verify the cert:
+##   #   curl -sk ${webScheme}://localhost:${c.dashboardPort}/api/v1/ca/root -o ca.pem
+##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ca.pem`}
 ##   (approve the agent in Settings, then restart the agent)
 ##
 
@@ -148,7 +274,9 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   y += `  # See: https://github.com/Tr3kkR/Yuzu/issues/388\n`;
   y += `  server-cfg:\n`;
   y += `    content: |\n`;
-  y += `      ${c.adminUser}:${c.adminPass}:ab3585560da45a7b7da0a220c922dd72:25e957743ebefd48d938b30cdd117ef4487897da209e0e8883dd473363dceb8a\n`;
+  y += `      # ${c.adminUser} / <the password you entered> — PBKDF2-HMAC-SHA256, 100k iters.\n`;
+  y += `      # Regenerate with: yuzu-server hash-password ${c.adminUser} <password>\n`;
+  y += `      ${c.authLine}\n`;
   y += `      \n`;
   y += `      [rbac]\n`;
   y += `      enabled = true\n`;
@@ -177,6 +305,10 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `              {backpressure_threshold, 1000},\n`;
     y += `              {hash_ring_vnodes, 256}\n`;
     y += `          ]},\n`;
+    // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
+    // so this path is only reached in plaintext mode — the gateway dials the server
+    // over plain HTTP/2 and its listeners are plaintext.
+    // ⚠️ Do NOT internet-expose :50051 in this mode (command fan-out = fleet RCE).
     y += `          {grpcbox, [\n`;
     y += `              {client, #{channels => [\n`;
     y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
@@ -220,8 +352,15 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      scrape_configs:\n`;
     y += `        - job_name: 'yuzu-server'\n`;
     y += `          metrics_path: '/metrics'\n`;
+    if (tls) {
+      // TLS modes: the server serves /metrics over HTTPS on 8443 (8080 just
+      // redirects). Scrape https and skip verification (internal default CA).
+      y += `          scheme: https\n`;
+      y += `          tls_config:\n`;
+      y += `            insecure_skip_verify: true\n`;
+    }
     y += `          static_configs:\n`;
-    y += `            - targets: ['server:8080']\n`;
+    y += `            - targets: ['server:${webContainerPort}']\n`;
     y += `              labels:\n`;
     y += `                component: 'server'\n`;
     if (c.gateway) {
@@ -340,7 +479,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   y += `    container_name: yuzu-server\n`;
   y += `    restart: unless-stopped\n`;
   y += `    ports:\n`;
-  y += `      - "${c.dashboardPort}:8080"     # Web dashboard + REST API\n`;
+  y += `      - "${c.dashboardPort}:${webContainerPort}"     # Web dashboard + REST API (${webScheme.toUpperCase()})\n`;
   y += `      - "${c.grpcPort}:50051"   # Agent gRPC (direct-connect agents)\n`;
   y += `      - "${c.mgmtPort}:50052"   # Management gRPC\n`;
   y += `      - "${c.gwUpstreamPort}:${c.gwUpstreamPort}"   # Gateway upstream\n`;
@@ -362,19 +501,45 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   y += `    command:\n`;
   y += `      - "--listen"\n`;
   y += `      - "0.0.0.0:50051"\n`;
-  if (c.tls) {
+  if (c.tlsMode === 'plaintext') {
+    // Insecure dev mode — overrides secure-by-default. Do NOT expose :50051.
+    y += `      - "--no-tls"\n`;
+    y += `      - "--no-https"\n`;
+  } else if (c.tlsMode === 'operator') {
+    // Operator-supplied PEM material, bind-mounted read-only below.
     y += `      - "--cert"\n`;
     y += `      - "${c.tlsCert}"\n`;
     y += `      - "--key"\n`;
     y += `      - "${c.tlsKey}"\n`;
+    if (c.tlsCaCert) {
+      y += `      - "--ca-cert"\n`;
+      y += `      - "${c.tlsCaCert}"\n`;
+    }
   } else {
-    y += `      - "--no-tls"\n`;
-    y += `      - "--no-https"\n`;
+    // Default mode: emit NO --cert/--key/--no-tls. The server auto-generates a
+    // per-install CA + leaf certs on first boot (encrypted-by-default). Extra
+    // SANs make those leaves validate for the names agents actually dial.
+    const sans = effectiveCertSans(c);
+    if (sans.length) {
+      y += `      # Auto-generated default certs get these extra SANs so agents can\n`;
+      y += `      # validate the gateway/server hostname (see PKI default-certs).\n`;
+      for (const s of sans) {
+        y += `      - "--cert-san"\n`;
+        y += `      - "${s}"\n`;
+      }
+    }
   }
   y += `      - "--web-address"\n`;
   y += `      - "0.0.0.0"\n`;
-  y += `      - "--web-port"\n`;
-  y += `      - "8080"\n`;
+  if (tls) {
+    // TLS modes: dashboard/API is HTTPS on 8443 (8080 stays an auto HTTP→HTTPS
+    // redirect). #1484.
+    y += `      - "--https-port"\n`;
+    y += `      - "8443"\n`;
+  } else {
+    y += `      - "--web-port"\n`;
+    y += `      - "8080"\n`;
+  }
   y += `      - "--config"\n`;
   y += `      - "/etc/yuzu/yuzu-server.cfg"\n`;
   y += `      - "--data-dir"\n`;
@@ -409,11 +574,32 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
   } else {
     y += `      - ${c.dataDir}\n`;
   }
+  // Cert directory (/etc/yuzu/certs = auth::default_cert_dir()). In default mode
+  // the auto-generated CA lives here and MUST persist across recreates, or every
+  // `down && up` mints a new CA and breaks enrolled-agent trust. In operator mode
+  // bind-mount the host PEM material read-only.
+  if (c.tlsMode === 'default') {
+    if (certVolNamed) {
+      // Named volume: persists the auto-generated CA across recreates.
+      y += `      - server-certs:/etc/yuzu/certs\n`;
+    } else if (c.persistCerts) {
+      y += `      - /etc/yuzu/certs\n`;
+    }
+    // else: persist off → certs live in the container layer (ephemeral).
+  } else if (c.tlsMode === 'operator') {
+    y += `      # Put server.pem / server.key (and ca.pem for mTLS) in ./certs.\n`;
+    y += `      - ./certs:/etc/yuzu/certs:ro\n`;
+  }
   y += `    healthcheck:\n`;
-  y += `      test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]\n`;
+  // #1487: the server image ships bash but NOT curl, so probe the listening port
+  // with a bash /dev/tcp TCP connect (matches docker-compose.uat.yml). Targets the
+  // real serving port: 8443 in TLS modes, 8080 in plaintext (#1484). A TCP-connect
+  // check avoids speaking HTTP to the wrong scheme.
+  y += `      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${webContainerPort}"]\n`;
   y += `      interval: 10s\n`;
-  y += `      timeout: 5s\n`;
-  y += `      retries: 5\n`;
+  y += `      timeout: 3s\n`;
+  y += `      retries: 30\n`;
+  y += `      start_period: 10s\n`;
   // Gate server start on Postgres (bundled mode) and ClickHouse readiness so
   // migrations don't race an unready substrate.
   if (c.pgBundled || c.clickhouse) {
@@ -481,15 +667,27 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - "${c.gwHealthPort}:8081"     # Health/readiness\n`;
     y += `      - "${c.gwMetricsPort}:9568"     # Prometheus metrics\n`;
     y += `    environment:\n`;
-    y += `      - YUZU_GW_TLS_ENABLED=${c.gwTls ? 'true' : 'false'}\n`;
+    // #1483: a real distribution cookie from .env (the gateway fail-closes on the
+    // insecure default). YUZU_GW_TLS_ENABLED is advisory only (#1291); the gateway
+    // here is plaintext (gateway + TLS isn't generated — see the C1/N2 guard).
+    y += `      - YUZU_GW_COOKIE=\${YUZU_GW_COOKIE}\n`;
+    y += `      - YUZU_GW_TLS_ENABLED=false\n`;
     y += `    configs:\n`;
     y += `      - source: gateway-sys-config\n`;
     y += `        target: /opt/yuzu_gw/releases/0.2.0/sys.config\n`;
+    // #1486: probe /healthz with busybox wget (the gateway image ships busybox,
+    // which provides `wget --spider`; it has NO bash/curl, so the old
+    // `echo > /dev/tcp` CMD-SHELL probe always failed). Matches docker-compose.uat.yml.
     y += `    healthcheck:\n`;
-    y += `      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]\n`;
+    y += `      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]\n`;
     y += `      interval: 10s\n`;
     y += `      timeout: 5s\n`;
     y += `      retries: 5\n`;
+    y += `      start_period: 10s\n`;
+    // Gate the gateway on the server being healthy so its upstream is reachable.
+    y += `    depends_on:\n`;
+    y += `      server:\n`;
+    y += `        condition: service_healthy\n`;
   }
 
   // Prometheus
@@ -505,7 +703,9 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: prometheus-config\n`;
     y += `        target: /etc/prometheus/prometheus.yml\n`;
     y += `    volumes:\n`;
-    y += `      - prometheus-data:/prometheus\n`;
+    // M1: only a NAMED volume when named volumes are enabled; otherwise anonymous,
+    // so the top-level volumes: block (which only declares names) stays consistent.
+    y += c.persistentVolumes ? `      - prometheus-data:/prometheus\n` : `      - /prometheus\n`;
     y += `    depends_on:\n`;
     y += `      - server\n`;
     if (c.gateway) y += `      - gateway\n`;
@@ -536,7 +736,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: grafana-dashboard-analytics\n`;
     y += `        target: /var/lib/grafana/dashboards/yuzu-analytics-dashboard.json\n`;
     y += `    volumes:\n`;
-    y += `      - grafana-data:/var/lib/grafana\n`;
+    y += c.persistentVolumes ? `      - grafana-data:/var/lib/grafana\n` : `      - /var/lib/grafana\n`;
     y += `    depends_on:\n`;
     y += `      - prometheus\n`;
   }
@@ -559,7 +759,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: clickhouse-init\n`;
     y += `        target: /docker-entrypoint-initdb.d/init.sql\n`;
     y += `    volumes:\n`;
-    y += `      - clickhouse-data:/var/lib/clickhouse\n`;
+    y += c.persistentVolumes ? `      - clickhouse-data:/var/lib/clickhouse\n` : `      - /var/lib/clickhouse\n`;
     y += `    ulimits:\n`;
     y += `      nofile:\n`;
     y += `        soft: 262144\n`;
@@ -571,14 +771,16 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      retries: 5\n`;
   }
 
-  // Volumes
+  // Volumes — only named volumes are declared here; services use anonymous volumes
+  // when named volumes are off (M1), so every name referenced above is declared.
   if (c.persistentVolumes) {
     y += `\nvolumes:\n`;
     y += `  server-data:\n`;
-    if (c.pgBundled) y += `  postgres-data:\n`;
-    if (c.prometheus) y += `  prometheus-data:\n`;
-    if (c.grafana) y += `  grafana-data:\n`;
-    if (c.clickhouse) y += `  clickhouse-data:\n`;
+    if (certVolNamed) y += `  server-certs:\n`;
+    if (c.persistentVolumes && c.pgBundled) y += `  postgres-data:\n`;
+    if (c.persistentVolumes && c.prometheus) y += `  prometheus-data:\n`;
+    if (c.persistentVolumes && c.grafana) y += `  grafana-data:\n`;
+    if (c.persistentVolumes && c.clickhouse) y += `  clickhouse-data:\n`;
   }
 
   return y;

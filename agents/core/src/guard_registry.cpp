@@ -39,6 +39,11 @@
 #endif
 #include <windows.h>
 
+// Self-sufficient link (#1287): this TU calls advapi32 directly (RegOpenKeyExW,
+// RegNotifyChangeKeyValue, RegQueryValueExW, RegSetValueExW). Don't rely on a
+// sibling TU's pragma to carry advapi32 across the whole yuzu_agent_core link line.
+#pragma comment(lib, "advapi32.lib")
+
 #include "guard_win_handle.hpp"
 
 #include <algorithm>

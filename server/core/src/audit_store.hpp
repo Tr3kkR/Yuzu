@@ -38,7 +38,32 @@ struct AuditQuery {
     int64_t until{0};
     int limit{100};
     int offset{0};
+    // Match any action that starts with one of these prefixes (OR-combined),
+    // e.g. {"auth.","mfa.","session."} to scope to the authentication surface
+    // (sampled auth-log evidence export, #4 / SOC 2 CC7.2). Empty = no prefix
+    // filter. Combines with `action` (exact) if both are set.
+    //
+    // CONTRACT (Hermes I-1): prefixes are bound as a SQL `LIKE <prefix>%` pattern
+    // and are NOT escaped, so a caller must only ever pass code-controlled literal
+    // prefixes — never untrusted input, which could smuggle `%`/`_` wildcards.
+    // A degenerate all-empty list does NOT widen to "all actions" (query() emits
+    // an always-false guard), so it fails closed.
+    std::vector<std::string> action_prefixes;
+    // When true, the result is a pseudo-random sample rather than newest-first:
+    // query() fetches a bounded candidate pool in indexed timestamp order (capped
+    // at kAuditSampleScanCap to bound CPU + reader-lock hold — NOT `ORDER BY
+    // RANDOM()`, which would full-scan the window), then shuffles in C++ and
+    // truncates to `limit`. When the window holds more than the cap, the pool is
+    // the most-recent kAuditSampleScanCap events (a recency bias above the cap —
+    // callers presenting this as evidence must surface it). `offset` is ignored.
+    bool random_sample{false};
 };
+
+// Candidate-pool cap for AuditQuery::random_sample. A sample is drawn from at
+// most this many most-recent matching rows; above it the sample is recency-biased
+// (see random_sample). Public so the REST layer can report `recency_capped` to an
+// auditor (#4 / SOC 2 CC7.2 evidence honesty).
+inline constexpr std::size_t kAuditSampleScanCap = 10000;
 
 class AuditStore {
 public:
@@ -62,7 +87,14 @@ public:
     /// already failed the operation) may discard the bool; the
     /// `[[nodiscard]]` flag makes the discard locally visible.
     [[nodiscard]] bool log(const AuditEvent& event);
-    std::vector<AuditEvent> query(const AuditQuery& q = {}) const;
+    /// Query audit events. When `q.random_sample` is set and `out_pool_size` is
+    /// non-null, `*out_pool_size` receives the size of the candidate pool the
+    /// sample was drawn from BEFORE shuffle/truncate (<= kAuditSampleScanCap) —
+    /// so the caller can report `recency_capped = (*out_pool_size == kAuditSampleScanCap)`
+    /// for evidence honesty (#4). For non-sample queries `*out_pool_size` is left
+    /// untouched.
+    std::vector<AuditEvent> query(const AuditQuery& q = {},
+                                  std::size_t* out_pool_size = nullptr) const;
     std::size_t total_count() const;
 
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for

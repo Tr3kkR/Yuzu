@@ -253,7 +253,7 @@ for the tool to execute.
 | 3 | `query_audit_log` | Query the audit log with filters (principal, action, target, time range). | `AuditLog:Read` |
 | 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). | `InstructionDefinition:Read` |
 | 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. | `InstructionDefinition:Read` |
-| 6 | `query_responses` | Query command response data with filters (requires instruction_id). | `Response:Read` |
+| 6 | `query_responses` | Query command response data. Pass `execution_id` to collect exactly the responses from one `execute_instruction` dispatch (closes the dispatch→collect loop), or `instruction_id` for all responses to a definition. At least one required (execution_id wins if both given); returns up to `limit` rows (max 1000). **Results are management-group scoped** — only rows for agents inside your groups are returned; out-of-scope rows are silently dropped (and audited `result=denied`). The result object may carry two outer fields: `audit_persisted:false` if the access-audit row could not be written (SOC 2 evidence gap — investigate), and `result_truncated_by_cap:true` if the raw query hit the 1000-row cap (the page is incomplete — do **not** treat `count<limit` as "done"; paginate via the keyset follow-up). | `Response:Read` |
 | 7 | `aggregate_responses` | Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. | `Response:Read` |
 | 8 | `query_inventory` | Query inventory data across agents (filterable by agent, plugin). | `Infrastructure:Read` |
 | 9 | `list_inventory_tables` | List available inventory data types with agent counts. | `Infrastructure:Read` |
@@ -282,6 +282,8 @@ for the tool to execute.
 | 32 | `list_dex_perf_devices` | The device list behind every fleet-performance drill (worst-by-metric / not-reporting / cohort members). Machine-health telemetry. Mirrors `GET /api/v1/dex/perf/devices`. | `GuaranteedState:Read` |
 | 33 | `get_network_fleet` | Fleet network-quality now-stats (avg/p50/p90/max for RTT / retransmit / throughput + reporting populations incl. the honest RTT denominator; null = nobody reported) plus measured net/device/app co-occurrence counts. Mirrors `GET /api/v1/network/fleet`. | `GuaranteedState:Read` |
 | 34 | `list_network_devices` | The device list behind every network-quality drill (worst-by-metric / not-reporting / co-occurrence band / cohort members), with the co-occurring facts inline. Device link-health telemetry, never a verdict. Mirrors `GET /api/v1/network/devices`. | `GuaranteedState:Read` |
+| 35 | `execute_bundle` | Fan one instruction out into 1–32 plugin actions on **one** device, async (server-side fan-out, ADR-0011). Returns `{bundle_id, agent_id, expected}` immediately; poll `get_bundle_result` with the `bundle_id`. Use instead of N `execute_instruction` calls when refreshing a single device. Mirrors `POST /api/v1/bundles`. | `Execution:Execute` |
+| 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle` (arg `bundle_id`): `{complete, received, succeeded, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output (invalid-UTF-8 bytes replaced with U+FFFD). `complete` is terminal **not** success — check `succeeded == expected`. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
@@ -303,7 +305,18 @@ for the tool to execute.
 > 2. Open `GET /api/v1/events?execution_id=<execution_id>` with `Accept: text/event-stream`.
 > 3. Stream JSON envelopes until the `execution-completed` event arrives.
 >
+> For a non-streaming collect (e.g. batch fan-out across tens of thousands of devices), poll `query_responses` with that same `execution_id` instead of subscribing — it returns exactly the rows produced by that dispatch (exact-correlation; no cross-execution bleed). Use `get_execution_status` (or watch for the `execution-completed` SSE event) to decide when the run is terminal: an **empty** `query_responses` result means "no responses have landed *yet*", not necessarily "done with zero responses". `limit` caps the page at 1000 rows; collecting an execution that fans out to more than 1000 devices is a keyset-pagination follow-up (offset-based paging is intentionally not offered — it would skip/duplicate rows while responses are still arriving). **Results are management-group scoped**: you receive only rows for agents inside your groups, so on a multi-operator deployment the count you collect may be a subset of `agents_reached`. **Do not treat `count < limit` as "done"** — if the result object carries `result_truncated_by_cap: true`, the raw query hit the 1000-row cap before scoping and the page is incomplete (wait for the keyset follow-up to collect the remainder). A `result_truncated_by_cap` absent + an `execution-completed` SSE event (or terminal `get_execution_status`) is the reliable "done" signal. This is the canonical fleet-scale dispatch→collect loop.
+>
 > `execution_id` is an empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
+
+> **Live-query bundle (`execute_bundle` / `get_bundle_result`) — ADR-0011:**
+> `execute_bundle` is the **single-device** companion to `execute_instruction`. Instead of N round-trips to refresh one device, fan one instruction out into several plugin actions on that device. The server dispatches each step as an ordinary command under one `bundle-…` correlation id (the agent is unchanged — it never sees a "bundle") and returns immediately. It is **async**: a slow plugin step does not withhold the others; collate when you need the current state.
+> - **Two-call shape:** `execute_bundle` → `{bundle_id, agent_id, expected}` (HTTP 202 on the REST sibling); then poll `get_bundle_result` with that `bundle_id` until `complete` is `true`. `bundle_id` is **not** an `execution_id` — it is not a tracked execution, so don't feed it to `get_execution_status` / `/api/v1/events` (they'd 404). Each step is reported in request order with its `state` (`pending`/`responded`/`dispatch_failed`), so duplicate or same-plugin steps stay unambiguous; a step that reached no agent is `dispatch_failed` (terminal — it does not hold the bundle open).
+> - **`complete` ≠ success:** an all-offline bundle completes with `received=0`, `succeeded=0`, every step `dispatch_failed`. Check `succeeded == expected`, never `complete` alone.
+> - **Tier behavior** mirrors `execute_instruction` (`readonly` blocked; `operator` immediate; `supervised` returns the approval-not-implemented error).
+> - **Audit:** each step emits its own `bundle.<plugin>.<action>` audit (`target_type=Agent`) — the works-council device-access lens — so a bundle is exactly as auditable as the N separate executions it replaces.
+> - **Ownership guard:** `get_bundle_result` returns the same not-found error for a bundle the caller did not dispatch (and is not admin) as for an unknown id — no enumeration oracle.
+> - **Not in the executions drawer:** bundles are caller-polled, not tracker executions. v1 bundle state is per-surface and in-memory (a bundle dispatched over MCP is collated over MCP); a durable Postgres manifest for HA + cross-surface collation is a committed follow-up (ADR-0011).
 
 ### Tool parameters
 
@@ -315,7 +328,16 @@ Required parameters are validated server-side; missing required fields return a
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
   `get_tags`.
-- `instruction_id` (string) -- required by `query_responses`.
+- `execution_id` / `instruction_id` (string) -- `query_responses` requires at
+  least one. `execution_id` collects a single dispatch's responses exactly;
+  `instruction_id` collects all responses to a definition. If both are supplied,
+  `execution_id` takes precedence (the `instruction_id` filter is ignored).
+- `agent_id` + `steps` -- required by `execute_bundle`. `steps` is an array of
+  `{plugin, action, params?}` objects (1–32, in request order; duplicate
+  `(plugin, action)` allowed — each gets its own command_id);
+  `agent_id` is the single target device.
+- `bundle_id` (string) -- required by `get_bundle_result`; the `bundle-…`
+  id returned by `execute_bundle`.
 - `expression` (string) -- required by `validate_scope` and
   `preview_scope_targets`. Uses the Yuzu scope DSL (e.g.,
   `os = "Windows" AND tag:environment = "production"`).
@@ -440,16 +462,28 @@ proposes.
 
 ### How it works
 
+> **Current behaviour (Phase 1).** Approval **re-dispatch** — resuming an
+> approved operation through MCP — is Phase 2 and not yet implemented. Until it
+> lands, an approval-gated MCP call is **denied** with JSON-RPC code `-32004`
+> (`TierDenied`), **not** `-32006` (`ApprovalRequired`). The A4 error contract
+> reserves `-32006` for a response that can carry a pollable `approval_id` +
+> `status_url`; with no re-dispatch path there is nothing to poll, so returning
+> `-32006` would be a contract lie. The `error.data.remediation` hint points the
+> caller at the REST API or dashboard, where the supervised-tier approval
+> workflow is fully wired. The numbered flow below describes the **Phase 2
+> target**.
+
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier).
-2. The MCP server creates an **approval request** with status `pending`.
-3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
-   containing the approval ID.
+2. The MCP server **will** create an **approval request** with status `pending`.
+3. The server **will** return a JSON-RPC error with code `-32006`
+   (`ApprovalRequired`) carrying the approval ID and a `status_url` to poll.
+   *(Today this path returns `-32004` — see the callout above.)*
 4. The AI assistant can inform the operator that approval is needed.
 5. An administrator reviews the request via the dashboard or REST API
    (`GET /api/approvals`, `POST /api/approvals/{id}/approve`,
    `POST /api/approvals/{id}/reject`).
-6. Once approved, the operation can be retried.
+6. Once approved, the operation **will** be retriable.
 
 ### What requires approval
 
@@ -610,17 +644,29 @@ example, a `readonly` token attempting to execute an instruction.
 **Fix**: Create a new token with a higher tier (`operator` or `supervised`),
 or use a different tool that is within the current tier's permissions.
 
-### -32006: Approval required
+### -32004: Tier denied (including approval-gated operations)
 
-**Symptom**: A tool call returns error code `-32006` with an approval ID.
+**Symptom**: A tool call returns error code `-32004` with an `error.data` object
+carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 
-**Cause**: The operation requires admin approval before it can proceed. This
-is expected behavior for destructive operations on `supervised` tier tokens,
-and for tag deletions on `operator` tier tokens. Note that `operator` tier
-executions are auto-approved and do not trigger this error.
+**Cause**: Either the token's MCP tier does not permit the requested operation,
+or — for a `supervised`-tier token on a destructive operation — the operation is
+approval-gated and Phase 2 re-dispatch is not yet implemented. The A4 contract
+reserves `-32006` (`ApprovalRequired`) for a response that can carry a pollable
+`approval_id` + `status_url`; until that is wired, the denial is returned as
+`-32004` with a remediation hint instead. (`operator`-tier executions are
+auto-approved and do not hit this path.)
 
-**Fix**: An administrator must approve the request via the dashboard or REST
-API. After approval, retry the operation.
+**Fix**: For a tier restriction — create a new token with a higher tier
+(`operator` or `supervised`). For an approval-gated `supervised` operation —
+perform it via the REST API or dashboard, where the approval workflow is wired.
+
+### -32006: Approval required (Phase 2 target — not yet emitted)
+
+**Symptom**: Reserved. The MCP server does **not** currently emit `-32006`;
+approval-gated operations return `-32004` (above) until approval re-dispatch
+ships (Phase 2). Documented here so client error handling can be written
+forward-compatibly.
 
 ### -32003: Permission denied (RBAC)
 
@@ -638,8 +684,8 @@ principal, or create a new token from an account with the required permissions.
 **Symptom**: A tool call returns error code `-32602`.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
-`get_agent_details` without `agent_id`, or calling `query_responses` without
-`instruction_id`.
+`get_agent_details` without `agent_id`, or calling `query_responses` with
+neither `execution_id` nor `instruction_id`.
 
 **Fix**: Include all required parameters in the `arguments` object. See the
 [Available Tools](#available-tools) section for parameter requirements.

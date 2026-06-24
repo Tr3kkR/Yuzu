@@ -529,6 +529,24 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         )"},
+        // v3: Account lockout — brute-force / credential-stuffing protection
+        // on the local-password login path. SOC 2 CC6.3 — see the
+        // `/auth-and-authz` skill gap matrix entry P0 #2 and
+        // docs/auth-architecture.md. Three columns on the existing users
+        // table (no separate table): a non-existent username has no row, so
+        // an attacker spraying random usernames creates no storage growth.
+        // Columns are defaulted/nullable so existing rows survive the
+        // migration without backfill. The lockout is temporary/auto-expiring
+        // (locked_until is a future timestamp, not a permanent flag) so it
+        // cannot be weaponised to permanently DoS a legitimate principal.
+        // Policy (threshold + window) lives in ServerConfig, not the schema,
+        // so operators retune without a migration. locked_until NULL = not
+        // locked.
+        {3, R"(
+            ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE users ADD COLUMN last_failed_login_at DATETIME;
+            ALTER TABLE users ADD COLUMN locked_until DATETIME;
+        )"},
     };
 
     if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
@@ -1042,6 +1060,178 @@ std::expected<int, AuthDBError> AuthDB::cleanup_expired_sessions() {
     }
 
     return deleted;
+}
+
+// ── Account-lockout Operations ────────────────────────────────────────────────
+//
+// SOC 2 CC6.3 — brute-force / credential-stuffing protection on the
+// local-password login path. See `/auth-and-authz` skill gap matrix entry
+// P0 #2 and docs/auth-architecture.md. State lives in three columns on the
+// users table (migration v3). Policy (threshold + window) is owned by the
+// caller (ServerConfig) and passed in, so AuthDB stays policy-free and an
+// operator can retune without a schema change. A non-existent username has
+// no row, so spraying random usernames cannot grow storage and cannot lock
+// an account that does not exist (anti-enumeration).
+
+std::expected<AuthDB::LockoutStatus, AuthDBError>
+AuthDB::lockout_status(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // is_locked is computed in SQL against CURRENT_TIMESTAMP so the
+    // "still locked?" decision uses the DB clock, not a parsed string.
+    static const char* sql = R"(
+        SELECT failed_login_count,
+               COALESCE(locked_until, ''),
+               (locked_until IS NOT NULL AND locked_until > CURRENT_TIMESTAMP)
+        FROM users
+        WHERE username = ? AND is_active = 1
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare lockout_status statement: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+
+    LockoutStatus out;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out.failed_count = sqlite3_column_int(stmt, 0);
+        out.locked_until = col_text(stmt, 1);
+        out.locked = sqlite3_column_int(stmt, 2) != 0;
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        spdlog::error("lockout_status query failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::QueryFailed);
+    }
+    // rc == SQLITE_DONE → no active row for this username → return the
+    // zero-initialised (not-locked) status. The caller treats "no such
+    // user" identically to "not locked" so the bad-username and
+    // bad-password paths stay indistinguishable on the wire.
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+std::expected<AuthDB::LockoutRecord, AuthDBError>
+AuthDB::record_failed_login(const std::string& username, int threshold, int window_secs) {
+    LockoutRecord out;
+    // Feature disabled — record nothing, report a clean not-locked state.
+    // The threshold check DELIBERATELY precedes is_valid_username: when
+    // lockout is off this is a pure no-op regardless of input, and the sole
+    // caller already gates on `cfg_.auth_lockout_threshold > 0`, so the
+    // ordering is unreachable in practice. Do not "fix" it to validate first.
+    if (threshold <= 0) {
+        return out;
+    }
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    if (window_secs < 1) {
+        window_secs = 1; // a 0/negative window would unlock instantly
+    }
+    // Bound modifier string for datetime('now', ?) — same idiom as
+    // cleanup_provisional_mfa. Value form is "+900 seconds".
+    std::string window = std::string("+") + std::to_string(window_secs) + " seconds";
+
+    // Single atomic statement (no read-then-write race; RETURNING carries
+    // the post-update state so there is no sqlite3_changes() race either —
+    // #1033). Two cases:
+    //
+    //   * A prior lock has FULLY EXPIRED (locked_until <= now): this failure
+    //     starts a fresh cycle. The counter resets to 1 and the stale lock
+    //     clears, so a legitimate user who waited out the window gets their
+    //     full attempt budget back (and a genuine re-lock later is audited
+    //     as a clean threshold crossing rather than a silent bump).
+    //
+    //   * Otherwise (never locked, or an active in-window lock): increment.
+    //     The lock arms the moment the *new* counter reaches the threshold;
+    //     an already-armed in-window lock is preserved (ELSE keeps the
+    //     existing locked_until) so a late failure cannot shorten it.
+    //
+    // SQLite can't reference a just-assigned column in a sibling SET clause,
+    // so the expiry test is repeated in both clauses rather than factored.
+    static const char* sql = R"(
+        UPDATE users
+        SET failed_login_count = CASE
+                WHEN locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP THEN 1
+                ELSE failed_login_count + 1
+            END,
+            last_failed_login_at = CURRENT_TIMESTAMP,
+            locked_until = CASE
+                WHEN locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP
+                    THEN CASE WHEN 1 >= ?1 THEN datetime('now', ?2) ELSE NULL END
+                ELSE CASE WHEN failed_login_count + 1 >= ?1 THEN datetime('now', ?2)
+                          ELSE locked_until END
+            END
+        WHERE username = ?3 AND is_active = 1
+        RETURNING failed_login_count,
+                  COALESCE(locked_until, ''),
+                  (locked_until IS NOT NULL AND locked_until > CURRENT_TIMESTAMP)
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare record_failed_login statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_int(stmt, 1, threshold);
+    sqlite3_bind_text(stmt, 2, window.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, username.c_str(), -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out.failed_count = sqlite3_column_int(stmt, 0);
+        out.locked_until = col_text(stmt, 1);
+        out.locked = sqlite3_column_int(stmt, 2) != 0;
+        // The threshold-crossing edge fires exactly once per lock cycle:
+        // the counter equals `threshold` only on the failure that armed it
+        // (subsequent failures push it past). Lets the caller emit a single
+        // audit row instead of one per blocked attempt.
+        out.just_locked = out.locked && (out.failed_count == threshold);
+        sqlite3_finalize(stmt);
+        return out;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        spdlog::error("record_failed_login failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    // SQLITE_DONE with no row → no such active user → clean not-locked state
+    // (we deliberately never create a row for a non-existent account).
+    return out;
+}
+
+std::expected<void, AuthDBError> AuthDB::clear_failed_logins(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Reset on a successful login or an admin unlock. Idempotent; matches
+    // 0 rows for an absent user without error. The `is_active = 1` filter
+    // matches lockout_status / record_failed_login (governance UP-12): a
+    // soft-deleted principal carries no live lockout state worth clearing,
+    // so this never touches an inactive row.
+    static const char* sql = R"(
+        UPDATE users
+        SET failed_login_count = 0,
+            last_failed_login_at = NULL,
+            locked_until = NULL
+        WHERE username = ? AND is_active = 1
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare clear_failed_logins statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        spdlog::error("clear_failed_logins failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return {};
 }
 
 // ── MFA / TOTP Operations ────────────────────────────────────────────────────
