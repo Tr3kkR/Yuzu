@@ -151,4 +151,18 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         yuzu::server::ingest_inventory_report(store, "agent-y", rep, ack);
         CHECK(ack.need_full_size() == 0);
     }
+
+    SECTION("an oversized blob is dropped, nacked, and stores no rows (UP-2/UP-4)") {
+        // > 4 MiB per-source cap: the seam must NOT store it (false success) and
+        // must nack so the agent resends rather than silently advancing.
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = h;
+        (*rep.mutable_plugin_data())["installed_software"] =
+            std::string(5u * 1024 * 1024, 'x'); // no separators → still over the cap
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-oversized", rep, ack);
+        REQUIRE(ack.need_full_size() == 1);
+        CHECK(ack.need_full(0) == "installed_software");
+        CHECK(store.get_agent_software("agent-oversized").empty());
+    }
 }
