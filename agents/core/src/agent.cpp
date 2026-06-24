@@ -35,6 +35,8 @@ __declspec(allocate(".CRT$XCB"))
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
+#include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
+#include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -1504,6 +1506,88 @@ public:
                     });
                 }
 
+                // 4b-sync. Spawn the daily-sync thread (ADR-0016). Per-connection,
+                // mirroring the heartbeat thread: its own ReportInventory stub from
+                // `channel`, joined on disconnect. Sync state (last_hash / next_fire)
+                // persists in kv_store_ namespace "__sync__" across reconnects, so a
+                // flap does not lose or duplicate a daily push.
+                {
+                    const YuzuPluginDescriptor* ia_descriptor = nullptr;
+                    for (const auto& handle : plugins_) {
+                        if (std::string_view{handle.descriptor()->name} == "installed_apps") {
+                            ia_descriptor = handle.descriptor();
+                            break;
+                        }
+                    }
+                    sync_stop_.store(false, std::memory_order_release);
+                    auto sync_stub = pb::AgentService::NewStub(channel);
+                    sync_thread_ = std::thread([this, ia_descriptor,
+                                                sync_stub = std::move(sync_stub)]() {
+                        auto should_stop = [this]() {
+                            return stop_requested_.load(std::memory_order_acquire) ||
+                                   sync_stop_.load(std::memory_order_acquire);
+                        };
+                        auto kv_get = [this](const std::string& key) -> std::string {
+                            auto v = kv_store_ ? kv_store_->get("__sync__", key) : std::nullopt;
+                            return v ? *v : std::string{};
+                        };
+                        auto kv_set = [this](const std::string& key, const std::string& value) {
+                            if (kv_store_)
+                                kv_store_->set("__sync__", key, value);
+                        };
+                        auto sender =
+                            [this, &sync_stub](
+                                const std::vector<std::pair<std::string, std::string>>& hashes,
+                                const std::vector<std::pair<std::string, std::string>>& blobs)
+                            -> std::optional<std::vector<std::string>> {
+                            pb::InventoryReport report;
+                            report.set_session_id(session_id_);
+                            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+                            report.mutable_collected_at()->set_millis_epoch(now_ms);
+                            auto& ch = *report.mutable_content_hashes();
+                            for (const auto& [k, v] : hashes)
+                                ch[k] = v;
+                            auto& pd = *report.mutable_plugin_data();
+                            for (const auto& [k, v] : blobs)
+                                pd[k] = v;
+                            grpc::ClientContext ctx;
+                            // Bound the worst-case shutdown-join wait if a sync
+                            // coincides with a disconnect (no stored ctx to cancel).
+                            ctx.set_deadline(std::chrono::system_clock::now() +
+                                             std::chrono::seconds{30});
+                            pb::InventoryAck ack;
+                            auto status = sync_stub->ReportInventory(&ctx, report, &ack);
+                            if (!status.ok()) {
+                                spdlog::debug("sync: ReportInventory RPC failed: {}",
+                                              status.error_message());
+                                return std::nullopt;
+                            }
+                            std::vector<std::string> need;
+                            for (const auto& n : ack.need_full())
+                                need.push_back(n);
+                            return need;
+                        };
+                        SyncScheduler scheduler(cfg_.agent_id, kv_get, kv_set, sender);
+                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        spdlog::info("Daily-sync thread started (sources=1: installed_software)");
+                        while (!should_stop()) {
+                            auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+                            auto sleep = scheduler.tick(now_secs);
+                            auto remaining = sleep;
+                            while (remaining.count() > 0 && !should_stop()) {
+                                auto step = std::min(remaining, std::chrono::seconds{2});
+                                std::this_thread::sleep_for(step);
+                                remaining -= step;
+                            }
+                        }
+                        spdlog::info("Daily-sync thread stopped");
+                    });
+                }
+
                 // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
                 {
                     heartbeat_stop_.store(false, std::memory_order_release);
@@ -2056,6 +2140,12 @@ public:
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
+                // Daily-sync thread is per-connection (like heartbeat): stop +
+                // join it on disconnect; its state persists in kv_store_.
+                sync_stop_.store(true, std::memory_order_release);
+                if (sync_thread_.joinable()) {
+                    sync_thread_.join();
+                }
                 // PR 10: the snapshot pump is intentionally NOT joined on a
                 // transient (non-final) disconnect. It is a Run()-lifetime
                 // thread that survives reconnects, so the heartbeat thread of
@@ -2207,6 +2297,9 @@ private:
             snapshot_pump_thread_.join();
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
+        sync_stop_.store(true, std::memory_order_release);
+        if (sync_thread_.joinable())
+            sync_thread_.join();
         if (update_thread_.joinable())
             update_thread_.join();
     }
@@ -2229,6 +2322,7 @@ private:
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
+    std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
     // Set when run() returns due to a fatal STARTUP failure (the #1303 fail-closed
     // TLS posture refused to connect, or an unreadable cert/key) — not a normal
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
@@ -2272,6 +2366,7 @@ private:
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;
+    std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //

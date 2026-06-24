@@ -17,6 +17,7 @@ Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Upd
 | Store | Schema | Notes |
 |---|---|---|
 | `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). durability-on-top. |
+| `SoftwareInventoryStore` | `software_inventory_store` | Born-on-Pg (ADR-0016). Typed projection for the daily-sync `installed_software` source (normalized rows, no JSONB). authoritative reads; ingest fail-soft (next sync + weekly floor self-heal). **Coexists with the generic `InventoryStore` (Wave 1 below) — it is NOT that store's migration.** |
 
 ## Wave 1 — cross-store-join / durable / high-write
 
@@ -26,7 +27,7 @@ query-owner seam (ADR-0012 §3) when scoring lands.
 
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
-| `InventoryStore` | `inventory_store` | authoritative | vuln-graph join input; high-write. |
+| `InventoryStore` | `inventory_store` | authoritative | Generic per-source blob store (backs the `kInventoryQuery` scope source + eval engine). Still SQLite. **Note:** the typed `installed_software` projection already went born-on-Pg as `SoftwareInventoryStore` (ADR-0016, Done above); this row is the *generic* store's own migration, still pending. vuln-graph join input; high-write. |
 | `GuaranteedStateStore` | `guaranteed_state_store` | authoritative | Guardian state; high-write; join input. Uses `SqliteTxn`/`SqliteStmt` today. |
 | `FleetTopologyStore` | `fleet_topology_store` | authoritative | durable topology; viz; join-adjacent. |
 | `ResponseStore` | `response_store` | durability-on-top? | high-write, TTL'd 90d; backfill **skippable** (ADR-0009). |

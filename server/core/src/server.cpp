@@ -39,6 +39,7 @@
 #include "inventory_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -1919,6 +1920,25 @@ public:
             }
             if (gateway_service_)
                 gateway_service_->set_inventory_store(inventory_store_.get());
+        }
+
+        // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+        // Coexists with the generic InventoryStore above (the sync-framework
+        // baseline). Fails closed like every PG store (ADR-0007/0008): a
+        // reachable database whose schema cannot be created/opened must not
+        // serve degraded. Wires BOTH server entry points to the typed store.
+        if (pg_pool_ && !startup_failed_) {
+            software_inventory_store_ = std::make_unique<SoftwareInventoryStore>(*pg_pool_);
+            if (!software_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software inventory store migration/open "
+                              "failed (database reachable but the software_inventory_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                agent_service_.set_software_inventory_store(software_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_software_inventory_store(software_inventory_store_.get());
+            }
         }
 
         // Phase 7: Directory Sync (AD/Entra integration)
@@ -9455,6 +9475,9 @@ private:
 
     // Phase 7: Inventory Store (Issue 7.17)
     std::unique_ptr<InventoryStore> inventory_store_;
+    // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+    // Declared after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;

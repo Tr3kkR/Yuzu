@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
+  pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
+  with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
+  fleet scale: each endpoint spreads its sync by a stable per-agent phase offset (no lockstep), and
+  when a source's content is unchanged since the last successful sync it sends only a **content hash**
+  instead of the full list (hash-skip); the server replies `need_full` to force a resend on a cold
+  cache, with a weekly full-floor as a backstop. Installed software lands in a new born-on-Postgres
+  **`SoftwareInventoryStore`** (normalized rows — portable SQL, no JSONB — so fleet-wide queries
+  like "which devices run X" are first-class), via a shared ingest seam wired identically on the
+  direct and gateway paths. Reads are gated on a new **`Inventory` RBAC securable** (`Inventory:Read`).
+  Reuses the existing `installed_apps` plugin (Windows/Linux/macOS) in-process — no new collector.
+
 ### Security
 
 - **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool

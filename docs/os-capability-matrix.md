@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-06-23._
+_Last hand-updated: 2026-06-24._
 
 ## Matrix
 
@@ -32,6 +32,7 @@ _Last hand-updated: 2026-06-23._
 | **TAR — ARP table** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `arp` def (Win `kSupported` via `iphlpapi`; Linux `kPlanned` `/proc/net/arp`; macOS `kPlanned` route sysctl, constrained — `entry_type 'unknown'`); collector `tar_arp_collector.cpp` (ADR-0015, opt-in) |
 | **TAR — DNS cache** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `dns` def (Win `kSupported` via `dnsapi`; Linux `kPlanned` systemd-resolved, hosts-file fallback where absent; macOS `kPlanned` `dscacheutil`, constrained — no TTL); collector `tar_dns_collector.cpp` (ADR-0015, opt-in; device-level usage-class PII, names-only) |
 | **Process enumeration / live capture** | ✅ (ETW / Win32) | ✅ (`/proc`) | 🟡 | `process_enum.cpp`; ETW workstream is Windows-specific |
+| **Installed-software inventory** (daily sync → central Postgres) | ✅ | ✅ | ✅ | Agent sync framework `sync_scheduler.cpp` + `sync_source_installed_software.cpp` reuse the `installed_apps` plugin `list` (Win registry; Linux dpkg/rpm/pacman; macOS `system_profiler`) via `LocalDispatcher`. Machine-scope only. Server: `SoftwareInventoryStore` (ADR-0016) |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate
