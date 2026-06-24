@@ -72,7 +72,10 @@ bool icontains(const std::string& haystack, const std::string& needle) {
     return it != haystack.end();
 }
 
-/// Strip leading/trailing '*' from a glob pattern to get the core substring.
+/// Strip leading/trailing '*' from a pattern to get the core substring. NOTE:
+/// matching is case-insensitive SUBSTRING containment, NOT real glob — `?` and
+/// `[abc]` are treated as literals; only leading/trailing `*` are honoured (as a
+/// readability affordance), then stripped here before the substring search.
 std::string strip_stars(const std::string& pattern) {
     std::string result = pattern;
     while (!result.empty() && result.front() == '*')

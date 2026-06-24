@@ -9,25 +9,33 @@
 #include "tar_aggregator.hpp"
 #include "tar_schema_registry.hpp"
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu::tar {
 
 namespace {
 
 // Boundary computation helpers
-int64_t hour_boundary(int64_t epoch)  { return (epoch / 3600) * 3600; }
-int64_t day_boundary(int64_t epoch)   { return (epoch / 86400) * 86400; }
+int64_t hour_boundary(int64_t epoch) {
+    return (epoch / 3600) * 3600;
+}
+int64_t day_boundary(int64_t epoch) {
+    return (epoch / 86400) * 86400;
+}
 
 // M2: Use calendar-month boundary via gmtime instead of fixed 30-day approximation
 int64_t month_boundary(int64_t epoch) {
     time_t t = static_cast<time_t>(epoch);
-    struct tm tm_val{};
+    struct tm tm_val {};
 #ifdef _WIN32
     gmtime_s(&tm_val, &t);
 #else
@@ -51,8 +59,8 @@ constexpr int64_t kMaxMonthlyGap = 5400000; // ~62 days
 
 // Rollup one tier for one source.
 // Returns true if any data was rolled up.
-bool rollup_tier(TarDatabase& db, std::string_view source_name,
-                 std::string_view target_suffix, int64_t now_epoch) {
+bool rollup_tier(TarDatabase& db, std::string_view source_name, std::string_view target_suffix,
+                 int64_t now_epoch) {
 
     auto sql = rollup_sql(source_name, target_suffix);
     if (sql.empty())
@@ -60,15 +68,24 @@ bool rollup_tier(TarDatabase& db, std::string_view source_name,
 
     int64_t boundary;
     int64_t max_gap;
-    if (target_suffix == "hourly")       { boundary = hour_boundary(now_epoch);  max_gap = kMaxHourlyGap; }
-    else if (target_suffix == "daily")   { boundary = day_boundary(now_epoch);   max_gap = kMaxDailyGap; }
-    else if (target_suffix == "monthly") { boundary = month_boundary(now_epoch); max_gap = kMaxMonthlyGap; }
-    else return false;
+    if (target_suffix == "hourly") {
+        boundary = hour_boundary(now_epoch);
+        max_gap = kMaxHourlyGap;
+    } else if (target_suffix == "daily") {
+        boundary = day_boundary(now_epoch);
+        max_gap = kMaxDailyGap;
+    } else if (target_suffix == "monthly") {
+        boundary = month_boundary(now_epoch);
+        max_gap = kMaxMonthlyGap;
+    } else
+        return false;
 
     auto mark_key = std::format("rollup_{}_{}_at", source_name, target_suffix);
     auto mark_str = db.get_config(mark_key, "0");
     int64_t last_mark = 0;
-    try { last_mark = std::stoll(mark_str); } catch (...) {}
+    try {
+        last_mark = std::stoll(mark_str);
+    } catch (...) {}
 
     if (last_mark >= boundary)
         return false;
@@ -76,15 +93,15 @@ bool rollup_tier(TarDatabase& db, std::string_view source_name,
     // H11: Clock skew protection — if the gap is abnormally large, clamp it
     if (boundary - last_mark > max_gap && last_mark > 0) {
         spdlog::warn("TAR rollup: {}_{} gap {}s exceeds max {}s, possible clock jump — clamping",
-                      source_name, target_suffix, boundary - last_mark, max_gap);
+                     source_name, target_suffix, boundary - last_mark, max_gap);
         last_mark = boundary - max_gap;
     }
 
     bool ok = db.execute_sql_range(sql, last_mark, boundary);
     if (ok) {
         db.set_config(mark_key, std::to_string(boundary));
-        spdlog::debug("TAR rollup: {}_{} processed [{}, {})", source_name, target_suffix,
-                       last_mark, boundary);
+        spdlog::debug("TAR rollup: {}_{} processed [{}, {})", source_name, target_suffix, last_mark,
+                      boundary);
     }
 
     return ok;
@@ -116,10 +133,8 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
-bool apply_source_enabled_transition(TarDatabase& db,
-                                      std::string_view source,
-                                      std::string_view new_value,
-                                      int64_t now_epoch) {
+bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
+                                     std::string_view new_value, int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
     // Default `prev` to the source's declared default so the first-ever set on a
     // fresh DB is only a transition when it differs from that default. For an
@@ -184,19 +199,101 @@ std::string_view diff_state_key(std::string_view source) {
     // "network" (historical). Keep this the ONE home for the mapping — the
     // collectors (collect_fast/slow) and apply_source_enabled_transition both
     // route through here so the on-disable clear can never target the wrong key.
-    if (source == "process") return "process";
-    if (source == "tcp")     return "network";
-    if (source == "service") return "service";
-    if (source == "user")    return "user";
+    if (source == "process")
+        return "process";
+    if (source == "tcp")
+        return "network";
+    if (source == "service")
+        return "service";
+    if (source == "user")
+        return "user";
     // ADR-0015 — arp/dns are snapshot-diff sources too: the collect legs keep a
     // baseline under these exact keys (get_state/set_state "arp"/"dns"), so the
     // on-disable clear must reach them or a re-enable would emit ghost
     // removed/added neighbour + cache deltas for the paused window (#538).
-    if (source == "arp")     return "arp";
-    if (source == "dns")     return "dns";
+    if (source == "arp")
+        return "arp";
+    if (source == "dns")
+        return "dns";
     // perf/procperf keep an in-memory previous reading; netqual is stateless;
     // module is a stream-drained source (no snapshot-diff baseline).
     return {};
+}
+
+namespace {
+// The effective match core of a pattern: should_redact strips only leading and
+// trailing '*' and treats an interior '*' as a literal, so "*a*" matches the
+// 1-char substring "a". The min-core floor (#541 / gov UP-2) must measure this
+// stripped core, not the raw length, or it is trivially bypassed. Shared by
+// validate_config_pattern (configure path) and parse_pattern_config (load path)
+// so both enforce an identical floor.
+std::string_view stripped_core(std::string_view pattern) {
+    while (!pattern.empty() && pattern.front() == '*')
+        pattern.remove_prefix(1);
+    while (!pattern.empty() && pattern.back() == '*')
+        pattern.remove_suffix(1);
+    return pattern;
+}
+} // namespace
+
+std::optional<std::string> validate_config_pattern(std::string_view pattern,
+                                                   bool require_min_core_len) {
+    if (pattern.size() > kMaxPatternLength) {
+        return std::format("pattern exceeds the {}-character limit", kMaxPatternLength);
+    }
+    if (require_min_core_len && stripped_core(pattern).size() < kMinExclusionCoreLength) {
+        return std::format("exclusion pattern '{}' has an effective substring shorter than {} "
+                           "characters and would match almost every process — use a longer "
+                           "substring (leading/trailing '*' do not count)",
+                           pattern, kMinExclusionCoreLength);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<std::string>> parse_pattern_config(std::string_view json_text,
+                                                             bool require_min_core_len) {
+    // Runtime defense-in-depth (#541 / gov UP-1): the configure path caps the
+    // array at write time, but load_*/collect read whatever is stored every fast
+    // cycle. A value written before the cap existed, or mutated outside the
+    // plugin, must still be bounded here so it can't degrade the per-process
+    // redaction scan. Parse, drop non-string / empty / over-long elements, and
+    // truncate to the element cap. Returns nullopt only when the stored value is
+    // not a JSON array at all (caller falls back to its own default).
+    //
+    // Cap the raw text BEFORE parsing (gov MEDIUM): the element/length caps only
+    // bite after the array is materialised, so without this a multi-MB tampered or
+    // legacy value would be fully parsed + copied every fast cycle. A blob over the
+    // cap is treated as unparseable → caller's safe default.
+    if (json_text.size() > kMaxPatternConfigBytes)
+        return std::nullopt;
+    nlohmann::json arr;
+    try {
+        arr = nlohmann::json::parse(json_text);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (!arr.is_array())
+        return std::nullopt;
+    std::vector<std::string> patterns;
+    for (const auto& elem : arr) {
+        if (patterns.size() >= kMaxPatternArrayElements)
+            break; // element cap — ignore the overflow tail
+        if (!elem.is_string())
+            continue;
+        // get_ref avoids copying the element until it has passed the length check.
+        const auto& s = elem.get_ref<const std::string&>();
+        if (s.empty() || s.size() > kMaxPatternLength)
+            continue; // skip empty / over-long elements rather than failing
+        // #541 load-path floor: drop a sub-floor exclusion the same way configure
+        // rejects it, so a value persisted before the floor existed (no-tamper
+        // upgrade) or written out of band can't reach should_redact and silently
+        // suppress most process events. Off for redaction patterns (a short core
+        // only over-redacts a command line; it never drops an event).
+        if (require_min_core_len && stripped_core(s).size() < kMinExclusionCoreLength)
+            continue;
+        patterns.push_back(s); // copy: `s` is a borrowed ref into the json element
+    }
+    return patterns;
 }
 
 std::string_view canonical_source_enabled(std::string_view stored_value) {

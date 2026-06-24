@@ -32,10 +32,15 @@ Group=yuzu
 # external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
 # (the DSN embeds a credential).
 EnvironmentFile=-/etc/yuzu/yuzu-server.env
+# --data-dir is REQUIRED for the persistent auth.db: without it the server
+# falls back to in-memory auth, which silently disables account lockout
+# (SOC 2 CC6.3) and session persistence. /var/lib/yuzu matches StateDirectory,
+# WorkingDirectory, and the ReadWritePaths grant below.
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \
-    --web-port 8080
+    --web-port 8080 \
+    --data-dir /var/lib/yuzu
 Restart=on-failure
 RestartSec=5
 

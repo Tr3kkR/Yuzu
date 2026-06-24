@@ -10,10 +10,64 @@
 
 #include "tar_db.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::tar {
+
+// ── configure-time pattern-array validation caps (#541) ───────────────────────
+//
+// `redaction_patterns` and `process_stabilization_exclusions` feed should_redact,
+// which is O(patterns × cmdline_length) per process per fast-collect cycle, so an
+// unbounded array or pathologically-long element degrades the collector. The
+// min-core-length floor guards a separate footgun: a 1–2 char bare substring
+// (e.g. "a") matches almost every process name, silently dropping 70-90% of
+// process events with no warning.
+inline constexpr std::size_t kMaxPatternArrayElements = 256;
+inline constexpr std::size_t kMaxPatternLength = 256;
+inline constexpr std::size_t kMinExclusionCoreLength = 3;
+// Pre-parse byte cap for parse_pattern_config (load path, runs every fast cycle).
+// The element/length caps only apply AFTER the whole array is materialised, so a
+// multi-MB tampered/legacy stored value would otherwise be fully parsed + copied
+// each cycle. A maximal *valid* array is 256 × 256 chars plus JSON punctuation
+// (~66 KiB); 128 KiB admits any valid config with headroom while rejecting a
+// pathological blob, which is treated as "not parseable" → caller's safe default.
+inline constexpr std::size_t kMaxPatternConfigBytes = 128 * 1024;
+
+// Validate a single configure pattern. Returns an error message (suitable for
+// the `error|...` configure response) or std::nullopt if valid. Always enforces
+// the per-element length cap. When `require_min_core_len` is set (process
+// stabilization exclusions), an effective match core shorter than
+// kMinExclusionCoreLength is rejected after stripping leading/trailing `*` —
+// the operator must use a longer substring. The empty/is_string checks are done
+// by the caller during JSON parsing.
+[[nodiscard]] std::optional<std::string> validate_config_pattern(std::string_view pattern,
+                                                                 bool require_min_core_len);
+
+// Parse a stored pattern-array config value (redaction_patterns /
+// process_stabilization_exclusions) into a bounded, sanitised vector. This is
+// the RUNTIME defence (#541): configure caps the array at write time, but the
+// collect loop re-reads the stored value every fast cycle, so a value written
+// before the cap existed — or mutated outside the plugin — must still be bounded
+// here. Drops non-string, empty, and over-long (> kMaxPatternLength) elements and
+// truncates to kMaxPatternArrayElements. Returns std::nullopt only when the
+// stored text is not a JSON array (the caller then applies its own default);
+// a valid-but-empty array yields an empty vector (explicit "no patterns").
+//
+// When `require_min_core_len` is set (the exclusions loader), an element whose
+// effective match core — after stripping leading/trailing `*` — is shorter than
+// kMinExclusionCoreLength is ALSO dropped, matching the configure-time floor in
+// validate_config_pattern. This closes the load-path gap (#541): a sub-floor
+// value persisted before the floor existed (a no-tamper upgrade) or written out
+// of band would otherwise reach should_redact and silently suppress most process
+// events. The redaction loader leaves it false — a short redaction core merely
+// over-redacts a command line, it does not drop events.
+[[nodiscard]] std::optional<std::vector<std::string>>
+parse_pattern_config(std::string_view json_text, bool require_min_core_len = false);
 
 /**
  * Run all pending aggregations for all sources.
@@ -77,10 +131,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  *         not clear the baseline (the source is left enabled). Non-disabling
  *         transitions always return true.
  */
-[[nodiscard]] bool apply_source_enabled_transition(TarDatabase& db,
-                                                    std::string_view source,
-                                                    std::string_view new_value,
-                                                    int64_t now_epoch);
+[[nodiscard]] bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
+                                                   std::string_view new_value, int64_t now_epoch);
 
 /**
  * Map a capture source to its snapshot-diff baseline key in the TAR state store
