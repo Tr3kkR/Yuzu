@@ -523,6 +523,20 @@ TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
     REQUIRE(res->body.find("Sampled authentication-log evidence export") != std::string::npos);
 }
 
+TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
+          "[events][discovery][a2][lockout]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2: the new admin operability route POST /api/v1/users/{username}/unlock
+    // must be discoverable from the live spec, not only an out-of-band manual
+    // (adversarial-review C2). The text-shape check matches the sibling tests.
+    REQUIRE(res->body.find(R"("/users/{username}/unlock":)") != std::string::npos);
+    REQUIRE(res->body.find("admin unlock") != std::string::npos);
+    REQUIRE(res->body.find("UserManagement:Write") != std::string::npos);
+}
+
 TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
           "[events][discovery][a2]") {
     RestEventsHarness h;
@@ -553,6 +567,25 @@ TEST_CASE("error_json_a4 overload: 503 carries retry_after_ms + remediation",
     // Existing fields still present.
     REQUIRE(body.find(R"("code":503)") != std::string::npos);
     REQUIRE(body.find(R"("correlation_id":"req-xyz-1")") != std::string::npos);
+}
+
+TEST_CASE("error_json_a4 no-retry overload emits retry_after_ms:null (A4 field set)",
+          "[events][envelope][a4]") {
+    // #1470: A4 lists retry_after_ms as a REQUIRED, nullable envelope field.
+    // The no-retry overload (used by validation 400s incl. the dex-perf family)
+    // must still carry it as null, not omit it — uniform with the MCP a4_data
+    // sibling.
+    auto body = detail::error_json_a4(400, "invalid cohort_key", "req-abc-2");
+    REQUIRE(body.find(R"("retry_after_ms":null)") != std::string::npos);
+    REQUIRE(body.find(R"("code":400)") != std::string::npos);
+    REQUIRE(body.find(R"("correlation_id":"req-abc-2")") != std::string::npos);
+    // No remediation passed → field absent (nullable, omit is fine for the hint).
+    REQUIRE(body.find(R"("remediation")") == std::string::npos);
+
+    // With remediation, both nullable fields render correctly.
+    auto body2 = detail::error_json_a4(400, "invalid limit", "req-abc-3", "limit must be > 0");
+    REQUIRE(body2.find(R"("retry_after_ms":null)") != std::string::npos);
+    REQUIRE(body2.find(R"("remediation":"limit must be > 0")") != std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/events: 503 (no bus) envelope includes retry_after_ms",

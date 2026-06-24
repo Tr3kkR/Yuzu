@@ -22,6 +22,7 @@
 #include <openssl/x509v3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -137,6 +138,27 @@ TEST_CASE("default_certs: leaf EKUs match each role (server is also a client —
     const uint32_t https_eku = leaf_eku_flags(set.https_cert);
     REQUIRE((https_eku & XKU_SSL_SERVER) != 0);
     REQUIRE((https_eku & XKU_SSL_CLIENT) == 0);
+}
+
+TEST_CASE("default_certs: server leaves backdate notBefore by the clock-skew allowance (#1302)",
+          "[default_certs]") {
+    // An agent whose clock lags the server at first connect must not reject a
+    // freshly-minted server leaf as not-yet-valid. The CA root + per-agent client
+    // leaf already backdate notBefore by kClockSkewBackdate; this pins the same for
+    // the server-facing default leaves (HTTPS / agent-gRPC / gateway), which the
+    // PR3 H-2 fix had missed.
+    TempDir dir;
+    DefaultCertSet set;
+    const auto now = std::chrono::system_clock::now();
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set));
+    // now is captured BEFORE generation, so notBefore <= now - backdate (minus a
+    // little slack for test execution time). Use 280s against the 300s backdate.
+    const auto floor = now - pki::kClockSkewBackdate + std::chrono::seconds(20);
+    for (const auto& leaf : {set.https_cert, set.server_cert, set.gateway_cert}) {
+        auto c = pki::parse_certificate(read_file(leaf));
+        REQUIRE(c);
+        REQUIRE(c->not_before <= floor); // genuinely backdated, not now()
+    }
 }
 
 TEST_CASE("default_certs: --cert-san extra SANs land on every default leaf", "[default_certs]") {

@@ -693,6 +693,11 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         const int ext = sqlite3_extended_errcode(db_);
         const std::string err = sqlite3_errmsg(db_);
         if (is_sqlite_uniqueness_violation(ext)) {
+            // Silent-drop visibility (#1414, CC7.3): the conflicting event is
+            // discarded here and guardian_ingest only warns. Count it so the loss
+            // is alertable in Prometheus rather than grep-only. Surfaced as
+            // yuzu_server_guardian_events_dropped_total.
+            events_dropped_.fetch_add(1, std::memory_order_relaxed);
             return std::unexpected(
                 format_conflict("event_id '" + row.event_id + "' already exists"));
         }

@@ -65,12 +65,12 @@ Every failure response — REST, MCP, gRPC error — includes:
 - `message` — human-readable summary (one sentence)
 - `correlation_id` — server-issued ID that ties the error to the audit log entry
 - `retry_after_ms` — nullable; if non-null, the agent should wait at least this long before retrying
-- `remediation` — nullable URL or natural-language hint (e.g. `"request the missing permission via POST /api/v1/approvals"`)
+- `remediation` — optional/nullable URL or natural-language hint (e.g. `"request the missing permission via POST /api/v1/approvals"`). When there is no hint, a surface MAY either emit `"remediation": null` (the MCP envelopes) or omit the key entirely (the REST envelope — absence carries the same "no recovery hint" meaning); both are conformant for this nullable field.
 
 Two specialisations:
 
 - On `kPermissionDenied` (-32003 / HTTP 403), the envelope names the missing permission as `securable_type:operation` (e.g. `Tag:Write`).
-- On `kApprovalRequired` (-32006 / HTTP 202), the envelope returns `approval_id` and `status_url` so the agent can poll the approval workflow rather than re-issuing the same request.
+- On `kApprovalRequired` (-32006 / HTTP 202) — **Phase 2 target** — the envelope returns `approval_id` and `status_url` so the agent can poll the approval workflow rather than re-issuing the same request. Until approval re-dispatch ships, an approval-gated MCP operation is denied with `kTierDenied` (-32004) carrying a remediation hint (a `-32006` with no pollable approval would violate this very contract); see `docs/mcp-server.md`.
 
 **Why this matters.** Today errors give a code and message; nothing else. An agentic worker hitting `Permission denied` cannot tell which permission, who can grant it, or whether to retry. A4 closes that loop and makes self-recovery feasible.
 

@@ -28,6 +28,15 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
+> **Tag source precedence.** Every tag carries a `source` field — `"server"` for operator/API
+> writes (REST `PUT /api/v1/tags`, MCP `set_tag`) and `"agent"` for tags an agent self-reports
+> via its heartbeat `scopable_tags`. An agent-reported tag is written only when the stored row
+> is itself `"agent"`-sourced or absent; an operator/API-set tag for the same `(agent_id, key)`
+> is **authoritative and cannot be overwritten by the agent**. This prevents a rogue or
+> misconfigured agent from self-assigning into an operator-declared benchmark cohort. To force a
+> value regardless of the current source, write it via the REST API or MCP `set_tag` (source
+> `"server"`).
+
 ### Via the REST API
 
 **Set a tag on a device:**
