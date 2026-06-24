@@ -11,6 +11,7 @@
 #include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
+#include "rest_audit.hpp"             // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"              // html_escape
 
 #include <algorithm>
@@ -535,13 +536,14 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                             "text/html; charset=utf-8");
             return;
         }
-        // HIGH-1 (review #1585): AuditFn is bool-returning — capture it and surface
-        // Sec-Audit-Failed when the access row can't persist. This fragment still
-        // renders the lens (HTML surface; the REST PII endpoints fail closed instead).
-        if (audit_fn_ &&
-            !audit_fn_(req, "dex.device.view", "success", "Agent", id,
-                       "device DEX lens (per-device signal summary)"))
-            res.set_header("Sec-Audit-Failed", "true");
+        // Behavioural-PII access audit. HTML dashboard fragment → set-and-proceed:
+        // a dropped evidence row flags via Sec-Audit-Failed but STILL renders, so
+        // a transient audit hiccup never blanks the operator's lens (#1647). The
+        // shared helper captures the persist bool behind a try/catch (the throw
+        // arm is otherwise silent) — one pattern across every behavioural route.
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success",
+                                            "Agent", id,
+                                            "device DEX lens (per-device signal summary)");
         const std::string since = dex_iso_since(7);
         const int score = dex_device_score(store_, id, since);
         std::vector<std::pair<std::string, std::int64_t>> sigs;
@@ -561,12 +563,11 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                             "text/html; charset=utf-8");
             return;
         }
-        // HIGH-1 (review #1585): capture the bool audit result and surface
-        // Sec-Audit-Failed on a persist failure (still renders — HTML surface).
-        if (audit_fn_ &&
-            !audit_fn_(req, "guardian.device.view", "success", "Agent", id,
-                       "device Guardian lens (per-guard compliance)"))
-            res.set_header("Sec-Audit-Failed", "true");
+        // Behavioural-PII access audit — set-and-proceed (HTML fragment), parity
+        // with the DEX lens above and the shared #1647 helper.
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
+                                            "Agent", id,
+                                            "device Guardian lens (per-guard compliance)");
         std::unordered_map<std::string, std::string> rule_names;
         for (const auto& r : store_->list_rules())
             rule_names[r.rule_id] = r.name;
