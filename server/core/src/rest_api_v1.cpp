@@ -5679,7 +5679,7 @@ void RestApiV1::register_routes(
             // body-parsing CMDB/ServiceNow integration must not read per-device
             // behavioral compliance as audited-evidence when the `guardian.device.view`
             // row never landed. Set-and-proceed, mirroring the /api/v1/events route
-            // (api.v1.events.subscribe) and the api_token.create body flag: the read
+            // (api.v1.events.subscribe) and the session-revoke body flag: the read
             // still serves, but the header + body flag let SRE/SIEM and a body-only
             // consumer detect the missing evidence row. (The sibling dex.device.view /
             // dashboard guardian.device.view routes carry the same latent discard — a

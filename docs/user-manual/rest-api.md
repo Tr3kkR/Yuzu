@@ -3559,6 +3559,7 @@ curl -s -H "Authorization: Bearer $TOKEN" --get \
     "total_guards": 3,
     "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
     "last_updated": "2026-06-20T13:45:00Z",
+    "audit_emitted": true,
     "guards": [
       {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
       {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},

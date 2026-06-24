@@ -1326,6 +1326,9 @@ TEST_CASE("REST gs.device-compliance: audit-fail on unknown baseline → 404 + S
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["code"].get<int>() == 404);
+    // The not_found audit attempt still fired (audit_succeeds=false pushes the row
+    // then returns false); guards against a refactor moving the audit after the 404.
+    CHECK(h.audit_log.size() == 1);
 }
 
 TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids",
