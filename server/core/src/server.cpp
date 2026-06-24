@@ -8246,11 +8246,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8441,12 +8444,15 @@ private:
         device_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
             guaranteed_state_store_.get(),
-            // "Get live info" dispatches real plugin instructions (os_info/uptime,
-            // processes/list_hashed) through the shared chokepoint. DELIBERATELY an
+            // "Get live info" dispatches real read-only plugin instructions through the
+            // shared chokepoint — the live-snapshot cards (processes/list_tree +
+            // network_diag/connections, services/list, users/logged_on,
+            // network_config/{ip_addresses,arp,dns_cache}, network_diag/listening +
+            // connections, tar/status) plus os_info/uptime for the KPI. DELIBERATELY an
             // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
-            // the executions drawer): the live shell auto-fires one panel per kind on
-            // every device-page open, so tracking would flood the drawer with two
-            // executions per view. This matches the already-shipped DEX device-perf
+            // the executions drawer): the snapshot auto-fires one query per card when an
+            // operator clicks Get live info, so tracking would flood the drawer with a
+            // burst of executions per view. This matches the already-shipped DEX device-perf
             // panel (also execution_id="") and the compliance polchk- skip — the same
             // high-frequency-read rationale. Agentic-first parity (a machine-readable
             // MCP/REST equivalent + discovery) for live-info AND the DEX-perf sibling
@@ -8460,11 +8466,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8488,11 +8497,14 @@ private:
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },

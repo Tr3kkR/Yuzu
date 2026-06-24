@@ -95,6 +95,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
+  page's **Get live info** button now returns a full live system snapshot — a KPI strip
+  (uptime, process / service / connection / user counts) over a grid of collapsible,
+  uniformly-sized, scrollable cards with an **Expand all / Collapse all** control and a
+  per-card **pop-out** for a larger view. Each card is a separate live read-only dispatch
+  through the existing Execute-gated, audit-logged chokepoint: **Processes** (a parent→
+  child tree with the SHA-256 of each on-disk image and live network connections joined
+  by PID, suspicious parent→child spawns flagged), **Services**, **Adapters & IP**,
+  **ARP** (Windows), **DNS cache** (Windows), **Listening ports**, **Active connections**,
+  **Logged-in users**, and a read-only **Capture sources** view (which TAR warehouse
+  sources are capturing locally; configuration stays on the TAR page). Two new agent
+  actions: `processes/list_tree` (adds parent PID for tree reconstruction) and
+  `network_config/arp` (Windows `GetIpNetTable2`) — these ship with agents built from
+  this release onward; an older agent renders an empty Processes-tree / ARP card (it
+  returns an `unknown action` response, so upgrade the agent to populate those cards). Each card has its own
+  `device.live.<kind>` audit verb so usage-class reads (process tree, connections, users,
+  DNS cache) stay separately countable for works-council. ARP and DNS-cache are
+  Windows-only; on other platforms those cards render an honest "not available on this OS"
+  note. Requires `Execution:Execute` + `GuaranteedState:Read`, scoped to the device. The
+  previous flat "Running processes" panel (`kind=processes`) is **retained** for
+  REST/scripted callers; the dashboard now dispatches `kind=process_tree`. REST/scripted
+  callers reach `kind=uptime|processes` only — the 9-card grid is dashboard-only pending
+  the A1 JSON backfill (#1649). See `docs/user-manual/device-management.md`.
 - **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
   (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
   via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS

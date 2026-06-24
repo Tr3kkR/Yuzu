@@ -2752,7 +2752,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* failed = nullptr;
-        const auto rows = responses_fn_(command_id);
+        // #1634: scope at the store seam (q.agent_id), not only the post-filter below.
+        const auto rows = responses_fn_(command_id, id);
         for (const auto& r : rows) {
             if (r.agent_id != id)
                 continue; // another agent's rows are never rendered here
@@ -2880,7 +2881,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  }
                  const DexAgentResponse* with_output = nullptr;
                  const DexAgentResponse* failed = nullptr;
-                 const auto rows = responses_fn_(command_id);
+                 // #1634: scope at the store seam (q.agent_id), not only the post-filter.
+                 const auto rows = responses_fn_(command_id, id);
                  for (const auto& r : rows) {
                      if (r.agent_id != id)
                          continue; // another agent's rows are never rendered here

@@ -139,6 +139,7 @@ Plugins for enumerating running processes, fetching process metadata, and queryi
 |---|---|
 | `list` | List all running processes (PID, name, user, memory, CPU). |
 | `list_hashed` | List running processes with the **SHA-256 of each on-disk executable image** (kernel-resolved path, not argv[0]; 512 MiB read cap). Returns `proc\|pid\|name\|sha256\|path`; sha256/path are empty when the path is unresolvable (kernel threads, access-denied). Usage-class behavioral telemetry — see the `device.live.processes` audit verb and the device page's **Get live info** ([device management](device-management.md)). This is the on-demand, Execute-gated, dashboard-integrated counterpart to `procfetch` (which is the scheduled-instruction fleet hash collector, SHA-1). |
+| `list_tree` | Like `list_hashed` but also carries the **parent PID** for tree reconstruction. Returns `proc\|pid\|ppid\|name\|sha256\|path` (`ppid` 0 = a root / unresolved). Backs the device page's **Processes** live card, which reconstructs a parent→child tree and joins live connections by PID. Same usage-class posture as `list_hashed`. |
 | `query` | Filter processes by name pattern. Returns matching entries. |
 
 ### procfetch
@@ -212,6 +213,8 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | `ip_addresses` | IPv4 and IPv6 addresses per adapter, including subnet mask and gateway. |
 | `dns_servers` | Configured DNS servers per adapter. |
 | `proxy` | System proxy settings (HTTP, HTTPS, SOCKS, PAC URL). |
+| `dns_cache` | Resolver cache entries (`cache_entry\|name\|type\|…`). **Windows only.** Backs the device page's **DNS cache** live card. |
+| `arp` | Host ARP / IPv6-neighbour table via `GetIpNetTable2` (`arp\|iface\|ip\|mac\|type`, capped at 20k entries). **Windows only** — Linux (`/proc/net/arp`) and macOS (route sysctl) are planned. Backs the device page's **ARP** live card. |
 
 ### netstat
 
