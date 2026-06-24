@@ -21,6 +21,7 @@
 
 #include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
@@ -61,6 +62,14 @@ struct RestGsHarness {
     fs::path db_path;
     std::unique_ptr<GuaranteedStateStore> store;
 
+    // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
+    // endpoint polls; the dispatch stub returns a deterministic command_id so a test
+    // can pre-insert the matching response row. live_sent toggles the offline path.
+    fs::path resp_db_path;
+    std::unique_ptr<ResponseStore> resp_store;
+    int live_sent{1};
+    std::string last_live_plugin, last_live_action;
+
     // BaselineStore for the baseline-anchored per-device status route.
     fs::path bl_db_path;
     std::unique_ptr<BaselineStore> baseline_store;
@@ -73,6 +82,24 @@ struct RestGsHarness {
     // preserving every other test's behaviour).
     bool grant_perms{true};
 
+    // When non-empty, the scoped per-device gate denies (403) this agent_id — lets a
+    // test prove the per-device scope is enforced on /api/v1/dex/devices/{id}.
+    std::string deny_scoped_agent;
+
+    // When non-empty, the scoped gate denies (403) only this operation (e.g.
+    // "Execute") — lets a test isolate the Execute floor on /live from the Read
+    // floor (#1549 review LOW: the gaps didn't isolate Execute-denied-but-Read-OK).
+    std::string deny_scoped_op;
+
+    // When false, audit_fn returns false (simulating a dropped evidence row) so a
+    // test can prove audit-on-open fails CLOSED on the REST PII / dispatch surface
+    // (#1549 review HIGH). Default true preserves every other test's behaviour.
+    bool audit_succeeds{true};
+
+    // When false, the live deps (response_store + command_dispatch_fn) are left
+    // unwired so a test can prove /live → 503 when the substrate is unavailable.
+    bool wire_live_deps{true};
+
     // Per-device scoped-permission simulation for the baseline-anchored route.
     // scoped_deny_agent (when non-empty) is treated as OUT OF SCOPE → 403; every
     // other agent is in scope. last_scoped_agent_id records the agent_id the route
@@ -82,13 +109,16 @@ struct RestGsHarness {
 
     std::vector<AuditRecord> audit_log;
 
+    yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
-    // wire_scoped_perm=false registers the baseline-device route with an EMPTY
-    // ScopedPermFn, exercising the route's fail-closed-503 path (an unwired call
-    // site). Defaults true so every existing test is unchanged.
-    explicit RestGsHarness(bool wire_scoped_perm = true)
-        : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")) {
+    // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
+    // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
+    // baseline-device route with an EMPTY ScopedPermFn, exercising its fail-closed-503
+    // path. Both default true so every existing test is unchanged.
+    explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true)
+        : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")),
+          wire_live_deps(live_deps) {
         fs::remove(db_path);
         fs::remove(bl_db_path);
         // retention=0 keeps the reaper out of the way for ingest tests.
@@ -97,6 +127,27 @@ struct RestGsHarness {
         REQUIRE(store->is_open());
         baseline_store = std::make_unique<BaselineStore>(bl_db_path);
         REQUIRE(baseline_store->is_open());
+
+        resp_db_path = unique_temp_path("rest-gs-resp");
+        fs::remove(resp_db_path);
+        resp_store = std::make_unique<ResponseStore>(resp_db_path, /*retention_days=*/0);
+
+        // Deterministic dispatch stub: command_id = "<plugin>-live" so a test can
+        // pre-insert the matching response row; live_sent toggles offline (0).
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>&, const std::string&,
+                   const std::unordered_map<std::string, std::string>&,
+                   const std::string&) -> std::pair<std::string, int> {
+            last_live_plugin = plugin;
+            last_live_action = action;
+            return {plugin + "-live", live_sent};
+        };
+        // When wire_live_deps is off, leave the dispatch closure empty so the /live
+        // handler hits its "substrate unavailable → 503" branch.
+        RestApiV1::CommandDispatchFn dispatch_arg =
+            wire_live_deps ? RestApiV1::CommandDispatchFn{command_dispatch_fn}
+                           : RestApiV1::CommandDispatchFn{};
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -118,29 +169,32 @@ struct RestGsHarness {
             return false;
         };
 
-        // Scoped per-device permission: records the agent_id, denies (403) when
-        // grant_perms is off OR the agent is the configured out-of-scope device.
-        // Mirrors require_scoped_permission's contract (global passes; otherwise the
-        // device must be in scope). The real RBAC group-widening is covered in
-        // test_rbac_store.cpp; this proves the ROUTE gates on the scoped fn with the
-        // correct agent_id (catches a regression to flat perm_fn or a wrong device).
+        // Scoped per-device permission (require_scoped_permission stand-in): records
+        // the agent_id, then denies (403) when grant_perms is off OR the agent matches
+        // either deny knob (deny_scoped_agent / dev's scoped_deny_agent) OR the
+        // operation matches deny_scoped_op (Execute-vs-Read isolation, #1549). Mirrors
+        // require_scoped_permission's contract (global passes; otherwise in-scope);
+        // last_scoped_agent_id proves the route scopes by the right device.
         auto scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                                     const std::string&, const std::string&,
+                                     const std::string&, const std::string& operation,
                                      const std::string& agent_id) -> bool {
             last_scoped_agent_id = agent_id;
-            if (!grant_perms || (!scoped_deny_agent.empty() && agent_id == scoped_deny_agent)) {
+            if (!grant_perms || (!deny_scoped_agent.empty() && agent_id == deny_scoped_agent) ||
+                (!scoped_deny_agent.empty() && agent_id == scoped_deny_agent) ||
+                (!deny_scoped_op.empty() && operation == deny_scoped_op)) {
                 res.status = 403;
                 return false;
             }
             return true;
         };
 
-        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
+        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>. Returns
+        // audit_succeeds so a test can simulate a dropped evidence row (#1549).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
-            return true;
+            return audit_succeeds;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -148,7 +202,7 @@ struct RestGsHarness {
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
-                            /*response_store=*/nullptr,
+                            wire_live_deps ? resp_store.get() : nullptr,
                             /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
@@ -162,11 +216,17 @@ struct RestGsHarness {
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr, store.get(),
-                            /*metrics_registry=*/nullptr, /*session_revoke_fn=*/{},
-                            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
-                            /*command_dispatch_fn=*/{}, /*step_up_fn=*/{},
-                            /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-                            /*lockout_clear_fn=*/{}, baseline_store.get(),
+                            /*metrics_registry=*/&metrics,
+                            /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr,
+                            /*result_set_store=*/nullptr,
+                            dispatch_arg,
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{},
+                            /*lockout_clear_fn=*/{},
+                            baseline_store.get(),
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{});
     }
@@ -174,7 +234,8 @@ struct RestGsHarness {
     ~RestGsHarness() {
         store.reset();
         baseline_store.reset();
-        for (const auto& p : {db_path, bl_db_path}) {
+        resp_store.reset();
+        for (const auto& p : {db_path, bl_db_path, resp_db_path}) {
             fs::remove(p);
             // sqlite WAL/SHM siblings
             fs::remove(p.string() + "-wal");
@@ -768,6 +829,526 @@ TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audite
     CHECK(h.audit_log.empty());
 }
 
+TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device's signals, audited",
+          "[rest][dex][device]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("o2", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.seed_obs("o3", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z"); // other device
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    REQUIRE(j["data"]["signals"].is_array());
+    bool saw_crashed = false, saw_other = false;
+    int64_t crashed_count = -1;
+    for (const auto& s : j["data"]["signals"]) {
+        if (s["obs_type"].get<std::string>() == "process.crashed") {
+            saw_crashed = true;
+            crashed_count = s["count"].get<int64_t>();
+        }
+        if (s["obs_type"].get<std::string>() == "os.boot")
+            saw_other = true; // belongs to WS-2
+    }
+    CHECK(saw_crashed);
+    CHECK(crashed_count == 2);
+    CHECK_FALSE(saw_other); // WS-2's signal must not leak into WS-1's per-device summary
+    // Per-device behavioral read → audited dex.device.view (parity with the lens).
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
+          "[rest][dex][device][a2]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2 discovery: the per-device DEX endpoint is enumerable from the live server.
+    REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
+    // And the embedded spec remains valid JSON after the insertion.
+    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+}
+
+TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no audit",
+          "[rest][dex][device][scope]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-9", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.deny_scoped_agent = "WS-9"; // the per-device scope gate denies this agent
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-9?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty()); // the scope gate runs BEFORE any audit emission
+}
+
+TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, audited",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // Pre-insert the agent's response for the deterministic command_id the stub mints.
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 0; // RUNNING row carries the output
+    r.output = "uptime_seconds|181740\nuptime_display|2d 2h 29m";
+    h.resp_store->store(r);
+
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.last_live_plugin == "os_info");
+    CHECK(h.last_live_action == "uptime");
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["kind"].get<std::string>() == "uptime");
+    CHECK(j["data"]["uptime_display"].get<std::string>() == "2d 2h 29m");
+    CHECK(j["data"]["uptime_seconds"].get<int64_t>() == 181740);
+    // #1549 audit-on-open: the audit fires BEFORE dispatch with result "requested"
+    // (the works-council event = operator asked for live data), not the old
+    // post-dispatch "dispatched". Lock it so a revert to post-dispatch auditing
+    // (which would dispatch before durable evidence) fails.
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.uptime" && a.result == "requested" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|path rows",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = 0;
+    r.output =
+        "proc|0|[System Process]||\n"
+        "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh";
+    h.resp_store->store(r);
+
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.last_live_action == "list_hashed"); // the hashed variant
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["processes"].is_array());
+    REQUIRE(j["data"]["processes"].size() == 2);
+    const auto& sh = j["data"]["processes"][1];
+    CHECK(sh["pid"].get<int64_t>() == 123);
+    CHECK(sh["name"].get<std::string>() == "sh");
+    CHECK(sh["sha256"].get<std::string>().rfind("deadbeefcafe0000", 0) == 0);
+    CHECK(sh["path"].get<std::string>() == "/bin/sh");
+    bool audited = false; // #1549: pre-dispatch audit, result "requested"
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.processes" && a.result == "requested")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited requested",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    h.live_sent = 0; // dispatch reaches no connected agent
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // #1549: the audit fires "requested" BEFORE dispatch — the works-council event
+    // is the operator's request, recorded regardless of whether an agent was reached
+    // (the 503 carries the no-agent outcome). The dispatch still happened (audit
+    // persisted), so the evidence row exists.
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "device.live.uptime" && a.result == "requested")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=bogus", "");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.last_live_plugin.empty()); // never dispatched
+}
+
+TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
+          "[rest][dex][device][live][scope]") {
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-9/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty()); // gate denied before any dispatch
+}
+
+// ── Governance hardening-round coverage (R1) ──────────────────────────────
+
+namespace {
+// StoredResponse::status mirrors CommandResponse::Status; name the values the /live
+// poll branches on so a proto enum shuffle breaks these tests loudly (quality S4).
+constexpr int kStatusPending = 0;
+constexpr int kStatusSuccess = 1;
+constexpr int kStatusFailure = 2;
+constexpr int kStatusFatal = 3;
+
+// Exception-safe save/restore for a process-global test-seam atomic: restores in the
+// dtor so a throwing REQUIRE between mutate and restore can't poison later tests
+// (quality S1 / cpp-safety SHOULD).
+struct AtomicSave {
+    std::atomic<int>& ref;
+    int saved;
+    explicit AtomicSave(std::atomic<int>& a) : ref(a), saved(a.load()) {}
+    ~AtomicSave() { ref.store(saved); }
+    AtomicSave(const AtomicSave&) = delete;
+    AtomicSave& operator=(const AtomicSave&) = delete;
+};
+} // namespace
+
+
+TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
+          "[rest][dex][device]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=banana");
+    REQUIRE(res);
+    CHECK(res->status == 400);          // not a silent default to 7d
+    CHECK(h.audit_log.empty());         // validated before any audit emission
+}
+
+TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-output row → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // A single frame that carries BOTH partial output AND a failure status — the
+    // pre-fix poll returned 200 with the partial data (UP-4). Failure must 502.
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusFailure;
+    r.output = "uptime_display|2d 2h"; // partial output present alongside the failure
+    r.error_detail = "agent aborted";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
+    CHECK(j["error"]["message"].get<std::string>().find("device query failed") != std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusPending;
+    r.output = "error|disk subsystem offline";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
+    CHECK(j["error"]["message"].get<std::string>().find("device reported an error") !=
+          std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusFatal; // FAILURE, no output
+    r.error_detail = "plugin crashed";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 502);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty (not a 504)",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess; // no output rows
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["kind"].get<std::string>() == "processes");
+    REQUIRE(j["data"]["processes"].is_array());
+    CHECK(j["data"]["processes"].empty());
+}
+
+TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
+    yuzu::server::detail::live_max_inflight().store(0); // any call is over budget
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(h.last_live_plugin.empty()); // 429'd before dispatch — no command sent
+}
+
+TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1); // ~2ms not ~20s; no row inserted
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 504);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    // The endpoint is POST-only (it dispatches a command). A GET must NOT reach the
+    // handler — the TestRouteSink returns nullptr when no route matches the method,
+    // mirroring httplib's 404. Locks the GET->POST migration (architect B1).
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/live?kind=uptime");
+    CHECK(res == nullptr);
+    CHECK(h.last_live_plugin.empty()); // never dispatched
+}
+
+TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
+          "[rest][dex][device][live][metrics]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess;
+    r.output = "uptime_display|1d";
+    h.resp_store->store(r);
+
+    auto ok = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    // One uptime/200 counted; the in-flight gauge returns to 0 after the call.
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "200"}})
+              .value() == 1.0);
+    CHECK(h.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
+
+    // A 429 (cap exhausted) is counted under its own outcome label, no dispatch.
+    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
+    yuzu::server::detail::live_max_inflight().store(0);
+    auto rej = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(rej);
+    CHECK(rej->status == 429);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "429"}})
+              .value() == 1.0);
+}
+
+// ── #1549 review hardening: audit-on-open fail-closed, A4 denials, headers ──
+
+TEST_CASE("REST dex/devices/{id}: audit persistence failure → 503, no PII served, Sec-Audit-Failed",
+          "[rest][dex][device][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false; // the audit row cannot persist (DB locked/full/corrupt)
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    // FAIL-CLOSED: behavioral PII must not be served when the evidence row is known
+    // to have been lost (SOC 2 CC7.2 / works-council).
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty()); // echoed on the error path too
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    // No device data leaked onto the body — assert the structural keys AND the actual
+    // seeded PII content (an app-identity leak under a different key would harm the
+    // works-council/SOC 2 evidence review).
+    CHECK(res->body.find("\"signals\"") == std::string::npos);
+    CHECK(res->body.find("\"score\"") == std::string::npos);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}: success echoes X-Correlation-Id header",
+          "[rest][dex][device][a3]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+}
+
+TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dispatch, "
+          "Sec-Audit-Failed",
+          "[rest][dex][device][live][audit]") {
+    RestGsHarness h;
+    h.audit_succeeds = false; // evidence row cannot persist
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    // The probe must NOT be dispatched without durable evidence.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty()); // echoed on the error path too
+    CHECK(h.last_live_plugin.empty()); // audit failed BEFORE dispatch → no command sent
+}
+
+TEST_CASE("REST dex/devices/{id}/live: success echoes X-Correlation-Id header",
+          "[rest][dex][device][live][a3]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess;
+    r.output = "uptime_display|1d";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+}
+
+TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, no dispatch",
+          "[rest][dex][device][live][scope]") {
+    RestGsHarness h;
+    h.deny_scoped_op = "Execute"; // Read floor passes; Execute floor denies
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty()); // the Execute gate denied before any dispatch
+}
+
+TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
+          "[rest][dex][device][live]") {
+    RestGsHarness h{/*live_deps=*/false}; // no response_store + no command_dispatch_fn
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess;
+    r.output = std::string(5 * 1024 * 1024, 'x'); // > 4 MiB cap
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("too large") != std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never rendered → 504",
+          "[rest][dex][device][live][scope]") {
+    RestGsHarness h;
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1);
+    // A row under the SAME command_id but for a DIFFERENT agent must be ignored —
+    // never returned as WS-1's data. With no WS-1 row, the poll times out (504).
+    StoredResponse other;
+    other.instruction_id = "os_info-live";
+    other.agent_id = "OTHER";
+    other.status = kStatusSuccess;
+    other.output = "uptime_display|99d";
+    h.resp_store->store(other);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 504);
+    CHECK(res->body.find("99d") == std::string::npos); // OTHER's data never leaked
+}
+
+TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 200 empty",
+          "[rest][dex][device][live]") {
+    RestGsHarness h;
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusSuccess; // no output rows
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["kind"].get<std::string>() == "uptime");
+}
+
+TEST_CASE("REST dex/devices/{id}: scoped denial carries the A4 envelope (correlation_id + "
+          "permission)",
+          "[rest][dex][device][scope][a4]") {
+    // The scoped gate is wired in production to require_scoped_permission, whose
+    // denial now emits the A4 envelope. Here the harness's scoped_perm_fn stands in
+    // for the gate and writes only a 403 status — so this test asserts the handler
+    // surfaces the gate's status untouched (no data leak); the A4 *body* shape is
+    // pinned at the helper level in test_auth_routes.cpp.
+    // KNOWN GAP (governance #1549 QE-SHOULD): this test does NOT prove the
+    // /api/v1/dex/devices/{id} handler is wired to the A4-emitting
+    // require_scoped_permission — that binding is accepted as untested at this unit
+    // boundary (the harness stub stands in for the gate).
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-9?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
+
+// #1549 governance consistency-B1: the per-device PII REST siblings must fail closed
+// on a dropped audit row, same as GET /dex/devices/{id}.
+
+TEST_CASE("REST guaranteed-state/events: agent-scoped audit failure → 503, no PII, Sec-Audit-Failed",
+          "[rest][dex][events][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false;
+    // agent_id filter = individual-identifying behavioral PII → audited + fail-closed.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events?agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos); // no PII leaked
+}
+
+TEST_CASE("REST guaranteed-state/events: NO agent_id filter is a bulk query — not gated by audit",
+          "[rest][dex][events][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false; // would fail-close IF it were audited
+    // No agent_id → bulk operational query, deliberately not individual-audited → serves.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+}
+
+TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, Sec-Audit-Failed",
+          "[rest][dex][signals][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_succeeds = false;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("WS-1") == std::string::npos); // the agent_id list must not leak
+}
+
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
@@ -1061,7 +1642,7 @@ TEST_CASE("REST gs.baseline-device: per-device scope — out-of-scope agent 403,
 
 TEST_CASE("REST gs.baseline-device: unwired scoped_perm_fn → fail-closed 503 (A4)",
           "[rest][guaranteed_state][baseline][rbac]") {
-    RestGsHarness h{/*wire_scoped_perm=*/false};
+    RestGsHarness h{/*live_deps=*/true, /*wire_scoped_perm=*/false};
     h.seed_rule("r1", "G1");
     const auto bid = h.seed_deployed_baseline("B", {"r1"});
     // With no scoped_perm_fn wired the route MUST fail closed (503) — never silently

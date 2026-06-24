@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
   service guard remains observe-only on the compliant edge (parity deferred).
 
+### Security
+
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
+
 ### Added
 
 - **Sampled authentication-log evidence export (SOC 2 CC7.2).** New
@@ -85,6 +105,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device's management group (a device outside your scope cannot be live-queried); each dispatch
   is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
   usage-class read kept separately countable for works-council access audit.
+- **REST: agentic-first per-device DEX endpoints.** `GET /api/v1/dex/devices/{id}` — the
+  per-device DEX read model (score + signal summary), the machine-readable equivalent of the
+  dashboard DEX lens; `GuaranteedState:Read` scoped to the device, audited `dex.device.view`,
+  off-enum `window` rejected `400`. `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` —
+  the machine-readable "Get live info": dispatches a read-only instruction now and returns the
+  result synchronously (~20s). **POST, not GET** (it dispatches a command — a side effect);
+  `GuaranteedState:Read` + `Execution:Execute` scoped to the device; audited per kind
+  (`device.live.uptime` / `device.live.processes`, audited `result=requested` pre-dispatch — see
+  the Security entry above; the dashboard "Get live info" emitter still audits post-dispatch
+  `result=dispatched`, a tracked alignment follow-up). Concurrent live polls
+  are capped server-wide (over-budget → `429`); offline → `503`, timeout → `504`, device error
+  → `502`, all with `retry_after_ms` where applicable.
 - **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
   executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux
   `/proc/<pid>/exe`, macOS `proc_pidpath`) — not the spoofable argv[0] — and the on-disk image
