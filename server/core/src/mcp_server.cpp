@@ -5,6 +5,7 @@
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 
@@ -2119,8 +2120,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Behavioral-PII access audit — the devices[] list below names the
                 // agent_ids exhibiting this signal. Same verb/target as the REST
                 // and dashboard per-signal views (cross-surface SIEM parity).
-                audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
-                         "DEX per-signal drill-down via MCP get_dex_signal_detail");
+                // The route previously DISCARDED the AuditFn bool (#1647). It now
+                // captures it through the shared kernel (which adds the catch-arm log
+                // a throwing audit_fn otherwise lacked). MCP convention is set-and-
+                // proceed with `audit_persisted:false` in the result — JSON-RPC has no
+                // response-header channel, and this matches the query_responses (#1550)
+                // and revoke_certificate (#1240) siblings; a null audit_fn (audit-off)
+                // returns true and serves, per contract. (The REST dex.signal.view
+                // sibling fails closed instead — different surface, different posture.)
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.signal.view", "success", "ObsType", obs_type,
+                    "DEX per-signal drill-down via MCP get_dex_signal_detail");
 
                 JArr subjects;
                 for (const auto& s :
@@ -2151,13 +2161,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
                     by_day.add(JObj().add("day", d.day).add("count", d.crashes));
                 }
-                auto payload = JObj()
-                                   .add("obs_type", obs_type)
-                                   .raw("subjects", subjects.str())
-                                   .raw("by_os", by_os.str())
-                                   .raw("devices", devices.str())
-                                   .raw("by_day", by_day.str())
-                                   .str();
+                JObj payload_obj;
+                payload_obj.add("obs_type", obs_type)
+                    .raw("subjects", subjects.str())
+                    .raw("by_os", by_os.str())
+                    .raw("devices", devices.str())
+                    .raw("by_day", by_day.str());
+                // Evidence-gap signal: absent on success (consumers key on absence),
+                // false when the per-signal access audit row failed to persist (#1647).
+                if (!audit_ok)
+                    payload_obj.add("audit_persisted", false);
+                auto payload = payload_obj.str();
                 auto result =
                     JObj()
                         .raw("content",

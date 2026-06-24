@@ -1000,6 +1000,32 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
 }
 
+// #1647: get_dex_signal_detail previously DISCARDED the AuditFn bool. It now captures
+// it (shared try_persist_audit kernel — try/catch + catch-arm log) and surfaces a
+// dropped row via audit_persisted:false. MCP set-and-proceeds (parity with the
+// query_responses #1550 and revoke_certificate #1240 siblings — no header channel).
+TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persisted:false (#1647)",
+          "[mcp][integration][dex][audit]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.audit_succeeds_ = false; // the dex.signal.view audit row cannot persist
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":44,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // set-and-proceed
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // Data still served, but flagged so a body-parsing agentic worker sees the gap.
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(payload["devices"].size() == 1); // WS-1 still returned
+}
+
 TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
           "[mcp][integration][dex]") {
     GuaranteedStateStore store(":memory:");

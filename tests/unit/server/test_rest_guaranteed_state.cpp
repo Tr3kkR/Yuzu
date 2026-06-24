@@ -33,6 +33,7 @@
 #include "../test_helpers.hpp"
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,11 @@ struct RestGsHarness {
     // test can prove audit-on-open fails CLOSED on the REST PII / dispatch surface
     // (#1549 review HIGH). Default true preserves every other test's behaviour.
     bool audit_succeeds{true};
+
+    // When true, audit_fn THROWS (a bad_alloc-class failure) so a test can prove
+    // the shared #1647 helper catches it (the throw arm was previously silent) and
+    // still fails closed with Sec-Audit-Failed rather than letting it escape.
+    bool audit_throws{false};
 
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
@@ -194,6 +200,8 @@ struct RestGsHarness {
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (audit_throws)
+                throw std::runtime_error("audit DB write blew up");
             return audit_succeeds;
         };
 
@@ -1583,6 +1591,43 @@ TEST_CASE("REST gs.baseline-device: unknown baseline_id → 404 + not_found audi
             a.result == "not_found")
             not_found_audited = true;
     CHECK(not_found_audited);
+}
+
+// #1647: the baseline-device route serves per-device behavioural-compliance PII
+// over REST (machine consumers — CMDB/ServiceNow). It previously DISCARDED the
+// AuditFn bool; it now fails closed (parity with the dex.device.view REST siblings)
+// so evidence-less PII is never served as audited.
+TEST_CASE("REST gs.baseline-device: audit persistence failure → 503, no PII served, Sec-Audit-Failed",
+          "[rest][guaranteed_state][baseline][audit]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Defender on");
+    const auto bid = h.seed_deployed_baseline("Endpoint Hardening", {"r1"});
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.audit_succeeds = false; // the evidence row cannot persist
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // No compliance PII leaked — neither the guard rollup nor the guard name.
+    CHECK(res->body.find("\"guards\"") == std::string::npos);
+    CHECK(res->body.find("Defender on") == std::string::npos);
+}
+
+// #1647 item 1: a bad_alloc-class throw out of audit_fn was previously silent on
+// this route (no try/catch). The shared helper catches it → fail closed, never lets
+// it escape into a bare 500.
+TEST_CASE("REST gs.baseline-device: a throwing audit_fn is caught → 503 fail-closed",
+          "[rest][guaranteed_state][baseline][audit]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Defender on");
+    const auto bid = h.seed_deployed_baseline("Endpoint Hardening", {"r1"});
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.audit_throws = true;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("Defender on") == std::string::npos);
 }
 
 TEST_CASE("REST gs.baseline-device: deployed-but-empty baseline → deployed:true, no guards",

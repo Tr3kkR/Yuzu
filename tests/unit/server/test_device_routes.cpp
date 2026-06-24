@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -260,11 +261,15 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
     auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
     std::vector<std::string> audited;
-    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid,
-                            const std::string&) -> bool {
+    bool audit_ok = true;      // flip to simulate a dropped evidence row (#1647)
+    bool audit_throws = false; // flip to simulate a bad_alloc-class throw from audit_fn (#1647)
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
+                     const std::string&, const std::string& tid, const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
-        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
+        // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549).
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        return audit_ok;
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
@@ -291,6 +296,37 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
         }
         CHECK(saw_dex);
         CHECK(saw_guardian);
+    }
+    // #1647: a per-device behavioural-PII lens whose audit row silently fails to
+    // persist must surface the gap (Sec-Audit-Failed) — but as an HTML dashboard
+    // surface it SET-AND-PROCEEDS (a transient audit hiccup must not blank the
+    // operator's lens, unlike the strict REST per-device endpoints that fail closed).
+    SECTION("audit-persist failure -> Sec-Audit-Failed header, fragment still renders") {
+        allow_read = true;
+        audit_ok = false; // the evidence row cannot persist
+        auto dex = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(dex);
+        CHECK(dex->status == 200); // set-and-proceed
+        CHECK(dex->get_header_value("Sec-Audit-Failed") == "true");
+        auto gd = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(gd);
+        CHECK(gd->status == 200);
+        CHECK(gd->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    // #1647 item 1: a bad_alloc-class throw out of audit_fn was previously silent
+    // (no try/catch). The shared helper catches it, logs, flags the header, and the
+    // handler still returns a response instead of letting the throw escape.
+    SECTION("a throwing audit_fn is caught + flagged, never escapes the handler") {
+        allow_read = true;
+        audit_throws = true;
+        auto dex = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(dex);
+        CHECK(dex->status == 200);
+        CHECK(dex->get_header_value("Sec-Audit-Failed") == "true");
+        auto gd = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(gd);
+        CHECK(gd->status == 200);
+        CHECK(gd->get_header_value("Sec-Audit-Failed") == "true");
     }
 }
 
