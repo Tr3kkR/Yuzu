@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
@@ -35,6 +36,7 @@
 #include <memory>
 #include <random>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -443,7 +445,7 @@ const std::string& openapi_spec() {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
               "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
-              "retry_after_ms": {"type": "integer", "format": "int64", "description": "Optional. Advises the worker to back off this many milliseconds before retrying. Currently emitted on 503 (warmup) only."},
+              "retry_after_ms": {"type": ["integer", "null"], "format": "int64", "description": "Always present in an A4 error body; null unless the condition is retryable, in which case it advises the worker to back off this many milliseconds before retrying (e.g. 503 warmup)."},
               "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
             }
           },
@@ -541,6 +543,9 @@ const std::string& openapi_spec() {
     "/audit": {
       "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}}}
     },
+    "/audit/auth-sample": {
+      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
+    },
     "/inventory/tables": {
       "get": {"summary": "List available inventory data types", "tags": ["Inventory"], "description": "Lists distinct plugins that have reported inventory data, with agent counts and last collection timestamps.", "responses": {"200": {"description": "List of inventory tables", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InventoryTable"}}}}}}
     },
@@ -557,6 +562,9 @@ const std::string& openapi_spec() {
     },
     "/bundles/{id}": {
       "get": {"summary": "Collate a dispatched bundle", "tags": ["Bundles"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^bundle-[a-f0-9]+$"}}], "responses": {"200": {"description": "Server-grouped {complete, received, succeeded, expected, steps[]} in request order. complete is terminal, NOT success — check succeeded==expected. Invalid-UTF-8 bytes in step output are replaced with U+FFFD."}, "403": {"description": "Requires Response:Read"}, "404": {"description": "Not found, expired, or not owned (no enumeration oracle)"}, "503": {"description": "Service unavailable"}}}
+    },
+    "/users/{username}/unlock": {
+      "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
@@ -761,8 +769,15 @@ std::string make_correlation_id() {
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::string_view remediation) {
-    auto err =
-        JObj().add("code", code).add("message", message).add("correlation_id", correlation_id);
+    // A4 (docs/agentic-first-principle.md) lists retry_after_ms as a REQUIRED,
+    // nullable envelope field. This no-retry overload emits it as null so every
+    // REST A4 error body carries the full field set (matching the MCP a4_data
+    // sibling); the second overload below supplies a concrete value. #1470.
+    auto err = JObj()
+                   .add("code", code)
+                   .add("message", message)
+                   .add("correlation_id", correlation_id)
+                   .raw("retry_after_ms", "null");
     if (!remediation.empty()) {
         err.add("remediation", remediation);
     }
@@ -839,7 +854,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -849,7 +864,8 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn), baseline_store, std::move(scoped_perm_fn));
+                    std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
+                    std::move(scoped_perm_fn));
 }
 
 void RestApiV1::register_routes(
@@ -865,7 +881,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1889,6 +1905,100 @@ void RestApiV1::register_routes(
             "application/json");
     });
 
+    // POST /api/v1/users/<username>/unlock — admin clears an account's
+    // lockout counter (SOC 2 CC6.3). Gated by `UserManagement:Write` (parity
+    // with role change / session force-logout). Self-target is permitted:
+    // clearing your own lockout is recoverable, same reasoning as the
+    // self-revoke at the sessions route above. The lockout already
+    // auto-expires after the window — this is the operability path for an
+    // operator who can't wait it out. `username` is validated with
+    // `is_valid_username` so a NUL byte can't diverge the audit target_id
+    // from the SQL bind (sec-H1 parity with the sessions route).
+    sink.Post(
+        R"(/api/v1/users/([^/]+)/unlock)",
+        [auth_fn, perm_fn, audit_fn, step_up_fn, lockout_clear_fn](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+            // Brand-new route — emit the structured A4 error envelope
+            // (correlation_id / retry_after_ms / remediation) so new code moves
+            // the REST surface toward the agentic-first idiom.
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!perm_fn(req, res, "UserManagement", "Write"))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (session->username.empty()) {
+                // sec-M1: an empty caller username would mis-attribute the
+                // audit row; never proceed past it.
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "session has empty username", cid),
+                                "application/json");
+                return;
+            }
+            // High-risk admin action on another principal's access state —
+            // require fresh MFA proof (parity with session force-logout).
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/users/{name}/unlock"))
+                return;
+            if (!lockout_clear_fn) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "lockout subsystem unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "account lockout requires the persistent auth.db; start "
+                                          "the server with --data-dir"),
+                    "application/json");
+                return;
+            }
+            const auto username = req.matches[1].str();
+            if (username.empty() || !is_valid_username(username)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                      "username must match the allowed format"),
+                                "application/json");
+                return;
+            }
+            // Audit emission wrapper — parity with the sessions-revoke route
+            // (HIGH-2 on PR #883): a lost or throwing audit write on this
+            // CC6.3-evidence action must NOT masquerade as a clean 200. The
+            // `Sec-Audit-Failed` response header + `audit_emitted` body field
+            // give SRE/SIEM and the API client an out-of-band signal.
+            auto try_audit = [&audit_fn, &req, &username](const std::string& result,
+                                                          const std::string& detail) -> bool {
+                try {
+                    return audit_fn(req, "auth.lockout.cleared", result, "User", username, detail);
+                } catch (const std::exception& e) {
+                    spdlog::error("audit_fn threw on auth.lockout.cleared target={}: {}", username,
+                                  e.what());
+                    return false;
+                } catch (...) {
+                    spdlog::error("audit_fn threw unknown on auth.lockout.cleared target={}",
+                                  username);
+                    return false;
+                }
+            };
+            const bool ok = lockout_clear_fn(username);
+            if (!ok) {
+                res.status = 500;
+                // Best-effort failure audit so a lost unlock is still visible
+                // in the CC6.3 evidence chain.
+                if (!try_audit("error", "admin_unlock"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(detail::error_json_a4(500, "failed to clear lockout", cid),
+                                "application/json");
+                return;
+            }
+            const bool audit_emitted = try_audit("ok", "admin_unlock");
+            if (!audit_emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(ok_json(JObj()
+                                        .add("username", username)
+                                        .add("unlocked", true)
+                                        .add("audit_emitted", audit_emitted)
+                                        .str()),
+                            "application/json");
+        });
+
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
     sink.Get("/api/v1/quarantine",
@@ -2640,6 +2750,181 @@ void RestApiV1::register_routes(
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
                                  "application/json");
              });
+
+    // GET /api/v1/audit/auth-sample — pseudo-random sample of authentication-
+    // surface audit events over an optional [from,to] window, for SOC 2 CC7.2
+    // sampled-evidence export. Scoped to the auth./mfa./session. action prefixes.
+    // Gated on AuditLog:Read (consistent with /api/v1/audit, and lets a read-only
+    // auditor role pull evidence without full admin — separation of duties). The
+    // export itself is audited (audit.auth_sample.exported) so evidence access is
+    // on the chain.
+    sink.Get(
+        "/api/v1/audit/auth-sample",
+        [perm_fn, audit_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AuditLog", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            // A broken/closed audit store must FAIL LOUD, not return an empty
+            // 200 — on a CC7.2 evidence endpoint an empty sample reads as "no
+            // authentication activity" when the truth is "the store is down".
+            // !is_open() is the platform-wide store-down guard
+            // (docs/observability-conventions.md), the 15+ peer routes in this
+            // file all carry it, and docs/user-manual/rest-api.md promises 503
+            // when the audit store is unavailable. Checking only the pointer
+            // (store wired but DB never opened) let a null handle return an
+            // empty query result as 200 — misleading evidence, not missing.
+            if (!audit_store || !audit_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit store unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the audit store opens during "
+                                          "startup or after a config reload"),
+                    "application/json");
+                return;
+            }
+
+            AuditQuery q;
+            q.action_prefixes = {"auth.", "mfa.", "session."};
+            q.random_sample = true;
+            // std::stoll throws std::out_of_range on overflow (unlike strtoll) — the
+            // catch turns that into a 400, so no separate errno/ceiling check is
+            // needed. out>=0 rejects negatives.
+            auto parse_epoch = [](const std::string& s, int64_t& out) -> bool {
+                if (s.empty())
+                    return true; // optional — leave default (unbounded that side)
+                // Reject leading whitespace / '+' / '-' that std::stoll would
+                // otherwise silently accept (cpp-expert S-1 / UP-9): a strict
+                // digits-only contract, so "non-numeric → 400" is literally true.
+                if (!std::isdigit(static_cast<unsigned char>(s.front())))
+                    return false;
+                try {
+                    size_t consumed = 0;
+                    out = std::stoll(s, &consumed);
+                    return consumed == s.size() && out >= 0; // reject trailing junk
+                } catch (const std::invalid_argument&) {
+                    return false;
+                } catch (const std::out_of_range&) {
+                    return false; // overflow — std::stoll throws (unlike strtoll)
+                }
+                // Narrow catches only — std::bad_alloc and other fatal exceptions
+                // propagate rather than masquerading as a 400 (Hermes L-2).
+            };
+            if (!parse_epoch(req.get_param_value("from"), q.since) ||
+                !parse_epoch(req.get_param_value("to"), q.until)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "from/to must be non-negative epoch seconds", cid,
+                                          "pass from/to as non-negative integer epoch seconds"),
+                    "application/json");
+                return;
+            }
+            // Inverted window is a client bug, not "no data" (Hermes L-3).
+            if (q.since > 0 && q.until > 0 && q.since > q.until) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "from must be <= to", cid,
+                                                      "ensure from <= to"),
+                                "application/json");
+                return;
+            }
+            // Malformed limit is a 400, not a silent fallback to the default
+            // (Hermes L-2 — stricter than the legacy /api/v1/audit).
+            auto limit_str = req.get_param_value("limit");
+            if (!limit_str.empty()) {
+                bool limit_bad = !std::isdigit(static_cast<unsigned char>(limit_str.front()));
+                try {
+                    size_t consumed = 0;
+                    q.limit = std::stoi(limit_str, &consumed);
+                    limit_bad = limit_bad || (consumed != limit_str.size()); // trailing junk
+                } catch (const std::invalid_argument&) {
+                    limit_bad = true;
+                } catch (const std::out_of_range&) {
+                    limit_bad = true;
+                }
+                // Narrow catches only (Hermes L-2) — std::bad_alloc propagates.
+                if (limit_bad) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(400, "limit must be an integer", cid,
+                                                          "pass limit as a positive integer"),
+                                    "application/json");
+                    return;
+                }
+            }
+            if (q.limit > 1000)
+                q.limit = 1000;
+            if (q.limit < 1)
+                q.limit = 1;
+
+            std::size_t pool_size = 0;
+            auto events = audit_store->query(q, &pool_size);
+            // recency_capped: the window held at least the scan cap, so the sample
+            // was drawn only from the most-recent kAuditSampleScanCap events and is
+            // NOT a uniform sample of the full window. Surfaced in the response so an
+            // auditor never presents a biased sample as representative (CC7.2 evidence
+            // honesty — compliance/architect SHOULD).
+            const bool recency_capped = (pool_size >= kAuditSampleScanCap);
+            // Field set matches the sibling GET /api/v1/audit exactly (Hermes M-2):
+            // auth-sample does NOT widen what an AuditLog:Read principal can see —
+            // session_id (session bearer correlation) and source_ip are deliberately
+            // NOT exposed here. A richer evidence view, if needed, is a follow-up
+            // under a narrower permission.
+            JArr arr;
+            for (const auto& e : events) {
+                arr.add(JObj()
+                            .add("timestamp", e.timestamp)
+                            .add("principal", e.principal)
+                            .add("action", e.action)
+                            .add("result", e.result)
+                            .add("target_type", e.target_type)
+                            .add("target_id", e.target_id)
+                            .add("detail", e.detail));
+            }
+            // Evidence access is itself auditable (CC7.2): record who exported which
+            // window and how many rows. The read still proceeds if audit persistence
+            // fails, but the failure is made VISIBLE (Hermes M-1, repudiation gap) via
+            // a warn log + a `Sec-Audit-Failed: true` response header — never silently
+            // swallowed. result="success" matches the dominant audit vocabulary and
+            // the analogous self-auditing export `ca.root_csr.exported` (consistency S1).
+            bool audit_emitted = false;
+            try {
+                std::string detail = "from=" + std::to_string(q.since) +
+                                     " to=" + std::to_string(q.until) +
+                                     " limit=" + std::to_string(q.limit) +
+                                     " returned=" + std::to_string(events.size());
+                audit_emitted = audit_fn(req, "audit.auth_sample.exported", "success", "AuditLog",
+                                         "auth-sample", detail);
+            } catch (const std::exception& ex) {
+                spdlog::warn("audit.auth_sample.exported emission threw: {}", ex.what());
+            }
+            if (!audit_emitted) {
+                spdlog::warn("audit.auth_sample.exported did not persist — evidence-chain gap "
+                             "for an auth-sample export");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            // Envelope mirrors list_json (data + pagination + meta) and adds a
+            // `sampling` block so the evidence semantics are honest in the response
+            // itself: candidates_considered = pool the sample was drawn from,
+            // recency_capped = that pool hit the scan cap (sample is recency-biased,
+            // not uniform over the window). page_size = the actual limit (Hermes L-1).
+            std::string pagination = JObj()
+                                         .add("total", static_cast<int64_t>(events.size()))
+                                         .add("start", static_cast<int64_t>(0))
+                                         .add("page_size", static_cast<int64_t>(q.limit))
+                                         .str();
+            std::string sampling = JObj()
+                                       .add("candidates_considered", static_cast<int64_t>(pool_size))
+                                       .add("scan_cap", static_cast<int64_t>(kAuditSampleScanCap))
+                                       .add("recency_capped", recency_capped)
+                                       .str();
+            std::string body = JObj()
+                                   .raw("data", arr.str())
+                                   .raw("pagination", pagination)
+                                   .raw("sampling", sampling)
+                                   .raw("meta", R"({"api_version":"v1"})")
+                                   .str();
+            res.set_content(body, "application/json");
+        });
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
 
@@ -5148,9 +5433,18 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): match the cohort-diff sibling — a correlation
+                 // id on every response + the A4 error envelope on failures.
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
@@ -5173,16 +5467,25 @@ void RestApiV1::register_routes(
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const std::string key =
                      req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid tag key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid tag key", cid),
+                                     "application/json");
                      return;
                  }
                  const auto snap = dex_perf_fn(key);
@@ -5320,9 +5623,17 @@ void RestApiV1::register_routes(
              [perm_fn, dex_perf_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
+                 // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
                  if (!dex_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(
+                         detail::error_json_a4(503, "service unavailable", cid,
+                                               /*retry_after_ms=*/5000,
+                                               "retry after server warmup; the fleet-perf snapshot "
+                                               "provider initialises during startup"),
+                         "application/json");
                      return;
                  }
                  const DexPerfMetric metric = dex_perf_metric_from_token(
@@ -5338,7 +5649,8 @@ void RestApiV1::register_routes(
                                                  : kDexDefaultCohortKey;
                  if (!TagStore::validate_key(cohort_key)) {
                      res.status = 400;
-                     res.set_content(error_json("invalid cohort_key"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid cohort_key", cid),
+                                     "application/json");
                      return;
                  }
                  std::optional<std::string> cohort_filter;
@@ -5352,7 +5664,8 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v <= 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::error_json_a4(400, "invalid limit", cid),
+                                         "application/json");
                          return;
                      }
                      limit = std::min(v, 500);

@@ -277,6 +277,24 @@ TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store
     CHECK(by_sev[0].event_id == "evt-2");
 }
 
+TEST_CASE("GuaranteedStateStore: duplicate event_id is dropped and counted (#1414)",
+          "[guaranteed_state_store][events]") {
+    GuaranteedStateStore store(":memory:");
+
+    REQUIRE(store.insert_event(make_event("evt-dup", "rule-1", "agent-A")));
+    CHECK(store.events_written_total() == 1);
+    CHECK(store.events_dropped_total() == 0);
+
+    // Redelivery / forged-id pre-claim: same event_id collides on the global PK.
+    // The conflicting event must NOT be written, the failure surfaces as an error,
+    // and the silent-drop counter must advance (CC7.3 evidence — #1414).
+    auto r = store.insert_event(make_event("evt-dup", "rule-1", "agent-B"));
+    REQUIRE_FALSE(r);
+    CHECK(store.event_count() == 1);
+    CHECK(store.events_written_total() == 1);
+    CHECK(store.events_dropped_total() == 1);
+}
+
 TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
           "[guaranteed_state_store][events][crash]") {
     // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel
