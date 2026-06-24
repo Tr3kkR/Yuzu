@@ -365,6 +365,7 @@ const std::string& openapi_spec() {
           "errored": {"type": "integer"},
           "pending": {"type": "integer", "description": "applicable Guards reported with an unrecognized verdict; equals total_guards - (compliant+drifted+errored). Out-of-scope Guards are ABSENT (not pending) in the report-driven model — usually 0 here."},
           "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null if none reported"},
+          "audit_emitted": {"type": "boolean", "description": "false => the guardian.device.view audit row failed to persist for this request (also signalled by the Sec-Audit-Failed:true header); compliance data still served but is not backed by an audit-evidence row (CC7.2). true on success and on audit-off deployments."},
           "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when status is pending"}}}}
         }
       },)json"
@@ -616,7 +617,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
     "/guaranteed-state/device-compliance": {
-      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found). Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found). Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the guardian.device.view audit row failed to persist; the read still serves and the body carries audit_emitted:false (CC7.2 evidence chain)."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the guardian.device.view (not_found) audit row failed to persist; the 404 still returns (CC7.2 evidence chain)."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -5673,14 +5674,16 @@ void RestApiV1::register_routes(
             // auth layer as auth.scoped_permission_required, not by this verb.
             //
             // Capture the AuditFn result and surface a silent persistence failure via
-            // `Sec-Audit-Failed: true` (rest_api_v1.hpp AuditFn contract / CC6.6) — a
-            // CMDB/ServiceNow integration must not read per-device behavioral
-            // compliance as audited-evidence when the `guardian.device.view` row never
-            // landed. Set-and-proceed, mirroring the /api/v1/events route
-            // (api.v1.events.subscribe): the read still serves, but the out-of-band
-            // header lets SRE/SIEM detect the missing evidence row. (The sibling
-            // dex.device.view / dashboard guardian.device.view routes carry the same
-            // latent discard — a systemic gap tracked separately, not retrofitted here.)
+            // both `Sec-Audit-Failed: true` (response header) AND `audit_emitted:false`
+            // in the JSON body (rest_api_v1.hpp AuditFn contract / SOC 2 CC7.2) — a
+            // body-parsing CMDB/ServiceNow integration must not read per-device
+            // behavioral compliance as audited-evidence when the `guardian.device.view`
+            // row never landed. Set-and-proceed, mirroring the /api/v1/events route
+            // (api.v1.events.subscribe) and the api_token.create body flag: the read
+            // still serves, but the header + body flag let SRE/SIEM and a body-only
+            // consumer detect the missing evidence row. (The sibling dex.device.view /
+            // dashboard guardian.device.view routes carry the same latent discard — a
+            // systemic gap tracked separately in #1647, not retrofitted here.)
             bool audit_ok = true;
             if (audit_fn) {
                 try {
@@ -5688,8 +5691,16 @@ void RestApiV1::register_routes(
                                         baseline ? "success" : "not_found", "Agent", agent_id,
                                         "baseline '" + baseline_name +
                                             "' per-device guard status via REST");
+                } catch (const std::exception& e) {
+                    // Realistic audit failures RETURN false (AuditStore::log bumps
+                    // yuzu_server_audit_emit_failed_total + logs spdlog::error); only a
+                    // bad_alloc-class throw reaches here. Log it so even that path is not
+                    // server-side-silent (CC7.2), matching api_token.create's catch arms.
+                    audit_ok = false;
+                    spdlog::warn("guardian.device.view audit threw: {}", e.what());
                 } catch (...) {
                     audit_ok = false;
+                    spdlog::warn("guardian.device.view audit threw (non-std exception)");
                 }
             }
             if (!audit_ok)
@@ -5781,7 +5792,11 @@ void RestApiV1::register_routes(
                 .add("compliant", compliant)
                 .add("drifted", drifted)
                 .add("errored", errored)
-                .add("pending", pending);
+                .add("pending", pending)
+                // Evidence-integrity flag (CC7.2): false => the guardian.device.view
+                // audit row failed to persist for this request (also signalled by the
+                // Sec-Audit-Failed:true header). true on success and on audit-off.
+                .add("audit_emitted", audit_ok);
             if (last_updated.empty())
                 data.raw("last_updated", "null");
             else

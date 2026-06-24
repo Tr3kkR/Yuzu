@@ -1255,7 +1255,7 @@ TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no 
     CHECK(nul->status == 400);
 }
 
-TEST_CASE("REST gs.device-compliance: audit-persist failure → Sec-Audit-Failed header, still serves",
+TEST_CASE("REST gs.device-compliance: audit-persist failure → Sec-Audit-Failed header + body flag",
           "[rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
@@ -1266,13 +1266,17 @@ TEST_CASE("REST gs.device-compliance: audit-persist failure → Sec-Audit-Failed
     auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
     REQUIRE(res);
     // Set-and-proceed (mirrors /api/v1/events): the read still serves, but the
-    // out-of-band header lets SRE/SIEM detect the missing evidence row (CC6.6).
+    // out-of-band header AND the body flag let SRE/SIEM and a body-only consumer
+    // detect the missing evidence row (CC7.2).
     CHECK(res->status == 200);
     REQUIRE(res->has_header("Sec-Audit-Failed"));
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // Body-parsing consumer (the named CMDB threat) must see audit_emitted:false.
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["audit_emitted"].get<bool>() == false);
 }
 
-TEST_CASE("REST gs.device-compliance: a throwing audit_fn is caught → Sec-Audit-Failed, not 500",
+TEST_CASE("REST gs.device-compliance: a throwing audit_fn is caught → header + body flag, not 500",
           "[rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
@@ -1285,9 +1289,14 @@ TEST_CASE("REST gs.device-compliance: a throwing audit_fn is caught → Sec-Audi
     CHECK(res->status == 200); // caught, not surfaced as a 500
     REQUIRE(res->has_header("Sec-Audit-Failed"));
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["audit_emitted"].get<bool>() == false);
+    // The throw path exits the audit lambda BEFORE it records — mechanically proves
+    // the catch(...) arm was taken, not the return-false arm (which would log a row).
+    CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST gs.device-compliance: audit success → no Sec-Audit-Failed header",
+TEST_CASE("REST gs.device-compliance: audit success → no header, audit_emitted true",
           "[rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h; // default audit_succeeds == true
     h.seed_rule("r1", "G1");
@@ -1298,6 +1307,25 @@ TEST_CASE("REST gs.device-compliance: audit success → no Sec-Audit-Failed head
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["audit_emitted"].get<bool>() == true);
+}
+
+TEST_CASE("REST gs.device-compliance: audit-fail on unknown baseline → 404 + Sec-Audit-Failed",
+          "[rest][guaranteed_state][baseline][audit]") {
+    // Pins the load-bearing ordering: the header is set BEFORE the 404 branch, so a
+    // not_found audit failure still surfaces the signal. The 404 returns the A4 error
+    // envelope (not the success schema), so there is no audit_emitted body field there.
+    RestGsHarness h;
+    h.audit_succeeds = false;
+    auto res =
+        h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=NoSuch&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 404);
 }
 
 TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids",
