@@ -649,6 +649,55 @@ TEST_CASE("REST /dex/perf/fleet: stats + denominators, absent metric is null",
     CHECK(j["data"]["windows_online"] == 3);
 }
 
+TEST_CASE("REST /dex/perf/* A4 error bodies carry retry_after_ms + X-Correlation-Id (#1470)",
+          "[dex][perf][rest][a4]") {
+    DexPerfFn perf = [](const std::string&) { return DexPerfSnapshot{}; };
+
+    SECTION("invalid cohort_key → 400 with A4 retry_after_ms:null + header") {
+        RestPerfHarness h(perf);
+        auto res = h.sink.Get("/api/v1/dex/perf/devices?cohort_key=not%20a%20key%21");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // Header present on every dex-perf response (success and error).
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        auto j = nlohmann::json::parse(res->body);
+        // A4 envelope: code, correlation_id, and the always-present nullable field.
+        CHECK(j["error"]["code"] == 400);
+        CHECK(j["error"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        CHECK(j["error"]["retry_after_ms"].is_null());
+    }
+
+    SECTION("invalid limit → 400 with A4 retry_after_ms:null") {
+        RestPerfHarness h(perf);
+        auto res = h.sink.Get("/api/v1/dex/perf/devices?limit=0");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    }
+
+    SECTION("invalid tag key on /cohorts → 400 A4") {
+        RestPerfHarness h(perf);
+        auto res = h.sink.Get("/api/v1/dex/perf/cohorts?key=not%20a%20key%21");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        CHECK(j["error"]["retry_after_ms"].is_null());
+    }
+
+    SECTION("no provider → 503 with a concrete retry_after_ms (warmup)") {
+        RestPerfHarness h(DexPerfFn{}); // null provider
+        auto res = h.sink.Get("/api/v1/dex/perf/devices");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["retry_after_ms"] == 5000); // non-null on a retryable condition
+    }
+}
+
 TEST_CASE("REST /dex/perf/cohorts: floor + suppression + untagged in the JSON",
           "[dex][perf][rest]") {
     DexPerfFn perf = [](const std::string& key) {

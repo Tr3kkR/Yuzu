@@ -37,6 +37,8 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_pool.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -69,6 +71,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -225,21 +228,12 @@ struct ScopedKeyZero {
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
-// #1290 adds (field confusion), and a CRLF could split the audit line. Replace
-// every control byte and structural delimiter (space, '=', ',') with '_'; the
-// identity is preserved verbatim in its own audit columns (principal/target_id)
-// and rendered safely elsewhere (DB-parameterised, html-escaped, json-escaped).
-[[nodiscard]] inline std::string audit_token(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
-            out.push_back('_');
-        else
-            out.push_back(static_cast<char>(c));
-    }
-    return out;
-}
+// #1290 adds (field confusion), and a CRLF could split the audit line. The
+// canonical implementation now lives in web_utils.hpp so the same neutralizer
+// guards every structured-audit call site (here + tar_tree_routes.cpp) without
+// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// spellings below resolving unchanged.
+using yuzu::server::audit_token;
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -289,6 +283,30 @@ public:
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");
+        // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
+        // Gauges are sampled every recompute cycle; counters/histogram are fed
+        // live by the pool's observer hooks wired at pool construction.
+        metrics_.describe("yuzu_pg_pool_in_use", "PostgreSQL pool connections currently leased out",
+                          "gauge");
+        metrics_.describe("yuzu_pg_pool_open",
+                          "PostgreSQL pool connections currently open (leased + idle)", "gauge");
+        metrics_.describe("yuzu_pg_pool_size", "PostgreSQL pool configured maximum size", "gauge");
+        metrics_.describe("yuzu_pg_pool_waiters",
+                          "Threads currently blocked waiting for a PostgreSQL pool connection — "
+                          "the saturation signal between fully-leased and an acquire timeout",
+                          "gauge");
+        metrics_.describe("yuzu_pg_connect_failed_total",
+                          "Total PostgreSQL connection attempts that failed", "counter");
+        metrics_.describe("yuzu_pg_acquire_timeout_total",
+                          "Total PostgreSQL pool acquires that timed out before a connection was "
+                          "available",
+                          "counter");
+        metrics_.describe("yuzu_pg_unhealthy_discard_total",
+                          "Total PostgreSQL connections discarded as unhealthy on return", "counter");
+        metrics_.describe("yuzu_pg_acquire_wait_seconds",
+                          "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
+                          "leading pool-saturation indicator",
+                          "histogram");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -584,6 +602,12 @@ public:
                           "Total Guaranteed-State events currently persisted", "gauge");
         metrics_.describe("yuzu_server_guardian_events_written_total",
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_dropped_total",
+                          "Cumulative Guaranteed-State events dropped at ingest on an event_id "
+                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
+                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
+                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -671,6 +695,10 @@ public:
                           "Fleet topology requests that triggered a cache refill", "counter");
         metrics_.describe("yuzu_viz_oversize_response_total",
                           "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
+                          "counter");
+        metrics_.describe("yuzu_viz_offline_hosts_total",
+                          "Stale-flagged offline hosts merged into /viz/fleet from the durable "
+                          "OfflineEndpointStore (hosts that aged out of the in-memory snapshot)",
                           "counter");
         metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
                           "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
@@ -771,13 +799,11 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Create gateway management client for command forwarding
-        if (!cfg_.gateway_command_address.empty()) {
-            gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address,
-                                                   grpc::InsecureChannelCredentials());
-            gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-            spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
-        }
+        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // built in run(), AFTER bootstrap_default_certs() — for a default-cert
+        // install the client cert/key paths are empty here and only populated by
+        // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
+        // pre-bootstrap-empty reason the per-agent mTLS wiring is deferred to run().
 
         // Load auto-approve policies
         auto approve_path = cfg_.db_dir() / "auto-approve.cfg";
@@ -895,6 +921,72 @@ public:
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
+
+        // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
+        // BEFORE any Postgres-backed store and validated by a probe checkout so
+        // the server FAILS CLOSED — no SQLite fallback — when the DSN is empty
+        // or the database is unreachable. The observer hooks feed the pool's
+        // saturation/health metrics and capture &metrics_, which outlives the
+        // pool (declaration order). A distinct "[PG] Refusing to start" log
+        // token separates a substrate failure from other startup failures.
+        {
+            if (cfg_.postgres_dsn.empty()) {
+                spdlog::error("[PG] Refusing to start: no PostgreSQL DSN. Set --postgres-dsn / "
+                              "YUZU_POSTGRES_DSN (ADR-0006/0007 — the server requires Postgres; "
+                              "the agent stays SQLite).");
+                startup_failed_ = true;
+            } else {
+                pg::PgPool::Options opts;
+                opts.conninfo = cfg_.postgres_dsn;
+                opts.size = cfg_.postgres_pool_size > 0
+                                ? static_cast<std::size_t>(cfg_.postgres_pool_size)
+                                : 16;
+                opts.observer.on_connect_failure = [this] {
+                    metrics_.counter("yuzu_pg_connect_failed_total").increment();
+                };
+                opts.observer.on_acquire_timeout = [this] {
+                    metrics_.counter("yuzu_pg_acquire_timeout_total").increment();
+                };
+                opts.observer.on_unhealthy_discard = [this] {
+                    metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
+                };
+                opts.observer.on_acquire_wait_seconds = [this](double s) {
+                    metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
+                };
+                pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
+                // Probe: a live checkout proves reachability and warms one
+                // connection. Bounded by connect_timeout_s; an empty lease means
+                // an invalid DSN or an unreachable database — fail closed.
+                if (auto probe = pg_pool_->acquire(); !probe) {
+                    spdlog::error("[PG] Refusing to start: cannot reach PostgreSQL substrate: {}",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
+                                 pg_pool_->size());
+                }
+            }
+        }
+
+        // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
+        // so offline hosts render stale-flagged on /viz/fleet. Only built when
+        // the substrate probe above succeeded (an unreachable database already
+        // set startup_failed_ and run() refuses to serve). FAIL CLOSED on a
+        // migration/open failure too (ADR-0007 + the ADR-0008 per-store
+        // migration invariant): a reachable database whose schema migration
+        // fails — schema conflict, missing CREATE privilege, advisory-lock
+        // contention — must NOT serve degraded. This is the template every
+        // future Postgres-backed store inherits, so the contract is uniform:
+        // a Postgres-backed store that cannot open is a fatal startup error.
+        if (pg_pool_ && !startup_failed_) {
+            offline_endpoint_store_ = std::make_unique<OfflineEndpointStore>(*pg_pool_);
+            if (!offline_endpoint_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
+                              "failed (database reachable but the endpoint_state schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            }
+        }
 
         // Initialize response store
         {
@@ -1238,7 +1330,8 @@ public:
             // that fleet_topology_store_ and health_store_ are wired, then
             // inject into both ingestion paths so they cannot drift.
             heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
-                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_,
+                offline_endpoint_store_.get());
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
@@ -1915,7 +2008,7 @@ public:
             spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
-                                  cfg_.cert_sans)) {
+                                  cfg_.cert_sans, cfg_.cert_group)) {
             spdlog::error("default certificates were required but generation failed");
             default_certs_failed_ = true;
             return;
@@ -2002,6 +2095,14 @@ public:
     void run() override {
         spdlog::info("run(): entering");
 
+        // Fail closed if construction already determined the server cannot
+        // start — e.g. the PostgreSQL substrate (ADR-0007) was absent or
+        // unreachable in the ctor. main() exits non-zero on startup_failed().
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed during construction");
+            return;
+        }
+
         // PKI: generate + wire per-install default certs before building TLS
         // credentials (fills cfg_ cert paths + cfg_.using_default_certs).
         bootstrap_default_certs();
@@ -2011,6 +2112,38 @@ public:
                           "--no-default-certs to opt out.");
             startup_failed_ = true;
             return;
+        }
+
+        // Gateway command-forwarding client — built HERE (post-bootstrap) so the
+        // mutual-TLS dial sees the now-populated server leaf + CA (HIGH-2 #1314).
+        // When TLS is on, dial the gateway's privileged command plane over MUTUAL
+        // TLS (server presents its leaf, verifies the gateway against the install
+        // CA). The gateway's mgmt listener requires the client cert, so an
+        // unauthenticated container — including a compromised agent with no
+        // CA-issued cert — can no longer push commands to the fleet. Only a
+        // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
+        if (!cfg_.gateway_command_address.empty()) {
+            std::shared_ptr<grpc::ChannelCredentials> gw_creds;
+            if (cfg_.tls_enabled) {
+                gw_creds = build_gateway_command_credentials();
+                if (!gw_creds)
+                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
+                                  "build mutual-TLS credentials.",
+                                  cfg_.gateway_command_address);
+            } else {
+                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.",
+                             cfg_.gateway_command_address);
+                gw_creds = grpc::InsecureChannelCredentials();
+            }
+            if (gw_creds) {
+                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
+                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
+                spdlog::info("Gateway command forwarding enabled: {} ({})",
+                             cfg_.gateway_command_address,
+                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+            }
         }
 
         // PKI PR3: per-agent mTLS issuance + enforcement, wired AFTER the
@@ -2235,6 +2368,17 @@ public:
                 // revoked-agent teardown by the same amount. Make it visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // PostgreSQL pool gauges (#1368): sampled on the same cadence as
+                // the fleet families. Counters/histogram are fed live by the
+                // pool's observer hooks, so only the level gauges are polled here.
+                if (pg_pool_) {
+                    metrics_.gauge("yuzu_pg_pool_in_use")
+                        .set(static_cast<double>(pg_pool_->in_use()));
+                    metrics_.gauge("yuzu_pg_pool_open").set(static_cast<double>(pg_pool_->open()));
+                    metrics_.gauge("yuzu_pg_pool_size").set(static_cast<double>(pg_pool_->size()));
+                    metrics_.gauge("yuzu_pg_pool_waiters")
+                        .set(static_cast<double>(pg_pool_->waiters()));
+                }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
@@ -2383,6 +2527,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_dropped_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -2646,6 +2792,20 @@ public:
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
+
+        // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
+        // quiesced every handler thread that could hold a pool lease through a
+        // Postgres-backed store (the heartbeat ingest path's borrowed
+        // offline-store pointer was nulled before this), so it is now safe to
+        // drop the stores that borrow the pool, then the pool itself — LAST, so
+        // no lease outlives it. The pool dtor blocks on outstanding leases; a
+        // still-leased thread destroying the pool would self-deadlock (see
+        // pg_pool.hpp). Reset is idempotent, so a startup_failed() server that
+        // never built these tears down cleanly too.
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        offline_endpoint_store_.reset();
+        pg_pool_.reset();
     }
 
 private:
@@ -2709,6 +2869,68 @@ private:
         for (auto& kc : ssl_opts.pem_key_cert_pairs) {
             yuzu::secure_zero(kc.private_key);
         }
+        return creds;
+    }
+
+    // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
+    // plane (ManagementService at --gateway-command-addr). The gateway's mgmt
+    // listener is the PRIVILEGED command-fan-out plane; without mTLS it is an
+    // unauthenticated fleet-RCE surface reachable by any container that can route
+    // to it (incl. a compromised agent). Here the server PRESENTS its own leaf as
+    // the client cert and VERIFIES the gateway against the install CA, so the
+    // gateway can require a client cert (strict mTLS) and reject anyone who can't
+    // present a CA-issued cert. Returns nullptr (fail-closed — caller disables
+    // command forwarding) if the required cert material is missing/unreadable.
+    //
+    // The two directions are NOT symmetric. Server→gateway (here): grpc verifies
+    // the gateway's identity by SNI/SAN against the dialled host, so the server
+    // talks only to the real gateway. Gateway→server (the listener's acceptance
+    // policy): verify_peer authenticates to the CA, NOT to a specific identity.
+    //
+    // Residual (tracked, PKI-ladder): because the gateway side authenticates to
+    // the CA only, ANY holder of ANY CA-issued cert+key passes — an enrolled
+    // agent's stolen per-agent leaf, or the default-server/default-gateway leaves
+    // (0600, need filesystem compromise to extract). There is also no CRL/OCSP
+    // check on this path yet, so a revoked-but-stolen leaf still passes. Pinning
+    // the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) + mgmt
+    // revocation is the cryptographic-identity-binding item that lands with the
+    // QUIC-era rework; through-gateway identity stays app-layer until then. mTLS
+    // still closes the far larger hole: the plaintext, no-cert-required plane.
+    [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
+    build_gateway_command_credentials() const {
+        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
+                          "client cert/key to present for mutual TLS — command forwarding "
+                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
+            return nullptr;
+        }
+        if (cfg_.tls_ca_cert.empty()) {
+            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
+                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
+            return nullptr;
+        }
+        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
+            return nullptr;
+        }
+        grpc::SslCredentialsOptions ssl_opts;
+        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
+        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
+        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
+        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
+            ssl_opts.pem_private_key.empty()) {
+            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
+                          "command forwarding DISABLED (fail-closed).");
+            yuzu::secure_zero(ssl_opts.pem_private_key);
+            return nullptr;
+        }
+        auto creds = grpc::SslCredentials(ssl_opts);
+        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
+        // key is the sensitive one, the CA/cert are public, but zeroing all three
+        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
+        // metadata resident longer than needed.
+        yuzu::secure_zero(ssl_opts.pem_private_key);
+        yuzu::secure_zero(ssl_opts.pem_cert_chain);
+        yuzu::secure_zero(ssl_opts.pem_root_certs);
         return creds;
     }
 
@@ -4206,6 +4428,24 @@ private:
                 // the right probe. Without this, a store-construction failure
                 // would leave /readyz "ready" while every viz request 503s.
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // #1320 PR 3 (#1368 Pattern E): the Postgres substrate is
+                // load-bearing — without it every Postgres-backed store is
+                // dead. Cheap, NON-lease-consuming signal: valid() (conninfo
+                // parsed) AND the connect breaker is closed. The breaker arms
+                // on real connect failures (PG unreachable) but NOT on pool
+                // saturation, so this reflects runtime reachability without the
+                // false-negative a lease-consuming probe would hit under load
+                // (gov UP-2 — a busy-but-healthy server must NOT be evicted
+                // from the LB). Saturation is surfaced via the acquire-wait
+                // histogram + pool gauges + their alert rules, not /readyz.
+                {"pg_pool", pg_pool_ != nullptr && pg_pool_->valid() &&
+                                !pg_pool_->connect_breaker_open()},
+                // First migrated store (#1368). The server fails closed without
+                // Postgres, so this is true whenever it serves; a false here is
+                // the loud signal that the migration path is broken even though
+                // the pool answered.
+                {"offline_endpoint_store",
+                 offline_endpoint_store_ && offline_endpoint_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8230,11 +8470,40 @@ private:
             },
             audit_fn);
 
+        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
+        // untracked dispatch (execution_id="" → not in the executions drawer, like the
+        // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
+        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
+        // agent). Per-host only; data from the agent's local tar.db only.
+        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
+        tar_tree_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_,
+                                     offline_endpoint_store_.get());
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -8643,9 +8912,20 @@ private:
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
             net_perf_fn,
-            // Per-device scope gate for the agentic-first /api/v1/dex/devices/*
-            // endpoints — the SAME require_scoped_permission the dashboard device
-            // routes use, so a REST worker is held to the same per-device scope.
+            // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
+            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
+            // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
+            [this](const std::string& username) -> bool {
+                auto* db = auth_mgr_.auth_db_ptr();
+                return db && db->clear_failed_logins(username).has_value();
+            },
+            // Baseline-anchored per-device Guardian status route (trailing optional deps).
+            baseline_store_.get(),
+            // Per-device-scoped permission (management-group aware): the SAME
+            // require_scoped_permission closure the dashboard device routes + the
+            // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
+            // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
@@ -8761,7 +9041,10 @@ private:
                 // three surfaces — fragments, REST, MCP).
                 dex_perf_fn,
                 // N1: the shared network-quality provider (fragments + REST + MCP).
-                net_perf_fn);
+                net_perf_fn,
+                // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
+                // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
+                &metrics_);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -8928,6 +9211,15 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
+    /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
+    /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
+    /// gRPC drain so no handler thread still holds a lease. DECLARED right after
+    /// metrics_ on purpose: its observer hooks capture &metrics_, so the pool
+    /// must destruct before metrics_ (reverse-declaration order) — and before it,
+    /// every Postgres-backed store (declared later) releases its PgPool& and
+    /// every ingest thread (agent_service_, declared later) has already stopped.
+    std::unique_ptr<pg::PgPool> pg_pool_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
@@ -8980,6 +9272,11 @@ private:
 
     // Phase 1: Data infrastructure
     std::unique_ptr<ResponseStore> response_store_;
+    /// Born-on-Postgres last-known endpoint store (#1320 PR 3). Borrows pg_pool_
+    /// (declared earlier, destructs later) and is borrowed by the heartbeat
+    /// ingest path; declared here among the stores so it destructs AFTER the
+    /// ingest services + BEFORE the pool.
+    std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -9037,7 +9334,11 @@ private:
     // — not atomic by design; do NOT read/write it from another thread without
     // converting to std::atomic first (gov L1).
     std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
-    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // atomic so a future background-thread read can never be UB; today it is
+    // written/read only on the main thread (ctor → run() → main()), so the
+    // default seq_cst on the implicit load/store is free on this cold path
+    // (gov fjarvis L2).
+    std::atomic<bool> startup_failed_{false}; // run() refused to start — main() exits non-zero
     // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
     // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
     std::string agent_ca_cert_pem_;
@@ -9067,6 +9368,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by

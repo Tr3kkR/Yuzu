@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -312,6 +313,42 @@ TEST_CASE("TAR diff: process with sensitive cmdline is redacted in events", "[ta
     CHECK(events[0].detail_json.find("hunter2") == std::string::npos);
 }
 
+TEST_CASE("TAR redaction: ensure_redaction_defaults is fail-closed for every input (#1532)",
+          "[tar][diff][redaction][issue1532]") {
+    // fjarvis HIGH: no loaded set may disable the baseline redaction. load_redaction_patterns
+    // routes the parse_pattern_config result through ensure_redaction_defaults; the fail-open
+    // was that a valid array whose elements all get dropped (`[]`, `[1,2,3]`, all-over-long, or
+    // `["*"]`) yields an EMPTY loaded vector. Prove every such loaded vector still redacts.
+    auto contains_all_defaults = [](const std::vector<std::string>& v) {
+        for (const auto& def : kDefaultRedactionPatterns)
+            if (std::find(v.begin(), v.end(), def) == v.end())
+                return false;
+        return true;
+    };
+
+    SECTION("empty loaded set (the all-dropped / empty-array fail-open) still redacts") {
+        auto merged = ensure_redaction_defaults({});
+        CHECK(contains_all_defaults(merged));
+        CHECK(should_redact("myapp --password=hunter2", merged));
+        CHECK(should_redact("export API_KEY=abc123", merged));
+        CHECK(should_redact("vault read secret/database", merged));
+    }
+
+    SECTION("operator-custom patterns are ADDED to, never REPLACE, the defaults") {
+        auto merged = ensure_redaction_defaults({"*myorg_session*"});
+        CHECK(contains_all_defaults(merged));
+        CHECK(std::find(merged.begin(), merged.end(), "*myorg_session*") != merged.end());
+        CHECK(should_redact("svc --myorg_session=xyz", merged)); // custom still applies
+        CHECK(should_redact("svc --password=p", merged));        // default still applies
+    }
+
+    SECTION("a loaded set already holding a default is not duplicated") {
+        auto merged = ensure_redaction_defaults({"*password*"});
+        CHECK(contains_all_defaults(merged));
+        CHECK(std::count(merged.begin(), merged.end(), std::string{"*password*"}) == 1);
+    }
+}
+
 // =============================================================================
 // L3: Edge case tests — empty redaction patterns, long cmdline, unicode username
 // =============================================================================
@@ -359,4 +396,53 @@ TEST_CASE("TAR diff: unicode username in process events", "[tar][diff][process][
     CHECK(events[0].event_action == "started");
     // The unicode username should be preserved in the JSON
     CHECK(events[0].detail_json.find("\xc3\xa9\x6d\x69\x6c\x65") != std::string::npos);
+}
+
+// ── #541: should_redact is case-insensitive SUBSTRING, not real glob ────────
+
+TEST_CASE("TAR should_redact: case-insensitive substring, not glob", "[tar][diff][redact][issue541]") {
+    // Plain substring containment, case-insensitive.
+    CHECK(should_redact("PASSWORD=hunter2", {"password"}));
+    CHECK(should_redact("api --Token=abc", {"token"}));
+    CHECK_FALSE(should_redact("nothing here", {"secret"}));
+
+    // Leading/trailing '*' are stripped to the core substring (a readability
+    // affordance), then matched as substring.
+    CHECK(should_redact("my secret value", {"*secret*"}));
+    CHECK(should_redact("prefix-token", {"*token"}));
+
+    // '?' and '[abc]' are LITERALS, not glob metacharacters.
+    CHECK(should_redact("run with ?flag", {"?flag"}));      // literal '?'
+    CHECK_FALSE(should_redact("run with xflag", {"?flag"})); // '?' is NOT "any char"
+    CHECK(should_redact("path [abc] here", {"[abc]"}));      // literal bracket
+    CHECK_FALSE(should_redact("path a here", {"[abc]"}));    // not a char class
+
+    // A pattern that strips to an empty core matches nothing (no-op).
+    CHECK_FALSE(should_redact("anything", {"*"}));
+}
+
+// =============================================================================
+// Typed warehouse events — macOS names-only (B-heavy)
+// =============================================================================
+
+TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhere",
+          "[tar][diff][process]") {
+    // On macOS the poll path blanks cmdline (parity with the Endpoint Security
+    // stream and the works-council / data-minimization posture); Linux/Windows keep
+    // the (redacted) command line. Locks the #if defined(__APPLE__) branch in
+    // compute_process_events so the macOS names-only guarantee can't silently regress.
+    std::vector<ProcessInfo> prev; // empty previous → current process is a 'started'
+    std::vector<ProcessInfo> curr = {
+        {4242, 1, "python3", "/usr/bin/python3 --token=secret", "alice"}};
+
+    auto events = compute_process_events(prev, curr, 1000, 7, /*redaction_patterns=*/{});
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "started");
+    CHECK(events[0].pid == 4242);
+    CHECK(events[0].name == "python3");
+#if defined(__APPLE__)
+    CHECK(events[0].cmdline.empty()); // names-only on macOS — both ES stream and poll
+#else
+    CHECK(events[0].cmdline == "/usr/bin/python3 --token=secret"); // populated on Linux/Windows
+#endif
 }

@@ -200,3 +200,128 @@ groups:
   #         severity: critical
   #       annotations:
   #         summary: "Secret blob failed GCM authentication (tamper signal)"
+
+  # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
+  # The server fails closed without PostgreSQL, so substrate health is
+  # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on
+  # breaker-open (off yuzu_pg_connect_failed_total), so the load balancer
+  # drains the instance right away. These alerts carry `for:` windows and are
+  # for paging/escalation — they fire AFTER the LB has already reacted, not
+  # before. Metrics come from the pool's Observer feed.
+  - name: yuzu-postgres
+    rules:
+      - alert: YuzuPgConnectFailing
+        # The connect-failure circuit breaker has armed — the database is
+        # unreachable. /readyz already reports not-ready off the same signal
+        # (LB eviction is immediate); this alert fires after for:2m of
+        # sustained failure to page/escalate, NOT to drive LB eviction.
+        expr: |
+          rate(yuzu_pg_connect_failed_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu cannot connect to PostgreSQL (breaker armed; /readyz already 503)"
+
+      - alert: YuzuPgPoolSaturated
+        # >90% of the pool leased for 5m — acquire timeouts (and heartbeat
+        # upsert skips) are imminent. Raise --postgres-pool-size or scale.
+        expr: |
+          yuzu_pg_pool_in_use / yuzu_pg_pool_size > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu PostgreSQL pool >90% saturated"
+
+      - alert: YuzuPgAcquireWaitHigh
+        # p99 acquire wait > 200ms — the leading saturation indicator; the
+        # heartbeat upsert deadline is 250ms, so persistence starts to drop here.
+        expr: |
+          histogram_quantile(0.99, rate(yuzu_pg_acquire_wait_seconds_bucket[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
+
+  - name: yuzu-guardian
+    rules:
+      # yuzu_server_guardian_events_dropped_total is a cumulative-but-published-
+      # as-gauge counter that RESETS on server restart, so alert on increase()
+      # over a window, never an absolute value or `> 0`. The metric conflates
+      # benign redelivery (agent reconnect / event_seq_ reset after a crash-loop)
+      # with real loss and the forged-id pre-claim path (#1360), so the threshold
+      # needs a real-fleet redelivery baseline — the value below is a placeholder
+      # starting point, tune it against your own reconnect churn. Closing this
+      # alert is what turns the #1414 CC7.3 visibility gauge into an operating
+      # control: a sustained climb means drift was observed but silently discarded.
+      - alert: YuzuGuardianEventsDropped
+        expr: |
+          increase(yuzu_server_guardian_events_dropped_total[1h]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian events dropped at ingest (event_id PK conflict)"
+          description: >-
+            More than 50 Guardian events were dropped at ingest on an event_id
+            PK/UNIQUE conflict in the last hour. Some redelivery is benign
+            (agent reconnects, event_seq_ resets); a sustained climb means real
+            drift is being silently discarded — check the server `warn` logs for
+            the rejected event_id, and rule out a clock-skewed fleet or a
+            forged-id pre-claim. Tune the threshold to your fleet's reconnect
+            churn.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-events-dropped"
+
+  - name: yuzu-bundles
+    # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
+    # (TTL + cap), so cap-eviction silently discards another operator's in-flight
+    # bundle — these alerts make that (and dispatch health) observable until the
+    # manifest moves to Postgres.
+    rules:
+      - alert: YuzuBundleCapEviction
+        expr: |
+          rate(yuzu_bundle_evictions_total{reason="cap"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest cap is forcing evictions"
+          description: >-
+            The in-memory bundle manifest map has hit its cap and is evicting
+            non-expired bundles to admit new ones — an in-flight bundle may 404 on
+            collate for an operator who did not cause the load. Likely a runaway
+            agentic dispatch loop. Investigate the dispatching principal; the
+            durable Postgres manifest (ADR-0011) removes the cap.
+      - alert: YuzuBundleManifestSaturation
+        expr: |
+          max(yuzu_bundle_manifests) > 3500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live-query bundle manifest count approaching the 4096 cap"
+          description: >-
+            In-flight bundle manifests are within ~15% of the cap; sustained growth
+            will force cross-operator cap-eviction (see YuzuBundleCapEviction).
+      - alert: YuzuBundleDispatchLatencyHigh
+        # UP-15: the bundle fan-out is synchronous — a POST holds an HTTP worker
+        # across N gRPC writes. This pages before that hold (×concurrency) starves
+        # the worker pool; observe-only is not enough while the async-dispatch fix
+        # is deferred. 500ms is well above the ms-scale normal case.
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(yuzu_bundle_dispatch_duration_seconds_bucket[5m])) by (le, surface)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bundle dispatch fan-out p99 > 500ms (HTTP worker hold risk)"
+          description: >-
+            The synchronous bundle dispatch fan-out is holding HTTP workers for
+            >500ms p99 on surface={{ $labels.surface }}. Under load this risks
+            HTTP thread-pool starvation affecting unrelated routes. Reduce
+            concurrent bundle dispatches, reduce steps-per-bundle, or prioritise
+            the deferred async-dispatch fix (UP-15).

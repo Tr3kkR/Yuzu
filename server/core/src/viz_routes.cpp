@@ -44,15 +44,19 @@
 #include "fleet_topology_store.hpp"
 #include "fleet_topology_types.hpp"
 #include "http_route_sink.hpp"
+#include "offline_endpoint_store.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -102,16 +106,18 @@ void escape_json_for_script(std::string& s) {
 void VizRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
-                                const std::atomic<bool>* kill_switch) {
+                                const std::atomic<bool>* kill_switch,
+                                OfflineEndpointStore* offline_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, AuthFn{}, std::move(perm_fn), std::move(audit_fn), store, metrics,
-                    kill_switch);
+                    kill_switch, offline_store);
 }
 
 void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
-                                const std::atomic<bool>* kill_switch) {
+                                const std::atomic<bool>* kill_switch,
+                                OfflineEndpointStore* offline_store) {
     // auth_fn is accepted in the signature for parity with sibling
     // register_routes overloads but never invoked here -- require_permission
     // (which the perm_fn lambda wraps) calls require_auth internally, so a
@@ -122,6 +128,7 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn 
     store_ = store;
     metrics_ = metrics;
     kill_switch_ = kill_switch;
+    offline_store_ = offline_store;
 
     sink.Get("/api/v1/viz/fleet/topology",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -246,6 +253,45 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
             metrics_->counter("yuzu_viz_cache_hit_total").increment();
         if (store_->cache_misses() > pre_misses)
             metrics_->counter("yuzu_viz_cache_miss_total").increment();
+    }
+
+    // ── 6b. Merge persisted offline endpoints (#1320 PR 3) ────────────────
+    // Hosts whose fleet_snapshot aged out of the in-memory 60 s cache vanish
+    // from snap->machines. The durable last-known store lets them render as
+    // stale-flagged cubes instead of disappearing. Copy-on-write: only when
+    // there are stale rows to add do we materialise a merged snapshot (the
+    // common steady state — all hosts online — pays nothing). Null store
+    // (tests, or a legacy binary) = exactly the prior behavior. Done BEFORE the
+    // DoS gate so the machines_max cap counts the merged total.
+    if (offline_store_) {
+        auto persisted = offline_store_->query_stale_within(
+            std::chrono::seconds(kOfflineStaleWindowSecs));
+        if (!persisted.empty()) {
+            std::unordered_set<std::string> online;
+            online.reserve(snap->machines.size());
+            for (const auto& m : snap->machines)
+                online.insert(m.agent_id);
+            std::vector<MachineNode> stale_nodes;
+            for (auto& ep : persisted) {
+                if (online.count(ep.agent_id) != 0U)
+                    continue; // currently online — already in the live snapshot
+                MachineNode n;
+                n.agent_id = std::move(ep.agent_id);
+                n.hostname = std::move(ep.hostname);
+                n.os = std::move(ep.os);
+                n.stale = true; // dimmed "offline" cube; ts stays 0
+                stale_nodes.push_back(std::move(n));
+            }
+            if (!stale_nodes.empty()) {
+                auto merged = std::make_shared<TopologySnapshot>(*snap);
+                for (auto& n : stale_nodes)
+                    merged->machines.push_back(std::move(n));
+                snap = merged;
+                if (metrics_)
+                    metrics_->counter("yuzu_viz_offline_hosts_total")
+                        .increment(static_cast<double>(stale_nodes.size()));
+            }
+        }
     }
 
     // ── 7. machines_max DoS gate (M-1) ────────────────────────────────────

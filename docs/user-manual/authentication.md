@@ -285,7 +285,7 @@ Browser           Yuzu Server               IdP (Entra ID)
 
 When the IdP includes group claims (e.g., Entra ID `groups` claim), Yuzu checks whether the user belongs to the admin group specified by `--oidc-admin-group`. If the user's group list contains that group ID, they receive the `admin` role. Otherwise they receive the default `user` role.
 
-If the OIDC user's email or display name matches a local admin account, they are also granted admin regardless of group membership.
+Admin via OIDC is granted **only** through explicit membership in the configured admin group. Email and display name are **never** used to elevate privileges — they are attacker-controllable values, so a match against a local admin account's name does **not** grant admin (enforced in `create_oidc_session`).
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 
@@ -532,7 +532,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
-| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from approval-gated operation (Phase 2 re-dispatch not yet implemented) |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on the REST transport** (Phase 2 re-dispatch not yet implemented). The MCP **tool** transport audits the same denial as `mcp.<tool_name>` / `denied` (see `mcp.md`), and returns JSON-RPC `-32004` (`TierDenied`), not `-32006`. |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
@@ -543,7 +543,7 @@ All `denied` results include a `detail` field explaining the reason. Examples pe
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
 - `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
 - `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
-- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"`
+- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"` — this is the **REST path** detail (`auth_routes.cpp`). The **MCP tool path** is a *separate* audit row: verb `mcp.<tool_name>`, result `denied`, with the distinct detail string `"approval-gated execution not implemented"` (`mcp_server.cpp`).
 
 ### JSON Error Envelope
 

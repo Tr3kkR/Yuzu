@@ -49,6 +49,10 @@
 // explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
+// Baseline-anchored per-device Guardian status route borrows the BaselineStore.
+// Forward-declared (used only as a pointer in register_routes); the .cpp includes
+// baseline_store.hpp for the definition.
+class BaselineStore;
 }
 
 #include <httplib.h>
@@ -83,16 +87,16 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    /// Per-device tier + management-group scope gate — wraps
-    /// AuthRoutes::require_scoped_permission (global grant OR a role on the agent's
-    /// management group / an ancestor). Used by the per-device agentic-first
-    /// endpoints so a REST worker is held to the SAME per-device scope as the
-    /// dashboard device lenses. The per-device agentic-first endpoints REQUIRE
-    /// this gate: when it is unset they **fail closed (500)** rather than silently
-    /// downgrading to the global `perm_fn` (which would widen scope) — production
-    /// always wires it from `server.cpp` (`require_scoped_permission`). This
-    /// matches the sibling `DeviceRoutes`, which also refuses to serve per-device
-    /// data without a scope gate (governance R-sec-LOW / architect S4).
+    /// Per-device-scoped permission check (mirrors DeviceRoutes::ScopedPermFn): a
+    /// global grant passes fleet-wide, otherwise the principal must hold the
+    /// permission via a management group the agent is in. Per-device REST reads gate
+    /// on this so a management-group-scoped operator is not fail-closed out of
+    /// devices they can legitimately see. The empty/default `{}` exists ONLY for
+    /// source-stability of the other (unrelated) call sites — a route that requires
+    /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED (503); it
+    /// does NOT silently fall back to the flat PermFn (that would re-introduce the
+    /// group-scoped lockout this typedef exists to fix). See the baseline-device route
+    /// in rest_api_v1.cpp for the fail-closed contract.
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
@@ -158,6 +162,13 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
+    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
+    /// the underlying auth.db write succeeded. Empty/missing callback =
+    /// `POST /api/v1/users/<name>/unlock` returns 503.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -196,7 +207,10 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
-        ScopedPermFn scoped_perm_fn = {});
+        LockoutClearFn lockout_clear_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -224,7 +238,10 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
-        ScopedPermFn scoped_perm_fn = {});
+        LockoutClearFn lockout_clear_fn = {},
+        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // optional dep to keep every existing register_routes call site source-stable).
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
 };
 
 } // namespace yuzu::server

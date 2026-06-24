@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# ensure-postgres.sh — idempotent "a PostgreSQL 16 is reachable for server
-# tests" step for every CI tier (ADR-0006 decision 8, #1318).
+# ensure-postgres.sh — idempotent "a PostgreSQL is reachable for server
+# tests" step for every CI tier (ADR-0006 decision 8, #1318). The shipped
+# substrate is PostgreSQL 18 (deploy/docker/Dockerfile.postgres); the server
+# SQL is version-agnostic (13+), so a runner-native cluster on an older major
+# still exercises the suites correctly.
 #
 # Exports YUZU_TEST_POSTGRES_DSN via $GITHUB_ENV (or prints it when run
 # outside Actions, e.g. by the /test skill or a dev shell). Resolution
@@ -16,10 +19,10 @@
 #      Port 15432 deliberately avoids colliding with any native cluster or
 #      UAT rig on 5432. `--restart unless-stopped` + `docker start` makes
 #      this a one-time cost per runner.
-#   3. macOS (GHA-hosted, no docker): brew postgresql@16, throwaway
+#   3. macOS (GHA-hosted, no docker): brew postgresql@18, throwaway
 #      trust-auth cluster under $RUNNER_TEMP on port 15432.
 #   4. Native cluster on 127.0.0.1:5432 (self-hosted Windows precondition —
-#      PostgreSQL 16 installed as a service with role yuzu / password yuzu
+#      PostgreSQL 16+ installed as a service with role yuzu / password yuzu
 #      / database yuzu_test; bootstrap once per runner, see
 #      docs/ci-architecture.md).
 #   5. Nothing found -> ::error + exit 1.
@@ -33,7 +36,7 @@ set -euo pipefail
 SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 
 # Same pinned multi-arch image as deploy/docker/Dockerfile.postgres's base.
-PG_IMAGE="postgres:16.14-bookworm@sha256:da514b7d293c5e9126503f85ecd835f4fb0942a77e012fe74f016c114c3e25b8"
+PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf"
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432
 
@@ -60,6 +63,15 @@ fi
 
 # ── 2. Docker (self-hosted Linux) ────────────────────────────────────────
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/tmp/yuzu-ci-postgres.lock
+    if ! flock -w 120 9; then
+      echo "::error::ensure-postgres: timed out waiting for /tmp/yuzu-ci-postgres.lock — another runner may be stuck managing ${CONTAINER}" >&2
+      exit "$SOFT_EXIT"
+    fi
+  else
+    echo "::warning::ensure-postgres: flock not available; shared docker container lifecycle is not serialized" >&2
+  fi
   # Digest-drift guard: the container is persistent (--restart
   # unless-stopped), so a PG_IMAGE pin bump would otherwise never reach
   # runners that already have one — tests would silently keep running the
@@ -77,7 +89,10 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       -p "127.0.0.1:${DOCKER_PORT}:5432" \
       "$PG_IMAGE" >/dev/null
   fi
-  for _ in $(seq 1 30); do
+  # 120 s budget (60 × 2 s): a cold PG18 first boot runs the init scripts +
+  # pgvector extension install, which on a loaded self-hosted runner can take
+  # longer than the old 60 s (gov fjarvis).
+  for _ in $(seq 1 60); do
     # -h 127.0.0.1: the init-phase temporary server is unix-socket-only,
     # so a TCP probe can't false-positive mid-init.
     if docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -U yuzu -d yuzu_test >/dev/null 2>&1; then
@@ -86,7 +101,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
     sleep 2
   done
-  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 60s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
+  echo "::error::ensure-postgres: ${CONTAINER} container did not become ready in 120s — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -97,8 +112,8 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
   # spawns a thread). Pin LC_ALL/LANG defensively — minimal shells (and
   # this script's own CI smoke test under `env -i`) hit it.
   export LC_ALL="${LC_ALL:-C}" LANG="${LANG:-C}"
-  brew list postgresql@16 >/dev/null 2>&1 || brew install --quiet postgresql@16
-  PGBIN="$(brew --prefix postgresql@16)/bin"
+  brew list postgresql@18 >/dev/null 2>&1 || brew install --quiet postgresql@18
+  PGBIN="$(brew --prefix postgresql@18)/bin"
   PGDATA="${RUNNER_TEMP:-/tmp}/yuzu-ci-pgdata"
   PGLOG="${PGDATA}.log"
   if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
@@ -113,12 +128,12 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
   for _ in $(seq 1 15); do
     if "$PGBIN/pg_isready" -h 127.0.0.1 -p "$DOCKER_PORT" -U yuzu >/dev/null 2>&1; then
       "$PGBIN/createdb" -h 127.0.0.1 -p "$DOCKER_PORT" -U yuzu yuzu_test 2>/dev/null || true
-      emit_dsn "postgresql://yuzu@127.0.0.1:${DOCKER_PORT}/yuzu_test" "brew postgresql@16 cluster"
+      emit_dsn "postgresql://yuzu@127.0.0.1:${DOCKER_PORT}/yuzu_test" "brew postgresql@18 cluster"
       exit 0
     fi
     sleep 2
   done
-  echo "::error::ensure-postgres: brew postgresql@16 cluster did not become ready (log: ${PGLOG}) — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
+  echo "::error::ensure-postgres: brew postgresql@18 cluster did not become ready (log: ${PGLOG}) — failing the job (SOFT_EXIT=1 since #1320 PR 1)" >&2
   exit "$SOFT_EXIT"
 fi
 

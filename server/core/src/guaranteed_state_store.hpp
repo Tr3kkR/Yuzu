@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -385,6 +386,20 @@ public:
     // drill-down, served by idx_gars_rule); empty = the whole fleet. Read-only.
     std::vector<GuardianAgentRuleStatus> agent_rule_statuses(const std::string& rule_id = "") const;
 
+    // One agent's current per-rule compliance verdicts (every rule it has reported
+    // on) — the per-agent analog of agent_rule_statuses(rule_id), read via the
+    // (agent_id, rule_id) PK index. Backs the baseline-anchored per-device status
+    // REST view; the caller intersects the returned rule_ids with a Baseline's
+    // deployed members. Read-only (last-reported state, not a live probe).
+    std::vector<GuardianAgentRuleStatus>
+    agent_rule_statuses_for_agent(const std::string& agent_id) const;
+
+    // rule_id -> name for the whole catalogue, reading ONLY the two small columns
+    // (not yaml_source / spec_json / signature blobs that list_rules() materializes).
+    // For per-request name resolution on read paths like the baseline-anchored
+    // per-device status route, where the full rule body is never needed.
+    std::unordered_map<std::string, std::string> rule_names() const;
+
     std::size_t rule_count() const;
     std::size_t event_count() const;
 
@@ -421,6 +436,14 @@ public:
         return observations_proj_failures_.load();
     }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
+    // PK/UNIQUE-conflict drops at the single-row insert_event (redelivery, an
+    // event_seq_ reset on an agent crash-loop, a clock-skewed fleet, or a forged
+    // event_id pre-claim #1360). The conflicting event is NOT written; counting it
+    // closes the CC7.3 evidence gap (#1414) so an auditor can distinguish "no
+    // drift observed" from "drift observed but silently discarded". The batch
+    // insert_events path is excluded by design — it aborts the whole batch loudly
+    // (returns an error) rather than dropping one row and continuing.
+    uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -435,6 +458,7 @@ private:
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
+    std::atomic<uint64_t> events_dropped_{0}; // #1414: PK/UNIQUE-conflict ingest drops
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;

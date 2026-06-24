@@ -66,6 +66,16 @@ struct OsSupport {
 struct CaptureSourceDef {
     std::string_view name;        // "process", "tcp", "service", "user"
     std::string_view dollar_name; // "Process", "TCP", "Service", "User"
+    // Whether a fresh agent (no `<name>_enabled` config row yet) treats this
+    // source as enabled. Always-on sources keep the default `true`; high-volume
+    // usage-class sources that are opt-in under the works-council posture
+    // (module, procperf, netqual) set this `false` so `tar.status`, retention,
+    // and the paused_at transition all agree the source starts disabled. This is
+    // the single source of truth — `source_default_enabled()` exposes it to the
+    // two call sites that only have the source name (issue #59 follow-up).
+    // (Declared before os_support so the designated initialisers in
+    // build_sources() stay in member-declaration order.)
+    bool default_enabled = true;
     std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
@@ -82,6 +92,45 @@ struct CaptureSourceDef {
 // so an operator can pre-stage configuration ahead of an implementation
 // landing.
 [[nodiscard]] std::vector<std::string> accepted_capture_methods(std::string_view source_name);
+
+// The compile-time platform this agent was built for: "windows", "linux",
+// "macos", or "" on an unrecognised platform.
+[[nodiscard]] std::string_view current_platform_os();
+
+// Like accepted_capture_methods, but restricted to the `os_support` rows for a
+// single OS. This is what `configure` MUST validate against: the OS-blind union
+// (accepted_capture_methods) lets a Linux agent accept a Windows-only method
+// such as `iphlpapi`, which is then stored and surfaced even though the
+// collector never honours it (#540). Pass `current_platform_os()` for the
+// running host. `kPlanned` rows for that OS are still included (pre-staging).
+[[nodiscard]] std::vector<std::string>
+accepted_capture_methods_for_os(std::string_view source_name, std::string_view os);
+
+// ── Effective (actually-wired) network capture mechanism (issue #1528) ─────
+//
+// Returns the capture mechanism the TAR collector ACTUALLY uses, given the
+// configured `network_capture_method`. Only polling is wired today: the
+// per-OS platform APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling
+// implementation, and the kPlanned kernel-event methods (etw /
+// endpoint_security) are accepted for pre-staging but not yet collected. So
+// the effective mechanism is "polling" for every configured value until a
+// kernel-event collector lands -- at which point this is where the runtime
+// availability check goes (mirroring the process collector's `etw_active_`
+// gate in tar_plugin.cpp's do_status). The `status` action reports this
+// alongside the configured value so it can never misrepresent the active
+// mechanism.
+[[nodiscard]] std::string effective_network_capture_method(std::string_view configured);
+
+// ── Per-source default-enabled lookup ──────────────────────────────────────
+//
+// Returns `CaptureSourceDef::default_enabled` for the named source — the value
+// a fresh agent should assume when no `<source>_enabled` config row exists yet.
+// `true` (the always-on default) when the source name is unknown. Used by the
+// two default-enabled read sites that only have the bare source name (the
+// plugin's `source_enabled()` and the aggregator's
+// `apply_source_enabled_transition()`); call sites that already hold the
+// `CaptureSourceDef` read the field directly.
+[[nodiscard]] bool source_default_enabled(std::string_view source_name);
 
 // ── Registry access ─────────────────────────────────────────────────────────
 

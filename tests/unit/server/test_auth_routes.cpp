@@ -358,9 +358,12 @@ TEST_CASE("AuthRoutes::require_scoped_permission — readonly MCP tier blocks Ex
 
 // ---------------------------------------------------------------------------
 // supervised-tier approval enforcement on REST transport (sec-H1 / CH-1)
-// MCP server returns kApprovalRequired for supervised+destructive ops because
-// Phase 2 re-dispatch is not built. The REST transport must mirror that — a
-// supervised MCP token must not bypass the approval gate by switching endpoints.
+// The MCP server DENIES supervised+destructive ops (kTierDenied) because Phase 2
+// re-dispatch is not built — it deliberately does NOT return kApprovalRequired,
+// which the A4 contract reserves for a pollable approval (approval_id +
+// status_url) it cannot honestly produce. The REST transport must mirror that
+// denial — a supervised MCP token must not bypass the approval gate by switching
+// endpoints.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from approval-gated Execute",

@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <random>
 #include <string>
 
 #include <libpq-fe.h>
@@ -43,6 +44,28 @@ namespace yuzu::server::pg {
 
 class PgPool {
 public:
+    /// Optional observability hooks (#1368). Every callback is invoked
+    /// WITHOUT the pool's internal lock held, so an implementation may do
+    /// real work — but it MUST NOT re-enter the pool (acquire/with_txn/
+    /// destroy), which risks self-deadlock, and SHOULD NOT throw
+    /// (`on_unhealthy_discard` fires from a noexcept context, where a throw
+    /// is swallowed). The server wires these to its Prometheus registry; the
+    /// default — every hook empty — is a zero-overhead no-op. Connection
+    /// in_use/open/size are polled gauges via the accessors below, not hooks.
+    struct Observer {
+        /// A fresh connection attempt failed (feeds a connect-failure counter).
+        std::function<void()> on_connect_failure;
+        /// `try_acquire_for` gave up at its deadline (acquire-timeout counter).
+        std::function<void()> on_acquire_timeout;
+        /// A returned connection was discarded as unhealthy (discard counter).
+        std::function<void()> on_unhealthy_discard;
+        /// Wall time a successful `acquire`/`try_acquire_for` spent waiting,
+        /// in seconds (the acquire-wait histogram — the leading saturation
+        /// indicator). Observed on every successful checkout, including the
+        /// zero-wait idle-hit fast path.
+        std::function<void(double)> on_acquire_wait_seconds;
+    };
+
     struct Options {
         /// Connection string — keyword/value or URI form, as accepted by
         /// `PQconnectdb`.
@@ -58,6 +81,34 @@ public:
         /// timeout by default — without this a black-holed host wedges the
         /// acquiring thread indefinitely.
         int connect_timeout_s = 10;
+        /// Server-side per-statement timeout (ms), injected as a startup GUC
+        /// (`-c statement_timeout=`) via the `options` keyword unless the
+        /// conninfo sets its own `options`. Bounds a wedged query — including
+        /// the `PgTxn`-dtor ROLLBACK on a half-open connection. 0 disables
+        /// (libpq default = no timeout). (#1368 UP-2/4)
+        int statement_timeout_ms = 30000;
+        /// Server-side lock-acquisition timeout (ms), injected the same way.
+        /// Bounds the migration-runner advisory-lock wait so a wedged
+        /// lock-holder fails the boot closed instead of hanging forever — the
+        /// runner inherits this from its pooled lease. 0 disables. (#1368 CH-10)
+        int lock_timeout_ms = 10000;
+        /// TCP keepalive idle (s), injected as `keepalives=1 keepalives_idle=`
+        /// unless the conninfo sets `keepalives`. Surfaces a silently-dropped
+        /// connection (NAT/firewall reap) as a failed statement instead of an
+        /// indefinite hang. 0 leaves libpq defaults.
+        int keepalives_idle_s = 30;
+        /// Connect-failure circuit breaker (#1368 cheap-idle): after a failed
+        /// connect, suppress further connect attempts for an
+        /// exponentially-growing window (`base × 2^(failures-1)`, capped, with
+        /// ±25% jitter) so a down database is not hammered by `size`
+        /// simultaneous `connect_timeout_s` connects on every retry. During
+        /// the window `acquire()` fails fast with an empty lease; a returned
+        /// healthy idle connection is still served immediately (recovery is
+        /// not blocked). A successful connect resets the breaker.
+        std::chrono::milliseconds connect_backoff_base{200};
+        std::chrono::milliseconds connect_backoff_cap{5000};
+        /// Observability hooks; see Observer. All optional.
+        Observer observer;
     };
 
     /// Parses (but does not connect) the conninfo. A parse failure leaves the
@@ -170,6 +221,19 @@ public:
     /// Connections currently open (leased + idle).
     [[nodiscard]] std::size_t open() const;
 
+    /// Threads currently blocked in acquire() waiting for a lease — the
+    /// saturation depth that fills the gap between "all leased" and a /readyz
+    /// flip (gov sre).
+    [[nodiscard]] std::size_t waiters() const;
+
+    /// True while the connect-failure breaker is suppressing new connects.
+    /// A cheap, NON-lease-consuming health signal for readiness probes: armed
+    /// ⇒ the database is unreachable (recent connect failures). Pool
+    /// saturation alone — all leases out but no connect failures — does NOT
+    /// arm the breaker, so this never false-trips under load, which a
+    /// lease-consuming probe would (gov UP-2).
+    [[nodiscard]] bool connect_breaker_open() const;
+
 private:
     void release(PGconn* conn) noexcept;
     Lease acquire_internal(const std::chrono::steady_clock::time_point* deadline);
@@ -178,12 +242,21 @@ private:
     /// stores the reason via `set_error`.
     PGconn* connect_one();
     void set_error(std::string msg);
+    /// Arm the connect-failure breaker after a failed connect. Caller holds
+    /// `mu_`; grows the suppression window exponentially with ±jitter.
+    void arm_connect_backoff_locked();
 
     std::string conninfo_;
     std::size_t size_{16};
     int connect_timeout_s_{10};
+    int statement_timeout_ms_{30000};
+    int lock_timeout_ms_{10000};
+    int keepalives_idle_s_{30};
     bool valid_{false};
     bool conninfo_has_timeout_{false};
+    bool conninfo_has_options_{false};
+    bool conninfo_has_keepalives_{false};
+    Observer observer_;
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
@@ -194,6 +267,17 @@ private:
     std::size_t waiters_{0};    ///< threads blocked inside acquire's wait
     bool shutdown_{false};
     std::string last_error_;
+
+    // Connect-failure circuit breaker (guarded by mu_). connect_blocked_until_
+    // is the steady-clock instant before which no new connect is attempted.
+    std::chrono::milliseconds backoff_base_{200};
+    std::chrono::milliseconds backoff_cap_{5000};
+    std::size_t connect_failures_{0};
+    std::chrono::steady_clock::time_point connect_blocked_until_{};
+    /// Backoff jitter only (not crypto). Seeded from random_device so a fleet
+    /// of instances started together decorrelate their reconnect jitter — a
+    /// fixed seed gives every instance the identical sequence (gov fjarvis L1).
+    std::minstd_rand jitter_rng_{std::random_device{}()};
 };
 
 } // namespace yuzu::server::pg

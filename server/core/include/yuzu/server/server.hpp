@@ -42,6 +42,13 @@ struct Config {
     // (e.g. "dns:gateway" so an agent verifying a gateway reached by that name
     // succeeds). Ignored when operator certs are supplied or --no-default-certs.
     std::vector<std::string> cert_sans;
+    // Shared POSIX group (name or numeric gid) for the auto-generated cert volume
+    // (--cert-group, PKI #1289). When set, the cert dir (0750) and the gateway
+    // leaf key (0640) are chgrp'd to it so a gateway/agent running as a DIFFERENT
+    // uid in a sibling container can read the shared CA + its leaf out of the
+    // shared /etc/yuzu/certs volume. Empty (default) = tight single-host perms
+    // (dir 0700, keys 0600). The server/HTTPS private keys stay 0600 regardless.
+    std::string cert_group;
 
     // Optional management listener TLS override.
     // If left empty, management reuses the agent listener credentials.
@@ -65,6 +72,20 @@ struct Config {
     [[nodiscard]] std::filesystem::path db_dir() const {
         return data_dir.empty() ? auth_config_path.parent_path() : data_dir;
     }
+
+    // PostgreSQL server storage substrate (ADR-0006/0007). libpq conninfo —
+    // keyword/value or URI form — for the shared PgPool every Postgres-backed
+    // server store uses. Wired via --postgres-dsn / YUZU_POSTGRES_DSN. The
+    // server FAILS CLOSED (ADR-0007, no SQLite fallback) when this is empty or
+    // the pool cannot reach the database: startup_failed() is set and run()
+    // returns non-zero. The agent stays SQLite; this is server-only.
+    std::string postgres_dsn;
+
+    // Max concurrent PostgreSQL connections in the shared pool. Default 16.
+    // Sizing guidance in docs/user-manual/server-admin.md; tuning signals are
+    // yuzu_pg_pool_in_use / yuzu_pg_acquire_wait_seconds. Wired via
+    // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
+    int postgres_pool_size{16};
 
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
@@ -151,6 +172,17 @@ struct Config {
     // Rate limiting
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
+
+    // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
+    // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
+    // attempts the account is locked for `auth_lockout_window_secs`. The
+    // counter resets on a successful login or an admin unlock. Threshold 0
+    // disables the feature. The lock is temporary/auto-expiring so it cannot
+    // be weaponised to permanently DoS a legitimate principal; OIDC and the
+    // MFA code-verification path (which has its own rate-limit) are out of
+    // scope. See docs/auth-architecture.md.
+    int auth_lockout_threshold{5};     // consecutive failures before lock; 0 disables
+    int auth_lockout_window_secs{900}; // lock duration, default 15 min
 
     // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
     // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-

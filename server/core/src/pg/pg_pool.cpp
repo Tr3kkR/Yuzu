@@ -4,9 +4,11 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server::pg {
 
@@ -29,7 +31,10 @@ bool conninfo_sets(PQconninfoOption* opts, const char* keyword) {
 
 PgPool::PgPool(Options opts)
     : conninfo_(std::move(opts.conninfo)), size_(opts.size > 0 ? opts.size : 1),
-      connect_timeout_s_(opts.connect_timeout_s) {
+      connect_timeout_s_(opts.connect_timeout_s), statement_timeout_ms_(opts.statement_timeout_ms),
+      lock_timeout_ms_(opts.lock_timeout_ms), keepalives_idle_s_(opts.keepalives_idle_s),
+      observer_(std::move(opts.observer)), backoff_base_(opts.connect_backoff_base),
+      backoff_cap_(opts.connect_backoff_cap) {
     // Parse up front so a malformed conninfo is caught here, once, with a
     // sanitized error — NOT at first acquire with libpq's parse error, which
     // quotes the offending token (potentially a credential).
@@ -50,6 +55,13 @@ PgPool::PgPool(Options opts)
     const char* env_timeout = std::getenv("PGCONNECT_TIMEOUT");
     conninfo_has_timeout_ = conninfo_sets(parsed, "connect_timeout") ||
                             (env_timeout != nullptr && env_timeout[0] != '\0');
+    // The pool injects statement/lock timeouts via the `options` keyword and
+    // keepalives via `keepalives*`; never clobber an operator who set their
+    // own (conninfo wins). PGOPTIONS is the env analogue of `options`.
+    const char* env_options = std::getenv("PGOPTIONS");
+    conninfo_has_options_ = conninfo_sets(parsed, "options") ||
+                            (env_options != nullptr && env_options[0] != '\0');
+    conninfo_has_keepalives_ = conninfo_sets(parsed, "keepalives");
     PQconninfoFree(parsed);
     valid_ = true;
 }
@@ -84,6 +96,19 @@ PgPool::Lease PgPool::try_acquire_for(std::chrono::milliseconds timeout) {
 }
 
 PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_point* deadline) {
+    const auto t0 = std::chrono::steady_clock::now();
+    // Report wall time spent waiting for a checkout — including the zero-wait
+    // idle-hit fast path. Always invoked AFTER `lk` is released (the histogram
+    // has its own mutex; calling under mu_ would needlessly widen the
+    // critical section and the Observer contract forbids re-entry anyway).
+    const auto observe_wait = [&] {
+        if (observer_.on_acquire_wait_seconds) {
+            const auto secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            observer_.on_acquire_wait_seconds(secs);
+        }
+    };
+
     std::unique_lock lk{mu_};
     if (!valid_)
         return {};
@@ -100,7 +125,15 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             PGconn* c = idle_.front();
             idle_.pop_front();
             ++leased_;
-            return Lease{this, c};
+            // Take ownership in the RAII Lease BEFORE the observer can run: if
+            // observe_wait() throws, `lease` destructs and returns `c` to the
+            // pool (decrementing leased_) instead of leaking it and wedging the
+            // destructor's leased_==0 wait (gov fjarvis S1). The Observer
+            // contract is SHOULD-NOT-throw, but that is weaker than noexcept.
+            Lease lease{this, c};
+            lk.unlock();
+            observe_wait();
+            return lease;
         }
         // Deadline gate: never START a connect (or another wait) past the
         // caller's deadline. An idle connection at/past the deadline is
@@ -109,6 +142,17 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             // Deliberately not "exhausted": the deadline can also expire
             // before a connect was ever attempted (Gate 8 LOW).
             last_error_ = "acquire timed out before a connection was available";
+            lk.unlock();
+            if (observer_.on_acquire_timeout)
+                observer_.on_acquire_timeout();
+            return {};
+        }
+        // Connect-failure breaker (#1368): with no idle connection available
+        // and a failed connect still inside its suppression window, fail fast
+        // rather than launch another connect into a down database. The idle
+        // check above runs first, so a recovered connection is always served.
+        if (std::chrono::steady_clock::now() < connect_blocked_until_) {
+            last_error_ = "connect backoff active after repeated connection failures";
             return {};
         }
         if (open_ + connecting_ < size_) {
@@ -129,8 +173,10 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             lk.lock();
             --connecting_;
             if (!c) {
-                // Capacity we reserved is free again — wake a waiter so it
-                // can retry (or fail) rather than sleep forever.
+                // Arm the breaker so the next acquirers fail fast instead of
+                // each launching another connect storm, then free the
+                // reserved capacity and wake a waiter to retry-or-fail.
+                arm_connect_backoff_locked();
                 cv_.notify_all();
                 return {};
             }
@@ -140,9 +186,18 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
                 last_error_ = "pool is shutting down";
                 return {};
             }
+            // A live connection proves the database is reachable: clear the
+            // breaker so recovery is immediate.
+            connect_failures_ = 0;
+            connect_blocked_until_ = {};
             ++open_;
             ++leased_;
-            return Lease{this, c};
+            // RAII owner before the (SHOULD-not-throw) observer — see the
+            // idle-hit path above (gov fjarvis S1).
+            Lease lease{this, c};
+            lk.unlock();
+            observe_wait();
+            return lease;
         }
         // waiters_ keeps the destructor from tearing the pool down while we
         // are still inside the wait (it spins on waiters_ == 0).
@@ -155,19 +210,71 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     }
 }
 
+void PgPool::arm_connect_backoff_locked() {
+    ++connect_failures_;
+    // base × 2^(failures-1), capped, then ±25% jitter. Shift is bounded by
+    // the cap so a long outage can't overflow.
+    const long long base = backoff_base_.count() > 0 ? backoff_base_.count() : 1;
+    const long long cap = std::max<long long>(backoff_cap_.count(), base);
+    long long window = base;
+    for (std::size_t i = 1; i < connect_failures_ && window < cap; ++i)
+        window = std::min(cap, window * 2);
+    window = std::min(window, cap);
+    // Jitter in [75%, 100%] of the window — decorrelates a fleet of acquirers
+    // that all failed at once.
+    std::uniform_int_distribution<long long> jitter(window * 3 / 4, window);
+    const long long ms = jitter(jitter_rng_);
+    connect_blocked_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+}
+
 PGconn* PgPool::connect_one() {
     // Expand the caller's conninfo through the `dbname` keyword
-    // (expand_dbname=1) and append our connect_timeout default only when the
-    // conninfo (or PGCONNECT_TIMEOUT) doesn't set one — libpq has no
-    // client-side timeout otherwise, and a black-holed host would wedge the
-    // acquiring thread.
+    // (expand_dbname=1) and append the pool's effective defaults only where
+    // the conninfo (or the matching env var) didn't set one — operator
+    // settings always win:
+    //  - connect_timeout: libpq has no client-side timeout, so a black-holed
+    //    host would otherwise wedge the acquiring thread;
+    //  - keepalives/keepalives_idle: surface a silently reaped connection as a
+    //    failed statement rather than an indefinite hang;
+    //  - options (-c statement_timeout / -c lock_timeout): bound a wedged
+    //    query and the migration-runner advisory-lock wait server-side.
+    // All locals below must outlive the PQconnectdbParams call (they do — the
+    // call happens before this function returns).
     const std::string timeout = std::to_string(connect_timeout_s_);
-    const char* keys[] = {"dbname", "connect_timeout", nullptr};
-    const char* vals[] = {conninfo_.c_str(), timeout.c_str(), nullptr};
-    if (conninfo_has_timeout_)
-        keys[1] = nullptr; // vals[1] ignored past the terminator
+    const std::string keepalives_idle = std::to_string(keepalives_idle_s_);
+    std::string options;
+    if (!conninfo_has_options_) {
+        if (statement_timeout_ms_ > 0)
+            options += "-c statement_timeout=" + std::to_string(statement_timeout_ms_);
+        if (lock_timeout_ms_ > 0) {
+            if (!options.empty())
+                options += " ";
+            options += "-c lock_timeout=" + std::to_string(lock_timeout_ms_);
+        }
+    }
 
-    PgConn conn{PQconnectdbParams(keys, vals, /*expand_dbname=*/1)};
+    std::vector<const char*> keys;
+    std::vector<const char*> vals;
+    keys.push_back("dbname");
+    vals.push_back(conninfo_.c_str());
+    if (!conninfo_has_timeout_) {
+        keys.push_back("connect_timeout");
+        vals.push_back(timeout.c_str());
+    }
+    if (!conninfo_has_keepalives_ && keepalives_idle_s_ > 0) {
+        keys.push_back("keepalives");
+        vals.push_back("1");
+        keys.push_back("keepalives_idle");
+        vals.push_back(keepalives_idle.c_str());
+    }
+    if (!conninfo_has_options_ && !options.empty()) {
+        keys.push_back("options");
+        vals.push_back(options.c_str());
+    }
+    keys.push_back(nullptr);
+    vals.push_back(nullptr);
+
+    PgConn conn{PQconnectdbParams(keys.data(), vals.data(), /*expand_dbname=*/1)};
     if (PQstatus(conn.get()) != CONNECTION_OK) {
         // Safe to surface: connect errors from a *well-formed* conninfo name
         // host/port and the failure cause, never credentials. The malformed
@@ -175,6 +282,9 @@ PGconn* PgPool::connect_one() {
         std::string err = conn ? PQerrorMessage(conn.get()) : "out of memory";
         spdlog::warn("PgPool: connection attempt failed: {}", err);
         set_error(std::move(err));
+        // Observer runs here: connect_one is always called WITHOUT mu_ held.
+        if (observer_.on_connect_failure)
+            observer_.on_connect_failure();
         return nullptr;
     }
     return conn.release();
@@ -191,23 +301,38 @@ void PgPool::release(PGconn* conn) noexcept {
             spdlog::warn("PgPool: connection returned mid-transaction; rolled back");
     }
 
-    std::lock_guard lk{mu_};
-    --leased_;
-    if (shutdown_ || !healthy) {
-        PQfinish(conn);
-        --open_;
-    } else {
-        try {
-            idle_.push_back(conn);
-        } catch (...) {
-            // release() is noexcept; a bad_alloc from the deque must not
-            // terminate — drop the connection instead (capacity frees up
-            // for a fresh connect).
+    bool discarded_unhealthy = false;
+    {
+        std::lock_guard lk{mu_};
+        --leased_;
+        if (shutdown_ || !healthy) {
             PQfinish(conn);
             --open_;
+            // A discard during shutdown is routine teardown, not a health
+            // signal; only count connections dropped because they came back
+            // broken.
+            discarded_unhealthy = !healthy;
+        } else {
+            try {
+                idle_.push_back(conn);
+            } catch (...) {
+                // release() is noexcept; a bad_alloc from the deque must not
+                // terminate — drop the connection instead (capacity frees up
+                // for a fresh connect).
+                PQfinish(conn);
+                --open_;
+            }
+        }
+        cv_.notify_all();
+    }
+    // Observer runs after the lock is released; release() is noexcept, so a
+    // throwing hook must not propagate.
+    if (discarded_unhealthy && observer_.on_unhealthy_discard) {
+        try {
+            observer_.on_unhealthy_discard();
+        } catch (...) {
         }
     }
-    cv_.notify_all();
 }
 
 bool PgPool::with_txn(const std::function<bool(PGconn*)>& fn) {
@@ -251,6 +376,16 @@ std::size_t PgPool::in_use() const {
 std::size_t PgPool::open() const {
     std::lock_guard lk{mu_};
     return open_;
+}
+
+std::size_t PgPool::waiters() const {
+    std::lock_guard lk{mu_};
+    return waiters_;
+}
+
+bool PgPool::connect_breaker_open() const {
+    std::lock_guard lk{mu_};
+    return std::chrono::steady_clock::now() < connect_blocked_until_;
 }
 
 void PgPool::set_error(std::string msg) {

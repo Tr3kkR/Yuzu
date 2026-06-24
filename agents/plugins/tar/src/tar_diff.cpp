@@ -72,7 +72,10 @@ bool icontains(const std::string& haystack, const std::string& needle) {
     return it != haystack.end();
 }
 
-/// Strip leading/trailing '*' from a glob pattern to get the core substring.
+/// Strip leading/trailing '*' from a pattern to get the core substring. NOTE:
+/// matching is case-insensitive SUBSTRING containment, NOT real glob — `?` and
+/// `[abc]` are treated as literals; only leading/trailing `*` are honoured (as a
+/// readability affordance), then stripped here before the substring search.
 std::string strip_stars(const std::string& pattern) {
     std::string result = pattern;
     while (!result.empty() && result.front() == '*')
@@ -417,6 +420,21 @@ std::vector<ProcessEvent> compute_process_events(
 
     std::vector<ProcessEvent> events;
 
+    // macOS TAR process capture is names-only — parity with the Endpoint Security
+    // stream and the works-council / data-minimization posture. The sysctl poll's
+    // proc_pidpath() would otherwise leak the full executable path into the cmdline
+    // column, so blank it here. Windows process capture is already names-only via
+    // ETW; Linux keeps the (redacted) command line. See docs/user-manual/tar.md.
+    const auto cmd = [&](const std::string& c) -> std::string {
+#if defined(__APPLE__)
+        (void)c;
+        (void)redaction_patterns;
+        return {};
+#else
+        return redact_cmdline(c, redaction_patterns);
+#endif
+    };
+
     struct ProcState { std::string name; std::string cmdline; std::string user; uint32_t ppid; };
     std::unordered_map<uint32_t, ProcState> prev_map;
     prev_map.reserve(previous.size());
@@ -432,20 +450,20 @@ std::vector<ProcessEvent> compute_process_events(
         auto it = prev_map.find(p.pid);
         if (it == prev_map.end()) {
             events.push_back({timestamp, snapshot_id, "started", p.pid, p.ppid,
-                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+                              p.name, cmd(p.cmdline), p.user});
         } else if (it->second.name != p.name) {
             events.push_back({timestamp - 1, snapshot_id, "stopped", p.pid, it->second.ppid,
-                              it->second.name, redact_cmdline(it->second.cmdline, redaction_patterns),
+                              it->second.name, cmd(it->second.cmdline),
                               it->second.user});
             events.push_back({timestamp, snapshot_id, "started", p.pid, p.ppid,
-                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+                              p.name, cmd(p.cmdline), p.user});
         }
     }
 
     for (const auto& p : previous) {
         if (!curr_map.contains(p.pid)) {
             events.push_back({timestamp, snapshot_id, "stopped", p.pid, p.ppid,
-                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+                              p.name, cmd(p.cmdline), p.user});
         }
     }
 

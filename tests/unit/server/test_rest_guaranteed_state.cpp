@@ -19,6 +19,7 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
@@ -69,6 +70,10 @@ struct RestGsHarness {
     int live_sent{1};
     std::string last_live_plugin, last_live_action;
 
+    // BaselineStore for the baseline-anchored per-device status route.
+    fs::path bl_db_path;
+    std::unique_ptr<BaselineStore> baseline_store;
+
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
 
@@ -95,18 +100,33 @@ struct RestGsHarness {
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
     bool wire_live_deps{true};
 
+    // Per-device scoped-permission simulation for the baseline-anchored route.
+    // scoped_deny_agent (when non-empty) is treated as OUT OF SCOPE → 403; every
+    // other agent is in scope. last_scoped_agent_id records the agent_id the route
+    // handed the scoped check (proves the route scopes by the right device).
+    std::string scoped_deny_agent;
+    std::string last_scoped_agent_id;
+
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
-    explicit RestGsHarness(bool live_deps = true)
-        : db_path(unique_temp_path("rest-gs")), wire_live_deps(live_deps) {
+    // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
+    // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
+    // baseline-device route with an EMPTY ScopedPermFn, exercising its fail-closed-503
+    // path. Both default true so every existing test is unchanged.
+    explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true)
+        : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")),
+          wire_live_deps(live_deps) {
         fs::remove(db_path);
+        fs::remove(bl_db_path);
         // retention=0 keeps the reaper out of the way for ingest tests.
         store = std::make_unique<GuaranteedStateStore>(db_path, /*retention_days=*/0,
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
+        baseline_store = std::make_unique<BaselineStore>(bl_db_path);
+        REQUIRE(baseline_store->is_open());
 
         resp_db_path = unique_temp_path("rest-gs-resp");
         fs::remove(resp_db_path);
@@ -149,12 +169,18 @@ struct RestGsHarness {
             return false;
         };
 
-        // Per-device scope gate (require_scoped_permission stand-in): grants unless
-        // grant_perms is off OR the agent matches deny_scoped_agent.
+        // Scoped per-device permission (require_scoped_permission stand-in): records
+        // the agent_id, then denies (403) when grant_perms is off OR the agent matches
+        // either deny knob (deny_scoped_agent / dev's scoped_deny_agent) OR the
+        // operation matches deny_scoped_op (Execute-vs-Read isolation, #1549). Mirrors
+        // require_scoped_permission's contract (global passes; otherwise in-scope);
+        // last_scoped_agent_id proves the route scopes by the right device.
         auto scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
                                      const std::string&, const std::string& operation,
                                      const std::string& agent_id) -> bool {
+            last_scoped_agent_id = agent_id;
             if (!grant_perms || (!deny_scoped_agent.empty() && agent_id == deny_scoped_agent) ||
+                (!scoped_deny_agent.empty() && agent_id == scoped_deny_agent) ||
                 (!deny_scoped_op.empty() && operation == deny_scoped_op)) {
                 res.status = 403;
                 return false;
@@ -199,19 +225,90 @@ struct RestGsHarness {
                             /*guardian_push_fn=*/{},
                             /*dex_perf_fn=*/{},
                             /*net_perf_fn=*/{},
-                            scoped_perm_fn);
+                            /*lockout_clear_fn=*/{},
+                            baseline_store.get(),
+                            wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
+                                             : RestApiV1::ScopedPermFn{});
     }
 
     ~RestGsHarness() {
         store.reset();
-        fs::remove(db_path);
-        // sqlite WAL/SHM siblings
-        fs::remove(db_path.string() + "-wal");
-        fs::remove(db_path.string() + "-shm");
+        baseline_store.reset();
         resp_store.reset();
-        fs::remove(resp_db_path);
-        fs::remove(resp_db_path.string() + "-wal");
-        fs::remove(resp_db_path.string() + "-shm");
+        for (const auto& p : {db_path, bl_db_path, resp_db_path}) {
+            fs::remove(p);
+            // sqlite WAL/SHM siblings
+            fs::remove(p.string() + "-wal");
+            fs::remove(p.string() + "-shm");
+        }
+    }
+
+    // Seed a Guard rule (name resolves in the route's list_rules() lookup).
+    void seed_rule(const std::string& rule_id, const std::string& name) {
+        GuaranteedStateRuleRow r;
+        r.rule_id = rule_id;
+        r.name = name;
+        REQUIRE(store->create_rule(r).has_value());
+    }
+
+    // Seed one device's reported verdict for a Guard via the status feed
+    // (insert_event → upsert_rule_status). event_type maps to state per
+    // event_state_from_type: guard.compliant→compliant, drift.detected→drifted,
+    // guard.unhealthy→errored. NOTE: the upsert keeps the row only when
+    // excluded.updated_at >= the existing updated_at, so re-seeding the same
+    // (agent, rule_id) with an EARLIER (or equal-then-different-state) timestamp
+    // is silently dropped — use strictly increasing ts when overwriting a verdict.
+    void seed_status(const std::string& event_id, const std::string& agent,
+                     const std::string& rule_id, const std::string& event_type,
+                     const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = event_id;
+        e.rule_id = rule_id;
+        e.agent_id = agent;
+        e.event_type = event_type;
+        e.severity = "info";
+        e.timestamp = ts;
+        REQUIRE(store->insert_event(e).has_value());
+    }
+
+    // Write a RAW guardian_agent_rule_status row (arbitrary `state`) directly via
+    // a second SQLite connection — the public ingest path (insert_event →
+    // event_state_from_type) can only ever write "compliant"/"drifted"/"errored",
+    // so this is the only way to exercise the handler's defensive "unrecognized
+    // state → pending" fallthrough (e.g. a corrupt DB or a future state token).
+    void seed_raw_status(const std::string& agent, const std::string& rule_id,
+                         const std::string& state, const std::string& ts) {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(
+                    raw,
+                    "INSERT OR REPLACE INTO guardian_agent_rule_status"
+                    "(agent_id, rule_id, state, updated_at) VALUES(?1,?2,?3,?4)",
+                    -1, &st, nullptr) == SQLITE_OK);
+        sqlite3_bind_text(st, 1, agent.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, state.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        REQUIRE(sqlite3_close(raw) == SQLITE_OK);
+    }
+
+    // Create + deploy a Baseline with the given member Guards (snapshot = members,
+    // lifecycle = deployed). Returns the generated baseline_id.
+    std::string seed_deployed_baseline(const std::string& name,
+                                       const std::vector<std::string>& member_rule_ids) {
+        Baseline b;
+        b.name = name;
+        auto bid = baseline_store->create_baseline(b);
+        REQUIRE(bid.has_value());
+        REQUIRE(baseline_store->set_members(*bid, member_rule_ids).has_value());
+        Baseline deployed = *baseline_store->get_baseline(*bid);
+        deployed.deployed_snapshot = nlohmann::json(member_rule_ids).dump();
+        deployed.lifecycle = kBaselineDeployed;
+        REQUIRE(baseline_store->update_baseline(deployed).has_value());
+        return *bid;
     }
 
     // Seed one ruleless DEX observation (the __observation__ projection the DEX
@@ -1344,4 +1441,335 @@ TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
     // No audit emission on a denied request — the permission check is the first
     // statement in the handler, before the dex.signal.view audit.
     CHECK(h.audit_log.empty());
+}
+
+// ── Baseline-anchored per-device Guardian status ─────────────────────────────
+// GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}
+
+TEST_CASE("REST gs.baseline-device: deployed baseline returns per-guard verdicts + counts",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Firewall on");
+    h.seed_rule("r2", "RDP NLA");
+    h.seed_rule("r3", "BitLocker");
+    const auto bid = h.seed_deployed_baseline("ServiceNow Compliance", {"r1", "r2", "r3"});
+    // WS-1: r1 compliant, r2 drifted, r3 unreported (→ pending).
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r2", "drift.detected", "2026-06-20T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // A1 envelope: ok_json() wraps the payload as {data:..., meta:...}.
+    CHECK(j.contains("data"));
+    CHECK(j.contains("meta"));
+    auto& d = j["data"];
+    CHECK(d["baseline"]["name"].get<std::string>() == "ServiceNow Compliance");
+    CHECK(d["baseline"]["baseline_id"].get<std::string>() == bid);
+    CHECK(d["deployed"].get<bool>() == true);
+    CHECK(d["agent_id"].get<std::string>() == "WS-1");
+    CHECK(d["total_guards"].get<int>() == 3);
+    CHECK(d["compliant"].get<int>() == 1);
+    CHECK(d["drifted"].get<int>() == 1);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 1);
+    CHECK(d["total_guards"].get<int>() == d["compliant"].get<int>() + d["drifted"].get<int>()
+                                             + d["errored"].get<int>() + d["pending"].get<int>());
+    // last_updated = newest reported verdict (the pending guard contributes nothing).
+    CHECK(d["last_updated"].get<std::string>() == "2026-06-20T11:00:00Z");
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 3);
+    bool saw_pending = false, saw_named = false;
+    for (auto& g : d["guards"]) {
+        if (g["rule_id"].get<std::string>() == "r3")
+            saw_pending =
+                g["status"].get<std::string>() == "pending" && g["updated_at"].is_null();
+        if (g["rule_id"].get<std::string>() == "r1")
+            saw_named = g["name"].get<std::string>() == "Firewall on"
+                        && g["status"].get<std::string>() == "compliant"
+                        && !g["updated_at"].is_null();
+    }
+    CHECK(saw_pending);
+    CHECK(saw_named);
+    bool audited = false;
+    for (auto& a : h.audit_log)
+        if (a.action == "guardian.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST gs.baseline-device: verdicts are isolated per agent (WHERE agent_id)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_rule("r2", "G2");
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r2"});
+    // WS-1 all compliant; WS-2 all errored — the WS-2 rows must not bleed into WS-1.
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("a2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("b1", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("b2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["compliant"].get<int>() == 2);
+    CHECK(d["errored"].get<int>() == 0); // WS-2's errored verdicts must not leak here
+    CHECK(d["pending"].get<int>() == 0);
+
+    // The same data, queried for WS-2, positively exercises the errored bucket
+    // (guard.unhealthy -> "errored" via event_state_from_type) and confirms the
+    // counts are isolated in both directions.
+    auto res2 = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-2");
+    REQUIRE(res2);
+    auto j2 = nlohmann::json::parse(res2->body);
+    auto& d2 = j2["data"];
+    CHECK(d2["errored"].get<int>() == 2);
+    CHECK(d2["compliant"].get<int>() == 0);
+    CHECK(d2["pending"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.baseline-device: unknown agent on a deployed baseline → all pending",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    h.seed_rule("r2", "G2");
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r2"});
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/ghost");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 2);
+    CHECK(d["pending"].get<int>() == 2);
+    CHECK(d["last_updated"].is_null());
+}
+
+TEST_CASE("REST gs.baseline-device: draft baseline → deployed:false, no guards",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    // Members set but never deployed → empty deployed_snapshot.
+    Baseline b;
+    b.name = "Draft B";
+    auto bid = h.baseline_store->create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(h.baseline_store->set_members(*bid, {"r1"}).has_value());
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + *bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["deployed"].get<bool>() == false);
+    CHECK(d["total_guards"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].empty());
+}
+
+TEST_CASE("REST gs.baseline-device: unknown baseline_id → 404 + not_found audit",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/nope123abc/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    // The attempt is still audited (enumeration trail), but result reflects the
+    // miss — not "success" — so a 404 probe stream stays distinguishable.
+    bool not_found_audited = false;
+    for (auto& a : h.audit_log)
+        if (a.action == "guardian.device.view" && a.target_id == "WS-1" &&
+            a.result == "not_found")
+            not_found_audited = true;
+    CHECK(not_found_audited);
+}
+
+TEST_CASE("REST gs.baseline-device: deployed-but-empty baseline → deployed:true, no guards",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    // A genuinely deployed Baseline with zero members (snapshot "[]") — distinct
+    // from a draft (deployed:false). A consumer must branch on `deployed`, not on
+    // total_guards, to decide "No Baseline Deployed".
+    const auto bid = h.seed_deployed_baseline("Empty Deployed", {});
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["deployed"].get<bool>() == true);
+    CHECK(d["total_guards"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].empty());
+}
+
+TEST_CASE("REST gs.baseline-device: permission gate runs before audit",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    h.grant_perms = false; // scoped_perm_fn denies → 403
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST gs.baseline-device: per-device scope — out-of-scope agent 403, in-scope 200",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    // WS-1 is outside the caller's management-group scope → 403, and the gate runs
+    // before the store read + audit (no leak, no audit row). Also proves the route
+    // hands the scoped check the RIGHT device id (regression net vs flat perm_fn).
+    h.scoped_deny_agent = "WS-1";
+    auto denied = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK(h.last_scoped_agent_id == "WS-1");
+    CHECK(h.audit_log.empty());
+
+    // WS-2 is in scope → 200.
+    auto ok = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-2");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.last_scoped_agent_id == "WS-2");
+}
+
+TEST_CASE("REST gs.baseline-device: unwired scoped_perm_fn → fail-closed 503 (A4)",
+          "[rest][guaranteed_state][baseline][rbac]") {
+    RestGsHarness h{/*live_deps=*/true, /*wire_scoped_perm=*/false};
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    // With no scoped_perm_fn wired the route MUST fail closed (503) — never silently
+    // fall back to the flat gate that would re-introduce the group-scoped lockout.
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["meta"]["api_version"] == "v1");
+    CHECK(h.audit_log.empty()); // fail-closed before any audit
+}
+
+TEST_CASE("REST gs.baseline-device: path-param length cap at kMaxAgentIdLength (256)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+
+    // 256-char baseline_id is AT the cap → passes → reaches the store → 404 (unknown
+    // id), proving the cap did not bite a valid-length id.
+    const std::string id256(256, 'x');
+    auto ok_b = h.sink.Get("/api/v1/guaranteed-state/baselines/" + id256 + "/devices/WS-1");
+    REQUIRE(ok_b);
+    CHECK(ok_b->status == 404);
+
+    // 257-char baseline_id is past the cap → 400 A4.
+    const std::string id257(257, 'x');
+    auto bad_b = h.sink.Get("/api/v1/guaranteed-state/baselines/" + id257 + "/devices/WS-1");
+    REQUIRE(bad_b);
+    CHECK(bad_b->status == 400);
+    auto jb = nlohmann::json::parse(bad_b->body);
+    CHECK(jb["error"]["code"].get<int>() == 400);
+    CHECK(jb["error"].contains("correlation_id"));
+
+    // 257-char agent_id is independently capped → 400 A4.
+    const std::string a257(257, 'a');
+    auto bad_a = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/" + a257);
+    REQUIRE(bad_a);
+    CHECK(bad_a->status == 400);
+    CHECK(nlohmann::json::parse(bad_a->body)["error"].contains("correlation_id"));
+
+    // 256-char agent_id is AT the cap → passes → deployed baseline → 200 (all pending).
+    const std::string a256(256, 'a');
+    auto ok_a = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/" + a256);
+    REQUIRE(ok_a);
+    CHECK(ok_a->status == 200);
+}
+
+TEST_CASE("REST gs.baseline-device: 404 uses the A4 envelope (code + correlation_id)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/does-not-exist/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 404);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"]["message"].get<std::string>() == "baseline not found");
+    CHECK(j["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("REST gs.baseline-device: route + schema are in the OpenAPI spec (A1 discoverability)",
+          "[rest][guaranteed_state][baseline][discovery]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    nlohmann::json spec;
+    // Parsing validates the spec survived the C2026 string-literal split.
+    REQUIRE_NOTHROW(spec = nlohmann::json::parse(res->body));
+    REQUIRE(spec.contains("paths"));
+    CHECK(spec["paths"].contains("/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}"));
+    REQUIRE(spec.contains("components"));
+    REQUIRE(spec["components"].contains("schemas"));
+    CHECK(spec["components"]["schemas"].contains("GuaranteedStateBaselineDeviceStatus"));
+}
+
+TEST_CASE("REST gs.baseline-device: unrecognized stored state folds into pending (invariant holds)",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "G1");
+    const auto bid = h.seed_deployed_baseline("B", {"r1"});
+    // A corrupt/future state token the public ingest path can never write.
+    h.seed_raw_status("WS-1", "r1", "weird-future-state", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 1);
+    CHECK(d["compliant"].get<int>() == 0);
+    CHECK(d["drifted"].get<int>() == 0);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 1); // unrecognized state -> pending
+    CHECK(d["total_guards"].get<int>() == d["compliant"].get<int>() + d["drifted"].get<int>()
+                                             + d["errored"].get<int>() + d["pending"].get<int>());
+    CHECK(d["last_updated"].is_null()); // only recognized verdicts contribute
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["status"].get<std::string>() == "pending");
+    CHECK(d["guards"][0]["updated_at"].is_null());
+}
+
+TEST_CASE("REST gs.baseline-device: snapshot guard with no rule row falls back to rule_id name",
+          "[rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Real Guard");
+    // r-gone is in the deployed snapshot but its rule row was never created
+    // (e.g. the Guard was deleted after deploy) -> name falls back to the rule_id.
+    const auto bid = h.seed_deployed_baseline("B", {"r1", "r-gone"});
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/baselines/" + bid + "/devices/WS-1");
+    REQUIRE(res);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 2);
+    bool saw_fallback = false;
+    for (auto& g : d["guards"]) {
+        if (g["rule_id"].get<std::string>() == "r-gone") {
+            CHECK(g["name"].get<std::string>() == "r-gone"); // fallback to rule_id
+            CHECK(g["status"].get<std::string>() == "pending");
+            saw_fallback = true;
+        }
+    }
+    CHECK(saw_fallback);
 }
