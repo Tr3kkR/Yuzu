@@ -2482,9 +2482,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  // flag via Sec-Audit-Failed but STILL render (a transient audit
                  // hiccup must not blank the dashboard); the REST sibling fails closed.
                  // Shared helper (#1647) adds the catch-arm log the inline copy lacked.
-                 detail::emit_behavioral_audit(audit_fn_, req, res, "dex.signal.view", "success",
-                                               "ObsType", type,
-                                               "DEX per-signal most-affected devices");
+                 (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.signal.view",
+                                                     "success", "ObsType", type,
+                                                     "DEX per-signal most-affected devices");
                  const auto vis = resolve_visible(req); // scope the most-affected-devices list
                  res.set_content(
                      render_dex_catalogue_signal_fragment(store_, since, window_days, type, os,
@@ -2551,8 +2551,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // Capture the audit bool (#1549 review): surface a dropped evidence row on
         // this PII drill-down via Sec-Audit-Failed; HTML surface still renders.
         // Shared helper (#1647) adds the catch-arm log the inline copy lacked.
-        detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success", "Agent",
-                                      id, "DEX per-device signal history");
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success",
+                                            "Agent", id, "DEX per-device signal history");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
         std::optional<DexPerfSnapshot> snap;

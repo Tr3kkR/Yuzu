@@ -93,8 +93,12 @@ template <class AuditFn>
 /// HTTP wrapper: `try_persist_audit` + set the `Sec-Audit-Failed: true`
 /// response header on failure. Returns the persist outcome so the caller picks
 /// its posture (HTML fragments PROCEED and render; REST JSON FAIL CLOSED 503).
+/// `[[nodiscard]]` so a future REST route can't silently drop the bool and serve
+/// PII after a known audit-persist failure (#1651 review K4) — the HTML
+/// set-and-proceed callers, which legitimately ignore it (the header side effect
+/// is the point), discard it explicitly with `(void)`.
 template <class AuditFn>
-inline bool emit_behavioral_audit(const AuditFn& audit_fn, const httplib::Request& req,
+[[nodiscard]] inline bool emit_behavioral_audit(const AuditFn& audit_fn, const httplib::Request& req,
                                   httplib::Response& res, const std::string& action,
                                   const std::string& result, const std::string& target_type,
                                   const std::string& target_id, const std::string& detail) {

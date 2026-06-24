@@ -252,8 +252,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         // a transient audit hiccup never blanks the operator's lens (#1647). The
         // shared helper captures the persist bool behind a try/catch (the throw
         // arm is otherwise silent) — one pattern across every behavioural route.
-        detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success", "Agent",
-                                      id, "device DEX lens (per-device signal summary)");
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success",
+                                            "Agent", id,
+                                            "device DEX lens (per-device signal summary)");
         const std::string since = dex_iso_since(7);
         const int score = dex_device_score(store_, id, since);
         std::vector<std::pair<std::string, std::int64_t>> sigs;
@@ -275,8 +276,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         }
         // Behavioural-PII access audit — set-and-proceed (HTML fragment), parity
         // with the DEX lens above and the shared #1647 helper.
-        detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
-                                      "Agent", id, "device Guardian lens (per-guard compliance)");
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
+                                            "Agent", id,
+                                            "device Guardian lens (per-guard compliance)");
         std::unordered_map<std::string, std::string> rule_names;
         for (const auto& r : store_->list_rules())
             rule_names[r.rule_id] = r.name;

@@ -1331,6 +1331,26 @@ TEST_CASE("REST guaranteed-state/events: agent-scoped audit failure → 503, no 
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(res->body.find("chrome.exe") == std::string::npos); // no PII leaked
+    // A4 envelope on the fail-closed body (#1651 review K2): correlation_id + retry_after_ms,
+    // parity with the /dex/devices/{id} + baseline siblings.
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    auto j = nlohmann::json::parse(res->body);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"]["retry_after_ms"].get<int>() == 5000);
+}
+
+// #1651 review K5: the converted route's catch arm (a throwing audit_fn) was only
+// covered by the helper unit test, not end-to-end here. Pin it at the route level.
+TEST_CASE("REST guaranteed-state/events: agent-scoped throwing audit → 503, A4, Sec-Audit-Failed",
+          "[rest][dex][events][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_throws = true; // bad_alloc-class throw — caught by the shared helper
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events?agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
 }
 
 TEST_CASE("REST guaranteed-state/events: NO agent_id filter is a bulk query — not gated by audit",
@@ -1355,6 +1375,24 @@ TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, S
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(res->body.find("WS-1") == std::string::npos); // the agent_id list must not leak
+    // A4 envelope on the fail-closed body (#1651 review K2).
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    auto j = nlohmann::json::parse(res->body);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"]["retry_after_ms"].get<int>() == 5000);
+}
+
+// #1651 review K5: route-level catch-arm coverage for the converted dex.signal route.
+TEST_CASE("REST dex/signals/{obs_type}: throwing audit → 503, A4, Sec-Audit-Failed",
+          "[rest][dex][signals][audit]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.audit_throws = true; // caught by the shared helper, must still fail closed
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("WS-1") == std::string::npos);
 }
 
 TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
