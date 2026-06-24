@@ -63,7 +63,38 @@ struct UserSession {
     std::string session_id;
 };
 
+// One host ARP / neighbour-table entry (ADR-0015). Snapshot type for the `arp`
+// capture source; diffed into ArpEvent rows. Diff key = (interface, ip_address,
+// mac_address); entry_type is a value field. All fields agent-controlled.
+struct ArpEntry {
+    std::string iface; // NB: 'interface' is a Win32 COM macro under full <windows.h>
+    std::string ip_address;
+    std::string mac_address;
+    std::string entry_type; // dynamic, static, incomplete, other, unknown
+};
+
+// One host DNS resolver-cache entry (ADR-0015). Snapshot type for the `dns`
+// capture source; diffed into DnsEvent rows. Diff key = (name, record_type,
+// data); ttl_remaining_s is a value field (changes every tick, never keyed).
+// The cache is system-wide and carries NO pid — there is no process attribution.
+struct DnsEntry {
+    std::string name;
+    std::string record_type; // A, AAAA, CNAME, PTR, ...
+    std::string data;
+    int64_t ttl_remaining_s{0};
+    std::string source; // cache, hosts_file, unknown
+};
+
 // ── Platform enumeration functions ────────────────────────────────────────────
+//
+// Adding a NEW capture source? Follow the core pattern these functions use
+// (process/tcp/service/user, NOT the perf/procperf/netqual derived-metric tiers
+// which are self-contained tar_<name>.{hpp,cpp}): collected type + enumerate_*()
+// + compute_*_events() declared HERE, one tar_<source>_collector.cpp for the
+// platform shell (no per-source header), diffs in tar_diff.cpp, row struct +
+// insert_*_events in tar_db.{hpp,cpp}, one CaptureSourceDef in
+// tar_schema_registry.cpp. Full recipe: docs/tar-implementer.md "Adding a
+// capture source".
 
 /** Enumerate active network connections on the current host. */
 std::vector<NetConnection> enumerate_connections();
@@ -86,6 +117,25 @@ std::vector<ServiceInfo> enumerate_services();
 
 /** Enumerate active user sessions on the current host. */
 std::vector<UserSession> enumerate_users();
+
+/**
+ * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
+ * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
+ * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
+ */
+std::vector<ArpEntry> enumerate_arp();
+
+/**
+ * Enumerate the host DNS resolver cache (ADR-0015). Windows: DnsGetCacheDataTable.
+ * Hard-capped at kDnsEntryCap entries (warn on truncation). The cache is
+ * system-wide (no process attribution). Returns `{}` off Windows for now.
+ */
+std::vector<DnsEntry> enumerate_dns();
+
+/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector resizes to
+/// the cap and logs a truncation warning rather than growing unbounded.
+inline constexpr std::size_t kArpEntryCap = 2048;
+inline constexpr std::size_t kDnsEntryCap = 4096;
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -199,5 +249,25 @@ std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>&
 std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previous,
                                            const std::vector<UserSession>& current,
                                            int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute ARP diff. Key: interface + ip_address + mac_address.
+ * Detects bindings that appeared (`appeared`) and disappeared (`removed`). A
+ * changed entry_type on an otherwise-identical binding is NOT an event (value
+ * update only), so a flapping dynamic/static flag does not churn the warehouse.
+ */
+std::vector<ArpEvent> compute_arp_events(const std::vector<ArpEntry>& previous,
+                                         const std::vector<ArpEntry>& current,
+                                         int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute DNS-cache diff. Key: name + record_type + data.
+ * Detects resolutions that appeared (`appeared`) and aged out (`removed`). The
+ * ttl_remaining_s value is carried on the row but excluded from the key, so the
+ * per-tick TTL decrement does not produce spurious appeared/removed churn.
+ */
+std::vector<DnsEvent> compute_dns_events(const std::vector<DnsEntry>& previous,
+                                         const std::vector<DnsEntry>& current,
+                                         int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar

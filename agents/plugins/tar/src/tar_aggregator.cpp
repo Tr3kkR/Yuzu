@@ -207,7 +207,16 @@ std::string_view diff_state_key(std::string_view source) {
         return "service";
     if (source == "user")
         return "user";
-    // perf/procperf keep an in-memory previous reading; netqual is stateless.
+    // ADR-0015 — arp/dns are snapshot-diff sources too: the collect legs keep a
+    // baseline under these exact keys (get_state/set_state "arp"/"dns"), so the
+    // on-disable clear must reach them or a re-enable would emit ghost
+    // removed/added neighbour + cache deltas for the paused window (#538).
+    if (source == "arp")
+        return "arp";
+    if (source == "dns")
+        return "dns";
+    // perf/procperf keep an in-memory previous reading; netqual is stateless;
+    // module is a stream-drained source (no snapshot-diff baseline).
     return {};
 }
 
