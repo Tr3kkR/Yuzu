@@ -8922,10 +8922,10 @@ private:
             },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
-            // Per-device-scoped permission (management-group aware) for that route —
-            // the SAME named closure DeviceRoutes already uses for the dashboard
-            // Guardian device lens (defined once above), not a re-inlined duplicate
-            // that two copies would have to keep in sync.
+            // Per-device-scoped permission (management-group aware): the SAME
+            // require_scoped_permission closure the dashboard device routes + the
+            // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
+            // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
