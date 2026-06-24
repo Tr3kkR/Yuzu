@@ -367,6 +367,19 @@ the agent never receives the cert (an active MITM stripping the field, or a
 persistent signer outage), the agent bounds its retries and gives up
 auto-provisioning for that run rather than looping.
 
+**Agent CA pinning is fail-closed (#1303).** When the agent has TLS on but no CA
+to pin — no `--ca-cert` **and** no install CA auto-discovered at the standard
+shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows) — it
+**refuses to connect** rather than silently falling back to the system trust
+store. An empty root set makes gRPC verify against the OS roots, which do **not**
+trust a Yuzu self-signed install CA, so with the gateway one-way-TLS edge live any
+publicly-trusted impostor cert for the dial host would be accepted — a fail-open
+MITM on the command fan-out plane. The deliberate escape hatch is
+`--tls-system-roots` / `YUZU_TLS_SYSTEM_ROOTS`, for the legitimate case where the
+server certificate chains to a public or corporate CA already in the system store;
+it logs a loud warning and is never the default. (`--no-tls` remains the dev/demo
+opt-out.)
+
 **Operator surface.** Server: `--ca-dir` (shared with the default-cert
 bootstrap). Agent: `--cert-dir` / env `YUZU_CERT_DIR` (where the provisioned
 credential lives) and `--no-auto-provision-cert` (disable the CSR-at-enrollment
@@ -410,6 +423,33 @@ gateway-proxied agent promptly, revoke at the gateway/management layer (disconne
 the agent) in addition to `POST /api/v1/ca/revoke`. This is the same
 direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
 ("Gateway path identity").
+
+**Gateway CSR-swap forgery (R-5, accepted M1 residual).** Wiring `ProxyRegister`
+to sign forwarded CSRs makes the gateway a bounded **confused deputy**. The
+server signs the relayed CSR's public key under the **gateway-supplied**
+`agent_id` (the through-gateway identity is the app-layer `gateway_observed_peer`,
+not a transport-cryptographic binding in M1), so a compromised or on-path gateway
+can relay a *victim's* `agent_id` paired with its *own* CSR and obtain a real
+CA-signed leaf for that `agent_id`. Worse than a transient relay: that leaf is a
+durable credential the attacker can present for **persistent direct mTLS
+reconnect**, bypassing the gateway entirely — it **survives gateway eviction**.
+Compensating controls (why this is accepted for M1, not a live break):
+
+- Every forged leaf is recorded in `ca_issued` and is **revocable** — and #1290
+  stamps `via=gateway_proxy` on the `ca.cert.issued` audit + issuance metric, so
+  an incident responder can **scope and bulk-revoke the gateway-issued population**
+  after a gateway compromise (the row the forensic control depends on).
+- The gateway authenticates to the server over **upstream mutual TLS** (a rogue
+  gateway cannot reach the issuance path without being an enrolled gateway).
+- PR5c **one-way TLS** on the agent↔gateway edge mitigates the *on-path* (non-gateway-
+  compromise) variant.
+
+The actual cryptographic remediation — gateway agent-identity **attestation** +
+per-gateway issuance **scoping** so a gateway can only obtain leaves for the
+`agent_id`s it legitimately fronts — is tracked in **#1292** (cryptographic
+through-gateway binding lands with the QUIC migration, #376). Full threat model:
+`docs/security-reviews/pki-pr5-gateway-tls.md`; also summarised in
+`docs/pki-architecture.md`.
 
 ## HTTP security response headers (SOC2-C1)
 

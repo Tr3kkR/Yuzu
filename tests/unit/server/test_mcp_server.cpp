@@ -1128,6 +1128,32 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(badkey["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
+          "[mcp][integration][a4]") {
+    McpTestServer ts;
+    ts.start("readonly"); // readonly tier allows only Read
+
+    // set_tag is Tag:Write — denied by the readonly tier through the shared C8
+    // chokepoint that gates ~13 tools. The whole MCP error family must now carry
+    // an A4 error.data correlation id (#1470), not just the per-tool validations.
+    auto denied = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"set_tag","arguments":{"agent_id":"a","key":"k","value":"v"}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    REQUIRE(denied["error"].contains("data"));
+    CHECK(denied["error"]["data"]["correlation_id"].is_string());
+    CHECK(denied["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    // #1470 Gate-4 consistency: tier-denials carry an actionable remediation hint
+    // (parity with the cohort-diff sibling), not a bare null.
+    CHECK(denied["error"]["data"]["remediation"].is_string());
+    // Full A4 field set present — retry_after_ms is always emitted (null here),
+    // parity with the REST sibling (Gate-4 consistency N2).
+    REQUIRE(denied["error"]["data"].contains("retry_after_ms"));
+    CHECK(denied["error"]["data"]["retry_after_ms"].is_null());
+}
+
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
@@ -1155,14 +1181,32 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // #1470: every error path in the dex-perf block is A4 — the validation
+    // errors carry error.data with a correlation id and a nullable retry/
+    // remediation, not a bare message (the block comment asserts this).
+    REQUIRE(bad["error"].contains("data"));
+    CHECK(bad["error"]["data"]["correlation_id"].is_string());
+    CHECK(bad["error"]["data"].contains("retry_after_ms"));
+    CHECK(bad["error"]["data"]["remediation"].is_string());
 
-    // Invalid cohort key → kInvalidParams (REST 400 parity).
+    // Invalid cohort_key on list_dex_perf_devices → A4 kInvalidParams.
+    auto badcohort = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":61,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"not a key!"}}})")
+            ->body);
+    REQUIRE(badcohort.contains("error"));
+    CHECK(badcohort["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(badcohort["error"]["data"]["correlation_id"].is_string());
+
+    // Invalid cohort key → kInvalidParams (REST 400 parity), also A4.
     auto badkey = nlohmann::json::parse(
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":55,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"not a key!"}}})")
             ->body);
     REQUIRE(badkey.contains("error"));
     CHECK(badkey["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    REQUIRE(badkey["error"].contains("data"));
+    CHECK(badkey["error"]["data"]["correlation_id"].is_string());
 }
 
 TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
@@ -2065,8 +2109,19 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated",
 
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    // Deliberately kTierDenied, NOT kApprovalRequired (-32006): approval
+    // re-dispatch is unimplemented (Phase 2), and the A4 contract reserves
+    // kApprovalRequired for envelopes that carry approval_id + status_url. The
+    // operation is denied with no pollable approval, so a tier-denial is the
+    // honest shape. See docs/agentic-first-principle.md + docs/mcp-server.md.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
     CHECK(body["error"]["message"].get<std::string>().find("approval") != std::string::npos);
+    // A4 envelope, and crucially NO approval_id/status_url (would be a contract
+    // lie on a path that cannot resume the execution).
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(body["error"]["data"].contains("status_url"));
 }
 
 // ── 36. Audit on success ─────────────────────────────────────────────────
