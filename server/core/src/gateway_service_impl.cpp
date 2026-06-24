@@ -538,7 +538,18 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
     // to the direct ReportInventory path; fills response->need_full for any
     // source needing a cold-cache resync.
     if (software_inventory_store_ && software_inventory_store_->is_open()) {
-        ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response);
+        // Isolate ingest failures, identical to the direct ReportInventory path
+        // — otherwise an exception escapes as gRPC UNKNOWN (UP-9 / parity).
+        try {
+            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: inventory ingest threw for agent={} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: inventory ingest threw (unknown) for agent={} "
+                         "— acked",
+                         agent_id);
+        }
     }
     response->set_received(true);
     return grpc::Status::OK;

@@ -90,15 +90,24 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         if (it != report.plugin_data().end()) {
             rows = parse_software_blob(it->second);
             if (!rows.has_value()) {
-                spdlog::warn("inventory: oversized '{}' blob from agent={}, dropping", source,
-                             agent_id);
-                continue; // implausible payload — do not store, do not nack
+                // Oversized blob: don't store it, but DO nack so the agent
+                // retries rather than recording a false success (UP-2). The
+                // agent's own blob cap (UP-4) should prevent reaching here.
+                spdlog::warn("inventory: oversized '{}' blob from agent={}, dropping + nacking",
+                             source, agent_id);
+                ack.add_need_full(source);
+                continue;
             }
         }
 
         InventoryIngestOutcome outcome =
             store.apply_installed_software(agent_id, claimed_hash, rows, collected_at);
-        if (outcome == InventoryIngestOutcome::kNeedFull)
+        // need_full on cold-cache/drift (kNeedFull) AND on a transient store
+        // failure (kError) — otherwise the agent sees an empty need_full, treats
+        // the cycle as stored, and silently advances past un-stored data for up
+        // to a week (UP-2). Nacking makes the agent resend a full payload.
+        if (outcome == InventoryIngestOutcome::kNeedFull ||
+            outcome == InventoryIngestOutcome::kError)
             ack.add_need_full(source);
     }
 }

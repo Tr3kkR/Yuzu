@@ -301,6 +301,13 @@ jobs:
       - name: Verify vendored grpcbox integrity
         run: bash gateway/scripts/verify-vendored-grpcbox.sh
 
+      # ADR-0016 / gov build-ci: the committed gateway _pb.erl are GENERATED from
+      # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
+      # un-regenerated, silently field-dropping _pb.erl (e.g. management_pb, which
+      # no test exercises) fails the merge-guarding path — not only release.yml.
+      - name: Verify gateway proto codegen is up to date
+        run: bash gateway/scripts/check-proto-codegen.sh
+
       # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
       # runner, which persists in the github-runner user's home between
       # jobs by definition. No actions/cache round-trip needed — paying

@@ -323,12 +323,13 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     // Both deletes in one transaction so an agent removal can't leave a parent
     // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
     pool_.with_txn([&](PGconn* c) -> bool {
-        pg::exec_params(c,
-                        "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
-                        std::vector<std::string>{id});
-        pg::exec_params(c, "DELETE FROM software_inventory_store.inventory_state WHERE agent_id = $1",
-                        std::vector<std::string>{id});
-        return true;
+        pg::PgResult d1 = pg::exec_params(
+            c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        pg::PgResult d2 = pg::exec_params(
+            c, "DELETE FROM software_inventory_store.inventory_state WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
     });
 }
 

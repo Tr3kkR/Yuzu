@@ -4466,6 +4466,11 @@ private:
                 // the pool answered.
                 {"offline_endpoint_store",
                  offline_endpoint_store_ && offline_endpoint_store_->is_open()},
+                // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
+                // state post-boot makes ReportInventory silently ack with no
+                // ingest and no readiness signal — surface it (gov Pattern E).
+                {"software_inventory_store",
+                 software_inventory_store_ && software_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces

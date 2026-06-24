@@ -19,6 +19,11 @@ namespace {
 // parse does not truncate/drop differently from what this source hashed.
 constexpr std::size_t kMaxEntries = 20000;
 constexpr std::size_t kMaxFieldLen = 1024;
+// Total canonical-blob ceiling — MUST match the server seam's kMaxBlobBytes
+// (inventory_ingestion.cpp). The agent drops a cycle whose blob exceeds this so
+// it never (a) records success on a payload the server will drop, nor (b) trips
+// the gRPC message-size limit into a tight retry loop (governance UP-4).
+constexpr std::size_t kMaxBlobBytes = 4u * 1024 * 1024;
 
 std::string clamp_field(std::string_view f) {
     if (f.size() > kMaxFieldLen)
@@ -105,6 +110,12 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         e.version = tok.size() > 2 ? clamp_field(tok[2]) : "";
         e.publisher = tok.size() > 3 ? clamp_field(tok[3]) : "";
         e.install_date = tok.size() > 4 ? clamp_field(tok[4]) : "";
+        // Drop a name that became empty AFTER clamping (e.g. a separator-only
+        // name). The server's parse_software_blob drops empty-name rows, so the
+        // agent must too or the two canonical hashes diverge → permanent
+        // always-full (governance UP-1). Mirrors the server's `!e.name.empty()`.
+        if (e.name.empty())
+            continue;
         entries.push_back(std::move(e));
     }
     return entries;
@@ -153,6 +164,12 @@ SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor
         }
         auto entries = parse_installed_apps_output(r.captured);
         std::string blob = installed_software_canonical_blob(std::move(entries));
+        if (blob.size() > kMaxBlobBytes) {
+            spdlog::warn("sync: installed_software blob {} B exceeds {} B cap — skipping this "
+                         "cycle (won't send an un-storable payload)",
+                         blob.size(), kMaxBlobBytes);
+            return std::nullopt;
+        }
         std::string hash = sha256_hex(blob);
         return std::make_pair(std::move(blob), std::move(hash));
     };
