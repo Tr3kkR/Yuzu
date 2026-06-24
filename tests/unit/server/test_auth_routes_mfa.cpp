@@ -44,6 +44,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -943,4 +944,172 @@ TEST_CASE("POST /login/mfa concurrent submit with same token: exactly one wins",
     t2.join();
     CHECK(successes.load() == 1);
     CHECK(failures.load() == 1);
+}
+
+// ── POST /login account lockout (SOC 2 CC6.3) ────────────────────────────
+//
+// The AuthRoutesHarness wires a real AuthDB + cfg; cfg is held by reference
+// so a per-test `h.cfg.auth_lockout_threshold` override takes effect. These
+// tests assert the HTTP-boundary CC6.3 evidence the AuthDB unit tests can't:
+// the generic-401 (no enumeration/lock-state oracle), the applied-audit-once
+// invariant, and the success-clears-the-counter path.
+
+TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires once",
+          "[mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+
+    // Three bad-password attempts — the third crosses the threshold.
+    for (int i = 0; i < 3; ++i) {
+        auto r = h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    // Exactly one applied audit row at the crossing — NOT one per failure.
+    CHECK(h.count_audits("auth.lockout.applied", "alice") == 1);
+
+    // A subsequent attempt with the CORRECT password is rejected while locked
+    // (the brute-force throttle does not yield to a correct guess mid-lock) and
+    // no session is minted.
+    auto locked = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(locked->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+    // Still exactly one applied row — the blocked attempt does not re-audit.
+    CHECK(h.count_audits("auth.lockout.applied", "alice") == 1);
+}
+
+TEST_CASE("POST /login: locked-account 401 body is byte-identical to a bad-password 401 (no oracle)",
+          "[mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+
+    // A bad-password 401 from a NOT-yet-locked account (attempt 1).
+    auto bad = h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 401);
+
+    // Attempt 2 crosses the threshold → account locked.
+    h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                "application/x-www-form-urlencoded");
+
+    // Attempt 3 is blocked by the pre-check (locked) with a correct password.
+    auto locked = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    // The whole point: a locked account is indistinguishable from a wrong
+    // password — same status AND same body, no Retry-After, no "locked" word.
+    CHECK(locked->body == bad->body);
+    CHECK(locked->body.find("locked") == std::string::npos);
+    CHECK(locked->get_header_value("Retry-After").empty());
+}
+
+TEST_CASE("POST /login: a successful login clears a non-zero failure counter",
+          "[mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+
+    // Two failures — below the threshold, account not locked.
+    for (int i = 0; i < 2; ++i) {
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    CHECK(h.count_audits("auth.lockout.applied", "alice") == 0);
+
+    // Correct password succeeds (alice has no MFA) and clears the counter.
+    auto ok = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+    // The reset emits a cleared audit (only because the counter was non-zero).
+    CHECK(h.count_audits("auth.lockout.cleared", "alice") == 1);
+
+    // The counter is back to zero — a single fresh failure does not re-lock.
+    auto st = h.auth_db.lockout_status("alice");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 0);
+    CHECK_FALSE(st->locked);
+}
+
+TEST_CASE("POST /login: lockout disabled (threshold=0) never locks",
+          "[mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 0; // disabled
+
+    for (int i = 0; i < 8; ++i) {
+        auto r = h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    CHECK(h.count_audits("auth.lockout.applied", "alice") == 0);
+    // Correct password still succeeds — never locked.
+    auto ok = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshold (C1 race close)",
+          "[mfa][routes][auth_routes][lockout][concurrency]") {
+    // Adversarial C1: without per-username serialization, a synchronized burst
+    // of attempts for ONE username could all pass the stale lockout pre-check
+    // and each verify a password before any failure was recorded, so the
+    // effective guess budget was the in-flight concurrency, not the threshold.
+    // The striped login lock serializes the check → verify → record sequence
+    // per username, so at most `threshold` attempts reach verification before
+    // the lock arms — failed_count ends EXACTLY at the threshold.
+    AuthRoutesHarness h;
+    const int threshold = 3;
+    h.cfg.auth_lockout_threshold = threshold;
+    h.cfg.auth_lockout_window_secs = 900;
+
+    constexpr int kThreads = 16;
+    // Per-thread result slots (distinct indices → no synchronization needed;
+    // Catch2 assertion macros are NOT thread-safe, so we assert after join on
+    // the main thread only).
+    std::vector<int> statuses(kThreads, 0);
+    std::vector<char> got_cookie(kThreads, 0);
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        ts.emplace_back([&h, &statuses, &got_cookie, i] {
+            auto r = h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                                 "application/x-www-form-urlencoded");
+            if (r) {
+                statuses[i] = r->status;
+                got_cookie[i] = r->get_header_value("Set-Cookie").empty() ? 0 : 1;
+            }
+        });
+    }
+    for (auto& t : ts)
+        t.join();
+
+    // Every burst request was rejected (bad password OR locked) — never a
+    // session minted for an out-of-budget guess.
+    for (int i = 0; i < kThreads; ++i) {
+        CHECK(statuses[i] == 401);
+        CHECK(got_cookie[i] == 0);
+    }
+
+    // The serialization capped verifications at exactly the threshold (without
+    // it, the racy count would exceed `threshold`).
+    auto st = h.auth_db.lockout_status("alice");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(st->failed_count == threshold);
+
+    // The correct password is now rejected — the account is locked.
+    auto locked = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(locked->get_header_value("Set-Cookie").empty());
 }

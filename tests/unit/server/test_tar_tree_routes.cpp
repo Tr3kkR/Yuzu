@@ -110,8 +110,10 @@ struct TarHarness {
             return {};
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string& tid, const std::string& d) {
+                            const std::string&, const std::string& tid,
+                            const std::string& d) -> bool {
             audit_log.push_back({a, r, tid, d});
+            return true; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit);
     }

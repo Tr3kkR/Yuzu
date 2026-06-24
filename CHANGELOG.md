@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
+  previously gated only flat `Response:Read` and then returned **any** execution's response rows
+  (`dispatched_by` was display-only, never an access check), so an operator could collect another
+  operator's rows by id. Results are now filtered per-agent through the same
+  `check_scoped_permission` management-group chokepoint the per-device REST/dashboard routes use —
+  a caller sees only rows for agents inside their groups; out-of-scope rows are dropped and audited
+  `result=denied` (with the distinct dropped-agent count). The `denied` row's persistence failure,
+  like the success row's, surfaces `audit_persisted:false` on the result. RBAC-off → legacy-open
+  (no filter), matching `require_scoped_permission`. **Behavior change for agentic-worker
+  integrators:** results may now be a subset of an execution's total rows. The filter runs after
+  the 1000-row cap, so a result that hit the cap before filtering carries
+  `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
+  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(Partial: the
+  REST/dashboard/workflow siblings that read the same response store and the `aggregate_responses`
+  MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
+  token creator's RBAC, not the service tag.)*
+
 ### Changed
 
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
@@ -31,6 +50,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
   (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
   service guard remains observe-only on the compliant edge (parity deferred).
+
+### Security
+
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
 
 ### Added
 
@@ -57,13 +96,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device is in — a previously group-scoped token now gets `403` for out-of-scope
   devices, where a flat global check would have passed them; global tokens are
   unaffected). Audited `guardian.device.view` on access (denials audited at the auth
-  layer as `auth.scoped_permission_required`). An audit-persistence failure surfaces
-  `Sec-Audit-Failed: true` (header) plus `audit_emitted: false` (body) and still serves
-  the read (set-and-proceed, CC7.2). Both query params are required,
-  length-capped (`256` / `auth::kMaxAgentIdLength`), and rejected if they contain
-  control characters (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use
-  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
-  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
+  layer as `auth.scoped_permission_required`). A behavioural-PII read, so it **fails
+  closed**: if the `guardian.device.view` audit row cannot persist it returns `503` +
+  `Sec-Audit-Failed: true` and **withholds** the compliance body (parity with
+  `GET /api/v1/dex/devices/{id}`, governance #1549) — the `503` is returned before the
+  `404`, so an audit outage never reveals baseline existence without durable evidence
+  (CC7.2). Both query params are required, length-capped (`256` /
+  `auth::kMaxAgentIdLength`), and rejected if they contain control characters
+  (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use the A4 envelope
+  (`correlation_id`), while the `403` is the auth/RBAC layer's denial body (not the A4
+  envelope; exact shape varies by denial reason — RBAC vs service-scope).
+- **MCP `query_responses` closes the dispatch→collect loop by `execution_id`.** The tool now
+  accepts an `execution_id` argument (routed to `ResponseStore::query_by_execution`) so an
+  agentic worker that dispatched via `execute_instruction` can collect exactly that run's
+  responses — exact-correlation, no cross-execution bleed — instead of the definition-wide
+  `instruction_id` collect. At least one of `execution_id`/`instruction_id` is now required (was
+  `instruction_id`-only); when both are given, `execution_id` wins. Each returned row now echoes
+  its `execution_id`. The advertised `status` filter is corrected to `integer` in the tool schema
+  (the handler always read it as the `CommandResponse` status enum; the prior `string` declaration
+  was wrong), and `limit` is now clamped to `[1,1000]` (a negative limit previously bound as an
+  unbounded SQLite `LIMIT -1`, and `limit:0` returned zero rows a worker could misread as "done").
+  Foundation for fleet-scale agentic fan-out across tens of thousands of devices. *(Scope: `limit`
+  caps a page at 1000 rows; correct collection of executions that fan out to more than 1000 devices
+  is a keyset-pagination follow-up — offset paging is deliberately not exposed, as it skips/dupes
+  rows while responses are still arriving. The sibling `aggregate_responses` tool still keys on
+  `instruction_id` only; an `execution_id` aggregate is a follow-up. MCP-first: the streaming REST
+  surface `GET /api/v1/events?execution_id=` already exists; a non-streaming polling REST collect
+  by `execution_id` is a deferred follow-up slice.)*
+- **Sampled authentication-log evidence export (SOC 2 CC7.2).** New
+  `GET /api/v1/audit/auth-sample?from=&to=&limit=` returns a pseudo-random
+  sample of authentication-surface audit events (action prefixes `auth.`,
+  `mfa.`, `session.`) over an optional epoch-seconds window — a representative
+  sample for auditor evidence rather than the latest-N. Gated on `AuditLog:Read`
+  (not admin-only, so a read-only auditor role can pull evidence without full
+  admin — separation of duties), and the export is itself audited as
+  `audit.auth_sample.exported`. Backed by two new `AuditQuery` knobs
+  (`action_prefixes` OR-group filter + `random_sample` ordering); discoverable
+  in the OpenAPI spec (A2). Closes the P0 auth gap "sampled auth-log evidence
+  export".
+- **Guardian ingest-drop counter.** New `/metrics` counter
+  `yuzu_server_guardian_events_dropped_total` counts cumulative Guardian events dropped at
+  ingest on an `event_id` PK/UNIQUE conflict (redelivery, an agent `event_seq_` reset, clock
+  skew, or a forged-id pre-claim). `> 0` distinguishes "no drift observed" from "drift observed
+  but silently discarded" (CC7.3 evidence). Sits alongside
+  `yuzu_server_guardian_events_{total,written_total,reaped_total}`. (#1414)
+
+- **Offline hosts stay visible on the fleet map.** A new born-on-Postgres store
+  (`endpoint_state`) records each agent's last-known identity + last-seen on every heartbeat, so
+  a host that drops out of the in-memory 60 s topology cache renders **stale-flagged** on
+  `/viz/fleet` instead of vanishing. New pool observability on `/metrics`
+  (`yuzu_pg_pool_{in_use,open,size}`, `yuzu_pg_connect_failed_total`,
+  `yuzu_pg_acquire_timeout_total`, `yuzu_pg_unhealthy_discard_total`,
+  `yuzu_pg_acquire_wait_seconds`) and a live pool probe + the new store join the `/readyz`
+  readiness conjunction.
+
+- **Shared device pages.** New dashboard pages `/devices` (searchable fleet list with an OS
+  filter, online status, and per-device DEX score) and `/device?id=` (the per-device entity
+  page, reachable from any dashboard, with **Device info / DEX / Guardian** lens tabs). The
+  fleet list now requires `Infrastructure:Read` (parity with `/api/agents`, via the same
+  `get_visible_agents_json` provider — closing the prior any-authenticated-operator access);
+  every per-device route — page, info, the DEX/Guardian lenses, and the live pull — is
+  additionally scoped to the device's management group via `require_scoped_permission`, so an
+  operator cannot open, read, or live-query a device outside their scope. The DEX and Guardian
+  lenses render per-device behavioral/compliance data
+  with audit-on-open (`dex.device.view`, `guardian.device.view`). The fleet list and a single
+  page open score only the rows they render — opening one device no longer scores the whole
+  fleet. The list shows currently-connected devices only (no offline/status filter yet). The
+  **DEX dashboard's per-device drills** the device DEX lens links to (`/fragments/dex/device`
+  + its `/perf`/`/procperf` live panels) are scoped the same way, and the DEX device-id lists
+  (overview top-devices, per-signal/per-app affected-devices, per-device perf) no longer
+  enumerate agents outside the operator's management scope. (Fleet **aggregates** — rate
+  denominators, score histograms — remain fleet-wide statistics.)
+- **"Get live info" on the device page.** Dispatches read-only instructions to the agent on
+  demand (not the 30s heartbeat): **Uptime** (`os_info/uptime`) and a **running-process list**
+  (`processes/list_hashed`) showing the **SHA-256 of each process's on-disk executable**, with
+  a first-10 preview and client-side search. Requires `Execution:Execute` scoped to the
+  device's management group (a device outside your scope cannot be live-queried); each dispatch
+  is individually audit-logged (`device.live.uptime`, `device.live.processes`) with the
+  usage-class read kept separately countable for works-council access audit.
+- **REST: agentic-first per-device DEX endpoints.** `GET /api/v1/dex/devices/{id}` — the
+  per-device DEX read model (score + signal summary), the machine-readable equivalent of the
+  dashboard DEX lens; `GuaranteedState:Read` scoped to the device, audited `dex.device.view`,
+  off-enum `window` rejected `400`. `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` —
+  the machine-readable "Get live info": dispatches a read-only instruction now and returns the
+  result synchronously (~20s). **POST, not GET** (it dispatches a command — a side effect);
+  `GuaranteedState:Read` + `Execution:Execute` scoped to the device; audited per kind
+  (`device.live.uptime` / `device.live.processes`, audited `result=requested` pre-dispatch — see
+  the Security entry above; the dashboard "Get live info" emitter still audits post-dispatch
+  `result=dispatched`, a tracked alignment follow-up). Concurrent live polls
+  are capped server-wide (over-budget → `429`); offline → `503`, timeout → `504`, device error
+  → `502`, all with `retry_after_ms` where applicable.
+- **`processes/list_hashed` plugin action** (all platforms): `proc|pid|name|sha256|path`. The
+  executable path is resolved from the OS kernel (Windows `QueryFullProcessImageNameW`, Linux
+  `/proc/<pid>/exe`, macOS `proc_pidpath`) — not the spoofable argv[0] — and the on-disk image
+  is hashed via the shared `sha256_file` (bounded at 512 MiB, deduped by path).
+- **DEX Catalogue is coverage-first.** A signal family/type now lights when a connected
+  platform **collects** it — not only when it fired — with per-family "N of M monitored", a
+  0–100 family health score, and an **OS filter** that persists across the family and per-type
+  drill-downs. Types no connected platform collects read as *not collected*, never as healthy.
+
+- **Linux server DEX: systemd unit-health signals from the journal.** The Linux DEX
+  collector now emits `service.hung` (a `WatchdogSec` timeout — the existing
+  unit-failed journal entry routed by `UNIT_RESULT="watchdog"`, since a watchdog kill
+  is a hang, not a crash; one entry, no double-emit) and `os.time_unsynced` (chrony's
+  "Can't synchronise: no selectable sources" / large-step markers, via a low-volume
+  `SYSLOG_IDENTIFIER=chronyd` query clause; the raw message, which carries NTP source
+  IPs, is never shipped). `service.hung` is verified through the agent's emit on a real
+  watchdog timeout. Reused obs_types need no live-render change; the per-OS coverage map
+  `dex_obs_platforms` (`dex_routes.cpp`) gains the new Linux types. Linux DEX coverage is now 17 signals.
+  (`service.dependency_failed` is deferred — no `MESSAGE_ID`, and the root failure is
+  already captured as `service.crashed`.)
+
+- **Linux server DEX: `/proc` + `/sys` performance/hardware state polls.** The Linux
+  DEX collector now also emits `perf.disk_latency_high` (per-I/O service time / iostat
+  `await` over the whole physical disks, from `/proc/diskstats` — completing the
+  Windows cpu/mem/disk perf trio on Linux, same `dex_perf_breach` hysteresis + 25 ms
+  threshold) and `hw.cpu_throttled` (a poll-and-latch on the `/sys`
+  `core_throttle_count` thermal-throttle counters, the Windows Kernel-Processor-Power
+  37 analogue). New pure parsers `parse_diskstats`/`disk_await_ms`/`is_whole_disk`
+  (`dex_linux_proc`) and `parse_throttle_count` (new `dex_linux_sysfs.cpp`); field
+  positions verified against a real box. Reused obs_types (no live-render change; the
+  per-OS coverage map gains them); this slice adds 2 (Linux 13→15, building on the
+  kernel-reliability slice below; the systemd unit-health entry above reaches 17).
+
+- **Linux server DEX: kernel-reliability signals from the journal.** The Linux DEX
+  collector's journald reader now also classifies `_TRANSPORT=kernel` ring-buffer
+  lines (free text, no `MESSAGE_ID`) via anchored substring markers in a new pure
+  `dex_linux_kmsg.cpp`, emitting on **existing** obs_types (no live-render change; the
+  per-OS coverage map gains them):
+  `os.bugcheck` (a fatal `Kernel panic - not syncing` only — survivable Oops/
+  soft-lockup deliberately not mapped, to keep the BSOD-equivalent rate honest),
+  `os.dirty_shutdown` (ext4/xfs journal-recovery at mount = the prior shutdown was
+  unclean), `disk.error` (block-layer / buffer I/O error, subject = backing device),
+  `fs.corruption` (ext4/xfs/btrfs metadata error, subject = device), `hw.error`
+  (machine-check / `[Hardware Error]`), and `process.hung` (the hung-task watchdog).
+  Markers for `disk.error`, `fs.corruption` and `os.dirty_shutdown` are pinned to
+  records live-captured on a real systemd-259 box via safe error injection (and
+  `disk.error` verified through the agent's emit on a real injected error); panic, MCE and
+  hung-task use the documented kernel format strings. Only infra-safe fields leave
+  the device (device / comm / short reason) — the raw kernel `MESSAGE` is never
+  shipped (`[dex][linux][kmsg][privacy]` pins). Linux server DEX coverage grows from
+  7 to 13 reused signals, all in the same `/dex` display groups.
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
@@ -296,6 +469,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `procboot.etl` (boot-process names reveal which security/EDR tools are present)
   — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
 
+### Fixed
+
+- **A4 error envelope on MCP tier-denied paths and dex-perf REST endpoints.** MCP tier-denied
+  errors (read-only mode, tier policy, approval-required) now carry
+  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":"…"}` (the
+  remediation is an actionable hint, not `null`), the dex-perf MCP validation errors
+  (`get_dex_perf_cohorts`/`list_dex_perf_devices` invalid key/cohort_key/limit) carry the same
+  `error.data`, and `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on
+  every 400/503 branch and an `X-Correlation-Id` response header (on success and error), matching
+  the `cohort-diff` sibling. The shared REST A4 helper now always emits the spec-required nullable
+  `retry_after_ms` field. **Behaviour change:** an approval-gated MCP operation on the `supervised`
+  tier is now denied with `kTierDenied` (-32004) instead of `kApprovalRequired` (-32006) — A4
+  reserves -32006 for an envelope carrying a pollable `approval_id` + `status_url`, which the
+  unimplemented re-dispatch path (Phase 2) cannot honestly provide; the operation is still denied
+  and the remediation points at the REST API / dashboard. (#1470)
+
+- **DEX catalogue family tile labelled honestly.** The family device figure is the *largest
+  single signal's* distinct-device count, not the family union (two disjoint 50-device signals
+  read 50, not 100); the tile now reads "Peak signal devices / largest single signal" so the
+  number and label agree. Health score unchanged. (#1374)
+
+- **Operator/API tags beat agent self-report.** An agent's reported `scopable_tags` can no
+  longer overwrite an operator- or API-set tag for the same `(agent_id, key)`, preventing a
+  rogue or misconfigured agent from self-assigning into an operator-declared benchmark cohort. (#1411)
+
+- **Guardian enforce-stop denylist extended with WdFilter and BFE.** Two Windows built-ins that
+  could defeat a *listed* control indirectly — `WdFilter` (Defender's filesystem minifilter,
+  stopping it blinds real-time scanning while `WinDefend` still reads as up) and `BFE` (the Base
+  Filtering Engine the firewall sits on, stopping it tears down the firewall while `mpssvc`
+  looks protected) — are now rejected by `dangerous_enforce_service_stop`. (#1285)
+
 ### Changed
 
 - **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
@@ -335,6 +539,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **Account lockout is ON by default (`--auth-lockout-threshold=5`).** Existing
+  deployments gain a new failure mode on upgrade with no config change: 5
+  consecutive failed local-password logins lock an account for 15 minutes
+  (returning the same generic 401 as a bad password — no "you are locked"
+  message). Shared/service accounts that authenticate with a password and any
+  password-rotation automation are the highest-risk targets. Recover with
+  `POST /api/v1/users/{name}/unlock`, wait out the window, or disable the
+  control with `--auth-lockout-threshold=0`. SSO/OIDC and API tokens are
+  unaffected. See `docs/user-manual/upgrading.md` § Account lockout and the
+  full feature entry under **Added** below.
 - **The shipped Docker images are now TLS-by-default (PKI #1289).** The
   `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
   images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
@@ -464,6 +678,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
+  (a) `network_capture_method` was validated against the OS-blind union of every
+  platform's capture methods, so a Linux agent would accept and store the
+  Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
+  polling — now validated against the running host's OS accept-list via the new
+  `accepted_capture_methods_for_os` (#540). (b) `process_stabilization_exclusions`
+  and `redaction_patterns` had no element-count or length caps (an oversized array
+  degrades the per-process redaction scan), and an over-short exclusion substring
+  (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
+  256 chars, and an exclusion whose EFFECTIVE substring (after stripping
+  leading/trailing `*`) is shorter than 3 chars is rejected at configure **and
+  dropped on the load path** — `*` does not buy a pass (`*a*` strips to core
+  `a`), and the load-path floor matters because the loader re-parses the stored
+  value every fast cycle, so a sub-floor value persisted before the floor existed
+  (a no-tamper upgrade) or written out of band would otherwise reach the redaction
+  scan and suppress events. The loaders skip non-string elements instead of
+  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
+  discovery metadata is synced (substring not glob, OS-aware method rejection,
+  the 256/256/3 limits), and the stale "glob" comments are corrected to
+  "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
+  pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
+  (#544). (d) **Command-line redaction is now fail-closed on every collect path.**
+  `load_redaction_patterns` previously returned the safe built-in patterns only
+  when the stored value was empty or a non-array; a *valid array whose elements all
+  got dropped* (`[]`, `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is
+  empty) returned an empty set, silently disabling redaction so `password`/`token`/
+  `secret` were written to `process_live` in plaintext — `collect_fast` and
+  `procperf` lacked the defaults-union that `fleet_snapshot` already applied. The
+  built-in defaults are now unioned inside `load_redaction_patterns` via the shared
+  `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
+  can never DISABLE the baseline protection on any path. The load-path JSON parse
+  also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
+  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
+  metadata for `network_capture_method` no longer advertises the process-source
+  `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
 - **TAR source enable/disable is now corruption-resilient and reports a strict
   state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
   corrupt `tar.db` was opened and trusted, and since `get_config` returns the
@@ -565,6 +814,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Account lockout for failed local-password logins (SOC 2 CC6.3).** After
+  `--auth-lockout-threshold` (default 5) consecutive failed `POST /login`
+  attempts within `--auth-lockout-window-secs` (default 900 s) the account is
+  locked; subsequent attempts return the **same generic 401** as a bad password
+  (no username-enumeration / lock-state oracle, and PBKDF2 is skipped). The lock
+  auto-expires after the window — it is never permanent — and a waited-out user
+  regains a fresh attempt budget. An admin can clear a lock immediately via
+  `POST /api/v1/users/{username}/unlock` (`UserManagement:Write`, MFA step-up;
+  self-target permitted). Set `--auth-lockout-threshold=0` to disable. Env vars:
+  `YUZU_AUTH_LOCKOUT_THRESHOLD` / `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. New audit
+  verbs `auth.lockout.applied` (once, at the threshold crossing) /
+  `auth.lockout.cleared` (successful login or admin unlock); new metrics
+  `yuzu_auth_lockout_applied_total` / `yuzu_auth_lockout_blocked_total`. Scope is
+  local-password login only — OIDC/SSO and API tokens are unaffected.
 - **Secrets-at-rest envelope encryption substrate — `SecretCodec` +
   `KekProvider` KEK wrap/unwrap seam (ADR-0010, #1320 PR 4; machinery only,
   no store writes secret columns yet).** Secret columns in PostgreSQL are

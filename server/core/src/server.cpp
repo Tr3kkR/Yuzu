@@ -602,6 +602,12 @@ public:
                           "Total Guaranteed-State events currently persisted", "gauge");
         metrics_.describe("yuzu_server_guardian_events_written_total",
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_dropped_total",
+                          "Cumulative Guaranteed-State events dropped at ingest on an event_id "
+                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
+                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
+                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -2521,6 +2527,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_dropped_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -8904,12 +8912,20 @@ private:
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
             net_perf_fn,
+            // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
+            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
+            // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
+            [this](const std::string& username) -> bool {
+                auto* db = auth_mgr_.auth_db_ptr();
+                return db && db->clear_failed_logins(username).has_value();
+            },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
-            // Per-device-scoped permission (management-group aware) for that route —
-            // the SAME named closure DeviceRoutes already uses for the dashboard
-            // Guardian device lens (defined once above), not a re-inlined duplicate
-            // that two copies would have to keep in sync.
+            // Per-device-scoped permission (management-group aware): the SAME
+            // require_scoped_permission closure the dashboard device routes + the
+            // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
+            // held to the same per-device scope (defined once above, not re-inlined).
             scoped_perm_fn);
 
         // -- Register MCP server routes ----------------------------------------
@@ -9026,6 +9042,24 @@ private:
                 dex_perf_fn,
                 // N1: the shared network-quality provider (fragments + REST + MCP).
                 net_perf_fn,
+                // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
+                // query_responses{execution_id}. Wired to check_scoped_permission —
+                // the SAME management-group chokepoint the per-device REST/dashboard
+                // routes use — so an operator collects only the agents inside their
+                // groups, not any execution's rows by id. The MCP handler resolves the
+                // principal ONCE (it already authed) and passes `username` in, so this
+                // does NOT re-resolve the session per agent. RBAC off / no store →
+                // legacy-open (no filter), matching require_scoped_permission.
+                // CAVEAT (#1634): for a service-scoped token this checks the token
+                // CREATOR's RBAC scope, not the service-tag confinement that
+                // require_scoped_permission's service branch applies — a pre-existing
+                // MCP confinement limitation this does not fully close.
+                [this](const std::string& username, const std::string& agent_id) -> bool {
+                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                        return true;
+                    return rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                agent_id, mgmt_group_store_.get());
+                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_);

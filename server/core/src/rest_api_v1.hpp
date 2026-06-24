@@ -57,6 +57,7 @@ class BaselineStore;
 
 #include <httplib.h>
 
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <string>
@@ -65,6 +66,18 @@ class BaselineStore;
 #include <vector>
 
 namespace yuzu::server {
+
+namespace detail {
+// --- /api/v1/dex/devices/{id}/live tuning (TEST SEAM, not a request knob) ---
+// The synchronous live-read handler bounds its blast radius with an in-flight cap
+// (UP-1/2/3: keeps httplib workers free for the dashboard, SSE and health probes)
+// and a bounded poll. These default to production values; unit tests lower them to
+// exercise the 429 (cap) and 504 (timeout) branches without real concurrency or a
+// ~20s wall. Process-global by design — the cap is a whole-server budget.
+std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
+std::atomic<int>& live_poll_max_polls();   // default 40
+std::atomic<int>& live_poll_interval_ms(); // default 500
+} // namespace detail
 
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.
 class RestApiV1 {
@@ -149,6 +162,13 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
+    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
+    /// the underlying auth.db write succeeded. Empty/missing callback =
+    /// `POST /api/v1/users/<name>/unlock` returns 503.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -187,6 +207,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
@@ -217,6 +238,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
