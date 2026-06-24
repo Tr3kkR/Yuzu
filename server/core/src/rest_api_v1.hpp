@@ -149,6 +149,13 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
+    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
+    /// the underlying auth.db write succeeded. Empty/missing callback =
+    /// `POST /api/v1/users/<name>/unlock` returns 503.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -187,6 +194,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
         // Baseline-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
@@ -217,6 +225,7 @@ public:
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        LockoutClearFn lockout_clear_fn = {},
         // Baseline-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
         BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});

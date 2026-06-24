@@ -512,6 +512,20 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events
     REQUIRE(res->body.find("Execution:Read") != std::string::npos);
 }
 
+TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
+          "[events][discovery][a2][lockout]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2: the new admin operability route POST /api/v1/users/{username}/unlock
+    // must be discoverable from the live spec, not only an out-of-band manual
+    // (adversarial-review C2). The text-shape check matches the sibling tests.
+    REQUIRE(res->body.find(R"("/users/{username}/unlock":)") != std::string::npos);
+    REQUIRE(res->body.find("admin unlock") != std::string::npos);
+    REQUIRE(res->body.find("UserManagement:Write") != std::string::npos);
+}
+
 TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
           "[events][discovery][a2]") {
     RestEventsHarness h;

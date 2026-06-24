@@ -558,6 +558,9 @@ const std::string& openapi_spec() {
     "/bundles/{id}": {
       "get": {"summary": "Collate a dispatched bundle", "tags": ["Bundles"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^bundle-[a-f0-9]+$"}}], "responses": {"200": {"description": "Server-grouped {complete, received, succeeded, expected, steps[]} in request order. complete is terminal, NOT success — check succeeded==expected. Invalid-UTF-8 bytes in step output are replaced with U+FFFD."}, "403": {"description": "Requires Response:Read"}, "404": {"description": "Not found, expired, or not owned (no enumeration oracle)"}, "503": {"description": "Service unavailable"}}}
     },
+    "/users/{username}/unlock": {
+      "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
+    },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
     },)json"
@@ -846,7 +849,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -856,7 +859,8 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn), baseline_store, std::move(scoped_perm_fn));
+                    std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
+                    std::move(scoped_perm_fn));
 }
 
 void RestApiV1::register_routes(
@@ -872,7 +876,7 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1895,6 +1899,100 @@ void RestApiV1::register_routes(
                         .str()),
             "application/json");
     });
+
+    // POST /api/v1/users/<username>/unlock — admin clears an account's
+    // lockout counter (SOC 2 CC6.3). Gated by `UserManagement:Write` (parity
+    // with role change / session force-logout). Self-target is permitted:
+    // clearing your own lockout is recoverable, same reasoning as the
+    // self-revoke at the sessions route above. The lockout already
+    // auto-expires after the window — this is the operability path for an
+    // operator who can't wait it out. `username` is validated with
+    // `is_valid_username` so a NUL byte can't diverge the audit target_id
+    // from the SQL bind (sec-H1 parity with the sessions route).
+    sink.Post(
+        R"(/api/v1/users/([^/]+)/unlock)",
+        [auth_fn, perm_fn, audit_fn, step_up_fn, lockout_clear_fn](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+            // Brand-new route — emit the structured A4 error envelope
+            // (correlation_id / retry_after_ms / remediation) so new code moves
+            // the REST surface toward the agentic-first idiom.
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!perm_fn(req, res, "UserManagement", "Write"))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (session->username.empty()) {
+                // sec-M1: an empty caller username would mis-attribute the
+                // audit row; never proceed past it.
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "session has empty username", cid),
+                                "application/json");
+                return;
+            }
+            // High-risk admin action on another principal's access state —
+            // require fresh MFA proof (parity with session force-logout).
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/users/{name}/unlock"))
+                return;
+            if (!lockout_clear_fn) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "lockout subsystem unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "account lockout requires the persistent auth.db; start "
+                                          "the server with --data-dir"),
+                    "application/json");
+                return;
+            }
+            const auto username = req.matches[1].str();
+            if (username.empty() || !is_valid_username(username)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                      "username must match the allowed format"),
+                                "application/json");
+                return;
+            }
+            // Audit emission wrapper — parity with the sessions-revoke route
+            // (HIGH-2 on PR #883): a lost or throwing audit write on this
+            // CC6.3-evidence action must NOT masquerade as a clean 200. The
+            // `Sec-Audit-Failed` response header + `audit_emitted` body field
+            // give SRE/SIEM and the API client an out-of-band signal.
+            auto try_audit = [&audit_fn, &req, &username](const std::string& result,
+                                                          const std::string& detail) -> bool {
+                try {
+                    return audit_fn(req, "auth.lockout.cleared", result, "User", username, detail);
+                } catch (const std::exception& e) {
+                    spdlog::error("audit_fn threw on auth.lockout.cleared target={}: {}", username,
+                                  e.what());
+                    return false;
+                } catch (...) {
+                    spdlog::error("audit_fn threw unknown on auth.lockout.cleared target={}",
+                                  username);
+                    return false;
+                }
+            };
+            const bool ok = lockout_clear_fn(username);
+            if (!ok) {
+                res.status = 500;
+                // Best-effort failure audit so a lost unlock is still visible
+                // in the CC6.3 evidence chain.
+                if (!try_audit("error", "admin_unlock"))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(detail::error_json_a4(500, "failed to clear lockout", cid),
+                                "application/json");
+                return;
+            }
+            const bool audit_emitted = try_audit("ok", "admin_unlock");
+            if (!audit_emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(ok_json(JObj()
+                                        .add("username", username)
+                                        .add("unlocked", true)
+                                        .add("audit_emitted", audit_emitted)
+                                        .str()),
+                            "application/json");
+        });
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
