@@ -91,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows-only; on other platforms those cards render an honest "not available on this OS"
   note. Requires `Execution:Execute` + `GuaranteedState:Read`, scoped to the device. The
   previous flat "Running processes" panel (`kind=processes`) is **retained** for
-  REST/scripted callers; the dashboard now dispatches `kind=process_tree`. See
-  `docs/user-manual/device-management.md`.
+  REST/scripted callers; the dashboard now dispatches `kind=process_tree`. REST/scripted
+  callers reach `kind=uptime|processes` only — the 9-card grid is dashboard-only pending
+  the A1 JSON backfill (#1649). See `docs/user-manual/device-management.md`.
 - **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
   (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
   via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS

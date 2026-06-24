@@ -165,7 +165,11 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             auto f = pipe_fields(l);
             if (f.size() < 7) continue;
             LiveConn c;
-            try { c.pid = static_cast<std::uint32_t>(std::stoul(f[6])); } catch (...) { continue; }
+            // Guard the uint32 narrowing exactly as the node-pid parse above: a forged
+            // pid > UINT32_MAX must not silently truncate (and on LP64 std::stoul would
+            // not throw). Match the sibling so the join key can't collide via truncation.
+            try { unsigned long v = std::stoul(f[6]); if (v > 0xFFFFFFFFUL) continue; c.pid = static_cast<std::uint32_t>(v); }
+            catch (...) { continue; }
             c.remote_addr = f[4];
             try { c.remote_port = std::stoi(f[5]); } catch (...) {}
             try { c.local_port = std::stoi(f[3]); } catch (...) {}
