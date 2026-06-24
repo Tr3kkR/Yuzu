@@ -84,14 +84,14 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
 | **Inactivity session timeout** — `auth_db.cpp:363` reserves `last_activity_at` column with DEFAULT but **no `UPDATE` writes anywhere** in the codebase; expiry-only today. Treat as from-scratch work, not a tweak. | "inactivity timeout" | CC6.3 | **MISSING (column reserved)** |
-| **Session revocation REST surface** — DB primitive `AuthDB::invalidate_all_sessions()` shipped at `auth_db.cpp:740` / `auth_db.hpp:136`, fires only via `remove_user`/`update_role`. **No `DELETE /api/v1/sessions` route, no admin UI button.** | "expiration, revocation" | CC6.3 | **PARTIAL — DB only** |
+| **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
 | **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
 | **API token inventory + last-used view** — data layer shipped (`api_tokens.last_used_at` written/read at `api_token_store.cpp:291,325-345`); dashboard inventory view missing. | "token inventory" | CC6.6 | **PARTIAL — UI only** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
-| **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **MISSING** |
+| **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **SHIPPED** — `GET /api/v1/audit/auth-sample` (`rest_api_v1.cpp`); `AuditQuery.action_prefixes` + `random_sample` (`audit_store.{hpp,cpp}`); scoped to `auth.`/`mfa.`/`session.`; `AuditLog:Read`; export audited as `audit.auth_sample.exported` |
 | **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. CSR API, lifecycle (issue / renew / revoke), audit chain. Today operators must bring their own PKI for both surfaces. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **MISSING** |
 | **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA (future) or any public CA / operator-internal CA today*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **PARTIAL — verifier shipped, CA upstream pending** |
 
@@ -154,16 +154,19 @@ matches the customer ask.
    with a clear message and logs `auth.local_disabled`. Break-glass account
    policy: a single named principal exempt from the flag, with mandatory
    MFA + 24h auto-disable + every action logged at `critical`.
-4. **Sampled auth-log evidence export.** New REST endpoint
-   `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` admin-only,
-   gated by `require_admin`, returning a pseudo-random sample. SOC 2 CC7.2
-   evidence chain.
-5. **Session revocation REST surface** *(promoted from P1 — DB primitive
-   already shipped)*. `DELETE /api/v1/sessions?user=<name>` admin-only that
-   calls the existing `AuthDB::invalidate_all_sessions()` (`auth_db.cpp:740`)
-   plus an admin-UI "Revoke all sessions" button. Audit: `session.revoke_all`.
-   Self-target guard applies (admin can't lock themselves out). Cheaper than
-   MFA, same SOC 2 control box (CC6.3 / CC6.8).
+4. ~~**Sampled auth-log evidence export.**~~ **DONE** —
+   `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` returns a
+   pseudo-random sample of the auth surface (`auth.`/`mfa.`/`session.` action
+   prefixes) over an optional window. Gated on **`AuditLog:Read`** (NOT
+   `require_admin` — a read-only auditor role can pull evidence without full
+   admin; separation of duties), and the export is itself audited as
+   `audit.auth_sample.exported`. Backed by `AuditQuery.action_prefixes` +
+   `random_sample`. SOC 2 CC7.2. See `docs/security-reviews/auth-sample-export-2026-06-15.md`.
+5. ~~**Session revocation REST surface.**~~ **DONE** —
+   `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me`
+   (self) over `AuthDB::invalidate_all_sessions()`; audit `session.revoke_all`
+   / `session.revoke_all.self`, step-up, self-target guard. (The skill matrix
+   previously listed this as PARTIAL — it has in fact shipped.)
 
 ### Priority 1 — enterprise-friction reducers
 

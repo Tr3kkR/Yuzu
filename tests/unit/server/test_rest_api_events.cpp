@@ -512,6 +512,17 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events
     REQUIRE(res->body.find("Execution:Read") != std::string::npos);
 }
 
+TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
+          "[events][discovery][a2]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2 (discovery): the sampled auth-log evidence export must be enumerable.
+    REQUIRE(res->body.find(R"("/audit/auth-sample":)") != std::string::npos);
+    REQUIRE(res->body.find("Sampled authentication-log evidence export") != std::string::npos);
+}
+
 TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
           "[events][discovery][a2][lockout]") {
     RestEventsHarness h;

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
@@ -35,6 +36,7 @@
 #include <memory>
 #include <random>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -540,6 +542,9 @@ const std::string& openapi_spec() {
     },
     "/audit": {
       "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}}}
+    },
+    "/audit/auth-sample": {
+      "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
     },
     "/inventory/tables": {
       "get": {"summary": "List available inventory data types", "tags": ["Inventory"], "description": "Lists distinct plugins that have reported inventory data, with agent counts and last collection timestamps.", "responses": {"200": {"description": "List of inventory tables", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InventoryTable"}}}}}}
@@ -2745,6 +2750,181 @@ void RestApiV1::register_routes(
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
                                  "application/json");
              });
+
+    // GET /api/v1/audit/auth-sample — pseudo-random sample of authentication-
+    // surface audit events over an optional [from,to] window, for SOC 2 CC7.2
+    // sampled-evidence export. Scoped to the auth./mfa./session. action prefixes.
+    // Gated on AuditLog:Read (consistent with /api/v1/audit, and lets a read-only
+    // auditor role pull evidence without full admin — separation of duties). The
+    // export itself is audited (audit.auth_sample.exported) so evidence access is
+    // on the chain.
+    sink.Get(
+        "/api/v1/audit/auth-sample",
+        [perm_fn, audit_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AuditLog", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            // A broken/closed audit store must FAIL LOUD, not return an empty
+            // 200 — on a CC7.2 evidence endpoint an empty sample reads as "no
+            // authentication activity" when the truth is "the store is down".
+            // !is_open() is the platform-wide store-down guard
+            // (docs/observability-conventions.md), the 15+ peer routes in this
+            // file all carry it, and docs/user-manual/rest-api.md promises 503
+            // when the audit store is unavailable. Checking only the pointer
+            // (store wired but DB never opened) let a null handle return an
+            // empty query result as 200 — misleading evidence, not missing.
+            if (!audit_store || !audit_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit store unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the audit store opens during "
+                                          "startup or after a config reload"),
+                    "application/json");
+                return;
+            }
+
+            AuditQuery q;
+            q.action_prefixes = {"auth.", "mfa.", "session."};
+            q.random_sample = true;
+            // std::stoll throws std::out_of_range on overflow (unlike strtoll) — the
+            // catch turns that into a 400, so no separate errno/ceiling check is
+            // needed. out>=0 rejects negatives.
+            auto parse_epoch = [](const std::string& s, int64_t& out) -> bool {
+                if (s.empty())
+                    return true; // optional — leave default (unbounded that side)
+                // Reject leading whitespace / '+' / '-' that std::stoll would
+                // otherwise silently accept (cpp-expert S-1 / UP-9): a strict
+                // digits-only contract, so "non-numeric → 400" is literally true.
+                if (!std::isdigit(static_cast<unsigned char>(s.front())))
+                    return false;
+                try {
+                    size_t consumed = 0;
+                    out = std::stoll(s, &consumed);
+                    return consumed == s.size() && out >= 0; // reject trailing junk
+                } catch (const std::invalid_argument&) {
+                    return false;
+                } catch (const std::out_of_range&) {
+                    return false; // overflow — std::stoll throws (unlike strtoll)
+                }
+                // Narrow catches only — std::bad_alloc and other fatal exceptions
+                // propagate rather than masquerading as a 400 (Hermes L-2).
+            };
+            if (!parse_epoch(req.get_param_value("from"), q.since) ||
+                !parse_epoch(req.get_param_value("to"), q.until)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "from/to must be non-negative epoch seconds", cid,
+                                          "pass from/to as non-negative integer epoch seconds"),
+                    "application/json");
+                return;
+            }
+            // Inverted window is a client bug, not "no data" (Hermes L-3).
+            if (q.since > 0 && q.until > 0 && q.since > q.until) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "from must be <= to", cid,
+                                                      "ensure from <= to"),
+                                "application/json");
+                return;
+            }
+            // Malformed limit is a 400, not a silent fallback to the default
+            // (Hermes L-2 — stricter than the legacy /api/v1/audit).
+            auto limit_str = req.get_param_value("limit");
+            if (!limit_str.empty()) {
+                bool limit_bad = !std::isdigit(static_cast<unsigned char>(limit_str.front()));
+                try {
+                    size_t consumed = 0;
+                    q.limit = std::stoi(limit_str, &consumed);
+                    limit_bad = limit_bad || (consumed != limit_str.size()); // trailing junk
+                } catch (const std::invalid_argument&) {
+                    limit_bad = true;
+                } catch (const std::out_of_range&) {
+                    limit_bad = true;
+                }
+                // Narrow catches only (Hermes L-2) — std::bad_alloc propagates.
+                if (limit_bad) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(400, "limit must be an integer", cid,
+                                                          "pass limit as a positive integer"),
+                                    "application/json");
+                    return;
+                }
+            }
+            if (q.limit > 1000)
+                q.limit = 1000;
+            if (q.limit < 1)
+                q.limit = 1;
+
+            std::size_t pool_size = 0;
+            auto events = audit_store->query(q, &pool_size);
+            // recency_capped: the window held at least the scan cap, so the sample
+            // was drawn only from the most-recent kAuditSampleScanCap events and is
+            // NOT a uniform sample of the full window. Surfaced in the response so an
+            // auditor never presents a biased sample as representative (CC7.2 evidence
+            // honesty — compliance/architect SHOULD).
+            const bool recency_capped = (pool_size >= kAuditSampleScanCap);
+            // Field set matches the sibling GET /api/v1/audit exactly (Hermes M-2):
+            // auth-sample does NOT widen what an AuditLog:Read principal can see —
+            // session_id (session bearer correlation) and source_ip are deliberately
+            // NOT exposed here. A richer evidence view, if needed, is a follow-up
+            // under a narrower permission.
+            JArr arr;
+            for (const auto& e : events) {
+                arr.add(JObj()
+                            .add("timestamp", e.timestamp)
+                            .add("principal", e.principal)
+                            .add("action", e.action)
+                            .add("result", e.result)
+                            .add("target_type", e.target_type)
+                            .add("target_id", e.target_id)
+                            .add("detail", e.detail));
+            }
+            // Evidence access is itself auditable (CC7.2): record who exported which
+            // window and how many rows. The read still proceeds if audit persistence
+            // fails, but the failure is made VISIBLE (Hermes M-1, repudiation gap) via
+            // a warn log + a `Sec-Audit-Failed: true` response header — never silently
+            // swallowed. result="success" matches the dominant audit vocabulary and
+            // the analogous self-auditing export `ca.root_csr.exported` (consistency S1).
+            bool audit_emitted = false;
+            try {
+                std::string detail = "from=" + std::to_string(q.since) +
+                                     " to=" + std::to_string(q.until) +
+                                     " limit=" + std::to_string(q.limit) +
+                                     " returned=" + std::to_string(events.size());
+                audit_emitted = audit_fn(req, "audit.auth_sample.exported", "success", "AuditLog",
+                                         "auth-sample", detail);
+            } catch (const std::exception& ex) {
+                spdlog::warn("audit.auth_sample.exported emission threw: {}", ex.what());
+            }
+            if (!audit_emitted) {
+                spdlog::warn("audit.auth_sample.exported did not persist — evidence-chain gap "
+                             "for an auth-sample export");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            // Envelope mirrors list_json (data + pagination + meta) and adds a
+            // `sampling` block so the evidence semantics are honest in the response
+            // itself: candidates_considered = pool the sample was drawn from,
+            // recency_capped = that pool hit the scan cap (sample is recency-biased,
+            // not uniform over the window). page_size = the actual limit (Hermes L-1).
+            std::string pagination = JObj()
+                                         .add("total", static_cast<int64_t>(events.size()))
+                                         .add("start", static_cast<int64_t>(0))
+                                         .add("page_size", static_cast<int64_t>(q.limit))
+                                         .str();
+            std::string sampling = JObj()
+                                       .add("candidates_considered", static_cast<int64_t>(pool_size))
+                                       .add("scan_cap", static_cast<int64_t>(kAuditSampleScanCap))
+                                       .add("recency_capped", recency_capped)
+                                       .str();
+            std::string body = JObj()
+                                   .raw("data", arr.str())
+                                   .raw("pagination", pagination)
+                                   .raw("sampling", sampling)
+                                   .raw("meta", R"({"api_version":"v1"})")
+                                   .str();
+            res.set_content(body, "application/json");
+        });
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
 
