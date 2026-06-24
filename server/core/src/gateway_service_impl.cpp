@@ -541,7 +541,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
         // Isolate ingest failures, identical to the direct ReportInventory path
         // — otherwise an exception escapes as gRPC UNKNOWN (UP-9 / parity).
         try {
-            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response);
+            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response,
+                                    metrics_);
         } catch (const std::exception& ex) {
             spdlog::warn("[gateway] ProxyInventory: inventory ingest threw for agent={} — acked: {}",
                          agent_id, ex.what());

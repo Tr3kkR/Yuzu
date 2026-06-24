@@ -191,7 +191,7 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     const std::string server_hash = SoftwareInventoryStore::canonical_hash(entries);
     const std::string agent_id_s{agent_id};
 
-    const bool ok = pool_.with_txn([&](PGconn* c) -> bool {
+    const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult del = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{agent_id_s});
@@ -322,7 +322,7 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     const std::string id{agent_id};
     // Both deletes in one transaction so an agent removal can't leave a parent
     // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
-    pool_.with_txn([&](PGconn* c) -> bool {
+    pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{id});

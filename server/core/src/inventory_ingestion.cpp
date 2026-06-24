@@ -3,6 +3,8 @@
 #include "agent.pb.h"
 #include "software_inventory_store.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
@@ -71,7 +73,14 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 } // namespace
 
 void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& agent_id,
-                             const pb::InventoryReport& report, pb::InventoryAck& ack) {
+                             const pb::InventoryReport& report, pb::InventoryAck& ack,
+                             ::yuzu::MetricsRegistry* metrics) {
+    const auto emit = [&](const std::string& source, const char* outcome) {
+        if (metrics)
+            metrics->counter("yuzu_inventory_ingest_total",
+                             {{"source", source}, {"outcome", outcome}})
+                .increment();
+    };
     if (agent_id.empty())
         return;
 
@@ -96,12 +105,17 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
                 spdlog::warn("inventory: oversized '{}' blob from agent={}, dropping + nacking",
                              source, agent_id);
                 ack.add_need_full(source);
+                emit(source, "dropped");
                 continue;
             }
         }
 
         InventoryIngestOutcome outcome =
             store.apply_installed_software(agent_id, claimed_hash, rows, collected_at);
+        emit(source, outcome == InventoryIngestOutcome::kStored    ? "stored"
+                     : outcome == InventoryIngestOutcome::kTouched  ? "touched"
+                     : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"
+                                                                    : "error");
         // need_full on cold-cache/drift (kNeedFull) AND on a transient store
         // failure (kError) — otherwise the agent sees an empty need_full, treats
         // the cycle as stored, and silently advances past un-stored data for up

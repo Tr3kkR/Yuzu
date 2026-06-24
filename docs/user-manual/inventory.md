@@ -73,6 +73,21 @@ PlatformEngineer, Viewer, and Operator roles. (The gate applies to the
 inventory REST/MCP surfaces; direct database access is governed by your Postgres
 credentials.)
 
+## Troubleshooting
+
+**The `installed_software` table is empty after upgrading agents.** Most likely
+the `installed_apps` plugin isn't loaded — the sync source then idles silently
+(it logs `sync: installed_apps plugin not loaded` only at **debug**). Verify the
+agent was built with `-Dbuild_examples=true` (the default for released binaries)
+and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
+only runs once per ~24 h per agent (spread across the fleet), so a freshly
+enrolled agent populates within minutes (jittered first sync), not instantly.
+
+**Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
+(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped`) — watch the
+`need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
+whose ingest is failing.
+
 ## See also
 
 - `docs/adr/0016-agent-daily-sync-framework.md` — the design and rationale.

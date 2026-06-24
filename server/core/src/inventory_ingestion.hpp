@@ -20,6 +20,10 @@ class InventoryReport;
 class InventoryAck;
 } // namespace yuzu::agent::v1
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 
 class SoftwareInventoryStore;
@@ -30,8 +34,11 @@ class SoftwareInventoryStore;
 /// (blob) sources — the caller owns `received` and the generic-`InventoryStore`
 /// upsert for non-normalized keys (coexistence, ADR-0016). No-op when `agent_id`
 /// is empty or no normalized source is present.
+/// `metrics` (nullable) receives a `yuzu_inventory_ingest_total{source,outcome}`
+/// counter per source — the observability the silent-degradation findings need.
 void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& agent_id,
                              const ::yuzu::agent::v1::InventoryReport& report,
-                             ::yuzu::agent::v1::InventoryAck& ack);
+                             ::yuzu::agent::v1::InventoryAck& ack,
+                             ::yuzu::MetricsRegistry* metrics = nullptr);
 
 } // namespace yuzu::server

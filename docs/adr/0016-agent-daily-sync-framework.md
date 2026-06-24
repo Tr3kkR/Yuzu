@@ -154,13 +154,18 @@ Therefore we **coexist, not replace**:
   source can join (`installed ⨝ last_used → unused ≥ X days`).
 
 ### 8. Scope, identity, and access
-- **No end-user profiles** for v1. We invoke `installed_apps` `list` (which reads
-  `HKLM` + the *agent service account's* `HKCU` on Windows; system package DBs on
-  Linux/macOS) — **not** `list_per_user`, which enumerates every user profile +
-  carries usernames. So no end-user PII and no works-council co-determination
-  trigger. (Precisely: the only `HKCU` read is the agent's own service-account
-  hive, which is benign — not the logged-in user's.) Per-user enumeration is a
-  later, gated, pseudonymized addition if needed.
+- **No end-user profiles** for v1. We invoke `installed_apps` `list` (Windows:
+  `HKLM` + the *agent service account's own* `HKCU`; Linux: the system package
+  DBs dpkg/rpm/pacman; macOS: a `system_profiler SPApplicationsDataType`
+  application-**bundle scan** of machine-wide locations + the calling account's
+  user-domain context — NOT a package DB) — **not** `list_per_user`, which
+  enumerates every user profile + carries usernames. So no end-user PII and no
+  works-council co-determination trigger. The Windows `HKCU` and the macOS
+  user-domain context are benign **by run identity**: the agent runs as a service
+  account (`NT SERVICE\YuzuAgent` / `_yuzu`) or root, never the console user, so
+  neither crawls a logged-in user's hive / `~/Applications`. (If macOS ever moves
+  to a console-scoped account, re-evaluate.) Per-user enumeration is a later,
+  gated, pseudonymized addition if needed.
 - Reuse the existing `installed_apps` plugin (already 3-OS) **in-process via
   `LocalDispatcher`** — no new collector.
 - New **`Inventory` securable type**; reads gated on `Inventory:Read` (no

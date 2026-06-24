@@ -690,7 +690,7 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     // seam the gateway ProxyInventory path uses. Isolate ingest failures so a
     // bad payload can't fail the RPC into a retry loop.
     try {
-        ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response);
+        ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response, &metrics_);
     } catch (const std::exception& ex) {
         spdlog::warn("ReportInventory: ingest threw for agent {} — acked: {}", agent_id, ex.what());
     } catch (...) {
