@@ -359,6 +359,79 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       text-align: left; padding: 0.2rem 0.4rem; border-bottom: 1px solid var(--border);
     }
     .tar-detail-conns th { color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
+)HTM"
+// Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate
+// (still one continuous <style> block in the rendered HTML).
+R"HTM(
+    /* Device DNS/ARP panels (ADR-0015) — embedded below the process tree */
+    .devnet-row { display: flex; gap: 1rem; margin-top: 1rem; padding-top: 0.85rem;
+      border-top: 1px solid var(--border); flex-wrap: wrap; }
+    .devnet-panel { flex: 1 1 22rem; min-width: 18rem; border: 1px solid var(--border);
+      border-radius: 0.4rem; overflow: hidden; background: var(--mds-color-theme-background-canvas); }
+    .devnet-panel > summary { list-style: none; cursor: pointer; display: flex; align-items: center;
+      justify-content: space-between; gap: 0.5rem; padding: 0.55rem 0.8rem;
+      background: var(--mds-color-state-hover); font-size: 0.82rem; font-weight: 600; }
+    .devnet-panel > summary::-webkit-details-marker { display: none; }
+    .devnet-panel > summary::before { content: "\25B8"; color: var(--mds-color-theme-text-tertiary);
+      font-size: 0.7rem; margin-right: 0.1rem; }
+    .devnet-panel[open] > summary::before { content: "\25BE"; }
+    .devnet-title-ico { color: var(--accent); margin-right: 0.35rem; }
+    .devnet-count { font-weight: 600; color: var(--fg); background: var(--mds-color-state-hover);
+      border-radius: 0.6rem; padding: 0 0.45rem; font-size: 0.7rem; }
+    .devnet-body { max-height: 18rem; overflow: auto; }
+    .devnet-table { width: 100%; border-collapse: collapse; font-family: var(--mono, monospace); font-size: 0.72rem; }
+    .devnet-table th { position: sticky; top: 0; background: var(--mds-color-theme-background-solid-secondary);
+      text-align: left; padding: 0.35rem 0.6rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;
+      font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--border); }
+    .devnet-table td { padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    .devnet-table tr:last-child td { border-bottom: none; }
+    .devnet-table tr:hover { background: var(--mds-color-state-hover); }
+    .dn-type { color: var(--accent); }
+    .dn-data { color: var(--fg); }
+    .dn-ttl { color: var(--mds-color-theme-text-tertiary); text-align: right; font-variant-numeric: tabular-nums; }
+    .dn-src { color: var(--mds-color-theme-text-tertiary); }
+    .arp-mac { color: var(--fg); }
+    .arp-type-static { color: var(--mds-color-theme-text-tertiary); }
+    .arp-type-dynamic { color: var(--accent); }
+    .arp-type-other { color: var(--mds-color-theme-indicator-warning, #d6a500); } /* incomplete / unresolved */
+    .devnet-caveat { padding: 0.4rem 0.8rem; font-size: 0.68rem; color: var(--mds-color-theme-text-tertiary);
+      background: var(--surface); border-top: 1px solid var(--border); }
+    .devnet-empty { padding: 1.5rem; text-align: center; color: var(--mds-color-theme-text-tertiary); font-size: 0.78rem; }
+
+    /* Capture-sources frame (ADR-0015) — toggles, category filter, push guardrail */
+    .picker-row { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.9rem; flex-wrap: wrap; }
+    .picker-row label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mds-color-theme-text-tertiary); font-weight: 600; }
+    .cat-filter { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+    .filter-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mds-color-theme-text-tertiary); font-weight: 600; margin-right: 0.2rem; }
+    #capTable .src-name { font-weight: 600; color: var(--fg); font-family: var(--mono, monospace); font-size: 0.82rem; }
+    #capTable .src-dollar { color: var(--mds-color-theme-text-tertiary); font-size: 0.72rem; font-family: var(--mono, monospace); }
+    #capTable .cat { font-size: 0.74rem; color: var(--fg); white-space: nowrap; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; font-size: 0.68rem; font-weight: 600; border-radius: 0.75rem; }
+    .badge-new { background: var(--mds-color-bg-info-tinted); color: var(--accent); }
+    .badge-pii { background: var(--mds-color-bg-warning-tinted); color: var(--mds-color-indicator-warning-bright); }
+    .badge-rows { background: var(--mds-color-bg-neutral-tinted); color: var(--mds-color-theme-text-tertiary); font-family: var(--mono, monospace); }
+    .os-cell { font-size: 0.7rem; white-space: nowrap; }
+    .os-ok { color: var(--green); }
+    .os-con { color: var(--yellow); }
+    .os-planned { color: var(--mds-color-theme-text-tertiary); opacity: 0.7; }
+    .tgl { position: relative; display: inline-block; width: 38px; height: 20px; }
+    .tgl input { opacity: 0; width: 0; height: 0; }
+    .tgl .sl { position: absolute; cursor: pointer; inset: 0; background: var(--mds-color-theme-outline-secondary); border-radius: 20px; transition: .15s; }
+    .tgl .sl:before { content: ""; position: absolute; height: 14px; width: 14px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: .15s; }
+    .tgl input:checked + .sl { background: var(--accent); }
+    .tgl input:checked + .sl:before { transform: translateX(18px); }
+    .tgl.locked .sl { background: var(--green); cursor: not-allowed; opacity: 0.55; }
+    .state-cell { display: flex; align-items: center; gap: 0.5rem; }
+    .state-txt { font-size: 0.72rem; color: var(--mds-color-theme-text-tertiary); }
+    .state-on { color: var(--green); font-weight: 600; }
+    .pending-txt { color: var(--mds-color-indicator-warning-bright) !important; font-weight: 600; }
+    #capTable tr.pending { box-shadow: inset 3px 0 0 var(--yellow); }
+    #capTable tr.pending td { background: var(--mds-color-bg-warning-tinted); }
+    .apply-bar { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; padding: 0.6rem 0.85rem; background: var(--mds-color-bg-warning-tinted); border: 1px solid var(--yellow); border-radius: 0.4rem; font-size: 0.82rem; }
+    .apply-icon { color: var(--mds-color-indicator-warning-bright); font-size: 1rem; }
+    .apply-spacer { flex: 1; }
+    .apply-push { background: var(--accent); color: #fff; border: none; border-radius: 0.25rem; padding: 0.4rem 0.95rem; font-size: 0.8rem; cursor: pointer; font-weight: 600; }
+    .apply-push:hover { opacity: 0.9; }
   </style>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals are
@@ -425,6 +498,33 @@ R"HTM(</head>
       </div>
     </div>
 
+)HTM"
+// Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
+R"HTM(    <!-- ── Capture sources (ADR-0015) ───────────────────────────────── -->
+    <div class="tar-frame" id="frame-capture-sources">
+      <div class="tar-frame-header">
+        <h2 class="tar-frame-title">Capture sources</h2>
+      </div>
+      <div class="tar-frame-body" id="capture-sources"
+           hx-get="/fragments/tar/capture-sources" hx-trigger="load" hx-swap="innerHTML">
+        <div class="placeholder">Loading capture sources&hellip;</div>
+      </div>
+    </div>
+    <script>
+    // Capture-sources staged-then-push guardrail + category filter (ADR-0015). Plain
+    // onclick/onchange handlers (CSP-safe — no hx-on/eval). A toggle only STAGES a
+    // change; nothing is dispatched until Push.
+    function capDirtyRows(){return Array.prototype.slice.call(document.querySelectorAll('#capTable tbody tr.pending'));}
+    function refreshCapBar(){var n=capDirtyRows().length,bar=document.getElementById('capApplyBar');if(!bar)return;bar.hidden=(n===0);var m=document.getElementById('capApplyMsg');if(m)m.textContent=n+' pending change'+(n===1?'':'s')+' — not yet sent';}
+    function setCapState(tr,on){var st=tr.querySelector('.state-txt');if(!st)return;st.textContent=on?'enabled':'disabled';st.classList.remove('pending-txt');st.classList.toggle('state-on',on);}
+    function stageCapToggle(cb){var tr=cb.closest('tr');var committed=cb.dataset.committed==='true';var dirty=cb.checked!==committed;tr.classList.toggle('pending',dirty);if(dirty){var st=tr.querySelector('.state-txt');st.textContent=(cb.checked?'→ enable':'→ disable')+' (pending)';st.classList.add('pending-txt');st.classList.remove('state-on');}else{setCapState(tr,committed);}refreshCapBar();}
+    function discardCapChanges(){capDirtyRows().forEach(function(tr){var cb=tr.querySelector('input[type=checkbox]');cb.checked=(cb.dataset.committed==='true');setCapState(tr,cb.checked);tr.classList.remove('pending');});refreshCapBar();}
+    function pushCapChanges(){var rows=capDirtyRows();if(!rows.length)return;var t=document.getElementById('capTable');var device=t?t.getAttribute('data-device'):'';var parts=rows.map(function(tr){var cb=tr.querySelector('input[type=checkbox]');return cb.dataset.source+'='+(cb.checked?'on':'off');});htmx.ajax('POST','/fragments/tar/capture-sources/push',{values:{device:device,changes:parts.join(',')},swap:'none'}).then(function(){if(typeof showToast==='function')showToast('Pushed '+parts.length+' change(s) to '+device,'success');htmx.ajax('GET','/fragments/tar/capture-sources/load',{values:{device:device},target:'#cap-sources-body',swap:'innerHTML'});});}
+    function filterCap(chip,cat){document.querySelectorAll('#capFilter .tar-chip').forEach(function(c){c.classList.toggle('on',c===chip);});document.querySelectorAll('#capTable tbody tr').forEach(function(tr){tr.style.display=(cat==='all'||tr.getAttribute('data-cat')===cat)?'':'none';});}
+    </script>
+)HTM"
+// Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
+R"HTM(
     <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — scope walking) ────────── -->
     <div class="tar-frame" id="frame-tar-sql">
       <div class="tar-frame-header">

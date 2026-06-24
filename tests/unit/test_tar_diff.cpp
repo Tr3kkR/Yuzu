@@ -446,3 +446,54 @@ TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhe
     CHECK(events[0].cmdline == "/usr/bin/python3 --token=secret"); // populated on Linux/Windows
 #endif
 }
+
+// =============================================================================
+// ARP diff tests (ADR-0015) — keyed on (iface, ip, mac); entry_type not keyed
+// =============================================================================
+
+TEST_CASE("ARP diff: appeared and removed bindings", "[tar][diff][arp]") {
+    std::vector<ArpEntry> prev = {{"Ethernet", "192.168.1.1", "aa:bb:cc:dd:ee:ff", "dynamic"}};
+    std::vector<ArpEntry> cur = {{"Ethernet", "192.168.1.1", "aa:bb:cc:dd:ee:ff", "dynamic"},
+                                 {"Ethernet", "192.168.1.2", "11:22:33:44:55:66", "static"}};
+    auto ev = compute_arp_events(prev, cur, 100, 7);
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0].action == "appeared");
+    CHECK(ev[0].ip_address == "192.168.1.2");
+    CHECK(ev[0].snapshot_id == 7);
+
+    auto removed = compute_arp_events(cur, prev, 101, 8);
+    REQUIRE(removed.size() == 1);
+    CHECK(removed[0].action == "removed");
+    CHECK(removed[0].ip_address == "192.168.1.2");
+}
+
+TEST_CASE("ARP diff: entry_type change on same binding is not churn", "[tar][diff][arp]") {
+    std::vector<ArpEntry> prev = {{"Ethernet", "10.0.0.1", "aa:bb:cc:dd:ee:ff", "dynamic"}};
+    std::vector<ArpEntry> cur = {{"Ethernet", "10.0.0.1", "aa:bb:cc:dd:ee:ff", "static"}};
+    CHECK(compute_arp_events(prev, cur, 100, 1).empty());
+}
+
+// =============================================================================
+// DNS diff tests (ADR-0015) — keyed on (name, type, data); TTL not keyed
+// =============================================================================
+
+TEST_CASE("DNS diff: appeared and removed resolutions", "[tar][diff][dns]") {
+    std::vector<DnsEntry> prev = {{"example.com", "A", "93.184.216.34", 60, "cache"}};
+    std::vector<DnsEntry> cur = {{"example.com", "A", "93.184.216.34", 60, "cache"},
+                                 {"evil.test", "A", "10.0.0.9", 10, "cache"}};
+    auto ev = compute_dns_events(prev, cur, 100, 5);
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0].action == "appeared");
+    CHECK(ev[0].name == "evil.test");
+
+    auto removed = compute_dns_events(cur, prev, 101, 6);
+    REQUIRE(removed.size() == 1);
+    CHECK(removed[0].action == "removed");
+    CHECK(removed[0].name == "evil.test");
+}
+
+TEST_CASE("DNS diff: TTL decrement on same resolution is not churn", "[tar][diff][dns]") {
+    std::vector<DnsEntry> prev = {{"example.com", "A", "93.184.216.34", 60, "cache"}};
+    std::vector<DnsEntry> cur = {{"example.com", "A", "93.184.216.34", 30, "cache"}};
+    CHECK(compute_dns_events(prev, cur, 100, 1).empty());
+}

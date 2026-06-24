@@ -557,6 +557,121 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── ARP / address-resolution table (ADR-0015) ─────────────────────
+        // Host L2 adjacency: IP<->MAC bindings per interface. Snapshot-diff
+        // appeared/removed keyed on the (interface, ip_address, mac_address)
+        // binding — a changing entry_type on the same binding is a value update,
+        // not churn. Opt-in (default_enabled=false): low-PII infrastructure data
+        // but shipped disabled per the standing capture-source posture. Windows
+        // only in this slice; Linux/macOS are kPlanned (see docs/tar-implementer.md
+        // "Adding a capture source").
+        {
+            .name = "arp",
+            .dollar_name = "ARP",
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "iphlpapi",
+                 "GetIpNetTable2(AF_UNSPEC) — the kernel ARP / IPv6 neighbour "
+                 "cache. Full interface/ip/mac/entry_type. Polled at the fast "
+                 "collector interval."},
+                {"linux",   OsSupportStatus::kPlanned,             "procfs",
+                 "/proc/net/arp — kernel ARP table (IPv4). Wired in the Linux "
+                 "follow-up."},
+                {"macos",   OsSupportStatus::kPlanned,             "route_sysctl",
+                 "sysctl NET_RT_FLAGS / RTF_LLINFO routing-socket dump. MAC is "
+                 "available; entry_type reported 'unknown' (constrained). Wired "
+                 "in the macOS follow-up."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 5000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"},
+                        {"interface",   "TEXT"},
+                        {"ip_address",  "TEXT"},
+                        {"mac_address", "TEXT"},
+                        {"entry_type",  "TEXT"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"interface",    "TEXT"},
+                        {"ip_address",   "TEXT"},
+                        {"mac_address",  "TEXT"},
+                        {"appear_count", "INTEGER"},
+                        {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── DNS resolution cache (ADR-0015) ───────────────────────────────
+        // Host DNS resolver-cache STATE (not per-process queries — the cache is
+        // system-wide and carries no pid; per-process attribution via the
+        // Microsoft-Windows-DNS-Client ETW provider is a deferred follow-up, so
+        // never join dns_live to a process by pid). Snapshot-diff appeared/removed
+        // keyed on the (name, record_type, data) resolution; ttl_remaining_s is a
+        // value field and is NOT part of the diff key (it decrements every tick
+        // and must not churn). Opt-in (usage-class PII — reveals visited domains).
+        // Windows only here; Linux/macOS kPlanned.
+        {
+            .name = "dns",
+            .dollar_name = "DNS",
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "dnsapi",
+                 "DnsGetCacheDataTable — the DNS client resolver cache. Full "
+                 "name/record_type/data/TTL. Polled at the fast collector "
+                 "interval."},
+                {"linux",   OsSupportStatus::kPlanned,             "systemd-resolved",
+                 "systemd-resolved cache via the resolve1 D-Bus interface where "
+                 "present; falls back to /etc/hosts (source='hosts_file'). Hosts "
+                 "without systemd-resolved yield hosts-file entries only "
+                 "(constrained). Wired in the Linux follow-up."},
+                {"macos",   OsSupportStatus::kPlanned,             "dscacheutil",
+                 "dscacheutil -cachedump subprocess. TTL is unavailable "
+                 "(ttl_remaining_s reported -1, constrained). Wired in the macOS "
+                 "follow-up."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 5000,
+                    .columns = {
+                        {"ts",              "INTEGER"},
+                        {"snapshot_id",     "INTEGER"},
+                        {"action",          "TEXT"},
+                        {"name",            "TEXT"},
+                        {"record_type",     "TEXT"},
+                        {"data",            "TEXT"},
+                        {"ttl_remaining_s", "INTEGER"},
+                        {"source",          "TEXT"},
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"name",         "TEXT"},
+                        {"record_type",  "TEXT"},
+                        {"appear_count", "INTEGER"},
+                        {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -941,6 +1056,32 @@ SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEG
 FROM module_daily
 WHERE day_ts >= ? AND day_ts < ?
 GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_state, is_kernel)";
+        }
+    }
+
+    // ── ARP rollups (ADR-0015) — per (interface, ip, mac) binding ────────
+    if (source_name == "arp") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO arp_hourly (hour_ts, interface, ip_address, mac_address, appear_count, remove_count)
+SELECT (ts / 3600) * 3600, interface, ip_address, mac_address,
+       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
+FROM arp_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, interface, ip_address, mac_address)";
+        }
+    }
+
+    // ── DNS rollups (ADR-0015) — per (name, record_type) ─────────────────
+    if (source_name == "dns") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO dns_hourly (hour_ts, name, record_type, appear_count, remove_count)
+SELECT (ts / 3600) * 3600, name, record_type,
+       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
+FROM dns_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, name, record_type)";
         }
     }
 

@@ -4797,7 +4797,7 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
-| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. The retention-paused list covers the always-on four; opt-in sources (`arp`, `dns`, `procperf`, `netqual`, `module`) are enabled/disabled via the **Capture sources** frame (below), not this route. |
 
 **Response:**
 - 200 OK with empty body and an `HX-Trigger` toast on success.
@@ -4805,6 +4805,38 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 
 **Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+
+#### `GET /fragments/tar/capture-sources`
+
+Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
+
+**Permission:** `Infrastructure:Read`.
+
+#### `GET /fragments/tar/capture-sources/load`
+
+Self-re-issuing poll that dispatches `tar.status` + `tar.compatibility` to one selected device and renders the per-source toggle table (enable state, live-row count, per-OS support, category). First call dispatches and returns a polling fragment carrying the two command IDs; subsequent calls (`scmd`/`ccmd`/`n` params) poll until both complete.
+
+**Permission:** `Infrastructure:Read` (scoped to the device) + `Execution:Execute` (the read dispatches a live query). **Audit:** `tar.sources.read` at dispatch.
+
+**Query params:** `device` (agent ID); `scmd`/`ccmd`/`n` (poll continuation, server-supplied).
+
+#### `POST /fragments/tar/capture-sources/push`
+
+Apply staged capture-source enable/disable changes. The dashboard stages toggles client-side; Push dispatches one `tar.configure <source>_enabled=<bool>` per changed source (the accidental-enable guardrail — nothing dispatches until Push).
+
+**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. Source names are validated against a fixed allowlist; values constrained to `on`/`off`.
+
+**Request body (form-encoded):** `device` (agent ID); `changes` (comma-separated `source=on|off`, e.g. `arp=on,dns=on`).
+
+**Audit:** `tar.sources.configure` — **one row per changed source**, `detail` = `<source>_enabled=<bool> command_id=<id>`.
+
+#### `GET /fragments/tar/process-tree/device-net`
+
+Self-re-issuing poll that dispatches read-only `tar.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
+
+**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `tar.dns.read` **and** `tar.arp.read` (distinct verbs — DNS is usage-class PII, separately countable) at dispatch.
+
+**Query params:** `device`; `dcmd`/`acmd`/`n` (poll continuation, server-supplied).
 
 ---
 

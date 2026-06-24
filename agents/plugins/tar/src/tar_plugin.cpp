@@ -138,6 +138,66 @@ std::vector<yuzu::tar::NetConnection> json_to_connections(const std::string& s) 
     return result;
 }
 
+json arp_to_json(const std::vector<yuzu::tar::ArpEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"interface", e.iface},
+                       {"ip_address", e.ip_address},
+                       {"mac_address", e.mac_address},
+                       {"entry_type", e.entry_type}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::ArpEntry> json_to_arp(const std::string& s) {
+    std::vector<yuzu::tar::ArpEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::ArpEntry e;
+            e.iface = j.value("interface", "");
+            e.ip_address = j.value("ip_address", "");
+            e.mac_address = j.value("mac_address", "");
+            e.entry_type = j.value("entry_type", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
+json dns_to_json(const std::vector<yuzu::tar::DnsEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"name", e.name},
+                       {"record_type", e.record_type},
+                       {"data", e.data},
+                       {"ttl_remaining_s", e.ttl_remaining_s},
+                       {"source", e.source}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::DnsEntry> json_to_dns(const std::string& s) {
+    std::vector<yuzu::tar::DnsEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::DnsEntry e;
+            e.name = j.value("name", "");
+            e.record_type = j.value("record_type", "");
+            e.data = j.value("data", "");
+            e.ttl_remaining_s = j.value("ttl_remaining_s", int64_t{0});
+            e.source = j.value("source", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
 json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
     json arr = json::array();
     for (const auto& s : svcs) {
@@ -570,7 +630,12 @@ private:
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_fast_impl(yuzu::CommandContext& ctx) {
+    // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
+    // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
+    // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    int collect_fast_impl(yuzu::CommandContext& ctx,
+                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -779,6 +844,47 @@ private:
             }
         }
 
+        // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
+        // source_enabled returns false until an operator turns it on. Windows-only
+        // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
+        // failure — the always-on legs above already committed, so a failure here
+        // must not misreport a healthy tick; the diff baseline is advanced ONLY on
+        // success so a failed insert retries the same deltas next tick.
+        if (source_enabled(*db_, "arp")) {
+            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
+            auto previous = json_to_arp(db_->get_state("arp"));
+            auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_arp_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state("arp", arp_to_json(current).dump());
+        }
+
+        // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
+        // Device-level resolver-cache state; NOT per-process (no pid). Same
+        // non-fatal / advance-on-success discipline as the arp leg.
+        if (source_enabled(*db_, "dns")) {
+            auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
+            auto previous = json_to_dns(db_->get_state("dns"));
+            auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_dns_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: dns insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state("dns", dns_to_json(current).dump());
+        }
+
         // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
         // off) — like procperf/netqual this reads the explicit "true" rather than
         // source_enabled. The session is only running if it was enabled at init.
@@ -872,8 +978,31 @@ private:
     }
 
     int do_collect_fast(yuzu::CommandContext& ctx) {
+        // SRE/UP-1: enumerate the syscall-heavy opt-in network sources (arp via
+        // GetIpNetTable2; dns via DnsGetCacheDataTable + up to kDnsEntryCap cache-only
+        // DnsQuery_W calls) BEFORE taking collect_mu_, so a large host cache cannot
+        // stall the always-on process/tcp legs or the fleet-snapshot pump (mirrors
+        // do_collect_perf's lock-free counter read). The diff/insert/state-save still
+        // run under collect_mu_ inside collect_fast_impl.
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        return collect_fast_impl(ctx);
+        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
     }
 
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
@@ -1264,7 +1393,22 @@ private:
             sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
                   "'' AS detail_json FROM user_live" +
                   where + tail;
+        } else if (type_filter == "arp") {
+            // ADR-0015. detail_json carries a human summary (ip @ mac [iface]); the
+            // full row is available via tar.sql over $ARP_Live.
+            sql = "SELECT ts, 'arp' AS event_type, action, snapshot_id, "
+                  "(ip_address || ' @ ' || mac_address || ' [' || interface || ']') AS detail_json "
+                  "FROM arp_live" +
+                  where + tail;
+        } else if (type_filter == "dns") {
+            sql = "SELECT ts, 'dns' AS event_type, action, snapshot_id, "
+                  "(name || ' ' || record_type || ' ' || data) AS detail_json "
+                  "FROM dns_live" +
+                  where + tail;
         } else {
+            // No-filter union stays the core four-source event timeline. arp/dns
+            // are device-state caches (opt-in, dns is PII) — reachable only via an
+            // explicit type filter above or tar.sql, never the default feed.
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
                   "process_live" +
@@ -1360,6 +1504,10 @@ private:
                 table = "service_live";
             else if (type_filter == "user")
                 table = "user_live";
+            else if (type_filter == "arp") // ADR-0015
+                table = "arp_live";
+            else if (type_filter == "dns") // ADR-0015
+                table = "dns_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
@@ -1391,8 +1539,26 @@ private:
     // ── snapshot action (force immediate full collection) ─────────────────────
 
     int do_snapshot(yuzu::CommandContext& ctx) {
+        // Pre-enumerate arp/dns lock-free (same rationale as do_collect_fast).
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        collect_fast_impl(ctx);
+        collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
         collect_slow_impl(ctx);
         ctx.write_output("tar|snapshot|complete");
         return 0;

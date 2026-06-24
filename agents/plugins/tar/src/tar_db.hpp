@@ -86,6 +86,34 @@ struct UserEvent {
     std::string session_id;
 };
 
+/// One arp_live row (ADR-0015 — host ARP / neighbour table). One row per
+/// appeared/removed transition of an (interface, ip_address, mac_address)
+/// binding; `entry_type` is a value field, not part of the diff key.
+struct ArpEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // appeared, removed
+    std::string iface;  // NB: 'interface' is a Win32 COM macro under full <windows.h>
+    std::string ip_address;
+    std::string mac_address;
+    std::string entry_type; // dynamic, static, incomplete, other, unknown
+};
+
+/// One dns_live row (ADR-0015 — host DNS resolver-cache state, NOT per-process
+/// queries). One row per appeared/removed transition of a (name, record_type,
+/// data) resolution; `ttl_remaining_s` is a value field, not part of the diff
+/// key (it decrements every tick). `source` ∈ {cache, hosts_file, unknown}.
+struct DnsEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // appeared, removed
+    std::string name;
+    std::string record_type; // A, AAAA, CNAME, PTR, ...
+    std::string data;
+    int64_t ttl_remaining_s{0};
+    std::string source;
+};
+
 /// One perf_live row (BRD A1 — continuous device performance sampling).
 struct PerfRow {
     int64_t ts{0};
@@ -253,6 +281,8 @@ public:
     bool insert_network_events(const std::vector<NetworkEvent>& events);
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
+    bool insert_arp_events(const std::vector<ArpEvent>& events);
+    bool insert_dns_events(const std::vector<DnsEvent>& events);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
