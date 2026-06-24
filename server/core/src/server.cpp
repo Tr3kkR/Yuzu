@@ -8931,19 +8931,19 @@ private:
                 // query_responses{execution_id}. Wired to check_scoped_permission —
                 // the SAME management-group chokepoint the per-device REST/dashboard
                 // routes use — so an operator collects only the agents inside their
-                // groups, not any execution's rows by id. RBAC off / no store →
-                // legacy-open (no filter), matching require_scoped_permission. The MCP
-                // handler already authed; we re-resolve the principal here without
-                // writing a response (resolve_session, not require_auth).
-                [this](const httplib::Request& req, const std::string& agent_id) -> bool {
+                // groups, not any execution's rows by id. The MCP handler resolves the
+                // principal ONCE (it already authed) and passes `username` in, so this
+                // does NOT re-resolve the session per agent. RBAC off / no store →
+                // legacy-open (no filter), matching require_scoped_permission.
+                // CAVEAT (#1634): for a service-scoped token this checks the token
+                // CREATOR's RBAC scope, not the service-tag confinement that
+                // require_scoped_permission's service branch applies — a pre-existing
+                // MCP confinement limitation this does not fully close.
+                [this](const std::string& username, const std::string& agent_id) -> bool {
                     if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
                         return true;
-                    auto session = auth_routes_->resolve_session(req);
-                    if (!session)
-                        return false; // unauthenticated → no rows (defence in depth)
-                    return rbac_store_->check_scoped_permission(session->username, "Response",
-                                                                "Read", agent_id,
-                                                                mgmt_group_store_.get());
+                    return rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                agent_id, mgmt_group_store_.get());
                 });
         }
 

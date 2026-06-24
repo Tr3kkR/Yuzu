@@ -1147,33 +1147,47 @@ McpServer::HandlerFn McpServer::build_handler(
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
 
+                // Did the raw query hit the row cap BEFORE scope filtering? If so the
+                // result is incomplete (more rows exist past the LIMIT). Capture this
+                // pre-filter so we can flag result_truncated_by_cap below — the filter
+                // shrinks `responses`, so `responses.size()` post-filter can't tell us.
+                const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
+
                 // #1550 HIGH-1 / #1634: management-group scope. The flat Response:Read
                 // gate above is NOT an ownership check (dispatched_by is display-only),
                 // so without this an operator could collect ANOTHER operator's execution
                 // rows by execution_id. Filter per-agent through the injected scope
                 // predicate (production: check_scoped_permission, the same chokepoint the
-                // per-device REST/dashboard routes use). Dedupe the check per distinct
-                // agent_id — an execution fans out to a bounded agent set even with many
-                // response rows. Unwired/RBAC-off → no filter (legacy-open), matching
-                // require_scoped_permission. NOTE: the filter runs AFTER the store LIMIT,
-                // so a fan-out wider than the cap that spans out-of-scope agents may
-                // truncate the in-scope view (keyset follow-up #1634); the isolation
-                // guarantee — never another operator's rows — holds regardless.
+                // per-device REST/dashboard routes use), passing the already-resolved
+                // principal so we don't re-resolve the session per call. Dedupe the
+                // check per distinct agent_id — an execution fans out to a bounded agent
+                // set even with many response rows. Unwired/RBAC-off → no filter
+                // (legacy-open), matching require_scoped_permission. NOTE: the filter
+                // runs AFTER the store LIMIT, so a fan-out wider than the cap that spans
+                // out-of-scope agents may truncate the in-scope view (keyset follow-up
+                // #1634); the isolation guarantee — never another operator's rows —
+                // holds regardless, and result_truncated_by_cap signals the gap.
                 bool scope_filtered = false;
+                std::size_t dropped_agents = 0;
                 if (response_scope_fn) {
                     std::unordered_map<std::string, bool> memo;
                     std::vector<StoredResponse> visible;
                     visible.reserve(responses.size());
                     for (auto& r : responses) {
-                        auto it = memo.find(r.agent_id);
-                        const bool allowed =
-                            it != memo.end()
-                                ? it->second
-                                : (memo[r.agent_id] = response_scope_fn(req, r.agent_id));
-                        if (allowed)
+                        // try_emplace returns a VALID iterator + an inserted flag, so we
+                        // never re-read a find() iterator across the insert (the insert
+                        // can rehash). `inserted` marks the first sighting of this
+                        // agent_id — run the scope check once, then memoise.
+                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                        if (inserted)
+                            m->second = response_scope_fn(session->username, r.agent_id);
+                        if (m->second) {
                             visible.push_back(std::move(r));
-                        else
+                        } else {
                             scope_filtered = true;
+                            if (inserted) // count each DISTINCT dropped agent once
+                                ++dropped_agents;
+                        }
                     }
                     responses.swap(visible);
                 }
@@ -1189,19 +1203,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // A dropped-by-scope read is a security-relevant event — audit it
                 // distinctly (#1634) so an operator reaching outside their groups is
-                // visible in the chain, separate from the served-set success row.
+                // visible in the chain, separate from the served-set success row. The
+                // detail carries the DISTINCT dropped-agent count (the agent_ids
+                // themselves are recoverable via the execution); fold the denied-row
+                // persistence bool into audit_persisted too — a dropped denial-evidence
+                // row is the MORE security-relevant gap, not less (governance compliance).
+                bool denied_ok = true;
                 if (scope_filtered)
-                    mcp_audit("denied",
-                              "scope: filtered out-of-management-group response rows for " + key);
-                // #1550 HIGH-2: observe the success-audit bool — a dropped evidence row
-                // on this SOC 2 read surface is surfaced to the caller via
-                // audit_persisted:false (mirrors the CA-revoke handler below).
-                const bool audit_ok = mcp_audit("success", key);
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group agent(s) for " +
+                                                        key);
+                // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
+                // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
+                const bool audit_ok = mcp_audit("success", key) && denied_ok;
                 JObj result_obj;
                 result_obj.raw("content",
                                JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
                 if (!audit_ok)
                     result_obj.raw("audit_persisted", "false");
+                // result_truncated_by_cap (#1550 UP-4/UP-5): the raw query hit the cap,
+                // so the served set is incomplete — an agentic collector must NOT treat
+                // count<limit as "done" and should paginate (keyset, #1634). Emitted as
+                // an outer result field (documented as the canonical query_responses
+                // shape — content[].text stays the bare rows array, unchanged).
+                if (hit_cap)
+                    result_obj.raw("result_truncated_by_cap", "true");
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }

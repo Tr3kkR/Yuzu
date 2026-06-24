@@ -93,6 +93,20 @@ partial-index predicate. Every query against this index must include
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
+**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
+SQL.** The MCP `query_responses` collect path filters the returned rows per-agent
+through `check_scoped_permission` (cross-operator isolation, #1550) *after* the
+store has already applied `ORDER BY timestamp DESC LIMIT`. So for an execution
+that fans out wider than the row cap and spans both in- and out-of-scope agents,
+the cap can be consumed by out-of-scope rows and the in-scope caller's view is
+truncated (or a row present in one poll vanishes from the next as newer
+out-of-scope rows shift the window). The isolation guarantee holds regardless
+(never another operator's rows); completeness does not. The handler flags this
+with `result_truncated_by_cap:true` so a collector can detect it; the durable fix
+(scope-aware keyset pagination, and pushing the scope predicate into the WHERE
+clause) is the #1634 follow-up. The same applies to every other operator-facing
+reader of this store once #1634 scopes them.
+
 ## PR 3 — SSE live updates
 
 `ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is the

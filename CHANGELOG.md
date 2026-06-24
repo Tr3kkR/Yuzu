@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
+  previously gated only flat `Response:Read` and then returned **any** execution's response rows
+  (`dispatched_by` was display-only, never an access check), so an operator could collect another
+  operator's rows by id. Results are now filtered per-agent through the same
+  `check_scoped_permission` management-group chokepoint the per-device REST/dashboard routes use —
+  a caller sees only rows for agents inside their groups; out-of-scope rows are dropped and audited
+  `result=denied` (with the distinct dropped-agent count). The `denied` row's persistence failure,
+  like the success row's, surfaces `audit_persisted:false` on the result. RBAC-off → legacy-open
+  (no filter), matching `require_scoped_permission`. **Behavior change for agentic-worker
+  integrators:** results may now be a subset of an execution's total rows. The filter runs after
+  the 1000-row cap, so a result that hit the cap before filtering carries
+  `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
+  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(Partial: the
+  REST/dashboard/workflow siblings that read the same response store and the `aggregate_responses`
+  MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
+  token creator's RBAC, not the service tag.)*
+
 ### Changed
 
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
