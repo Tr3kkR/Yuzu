@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors five categories of system activity:
+TAR monitors the following categories of system activity — the first five are always-on; **ARP** and **DNS** are opt-in (off by default), Windows-only today (ADR-0015):
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -15,8 +15,10 @@ TAR monitors five categories of system activity:
 | **Services** | 300 seconds (slow) | Service started, stopped, state changed |
 | **User sessions** | 300 seconds (slow) | User login, user logout |
 | **Performance** | 30 seconds (perf) | Device CPU/memory/disk/network sample (a scalar reading, not a diff) |
+| **ARP** *(opt-in, Windows)* | 60 seconds (fast) | ARP / neighbour binding appeared, removed |
+| **DNS cache** *(opt-in, Windows)* | 60 seconds (fast) | DNS resolver-cache entry appeared, removed |
 
-The first four categories take a snapshot of the current state each cycle, compare it to the previous snapshot, and record only the differences as events. This keeps the database compact while providing full visibility into system changes.
+Every source except **Performance** takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
 The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
@@ -101,6 +103,8 @@ Use the `configure` action to adjust TAR behavior.
 | `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
+| `arp_enabled` | `true` / `false` | **`false`** | Toggle the ARP / neighbour-table capture source (`arp` source → `$ARP_Live`/`$ARP_Hourly`) on this host (ADR-0015). **Off by default** (opt-in). Captures IP↔MAC bindings per interface for Layer-2 adjacency / ARP-spoofing forensics. **Windows only today** (`GetIpNetTable2`); Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in; collected at `fast_interval`. |
+| `dns_enabled` | `true` / `false` | **`false`** | Toggle the DNS resolver-cache capture source (`dns` source → `$DNS_Live`/`$DNS_Hourly`) on this host (ADR-0015). **Off by default** — the DNS cache reveals which domains a host resolved (**usage-class telemetry under the works-council posture; enabling is audited**). **Device-level state only — no per-process attribution** (the cache carries no PID). **Windows only today** (`DnsGetCacheDataTable`, cache-only — never issues a wire query); Linux/macOS planned. Set to `true` to opt in; collected at `fast_interval`. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). Set to `0` to disable the perf trigger entirely. |
 | `network_capture_method` | `polling` (always accepted) plus the methods accepted on the **running host's OS** — e.g. `iphlpapi` on Windows, `procfs` on Linux, `proc_pidfdinfo` on macOS (run `compatibility` for the live list) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. Methods from a *different* OS are rejected. The `status` action reports `network_capture_method_effective` alongside the configured value so the configured-vs-active discrepancy is always explicit. |
 | `process_stabilization_exclusions` | JSON array (≤256 × ≤256 chars) | `[]` | Process-name **substrings** (case-insensitive; leading/trailing `*` stripped; `?` and `[abc]` are literals; effective substring must be ≥3 chars) to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
@@ -143,6 +147,8 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
 | **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 | **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
+| **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
+| **dns** | supported (`dnsapi`), **opt-in (off by default)** — `DnsGetCacheDataTable` + cache-only `DnsQuery_W`: name/record_type/data/TTL (ADR-0015). Device-level resolver-cache state; **no per-process attribution**. | planned (`systemd-resolved`) — resolve1 D-Bus / `/etc/hosts` fallback (constrained). Records nothing until wired. | planned (`dscacheutil`) — subprocess; TTL unavailable (`ttl_remaining_s = -1`, constrained). Records nothing until wired. |
 
 Status values:
 
@@ -220,15 +226,27 @@ config|module_enabled|false
 config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
+config|arp_enabled|false
+config|arp_paused_at|0
+config|arp_live_rows|0
+config|arp_oldest_ts|0
+config|dns_enabled|false
+config|dns_paused_at|0
+config|dns_live_rows|0
+config|dns_oldest_ts|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 ```
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module` (shown above),
-`procperf`, and `netqual` are off by default and must be enabled explicitly via
-`configure` (see the configuration table above). `module_live_rows` stays `0`
-until a collector for the host's OS ships.
+`procperf`, `netqual`, `arp`, and `dns` are off by default and must be enabled
+explicitly via `configure` (see the configuration table above). `module_live_rows`
+stays `0` until a collector for the host's OS ships; likewise `arp`/`dns` are
+**Windows-only today** (planned on Linux/macOS), so on a Linux or macOS agent
+`arp_enabled|true` / `dns_enabled|true` still report `*_live_rows|0` — run the
+`compatibility` action to distinguish a supported-but-empty source from a
+planned-but-unimplemented one.
 
 A `<source>_enabled` value can also read `errored` — automation that scrapes
 this output should match three values, not two:
@@ -311,7 +329,7 @@ The third frame on the `/tar` page reconstructs a **per-host process tree** enti
 
 ## Forcing an immediate snapshot
 
-The `snapshot` action triggers an immediate full collection of all four categories, useful before a maintenance window or at the start of an investigation:
+The `snapshot` action triggers an immediate full collection of all **enabled** capture sources (including opt-in `arp`/`dns` when on), useful before a maintenance window or at the start of an investigation:
 
 ```
 POST /api/v1/instructions/execute
@@ -352,6 +370,15 @@ TAR is designed for minimal performance overhead:
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
+>
+> **`arp_enabled` / `dns_enabled` are new this release (ADR-0015) and also ship
+> off by default.** Expect both to read `false` in `tar.status` on upgrade; the
+> new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
+> empty until you opt in (Windows-only collectors today; Linux/macOS planned).
+> No data collection changes on upgrade. **GUI note:** after enabling a source
+> (Capture-sources frame or `configure`), the first rows appear at the next
+> `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
+> is expected, not a fault.
 
 > **Upgrade note (Windows process capture → ETW). BREAKING for `cmdline`
 > consumers.** On upgrade, the Windows process source switches from the
@@ -432,6 +459,8 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
 | **Module** | `$Module_Live` (100000 rows) | `$Module_Hourly` (24h) | `$Module_Daily` (31d) | `$Module_Monthly` (12mo) |
+| **ARP** *(opt-in)* | `$ARP_Live` (5000 rows) | `$ARP_Hourly` (24h) | — | — |
+| **DNS** *(opt-in)* | `$DNS_Live` (5000 rows) | `$DNS_Hourly` (24h) | — | — |
 
 The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 
