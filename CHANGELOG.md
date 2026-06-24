@@ -107,7 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Logged-in users**, and a read-only **Capture sources** view (which TAR warehouse
   sources are capturing locally; configuration stays on the TAR page). Two new agent
   actions: `processes/list_tree` (adds parent PID for tree reconstruction) and
-  `network_config/arp` (Windows `GetIpNetTable2`). Each card has its own
+  `network_config/arp` (Windows `GetIpNetTable2`) — these ship with agents built from
+  this release onward; an older agent renders an empty Processes-tree / ARP card (it
+  returns an `unknown action` response, so upgrade the agent to populate those cards). Each card has its own
   `device.live.<kind>` audit verb so usage-class reads (process tree, connections, users,
   DNS cache) stay separately countable for works-council. ARP and DNS-cache are
   Windows-only; on other platforms those cards render an honest "not available on this OS"
