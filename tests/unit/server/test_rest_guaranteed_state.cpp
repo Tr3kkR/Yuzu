@@ -166,7 +166,7 @@ struct RestGsHarness {
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
                             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{},
                             /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-                            baseline_store.get(),
+                            /*lockout_clear_fn=*/{}, baseline_store.get(),
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{});
     }

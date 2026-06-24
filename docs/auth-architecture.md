@@ -26,6 +26,76 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
 
+## Account lockout (SOC 2 CC6.3)
+
+Brute-force / credential-stuffing protection on the **local-password** login
+path (`POST /login`). OIDC delegates throttling to the IdP; the MFA
+code-verification path has its own per-token failure rate-limit — neither is in
+scope here.
+
+- **State** lives in three columns on the `users` table (`auth.db` migration
+  v3): `failed_login_count`, `last_failed_login_at`, `locked_until`
+  (`NULL` = not locked). A non-existent username has no row, so spraying random
+  usernames neither locks a non-existent account nor grows storage
+  (anti-enumeration). All three accessors (`AuthDB::lockout_status` /
+  `record_failed_login` / `clear_failed_logins`) are parameterised and use
+  `RETURNING`, never `sqlite3_changes()` (#1033).
+- **Policy** is config, not schema, so operators retune without a migration:
+  - `--auth-lockout-threshold` (`YUZU_AUTH_LOCKOUT_THRESHOLD`, default `5`,
+    `0` disables) — consecutive failures before lock.
+  - `--auth-lockout-window-secs` (`YUZU_AUTH_LOCKOUT_WINDOW_SECS`, default
+    `900`) — lock duration. The lock **auto-expires** after the window; it is
+    never permanent, so it cannot be weaponised to permanently DoS a
+    legitimate principal. The posture is logged once at boot for CC6.3
+    evidence.
+- **Flow** in `auth_routes.cpp` `POST /login`:
+  - *Pre-check* (before PBKDF2): if the account is currently locked, reject
+    with the **same generic 401** as a bad password — no `Retry-After`, no
+    "locked" wording, so the response body is not a username-enumeration /
+    lock-state **content** oracle. `verify_password` is skipped entirely, so the
+    ~100 ms PBKDF2 is never burned on a locked account. Fail-open on a read error
+    (lockout protects against *wrong* passwords; `verify_password` is still the
+    real gate). *Accepted residue:* skipping PBKDF2 makes the locked path
+    measurably faster than a known-user wrong-password 401, so response **timing**
+    is a weak lock-*state* oracle (it reveals that an account is locked, never a
+    credential). This is an accepted trade-off — adding a constant-time floor to
+    the locked path would re-introduce the PBKDF2-cost DoS the skip exists to
+    avoid.
+- **Concurrency — per-username serialized (single-node).** The flow is
+  *check-then-act* (`lockout_status` → `verify_password` → `record_failed_login`).
+  Without serialization a **synchronized burst** for one username could all
+  observe `locked=false` and each verify a password before any sibling recorded
+  its failure, so the effective single-burst guess budget would be the in-flight
+  concurrency rather than `auth_lockout_threshold` (the per-IP `login_rate_limit`
+  does **not** bound a distributed botnet firing one request per IP). The whole
+  sequence is therefore held under a **striped per-username login lock**
+  (`AuthRoutes::login_lock_for` / `login_locks_`): concurrent attempts for one
+  account serialize, so at most `threshold` reach password verification before
+  the lock arms (covered by a barrier-style concurrent route test). Different
+  usernames hash to different stripes and log in fully in parallel — only a burst
+  against one account is throttled, which is the intended effect. This is
+  **single-process** scope, adequate for the current single-node SQLite
+  `auth.db`; the HA/multi-replica-correct form is a DB-atomic attempt-reservation
+  that lands with the auth store's Postgres migration (tracked follow-up).
+  `login_rate_limit` remains the companion control for the distributed vector.
+  - *On failure*: `record_failed_login` increments the counter and arms
+    `locked_until` on the threshold-th failure. A window that has **fully
+    expired** starts a fresh attempt budget (the waited-out user gets their
+    attempts back).
+  - *On success*: `clear_failed_logins` resets the counter (covers all three
+    success exits — no-MFA mint, MFA challenge, enforced enrollment).
+- **Admin unlock** — `POST /api/v1/users/<name>/unlock`, gated by
+  `UserManagement:Write` and the MFA step-up gate. Self-target is permitted
+  (recoverable, same reasoning as session self-revoke). The operability path
+  for an operator who can't wait out the window.
+- **Audit** — `auth.lockout.applied` (once, on the threshold crossing),
+  `auth.lockout.cleared` (success reset or admin unlock, actor recorded). A
+  blocked attempt while already locked is counted via the metric, **not**
+  audited per-attempt (flood-amplification, same rationale as the MFA pending
+  load-shed).
+- **Metrics** — `yuzu_auth_lockout_applied_total`,
+  `yuzu_auth_lockout_blocked_total`.
+
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 
 Full design: `docs/auth-mfa-design.md`. Summary:
@@ -297,6 +367,19 @@ the agent never receives the cert (an active MITM stripping the field, or a
 persistent signer outage), the agent bounds its retries and gives up
 auto-provisioning for that run rather than looping.
 
+**Agent CA pinning is fail-closed (#1303).** When the agent has TLS on but no CA
+to pin — no `--ca-cert` **and** no install CA auto-discovered at the standard
+shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows) — it
+**refuses to connect** rather than silently falling back to the system trust
+store. An empty root set makes gRPC verify against the OS roots, which do **not**
+trust a Yuzu self-signed install CA, so with the gateway one-way-TLS edge live any
+publicly-trusted impostor cert for the dial host would be accepted — a fail-open
+MITM on the command fan-out plane. The deliberate escape hatch is
+`--tls-system-roots` / `YUZU_TLS_SYSTEM_ROOTS`, for the legitimate case where the
+server certificate chains to a public or corporate CA already in the system store;
+it logs a loud warning and is never the default. (`--no-tls` remains the dev/demo
+opt-out.)
+
 **Operator surface.** Server: `--ca-dir` (shared with the default-cert
 bootstrap). Agent: `--cert-dir` / env `YUZU_CERT_DIR` (where the provisioned
 credential lives) and `--no-auto-provision-cert` (disable the CSR-at-enrollment
@@ -340,6 +423,33 @@ gateway-proxied agent promptly, revoke at the gateway/management layer (disconne
 the agent) in addition to `POST /api/v1/ca/revoke`. This is the same
 direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
 ("Gateway path identity").
+
+**Gateway CSR-swap forgery (R-5, accepted M1 residual).** Wiring `ProxyRegister`
+to sign forwarded CSRs makes the gateway a bounded **confused deputy**. The
+server signs the relayed CSR's public key under the **gateway-supplied**
+`agent_id` (the through-gateway identity is the app-layer `gateway_observed_peer`,
+not a transport-cryptographic binding in M1), so a compromised or on-path gateway
+can relay a *victim's* `agent_id` paired with its *own* CSR and obtain a real
+CA-signed leaf for that `agent_id`. Worse than a transient relay: that leaf is a
+durable credential the attacker can present for **persistent direct mTLS
+reconnect**, bypassing the gateway entirely — it **survives gateway eviction**.
+Compensating controls (why this is accepted for M1, not a live break):
+
+- Every forged leaf is recorded in `ca_issued` and is **revocable** — and #1290
+  stamps `via=gateway_proxy` on the `ca.cert.issued` audit + issuance metric, so
+  an incident responder can **scope and bulk-revoke the gateway-issued population**
+  after a gateway compromise (the row the forensic control depends on).
+- The gateway authenticates to the server over **upstream mutual TLS** (a rogue
+  gateway cannot reach the issuance path without being an enrolled gateway).
+- PR5c **one-way TLS** on the agent↔gateway edge mitigates the *on-path* (non-gateway-
+  compromise) variant.
+
+The actual cryptographic remediation — gateway agent-identity **attestation** +
+per-gateway issuance **scoping** so a gateway can only obtain leaves for the
+`agent_id`s it legitimately fronts — is tracked in **#1292** (cryptographic
+through-gateway binding lands with the QUIC migration, #376). Full threat model:
+`docs/security-reviews/pki-pr5-gateway-tls.md`; also summarised in
+`docs/pki-architecture.md`.
 
 ## HTTP security response headers (SOC2-C1)
 
