@@ -189,6 +189,53 @@ public:
     std::expected<int, AuthDBError>
     cleanup_provisional_mfa(std::chrono::seconds older_than = std::chrono::hours(1));
 
+    // ── Account-lockout Operations ───────────────────────────────────────
+    //
+    // SOC 2 CC6.3 — brute-force / credential-stuffing protection on the
+    // local-password login path. See `/auth-and-authz` skill gap matrix
+    // entry P0 #2 and docs/auth-architecture.md. Lockout state lives as
+    // three columns on the users table (migration v3): failed_login_count,
+    // last_failed_login_at, locked_until. A non-existent username has no
+    // row, so spraying random usernames cannot grow storage and cannot lock
+    // a non-existent account. Policy (threshold + window) is owned by the
+    // caller (ServerConfig) and passed in, so AuthDB stays policy-free and
+    // an operator can retune without a schema change. The lockout is
+    // temporary/auto-expiring (locked_until is a future timestamp), so it
+    // cannot be weaponised to permanently DoS a legitimate principal.
+
+    struct LockoutStatus {
+        bool locked{false};       // locked_until is set AND still in the future
+        int failed_count{0};      // current consecutive-failure counter
+        std::string locked_until; // SQLite DATETIME string, or "" when unlocked
+    };
+
+    struct LockoutRecord {
+        int failed_count{0};      // counter value AFTER this failure
+        bool locked{false};       // account is locked after this failure
+        bool just_locked{false};  // this failure is the one that crossed the threshold
+        std::string locked_until; // SQLite DATETIME string, or "" when not locked
+    };
+
+    /// Read-only lockout pre-check. Returns a zero-initialised LockoutStatus
+    /// (locked=false) when the user row is absent — callers treat "no such
+    /// user" as "not locked" so the bad-username path is indistinguishable
+    /// from the bad-password path (anti-enumeration). Returns InvalidUsername
+    /// for malformed input.
+    std::expected<LockoutStatus, AuthDBError> lockout_status(const std::string& username);
+
+    /// Record one failed local-password attempt. Increments the counter,
+    /// stamps last_failed_login_at, and sets locked_until = now + window the
+    /// moment the counter reaches `threshold`. Single UPDATE ... RETURNING
+    /// (no sqlite3_changes() — #1033). No-op (failed_count=0, not locked)
+    /// when `threshold <= 0` or the user row is absent.
+    std::expected<LockoutRecord, AuthDBError>
+    record_failed_login(const std::string& username, int threshold, int window_secs);
+
+    /// Clear lockout state on a successful login or admin unlock. Resets the
+    /// counter to 0 and NULLs both timestamps. Idempotent; no-op on absent
+    /// rows. Returns InvalidUsername for malformed input.
+    std::expected<void, AuthDBError> clear_failed_logins(const std::string& username);
+
     // ── MFA / TOTP Operations ────────────────────────────────────────────
     //
     // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and
