@@ -16,6 +16,8 @@
 #include <format>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 namespace yuzu::tar {
 
@@ -607,6 +609,27 @@ std::vector<SoftwareEvent> compute_software_events(
     }
 
     return events;
+}
+
+std::vector<SoftwareInfo> assemble_steady_state_snapshot(
+    const std::vector<SoftwareInfo>& previous,
+    std::vector<SoftwareInfo> machine_and_loaded,
+    const std::vector<std::string>& scanned_users) {
+
+    // machine scope + currently-loaded user hives are already enumerated this
+    // tick; start from them and append carried-forward logged-off users.
+    std::vector<SoftwareInfo> current = std::move(machine_and_loaded);
+
+    std::unordered_set<std::string> scanned(scanned_users.begin(), scanned_users.end());
+    for (const auto& e : previous) {
+        // Carry forward a user whose hive was NOT scanned this tick (logged off):
+        // a logged-off user cannot install software, so their last-known inventory
+        // is still current. A scanned user's missing entry is a real uninstall and
+        // is deliberately NOT carried forward, so it diffs as 'removed'.
+        if (e.scope == "user" && !scanned.contains(e.user))
+            current.push_back(e);
+    }
+    return current;
 }
 
 } // namespace yuzu::tar

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `tar.configure` now advertises every per-source enable toggle and the software
+  tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
+  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`
+  and `software_max_hive_mounts`) were already accepted by the agent but missing from the
+  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
+  discover or tune them (notably the privacy-relevant disable toggles for the default-on
+  `software` source). No runtime behaviour change — the params were always honoured; they
+  are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
+  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
+  perf collection at runtime.)
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
   shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
   `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
@@ -54,9 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
   `software_max_hive_mounts` / `software_last_run_ts` lines — update any field-count
   parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
-  `$Software_*` tables are queryable but empty there until then. See
-  `docs/user-manual/tar.md` and the data-handling classification in
-  `docs/enterprise-readiness-soc2-first-customer.md`.
+  `$Software_*` tables are queryable but empty there until then. Disabling the source
+  (`software_enabled=false`) is **atomic with the collector** — it holds the same
+  `software_collect_mu_` the collector takes and the collector re-checks the flag under
+  that lock, so a disable racing an in-flight scan can never insert events from the paused
+  window or leave a stale baseline (no ghost install/remove/upgrade events on re-enable;
+  same #538 contract as the other snapshot-diff sources). `SystemComponent` entries are
+  read as `REG_DWORD` (their canonical type) so system components/patches are correctly
+  excluded, and `software` rows are reachable from the legacy `tar.query`/`tar.export`
+  typed paths as well as `tar.sql`. See `docs/user-manual/tar.md` and the data-handling
+  classification in `docs/enterprise-readiness-soc2-first-customer.md`.
 - **Guardian — baseline-anchored per-device compliance REST.**
   New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
   returns one Baseline's deployed Guards each with the device's last reported verdict

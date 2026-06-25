@@ -28,6 +28,7 @@
 #include "tar_collectors.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -169,20 +170,57 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 DWORD type = 0;
                 if (RegQueryValueExA(app_key.get(), value_name, nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if (type == REG_SZ && size > 0) {
-                        return std::string(buf, size - 1);
+                    // Accept REG_EXPAND_SZ as well as REG_SZ — some installers store
+                    // these values with embedded environment refs. `size` includes
+                    // the trailing NUL when present, but a non-NUL-terminated REG_SZ
+                    // is legal; trim at the first embedded NUL (capped at the buffer)
+                    // rather than blindly dropping the last byte.
+                    if ((type == REG_SZ || type == REG_EXPAND_SZ) && size > 0) {
+                        DWORD cap = size < sizeof(buf) ? size : sizeof(buf);
+                        return std::string(buf, ::strnlen(buf, cap));
                     }
                 }
                 return {};
             };
 
+            // SystemComponent is canonically a REG_DWORD (=1 hides the entry from
+            // Add/Remove Programs); a REG_SZ-only read made the filter a permanent
+            // no-op so system components/patches were collected despite the manual's
+            // contract (#1620). Read the DWORD form, falling back to the rare string
+            // form.
+            auto system_component_set = [&]() -> bool {
+                DWORD val = 0;
+                DWORD size = sizeof(val);
+                DWORD type = 0;
+                if (RegQueryValueExA(app_key.get(), "SystemComponent", nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS &&
+                    type == REG_DWORD && size == sizeof(DWORD)) {
+                    return val == 1;
+                }
+                return read_str("SystemComponent") == "1";
+            };
+
             auto display_name = read_str("DisplayName");
-            if (!display_name.empty() && read_str("SystemComponent") != "1") {
+            if (!display_name.empty() && !system_component_set()) {
                 SoftwareInfo app;
                 app.name = sanitize_utf8(std::move(display_name));
                 app.version = sanitize_utf8(read_str("DisplayVersion"));
                 app.publisher = sanitize_utf8(read_str("Publisher"));
-                app.install_date = sanitize_utf8(read_str("InstallDate"));
+                // InstallDate is usually REG_SZ "YYYYMMDD", but some installers
+                // store it as a REG_DWORD number — fall back to that so the column
+                // is not silently empty.
+                auto install_date = read_str("InstallDate");
+                if (install_date.empty()) {
+                    DWORD val = 0;
+                    DWORD dsize = sizeof(val);
+                    DWORD dtype = 0;
+                    if (RegQueryValueExA(app_key.get(), "InstallDate", nullptr, &dtype,
+                                         reinterpret_cast<LPBYTE>(&val), &dsize) == ERROR_SUCCESS &&
+                        dtype == REG_DWORD && dsize == sizeof(DWORD) && val != 0) {
+                        install_date = std::to_string(val);
+                    }
+                }
+                app.install_date = sanitize_utf8(install_date);
                 app.scope = scope;
                 app.user = user;
                 apps.push_back(std::move(app));
@@ -237,7 +275,11 @@ std::vector<ProfileEntry> list_profiles() {
         if (RegQueryValueExA(sid_key.get(), "ProfileImagePath", nullptr, &type,
                              reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS &&
             path_size > 0) {
-            p.profile_dir.assign(path_buf, path_size - 1);
+            // ProfileImagePath is REG_EXPAND_SZ; trim at the first embedded NUL
+            // rather than assuming path_size-1 is the terminator (parity with
+            // read_str — an unterminated value would otherwise drop its last char).
+            DWORD cap = path_size < sizeof(path_buf) ? path_size : sizeof(path_buf);
+            p.profile_dir.assign(path_buf, ::strnlen(path_buf, cap));
             auto last_sep = p.profile_dir.find_last_of("\\/");
             if (last_sep != std::string::npos)
                 username = p.profile_dir.substr(last_sep + 1);

@@ -1140,6 +1140,16 @@ private:
             max_mounts = 0;
 
         std::lock_guard lock(software_collect_mu_); // serialises concurrent collect_software only
+        // #538/#1620: the source_enabled gate above ran WITHOUT this lock; a
+        // `tar.configure software_enabled=false` (do_configure) takes this SAME
+        // lock to clear the baseline + flip the flag. Re-check under the lock so a
+        // disable racing a mid-flight tick can neither insert events from the
+        // paused window nor re-seed a baseline after the disable cleared it
+        // (mirrors the perf/procperf post-lock re-check).
+        if (!source_enabled(*db_, "software")) {
+            ctx.write_output("tar|collect_software|0|source_disabled");
+            return 0;
+        }
         auto prev_json = db_->get_state("software");
 
         // Cold start (no prior state row): seed the full baseline silently — mount
@@ -1175,17 +1185,16 @@ private:
         // entries identical in `previous` and `current`, so they yield no events.
         // `scanned_users` is every loaded profile (even those with zero apps), so
         // an uninstall of a logged-on user's last app is NOT masked by carry-forward.
-        std::vector<yuzu::tar::SoftwareInfo> current;
-        yuzu::tar::enumerate_machine_software(current);
+        // The carry-forward assembly is the pure assemble_steady_state_snapshot()
+        // helper (unit-tested in test_tar_diff.cpp) — this leg only feeds it the
+        // freshly enumerated machine + loaded-user software.
+        std::vector<yuzu::tar::SoftwareInfo> machine_and_loaded;
+        yuzu::tar::enumerate_machine_software(machine_and_loaded);
         auto loaded = yuzu::tar::enumerate_loaded_user_software();
-        std::unordered_set<std::string> scanned(loaded.scanned_users.begin(),
-                                                loaded.scanned_users.end());
         for (auto& e : loaded.entries)
-            current.push_back(std::move(e));
-        for (const auto& e : previous) {
-            if (e.scope == "user" && !scanned.contains(e.user))
-                current.push_back(e); // carry forward a logged-off user unchanged
-        }
+            machine_and_loaded.push_back(std::move(e));
+        auto current = yuzu::tar::assemble_steady_state_snapshot(
+            previous, std::move(machine_and_loaded), loaded.scanned_users);
 
         const auto snap_id = next_snapshot_id();
         auto typed = yuzu::tar::compute_software_events(previous, current, ts, snap_id);
@@ -1400,6 +1409,10 @@ private:
             sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
                   "'' AS detail_json FROM user_live" +
                   where + tail;
+        } else if (type_filter == "software") {
+            sql = "SELECT ts, 'software' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM software_live" +
+                  where + tail;
         } else {
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
@@ -1413,6 +1426,9 @@ private:
                   where +
                   " UNION ALL "
                   "SELECT ts, 'user', action, snapshot_id, '' FROM user_live" +
+                  where +
+                  " UNION ALL "
+                  "SELECT ts, 'software', action, snapshot_id, '' FROM software_live" +
                   where + ")" + tail;
         }
 
@@ -1463,7 +1479,7 @@ private:
 
         // Pick the right live table (HP-5: handle empty filter and unknown types)
         //
-        // For the "no filter" case we have to UNION ALL four tables that do
+        // For the "no filter" case we have to UNION ALL five tables that do
         // not share a column count or schema. Project each branch to a
         // uniform shape (source, ts, snapshot_id, action, summary) so the
         // UNION is well-typed and the JSON envelope stays consistent for
@@ -1483,9 +1499,13 @@ private:
                               "  FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
                               "SELECT 'user', ts, snapshot_id, action, "
                               "       (user || '@' || COALESCE(domain,'')) AS summary "
-                              "  FROM user_live WHERE ts >= {} AND ts <= {}"
+                              "  FROM user_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                              "SELECT 'software', ts, snapshot_id, action, "
+                              "       (name || ' ' || COALESCE(version,'') || ' [' || scope || ']') "
+                              "       AS summary "
+                              "  FROM software_live WHERE ts >= {} AND ts <= {}"
                               ") ORDER BY ts ASC LIMIT {}",
-                              from, to, from, to, from, to, from, to, limit);
+                              from, to, from, to, from, to, from, to, from, to, limit);
         } else {
             std::string table;
             if (type_filter == "process")
@@ -1496,6 +1516,8 @@ private:
                 table = "service_live";
             else if (type_filter == "user")
                 table = "user_live";
+            else if (type_filter == "software")
+                table = "software_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
@@ -1800,6 +1822,17 @@ private:
                 // "stopped" events on re-enable. No deadlock: do_configure runs
                 // without collect_mu_ held and the helper re-acquires nothing.
                 std::lock_guard lock(collect_mu_);
+                // `software` keeps its baseline read-diff-write under the dedicated
+                // software_collect_mu_, NOT collect_mu_ (its slow registry walk must
+                // not stall collect_fast under the shared lock — gov UP-6). So for the
+                // software transition also hold THAT lock, or the baseline clear +
+                // flag flip is not atomic w.r.t. an in-flight collect_software tick and
+                // the #538 ghost-event race reopens on the default-on software source
+                // (#1620). Lock order is always collect_mu_ ≺ software_collect_mu_
+                // (collect_software takes only the latter), so there is no inversion.
+                std::unique_lock<std::mutex> sw_lock;
+                if (src.name == "software")
+                    sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
                 transition_ok =
                     yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
                 if (transition_ok && v == "false") {

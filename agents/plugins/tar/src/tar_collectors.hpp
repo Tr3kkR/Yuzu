@@ -238,4 +238,28 @@ std::vector<SoftwareEvent> compute_software_events(const std::vector<SoftwareInf
                                                    const std::vector<SoftwareInfo>& current,
                                                    int64_t timestamp, int64_t snapshot_id);
 
+/**
+ * Assemble the current installed-software snapshot for a STEADY-STATE tick.
+ *
+ * `machine_and_loaded` is machine-scope software plus the apps found in
+ * currently-loaded user hives (from enumerate_machine_software +
+ * enumerate_loaded_user_software, no NTUSER.DAT mounting). `scanned_users` is
+ * EVERY logged-on profile that was read this tick (even those with zero apps).
+ * `previous` is the last persisted snapshot.
+ *
+ * Logged-off users (scope=="user" and NOT in `scanned_users`) are carried
+ * forward unchanged from `previous` — a logged-off user cannot install software,
+ * so re-mounting their hive every tick is pure I/O. Because their entries are
+ * then identical in `previous` and the returned snapshot, they yield no diff
+ * events. Crucially, an uninstall by a *logged-on* user is NOT masked: their SID
+ * is in `scanned_users`, so their (now-removed) entry is not carried forward.
+ *
+ * Pure (no registry I/O) so the carry-forward contract is unit-testable
+ * off-Windows. Returns by value (the assembled `current` snapshot).
+ */
+std::vector<SoftwareInfo> assemble_steady_state_snapshot(
+    const std::vector<SoftwareInfo>& previous,
+    std::vector<SoftwareInfo> machine_and_loaded,
+    const std::vector<std::string>& scanned_users);
+
 } // namespace yuzu::tar
