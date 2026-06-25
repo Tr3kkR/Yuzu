@@ -325,3 +325,42 @@ groups:
             HTTP thread-pool starvation affecting unrelated routes. Reduce
             concurrent bundle dispatches, reduce steps-per-bundle, or prioritise
             the deferred async-dispatch fix (UP-15).
+
+  # Agent daily-sync / installed-software inventory (ADR-0016). The
+  # yuzu_inventory_ingest_total{source,outcome} counter is otherwise measured but
+  # unoperationalised (gov sre). need_full + error are the degradation signals.
+  - name: yuzu-inventory
+    rules:
+      - alert: YuzuInventorySustainedIngestErrors
+        # outcome=error = a store/pool failure on ingest. Correlated with yuzu_pg_*
+        # = a transient PG outage (self-heals); uncorrelated + low/persistent = a
+        # device stuck on a payload the store keeps rejecting — grep the warn-level
+        # SoftwareInventoryStore log for the agent_id.
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="error"}[15m])) > 0.001
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest sustaining errors"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="error"} has been non-zero for 15m.
+            If correlated with yuzu_pg_connect_failed_total it is a transient
+            Postgres outage (self-heals via the next sync + weekly full-floor); if
+            uncorrelated it is likely one or more devices whose payload the store
+            keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
+            the agent_id.
+      - alert: YuzuInventoryHighNeedFullRatio
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="need_full"}[15m]))
+          / clamp_min(sum(rate(yuzu_inventory_ingest_total[15m])), 0.0001) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software need_full ratio > 20%"
+          description: >-
+            Over 20% of inventory ingest outcomes are need_full for 15m. Expected
+            transiently after a server DB restore (cold cache — agents re-send full,
+            then settle); a sustained ratio suggests hash drift or agents stuck in a
+            resend cycle.
