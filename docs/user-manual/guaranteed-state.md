@@ -238,7 +238,7 @@ Stand up a ServiceNow (or any CMDB/ITSM) Guardian-compliance CI field against th
    - `deployed: false` → render **"No Baseline Deployed"**.
    - `assessable: false` → render **"Not assessable"** (offline / newly-enrolled / all-out-of-scope) — **never** compute or show a compliance percentage.
    - `assessable: true` → show the `compliant`/`drifted`/`errored`/`pending` counts. **Do not gate** automated remediation on `compliant/total_guards` (it over-estimates on partial reports — see the REST caveats); treat it as advisory and use `last_updated` for freshness.
-   - `503` with `Sec-Audit-Failed: true` → transient (audit subsystem), retry after `retry_after_ms`; a `503` **without** that header is a misconfiguration — page an operator, do not auto-retry.
+   - `503` handling — **discriminate by header + `retry_after_ms`** (two `503` classes are header-less): `Sec-Audit-Failed: true` → transient audit-subsystem fault, **retry** after `retry_after_ms`. No `Sec-Audit-Failed` **but** a `retry_after_ms` in the A4 body → transient **store fault**, **retry** after `retry_after_ms`. Neither header **nor** `retry_after_ms` → permanent **misconfiguration** (unwired stores / scoped-permission fn) — page an operator, do **not** auto-retry.
 
 ## Compliance overview
 

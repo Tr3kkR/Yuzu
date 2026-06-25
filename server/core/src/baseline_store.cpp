@@ -281,8 +281,20 @@ std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& n
     }
     sqlite3_bind_text(s.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<Baseline> result;
-    if (sqlite3_step(s.get()) == SQLITE_ROW)
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW) {
         result = read_baseline_row(s.get());
+    } else if (rc != SQLITE_DONE) {
+        // The "DB locked/corrupt" fault the store_ok contract names surfaces at STEP
+        // (SQLITE_BUSY/LOCKED/IOERR/CORRUPT), not just prepare — SQLITE_DONE is the
+        // clean no-row not-found. Classify a non-DONE step rc as a fault so the route
+        // 503s (retryable), not 404 (which a CMDB reads as "delete this CI"). Without
+        // this the fix is defeated at the step layer (#1623 Gate-8 cpp-safety).
+        spdlog::error("BaselineStore::get_baseline_by_name: step failed (rc={}): {}", rc,
+                      sqlite3_errmsg(db_));
+        if (store_ok)
+            *store_ok = false;
+    }
     return result;
 }
 
