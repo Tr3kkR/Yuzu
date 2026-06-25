@@ -1519,6 +1519,14 @@ public:
                             break;
                         }
                     }
+                    if (cfg_.inventory_disable) {
+                        // Deploy-time opt-out (ADR-0016 / works-council co-determination
+                        // control): never start the daily-sync thread, collect or push no
+                        // installed-software inventory.
+                        spdlog::info("Daily-sync disabled (--inventory-disable / "
+                                     "YUZU_AGENT_INVENTORY_DISABLE) — no installed-software "
+                                     "inventory collected or pushed");
+                    } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, ia_descriptor,
@@ -1586,6 +1594,7 @@ public:
                         }
                         spdlog::info("Daily-sync thread stopped");
                     });
+                    } // end else: daily-sync enabled (inventory_disable == false)
                 }
 
                 // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
