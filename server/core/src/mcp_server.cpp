@@ -222,7 +222,10 @@ static const ToolDef kTools[] = {
     {"aggregate_responses", "Aggregate response data (COUNT, SUM, AVG) grouped by a column.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
 
-    {"query_inventory", "Query inventory data across agents. Filter by agent or plugin.",
+    {"query_inventory",
+     "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
+     "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
+     "query_installed_software instead.",
      R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})"},
 
     {"list_inventory_tables", "List available inventory data types with agent counts.",
@@ -1389,7 +1392,14 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // Cap hit BEFORE scope filtering → result incomplete (the store's hard
                 // ceiling kFleetQueryRowCap >> 1000, so the binding cap is q.limit).
-                // Captured pre-filter: the filter shrinks `rows`.
+                // Captured pre-filter: the filter shrinks `rows`. NOTE: unlike the
+                // correlation-bounded query_responses (which requires execution_id/
+                // instruction_id), an empty-filter call here is an unbounded fleet-wide
+                // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
+                // filter — so a narrow-scope operator may see few of their own rows in one
+                // page, signalled by result_truncated_by_cap. Cross-operator ISOLATION
+                // (never another operator's rows) holds regardless; completeness for a
+                // narrow scope over a wide fleet is the keyset follow-up (#1634).
                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
                 // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat
