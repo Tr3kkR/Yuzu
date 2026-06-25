@@ -102,7 +102,8 @@ struct TarHarness {
                 it != params.end() && it->second.find("$Process_Live") != std::string::npos;
             return {is_proc ? kProcCmd : kTcpCmd, 1};
         };
-        auto responses = [this](const std::string& cmd) -> std::vector<DexAgentResponse> {
+        auto responses = [this](const std::string& cmd,
+                                 const std::string& /*agent_id*/) -> std::vector<DexAgentResponse> {
             if (cmd == kProcCmd)
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)

@@ -34,6 +34,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
+  route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
+  failed to persist (audit DB locked/full, or a `bad_alloc`-class throw) could previously look like
+  a clean, audited read. Every such route now routes through one shared helper
+  (`server/core/src/rest_audit.hpp`) that captures the `AuditFn` result behind a `try/catch` (the
+  throw arm was previously silent on several routes), logs the gap, and surfaces it per surface:
+  - **Dashboard fragments** (`/fragments/device/dex`, `/fragments/device/guardian`, and the `/dex`
+    drill-downs) set the `Sec-Audit-Failed: true` response header and **still render** — a transient
+    audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
+    **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
+  - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
+    `/api/v1/guaranteed-state/events?agent_id=`, and now
+    `/api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`) **fails closed** with
+    `503` + `Sec-Audit-Failed: true` and serves no PII. The baseline-device route previously
+    discarded the result and served regardless — it now matches its `dex.device.view` siblings.
+  - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
+    `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
+    matching the `query_responses` / `revoke_certificate` convention.
+
+  Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
+  evidence-gap signal.
+
 - **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
   previously gated only flat `Response:Read` and then returned **any** execution's response rows
   (`dispatched_by` was display-only, never an access check), so an operator could collect another
@@ -98,6 +120,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
+  page's **Get live info** button now returns a full live system snapshot — a KPI strip
+  (uptime, process / service / connection / user counts) over a grid of collapsible,
+  uniformly-sized, scrollable cards with an **Expand all / Collapse all** control and a
+  per-card **pop-out** for a larger view. Each card is a separate live read-only dispatch
+  through the existing Execute-gated, audit-logged chokepoint: **Processes** (a parent→
+  child tree with the SHA-256 of each on-disk image and live network connections joined
+  by PID, suspicious parent→child spawns flagged), **Services**, **Adapters & IP**,
+  **ARP** (Windows), **DNS cache** (Windows), **Listening ports**, **Active connections**,
+  **Logged-in users**, and a read-only **Capture sources** view (which TAR warehouse
+  sources are capturing locally; configuration stays on the TAR page). Two new agent
+  actions: `processes/list_tree` (adds parent PID for tree reconstruction) and
+  `network_config/arp` (Windows `GetIpNetTable2`) — these ship with agents built from
+  this release onward; an older agent renders an empty Processes-tree / ARP card (it
+  returns an `unknown action` response, so upgrade the agent to populate those cards). Each card has its own
+  `device.live.<kind>` audit verb so usage-class reads (process tree, connections, users,
+  DNS cache) stay separately countable for works-council. ARP and DNS-cache are
+  Windows-only; on other platforms those cards render an honest "not available on this OS"
+  note. Requires `Execution:Execute` + `GuaranteedState:Read`, scoped to the device. The
+  previous flat "Running processes" panel (`kind=processes`) is **retained** for
+  REST/scripted callers; the dashboard now dispatches `kind=process_tree`. REST/scripted
+  callers reach `kind=uptime|processes` only — the 9-card grid is dashboard-only pending
+  the A1 JSON backfill (#1649). See `docs/user-manual/device-management.md`.
 - **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
   (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
   via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS

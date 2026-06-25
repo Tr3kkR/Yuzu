@@ -238,6 +238,7 @@ if build_server
       'unit/server/test_rest_bundle.cpp',
       'unit/server/test_audit_store.cpp',
       'unit/server/test_rest_audit_sample.cpp',
+      'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',

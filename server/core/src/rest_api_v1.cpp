@@ -11,6 +11,7 @@
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
+#include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "response_templates_engine.hpp"
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
@@ -674,7 +675,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/events": {
-      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
+      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary. An agent-scoped query (non-empty agent_id) returns that device's individual-identifying behavioural signal history and emits a dex.device.view audit before serving; it FAILS CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. A query with no agent_id is a bulk operational query, not individually audited.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}, "503": {"description": "Audit row could not persist on an agent-scoped query — behavioural data withheld; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/status": {
       "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
@@ -683,7 +684,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
     },
     "/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}": {
-      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view. Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable — non-transient misconfiguration, do not auto-retry (A4 envelope)"}}}
+      "get": {"summary": "Baseline-anchored per-device Guardian status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Returns one Baseline's DEPLOYED Guards each with this device's last reported (Observe-mode) verdict. The denominator is the Baseline's deployed_snapshot, so a Guard not yet reported shows status 'pending'. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). No liveness fold; updated_at carries staleness. Audited as guardian.device.view; this per-device behavioural-PII read FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the access-audit row cannot durably persist, so evidence-less compliance data is never served as audited (#1647). Baseline assignment is deferred (deploy is fleet-wide), so a deployed Baseline applies to every device; the verdict becomes assignment-aware when assignment lands.", "parameters": [{"name": "baseline_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateBaselineDeviceStatus"}}}}, "400": {"description": "Path parameter too long (A4 envelope)"}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline not found (A4 envelope)"}, "503": {"description": "Store or scoped-permission function unavailable (non-transient misconfiguration, do not auto-retry) OR the access-audit row could not durably persist — the latter carries the Sec-Audit-Failed: true response header and is retryable (#1647). A4 envelope.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -703,10 +704,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/signals/{obs_type}": {
-      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}": {
-      "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable OR the dex.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}/live": {
       "post": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The request is audited per kind (device.live.uptime / device.live.processes) with result=requested BEFORE the command is dispatched; if the audit row cannot persist the request is rejected with 503 + Sec-Audit-Failed: true and NO command is dispatched (audit-on-open, fail-closed). Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
@@ -5272,18 +5273,27 @@ void RestApiV1::register_routes(
         // FAIL-CLOSED (governance #1549 consistency-B1): an agent-scoped query serves
         // individual-identifying behavioral PII, so refuse to serve when the evidence
         // row is KNOWN to have failed to persist — parity with GET /dex/devices/{id}.
-        // A null audit_fn (audit-off) serves, per the AuditFn contract.
-        if (!q.agent_id.empty() && audit_fn &&
-            !audit_fn(req, "dex.device.view", "success", "Agent", q.agent_id,
-                      "DEX per-device events via REST /api/v1/guaranteed-state/events")) {
+        // The shared #1647 helper sets Sec-Audit-Failed + adds the catch-arm log
+        // (a bad_alloc-class throw from audit_fn was previously silent here); a null
+        // audit_fn (audit-off) returns true and serves, per the AuditFn contract.
+        if (!q.agent_id.empty() &&
+            !detail::emit_behavioral_audit(
+                audit_fn, req, res, "dex.device.view", "success", "Agent", q.agent_id,
+                "DEX per-device events via REST /api/v1/guaranteed-state/events")) {
+            // A4 envelope (correlation_id + retry_after_ms) for parity with the
+            // /dex/devices/{id} + baseline siblings (#1651 review K2); Sec-Audit-Failed
+            // is already set by emit_behavioral_audit. The failure is transient — retry.
+            const auto cid = detail::make_correlation_id();
             res.status = 503;
-            res.set_header("Sec-Audit-Failed", "true");
-            res.set_content(error_json("audit subsystem unavailable; refusing to serve device "
-                                       "data without durable evidence",
-                                       503),
+            res.set_header("X-Correlation-Id", cid);
+            res.set_content(detail::error_json_a4(503,
+                                                  "audit subsystem unavailable; refusing to serve "
+                                                  "device data without durable evidence",
+                                                  cid, 5000, "retry after the audit subsystem "
+                                                             "recovers"),
                             "application/json");
-            spdlog::warn("dex.device.view (events) audit fail-closed (503) agent_id={}",
-                         q.agent_id);
+            spdlog::warn("dex.device.view (events) audit fail-closed (503) agent_id={} cid={}",
+                         q.agent_id, cid);
             return;
         }
         if (req.has_param("limit")) {
@@ -5428,10 +5438,11 @@ void RestApiV1::register_routes(
             // failure audit-on-open exists to prevent (SOC 2 CC7.2 / works-council).
             // A null audit_fn means no audit callback wired (test / audit-off config),
             // not a persistence failure — that path serves, per the AuditFn contract.
-            if (audit_fn && !audit_fn(req, "dex.device.view", "success", "Agent", agent_id,
-                                      "REST per-device DEX read model cid=" + cid)) {
+            // Shared #1647 helper sets Sec-Audit-Failed + logs a bad_alloc-class throw.
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.device.view", "success",
+                                               "Agent", agent_id,
+                                               "REST per-device DEX read model cid=" + cid)) {
                 res.status = 503;
-                res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
                     detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
                                                "device data without durable evidence",
@@ -5743,16 +5754,24 @@ void RestApiV1::register_routes(
                  // FAIL-CLOSED (governance #1549 consistency-B1): refuse to serve the
                  // device list when the evidence row is KNOWN-lost — parity with GET
                  // /dex/devices/{id}. Null audit_fn (audit-off) serves per contract.
-                 if (audit_fn &&
-                     !audit_fn(req, "dex.signal.view", "success", "ObsType", obs_type,
-                               "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}")) {
+                 // Shared #1647 helper sets Sec-Audit-Failed + logs a throwing audit_fn.
+                 if (!detail::emit_behavioral_audit(
+                         audit_fn, req, res, "dex.signal.view", "success", "ObsType", obs_type,
+                         "DEX per-signal drill-down via REST /api/v1/dex/signals/{obs_type}")) {
+                     // A4 envelope (correlation_id + retry_after_ms) for parity with the
+                     // /dex/devices/{id} + baseline siblings (#1651 review K2);
+                     // Sec-Audit-Failed already set by emit_behavioral_audit. Transient — retry.
+                     const auto cid = detail::make_correlation_id();
                      res.status = 503;
-                     res.set_header("Sec-Audit-Failed", "true");
-                     res.set_content(error_json("audit subsystem unavailable; refusing to serve "
-                                                "device data without durable evidence",
-                                                503),
-                                     "application/json");
-                     spdlog::warn("dex.signal.view audit fail-closed (503) obs_type={}", obs_type);
+                     res.set_header("X-Correlation-Id", cid);
+                     res.set_content(
+                         detail::error_json_a4(503,
+                                               "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                               cid, 5000, "retry after the audit subsystem recovers"),
+                         "application/json");
+                     spdlog::warn("dex.signal.view audit fail-closed (503) obs_type={} cid={}",
+                                  obs_type, cid);
                      return;
                  }
 
@@ -6340,9 +6359,30 @@ void RestApiV1::register_routes(
             // return before this point and are intentionally NOT audited here — they
             // carry no authorized access; a scoped-permission DENIAL is audited at the
             // auth layer as auth.scoped_permission_required, not by this verb.
-            if (audit_fn)
-                audit_fn(req, "guardian.device.view", baseline ? "success" : "not_found", "Agent",
-                         agent_id, "baseline " + baseline_id + " per-device guard status via REST");
+            // FAIL-CLOSED (#1647): per-device behavioral PII over REST — refuse to
+            // serve (even the found/not-found distinction) when the evidence row is
+            // KNOWN-lost, parity with the dex.device.view REST siblings. The shared
+            // helper sets Sec-Audit-Failed + logs a throwing audit_fn; a null audit_fn
+            // (audit-off) returns true and serves, per the AuditFn contract.
+            // RECONCILIATION (#1623): the unmerged name-anchored guardian-compliance
+            // route lands as set-and-proceed + audit_emitted; when it merges it MUST
+            // match this verb's posture (fail-closed for REST PII) — two routes sharing
+            // guardian.device.view with opposite postures is the drift #1647 closes.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "guardian.device.view", baseline ? "success" : "not_found",
+                    "Agent", agent_id,
+                    "baseline " + baseline_id + " per-device guard status via REST")) {
+                const auto cid = detail::make_correlation_id();
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("guardian.device.view audit fail-closed (503) agent_id={} baseline={}",
+                             agent_id, baseline_id);
+                return;
+            }
 
             if (!baseline) {
                 const auto cid = detail::make_correlation_id();

@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+  MOCKUP — Device "Get live info" snapshot (feat/device-live-snapshot).
+  Standalone/self-contained: theme tokens + .gp-* + .tar-tree-* component CSS +
+  the tree filter / pop-out helpers inlined, opens in a browser with no server.
+  Mirrors what device_ui.cpp will render (HTMX, dark-theme-only, CSP-safe —
+  inline onclick/oninput only, never hx-on).
+
+  Layout: a compact KPI strip + a uniform responsive grid of category cards.
+  Every card is collapsed by default, same size, scrollable, with a pop-out
+  (⤢) for a larger view. The single Processes card uses the /tar tree format
+  (PR1551 — tar-tree-* / tt-* classes) and carries the SHA-256 + a name/PID/hash
+  search bar (no separate flat list). Not product code.
+-->
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Yuzu — Device live snapshot (mockup)</title>
+  <style>
+    :root{
+      --bg:#0e1a2d;--surface:#1a2940;--surface2:#243553;--border:#2d4068;
+      --fg:#cfdbe8;--fg-strong:#fff;--muted:#8fa3bd;--accent:#00bceb;
+      --green:#4ed27e;--yellow:#ffcc00;--red:#ff5765;
+      --mono:'JetBrains Mono','Cascadia Code','Consolas',monospace;
+      --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+      --hover:rgba(0,188,235,0.06);--role-accent:#00bceb;
+    }
+    *{box-sizing:border-box}
+    body{font-family:var(--sans);background:var(--bg);color:var(--fg);line-height:1.45;margin:0;font-size:13px}
+
+    .nav-bar{height:38px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:1rem;padding:0 1.1rem}
+    .nav-brand{color:var(--fg-strong);font-weight:700;font-size:.95rem;text-decoration:none}
+    .nav-link{color:var(--muted);text-decoration:none;font-size:.78rem}
+    .nav-link.active{color:var(--fg-strong);border-bottom:2px solid var(--role-accent);padding-bottom:2px}
+    .nav-spacer{flex:1}.nav-user{color:var(--muted);font-size:.76rem}
+    .context-bar{height:28px;background:var(--bg);border-bottom:2px solid var(--role-accent);display:flex;align-items:center;gap:.6rem;padding:0 1.1rem}
+    .context-role-badge{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent)}
+    .context-user{font-size:.72rem;color:var(--muted)}
+
+    .gp-wrap{max-width:1180px;margin:1rem auto;padding:0 1.3rem}
+    .gp-back{font-size:.76rem;color:var(--accent);text-decoration:none;display:inline-block;margin-bottom:.55rem}
+    .gp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;border-bottom:1px solid var(--border);padding-bottom:.7rem}
+    .gp-head h1{font-size:1.25rem;font-weight:700;margin:0}
+    .gp-sub{font-size:.76rem;color:var(--muted);margin-top:.25rem}
+    .gp-ok{color:var(--green);font-weight:600}.gp-mute{color:var(--muted)}
+    .gp-btn{padding:.32rem .65rem;font-size:.72rem;border-radius:.35rem;border:1px solid var(--border);background:var(--hover);color:var(--fg);cursor:pointer}
+    .gp-btn:disabled{opacity:.5;cursor:not-allowed}
+    code{font-family:var(--mono)}
+
+    /* KPI strip */
+    .ls-bar{font-size:.72rem;color:var(--muted);margin:.7rem 0 .55rem}.ls-bar b{color:#a5d6ff}
+    .ls-kpis{display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:.8rem}
+    .ls-kpi{background:var(--surface);border:1px solid var(--border);border-radius:.45rem;padding:.4rem .65rem;flex:1;min-width:104px}
+    .ls-kpi .n{font-size:1.15rem;font-weight:700;color:var(--fg-strong);line-height:1.1;font-variant-numeric:tabular-nums}
+    .ls-kpi .n.good{color:var(--green)}.ls-kpi .n.info{color:var(--accent)}
+    .ls-kpi .l{font-size:.55rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-top:.1rem}
+
+    /* uniform collapsible card grid */
+    .ls-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:.6rem;align-items:start}
+    .ls-card{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;overflow:hidden}
+    .ls-card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:.45rem;padding:.45rem .55rem}
+    .ls-card>summary::-webkit-details-marker{display:none}
+    .ls-card>summary::before{content:"\25B8";color:var(--muted);font-size:.66rem;flex:0 0 .7rem}
+    .ls-card[open]>summary{border-bottom:1px solid var(--border)}
+    .ls-card[open]>summary::before{content:"\25BE"}
+    .ls-card>summary:hover{background:var(--hover)}
+    .ls-ttl{font-size:.76rem;font-weight:700;color:var(--fg-strong);white-space:nowrap}
+    .ls-cnt{font-size:.6rem;color:var(--muted);background:var(--hover);border-radius:.6rem;padding:.02rem .4rem;font-variant-numeric:tabular-nums}
+    .ls-os{font-size:.54rem;color:var(--muted);border:1px solid var(--border);border-radius:.25rem;padding:0 .3rem;text-transform:uppercase;letter-spacing:.03em}
+    .ls-prev{flex:1 1 auto;font-size:.66rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+    .ls-prev .px{font-family:var(--mono)}
+    .ls-pop{flex:0 0 auto;background:none;border:1px solid var(--border);color:var(--muted);border-radius:.3rem;font-size:.74rem;line-height:1;padding:.12rem .35rem;cursor:pointer}
+    .ls-pop:hover{color:var(--accent);border-color:var(--accent)}
+    /* fixed body so open cards are the same size; content scrolls */
+    .ls-body{height:248px;overflow:auto;padding:.15rem .55rem .5rem}
+
+    .ls-tbl{width:100%;border-collapse:collapse;font-size:.74rem}
+    .ls-tbl th{position:sticky;top:0;background:var(--surface);text-align:left;padding:.28rem .45rem;border-bottom:1px solid var(--border);color:var(--muted);font-size:.56rem;text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+    .ls-tbl td{padding:.24rem .45rem;border-bottom:1px solid rgba(45,64,104,0.5)}
+    .ls-tbl .name{color:var(--fg-strong);font-weight:600}
+    .ls-num{text-align:right;font-variant-numeric:tabular-nums}
+    .ls-search{background:var(--bg);border:1px solid var(--border);border-radius:.35rem;color:var(--fg);padding:.22rem .45rem;font-size:.72rem;width:100%;margin:.25rem 0 .35rem;position:sticky;top:0}
+    .pill{font-size:.58rem;font-weight:700;border-radius:.25rem;padding:.02rem .35rem;border:1px solid var(--border)}
+    .pill.dyn,.pill.type{color:#a5d6ff}.pill.stat{color:var(--green);border-color:rgba(78,210,126,.5)}.pill.inc{color:var(--muted)}
+    .pill.cat{color:var(--muted)}
+    /* capture-source read-only toggle indicator */
+    .sw{display:inline-block;width:1.7rem;height:.85rem;border-radius:.6rem;background:var(--border);position:relative;flex:0 0 auto;vertical-align:middle}
+    .sw.on{background:rgba(78,210,126,.35)}
+    .sw::after{content:"";position:absolute;top:.13rem;left:.14rem;width:.58rem;height:.58rem;border-radius:50%;background:var(--muted)}
+    .sw.on::after{left:.98rem;background:var(--green)}
+    .src-on{color:var(--green);font-weight:600}.src-off{color:var(--muted)}
+
+    /* process tree — VERBATIM from tar_page_ui.cpp (PR1551), + .tt-hash */
+    .tar-tree-node{margin:0}
+    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:.05rem 0}
+    .tar-tree-node>summary::-webkit-details-marker{display:none}
+    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 1rem;text-align:center;color:var(--muted);font-size:.7rem}
+    .tar-tree-node[open]>summary::before{content:"\25BE"}
+    .tar-tree-children{margin-left:.5rem;padding-left:.7rem;border-left:1px solid var(--border)}
+    .tar-tree-leaf{display:flex;align-items:center;padding:.05rem 0 .05rem 1rem}
+    .tar-tree-row{display:inline-flex;align-items:center;gap:.45rem;flex:1 1 auto;min-width:0;color:var(--fg);text-decoration:none;cursor:pointer;padding:.05rem .3rem;border-radius:.2rem;font-size:.74rem}
+    .tar-tree-row:hover{background:var(--hover)}
+    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--red)}
+    .tt-dot{width:.5rem;height:.5rem;border-radius:50%;flex:0 0 auto}
+    .tt-dot-run{background:var(--green);box-shadow:0 0 4px rgba(60,200,120,.5)}
+    .tt-pid{color:var(--muted);flex:0 0 auto;min-width:3.4rem;text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+    .tt-name{flex:1 1 auto;min-width:0;color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tt-hash{flex:0 0 auto;color:var(--muted);font-family:var(--mono);font-size:.64rem;white-space:nowrap;padding-left:.6rem}
+    .tt-anom{color:var(--red);flex:0 0 auto}
+    /* inline per-process network summary (VERBATIM from tar_page_ui.cpp) */
+    .tt-net{display:inline-flex;align-items:center;gap:.25rem;font-size:.66rem;color:var(--muted);flex:0 0 auto;min-width:0}
+    .tt-net-ico{color:var(--accent)}
+    .tt-net-pub .tt-net-ico{color:var(--yellow)}
+    .tt-ep{background:var(--hover);border-radius:.6rem;padding:0 .35rem;white-space:nowrap;font-variant-numeric:tabular-nums}
+    .tt-ep-pub{color:var(--yellow)}.tt-ep-more{opacity:.7}
+    .tt-group{color:var(--muted)}.tt-group-ico{color:var(--accent);flex:0 0 auto;font-size:.7rem}
+    .tt-group .tt-name{color:var(--fg)}
+    .tt-group-count{color:var(--fg);font-weight:600;background:var(--hover);border-radius:.6rem;padding:0 .4rem;font-size:.7rem}
+    .tt-meta{color:var(--muted);font-size:.7rem;white-space:nowrap}
+
+    .gp-placeholder{text-align:center;color:var(--muted);padding:1rem;font-size:.76rem;background:var(--surface);border:1px dashed var(--border);border-radius:.5rem}
+    .gp-placeholder b{display:block;color:var(--fg-strong);margin-bottom:.2rem}
+    h2.grp{font-size:.62rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:700;margin:1.1rem 0 .3rem}
+    .grp-row{display:flex;align-items:center;justify-content:space-between;gap:.6rem;margin:1.1rem 0 .3rem}
+    .ls-toggle{background:var(--hover);border:1px solid var(--border);color:var(--fg);border-radius:.35rem;font-size:.66rem;padding:.2rem .55rem;cursor:pointer}
+    .ls-toggle:hover{color:var(--accent);border-color:var(--accent)}
+    .note{font-size:.7rem;color:var(--muted);margin:.1rem 0 .4rem}.note b{color:#a5d6ff}
+
+    /* pop-out dialog (larger view) */
+    dialog.po{border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:.6rem;padding:0;width:82vw;max-width:1040px}
+    dialog.po::backdrop{background:rgba(4,12,24,.66)}
+    .po-head{display:flex;align-items:center;justify-content:space-between;gap:.6rem;padding:.55rem .8rem;border-bottom:1px solid var(--border)}
+    .po-head .t{font-size:.92rem;font-weight:700;color:var(--fg-strong)}
+    .po-close{background:none;border:1px solid var(--border);color:var(--fg);border-radius:.35rem;padding:.2rem .55rem;cursor:pointer}
+    .po-body{padding:.6rem .8rem;max-height:76vh;overflow:auto}
+  </style>
+</head>
+<body>
+  <nav class="nav-bar">
+    <a href="#" class="nav-brand">Yuzu</a>
+    <a href="#" class="nav-link">Dashboard</a><a href="#" class="nav-link">Compliance</a>
+    <a href="#" class="nav-link">Guardian</a><a href="#" class="nav-link">DEX</a>
+    <a href="#" class="nav-link">TAR</a><a href="#" class="nav-link active">Devices</a>
+    <span class="nav-spacer"></span><span class="nav-user">alex@alexanderyoung.org</span>
+  </nav>
+  <div class="context-bar"><span class="context-role-badge">Administrator</span><span class="context-user">alex</span></div>
+
+  <div class="gp-wrap">
+    <a class="gp-back" href="#">&larr; Devices</a>
+    <div class="gp-head">
+      <div>
+        <h1>WIN-DEV-07</h1>
+        <div class="gp-sub">Windows / x86_64 &middot; <span class="gp-ok">online</span>
+          &middot; DEX <span class="gp-ok">96</span> &middot; agent v0.12.0 &middot; last seen now</div>
+      </div>
+      <div style="text-align:right">
+        <button class="gp-btn">&#9889; Get live info</button>
+        <div class="gp-mute" style="font-size:.62rem;margin-top:.25rem">read-only &middot; Execute-gated &middot; audited</div>
+      </div>
+    </div>
+
+    <div class="ls-bar">Live snapshot captured <b>just now</b> &middot; each card loads on demand;
+      one <code>device.live.&lt;kind&gt;</code> audit record per card. Cards are collapsed &mdash;
+      expand inline, or use <b>&#10530;</b> to pop out a larger view.</div>
+
+    <div class="ls-kpis">
+      <div class="ls-kpi"><div class="n">4d 03:21</div><div class="l">Uptime</div></div>
+      <div class="ls-kpi"><div class="n info">182</div><div class="l">Processes</div></div>
+      <div class="ls-kpi"><div class="n good">198</div><div class="l">Services running</div></div>
+      <div class="ls-kpi"><div class="n">3</div><div class="l">Listening ports</div></div>
+      <div class="ls-kpi"><div class="n">14</div><div class="l">Connections</div></div>
+      <div class="ls-kpi"><div class="n">3</div><div class="l">Logged-in users</div></div>
+    </div>
+
+    <div class="grp-row"><h2 class="grp" style="margin:0">Live cards</h2>
+      <button class="ls-toggle" onclick="toggleAll(this)">Expand all</button></div>
+    <div class="ls-grid">
+
+      <!-- ── Processes: single card = tree + hash + name/PID/hash search ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Processes</span><span class="ls-cnt">182</span>
+          <span class="ls-prev"><span class="px">tree &middot; SHA-256 &middot; excel.exe&rarr;powershell.exe flagged</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body">
+          <input class="ls-search" type="text" placeholder="Search name, PID, or hash&hellip;" oninput="filterTree(this)">
+          <div class="note">Windows names-only (no command line / path); suspicious parent&rarr;child spawns flagged.</div>
+          <div class="proctree">
+            <details class="tar-tree-node" open>
+              <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4</span><span class="tt-name">System</span><span class="tt-hash">&mdash;</span></span></summary>
+              <div class="tar-tree-children">
+                <details class="tar-tree-node" open>
+                  <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">388</span><span class="tt-name">smss.exe</span><span class="tt-hash" title="b1e4c0…full sha256">b1e4c0…8f2a</span></span></summary>
+                  <div class="tar-tree-children">
+                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">712</span><span class="tt-name">winlogon.exe</span><span class="tt-hash" title="3c9d…full">3c9d11…11ef</span></span></div>
+                  </div>
+                </details>
+              </div>
+            </details>
+            <details class="tar-tree-node" open>
+              <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">980</span><span class="tt-name">services.exe</span><span class="tt-hash" title="7a22…full">7a22f0…90bc</span></span></summary>
+              <div class="tar-tree-children">
+                <details class="tar-tree-node tar-tree-group">
+                  <summary><span class="tar-tree-row tt-group"><span class="tt-group-ico">&#9646;</span><span class="tt-name">svchost.exe</span><span class="tt-group-count">&times;12</span><span class="tt-meta">12 running</span></span></summary>
+                  <div class="tar-tree-children">
+                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1124</span><span class="tt-name">svchost.exe</span><span class="tt-net" title=":445 listen tcp  :3389 listen tcp"><span class="tt-net-ico">&#8599;</span>2<span class="tt-ep">:445 listen</span><span class="tt-ep">:3389 listen</span></span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1180</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1244</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+                  </div>
+                </details>
+                <details class="tar-tree-node" open>
+                  <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4188</span><span class="tt-name">explorer.exe</span><span class="tt-hash" title="9f7c…full">9f7c2a…a2d1</span></span></summary>
+                  <div class="tar-tree-children">
+                    <details class="tar-tree-node" open>
+                      <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5678</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.112.4:443 tcp  20.190.160.3:443 tcp  10.0.4.10:8080 tcp"><span class="tt-net-ico">&#8599;</span>3<span class="tt-ep tt-ep-pub">140.82.112.4:443</span><span class="tt-ep tt-ep-pub">20.190.160.3:443</span><span class="tt-ep tt-ep-more">+1</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></summary>
+                      <div class="tar-tree-children">
+                        <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5680</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.113.21:443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">140.82.113.21:443</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
+                        <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5712</span><span class="tt-name">chrome.exe</span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
+                      </div>
+                    </details>
+                    <div class="tar-tree-leaf"><span class="tar-tree-row" data-anom="1"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">9001</span><span class="tt-name">powershell.exe</span><span class="tt-anom" title="excel.exe spawned a shell">&#9888;</span><span class="tt-net tt-net-pub" title="185.220.101.5:8443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">185.220.101.5:8443</span></span><span class="tt-hash" title="5e5e…full">5e5e0f…0f0f</span></span></div>
+                  </div>
+                </details>
+              </div>
+            </details>
+          </div>
+        </div>
+      </details>
+
+      <!-- ── Services ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Services</span><span class="ls-cnt">214 &middot; 198 run</span>
+          <span class="ls-prev"><span class="px">Spooler, Dnscache, WinDefend&hellip;</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body">
+          <input class="ls-search" type="text" placeholder="Search service&hellip;" oninput="filterRows(this)">
+          <table class="ls-tbl"><thead><tr><th>Service</th><th>State</th><th>Startup</th></tr></thead><tbody id="svc-body"></tbody></table>
+        </div>
+      </details>
+
+      <!-- ── Logged-in users ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Logged-in users</span><span class="ls-cnt">3</span>
+          <span class="ls-prev"><span class="px">CORP\alex +2</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body"><table class="ls-tbl"><thead><tr><th>User</th><th>Host</th><th>Logon</th><th>Session</th></tr></thead><tbody>
+          <tr><td class="name">CORP\alex</td><td>local</td><td>Interactive</td><td class="gp-mute">console</td></tr>
+          <tr><td class="name">CORP\svc-backup</td><td>local</td><td>Service</td><td class="gp-mute">&mdash;</td></tr>
+          <tr><td class="name">CORP\jdoe</td><td>10.0.4.51</td><td>RemoteInteractive</td><td class="gp-mute">RDP-Tcp#2</td></tr>
+        </tbody></table></div>
+      </details>
+
+      <!-- ── Adapters & IP ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Adapters &amp; IP</span><span class="ls-cnt">3</span>
+          <span class="ls-prev"><span class="px">Ethernet 10.0.4.27/24</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body"><table class="ls-tbl"><thead><tr><th>Adapter</th><th>IP address</th><th class="ls-num">/</th><th>Gateway</th></tr></thead><tbody>
+          <tr><td class="name">Ethernet</td><td><code>10.0.4.27</code></td><td class="ls-num">24</td><td><code>10.0.4.1</code></td></tr>
+          <tr><td class="name">Ethernet</td><td><code>fe80::1c2d:4e5f:6a7b:8c9d</code></td><td class="ls-num">64</td><td class="gp-mute">&mdash;</td></tr>
+          <tr><td class="name">Loopback</td><td><code>127.0.0.1</code></td><td class="ls-num">8</td><td class="gp-mute">&mdash;</td></tr>
+        </tbody></table></div>
+      </details>
+
+      <!-- ── ARP ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">ARP / neighbours</span><span class="ls-os">Win</span><span class="ls-cnt">3</span>
+          <span class="ls-prev"><span class="px">10.0.4.1 &rarr; 00:1a:2b&hellip;</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body"><table class="ls-tbl"><thead><tr><th>Iface</th><th>IP</th><th>MAC</th><th>Type</th></tr></thead><tbody>
+          <tr><td class="name">Ethernet</td><td><code>10.0.4.1</code></td><td><code>00:1a:2b:3c:4d:5e</code></td><td><span class="pill dyn">dynamic</span></td></tr>
+          <tr><td class="name">Ethernet</td><td><code>10.0.4.55</code></td><td><code>a4:bb:6d:11:22:33</code></td><td><span class="pill stat">static</span></td></tr>
+          <tr><td class="name">Ethernet</td><td><code>10.0.4.99</code></td><td class="gp-mute">-</td><td><span class="pill inc">incomplete</span></td></tr>
+        </tbody></table></div>
+      </details>
+
+      <!-- ── DNS cache ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">DNS cache</span><span class="ls-os">Win</span><span class="ls-cnt">6</span>
+          <span class="ls-prev"><span class="px">github.com, api.github.com&hellip;</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body">
+          <input class="ls-search" type="text" placeholder="Search name&hellip;" oninput="filterRows(this)">
+          <table class="ls-tbl"><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody id="dns-body"></tbody></table>
+        </div>
+      </details>
+
+      <!-- ── Listening ports ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Listening ports</span><span class="ls-cnt">3</span>
+          <span class="ls-prev"><span class="px">:445 :3389 :50051</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body"><table class="ls-tbl"><thead><tr><th>Proto</th><th>Local</th><th class="ls-num">Port</th><th class="ls-num">PID</th></tr></thead><tbody>
+          <tr><td>tcp</td><td><code>0.0.0.0</code></td><td class="ls-num">445</td><td class="ls-num">4</td></tr>
+          <tr><td>tcp</td><td><code>0.0.0.0</code></td><td class="ls-num">3389</td><td class="ls-num">1124</td></tr>
+          <tr><td>tcp</td><td><code>127.0.0.1</code></td><td class="ls-num">50051</td><td class="ls-num">7420</td></tr>
+        </tbody></table></div>
+      </details>
+
+      <!-- ── Active connections ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Active connections</span><span class="ls-cnt">14</span>
+          <span class="ls-prev"><span class="px">140.82.112.4:443 ESTAB +13</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body"><table class="ls-tbl"><thead><tr><th>Local</th><th>Remote</th><th>State</th></tr></thead><tbody>
+          <tr><td><code>10.0.4.27:52210</code></td><td><code>140.82.112.4:443</code></td><td class="gp-ok">ESTAB</td></tr>
+          <tr><td><code>10.0.4.27:52344</code></td><td><code>10.0.4.10:8080</code></td><td class="gp-ok">ESTAB</td></tr>
+          <tr><td><code>10.0.4.27:52988</code></td><td><code>52.96.0.1:443</code></td><td class="gp-mute">TIME_WAIT</td></tr>
+        </tbody></table></div>
+      </details>
+
+      <!-- ── Capture sources (bottom-right): what TAR is capturing locally on this device ── -->
+      <details class="ls-card">
+        <summary><span class="ls-ttl">Capture sources</span><span class="ls-cnt">7 of 10 on</span>
+          <span class="ls-prev"><span class="px">Process, TCP, Service, ARP, DNS&hellip;</span></span>
+          <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
+        <div class="ls-body">
+          <div class="note">TAR warehouse capture running on this device (background &middot; distinct from the
+            live snapshot above). Read-only here &mdash; <a href="#" style="color:var(--accent)">configure on TAR &rarr;</a></div>
+          <table class="ls-tbl"><thead><tr><th></th><th>Source</th><th>Table</th><th class="ls-num">Live rows</th><th>Category</th></tr></thead><tbody>
+            <tr><td><span class="sw on"></span></td><td class="src-on">process</td><td><code>$Process_Live</code></td><td class="ls-num">100,000</td><td><span class="pill cat">Activity</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">tcp</td><td><code>$TCP_Live</code></td><td class="ls-num">8,412</td><td><span class="pill cat">Network</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">service</td><td><code>$Service_Live</code></td><td class="ls-num">214</td><td><span class="pill cat">Inventory</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">user</td><td><code>$User_Live</code></td><td class="ls-num">37</td><td><span class="pill cat">Identity</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">perf</td><td><code>$Perf_Live</code></td><td class="ls-num">1,440</td><td><span class="pill cat">Performance</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">arp</td><td><code>$ARP_Live</code></td><td class="ls-num">26</td><td><span class="pill cat">Network</span></td></tr>
+            <tr><td><span class="sw on"></span></td><td class="src-on">dns</td><td><code>$DNS_Live</code></td><td class="ls-num">312</td><td><span class="pill cat">Network</span></td></tr>
+            <tr><td><span class="sw"></span></td><td class="src-off">procperf</td><td><code>$ProcPerf_Live</code></td><td class="ls-num gp-mute">&mdash;</td><td><span class="pill cat">Performance</span></td></tr>
+            <tr><td><span class="sw"></span></td><td class="src-off">netqual</td><td><code>$NetQual_Live</code></td><td class="ls-num gp-mute">&mdash;</td><td><span class="pill cat">Network</span></td></tr>
+            <tr><td><span class="sw"></span></td><td class="src-off">module</td><td><code>$Module_Live</code></td><td class="ls-num gp-mute">&mdash;</td><td><span class="pill cat">Inventory</span></td></tr>
+          </tbody></table>
+        </div>
+      </details>
+
+    </div>
+
+    <h2 class="grp">Panel states (review only — not part of the live view)</h2>
+    <div class="ls-grid">
+      <div class="gp-placeholder"><b>Offline device</b><button class="gp-btn" disabled>&#9889; Get live info</button>
+        <div style="margin-top:.3rem">button disabled — needs a connected agent</div></div>
+      <div class="gp-placeholder"><b>Read-only operator</b>Live info needs the <b style="color:#a5d6ff">Execute</b> permission.</div>
+      <div class="gp-placeholder"><b>Empty / not available</b>DNS cache empty, or this OS has no resolver cache.</div>
+    </div>
+  </div>
+
+  <!-- pop-out dialog -->
+  <dialog class="po" id="popout">
+    <div class="po-head"><span class="t" id="po-title">Card</span>
+      <button class="po-close" onclick="document.getElementById('popout').close()">Close &times;</button></div>
+    <div class="po-body" id="po-body"></div>
+  </dialog>
+
+  <script>
+    /* Expand-all / collapse-all toggle for the live cards (scoped to the first
+       grid; the panel-states grid has no .ls-card children). */
+    function toggleAll(btn){
+      var cards = document.querySelectorAll('.ls-grid .ls-card');
+      var anyClosed = Array.prototype.some.call(cards, function(c){ return !c.open; });
+      cards.forEach(function(c){ c.open = anyClosed; });
+      btn.textContent = anyClosed ? 'Collapse all' : 'Expand all';
+    }
+    /* Pop out a card's body into the dialog at a larger size. Inline onclick is
+       CSP-safe (unsafe-inline allowed; only hx-on/new Function is blocked). */
+    function popOut(ev, btn){
+      ev.preventDefault(); ev.stopPropagation();           // don't toggle the <details>
+      var card = btn.closest('.ls-card');
+      document.getElementById('po-title').textContent = card.querySelector('.ls-ttl').textContent;
+      document.getElementById('po-body').innerHTML = card.querySelector('.ls-body').innerHTML;
+      document.getElementById('popout').showModal();
+    }
+    /* Tree filter — matches the /tar page: hide all, reveal each matching row's
+       ancestor chain (matches PID/name/hash via row.textContent). Scoped to the
+       nearest body so it works in the card AND the pop-out clone. */
+    function filterTree(input){
+      var scope = input.closest('.ls-body,.po-body'); if(!scope) return;
+      var tree = scope.querySelector('.proctree'); if(!tree) return;
+      var q = (input.value||'').trim().toLowerCase();
+      var nodes = tree.querySelectorAll('.tar-tree-node,.tar-tree-leaf');
+      if(!q){ nodes.forEach(function(el){el.style.display='';}); return; }
+      nodes.forEach(function(el){el.style.display='none';});
+      tree.querySelectorAll('.tar-tree-row').forEach(function(row){
+        if(row.textContent.toLowerCase().indexOf(q)===-1) return;
+        var el = row.closest('.tar-tree-leaf,.tar-tree-node');
+        while(el && tree.contains(el)){
+          el.style.display='';
+          if(el.tagName==='DETAILS') el.open=true;
+          el = el.parentElement ? el.parentElement.closest('.tar-tree-node') : null;
+        }
+      });
+    }
+    /* Plain table-row filter (services, DNS). */
+    function filterRows(input){
+      var scope = input.closest('.ls-body,.po-body'); if(!scope) return;
+      var q = (input.value||'').trim().toLowerCase();
+      scope.querySelectorAll('tbody tr').forEach(function(tr){
+        var t = (tr.getAttribute('data-gpname')||tr.textContent).toLowerCase();
+        tr.style.display = (!q || t.indexOf(q)!==-1) ? '' : 'none';
+      });
+    }
+
+    var SERVICES=[['Spooler','Running','Automatic'],['Dnscache','Running','Automatic'],['W32Time','Running','Manual'],
+      ['Schedule','Running','Automatic'],['WinDefend','Running','Automatic'],['LanmanServer','Running','Automatic'],
+      ['TermService','Running','Manual'],['Themes','Running','Automatic'],['wuauserv','Stopped','Manual'],
+      ['SysMain','Stopped','Disabled'],['YuzuAgent','Running','Automatic']];
+    var DNS=[['github.com','A'],['api.github.com','A'],['login.microsoftonline.com','A'],['fleet.corp.local','A'],['1.0.0.10.in-addr.arpa','PTR'],['ipv6.example.net','AAAA']];
+    function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+    var sb=document.getElementById('svc-body');
+    SERVICES.forEach(function(r){
+      var st=r[1]==='Running'?'<span class="gp-ok">Running</span>':'<span class="gp-mute">Stopped</span>';
+      sb.insertAdjacentHTML('beforeend','<tr><td class="name">'+esc(r[0])+'</td><td>'+st+'</td><td class="gp-mute">'+esc(r[2])+'</td></tr>');});
+    var db=document.getElementById('dns-body');
+    DNS.forEach(function(r){
+      db.insertAdjacentHTML('beforeend','<tr><td class="name">'+esc(r[0])+'</td><td><span class="pill type">'+esc(r[1])+'</span></td></tr>');});
+  </script>
+</body>
+</html>

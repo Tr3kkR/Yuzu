@@ -30,6 +30,12 @@ struct LiveKind {
     std::string action;
     std::string label;
     std::string audit_action;
+    // Optional SECONDARY dispatch joined at render (the dashboard process_tree card
+    // dispatches network_diag/connections alongside processes/list_tree and joins by
+    // PID). Empty for kinds with no join. The shared REST surface ignores these — it
+    // does not yet render the dashboard-only multi-card kinds (A1 backfill, #1649).
+    std::string plugin2;
+    std::string action2;
 };
 
 inline std::optional<LiveKind> resolve_kind(const std::string& kind) {

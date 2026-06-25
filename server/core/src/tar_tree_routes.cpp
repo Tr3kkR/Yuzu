@@ -210,7 +210,9 @@ PollResult poll_command(const TarTreeRoutes::ResponsesFn& responses_fn, const st
     PollResult pr;
     if (!responses_fn)
         return pr;
-    const auto rows = responses_fn(command_id);
+    // #1634: scope the poll read at the store seam (q.agent_id); the post-filter
+    // on `device` below is retained as defense-in-depth.
+    const auto rows = responses_fn(command_id, device);
     const DexAgentResponse* with_output = nullptr;
     const DexAgentResponse* terminal = nullptr;
     for (const auto& r : rows) {

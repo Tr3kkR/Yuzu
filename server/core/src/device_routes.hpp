@@ -130,6 +130,62 @@ std::string render_device_live_processes(const std::vector<LiveProcess>& procs);
 /// PURE: render a simple key/value live result (e.g. os_info/uptime) as a tile.
 std::string render_device_live_value(const std::string& label, const std::string& value);
 
+// ── Live snapshot v2: TAR-styled collapsible cards (feat/device-live-snapshot) ──
+// Each card is fed by ONE live plugin action (process_tree joins a second), parsed
+// in device_routes.cpp and rendered by the typed PURE renderers below. All agent
+// fields are HTML-escaped at render. Mockup: docs/mockups/device-live-snapshot.html.
+
+/// One node of the live process tree (processes/list_tree → proc|pid|ppid|name|sha256|path).
+struct LiveProcNode {
+    std::uint32_t pid = 0;
+    std::uint32_t ppid = 0;
+    std::string name;
+    std::string sha256; ///< lowercase hex; "" if unresolved
+    std::string path;   ///< resolved exe path; "" if unresolved
+};
+
+/// One live TCP entry joined to a tree node by pid (network_diag/connections, Windows
+/// emits the owning pid). `listening` rows have no remote endpoint.
+struct LiveConn {
+    std::uint32_t pid = 0;
+    std::string remote_addr; ///< "" for a listener
+    int remote_port = 0;
+    int local_port = 0;
+    bool listening = false;
+};
+
+struct LiveArpEntry { std::string iface, ip, mac, type; };
+struct LiveDnsEntry { std::string name, record_type; };
+struct LiveListen { std::string proto, ip; int port = 0; long long pid = 0; };
+struct LiveConnRow { std::string proto, local, remote, state; };
+struct LiveService { std::string name, display, status, startup; };
+struct LiveUserRow { std::string user, host, logon_type, session; };
+struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
+/// One TAR capture source's local state (tar/status → config|<src>_enabled / _live_rows).
+/// `dollar`/`category` are server-side presentation metadata (the agent schema registry
+/// is not linked into the server, so the source list is hand-held in device_routes.cpp;
+/// only sources the agent actually reports are rendered).
+struct LiveCaptureSource {
+    std::string name, dollar, category;
+    bool enabled = false;
+    long long live_rows = -1; ///< -1 = unknown (no count reported)
+};
+
+/// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.
+/// render_device_live_tree reconstructs a parent→child tree from the flat node set
+/// (cycle/cap guarded) and joins `conns` by pid for the inline `tt-net` summary,
+/// mirroring the /tar process-tree viewer.
+std::string render_device_live_tree(const std::vector<LiveProcNode>& nodes,
+                                    const std::vector<LiveConn>& conns);
+std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows);
+std::string render_device_live_dns(const std::vector<LiveDnsEntry>& rows);
+std::string render_device_live_listening(const std::vector<LiveListen>& rows);
+std::string render_device_live_connections(const std::vector<LiveConnRow>& rows);
+std::string render_device_live_services(const std::vector<LiveService>& rows);
+std::string render_device_live_users(const std::vector<LiveUserRow>& rows);
+std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
+std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
+
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
 
