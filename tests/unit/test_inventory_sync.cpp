@@ -213,6 +213,34 @@ TEST_CASE("clamp_field scrubs invalid UTF-8 to U+FFFD before hashing (UP-IN1)",
     CHECK(installed_software_canonical_blob(e).find('\xe9') == std::string::npos);
 }
 
+// Raw bytes exercising EVERY PG-strict rejection branch (overlong, surrogate,
+// > U+10FFFF, stray lead) plus valid 2- and 4-byte passthrough, and the EXACT
+// expected scrub output. These two literals are duplicated verbatim in the server
+// suite (test_software_inventory_store.cpp) — the whole anti-loop contract rests on
+// the agent's clamp_field and the server's parse_software_blob scrubbing IDENTICALLY,
+// and this pins both copies to the same spec so editing one without the other fails
+// a test (gov Gate-8 cpp-safety/unhappy-path drift guard).
+namespace {
+const std::string kScrubVectorRaw = std::string("X") + "\xc0\x80" + // overlong NUL → 2× U+FFFD
+                                    "\xed\xa0\x80" +                 // lone surrogate U+D800 → 3×
+                                    "\xf4\x90\x80\x80" +             // > U+10FFFF → 4×
+                                    "\xc3\xa9" +                     // é valid 2-byte (passthrough)
+                                    "\xf0\x9f\x98\x80" +             // 😀 valid 4-byte (passthrough)
+                                    "\xf5";                          // invalid lead → 1×
+const std::string kScrubVectorExpected =
+    std::string("X") + "\xef\xbf\xbd\xef\xbf\xbd" +                       // C0 80
+    "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" +                              // ED A0 80
+    "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" +                  // F4 90 80 80
+    "\xc3\xa9" + "\xf0\x9f\x98\x80" + "\xef\xbf\xbd";                     // é 😀 F5
+} // namespace
+
+TEST_CASE("clamp_field scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard)",
+          "[sync][parse]") {
+    auto e = parse_installed_apps_output("app|" + kScrubVectorRaw + "|1|p|d\n");
+    REQUIRE(e.size() == 1);
+    CHECK(e[0].name == kScrubVectorExpected);
+}
+
 TEST_CASE("collect skips an empty inventory rather than wiping stored rows (UP-IN6)",
           "[sync][parse]") {
     // A transient empty parse (plugin hiccup / "No applications found" sentinel) must

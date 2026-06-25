@@ -236,6 +236,41 @@ TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches
     CHECK(ack2.need_full_size() == 0);
 }
 
+TEST_CASE("ingest scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard)",
+          "[pg][software_inventory][seam]") {
+    // These two literals are duplicated VERBATIM from the agent suite
+    // (test_inventory_sync.cpp kScrubVectorRaw/kScrubVectorExpected). The agent's
+    // clamp_field and the server's parse_software_blob MUST scrub identically or the
+    // canonical hashes diverge → permanent always-full. Editing one scrub copy without
+    // the other fails one of these two tests (gov Gate-8 drift guard).
+    const std::string raw = std::string("X") + "\xc0\x80" + "\xed\xa0\x80" + "\xf4\x90\x80\x80" +
+                            "\xc3\xa9" + "\xf0\x9f\x98\x80" + "\xf5";
+    const std::string expected =
+        std::string("X") + "\xef\xbf\xbd\xef\xbf\xbd" + "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" +
+        "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" + "\xc3\xa9" + "\xf0\x9f\x98\x80" +
+        "\xef\xbf\xbd";
+
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The hash the agent would compute after its identical scrub.
+    const std::string agent_hash =
+        SoftwareInventoryStore::canonical_hash({{expected, "1", "p", "d"}});
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = agent_hash;
+    (*rep.mutable_plugin_data())["installed_software"] = blob1(raw, "1", "p", "d");
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-scrub-vec", rep, ack);
+    CHECK(ack.need_full_size() == 0); // PG accepted the scrubbed valid UTF-8
+
+    auto rows = store.get_agent_software("agent-scrub-vec");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == expected); // server scrub == agent scrub, byte-for-byte
+}
+
 TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 kError path)",
           "[pg][software_inventory][seam]") {
     // The UP-2 hardening: when apply_installed_software returns kError (a transient
