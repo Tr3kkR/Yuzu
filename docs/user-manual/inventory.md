@@ -15,8 +15,18 @@ cadences.
   `dpkg`/`rpm`/`pacman`; macOS: `system_profiler`).
 - **No end-user profiles / personal data.** We do **not** use the plugin's
   per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
-  usernames are collected — no end-user PII, no works-council trigger. (The only
-  `HKCU` read is the agent's own service-account hive, which is benign.)
+  usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
+  own service-account hive, which is benign.) It carries **lower behavioral
+  sensitivity** than the process/performance tiers (no run-time, no resource
+  attribution). **Note for works-council jurisdictions:** the data is still
+  device-attributable, and on personally-assigned devices installed-software
+  enumeration may be co-determination-relevant under national law (e.g. BetrVG
+  §87(1)(6)) — co-determination is triggered by the *capability to monitor*, not
+  by username presence. Use the opt-out below where an agreement requires it.
+- **Disabling it.** Pass **`--inventory-disable`** (or set
+  `YUZU_AGENT_INVENTORY_DISABLE`) on the agent to collect and push **no**
+  installed-software inventory. Deploy-time opt-out; not a server-side runtime
+  toggle.
 
 ## How the sync behaves (and why it's quiet on the network)
 

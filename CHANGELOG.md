@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
   **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
   scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
-  tools. A REST endpoint and software dashboard are planned follow-ons.
+  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
+  privacy-sensitive / works-council jurisdictions. UTF-8 field truncation is codepoint-boundary-safe
+  (no PostgreSQL TEXT-reject loop), and `query_installed_software` reports `devices_omitted` so a
+  scoped caller can distinguish "outside my scope" from "not installed".
 
 ### Security
 

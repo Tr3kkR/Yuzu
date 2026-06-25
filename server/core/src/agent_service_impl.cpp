@@ -689,6 +689,16 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     // Normalized installed_software via the shared seam (ADR-0016 §5) — the same
     // seam the gateway ProxyInventory path uses. Isolate ingest failures so a
     // bad payload can't fail the RPC into a retry loop.
+    //
+    // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): unlike
+    // GatewayUpstreamServiceImpl::ProxyInventory, this direct path does NOT also
+    // upsert *generic* (non-typed) plugin_data keys into the generic InventoryStore.
+    // Latent + non-regressive in slice 1: the agent registers exactly one source
+    // (installed_software, routed through the typed seam on both paths), and
+    // installed_software was never a live generic-store key. When a second, generic
+    // sync source lands, fold the generic-blob upsert INTO ingest_inventory_report
+    // (pass the InventoryStore&) so both paths stay symmetric — do NOT add a parallel
+    // loop here. Tracked as the source-#2 blocker.
     try {
         ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response, &metrics_);
     } catch (const std::exception& ex) {

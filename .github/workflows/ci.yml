@@ -305,6 +305,12 @@ jobs:
       # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
       # un-regenerated, silently field-dropping _pb.erl (e.g. management_pb, which
       # no test exercises) fails the merge-guarding path — not only release.yml.
+      # Warm gateway _build first: check-proto-codegen.sh needs _build/.../gpb/ebin,
+      # which nothing earlier provisions. On a cold/wiped workspace the check would
+      # otherwise exit before the meson build that warms _build — an unrecoverable
+      # deadlock (gov build-ci). rebar3 compile is idempotent/fast on a warm runner.
+      - name: Compile gateway (warm _build for the codegen check)
+        run: cd gateway && rebar3 compile
       - name: Verify gateway proto codegen is up to date
         run: bash gateway/scripts/check-proto-codegen.sh
 
