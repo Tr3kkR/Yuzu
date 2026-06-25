@@ -60,6 +60,28 @@ WHERE agent_id = '<agent-id>'
 ORDER BY name;
 ```
 
+**Counting the *active* fleet (excluding decommissioned devices).** A device's
+rows persist after it stops reporting — Yuzu keeps last-known state rather than
+silently dropping a host (the same posture as the offline-endpoint view). So for
+software-asset-management counts ("how many devices run X *right now*"), scope to
+recently-seen devices via `inventory_state.last_seen` rather than counting raw
+rows, which would include long-gone hosts:
+
+```sql
+-- Devices that ran Google Chrome AND reported within the last 30 days
+SELECT s.agent_id, s.version
+FROM software_inventory_store.installed_software s
+JOIN software_inventory_store.inventory_state st
+  ON st.agent_id = s.agent_id AND st.source = 'installed_software'
+WHERE s.name = 'Google Chrome'
+  AND st.last_seen > EXTRACT(EPOCH FROM now()) - 30 * 86400
+ORDER BY s.version;
+```
+
+(A platform-wide decommission/retention purge across all per-device stores is a
+tracked follow-on; until then, `last_seen` is the canonical "is this device still
+active" filter.)
+
 ### MCP (for agentic workers)
 
 The **`query_installed_software`** MCP tool exposes the same data to agentic
