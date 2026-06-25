@@ -7,6 +7,7 @@
 
 #include "agent.pb.h"
 #include "inventory_ingestion.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
@@ -24,6 +25,7 @@ using yuzu::server::SoftwareEntry;
 using yuzu::server::SoftwareFleetQuery;
 using yuzu::server::SoftwareInventoryStore;
 using yuzu::server::pg::PgPool;
+namespace pg = yuzu::server::pg;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
@@ -165,4 +167,40 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         CHECK(ack.need_full(0) == "installed_software");
         CHECK(store.get_agent_software("agent-oversized").empty());
     }
+}
+
+TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 kError path)",
+          "[pg][software_inventory][seam]") {
+    // The UP-2 hardening: when apply_installed_software returns kError (a transient
+    // store failure, NOT a cold cache), the seam must nack need_full so the agent
+    // resends rather than silently advancing past un-stored data. Every other seam
+    // test hits kStored/kTouched/kNeedFull/dropped; this is the only one that drives
+    // the kError branch (QE Gate-8 coverage gap). Induced by dropping the store's
+    // schema out from under an open store so the full-payload transaction's first
+    // statement fails (kError, returned not thrown — verified in the store).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    const std::string blob = blob1("Chrome", "119", "Google", "2026-01-01");
+    const std::string h =
+        SoftwareInventoryStore::canonical_hash({{"Chrome", "119", "Google", "2026-01-01"}});
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = h;
+    (*rep.mutable_plugin_data())["installed_software"] = blob; // FULL payload → exercises apply
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-err", rep, ack);
+    REQUIRE(ack.need_full_size() == 1);
+    CHECK(ack.need_full(0) == "installed_software");
 }
