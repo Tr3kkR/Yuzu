@@ -185,6 +185,18 @@ TEST_CASE("clamp_field strips framing separators and truncates over-long fields"
     CHECK(e2[0].name.size() == 1024); // truncated to kMaxFieldLen
 }
 
+TEST_CASE("clamp_field truncates on a UTF-8 codepoint boundary, not mid-sequence (UP-10)",
+          "[sync][parse]") {
+    // A 2-byte 'é' (0xC3 0xA9) straddling the 1024-byte cut must be dropped WHOLE,
+    // not split into a lone lead byte 0xC3 — invalid UTF-8 would make PostgreSQL's
+    // TEXT column reject the row → permanent need_full loop (governance UP-10).
+    std::string name = std::string(1023, 'a') + "\xc3\xa9"; // 1025 bytes; é at [1023,1024]
+    auto e = parse_installed_apps_output("app|" + name + "|1|p|d\n");
+    REQUIRE(e.size() == 1);
+    CHECK(e[0].name == std::string(1023, 'a')); // é dropped whole; no trailing 0xC3
+    CHECK(e[0].name.size() == 1023);
+}
+
 TEST_CASE("a name that becomes empty after clamping is dropped (UP-1 hash parity)",
           "[sync][parse]") {
     // A separator-only name clamps to "" — the server's parse_software_blob drops

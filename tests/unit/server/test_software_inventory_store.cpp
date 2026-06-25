@@ -169,6 +169,33 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
     }
 }
 
+TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",
+          "[pg][software_inventory][seam]") {
+    // Regression for the UTF-8 byte-cut: a raw field whose multibyte codepoint
+    // straddles the 1024-byte cap must be truncated on the codepoint boundary, NOT
+    // mid-sequence — otherwise the INSERT into the UTF8 TEXT column is rejected by
+    // PostgreSQL (22021) → kError → need_full, never storing. The row must STORE.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // name = 1023 'a' + 'é' (0xC3 0xA9) = 1025 bytes; record = name|1|| (0x1F fields,
+    // 0x1E terminator; octal \037=0x1F \036=0x1E to avoid greedy \x hex escapes).
+    std::string longname = std::string(1023, 'a') + "\xc3\xa9";
+    std::string blob = longname + "\0371\037\037\036";
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "x"; // recomputed on a full payload
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-utf8", rep, ack);
+    CHECK(ack.need_full_size() == 0); // STORED, not kError-nacked (PG accepted valid UTF-8)
+    auto rows = store.get_agent_software("agent-utf8");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == std::string(1023, 'a')); // boundary-truncated, valid UTF-8
+}
+
 TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 kError path)",
           "[pg][software_inventory][seam]") {
     // The UP-2 hardening: when apply_installed_software returns kError (a transient

@@ -57,8 +57,18 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
                 if (f_end == std::string_view::npos)
                     f_end = rec.size();
                 std::string_view f = rec.substr(p, f_end - p);
-                if (f.size() > kMaxFieldLen)
-                    f = f.substr(0, kMaxFieldLen);
+                if (f.size() > kMaxFieldLen) {
+                    // UTF-8 codepoint-boundary truncation — back up over trailing
+                    // continuation bytes (0b10xxxxxx) so a byte cut never splits a
+                    // multibyte sequence into invalid UTF-8 that PG's TEXT column
+                    // rejects (governance UP-10). MUST match the agent's clamp_field
+                    // (sync_source_installed_software.cpp) byte-for-byte or the
+                    // server-recomputed hash diverges from the agent's.
+                    std::size_t end = kMaxFieldLen;
+                    while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
+                        --end;
+                    f = f.substr(0, end);
+                }
                 *fields[fi] = std::string(f);
                 ++fi;
                 if (f_end >= rec.size())

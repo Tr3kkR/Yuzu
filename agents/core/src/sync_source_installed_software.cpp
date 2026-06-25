@@ -33,8 +33,20 @@ constexpr std::size_t kMaxFieldLen = 1024;
 constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
 
 std::string clamp_field(std::string_view f) {
-    if (f.size() > kMaxFieldLen)
-        f = f.substr(0, kMaxFieldLen);
+    if (f.size() > kMaxFieldLen) {
+        // Truncate on a UTF-8 codepoint boundary, never mid-sequence. A raw byte cut
+        // at kMaxFieldLen can split a multibyte codepoint, producing invalid UTF-8
+        // that PostgreSQL's TEXT column rejects (22021) → kError → need_full → the
+        // agent resends the SAME poisoned blob forever (governance UP-10). Back up
+        // over trailing continuation bytes (0b10xxxxxx) to the start of the codepoint
+        // that would be cut. This logic MUST match the server's parse_software_blob
+        // field clamp (inventory_ingestion.cpp) byte-for-byte, or the agent's and
+        // server's canonical hashes diverge → permanent always-full.
+        std::size_t end = kMaxFieldLen;
+        while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
+            --end;
+        f = f.substr(0, end);
+    }
     // Strip the canonical framing separators (and NUL) so a value can never
     // corrupt the wire blob's structure (0x1F field / 0x1E record separators) —
     // the server splits on exactly those bytes. Vanishingly rare in real
