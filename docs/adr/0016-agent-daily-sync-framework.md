@@ -171,9 +171,11 @@ Therefore we **coexist, not replace**:
 - New **`Inventory` securable type**; reads gated on `Inventory:Read` (no
   inventory securable exists today; `Response` is semantically wrong for a
   dedicated store; `Inventory` future-proofs the framework).
-- Read surfaces: direct SQL (free) + an **MCP query tool** + a **REST** endpoint
-  + an installed-software section on the existing `/device` drill-down. A
-  dedicated fleet-wide software dashboard is a later slice.
+- Read surfaces: **shipped in v1** — direct SQL (free) + an **MCP query tool**
+  (`query_installed_software`, `Inventory:Read`, management-group scoped).
+  **Planned follow-ons** (NOT in v1): a **REST** endpoint, an installed-software
+  section on the existing `/device` drill-down, and a dedicated fleet-wide
+  software dashboard.
 
 ## Consequences
 

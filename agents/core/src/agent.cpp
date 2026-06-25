@@ -1561,12 +1561,16 @@ public:
                             for (const auto& [k, v] : blobs)
                                 pd[k] = v;
                             grpc::ClientContext ctx;
-                            // Bound the worst-case shutdown-join wait if a sync
-                            // coincides with a disconnect (no stored ctx to cancel).
+                            // Publish the in-flight context so teardown can TryCancel it
+                            // (mirrors heartbeat_ctx_), bounding the shutdown-join wait when a
+                            // sync coincides with a disconnect; the 30s deadline is the backstop.
                             ctx.set_deadline(std::chrono::system_clock::now() +
                                              std::chrono::seconds{30});
+                            sync_ctx_.store(&ctx, std::memory_order_release);
                             pb::InventoryAck ack;
                             auto status = sync_stub->ReportInventory(&ctx, report, &ack);
+                            // Clear before `ctx` leaves scope so teardown never derefs a dead ctx.
+                            sync_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::debug("sync: ReportInventory RPC failed: {}",
                                               status.error_message());
@@ -2152,6 +2156,8 @@ public:
                 // Daily-sync thread is per-connection (like heartbeat): stop +
                 // join it on disconnect; its state persists in kv_store_.
                 sync_stop_.store(true, std::memory_order_release);
+                if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
+                    sctx->TryCancel(); // unblock an in-flight ReportInventory (mirrors heartbeat)
                 if (sync_thread_.joinable()) {
                     sync_thread_.join();
                 }
@@ -2307,6 +2313,8 @@ private:
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
         sync_stop_.store(true, std::memory_order_release);
+        if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
+            sctx->TryCancel(); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
             sync_thread_.join();
         if (update_thread_.joinable())
@@ -2339,6 +2347,7 @@ private:
     bool startup_failed_{false};
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
+    std::atomic<grpc::ClientContext*> sync_ctx_{nullptr}; // ADR-0016 daily-sync RPC (cancel on teardown)
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;

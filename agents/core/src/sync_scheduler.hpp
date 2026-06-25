@@ -80,7 +80,10 @@ public:
 private:
     struct State {
         std::int64_t next_fire{0};      ///< epoch s of the next scheduled sync
-        std::int64_t last_full{0};      ///< epoch s of the last full payload sent
+        std::int64_t last_full{0};      ///< epoch s of the last FULL payload sent — advances
+                                        ///< only on a full send, NOT on a hash-only kTouched
+                                        ///< cycle; the sentinel for kFullFloor (don't "reset
+                                        ///< on touch" or the weekly-full guarantee breaks)
         std::string last_hash;          ///< last successfully-synced content hash
         bool force_full{false};         ///< server asked for a resend (need_full)
         int needfull_streak{0};         ///< consecutive need_full nacks (backoff, UP-5)
@@ -88,7 +91,7 @@ private:
     };
 
     std::string kv_key(const std::string& source, const char* field) const;
-    State& load_state(const SyncSource& src, std::int64_t now_secs);
+    State& load_state(std::size_t idx, std::int64_t now_secs);
     void save_state(const SyncSource& src, const State& st);
     /// Stable per-(agent,source) phase offset in [0, interval).
     std::int64_t phase_offset(const std::string& source, std::int64_t interval) const;

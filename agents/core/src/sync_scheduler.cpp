@@ -55,8 +55,12 @@ std::int64_t SyncScheduler::phase_offset(const std::string& source, std::int64_t
                                      static_cast<std::uint64_t>(interval));
 }
 
-SyncScheduler::State& SyncScheduler::load_state(const SyncSource& src, std::int64_t now_secs) {
-    State& st = states_[static_cast<std::size_t>(&src - sources_.data())];
+SyncScheduler::State& SyncScheduler::load_state(std::size_t idx, std::int64_t now_secs) {
+    // Index in, not pointer-arithmetic out: deriving the index from `&src -
+    // sources_.data()` was only well-defined because the caller always passed
+    // sources_[i] (gov cpp-expert/cpp-safety) — take the index directly instead.
+    const SyncSource& src = sources_[idx];
+    State& st = states_[idx];
     if (st.loaded)
         return st;
 
@@ -102,7 +106,7 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
 
     for (std::size_t i = 0; i < sources_.size(); ++i) {
         const SyncSource& src = sources_[i];
-        State& st = load_state(src, now_secs);
+        State& st = load_state(i, now_secs);
         if (now_secs < st.next_fire)
             continue;
 
