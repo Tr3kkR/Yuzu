@@ -1461,6 +1461,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     result_obj.raw("audit_persisted", "false");
                 if (hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
+                // Surface the count of devices dropped by the management-group scope filter
+                // (0 when none) so an agentic caller can tell "out of my scope" from "not
+                // installed anywhere" — the partial- and all-out-of-scope false-negative
+                // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
+                result_obj.raw("devices_omitted", std::to_string(dropped_agents));
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }

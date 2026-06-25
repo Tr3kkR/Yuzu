@@ -15,9 +15,14 @@
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement,
-/// uses `RETURNING`. Normalized rows only — NO JSONB/GIN. Reads authoritative
-/// (errors → empty + logged); ingest tolerates a transient outage (next sync +
-/// the weekly full-floor self-heal).
+/// uses `RETURNING`. Normalized rows only — NO JSONB/GIN. Posture is
+/// **durability-on-top, not authoritative** (the agent + weekly full-floor are the
+/// source of truth): reads are **fail-soft** (a transient store/pool error returns
+/// empty + logs), and ingest tolerates a transient outage (next sync + the floor
+/// self-heal). CAVEAT: a fail-soft empty read is not distinguishable from "no rows"
+/// at this layer — surfacing store-degraded distinctly to callers (so a fleet
+/// vuln query can't read a PG hiccup as "installed nowhere") is a tracked
+/// fleet-scale-hardening follow-up.
 
 #include <cstdint>
 #include <optional>
@@ -59,7 +64,7 @@ struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
     std::string name;     ///< exact software-name filter ("" = all names)
     int limit{1000};
-    int offset{0};
+    // No offset: see query_software (gov consistency N1) — keyset is the #1634 follow-up.
 };
 
 class SoftwareInventoryStore {

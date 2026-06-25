@@ -2825,6 +2825,16 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // Same discipline for the software-inventory store (gov cpp-safety): null the
+        // borrowed raw pointers in both ingest services, then drop the store, BEFORE
+        // the pool — otherwise the store briefly holds a dangling PgPool& after the
+        // pool resets (no UAF today since the gRPC drain has quiesced every ingest
+        // handler, but it matches the offline-store contract and is safe if the store
+        // ever gains a pool-touching dtor).
+        agent_service_.set_software_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_software_inventory_store(nullptr);
+        software_inventory_store_.reset();
         pg_pool_.reset();
     }
 

@@ -151,8 +151,9 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     if (!rows.has_value()) {
         auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
         if (!lease) {
-            spdlog::debug("SoftwareInventoryStore: hash-only ingest skipped, no connection ({})",
-                          pool_.last_error());
+            spdlog::warn("SoftwareInventoryStore: hash-only ingest skipped for agent={}, no "
+                         "connection ({})",
+                         agent_id, pool_.last_error());
             return InventoryIngestOutcome::kError;
         }
         pg::PgResult res = pg::exec_params(
@@ -161,8 +162,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
             "WHERE agent_id = $1 AND source = $2",
             std::vector<std::string>{std::string(agent_id), kSourceInstalledSoftware});
         if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::debug("SoftwareInventoryStore: hash lookup failed for agent={}: {}", agent_id,
-                          PQerrorMessage(lease.get()));
+            spdlog::warn("SoftwareInventoryStore: hash lookup failed for agent={}: {}", agent_id,
+                         PQerrorMessage(lease.get()));
             return InventoryIngestOutcome::kError;
         }
         if (PQntuples(res.get()) == 0)
@@ -178,8 +179,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
             std::vector<std::string>{std::string(agent_id), kSourceInstalledSoftware,
                                      std::to_string(ts)});
         if (upd.status() != PGRES_TUPLES_OK) {
-            spdlog::debug("SoftwareInventoryStore: last_seen bump failed for agent={}: {}", agent_id,
-                          PQerrorMessage(lease.get()));
+            spdlog::warn("SoftwareInventoryStore: last_seen bump failed for agent={}: {}", agent_id,
+                         PQerrorMessage(lease.get()));
             return InventoryIngestOutcome::kError;
         }
         return InventoryIngestOutcome::kTouched;
@@ -222,8 +223,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         return par.status() == PGRES_TUPLES_OK;
     });
     if (!ok) {
-        spdlog::debug("SoftwareInventoryStore: full ingest transaction failed for agent={}",
-                      agent_id);
+        spdlog::warn("SoftwareInventoryStore: full ingest transaction failed for agent={}",
+                     agent_id);
         return InventoryIngestOutcome::kError;
     }
     return InventoryIngestOutcome::kStored;
@@ -276,7 +277,6 @@ std::vector<SoftwareFleetRow> SoftwareInventoryStore::query_software(const Softw
     int limit = q.limit > 0 ? q.limit : 1000;
     if (limit > kFleetQueryRowCap)
         limit = kFleetQueryRowCap;
-    const int offset = q.offset > 0 ? q.offset : 0;
 
     std::string sql =
         "SELECT agent_id, name, version, publisher, install_date "
@@ -293,8 +293,9 @@ std::vector<SoftwareFleetRow> SoftwareInventoryStore::query_software(const Softw
     }
     sql += " ORDER BY name, agent_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
-    sql += " OFFSET $" + std::to_string(++p) + "::bigint";
-    params.push_back(std::to_string(offset));
+    // No OFFSET: offset-paging over a fleet table that mutates on sync cadence, with
+    // the scope filter applied after LIMIT, yields unstable/duplicating windows
+    // (gov consistency N1). Complete >cap collection is the keyset follow-up (#1634).
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
