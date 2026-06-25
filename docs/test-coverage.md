@@ -36,6 +36,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
 | `test_fleet_snapshot.cpp` | TAR fleet_snapshot.v1 JSON builder | Envelope shape, processes/connections round-trip with `remote_host`, default + custom redaction patterns, truncation flags, `process_source_paused` / `tcp_source_paused` markers, `schema_minor` field, payload size bound at full cap (12 cases) |
+| `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin; SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; installed_apps parse; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6) (15 cases) |
 
 ### Untested Agent Components
 
@@ -109,6 +110,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_legacy_shim.cpp` | Legacy command shim | Raw command-to-instruction translation |
 | `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |
 | `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |
+| `test_software_inventory_store.cpp` | `SoftwareInventoryStore` + `inventory_ingestion` seam (ADR-0016) | Canonical-hash cross-pin, hash-skip ingest (full/touched/need_full/drift/cold-cache), atomic full-replace, invalid-UTF-8 scrub-to-U+FFFD store + agent hash coordination (UP-IN1), codepoint-boundary truncation (UP-10), oversized-blob drop+nack (UP-2/UP-4), kError→need_full nack (UP-2), fleet query (live PostgreSQL) |
 | `test_notification_store.cpp` | Notifications | In-app notification CRUD, read/unread status |
 | `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing |
 | `test_quarantine_store.cpp` | Quarantine | Device quarantine/release, network isolation state |

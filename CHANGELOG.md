@@ -28,9 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
   tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
   (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
-  privacy-sensitive / works-council jurisdictions. UTF-8 field truncation is codepoint-boundary-safe
-  (no PostgreSQL TEXT-reject loop), and `query_installed_software` reports `devices_omitted` so a
-  scoped caller can distinguish "outside my scope" from "not installed".
+  privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
+  (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and
+  server — so a non-UTF-8 registry string can never trigger a PostgreSQL TEXT-reject resend loop;
+  concurrent full-replaces for one agent are serialized with a transaction-scoped advisory lock (no
+  row/hash divergence); a transient empty collection is skipped rather than wiping stored inventory;
+  an over-cap blob raises a dedicated `dropped`-outcome alert (it never self-heals); and
+  `query_installed_software` reports `devices_omitted` so a scoped caller can distinguish "outside my
+  scope" from "not installed".
 
 ### Security
 

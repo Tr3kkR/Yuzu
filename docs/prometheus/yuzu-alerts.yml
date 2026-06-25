@@ -350,6 +350,7 @@ groups:
             uncorrelated it is likely one or more devices whose payload the store
             keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
             the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
         expr: |
           sum(rate(yuzu_inventory_ingest_total{outcome="need_full"}[15m]))
@@ -364,3 +365,27 @@ groups:
             transiently after a server DB restore (cold cache — agents re-send full,
             then settle); a sustained ratio suggests hash drift or agents stuck in a
             resend cycle.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryDroppedBlobs
+        # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
+        # outcome=error this NEVER self-heals: the agent resends the same over-cap
+        # payload and backs off forever (the agent's own cap should prevent reaching
+        # here, so a non-zero rate signals agent/server cap drift after a version
+        # skew, or a non-conforming agent). Deliberately a SEPARATE alert — folding
+        # it into YuzuInventorySustainedIngestErrors would mislabel a permanent
+        # condition as the self-healing transient-PG-outage case (gov sre).
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="dropped"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest dropping over-cap blobs"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
+            agents are sending an installed-software blob over the 3 MiB cap, which
+            is dropped + nacked and will NOT self-heal (the agent resends the same
+            payload). Likely an agent/server cap-constant drift after a version skew,
+            or a non-conforming agent — check the agent version and the warn-level
+            "oversized ... blob" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"

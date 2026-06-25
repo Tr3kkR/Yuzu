@@ -197,6 +197,33 @@ TEST_CASE("clamp_field truncates on a UTF-8 codepoint boundary, not mid-sequence
     CHECK(e[0].name.size() == 1023);
 }
 
+TEST_CASE("clamp_field scrubs invalid UTF-8 to U+FFFD before hashing (UP-IN1)",
+          "[sync][parse]") {
+    // cp1252 "Café" = 43 61 66 E9; the lone 0xE9 is invalid UTF-8 and PostgreSQL's
+    // TEXT column rejects it (22021) → the whole full-replace rolls back → kError →
+    // the agent resends the identical poison forever. clamp_field must replace any
+    // invalid byte with U+FFFD (EF BF BD) so the canonical blob the agent hashes is
+    // valid UTF-8 and the server stores it. This scrub MUST run before truncation
+    // and match the server's parse_software_blob byte-for-byte.
+    auto e = parse_installed_apps_output(std::string("app|Caf\xe9|1|Acme|2020\n"));
+    REQUIRE(e.size() == 1);
+    CHECK(e[0].name == std::string("Caf\xef\xbf\xbd")); // 0xE9 → U+FFFD
+    CHECK(e[0].name.find('\xe9') == std::string::npos); // no raw byte survives
+    // The whole canonical blob is valid UTF-8 (no stray invalid byte).
+    CHECK(installed_software_canonical_blob(e).find('\xe9') == std::string::npos);
+}
+
+TEST_CASE("collect skips an empty inventory rather than wiping stored rows (UP-IN6)",
+          "[sync][parse]") {
+    // A transient empty parse (plugin hiccup / "No applications found" sentinel) must
+    // NOT be turned into an empty full payload — that would DELETE the agent's stored
+    // inventory and the server would record the wipe as a successful store. The
+    // collector returns nullopt on an empty parse; here we assert the parse itself is
+    // empty for the sentinel so the guard upstream fires.
+    auto e = parse_installed_apps_output("app|No applications found|-|-|-\n");
+    CHECK(e.empty());
+}
+
 TEST_CASE("a name that becomes empty after clamping is dropped (UP-1 hash parity)",
           "[sync][parse]") {
     // A separator-only name clamps to "" — the server's parse_software_blob drops

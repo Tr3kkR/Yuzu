@@ -52,7 +52,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "  publisher    TEXT NOT NULL DEFAULT '',"
          "  install_date TEXT NOT NULL DEFAULT '');"
          "CREATE INDEX installed_software_agent_idx ON installed_software (agent_id);"
-         "CREATE INDEX installed_software_name_idx  ON installed_software (name);"},
+         // Composite (name, agent_id): the flagship fleet query is
+         // `WHERE name=$1 ORDER BY name, agent_id LIMIT N`. A single-column (name)
+         // index satisfies the equality but forces a sort by agent_id before LIMIT
+         // over the whole matching set (perf S-1); the composite serves equality AND
+         // order → ordered index scan + early LIMIT termination. Leading `name`
+         // subsumes the old single-column index, so the index count is unchanged.
+         "CREATE INDEX installed_software_name_idx  ON installed_software (name, agent_id);"},
     };
     return kMigrations;
 }
@@ -193,6 +199,18 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     const std::string agent_id_s{agent_id};
 
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        // Serialise concurrent full-replaces for THIS agent. Without it, two
+        // in-flight fulls for one agent_id under READ COMMITTED interleave: txn B's
+        // DELETE cannot see txn A's freshly-inserted rows, so A's and B's rows both
+        // survive and the parent content_hash matches neither (governance UP-IN2/3,
+        // reachable when a slow ingest outlives the agent's 30s client deadline and
+        // the scheduler retries). The lock is transaction-scoped (auto-released at
+        // COMMIT/ROLLBACK); distinct agents hash to distinct keys, so steady-state
+        // contention is nil. hashtext()→int4 widened to the bigint overload.
+        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                                          std::vector<std::string>{agent_id_s});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
         pg::PgResult del = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{agent_id_s});

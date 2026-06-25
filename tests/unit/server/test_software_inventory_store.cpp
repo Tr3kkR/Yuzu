@@ -196,6 +196,46 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     CHECK(rows[0].name == std::string(1023, 'a')); // boundary-truncated, valid UTF-8
 }
 
+TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches the agent (UP-IN1)",
+          "[pg][software_inventory][seam]") {
+    // A non-conforming agent (or a future SyncSource that does not pre-scrub) sends a
+    // RAW cp1252 byte 0xE9 ("Café" = 43 61 66 E9) in the name. PG's UTF8 TEXT column
+    // would reject it (22021) → kError → permanent resend (UP-IN1). The seam must
+    // replace it with U+FFFD (EF BF BD) IDENTICALLY to the agent's clamp_field, so the
+    // row STORES and the server-recomputed hash equals what the real agent (which
+    // scrubs before hashing) would have sent.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The hash the agent would compute AFTER its own identical scrub of 0xE9.
+    const std::string agent_hash = SoftwareInventoryStore::canonical_hash(
+        {{std::string("Caf\xef\xbf\xbd"), "1", "Acme", "2020"}});
+
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = agent_hash;
+    (*rep.mutable_plugin_data())["installed_software"] = blob1("Caf\xe9", "1", "Acme", "2020");
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-utf8-scrub", rep, ack);
+    CHECK(ack.need_full_size() == 0); // STORED, not 22021-rejected → kError-nacked
+
+    auto rows = store.get_agent_software("agent-utf8-scrub");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == std::string("Caf\xef\xbf\xbd")); // raw 0xE9 scrubbed to U+FFFD
+    CHECK(rows[0].name.find('\xe9') == std::string::npos);
+
+    // Cross-pin: a hash-only follow-up carrying the agent's hash → touched (no
+    // need_full) proves the server-recomputed stored hash equals the agent's, i.e.
+    // the two scrubs are byte-coordinated.
+    agentpb::InventoryReport rep2;
+    (*rep2.mutable_content_hashes())["installed_software"] = agent_hash; // no blob
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-utf8-scrub", rep2, ack2);
+    CHECK(ack2.need_full_size() == 0);
+}
+
 TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 kError path)",
           "[pg][software_inventory][seam]") {
     // The UP-2 hardening: when apply_installed_software returns kError (a transient

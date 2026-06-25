@@ -101,10 +101,13 @@ workers (gated on `Inventory:Read`):
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
   `true`, more rows exist past the cap (keyset pagination is a follow-up).
 - **Results are scoped to your management groups** — devices outside your
-  groups are omitted, and the omission is audited. This is distinct from the
-  generic `query_inventory` / `get_agent_inventory` tools, which read a
-  *separate* generic blob store on `Infrastructure:Read` and do **not** surface
-  this typed software data.
+  groups are omitted (and the omission audited), and the count is returned as
+  `devices_omitted` (absent when zero). A positive value means matching software
+  exists outside your scope — an empty or short result does **not** mean the
+  software is absent fleet-wide. This is distinct from the generic
+  `query_inventory` / `get_agent_inventory` tools, which read a *separate*
+  generic blob store on `Infrastructure:Read` and do **not** surface this typed
+  software data.
 
 A dedicated REST endpoint and a software dashboard / per-device drill-down view
 are planned follow-ons.

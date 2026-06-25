@@ -33,6 +33,71 @@ constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024; // 3 MiB per source
 constexpr std::size_t kMaxEntries = 20000;
 constexpr std::size_t kMaxFieldLen = 1024;
 
+// Replace every byte that is not part of a valid UTF-8 sequence with U+FFFD (the
+// replacement character, EF BF BD). "Valid" is exactly what PostgreSQL's UTF8
+// server-encoding accepts: no overlong forms, no surrogates (U+D800..U+DFFF),
+// nothing above U+10FFFF. A field that reaches PG with an invalid byte is
+// rejected with SQLSTATE 22021, which rolls back the whole full-replace
+// transaction and makes the agent resend the identical poison forever
+// (governance UP-IN1). Defence-in-depth against a non-conforming agent (the real
+// agent's clamp_field scrubs identically before hashing).
+//
+// This MUST run BEFORE the length clamp (U+FFFD is 3 bytes, so scrubbing can grow
+// the field) and MUST be byte-for-byte identical to the agent's copy in
+// sync_source_installed_software.cpp (clamp_field), or the server-recomputed hash
+// diverges from the agent's → permanent always-full.
+std::string sanitize_utf8_strict(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    const std::size_t n = s.size();
+    const auto cont = [&](std::size_t j) -> bool {
+        return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
+    };
+    std::size_t i = 0;
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
+        std::size_t len = 0;
+        bool ok = false;
+        if (c < 0x80) {
+            ok = true;
+            len = 1;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            ok = cont(i + 1);
+            len = 2;
+        } else if (c == 0xE0) {
+            ok = c1 >= 0xA0 && c1 <= 0xBF && cont(i + 2); // reject overlong 80..9F
+            len = 3;
+        } else if (c >= 0xE1 && c <= 0xEC) {
+            ok = cont(i + 1) && cont(i + 2);
+            len = 3;
+        } else if (c == 0xED) {
+            ok = c1 >= 0x80 && c1 <= 0x9F && cont(i + 2); // reject surrogates A0..BF
+            len = 3;
+        } else if (c >= 0xEE && c <= 0xEF) {
+            ok = cont(i + 1) && cont(i + 2);
+            len = 3;
+        } else if (c == 0xF0) {
+            ok = c1 >= 0x90 && c1 <= 0xBF && cont(i + 2) && cont(i + 3); // reject overlong 80..8F
+            len = 4;
+        } else if (c >= 0xF1 && c <= 0xF3) {
+            ok = cont(i + 1) && cont(i + 2) && cont(i + 3);
+            len = 4;
+        } else if (c == 0xF4) {
+            ok = c1 >= 0x80 && c1 <= 0x8F && cont(i + 2) && cont(i + 3); // reject > U+10FFFF
+            len = 4;
+        }
+        if (ok) {
+            out.append(s.data() + i, len);
+            i += len;
+        } else {
+            out.append("\xEF\xBF\xBD", 3); // U+FFFD, advance one byte
+            i += 1;
+        }
+    }
+    return out;
+}
+
 // Parse the canonical wire blob into rows: entries are 0x1E-separated; each is
 // 0x1F-separated (name, version, publisher, install_date) — the same byte form
 // the agent hashes (ADR-0016 §4), so the server re-hash matches. nullopt only
@@ -56,20 +121,20 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
                 std::size_t f_end = rec.find('\x1f', p);
                 if (f_end == std::string_view::npos)
                     f_end = rec.size();
-                std::string_view f = rec.substr(p, f_end - p);
+                std::string_view raw = rec.substr(p, f_end - p);
+                // Scrub to valid UTF-8 FIRST (governance UP-IN1), then truncate on a
+                // codepoint boundary. Both steps MUST match the agent's clamp_field
+                // (sync_source_installed_software.cpp) byte-for-byte — scrub before
+                // clamp, U+FFFD for any invalid byte — or the server-recomputed hash
+                // diverges from the agent's (governance UP-10 for the clamp half).
+                std::string f = sanitize_utf8_strict(raw);
                 if (f.size() > kMaxFieldLen) {
-                    // UTF-8 codepoint-boundary truncation — back up over trailing
-                    // continuation bytes (0b10xxxxxx) so a byte cut never splits a
-                    // multibyte sequence into invalid UTF-8 that PG's TEXT column
-                    // rejects (governance UP-10). MUST match the agent's clamp_field
-                    // (sync_source_installed_software.cpp) byte-for-byte or the
-                    // server-recomputed hash diverges from the agent's.
                     std::size_t end = kMaxFieldLen;
                     while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
                         --end;
-                    f = f.substr(0, end);
+                    f.resize(end);
                 }
-                *fields[fi] = std::string(f);
+                *fields[fi] = std::move(f);
                 ++fi;
                 if (f_end >= rec.size())
                     break;

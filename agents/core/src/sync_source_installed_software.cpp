@@ -32,25 +32,90 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // skips" for "outlier host loops" — the right call for installed software.
 constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
 
-std::string clamp_field(std::string_view f) {
+// Replace every byte that is not part of a valid UTF-8 sequence with U+FFFD (the
+// replacement character, EF BF BD). "Valid" is exactly what PostgreSQL's UTF8
+// server-encoding accepts: no overlong forms, no surrogates (U+D800..U+DFFF),
+// nothing above U+10FFFF. A field that reaches PG with an invalid byte is
+// rejected with SQLSTATE 22021, which rolls back the whole full-replace
+// transaction and makes the agent resend the identical poison forever
+// (governance UP-IN1). The installed_apps plugin already sanitises its output, so
+// this is defence-in-depth against any future SyncSource (and a plugin scrub that
+// is structurally laxer than PG, e.g. one that passes surrogate/overlong forms).
+//
+// This MUST run BEFORE the length clamp (U+FFFD is 3 bytes, so scrubbing can grow
+// the field; clamping first would apply a different 1024-byte budget on each
+// side) and MUST be byte-for-byte identical to the server's copy in
+// inventory_ingestion.cpp (parse_software_blob), or the agent's and server's
+// canonical hashes diverge → permanent always-full.
+std::string sanitize_utf8_strict(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    const std::size_t n = s.size();
+    const auto cont = [&](std::size_t j) -> bool {
+        return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
+    };
+    std::size_t i = 0;
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
+        std::size_t len = 0;
+        bool ok = false;
+        if (c < 0x80) {
+            ok = true;
+            len = 1;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            ok = cont(i + 1);
+            len = 2;
+        } else if (c == 0xE0) {
+            ok = c1 >= 0xA0 && c1 <= 0xBF && cont(i + 2); // reject overlong 80..9F
+            len = 3;
+        } else if (c >= 0xE1 && c <= 0xEC) {
+            ok = cont(i + 1) && cont(i + 2);
+            len = 3;
+        } else if (c == 0xED) {
+            ok = c1 >= 0x80 && c1 <= 0x9F && cont(i + 2); // reject surrogates A0..BF
+            len = 3;
+        } else if (c >= 0xEE && c <= 0xEF) {
+            ok = cont(i + 1) && cont(i + 2);
+            len = 3;
+        } else if (c == 0xF0) {
+            ok = c1 >= 0x90 && c1 <= 0xBF && cont(i + 2) && cont(i + 3); // reject overlong 80..8F
+            len = 4;
+        } else if (c >= 0xF1 && c <= 0xF3) {
+            ok = cont(i + 1) && cont(i + 2) && cont(i + 3);
+            len = 4;
+        } else if (c == 0xF4) {
+            ok = c1 >= 0x80 && c1 <= 0x8F && cont(i + 2) && cont(i + 3); // reject > U+10FFFF
+            len = 4;
+        }
+        if (ok) {
+            out.append(s.data() + i, len);
+            i += len;
+        } else {
+            out.append("\xEF\xBF\xBD", 3); // U+FFFD, advance one byte
+            i += 1;
+        }
+    }
+    return out;
+}
+
+std::string clamp_field(std::string_view raw) {
+    // 1. Scrub to valid UTF-8 FIRST (see sanitize_utf8_strict — order is
+    //    load-bearing for the agent/server hash coordination).
+    std::string f = sanitize_utf8_strict(raw);
+    // 2. Truncate on a UTF-8 codepoint boundary, never mid-sequence. After the
+    //    scrub the field is valid UTF-8, so backing up over trailing continuation
+    //    bytes (0b10xxxxxx) lands on a codepoint start. MUST match the server's
+    //    parse_software_blob field clamp (inventory_ingestion.cpp) byte-for-byte.
     if (f.size() > kMaxFieldLen) {
-        // Truncate on a UTF-8 codepoint boundary, never mid-sequence. A raw byte cut
-        // at kMaxFieldLen can split a multibyte codepoint, producing invalid UTF-8
-        // that PostgreSQL's TEXT column rejects (22021) → kError → need_full → the
-        // agent resends the SAME poisoned blob forever (governance UP-10). Back up
-        // over trailing continuation bytes (0b10xxxxxx) to the start of the codepoint
-        // that would be cut. This logic MUST match the server's parse_software_blob
-        // field clamp (inventory_ingestion.cpp) byte-for-byte, or the agent's and
-        // server's canonical hashes diverge → permanent always-full.
         std::size_t end = kMaxFieldLen;
         while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
             --end;
-        f = f.substr(0, end);
+        f.resize(end);
     }
-    // Strip the canonical framing separators (and NUL) so a value can never
-    // corrupt the wire blob's structure (0x1F field / 0x1E record separators) —
-    // the server splits on exactly those bytes. Vanishingly rare in real
-    // software names, but cheap to guarantee.
+    // 3. Strip the canonical framing separators (and NUL) so a value can never
+    //    corrupt the wire blob's structure (0x1F field / 0x1E record separators) —
+    //    the server splits on exactly those bytes. U+FFFD contains none of them.
     std::string out;
     out.reserve(f.size());
     for (char c : f) {
@@ -182,6 +247,17 @@ SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor
             return std::nullopt;
         }
         auto entries = parse_installed_apps_output(r.captured);
+        if (entries.empty()) {
+            // A real endpoint always reports >= 1 application; an empty parse is a
+            // transient plugin hiccup or the "No applications found" sentinel, NOT a
+            // genuine "everything uninstalled". Sending an empty full payload would
+            // DELETE the agent's stored inventory and the server would record the
+            // wipe as a successful store (governance UP-IN6). Skip the cycle and
+            // keep the last good state; the next cycle re-collects.
+            spdlog::debug("sync: installed_apps 'list' yielded no entries — skipping this cycle "
+                          "(not wiping stored inventory)");
+            return std::nullopt;
+        }
         std::string blob = installed_software_canonical_blob(std::move(entries));
         if (blob.size() > kMaxBlobBytes) {
             spdlog::warn("sync: installed_software blob {} B exceeds {} B cap — skipping this "
