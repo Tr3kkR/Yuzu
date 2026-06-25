@@ -401,7 +401,7 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
+        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -709,7 +709,7 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          meson test -C build-windows-${{ matrix.build_type }} --print-errorlogs
+          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs
 
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
@@ -825,10 +825,16 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Restore vcpkg installed packages
-        # Universal cache-key contract: vcpkg.json + vcpkg-configuration.json
-        # + every overlay triplet + the pinned VCPKG_COMMIT baseline.
-        # Without the triplet/baseline components a port edit or baseline
-        # bump silently restores stale binaries (D3 in the CI overhaul plan).
+        # Cache-key contract: vcpkg.json (ports/features) + vcpkg-configuration.json
+        # (registry/baseline) + the pinned VCPKG_COMMIT baseline (in the key
+        # prefix) catch the D3 staleness cases — a port edit or baseline bump.
+        # This leg installs the BUILTIN `arm64-osx` triplet (no
+        # `triplets/arm64-osx.cmake` overlay exists), so the repo's custom
+        # triplet descriptors (x64-linux-asan/tsan/static, x64-windows) cannot
+        # change its vcpkg output — hashing `triplets/*.cmake` only cold-starts
+        # this cache on unrelated sanitizer-triplet edits. We hash the specific
+        # `triplets/arm64-osx.cmake` instead: empty today (stable key), and
+        # auto-tracked the moment an arm64-osx overlay is ever added.
         # Save side is the paired `actions/cache/save` step at the job tail
         # — see comment on `Restore ccache` above for the save-always
         # deprecation rationale.
@@ -836,7 +842,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
+          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/arm64-osx.cmake') }}
           restore-keys: |
             vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
             vcpkg-arm64-osx-
@@ -893,7 +899,7 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-macos --print-errorlogs
+        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
@@ -1017,7 +1023,14 @@ jobs:
     needs: [detect-ci-changes]
     if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    # A genuinely cold cache builds the whole vcpkg closure from source on a
+    # 2-vCPU GHA-hosted runner — ~65-70 min for grpc/protobuf/abseil/openssl
+    # plus libpq, which compiles PostgreSQL from source (ADR-0006/0008) —
+    # before a single TU of ours is built. The old 75-min ceiling left no
+    # headroom, so a cold run timed out mid-build and only the `if: always()`
+    # cache saves rescued the next run. 120 min covers a cold build with
+    # margin; warm runs still finish in ~6 min.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -1035,9 +1048,19 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Restore vcpkg installed packages (canary)
-        # Universal cache key — invalidates only when manifest, triplet,
-        # or vcpkg baseline changes. First canary run on a stable manifest
-        # is ~25 min from-source; subsequent runs restore in ~10 s.
+        # Key tracks only what changes the canary's vcpkg output: the
+        # manifest (vcpkg.json), the registry/baseline config
+        # (vcpkg-configuration.json), and the pinned VCPKG_COMMIT (in the key
+        # prefix). The canary installs the BUILTIN `x64-linux` triplet — no
+        # `triplets/x64-linux.cmake` overlay exists today — so the repo's
+        # custom triplet descriptors (asan/tsan/static/windows) do NOT affect
+        # this build. Hashing the whole `triplets/*.cmake` glob cold-started
+        # the canary on unrelated sanitizer-triplet edits and blew the job
+        # timeout; we hash the specific `triplets/x64-linux.cmake` instead —
+        # empty today (stable key), auto-tracked if an x64-linux overlay is
+        # ever added (mirrors the macOS `arm64-osx` leg). Cold from-source
+        # build is ~65-70 min (libpq builds PostgreSQL from source,
+        # ADR-0006/0008); warm restore ~10 s.
         # Save side is the paired `actions/cache/save` step at the job tail
         # — see comment on the macOS `Restore ccache` step (line ~564) for
         # the save-always deprecation rationale and the documented split
@@ -1046,7 +1069,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
+          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake') }}
           restore-keys: |
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-

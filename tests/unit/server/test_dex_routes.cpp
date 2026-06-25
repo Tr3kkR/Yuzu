@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 using namespace yuzu::server;
@@ -514,9 +515,15 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     };
     auto fleet = []() { return DexFleet{4, 5}; };
     std::string audited;
+    bool audit_ok = true;      // flip to simulate a dropped evidence row (#1549)
+    bool audit_throws = false; // flip to simulate a bad_alloc-class throw (#1647)
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
-                     const std::string& ttype, const std::string& tid, const std::string&) {
+                     const std::string& ttype, const std::string& tid,
+                     const std::string&) -> bool {
         audited = a + "|" + ttype + "|" + tid; // capture target_type to pin the PascalCase fix
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        return audit_ok;
     };
 
     SECTION("authed shell + permitted fragments render") {
@@ -600,6 +607,48 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 403);
         CHECK(audited.empty());
+    }
+
+    SECTION("PII drill-down audit failure → Sec-Audit-Failed header but still renders (#1549)") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        audit_ok = false; // the evidence row cannot persist
+
+        // The dashboard is an HTML surface: a transient audit hiccup flags the gap
+        // via the header but must NOT blank the fragment (unlike the strict REST
+        // per-device endpoints, which fail closed).
+        auto dev = sink.Get("/fragments/dex/device?id=WS-1");
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        CHECK(dev->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dev->body.find("Signal history") != std::string::npos); // still served
+
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    // #1647 item 1: a throwing audit_fn (bad_alloc-class) was previously silent on
+    // these HTML sites (no try/catch). The shared helper catches it → header flagged,
+    // fragment still rendered, throw never escapes the handler.
+    SECTION("a throwing audit_fn is caught → Sec-Audit-Failed header, fragment still renders") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        audit_throws = true;
+
+        auto dev = sink.Get("/fragments/dex/device?id=WS-1");
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        CHECK(dev->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dev->body.find("Signal history") != std::string::npos); // still served
+
+        auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+        REQUIRE(sig);
+        CHECK(sig->status == 200);
+        CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
     }
 
     // Re-review blocker: the per-device DEX surface must be management-scoped (mirror
@@ -792,8 +841,9 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
     auto fleet = []() { return DexFleet{1, 1}; };
     std::string audited;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
-                     const std::string&, const std::string& tid, const std::string&) {
+                     const std::string&, const std::string& tid, const std::string&) -> bool {
         audited = a + "|" + r + "|" + tid;
+        return true;
     };
 
     // Fake dispatch + response store.
@@ -812,7 +862,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         return {"tar-deadbeef", fake_sent};
     };
     std::vector<DexAgentResponse> fake_rows;
-    auto responses = [&](const std::string& command_id) {
+    auto responses = [&](const std::string& command_id, const std::string& /*agent_id*/) {
         CHECK(command_id == "tar-deadbeef");
         return fake_rows;
     };

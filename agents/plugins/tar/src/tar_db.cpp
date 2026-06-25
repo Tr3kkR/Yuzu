@@ -18,8 +18,11 @@
 
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
+#include <string_view>
 
 namespace yuzu::tar {
 
@@ -109,6 +112,77 @@ constexpr const char* kCreateSchema = R"(
     );
 )";
 
+// #559 — self-test a freshly-opened tar.db with PRAGMA integrity_check. A
+// corrupt file (filesystem damage, partial restore, mid-write crash) must NOT
+// be silently trusted: get_config() returns the caller's default on a read
+// failure, so a corrupt DB would read every `<source>_enabled` key as its
+// "true" default and silently re-enable sources an operator deliberately paused
+// for forensic preservation — defeating the #539 retention guard with no
+// telemetry. Returns true only when the check reports the canonical "ok".
+bool integrity_ok(sqlite3* db) noexcept {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr) != SQLITE_OK)
+        return false; // can't even read the DB → treat as corrupt
+    StmtPtr stmt(raw);
+    bool ok = false;
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        ok = txt && std::string_view{txt} == "ok";
+    }
+    return ok;
+}
+
+// Move a corrupt tar.db (and its -wal/-shm sidecars) aside to a timestamped
+// `.corrupt-<epoch>` path for forensic review, so open() can re-initialise a
+// fresh, trustworthy database rather than refusing to load TAR entirely.
+// Returns the quarantine path, or std::nullopt if the corrupt main file could
+// NOT be moved aside (read-only mount, locked file on Windows, permissions) —
+// in which case the caller MUST fail closed rather than re-open-and-trust the
+// still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
+// instead, so the freshly-created DB can never adopt a stale -wal/-shm; the
+// caller's post-reopen integrity re-check is the backstop if even that fails.
+std::optional<std::filesystem::path>
+quarantine_corrupt_db(const std::filesystem::path& path) {
+    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    std::filesystem::path dest = path;
+    dest += std::format(".corrupt-{}", epoch);
+    // Collision-safe naming: `epoch` is only 1-second granular, and the wall
+    // clock can step backward (NTP correction, RTC reset). A second corruption
+    // that resolved to an already-existing `.corrupt-<epoch>` would otherwise
+    // rename ON TOP of the earlier quarantine and silently destroy preserved
+    // forensic evidence. Append a disambiguator so every quarantine is kept.
+    {
+        std::error_code exists_ec;
+        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
+            dest = path;
+            dest += std::format(".corrupt-{}-{}", epoch, n);
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(path, dest, ec);
+    if (ec)
+        return std::nullopt; // could not move the corrupt DB aside — fail closed
+    for (const char* suffix : {"-wal", "-shm"}) {
+        std::filesystem::path side = path;
+        side += suffix;
+        std::error_code ec2;
+        if (std::filesystem::exists(side, ec2)) {
+            std::filesystem::path side_dest = dest;
+            side_dest += suffix;
+            std::filesystem::rename(side, side_dest, ec2);
+            if (ec2) {
+                // Couldn't preserve the sidecar — remove it so the fresh DB
+                // can't replay a stale WAL belonging to the quarantined file.
+                std::error_code ec3;
+                std::filesystem::remove(side, ec3);
+            }
+        }
+    }
+    return dest;
+}
+
 } // namespace
 
 // ── Construction / destruction ───────────────────────────────────────────────
@@ -167,6 +241,52 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         if (raw_db)
             sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to open tar.db: {}", err));
+    }
+
+    // #559 — corruption self-test BEFORE we trust the DB. A fresh/empty file
+    // passes trivially; an existing corrupt one is quarantined aside and a clean
+    // DB is re-opened in its place, so the agent never silently serves garbage
+    // config (which would re-enable operator-paused sources, compounding #539).
+    if (!integrity_ok(raw_db)) {
+        sqlite3_close(raw_db);
+        raw_db = nullptr;
+        auto quarantined = quarantine_corrupt_db(path);
+        if (!quarantined) {
+            // FAIL CLOSED (UP-1): the corrupt DB could not be moved aside, so we
+            // must NOT re-open and trust it — doing so would silently serve the
+            // "true" get_config default for every `<source>_enabled` key and
+            // re-enable sources an operator paused for forensic preservation,
+            // the exact failure #559 guards against. Refuse to open; the
+            // operator must clear the underlying fault (read-only mount, locked
+            // file, permissions) and restart.
+            return std::unexpected(std::format(
+                "tar.db failed integrity_check and could not be quarantined "
+                "(corrupt and unmovable): {}",
+                path.string()));
+        }
+        spdlog::error("TAR: tar.db failed PRAGMA integrity_check (tar.db.corruption_detected) — "
+                      "quarantined to {} and re-initialising a fresh database",
+                      quarantined->string());
+        rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
+        if (rc != SQLITE_OK) {
+            std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
+            if (raw_db)
+                sqlite3_close(raw_db);
+            return std::unexpected(
+                std::format("failed to re-open tar.db after quarantine: {}", err));
+        }
+        // Backstop (UP-2): the freshly-created DB must itself be clean — this
+        // also catches the case where a -wal/-shm sidecar belonging to the
+        // quarantined file could neither be moved nor removed and was adopted by
+        // the new file. If even the fresh DB is corrupt, fail closed.
+        if (!integrity_ok(raw_db)) {
+            sqlite3_close(raw_db);
+            return std::unexpected(std::format(
+                "tar.db re-initialised after quarantine still fails integrity_check: {}",
+                path.string()));
+        }
     }
 
     // WAL mode for concurrent read performance -- required for correctness
@@ -897,6 +1017,121 @@ bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& event
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         spdlog::error("insert_software_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
+bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_arp_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO arp_live (ts, snapshot_id, action, interface, ip_address, mac_address, entry_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_arp_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.iface.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.ip_address.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.mac_address.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 7, ev.entry_type.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_arp_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_arp_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
+bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_dns_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO dns_live (ts, snapshot_id, action, name, record_type, data, ttl_remaining_s, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_dns_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.record_type.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.data.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt.get(), 7, ev.ttl_remaining_s);
+        sqlite3_bind_text(stmt.get(), 8, ev.source.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_dns_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_dns_events commit: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;

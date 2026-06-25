@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors these always-on categories of system activity (the opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below):
+TAR monitors these categories of system activity. Processes, network connections, services, user sessions, software, and device performance are **always-on**; **ARP** and **DNS** are opt-in (off by default), Windows-only today (ADR-0015). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -16,8 +16,10 @@ TAR monitors these always-on categories of system activity (the opt-in and plann
 | **User sessions** | 300 seconds (slow) | User login, user logout |
 | **Software** | 3600 seconds (software) | Application installed, removed, upgraded |
 | **Performance** | 30 seconds (perf) | Device CPU/memory/disk/network sample (a scalar reading, not a diff) |
+| **ARP** *(opt-in, Windows)* | 60 seconds (fast) | ARP / neighbour binding appeared, removed |
+| **DNS cache** *(opt-in, Windows)* | 60 seconds (fast) | DNS resolver-cache entry appeared, removed |
 
-The first five categories take a snapshot of the current state each cycle, compare it to the previous snapshot, and record only the differences as events. This keeps the database compact while providing full visibility into system changes.
+Every source except **Performance** takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
 The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures both **machine-wide** installs (the HKLM Uninstall keys, 64-bit and 32-bit) and **per-user** installs (each profile's `HKU\<SID>` Uninstall key); the `scope` column distinguishes the two and `user` carries the profile name for per-user rows. It runs on its own slower trigger (hourly by default — installs are infrequent) and is **on by default** (asset-management and vulnerability-relevance data, like Services and User sessions). It records names, versions, and publisher only — no command lines, no usage data.
 
@@ -99,7 +101,7 @@ Use the `configure` action to adjust TAR behavior.
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
 | `software_interval` | `0` or 300-86400 | 3600 | Seconds between software install/uninstall scans. `0` disables the scan trigger entirely (no collection until re-set or agent restart). |
 | `software_max_hive_mounts` | 0-100000 | 100 | Max logged-off-user `NTUSER.DAT` hives mounted during the **one-time cold-start baseline** (steady-state scans never mount). `0` = baseline only the machine scope and logged-on users; logged-off users are picked up when they next log on. Raise on a host where many never-recently-logged-on profiles must be baselined immediately. |
-| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive) |
+| `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive). **Merged with** the built-in defaults — added to, never replacing them; the defaults cannot be disabled. |
 | `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
@@ -109,16 +111,18 @@ Use the `configure` action to adjust TAR behavior.
 | `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
+| `arp_enabled` | `true` / `false` | **`false`** | Toggle the ARP / neighbour-table capture source (`arp` source → `$ARP_Live`/`$ARP_Hourly`) on this host (ADR-0015). **Off by default** (opt-in). Captures IP↔MAC bindings per interface for Layer-2 adjacency / ARP-spoofing forensics. **Windows only today** (`GetIpNetTable2`); Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in; collected at `fast_interval`. |
+| `dns_enabled` | `true` / `false` | **`false`** | Toggle the DNS resolver-cache capture source (`dns` source → `$DNS_Live`/`$DNS_Hourly`) on this host (ADR-0015). **Off by default** — the DNS cache reveals which domains a host resolved (**usage-class telemetry under the works-council posture; enabling is audited**). **Device-level state only — no per-process attribution** (the cache carries no PID). **Windows only today** (`DnsGetCacheDataTable`, cache-only — never issues a wire query); Linux/macOS planned. Set to `true` to opt in; collected at `fast_interval`. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). `0` disables registration of the perf trigger entirely. **Read at agent startup (trigger registration), not via `tar.configure`** — change it through the agent's KV config / install profile; a running agent picks it up on restart. (To stop perf collection at runtime without a restart, use `perf_enabled=false`.) |
-| `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
-| `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
+| `network_capture_method` | `polling` (always accepted) plus the methods accepted on the **running host's OS** — e.g. `iphlpapi` on Windows, `procfs` on Linux, `proc_pidfdinfo` on macOS (run `compatibility` for the live list) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. Methods from a *different* OS are rejected. The `status` action reports `network_capture_method_effective` alongside the configured value so the configured-vs-active discrepancy is always explicit. |
+| `process_stabilization_exclusions` | JSON array (≤256 × ≤256 chars) | `[]` | Process-name **substrings** (case-insensitive; leading/trailing `*` stripped; `?` and `[abc]` are literals; effective substring must be ≥3 chars) to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
 **Validation rules:**
 
 - When both `fast_interval` and `slow_interval` are provided, `fast_interval` must be less than `slow_interval`.
-- `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings.
-- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. A pattern like `"a"` will match every process whose name contains the letter `a` (most of them) — use length-3+ patterns or anchor with explicit substrings (`"-helper"`, `"chrome-helper"`).
-- `network_capture_method` is accepted unconditionally for the literal value `polling` (the platform default). Any other value must appear in the accept-list returned by `accepted_capture_methods("tcp")` (currently `iphlpapi`, `procfs`, `proc_pidfdinfo`); else the configure call is rejected.
+- `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings, with at most **256 elements** of at most **256 characters** each (both feed an O(patterns × command-line-length) scan per process per cycle).
+- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`). Matching is on the **process name only**, so a binary renamed to contain an approved substring evades capture — exclusions are a noise-reduction convenience, **not a threat-hunting control**.
+- `network_capture_method` is validated against the **running host's OS** accept-list, not the union across all platforms — e.g. a Linux agent rejects the Windows-only `iphlpapi`. `polling` is always accepted (the platform default). Run the `compatibility` action to see the live accepted list for a given agent.
 - Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
   - The interval samplers (`perf` and the opt-in `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory), which is off by default for privacy: no usage row ever spans the period it was disabled.
 
@@ -152,6 +156,8 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 | **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
 | **software** | supported (`registry`), **on by default** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (machine `scope`) plus each profile's `HKU\<SID>` Uninstall key, mounting `NTUSER.DAT` for logged-off users (per-user `scope`, with the profile name in `user`). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
+| **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
+| **dns** | supported (`dnsapi`), **opt-in (off by default)** — `DnsGetCacheDataTable` + cache-only `DnsQuery_W`: name/record_type/data/TTL (ADR-0015). Device-level resolver-cache state; **no per-process attribution**. | planned (`systemd-resolved`) — resolve1 D-Bus / `/etc/hosts` fallback (constrained). Records nothing until wired. | planned (`dscacheutil`) — subprocess; TTL unavailable (`ttl_remaining_s = -1`, constrained). Records nothing until wired. |
 
 Status values:
 
@@ -182,7 +188,9 @@ Default redaction patterns:
 ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]
 ```
 
-Patterns use case-insensitive substring matching. The `*` characters at the start and end indicate substring semantics (e.g., `*password*` matches any command line containing "password" in any case).
+Patterns use case-insensitive substring matching. Leading and trailing `*` are **optional** — they are stripped before matching, so the effective match is always a bare substring (`*password*`, `password*`, and `password` all match any command line containing "password" in any case). Interior `?` and `[abc]` are treated as literals, not glob metacharacters.
+
+**The built-in default patterns always apply and cannot be disabled.** `configure` lets you **add** patterns, but the baseline set (`password`, `secret`, `token`, `api_key`, `credential`) is enforced on every collect path regardless of what is stored. If `redaction_patterns` is set to an array whose elements are all invalid (over-long, non-string) or to `[]`, the built-in defaults are silently restored as the active list rather than leaving redaction disabled — so a corrupt, tampered, or empty config can never cause secrets to be written in plaintext.
 
 To customize:
 
@@ -231,7 +239,16 @@ config|software_enabled|true
 config|software_paused_at|0
 config|software_live_rows|36
 config|software_oldest_ts|1710950000
+config|arp_enabled|false
+config|arp_paused_at|0
+config|arp_live_rows|0
+config|arp_oldest_ts|0
+config|dns_enabled|false
+config|dns_paused_at|0
+config|dns_live_rows|0
+config|dns_oldest_ts|0
 config|network_capture_method|polling
+config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
 config|software_max_hive_mounts|100
 config|software_last_run_ts|1711050000
@@ -239,16 +256,43 @@ config|software_last_run_ts|1711050000
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module` (shown above),
-`procperf`, and `netqual` are off by default and must be enabled explicitly via
-`configure` (see the configuration table above). `module_live_rows` stays `0`
-until a collector for the host's OS ships. The default-ON sources — `process`,
-`tcp`, `service`, `user`, `perf`, and `software` — report `<source>_enabled|true`.
+`procperf`, `netqual`, `arp`, and `dns` are off by default and must be enabled
+explicitly via `configure` (see the configuration table above). The default-ON
+sources — `process`, `tcp`, `service`, `user`, `perf`, and `software` — report
+`<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
+host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on
+Linux/macOS), so on a Linux or macOS agent `arp_enabled|true` / `dns_enabled|true`
+still report `*_live_rows|0` — run the `compatibility` action to distinguish a
+supported-but-empty source from a planned-but-unimplemented one.
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_live_rows` stays low) from "the hourly trigger
 never fired".
 
-The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
+A `<source>_enabled` value can also read `errored` — automation that scrapes
+this output should match three values, not two:
+
+```
+config|process_enabled|errored
+```
+
+`errored` means the stored value is not the literal `true`/`false` the agent
+ever writes (corruption or tampering); the source is fail-closed until it is
+re-`configure`d. See the tri-state description below.
+
+The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
+
+### Corrupt-database quarantine
+
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
+
+- **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
+- **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
+- **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
+
+If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
+
+`network_capture_method` is the **configured** value (which may be a value pre-staged ahead of a forthcoming kernel-event collector, or a cross-OS platform API); `network_capture_method_effective` is the mechanism **actually collecting**, which is always `polling` today — no kernel-event collector is wired yet, so every configured value currently collects via polling. The two are reported side by side so `status` can never misrepresent the active capture mechanism to a forensic analyst.
 
 ## TAR dashboard page
 
@@ -306,7 +350,7 @@ The third frame on the `/tar` page reconstructs a **per-host process tree** enti
 
 ## Forcing an immediate snapshot
 
-The `snapshot` action triggers an immediate full collection of all four categories, useful before a maintenance window or at the start of an investigation:
+The `snapshot` action triggers an immediate full collection of all **enabled** capture sources (including opt-in `arp`/`dns` when on), useful before a maintenance window or at the start of an investigation:
 
 ```
 POST /api/v1/instructions/execute
@@ -347,6 +391,15 @@ TAR is designed for minimal performance overhead:
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
+>
+> **`arp_enabled` / `dns_enabled` are new this release (ADR-0015) and also ship
+> off by default.** Expect both to read `false` in `tar.status` on upgrade; the
+> new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
+> empty until you opt in (Windows-only collectors today; Linux/macOS planned).
+> No data collection changes on upgrade. **GUI note:** after enabling a source
+> (Capture-sources frame or `configure`), the first rows appear at the next
+> `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
+> is expected, not a fault.
 
 > **Upgrade note (new `software` source — ON by default).** This release adds the
 > `software` install/uninstall source, which ships **on by default** on Windows
@@ -442,6 +495,8 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
 | **Module** | `$Module_Live` (100000 rows) | `$Module_Hourly` (24h) | `$Module_Daily` (31d) | `$Module_Monthly` (12mo) |
 | **Software** | `$Software_Live` (5000 rows) | -- | `$Software_Daily` (31d) | `$Software_Monthly` (12mo) |
+| **ARP** *(opt-in)* | `$ARP_Live` (5000 rows) | `$ARP_Hourly` (24h) | — | — |
+| **DNS** *(opt-in)* | `$DNS_Live` (5000 rows) | `$DNS_Hourly` (24h) | — | — |
 
 The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 

@@ -130,11 +130,48 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
+| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete tar data on uninstall",
 that is a deployment-tooling change (MSI custom action), not a TAR
 plugin change.
+
+> **Collect gate and retention share `canonical_source_enabled`.** Both
+> `source_enabled()` (`tar_plugin.cpp`) and `run_retention()`
+> (`tar_aggregator.cpp`) decide a source's state via
+> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> literal `"true"` to non-enabled (`"false"` → disabled, anything else →
+> `"errored"`). This is load-bearing: a value the plugin never writes fails
+> **closed** — collection stops *and* retention preserves the rows — instead of
+> a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
+> let retention delete the paused window (#560). When adding a new always-on
+> capture source, gate collection on `source_enabled(*db_, "<name>")` and do
+> **not** add a parallel `== "false"` retention check — `run_retention` walks
+> `capture_sources()` and gates *every* registered source (including the opt-in
+> ones) through the same canonical helper, so retention is uniform.
+>
+> **Caveat for the opt-in collect gates.** The *retention* gate is canonical for
+> all sources, but the *collect* legs of the opt-in privacy sources (`procperf`,
+> `netqual`) deliberately read a raw `db_->get_config("<src>_enabled","false") ==
+> "true"` rather than `source_enabled()` — they default OFF and must not inherit
+> a source's `default_enabled`. That raw `== "true"` is *coincidentally*
+> fail-closed-equivalent to the canonical gate (only the literal `"true"`
+> enables), so an `errored` value still stops collection — but it is a separate
+> code path, not the shared helper. Unifying the opt-in collect gates onto
+> `canonical_source_enabled` is tracked as a follow-up; until then, the perf and
+> always-on collect legs are canonical and the two opt-in legs are raw-but-
+> equivalent.
+>
+> **`paused_at` is cleared on any non-`true` → `true` re-enable.**
+> `apply_source_enabled_transition` (`tar_aggregator.cpp`) canonicalises the
+> previous stored value before **both** legs, so the disable leg fires on
+> `prev_canon != "false"` and the re-enable leg clears `<source>_paused_at` on
+> `prev_canon != "true"`. The two are exact mirrors over the tri-state: an
+> `errored → true` recovery clears `paused_at` to `"0"` identically to a
+> `false → true` re-enable, so a recovered source never reports `enabled=true`
+> with a stale paused timestamp (#560). Idempotent `true → true` is a no-op and
+> does not touch `paused_at`.
 
 ---
 
@@ -241,3 +278,66 @@ For new-source bring-up, the smallest viable change is: add a
 `CaptureSourceDef` to `build_sources()`, write the platform collectors
 + enumeration function, write the diff, write tests. No DDL, no
 rollup, no plumbing changes — the registry is the contract.
+
+## 8. Adding a capture source
+
+A **capture source** is a snapshot-and-diff observer (births/deaths of host
+state) — like `process`, `tcp`, `service`, `user`. ARP and DNS (ADR-0015) are the
+worked example. Follow the **core capture-source pattern** below — do **not** copy
+the self-contained *tier* files (`tar_perf.*`, `tar_proc_perf.*`, `tar_netqual.*`),
+which are derived-metric samplers with their own headers and pure helpers, a
+different shape.
+
+The core pattern (mirror network/service/user — none of which have a per-source
+header):
+
+1. **`agents/plugins/tar/src/tar_collectors.hpp`** — add the collected-snapshot
+   struct (e.g. `ArpEntry`), the `enumerate_<source>()` declaration, and the typed
+   `compute_<source>_events()` diff declaration. **Watch for Win32 macro
+   collisions** — `interface` is `#define interface struct` under the full
+   `<windows.h>` (the server pulls it via httplib), so a member named `interface`
+   breaks the moment a TU without `WIN32_LEAN_AND_MEAN` includes the header; name
+   it `iface`.
+2. **`agents/plugins/tar/src/tar_<source>_collector.cpp`** (new) — `#include
+   "tar_collectors.hpp"`; implement `enumerate_<source>()` per platform with
+   `#ifdef _WIN32` / `#elif __APPLE__` / `#elif __linux__`, returning `{}` on
+   platforms whose collector is `kPlanned`. Enforce a per-cycle cap with a
+   `spdlog::warn` on truncation (there is no agent `/metrics` and no event bus, so
+   a log line is the truncation signal — not a metric or audit event).
+3. **`tar_db.{hpp,cpp}`** — add the warehouse-row struct (e.g. `ArpEvent`, next to
+   `NetworkEvent`) and `insert_<source>_events()` (mirror `insert_network_events`:
+   `BEGIN`/prepared insert/`COMMIT`, `StmtPtr` RAII).
+4. **`tar_diff.cpp`** — implement `compute_<source>_events()`: an `unordered_map`
+   keyed on the source's identity (delimiter `\x1f`, which never appears in the
+   data) → `appeared`/`removed`. Keep value-only fields (TTL, entry_type) **out**
+   of the key so they don't churn the warehouse.
+5. **`tar_schema_registry.cpp`** `build_sources()` — add ONE `CaptureSourceDef`.
+   This is the single source of truth: it auto-drives the warehouse DDL, the
+   `$Name_Tier` → `name_tier` translation, the read-only-SQL authorizer allowlist
+   (`is_queryable_table`, the #760/#631 chokepoint — **no hardcoded list to
+   touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
+   Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
+   `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
+   branch per non-live tier. **Usage-class / PII sources are opt-in**
+   (`default_enabled = false`, like `module`/`procperf`/`netqual`) under the
+   works-council posture.
+6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
+   gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
+   `set_state` (advance the diff baseline **only on insert success**). For an
+   opt-in source, an insert failure is non-fatal (log + skip — don't fail the
+   always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   should appear in those actions.
+7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
+   `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).
+8. **Content** (`content/definitions/`) — add `<source>_enabled` to
+   `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
+   `tar.sql` drill-downs.
+9. **Server GUI** (optional) — the Capture-sources frame
+   (`render_tar_capture_sources`) auto-lists any source the agent reports in
+   `tar status`; presentation metadata (category, always-on, `$`-name, badges)
+   lives in that render function. Device-level panels (no pid) go in the
+   process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
+10. **Tests** — extend `test_tar_schema_registry.cpp` (every source has all three
+    OS rows; opt-in sources in the `default_enabled=false` cross-check),
+    `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
+    `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.

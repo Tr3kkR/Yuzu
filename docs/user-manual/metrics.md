@@ -68,6 +68,15 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
+## DEX live-read metrics
+
+The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bounded by a server-wide concurrency cap; these metrics surface its saturation and outcomes.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_live_requests_total{kind, outcome}` | counter | Live-read requests by `kind` (`uptime` / `processes` / `unknown`) and terminal HTTP `outcome` (`200` / `400` / `403` / `429` / `500` / `502` / `503` / `504`). A rising `outcome="429"` rate means the concurrency cap is shedding load. |
+| `yuzu_server_live_inflight` | gauge | Current in-flight synchronous live-read polls. Approaching the cap (default 4) indicates saturation; sustained at the cap alongside 429s means the live surface is a bottleneck. |
+
 ## Fleet visualization metrics
 
 The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
@@ -378,10 +387,14 @@ appears if an agent of that OS still emits the retired tag).
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_guardian_baselines_total` | gauge | Number of persisted Guardian Baselines. Refreshed on every `/metrics` scrape. |
+| `yuzu_server_guardian_events_total` | gauge | Guardian events currently persisted in the store (post-reap). |
+| `yuzu_server_guardian_events_written_total` | counter | Cumulative Guardian events ever written (pre-reap). Exposed as TYPE `counter` via `describe()`; the value is read from the store each scrape and set through the gauge API (the `Counter` type has no `set()`), and resets to the store's current total on restart. |
+| `yuzu_server_guardian_events_dropped_total` | counter | Cumulative Guardian events dropped at ingest on an `event_id` PK/UNIQUE conflict (redelivery, an agent `event_seq_` reset, clock skew, or a forged-id pre-claim). `> 0` distinguishes "no drift observed" from "drift observed but silently discarded" — a CC7.3 evidence signal; investigate a sustained climb. Exposed as TYPE `counter`, but **resets on server restart** (in-memory atomic), so alert on `increase(...[1h])` over a window rather than an absolute value, and expect benign movement during fleet reconnect storms. The bundled `YuzuGuardianEventsDropped` alert uses a **placeholder threshold of 50/1h** — calibrate it against your fleet's reconnect baseline before enabling in production, or it will false-positive during a fleet-wide agent restart (see the tuning note in `docs/prometheus/yuzu-alerts.yml`). |
+| `yuzu_server_guardian_events_reaped_total` | counter | Cumulative Guardian event rows deleted by the retention reaper (disposal evidence). Exposed as TYPE `counter` (store-read value set via the gauge API, like the other `_total` counters here). |
 | `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
 | `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
-| `yuzu_server_guardian_proj_failures_total` | gauge | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
-| `yuzu_server_guardian_observations_reaped_total` | gauge | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). |
+| `yuzu_server_guardian_proj_failures_total` | counter | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
+| `yuzu_server_guardian_observations_reaped_total` | counter | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). Exposed as TYPE `counter` (store-read value set via the gauge API, like `events_written_total`). |
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 

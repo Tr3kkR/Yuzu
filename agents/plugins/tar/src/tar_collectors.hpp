@@ -13,7 +13,7 @@
  *   - "State change" = same key, different status field (services only)
  *
  * Command-line redaction: Before storing process events, cmdline is checked
- * against configurable glob patterns (default: *password*, *secret*, *token*,
+ * against configurable case-insensitive substring patterns (default: *password*, *secret*, *token*,
  * *api_key*, *credential*). Matching cmdlines are replaced with
  * "[REDACTED by TAR]".
  */
@@ -23,6 +23,7 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -86,7 +87,38 @@ struct LoadedUserScan {
     std::vector<std::string> scanned_users;
 };
 
+// One host ARP / neighbour-table entry (ADR-0015). Snapshot type for the `arp`
+// capture source; diffed into ArpEvent rows. Diff key = (interface, ip_address,
+// mac_address); entry_type is a value field. All fields agent-controlled.
+struct ArpEntry {
+    std::string iface; // NB: 'interface' is a Win32 COM macro under full <windows.h>
+    std::string ip_address;
+    std::string mac_address;
+    std::string entry_type; // dynamic, static, incomplete, other, unknown
+};
+
+// One host DNS resolver-cache entry (ADR-0015). Snapshot type for the `dns`
+// capture source; diffed into DnsEvent rows. Diff key = (name, record_type,
+// data); ttl_remaining_s is a value field (changes every tick, never keyed).
+// The cache is system-wide and carries NO pid — there is no process attribution.
+struct DnsEntry {
+    std::string name;
+    std::string record_type; // A, AAAA, CNAME, PTR, ...
+    std::string data;
+    int64_t ttl_remaining_s{0};
+    std::string source; // cache, hosts_file, unknown
+};
+
 // ── Platform enumeration functions ────────────────────────────────────────────
+//
+// Adding a NEW capture source? Follow the core pattern these functions use
+// (process/tcp/service/user, NOT the perf/procperf/netqual derived-metric tiers
+// which are self-contained tar_<name>.{hpp,cpp}): collected type + enumerate_*()
+// + compute_*_events() declared HERE, one tar_<source>_collector.cpp for the
+// platform shell (no per-source header), diffs in tar_diff.cpp, row struct +
+// insert_*_events in tar_db.{hpp,cpp}, one CaptureSourceDef in
+// tar_schema_registry.cpp. Full recipe: docs/tar-implementer.md "Adding a
+// capture source".
 
 /** Enumerate active network connections on the current host. */
 std::vector<NetConnection> enumerate_connections();
@@ -133,6 +165,25 @@ void enumerate_machine_software(std::vector<SoftwareInfo>& out);
  *  profiles scanned. Empty off Windows. */
 LoadedUserScan enumerate_loaded_user_software();
 
+/**
+ * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
+ * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
+ * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
+ */
+std::vector<ArpEntry> enumerate_arp();
+
+/**
+ * Enumerate the host DNS resolver cache (ADR-0015). Windows: DnsGetCacheDataTable.
+ * Hard-capped at kDnsEntryCap entries (warn on truncation). The cache is
+ * system-wide (no process attribution). Returns `{}` off Windows for now.
+ */
+std::vector<DnsEntry> enumerate_dns();
+
+/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector resizes to
+/// the cap and logs a truncation warning rather than growing unbounded.
+inline constexpr std::size_t kArpEntryCap = 2048;
+inline constexpr std::size_t kDnsEntryCap = 4096;
+
 // ── Redaction ────────────────────────────────────────────────────────────────
 
 /**
@@ -141,7 +192,7 @@ LoadedUserScan enumerate_loaded_user_software();
  * stripped (e.g. "*password*" matches any cmdline containing "password").
  *
  * @param cmdline   The command line to check.
- * @param patterns  List of glob-like patterns (e.g. {"*password*", "*secret*"}).
+ * @param patterns  Case-insensitive substring patterns (e.g. {"*password*", "*secret*"}; leading/trailing `*` are stripped, the rest is a literal substring).
  * @return true if the cmdline should be redacted.
  */
 bool should_redact(const std::string& cmdline, const std::vector<std::string>& patterns);
@@ -158,6 +209,26 @@ std::string redact_cmdline(const std::string& cmdline, const std::vector<std::st
  */
 inline const std::vector<std::string> kDefaultRedactionPatterns = {
     "*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
+
+/**
+ * Guarantee the built-in redaction defaults are present in `loaded`, appending
+ * any that are absent (order-preserving, de-duplicated). This is the fail-closed
+ * redaction invariant: an operator can ADD patterns via `tar.configure` but can
+ * never DISABLE the baseline protection, so no stored value — empty, a non-array,
+ * a valid array whose elements were all dropped by parse_pattern_config (`[]`,
+ * `[1,2,3]`, all-over-long), or one whose only entry has an empty stripped core
+ * (`["*"]`) — can ever cause `password`/`token`/`secret` to be written to
+ * `process_live` in plaintext. Every collect path (collect_fast, procperf,
+ * fleet_snapshot) routes its loaded patterns through here. (fjarvis #1532 HIGH.)
+ */
+inline std::vector<std::string>
+ensure_redaction_defaults(std::vector<std::string> loaded) {
+    for (const auto& def : kDefaultRedactionPatterns) {
+        if (std::find(loaded.begin(), loaded.end(), def) == loaded.end())
+            loaded.push_back(def);
+    }
+    return loaded;
+}
 
 // ── Diff functions ───────────────────────────────────────────────────────────
 
@@ -261,5 +332,25 @@ std::vector<SoftwareInfo> assemble_steady_state_snapshot(
     const std::vector<SoftwareInfo>& previous,
     std::vector<SoftwareInfo> machine_and_loaded,
     const std::vector<std::string>& scanned_users);
+
+/**
+ * Compute ARP diff. Key: interface + ip_address + mac_address.
+ * Detects bindings that appeared (`appeared`) and disappeared (`removed`). A
+ * changed entry_type on an otherwise-identical binding is NOT an event (value
+ * update only), so a flapping dynamic/static flag does not churn the warehouse.
+ */
+std::vector<ArpEvent> compute_arp_events(const std::vector<ArpEntry>& previous,
+                                         const std::vector<ArpEntry>& current,
+                                         int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute DNS-cache diff. Key: name + record_type + data.
+ * Detects resolutions that appeared (`appeared`) and aged out (`removed`). The
+ * ttl_remaining_s value is carried on the row but excluded from the key, so the
+ * per-tick TTL decrement does not produce spurious appeared/removed churn.
+ */
+std::vector<DnsEvent> compute_dns_events(const std::vector<DnsEntry>& previous,
+                                         const std::vector<DnsEntry>& current,
+                                         int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar

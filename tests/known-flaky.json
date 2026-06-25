@@ -1,0 +1,8 @@
+[
+  {
+    "case": "RegistryGuard Bounded: stops fixing after the cap (give-up flows through the guard)",
+    "platforms": ["windows"],
+    "reason": "res_get_flag() transiently returns 0xFFFFFFFF (HKCU\\SOFTWARE\\YuzuGuardResilience\\K briefly unopenable under concurrent guard access); confirmed flaky via a passing CI re-run. Source: tests/unit/test_guard_registry.cpp:511.",
+    "added": "2026-06-22"
+  }
+]

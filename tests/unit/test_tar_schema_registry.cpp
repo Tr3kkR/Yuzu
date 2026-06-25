@@ -88,16 +88,23 @@ TEST_CASE("TAR schema: kPlanned methods stay in the accept-list",
     // status is kPlanned must appear in accepted_capture_methods so a
     // configure call with that value succeeds (and the plugin separately
     // emits a `warn|...` line that the implementation isn't yet wired).
+    int planned_rows_checked = 0;
     for (const auto& src : capture_sources()) {
         auto accepted = accepted_capture_methods(src.name);
         for (const auto& os : src.os_support) {
             if (os.status == OsSupportStatus::kPlanned) {
+                ++planned_rows_checked;
                 INFO("source=" << src.name << " planned method=" << os.capture_method);
                 CHECK(std::find(accepted.begin(), accepted.end(),
                                 std::string{os.capture_method}) != accepted.end());
             }
         }
     }
+    // #544 — guard against silent vacuity: with zero kPlanned rows the loop runs
+    // no assertions and the pre-staging contract goes untested (the original bug
+    // — the test "passed" while checking nothing). Require at least one so this
+    // fails loudly if the kPlanned methods are ever removed.
+    REQUIRE(planned_rows_checked > 0);
 }
 
 TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
@@ -132,6 +139,93 @@ TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
     }
 }
 
+// ── #540: per-OS capture-method accept-list ────────────────────────────────
+
+TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",
+          "[tar][schema][issue59]") {
+    // The OS-blind union accepts every method across all platforms — which is
+    // exactly the #540 bug: a Linux agent could store the Windows-only
+    // 'iphlpapi'. The per-OS accessor must NOT leak another OS's methods.
+    auto unioned = accepted_capture_methods("tcp");
+    auto contains = [](const std::vector<std::string>& v, const std::string& s) {
+        return std::find(v.begin(), v.end(), s) != v.end();
+    };
+
+    // The union (the buggy validation surface) contains all platforms' methods.
+    CHECK(contains(unioned, "iphlpapi"));    // windows
+    CHECK(contains(unioned, "procfs"));      // linux
+    CHECK(contains(unioned, "proc_pidfdinfo")); // macos
+
+    auto linux_ok = accepted_capture_methods_for_os("tcp", "linux");
+    CHECK(contains(linux_ok, "procfs"));
+    CHECK_FALSE(contains(linux_ok, "iphlpapi"));      // Windows-only — must be rejected on Linux
+    CHECK_FALSE(contains(linux_ok, "proc_pidfdinfo")); // macOS-only
+
+    auto win_ok = accepted_capture_methods_for_os("tcp", "windows");
+    CHECK(contains(win_ok, "iphlpapi"));
+    CHECK_FALSE(contains(win_ok, "procfs"));
+
+    auto mac_ok = accepted_capture_methods_for_os("tcp", "macos");
+    CHECK(contains(mac_ok, "proc_pidfdinfo"));
+    CHECK_FALSE(contains(mac_ok, "iphlpapi"));
+
+    // An unknown OS yields an empty accept-list (everything rejected, fail-safe).
+    CHECK(accepted_capture_methods_for_os("tcp", "plan9").empty());
+}
+
+TEST_CASE("TAR schema: current_platform_os is one of the supported triplet",
+          "[tar][schema][issue59]") {
+    auto os = current_platform_os();
+    CHECK((os == "windows" || os == "linux" || os == "macos"));
+    // And the running platform's tcp accept-list is non-empty (every supported
+    // OS has at least a polling-equivalent capture method).
+    CHECK_FALSE(accepted_capture_methods_for_os("tcp", os).empty());
+}
+
+TEST_CASE("TAR schema: effective network capture method is always polling today",
+          "[tar][schema][issue1528]") {
+    // `do_configure` stores any `network_capture_method` in
+    // accepted_capture_methods("tcp") (plus the "polling" sentinel), but
+    // collect_fast always polls via enumerate_connections() regardless.
+    // effective_network_capture_method() is the single source of truth the
+    // `status` action reports so it can never claim a stored-but-unwired method
+    // is the active mechanism. Until a kernel-event collector lands, every
+    // configured value must collapse to "polling".
+
+    // Round-trip: the documented default maps to itself.
+    CHECK(effective_network_capture_method("polling") == "polling");
+
+    // Core invariant (issue #1528 acceptance): EVERY value `do_configure` will
+    // accept for network_capture_method must report effective "polling" and must
+    // NOT be reported back as the active mechanism. The tcp accept-list is the
+    // exact configurable set; the kSupported platform APIs (procfs / iphlpapi /
+    // proc_pidfdinfo) ARE the polling implementation, so the status field
+    // reports the logical "polling" rather than the underlying API -- and a
+    // cross-OS value (e.g. iphlpapi stored on a Linux box reading /proc/net) can
+    // never masquerade as the active mechanism.
+    auto configurable = accepted_capture_methods("tcp");
+    REQUIRE_FALSE(configurable.empty());  // guard against a vacuous loop
+    for (const auto& method : configurable) {
+        INFO("configurable network_capture_method=" << method);
+        CHECK(effective_network_capture_method(method) == "polling");
+        CHECK(effective_network_capture_method(method) != method);
+    }
+
+    // Forward-looking: etw / endpoint_security are named in the issue and the
+    // tar.yaml/tar.md prose as the kernel-event methods that would be pre-staged
+    // once their collectors land (they are NOT in the tcp accept-list today, so
+    // they appear here as explicit literals, not via the registry). The helper
+    // is total -- it must collapse them to "polling" too until those collectors
+    // are wired, which is when this function gains its runtime branch.
+    CHECK(effective_network_capture_method("etw") == "polling");
+    CHECK(effective_network_capture_method("endpoint_security") == "polling");
+
+    // Total-function contract: empty and unknown inputs are inert (the helper
+    // ignores `configured` today) and still report the truthful mechanism.
+    CHECK(effective_network_capture_method("") == "polling");
+    CHECK(effective_network_capture_method("not_a_real_method") == "polling");
+}
+
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
 
 TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
@@ -141,7 +235,7 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // read. The high-volume usage-class sources (module ~100× process volume,
     // procperf per-app, netqual per-connection) are opt-in and must report
     // disabled on a fresh agent; everything else is always-on.
-    for (const auto* name : {"module", "procperf", "netqual"}) {
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }

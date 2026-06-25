@@ -21,6 +21,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <filesystem>
@@ -342,13 +343,27 @@ TEST_CASE("AuthRoutes::require_scoped_permission — readonly MCP tier blocks Ex
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("MCP token tier does not allow Execution:Execute") != std::string::npos);
+    // #1549 review MEDIUM: the scoped-gate denial now carries the A4 envelope —
+    // a correlation_id and a structured securable_type:operation permission field.
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"]["permission"].get<std::string>() == "Execution:Execute");
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    // The body's correlation_id is echoed on the X-Correlation-Id header so a caller
+    // can correlate without parsing the body.
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 // ---------------------------------------------------------------------------
 // supervised-tier approval enforcement on REST transport (sec-H1 / CH-1)
-// MCP server returns kApprovalRequired for supervised+destructive ops because
-// Phase 2 re-dispatch is not built. The REST transport must mirror that — a
-// supervised MCP token must not bypass the approval gate by switching endpoints.
+// The MCP server DENIES supervised+destructive ops (kTierDenied) because Phase 2
+// re-dispatch is not built — it deliberately does NOT return kApprovalRequired,
+// which the A4 contract reserves for a pollable approval (approval_id +
+// status_url) it cannot honestly produce. The REST transport must mirror that
+// denial — a supervised MCP token must not bypass the approval gate by switching
+// endpoints.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from approval-gated Execute",
