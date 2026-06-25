@@ -237,7 +237,12 @@ Before upgrading any component:
   (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
   the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
   (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
-  debug). Machine-scope only, no end-user PII (no works-council trigger). Reads are
+  debug). Machine-scope only, no end-user PII (no username collection) — but the
+  data is device-attributable, and on **personally-assigned devices** installed-
+  software enumeration may be **works-council co-determination-relevant** (see the
+  works-council note in [Installed-Software Inventory](inventory.md)). To suppress
+  collection entirely, pass **`--inventory-disable`** / set
+  `YUZU_AGENT_INVENTORY_DISABLE` on the agent (deploy-time opt-out). Reads are
   gated on the new `Inventory:Read` RBAC securable; today the data is queryable via
   direct SQL (see [Installed-Software Inventory](inventory.md)).
 
