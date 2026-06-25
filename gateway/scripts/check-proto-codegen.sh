@@ -40,9 +40,12 @@ cd "$(dirname "$0")/.."
 
 SRC="apps/yuzu_gw/src"
 PROTO_DIR="priv/proto"
+# Register the cleanup trap immediately after the FIRST mktemp so a failure of the
+# second (under set -e) cannot leak the first dir; ${TMP_NESTED:-} tolerates the
+# trap firing before the second assignment completes.
 TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP" "${TMP_NESTED:-}"' EXIT
 TMP_NESTED="$(mktemp -d)"
-trap 'rm -rf "$TMP" "$TMP_NESTED"' EXIT
 
 if [ ! -d "$PROTO_DIR" ]; then
     echo "ERROR: $PROTO_DIR not found — run from the gateway project root." >&2
@@ -67,7 +70,7 @@ erl -noshell -pa "$GPB_EBIN" -eval "
     Opts = GpbOpts ++ [{i, \"$PROTO_DIR\"}, {o_erl, \"$TMP\"}, {o_hrl, \"$TMP\"}],
     Protos = filelib:wildcard(\"$PROTO_DIR/*.proto\"),
     case Protos of
-        [] -> io:format(standard_error, \"no top-level protos in $PROTO_DIR~n\", []), halt(3);
+        [] -> io:format(standard_error, \"::error::no top-level protos in $PROTO_DIR~n\", []), halt(3);
         _  -> ok
     end,
     lists:foreach(fun(P) ->
@@ -163,14 +166,19 @@ fi
 
 if [ "$drift" -ne 0 ]; then
     echo "" >&2
-    echo "Gateway proto codegen check failed. Two distinct causes report above:" >&2
-    echo "  • 'gateway proto codegen drift in <x>_pb.erl' — a committed module is" >&2
-    echo "    stale vs priv/proto. Regenerate + commit:" >&2
+    echo "Gateway proto codegen check failed. One or more of the following (see the" >&2
+    echo "'::error::' lines above for the specific file):" >&2
+    echo "  • 'gateway proto codegen drift in <x>_pb.erl' / 'regenerated <x>_pb.erl has" >&2
+    echo "    no committed counterpart' — a committed module under apps/yuzu_gw/src is" >&2
+    echo "    stale vs (or missing for) priv/proto. Regenerate + commit:" >&2
     echo "        cd gateway && rebar3 grpc gen   # or the gpb regen used to author them" >&2
     echo "  • 'flat/nested proto drift: priv/proto/<x>.proto vs ...' — the flat copy" >&2
     echo "    and its package-pathed mirror under priv/proto/yuzu/<pkg>/v1/ disagree" >&2
     echo "    on message/field structure. Edit BOTH copies in lockstep so the field" >&2
     echo "    survives the gateway proxy re-encode, then regenerate the _pb modules." >&2
+    echo "  • 'nested <x> generates <y> but no flat top-level proto produced it' — a" >&2
+    echo "    nested mirror's basename has no matching flat proto (layout/rename" >&2
+    echo "    mismatch); restore the flat counterpart or align the basenames." >&2
     echo "(gpb is version-pinned in rebar.config, so a matching toolchain reproduces these exactly.)" >&2
     exit 1
 fi
