@@ -208,17 +208,18 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // COMMIT/ROLLBACK); distinct agents hash to distinct keys, so steady-state
         // contention is nil. hashtext()→int4 widened to the bigint overload.
         //
-        // try_ (non-blocking) on purpose: on the rare same-agent contention, the
-        // loser must NOT block while holding a pooled connection up to lock_timeout/
-        // statement_timeout (that parks a shared-pool connection, gov Gate-8
-        // UP-IN2/3-P + security LOW). It bails → kError → the seam nacks need_full →
-        // the agent resends after backoff, by which time the winner has committed.
-        pg::PgResult lk = pg::exec_params(c, "SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)",
+        // Blocking (not try_) on purpose: same-agent contention is the rare
+        // post-restart-retry case; the loser WAITS for the winner to commit, then
+        // does its own clean replace → outcome="stored", no alert noise. A
+        // try-lock would return kError on benign contention and trip
+        // YuzuInventorySustainedIngestErrors (gov Gate-8 advisor — the error/alert
+        // taxonomy is sre's gate, out of scope for this round). The wait is
+        // transaction-scoped + bounded by the pool's statement_timeout; a distinct
+        // "contended" outcome label is the right pool-hygiene follow-up.
+        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
                                           std::vector<std::string>{agent_id_s});
-        if (lk.status() != PGRES_TUPLES_OK || PQntuples(lk.get()) != 1)
+        if (lk.status() != PGRES_TUPLES_OK)
             return false;
-        if (std::string_view(PQgetvalue(lk.get(), 0, 0)) != "t")
-            return false; // another full-replace for this agent holds the lock — retry later
         pg::PgResult del = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{agent_id_s});
