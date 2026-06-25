@@ -495,6 +495,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include "mcp_server.hpp"
 
+#include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
 #include <httplib.h>
@@ -580,6 +582,13 @@ struct McpTestServer {
     /// all rows. A two-principal test sets a lambda that returns true only for the
     /// caller's in-scope agents.
     yuzu::server::mcp::McpServer::ResponseScopeFn response_scope_fn_for_test{};
+
+    /// ADR-0016: optionally wire a typed SoftwareInventoryStore + an Inventory-scope
+    /// predicate so query_installed_software is exercised end-to-end, including the
+    /// management-group drop path. Default nullptr/{} keeps existing tests on the
+    /// "Software inventory store unavailable" path with no filter.
+    yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
+    yuzu::server::mcp::McpServer::InventoryScopeFn inventory_scope_fn_for_test{};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -696,7 +705,9 @@ private:
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
             /*dex_perf_fn=*/dex_perf_fn_for_test,
             /*net_perf_fn=*/net_perf_fn_for_test,
-            /*response_scope_fn=*/response_scope_fn_for_test);
+            /*response_scope_fn=*/response_scope_fn_for_test,
+            /*software_inventory_store=*/software_inventory_store_for_test,
+            /*inventory_scope_fn=*/inventory_scope_fn_for_test);
     }
 };
 
@@ -3003,4 +3014,61 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
     auto p = bundle_payload(resp);
     CHECK(p["steps"][0]["state"] == "responded");
+}
+
+// ── query_installed_software (ADR-0016 typed store + management-group scope) ──
+
+TEST_CASE("MCP query_installed_software: store unavailable → internal error",
+          "[mcp][inventory]") {
+    McpTestServer ts; // no software_inventory_store wired
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":78,)"
+                       R"("params":{"name":"query_installed_software","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("Software inventory store unavailable") != std::string::npos);
+}
+
+TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's groups",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    using yuzu::server::InventoryIngestOutcome;
+    using yuzu::server::SoftwareEntry;
+    using yuzu::server::SoftwareInventoryStore;
+    // Two devices both run Chrome.
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-in", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-out", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    // Caller may see agent-in, never agent-out (the management-group drop path).
+    ts.inventory_scope_fn_for_test = [](const std::string& /*user*/, const std::string& agent_id) {
+        return agent_id == "agent-in";
+    };
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":77,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res->status == 200);
+    // In-scope device present; out-of-scope device filtered OUT (cross-operator isolation).
+    CHECK(res->body.find("agent-in") != std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    // The drop is audited distinctly as a denied event, alongside the success row.
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.query_installed_software|denied")
+            saw_denied = true;
+        if (a == "mcp.query_installed_software|success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
 }

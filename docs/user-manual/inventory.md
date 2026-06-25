@@ -60,10 +60,22 @@ WHERE agent_id = '<agent-id>'
 ORDER BY name;
 ```
 
-A dedicated REST endpoint, MCP query tool, and a software dashboard /
-per-device drill-down view are planned follow-ons. (Note: the generic
-`/api/v1/inventory/*` REST endpoints and MCP inventory tools read a *separate*
-generic inventory store and do **not** surface this typed software data.)
+### MCP (for agentic workers)
+
+The **`query_installed_software`** MCP tool exposes the same data to agentic
+workers (gated on `Inventory:Read`):
+
+- Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
+- Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
+  `true`, more rows exist past the cap (keyset pagination is a follow-up).
+- **Results are scoped to your management groups** — devices outside your
+  groups are omitted, and the omission is audited. This is distinct from the
+  generic `query_inventory` / `get_agent_inventory` tools, which read a
+  *separate* generic blob store on `Infrastructure:Read` and do **not** surface
+  this typed software data.
+
+A dedicated REST endpoint and a software dashboard / per-device drill-down view
+are planned follow-ons.
 
 ## Access control
 

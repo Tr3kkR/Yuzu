@@ -9097,6 +9097,19 @@ private:
                     return rbac_store_->check_scoped_permission(username, "Response", "Read",
                                                                 agent_id, mgmt_group_store_.get());
                 },
+                // ADR-0016: the typed daily-sync software store + its per-device
+                // Inventory-scope predicate for query_installed_software. SAME
+                // management-group chokepoint as the response predicate above, but
+                // bound to ("Inventory","Read") — so an operator's fleet-wide software
+                // query returns only devices inside their groups (cross-operator
+                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                software_inventory_store_.get(),
+                [this](const std::string& username, const std::string& agent_id) -> bool {
+                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                        return true;
+                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
+                                                                agent_id, mgmt_group_store_.get());
+                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_);

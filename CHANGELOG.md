@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hardened for fleet-scale resilience: a per-source blob cap sized below the gRPC message ceiling,
   exponential agent-side backoff on consecutive `need_full` resends (so a server cold-cache or store
   outage cannot drive a flat-cadence full-resend storm), a `yuzu_inventory_ingest_total{source,outcome}`
-  metric, and the store wired into both `/readyz` and `/healthz`.
+  metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
+  **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
+  scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
+  tools. A REST endpoint and software dashboard are planned follow-ons.
 
 ### Security
 
