@@ -420,14 +420,16 @@ const std::string& openapi_spec() {
         "properties": {
           "baseline": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "name": {"type": "string"}, "lifecycle": {"type": "string", "enum": ["draft", "deployed"]}}},
           "deployed": {"type": "boolean", "description": "lifecycle == deployed; false => consumer shows 'No Baseline Deployed'"},
+          "assessable": {"type": "boolean", "description": "Machine-readable go/no-go: true only when deployed AND at least one applicable Guard has reported (total_guards>0). FALSE for a draft Baseline, or a deployed Baseline this device has reported NO applicable Guard against (newly-enrolled / offline / all out-of-scope). When false the consumer MUST NOT compute or render a compliance percentage — this is the machine signal that closes the 0/0 green-wash."},
           "agent_id": {"type": "string"},
-          "total_guards": {"type": "integer", "description": "Guards APPLICABLE to this device — the deployed_snapshot intersected with the Guards this device has actually reported (report-driven), NOT the snapshot size. Out-of-scope Guards are absent, so each machine's count reflects its own applicable set. NOT-ASSESSABLE: deployed:true with total_guards:0 and last_updated:null means NO applicable Guard has reported yet (device offline / newly-enrolled / all out-of-scope) — treat as 'not assessable', do NOT compute a compliance percentage or render it as compliant."},
+          "total_guards": {"type": "integer", "description": "Guards APPLICABLE to this device — the deployed_snapshot intersected with the Guards this device has actually REPORTED (report-driven), NOT the snapshot size and NOT this device's true in-scope count. CAUTION (compliance over-estimate): an in-scope Guard the agent has not yet reported (offline / newly-enrolled / guard crashed before arming) is absent — it drops out of the DENOMINATOR rather than counting as pending — so compliant/total_guards can read falsely high (e.g. 3/3=100% when 7 of 10 in-scope Guards are silent), worst exactly when Guards are broken. Do NOT gate automated remediation on this percentage until the per-device scope_expr computed denominator ships (deferred — see route description); cross-reference snapshot_total, last_updated, and device liveness. NOT-ASSESSABLE: assessable:false."},
+          "snapshot_total": {"type": "integer", "description": "The Baseline's full deployed-member count (the SUPERSET across all devices — an upper bound, NOT this device's in-scope count). total_guards <= snapshot_total; a gap is EXPECTED for a per-machine-scoped Baseline, but a large gap is a cue that this device's coverage may be partial (in-scope Guards unreported). The honest per-device denominator needs the deferred scope_expr evaluation."},
           "compliant": {"type": "integer"},
           "drifted": {"type": "integer"},
           "errored": {"type": "integer"},
-          "pending": {"type": "integer", "description": "applicable Guards reported with an unrecognized verdict; equals total_guards - (compliant+drifted+errored). Out-of-scope Guards are ABSENT (not pending) in the report-driven model — usually 0 here."},
-          "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null if none reported"},
-          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null when status is pending"}}}}
+          "pending": {"type": "integer", "description": "applicable Guards reported with an unrecognized verdict token (e.g. agent newer than server); equals total_guards - (compliant+drifted+errored). Out-of-scope Guards are ABSENT (not pending) in the report-driven model — usually 0 here."},
+          "last_updated": {"type": "string", "nullable": true, "description": "max guards[].updated_at — 'compliance as of'; null ONLY when this device has reported no applicable guard. A reported guard contributes its timestamp even if its verdict token is unrecognized (status pending)."},
+          "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "status": {"type": "string", "enum": ["compliant", "drifted", "errored", "pending"]}, "updated_at": {"type": "string", "nullable": true, "description": "ISO-8601 this device last reported this guard's verdict; null ONLY when this device has not reported this guard. A reported guard carries its timestamp even when status is pending (unrecognized verdict token)."}}}}
         }
       },)json"
         R"json(
@@ -6303,6 +6305,13 @@ void RestApiV1::register_routes(
         "/api/v1/guaranteed-state/device-compliance",
         [scoped_perm_fn, audit_fn, guaranteed_state_store,
          baseline_store](const httplib::Request& req, httplib::Response& res) {
+            // One correlation id for the whole request, surfaced as X-Correlation-Id
+            // on EVERY path (success + all error branches) — parity with the
+            // dex.device.view / dex.signals / events siblings (#1651, cons-1). Every
+            // error body reuses this same cid so the header and the A4 body can't
+            // diverge.
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
             const std::string baseline_name = req.get_param_value("baseline");
             const std::string agent_id = req.get_param_value("agent_id");
             // Both query params are required. Bound their length to the canonical
@@ -6310,7 +6319,6 @@ void RestApiV1::register_routes(
             // enrollment enforces) so an over-long value is rejected by THIS route
             // before it reaches the store. A4 400 on missing or over-length.
             if (baseline_name.empty() || agent_id.empty()) {
-                const auto cid = detail::make_correlation_id();
                 res.status = 400;
                 res.set_content(
                     detail::error_json_a4(
@@ -6320,7 +6328,6 @@ void RestApiV1::register_routes(
             }
             if (baseline_name.size() > auth::kMaxAgentIdLength ||
                 agent_id.size() > auth::kMaxAgentIdLength) {
-                const auto cid = detail::make_correlation_id();
                 res.status = 400;
                 res.set_content(detail::error_json_a4(400, "query parameter too long", cid),
                                 "application/json");
@@ -6342,7 +6349,6 @@ void RestApiV1::register_routes(
                 return false;
             };
             if (has_control_char(baseline_name) || has_control_char(agent_id)) {
-                const auto cid = detail::make_correlation_id();
                 res.status = 400;
                 res.set_content(
                     detail::error_json_a4(
@@ -6362,7 +6368,6 @@ void RestApiV1::register_routes(
             // group-scoped lockout this route exists to fix. Production wires it in
             // server.cpp; the in-process test harness wires its own.
             if (!scoped_perm_fn) {
-                const auto cid = detail::make_correlation_id();
                 // Distinct message from the store-null 503 below so log triage
                 // identifies the defect (unwired call site) without reading source.
                 spdlog::error("guardian.device.baseline: scoped_perm_fn unwired — "
@@ -6376,7 +6381,6 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
             if (!guaranteed_state_store || !baseline_store) {
-                const auto cid = detail::make_correlation_id();
                 spdlog::error("guardian.device.baseline: store null "
                               "(guaranteed_state_store/baseline_store) — "
                               "registration-order defect; cid={}",
@@ -6386,7 +6390,23 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            const auto baseline = baseline_store->get_baseline_by_name(baseline_name);
+            bool baseline_store_ok = true;
+            const auto baseline =
+                baseline_store->get_baseline_by_name(baseline_name, &baseline_store_ok);
+            if (!baseline_store_ok) {
+                // Store FAULT (DB locked/corrupt), NOT a genuine miss — return a
+                // retryable 503, not the 404 a CMDB would read as "no such baseline →
+                // delete this CI" on a transient fault (UP-13/sre-2). Pre-audit, like
+                // the store-null/unwired 503s above: no PII was looked up, and a
+                // name-independent fault leaks no baseline existence (no enumeration).
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "baseline store unavailable", cid, 5000,
+                                                      "retry the request"),
+                                "application/json");
+                spdlog::warn("guardian.device.view baseline store fault (503) cid={} agent_id={}",
+                             cid, agent_id);
+                return;
+            }
 
             // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel
             // detail::emit_behavioral_audit (parity with GET /dex/devices/{id}, GET
@@ -6410,7 +6430,6 @@ void RestApiV1::register_routes(
                     audit_fn, req, res, "guardian.device.view", baseline ? "success" : "not_found",
                     "Agent", agent_id,
                     "baseline '" + baseline_name + "' per-device guard status via REST")) {
-                const auto cid = detail::make_correlation_id();
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
@@ -6423,7 +6442,6 @@ void RestApiV1::register_routes(
             }
 
             if (!baseline) {
-                const auto cid = detail::make_correlation_id();
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "baseline not found", cid),
                                 "application/json");
@@ -6466,20 +6484,26 @@ void RestApiV1::register_routes(
                     continue;  // not applicable to this device
                 ++total_guards;
                 std::string status = "pending";
-                std::string updated_at;
                 const std::string& s = it->second.state;
                 if (s == "compliant") { status = s; ++compliant; }
                 else if (s == "drifted") { status = s; ++drifted; }
                 else if (s == "errored") { status = s; ++errored; }
-                // any unexpected stored state falls through to "pending" (no
-                // timestamp) — also the forward-compat path: a future verdict token
-                // this build doesn't recognize stays counted in total_guards as
-                // pending, never silently dropped from the denominator.
-                if (status != "pending") {
-                    updated_at = it->second.updated_at;
-                    if (updated_at > last_updated)
-                        last_updated = updated_at;
-                }
+                // any unexpected stored state falls through to "pending" — the
+                // forward-compat path: a future verdict token this build doesn't
+                // recognize stays counted in total_guards as pending, never silently
+                // dropped from the denominator.
+                //
+                // The report row EXISTS here (we are past dev.find != end), so it
+                // carries a real timestamp regardless of whether the token is
+                // recognized. Capture updated_at for staleness INDEPENDENT of the
+                // status LABEL (hp-1): an unrecognized-token "pending" guard (e.g. a
+                // newer agent talking to an older server) DID report recently —
+                // suppressing its updated_at would conflate "reported, unknown token"
+                // with "never reported", and a consumer watching last_updated could
+                // not tell them apart.
+                const std::string& updated_at = it->second.updated_at;
+                if (!updated_at.empty() && updated_at > last_updated)
+                    last_updated = updated_at;
                 const auto nit = rule_names.find(rid);
                 JObj g;
                 g.add("rule_id", rid)
@@ -6500,11 +6524,25 @@ void RestApiV1::register_routes(
                 .add("name", baseline->name)
                 .add("lifecycle", baseline->lifecycle);
 
+            // assessable: a machine-readable go/no-go for a CMDB consumer (UP-2 /
+            // comp-1 / er-1). FALSE when the response carries no compliance signal to
+            // act on — a draft Baseline, or a deployed Baseline for which this device
+            // has reported NO applicable Guard (newly-enrolled / offline / every Guard
+            // out of scope). When false the consumer MUST NOT compute or render a
+            // compliance percentage. snapshot_total is the Baseline's full deployed
+            // member count (the SUPERSET across all devices, NOT this device's in-scope
+            // count): total_guards < snapshot_total is EXPECTED for a per-machine-scoped
+            // Baseline, but a large gap is a cue that coverage may be partial — the
+            // honest per-device in-scope denominator needs the deferred scope_expr
+            // evaluation (see route header). Until then, do NOT gate remediation on
+            // compliant/total_guards.
             JObj data;
             data.raw("baseline", b.str())
                 .add("deployed", deployed)
+                .add("assessable", deployed && total_guards > 0)
                 .add("agent_id", agent_id)
                 .add("total_guards", total_guards)
+                .add("snapshot_total", static_cast<int64_t>(guard_ids.size()))
                 .add("compliant", compliant)
                 .add("drifted", drifted)
                 .add("errored", errored)

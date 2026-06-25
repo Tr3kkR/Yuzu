@@ -247,10 +247,18 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
     return result;
 }
 
-std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& name) const {
+std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& name,
+                                                            bool* store_ok) const {
+    // Optimistic: only a store FAULT (db-null / prepare-fail) clears this; a genuine
+    // not-found leaves it true so the caller 404s rather than 503s (UP-13/sre-2).
+    if (store_ok)
+        *store_ok = true;
     std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!db_) {
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
+    }
     // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE name = ? LIMIT 1;";
@@ -267,6 +275,8 @@ std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& n
         // and the value is caller-influenced).
         spdlog::error("BaselineStore::get_baseline_by_name: prepare failed: {}",
                       sqlite3_errmsg(db_));
+        if (store_ok)
+            *store_ok = false;  // fault, not a miss → caller 503s (retryable)
         return std::nullopt;
     }
     sqlite3_bind_text(s.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);

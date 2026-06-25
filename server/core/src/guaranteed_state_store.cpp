@@ -1846,24 +1846,32 @@ GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) c
     if (!db_ || rule_ids.empty())
         return out;
     // Bounded variant of rule_names(): WHERE rule_id IN (?,?,…) with one positional
-    // placeholder per id (ids are bound, never interpolated into the SQL). The id
-    // count is the baseline's deployed-snapshot size — operator-authored, well under
-    // SQLITE_MAX_VARIABLE_NUMBER — so a single IN-list is safe. Pure SELECT (#1033-safe).
-    std::string sql = "SELECT rule_id, name FROM guaranteed_state_rules WHERE rule_id IN (";
-    for (std::size_t i = 0; i < rule_ids.size(); ++i)
-        sql += (i == 0 ? "?" : ",?");
-    sql += ");";
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
-        spdlog::error("GuaranteedStateStore::rule_names_for: prepare failed: {}",
-                      sqlite3_errmsg(db_));
-        return out;
+    // placeholder per id (ids are bound, never interpolated into the SQL). CHUNKED at
+    // 500 ids per statement (perf-2/UP-6) so a Baseline whose deployed-snapshot
+    // exceeds SQLITE_MAX_VARIABLE_NUMBER (999 on a pre-3.32 build — the limit is
+    // build-/host-dependent and unpinned in vcpkg) cannot make prepare fail and
+    // silently drop ALL guard names to the rule_id fallback fleet-wide. 500 keeps even
+    // a 5000-member Baseline to 10 prepared seeks — negligible, since rule_id is the
+    // PK so each IN entry is an index seek. Pure SELECT (#1033-safe).
+    constexpr std::size_t kChunk = 500;
+    for (std::size_t base = 0; base < rule_ids.size(); base += kChunk) {
+        const std::size_t n = std::min(kChunk, rule_ids.size() - base);
+        std::string sql = "SELECT rule_id, name FROM guaranteed_state_rules WHERE rule_id IN (";
+        for (std::size_t i = 0; i < n; ++i)
+            sql += (i == 0 ? "?" : ",?");
+        sql += ");";
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error("GuaranteedStateStore::rule_names_for: prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return out;  // partial map; caller falls back to rule_id for unresolved names
+        }
+        for (std::size_t i = 0; i < n; ++i)
+            sqlite3_bind_text(s.get(), static_cast<int>(i + 1), rule_ids[base + i].c_str(), -1,
+                              SQLITE_TRANSIENT);
+        while (sqlite3_step(s.get()) == SQLITE_ROW)
+            out.emplace(col_text(s.get(), 0), col_text(s.get(), 1));
     }
-    for (std::size_t i = 0; i < rule_ids.size(); ++i)
-        sqlite3_bind_text(s.get(), static_cast<int>(i + 1), rule_ids[i].c_str(), -1,
-                          SQLITE_TRANSIENT);
-    while (sqlite3_step(s.get()) == SQLITE_ROW)
-        out.emplace(col_text(s.get(), 0), col_text(s.get(), 1));
     return out;
 }
 

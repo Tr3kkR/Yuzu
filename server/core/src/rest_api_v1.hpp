@@ -95,8 +95,8 @@ public:
     /// source-stability of the other (unrelated) call sites — a route that requires
     /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED (503); it
     /// does NOT silently fall back to the flat PermFn (that would re-introduce the
-    /// group-scoped lockout this typedef exists to fix). See the baseline-device route
-    /// in rest_api_v1.cpp for the fail-closed contract.
+    /// group-scoped lockout this typedef exists to fix). See the device-compliance
+    /// route in rest_api_v1.cpp for the fail-closed contract.
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,

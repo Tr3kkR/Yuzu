@@ -120,7 +120,7 @@ struct RestGsHarness {
 
     // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
-    // baseline-device route with an EMPTY ScopedPermFn, exercising its fail-closed-503
+    // device-compliance route with an EMPTY ScopedPermFn, exercising its fail-closed-503
     // path. Both default true so every existing test is unchanged.
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true)
         : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")),
@@ -199,11 +199,13 @@ struct RestGsHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
+            // Throw BEFORE recording, so a throwing audit_fn leaves audit_log empty —
+            // a test can then assert audit_log.empty() to prove the handler's catch arm
+            // (not the return-false arm) fired. (The merge that adopted #1647's harness
+            // left a second, unreachable post-push_back throw here; removed — qe-1.)
             if (audit_throws)
                 throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
-            if (audit_throws)
-                throw std::runtime_error("audit DB write blew up");
             return audit_succeeds;
         };
 
@@ -1740,6 +1742,12 @@ TEST_CASE("REST gs.device-compliance: deployed-but-empty baseline → deployed:t
     CHECK(d["total_guards"].get<int>() == 0);
     REQUIRE(d["guards"].is_array());
     CHECK(d["guards"].empty());
+    // UP-2/comp-1/er-1: deployed but zero applicable Guards reported → NOT assessable.
+    // A consumer MUST read assessable:false and refuse to compute a 0/0 compliance %
+    // (the green-wash this flag exists to prevent). snapshot_total is the deployed
+    // member count (0 here).
+    CHECK(d["assessable"].get<bool>() == false);
+    CHECK(d["snapshot_total"].get<int>() == 0);
 }
 
 TEST_CASE("REST gs.device-compliance: permission gate runs before audit",
@@ -1894,6 +1902,11 @@ TEST_CASE("REST gs.device-compliance: audit-persist failure → 503 fail-closed,
     CHECK(j["error"].contains("correlation_id"));
     CHECK_FALSE(j.contains("data")); // PII withheld, not served with a degraded flag
     CHECK(h.audit_log.size() == 1);  // the access attempt fired (then failed to persist)
+    // cons-1: X-Correlation-Id is set on EVERY path and equals the A4 body cid (the
+    // header and body never diverge — parity with the dex.device.view sibling).
+    REQUIRE(res->has_header("X-Correlation-Id"));
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("REST gs.device-compliance: a throwing audit_fn → 503 fail-closed, not 500",
@@ -1911,8 +1924,13 @@ TEST_CASE("REST gs.device-compliance: a throwing audit_fn → 503 fail-closed, n
     CHECK(res->status == 503);
     REQUIRE(res->has_header("Sec-Audit-Failed"));
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(nlohmann::json::parse(res->body)["error"]["code"].get<int>() == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    CHECK_FALSE(j.contains("data")); // qe-2: PII withheld on the throw path too
     CHECK(h.audit_log.empty()); // throw exits before the record → proves the catch arm
+    REQUIRE(res->has_header("X-Correlation-Id")); // cons-1
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("REST gs.device-compliance: audit success → 200, no header, serves compliance",
@@ -1926,8 +1944,15 @@ TEST_CASE("REST gs.device-compliance: audit success → 200, no header, serves c
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->has_header("X-Correlation-Id")); // cons-1: set on the success path too
     // Data is served only when the audit row landed.
-    CHECK(nlohmann::json::parse(res->body)["data"]["total_guards"].get<int>() == 1);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_guards"].get<int>() == 1);
+    // assessable + snapshot_total are on the wire (UP-2/comp-1/er-1): a deployed
+    // Baseline with a reported applicable Guard is assessable; snapshot_total is the
+    // deployed-member count.
+    CHECK(j["data"]["assessable"].get<bool>() == true);
+    CHECK(j["data"]["snapshot_total"].get<int>() == 1);
 }
 
 TEST_CASE("REST gs.device-compliance: audit-fail + unknown baseline → 503 (fail-closed precedes 404)",
@@ -2017,14 +2042,19 @@ TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pendi
     CHECK(d["compliant"].get<int>() == 0);
     CHECK(d["drifted"].get<int>() == 0);
     CHECK(d["errored"].get<int>() == 0);
-    CHECK(d["pending"].get<int>() == 1); // unrecognized state -> pending
+    CHECK(d["pending"].get<int>() == 1); // unrecognized state -> pending LABEL
     CHECK(d["total_guards"].get<int>() == d["compliant"].get<int>() + d["drifted"].get<int>()
                                              + d["errored"].get<int>() + d["pending"].get<int>());
-    CHECK(d["last_updated"].is_null()); // only recognized verdicts contribute
+    // hp-1: the device DID report (the row exists with a real timestamp), so the
+    // timestamp is preserved INDEPENDENT of the unrecognized status label — both the
+    // per-guard updated_at and the rolled-up last_updated carry it. (Previously these
+    // were suppressed to null, conflating "reported, unknown token" with "never
+    // reported" — a consumer watching last_updated could not tell them apart.)
+    CHECK(d["last_updated"].get<std::string>() == "2026-06-20T10:00:00Z");
     REQUIRE(d["guards"].is_array());
     CHECK(d["guards"].size() == 1);
     CHECK(d["guards"][0]["status"].get<std::string>() == "pending");
-    CHECK(d["guards"][0]["updated_at"].is_null());
+    CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:00:00Z");
 }
 
 TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back to rule_id name",
@@ -2052,4 +2082,41 @@ TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back
         }
     }
     CHECK(saw_fallback);
+}
+
+TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500 (perf-2/UP-6)",
+          "[rest][guaranteed_state][baseline]") {
+    // A Baseline whose deployed snapshot exceeds the 500-id chunk (and a pre-3.32
+    // SQLite's SQLITE_MAX_VARIABLE_NUMBER of 999) must STILL resolve every guard name.
+    // An un-chunked IN-list would prepare-fail past the limit and silently drop ALL
+    // names to the rule_id fallback fleet-wide; chunking at 500 keeps every name
+    // resolved. 600 crosses the boundary (chunk 1 = r0..r499, chunk 2 = r500..r599).
+    RestGsHarness h;
+    std::vector<std::string> ids;
+    for (int i = 0; i < 600; ++i) {
+        const std::string rid = "r" + std::to_string(i);
+        ids.push_back(rid);
+        h.seed_rule(rid, "G" + std::to_string(i));
+        h.seed_status("e" + std::to_string(i), "WS-1", rid, "guard.compliant",
+                      "2026-06-20T10:00:00Z");
+    }
+    h.seed_deployed_baseline("Big", ids);
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=Big&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 600);
+    CHECK(d["snapshot_total"].get<int>() == 600);
+    CHECK(d["compliant"].get<int>() == 600);
+    // Every name resolved (name "G<n>" matches rule_id "r<n>"), across BOTH chunks —
+    // none fell back to the rule_id, which is what a prepare-fail would have caused.
+    int resolved = 0;
+    for (auto& g : d["guards"]) {
+        const auto rid = g["rule_id"].get<std::string>();
+        CHECK(g["name"].get<std::string>() == "G" + rid.substr(1));
+        ++resolved;
+    }
+    CHECK(resolved == 600);
 }

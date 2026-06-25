@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
   token creator's RBAC, not the service tag.)*
 
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
+
 ### Changed
 
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
@@ -71,26 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
   (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
   service guard remains observe-only on the compliant edge (parity deferred).
-
-### Security
-
-- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
-  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
-  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
-  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
-  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
-  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
-  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
-  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
-  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
-  `401`/`403` denial bodies from
-  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
-  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
-  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
-  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
-  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
-  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
-  the audit subsystem recovers."
 
 ### Added
 
@@ -130,6 +128,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use the A4 envelope
   (`correlation_id`), while the `403` is the auth/RBAC layer's denial body (not the A4
   envelope; exact shape varies by denial reason — RBAC vs service-scope).
+  The response carries a machine-readable **`assessable`** flag (`false` for a draft
+  Baseline or a deployed Baseline this device has reported no applicable Guard against —
+  the consumer must not compute a `0/0` compliance %) and **`snapshot_total`** (the
+  Baseline's full deployed-member superset, an upper bound on coverage). **Caution:** the
+  report-driven denominator can *over-estimate* compliance on a partial report (an
+  in-scope-but-unreported Guard is absent, not `pending`), so consumers must not gate on
+  `compliant/total_guards` until the per-device `scope_expr` computed denominator lands
+  (deferred). `X-Correlation-Id` is set on every response (parity with the
+  `dex.device.view` siblings); a guard reported with an unrecognized verdict token keeps
+  its real `updated_at` (no longer suppressed); a baseline-store *fault* returns a
+  retryable `503` (not the `404` a CMDB would read as "delete this CI") on a transient
+  fault; and the guard-name lookup chunks its `IN`-list so a Baseline larger than
+  `SQLITE_MAX_VARIABLE_NUMBER` still resolves every name. A `YuzuAuditPersistFailures`
+  Prometheus alert (`docs/prometheus/yuzu-alerts.yml`) now fires when behavioural-data
+  routes 503 fleet-wide on an audit-store outage.
 - **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
   page's **Get live info** button now returns a full live system snapshot — a KPI strip
   (uptime, process / service / connection / user counts) over a grid of collapsible,

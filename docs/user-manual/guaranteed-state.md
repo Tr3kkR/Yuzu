@@ -213,7 +213,7 @@ The Baseline surface is on the dashboard (`/guardian` → Baselines). Its **read
 | Action | Securable | Effect |
 |---|---|---|
 | **Create** (name + member Guards) | `Write` | Persists a **draft** Baseline. Enforces nothing yet. |
-| **Edit** (rename, add/remove members) | `Write` | Updates the draft. For a *deployed* Baseline this is a **staged change that does not reach agents** until you re-deploy (see below). |
+| **Edit** (rename, add/remove members) | `Write` | Updates the draft. For a *deployed* Baseline this is a **staged change that does not reach agents** until you re-deploy (see below). **⚠️ Renaming a Baseline that an external integration references by name (ServiceNow CMDB, REST, MCP) breaks that integration** — every `device-compliance` poll `404`s until it is reconfigured to the new name, silently, until CIs stop updating. Treat the Baseline name as a **stable external identifier**. |
 | **Deploy / Re-deploy** | `Push` | Marks the Baseline deployed, snapshots its current member set, and converges the fleet to the union of all deployed Baselines' enabled member Guards. |
 | **Delete** | `Delete` | Removes the Baseline; if it was deployed, re-converges the fleet so its Guards are removed from agents no other deployed Baseline still delivers them to. |
 
@@ -226,6 +226,19 @@ The Baseline surface is on the dashboard (`/guardian` → Baselines). Its **read
 A Baseline's **assignment** is its device targeting: a set of *included* minus *excluded* management groups (exclude wins). It is **deferred — management-group targeting is not yet wired** (see the targeting note above), so every deploy currently converges the **whole fleet** and the dashboard labels the assignment area "coming soon". Until assignment lands, a *deployed* Baseline applies to every device; do not rely on assignment to contain a Baseline's blast radius.
 
 The per-device REST read (`GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`, see [REST API](rest-api.md) → Guaranteed State) is keyed by Baseline **name** and returns the Guards **actually applicable to the device** — the deployed Baseline's members this device has reported. Because each Guard carries its own `scope_expr`, one Baseline can hold a **superset** of Guards and arm a **different subset per machine**, so two devices querying the *same* Baseline name legitimately see different Guards. The read is **not** a statement that the Baseline was *targeted* at the device via management-group assignment; broader assignment-awareness (returning *not-applicable* for an out-of-scope device, and an honest `pending` for an in-scope-but-unreported Guard) lands when assignment is wired.
+
+### ServiceNow CI sync — setup checklist
+
+Stand up a ServiceNow (or any CMDB/ITSM) Guardian-compliance CI field against the `device-compliance` read:
+
+1. **Create + name the Baseline.** Author the member Guards, create the Baseline, and give it a **stable name** the integration will pin (e.g. `ServiceNow Compliance`). The name is the external identifier — **do not rename it later** (renaming `404`s the integration).
+2. **Deploy it** (`Push`). A draft returns `deployed: false`; only a deployed Baseline yields compliance data.
+3. **Mint a token.** Use a **global** `GuaranteedState:Read` API token for the service account (the documented setup). A management-group-scoped token works too but `403`s for devices outside its groups — prefer global unless you intend per-group restriction.
+4. **Author the business rule** to poll `GET /api/v1/guaranteed-state/device-compliance?baseline=<name>&agent_id=<device>` per CI on a cadence (15–60 min; stagger, don't stampede), and **branch on the response** in this order:
+   - `deployed: false` → render **"No Baseline Deployed"**.
+   - `assessable: false` → render **"Not assessable"** (offline / newly-enrolled / all-out-of-scope) — **never** compute or show a compliance percentage.
+   - `assessable: true` → show the `compliant`/`drifted`/`errored`/`pending` counts. **Do not gate** automated remediation on `compliant/total_guards` (it over-estimates on partial reports — see the REST caveats); treat it as advisory and use `last_updated` for freshness.
+   - `503` with `Sec-Audit-Failed: true` → transient (audit subsystem), retry after `retry_after_ms`; a `503` **without** that header is a misconfiguration — page an operator, do not auto-retry.
 
 ## Compliance overview
 
