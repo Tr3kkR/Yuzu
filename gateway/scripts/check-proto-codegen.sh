@@ -56,8 +56,10 @@ if [ -z "$GPB_EBIN" ]; then
 fi
 
 # Regenerate every TOP-LEVEL proto (the package-pathed copies under
-# priv/proto/yuzu/<pkg>/v1/ are import targets, not compiled directly — they
-# share basenames with the top-level files and would collide on module name).
+# priv/proto/yuzu/<pkg>/v1/ are import targets, not compiled directly HERE — they
+# share basenames with the top-level files and would collide on module name. The
+# nested loop below DOES compile them, one at a time into a separate temp dir,
+# precisely to drift-check them against these flat-generated modules).
 erl -noshell -pa "$GPB_EBIN" -eval "
     {ok, Terms} = file:consult(\"rebar.config\"),
     Grpc = proplists:get_value(grpc, Terms, []),
@@ -96,19 +98,25 @@ for regen in "$TMP"/*_pb.erl; do
     fi
 done
 
-# Nested import-target consistency. The package-pathed copies under
-# priv/proto/yuzu/<pkg>/v1/*.proto are the import targets gpb resolves for
+# Nested import-target consistency. Each proto exists as a flat top-level copy
+# (priv/proto/<x>.proto, regenerated above into $TMP) AND a package-pathed mirror
+# (priv/proto/yuzu/<pkg>/v1/<x>.proto), the import target gpb resolves for
 # `import "yuzu/<pkg>/v1/<x>.proto"`. gateway.proto and management.proto import
-# the NESTED agent.proto, so gateway_pb/management_pb are generated from the
-# nested copy while agent_pb is generated from the flat copy. If a field is added
-# to one copy but not its mirror, agent_pb would carry a field that gateway_pb
-# silently drops in transit — the csr_pem field-drop class (ADR-0016 added
-# content_hashes/need_full to BOTH copies for exactly this reason). The loop
-# above only regenerates the flat top-level protos, so it cannot see
-# flat<->nested divergence. Guard it: generate each nested copy on its own and
-# byte-diff the generated module against the flat-generated one. gpb output is
-# comment- and whitespace-free, so this compares message/field structure, not
-# formatting (the two copies legitimately differ in comments).
+# the NESTED agent.proto, so gateway_pb/management_pb are built from the nested
+# agent copy while agent_pb is built from the flat copy — if the two agent copies'
+# message defs diverge, agent_pb carries a field the gateway proxy drops (the
+# csr_pem field-drop class; ADR-0016 added content_hashes/need_full to BOTH copies
+# for exactly this reason). The flat regen above cannot see this divergence.
+#
+# Guard: generate each nested copy on its own and byte-diff its module against the
+# flat-generated one. The load-bearing comparisons are the LEAF pairs (agent,
+# common) — a divergence there is what skews agent_pb from the copy gateway_pb/
+# management_pb embed. The gateway/management pairs are drift-invariant to the
+# agent copy (both their flat and nested forms import the SAME nested agent.proto),
+# so those pairs only catch drift between a wrapper proto's own two copies. gpb
+# output is comment- and whitespace-free, so comment-only differences between the
+# copies (which exist today) are ignored — only message/field structure compares.
+nested_checked=0
 while IFS= read -r nested; do
     [ -e "$nested" ] || continue
     flat="$PROTO_DIR/$(basename "$nested")"
@@ -137,12 +145,21 @@ while IFS= read -r nested; do
             drift=1
             continue
         fi
+        nested_checked=$((nested_checked + 1))
         if ! diff -u "$flat_gen" "$nested_gen"; then
             echo "::error::flat/nested proto drift: priv/proto/$(basename "$nested") vs $nested generate different $gen_name" >&2
             drift=1
         fi
     done
 done < <(find "$PROTO_DIR/yuzu" -name '*.proto' 2>/dev/null | sort)
+
+# Fail closed if the mirror set vanished (priv/proto/yuzu restructured/removed, or
+# find returned nothing): a drift guard that silently no-ops is worse than none.
+# Mirrors the flat loop's empty-set floor (the halt(3) on an empty wildcard above).
+if [ "$nested_checked" -eq 0 ]; then
+    echo "::error::no flat/nested proto mirror pairs were compared — priv/proto/yuzu/<pkg>/v1/ layout changed or find returned nothing. Refusing to pass: the mirror-drift guard would silently stop guarding." >&2
+    exit 3
+fi
 
 if [ "$drift" -ne 0 ]; then
     echo "" >&2
