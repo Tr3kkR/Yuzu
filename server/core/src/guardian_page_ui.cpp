@@ -341,6 +341,62 @@ extern const char* const kGuardianDetailPageHtml =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
+    /* ── Device live-snapshot helpers (feat/device-live-snapshot). Plain functions
+       called from inline onclick/oninput (CSP-safe — 'unsafe-inline' allows attribute
+       handlers; only hx-on/new Function is blocked). ── */
+    function lsToggleAll(btn) {
+      var cards = document.querySelectorAll('.ls-card');
+      var anyClosed = Array.prototype.some.call(cards, function (c) { return !c.open; });
+      cards.forEach(function (c) { c.open = anyClosed; });
+      btn.textContent = anyClosed ? 'Collapse all' : 'Expand all';
+    }
+    function lsPopOut(ev, btn) {
+      ev.preventDefault(); ev.stopPropagation(); /* don't toggle the <details> */
+      var card = btn.closest('.ls-card'); if (!card) return;
+      var dlg = document.getElementById('ls-popout');
+      if (!dlg) {
+        dlg = document.createElement('dialog'); dlg.id = 'ls-popout'; dlg.className = 'ls-po';
+        dlg.innerHTML = '<div class="po-head"><span class="t" id="ls-po-title"></span>' +
+          '<button class="po-close" onclick="document.getElementById(\'ls-popout\').close()">Close ×</button></div>' +
+          '<div class="po-body" id="ls-po-body"></div>';
+        document.body.appendChild(dlg);
+      }
+      var t = card.querySelector('.ls-ttl');
+      dlg.querySelector('#ls-po-title').textContent = t ? t.textContent : '';
+      var body = card.querySelector('.ls-body');
+      dlg.querySelector('#ls-po-body').innerHTML = body ? body.innerHTML : '';
+      dlg.showModal();
+    }
+    /* Process-tree filter (matches /tar): hide all, reveal each matching row's ancestor
+       chain. Matches PID/name/hash/endpoint via row.textContent. Scoped to the nearest
+       body so it works in the card AND the popped-out clone. */
+    function lsFilterTree(input) {
+      var scope = input.closest('.ls-body,.po-body'); if (!scope) return;
+      var tree = scope.querySelector('.proctree'); if (!tree) return;
+      var q = (input.value || '').trim().toLowerCase();
+      var nodes = tree.querySelectorAll('.tar-tree-node,.tar-tree-leaf');
+      if (!q) { nodes.forEach(function (el) { el.style.display = ''; }); return; }
+      nodes.forEach(function (el) { el.style.display = 'none'; });
+      tree.querySelectorAll('.tar-tree-row').forEach(function (row) {
+        if (row.textContent.toLowerCase().indexOf(q) === -1) return;
+        var el = row.closest('.tar-tree-leaf,.tar-tree-node');
+        while (el && tree.contains(el)) {
+          el.style.display = '';
+          if (el.tagName === 'DETAILS') el.open = true;
+          el = el.parentElement ? el.parentElement.closest('.tar-tree-node') : null;
+        }
+      });
+    }
+    /* Plain table-row filter (services, DNS). */
+    function lsFilterRows(input) {
+      var scope = input.closest('.ls-body,.po-body'); if (!scope) return;
+      var q = (input.value || '').trim().toLowerCase();
+      scope.querySelectorAll('tbody tr').forEach(function (tr) {
+        var t = (tr.getAttribute('data-gpname') || tr.textContent).toLowerCase();
+        tr.style.display = (!q || t.indexOf(q) !== -1) ? '' : 'none';
+      });
+    }
+
     /* Populate nav user / role badge, mirroring the dashboard chrome. */
     fetch('/api/me').then(function (r) { return r.json(); }).then(function (d) {
       var nu = document.getElementById('nav-user'); if (nu) nu.textContent = d.username || '';

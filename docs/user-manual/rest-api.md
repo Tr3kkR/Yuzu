@@ -36,6 +36,16 @@ When writing new integrations, always use `/api/v1/` endpoints. If you have exis
 
 Every API response (versioned and legacy) carries the standard Yuzu HTTP security response headers: `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, and `Strict-Transport-Security` (HTTPS only). These headers add roughly 700–900 bytes per response — JSON consumers should expect this overhead. See [HTTP Security Response Headers](security-hardening.md#http-security-response-headers) for details, the full header list, and how to extend the CSP via `--csp-extra-sources` for browser dashboards that integrate with the Yuzu API.
 
+#### `Sec-Audit-Failed` and the behavioural-PII audit posture
+
+Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
+
+- **REST JSON endpoints fail closed:** they return `503` + `Sec-Audit-Failed: true` and serve **no** data, so a machine integration (CMDB / ServiceNow / agentic worker) never records evidence-less PII as audited. Distinguish this transient, retryable `503` from a non-transient misconfiguration `503` by the presence of the `Sec-Audit-Failed` header.
+- **Dashboard HTMX fragments set-and-proceed:** they set `Sec-Audit-Failed: true` but **still render**, so a transient audit hiccup never blanks a human operator's lens.
+- **MCP tools set-and-proceed** with an `audit_persisted: false` field in the result (absent on success) — JSON-RPC has no response-header channel.
+
+This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
+
 ---
 
 ## Table of Contents
@@ -3767,6 +3777,7 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
+- **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders nine additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all nine is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
 - **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path.
