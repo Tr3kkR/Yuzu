@@ -130,7 +130,11 @@ enrolled agent populates within minutes (jittered first sync), not instantly.
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped`) — watch the
 `need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing.
+whose ingest is failing. Shipped alert rules for both signals live in the
+`yuzu-inventory` group of `docs/prometheus/yuzu-alerts.yml`:
+`YuzuInventorySustainedIngestErrors` (a non-zero `error` rate held for 15m) and
+`YuzuInventoryHighNeedFullRatio` (>20% of ingests are `need_full` for 15m —
+hash-skip is not taking, so agents keep re-sending full payloads).
 
 ## See also
 
