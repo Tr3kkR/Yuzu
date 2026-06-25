@@ -618,3 +618,40 @@ TEST_CASE("TAR software assembly: stale machine entries are never resurrected",
     CHECK(events[0].action == "removed");
     CHECK(events[0].scope == "machine");
 }
+
+TEST_CASE("TAR software assembly: logged-on user's upgrade flows through (not masked)",
+          "[tar][software][assembly]") {
+    // alice is logged on (scanned) and bumped Slack 4.0 -> 4.1 — the fresh loaded
+    // scan supplies the new version, the prior entry is NOT carried forward, so the
+    // diff is a single 'upgraded', not a remove+install.
+    std::vector<SoftwareInfo> previous = {sw("Slack", "4.0", "user", "alice")};
+    std::vector<SoftwareInfo> machine_and_loaded = {sw("Slack", "4.1", "user", "alice")};
+    std::vector<std::string> scanned = {"alice"};
+
+    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
+
+    REQUIRE(current.size() == 1);
+    CHECK(current[0].version == "4.1"); // fresh scan wins; no carried 4.0 duplicate
+    auto events = compute_software_events(previous, current, 5000, 5);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "upgraded");
+    CHECK(events[0].version == "4.1");
+    CHECK(events[0].prev_version == "4.0");
+}
+
+TEST_CASE("TAR software assembly: a scanned user is not double-carried",
+          "[tar][software][assembly]") {
+    // A user present in BOTH the fresh loaded scan AND `previous`, whose SID IS in
+    // scanned_users, must appear exactly once in the assembled snapshot — the
+    // carry-forward guard (`!scanned.contains`) excludes them, so no duplicate
+    // (scope,user,name) entry is produced for the diff to fold.
+    std::vector<SoftwareInfo> previous = {sw("Zoom", "5.0", "user", "alice")};
+    std::vector<SoftwareInfo> machine_and_loaded = {sw("Zoom", "5.0", "user", "alice")};
+    std::vector<std::string> scanned = {"alice"};
+
+    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
+
+    REQUIRE(current.size() == 1); // single entry, not carried a second time
+    auto events = compute_software_events(previous, current, 6000, 6);
+    CHECK(events.empty()); // unchanged -> no event
+}
