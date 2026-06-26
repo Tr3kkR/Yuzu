@@ -1,13 +1,13 @@
 # Test Coverage Tracking
 
-Last updated: 2026-03-26
+Last updated: 2026-06-26
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 14 files | Active |
-| Server unit tests | `yuzu_server_tests` | 34 files | Active (requires `build_server=true`) |
+| Agent unit tests | `yuzu_agent_tests` | 16 files | Active |
+| Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
 **Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
 
@@ -36,7 +36,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
 | `test_fleet_snapshot.cpp` | TAR fleet_snapshot.v1 JSON builder | Envelope shape, processes/connections round-trip with `remote_host`, default + custom redaction patterns, truncation flags, `process_source_paused` / `tcp_source_paused` markers, `schema_minor` field, payload size bound at full cap (12 cases) |
-| `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin; SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; installed_apps parse; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6) (15 cases) |
+| `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin; SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; installed_apps parse; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6); invalid-UTF-8 parity vector (16 cases) |
 
 ### Untested Agent Components
 
