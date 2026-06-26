@@ -138,8 +138,9 @@ std::string sanitize_utf8(const std::string& s) {
 // non-ASCII names (e.g. "Café") survive intact — the *A APIs return the system
 // ANSI code page (cp1252), which then fails UTF-8 validation downstream and
 // corrupts the typed software-inventory store's WHERE name=$1 lookups (#1662).
-// Canonical helpers, duplicated from registry_plugin.cpp for build isolation
-// (each plugin is its own shared object with no shared internal code).
+// to_wide/from_wide are duplicated from registry_plugin.cpp for build isolation
+// (each plugin is its own shared object with no shared internal code); reg_sz_to_utf8
+// is a local helper for the REG_SZ byte-size convention.
 std::wstring to_wide(std::string_view s) {
     if (s.empty())
         return {};
@@ -176,9 +177,13 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
         return;
     }
 
-    wchar_t name_buf[256]{};
+    // RegEnumKeyExW's lpcchName is a WCHAR COUNT, not a byte size. Bind the array
+    // size and every reset to one constant so the byte-vs-count unit cannot skew —
+    // the #1662 A->W conversion missed one reset site (gov Gate 3/4 BLOCKING).
+    constexpr DWORD kNameBufLen = 256;
+    wchar_t name_buf[kNameBufLen]{};
     DWORD idx = 0;
-    DWORD name_len = 256; // RegEnumKeyExW counts WCHARs, not bytes
+    DWORD name_len = kNameBufLen;
 
     while (RegEnumKeyExW(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
            ERROR_SUCCESS) {
@@ -203,7 +208,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 auto sys_component = read_str("SystemComponent");
                 if (sys_component == "1") {
                     RegCloseKey(app_key);
-                    name_len = sizeof(name_buf);
+                    name_len = kNameBufLen;
                     continue;
                 }
 
@@ -216,7 +221,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
             }
             RegCloseKey(app_key);
         }
-        name_len = 256;
+        name_len = kNameBufLen;
     }
     RegCloseKey(hkey);
 }
@@ -512,6 +517,9 @@ private:
             std::vector<AppInfo> user_apps;
             enumerate_uninstall_key(HKEY_USERS, user_uninstall.c_str(), 0, user_apps);
 
+            // The !profile_path_w.empty() guard avoids mounting a hive from a bogus
+            // "\NTUSER.DAT" path when ProfileImagePath failed to read (it also
+            // blocked an empty-path hive-load the prior *A code permitted).
             if (user_apps.empty() && !profile_path_w.empty()) {
                 // User hive may not be loaded — try loading NTUSER.DAT
                 std::wstring ntuser_path_w = profile_path_w + L"\\NTUSER.DAT";
@@ -521,11 +529,20 @@ private:
                 wchar_t expanded[512]{};
                 ExpandEnvironmentStringsW(ntuser_path_w.c_str(), expanded, 512);
 
-                LONG load_res = RegLoadKeyW(HKEY_USERS, to_wide(mount_key).c_str(), expanded);
+                const std::wstring mount_w = to_wide(mount_key);
+                LONG load_res = RegLoadKeyW(HKEY_USERS, mount_w.c_str(), expanded);
                 if (load_res == ERROR_SUCCESS) {
+                    // RAII: unload the mounted hive on EVERY exit, including a
+                    // std::bad_alloc thrown by enumerate_uninstall_key. A leaked
+                    // mount is system-wide, survives process death, and locks the
+                    // user's NTUSER.DAT until reboot (gov Gate 6 sre / UP-1).
+                    struct HiveUnloadGuard {
+                        const std::wstring& mount;
+                        ~HiveUnloadGuard() { RegUnLoadKeyW(HKEY_USERS, mount.c_str()); }
+                    } unload_guard{mount_w};
+
                     std::string mounted_uninstall = mount_key + "\\" + kUninstallKey;
                     enumerate_uninstall_key(HKEY_USERS, mounted_uninstall.c_str(), 0, user_apps);
-                    RegUnLoadKeyW(HKEY_USERS, to_wide(mount_key).c_str());
                 }
             }
 
