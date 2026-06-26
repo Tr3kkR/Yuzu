@@ -3165,9 +3165,9 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
     // The degraded access is audited (gov compliance CC7.2): a CVE-triage caller under a
     // sustained outage still leaves a behavioural trail.
-    bool saw_error_audit = false;
+    bool saw_failure_audit = false;
     for (const auto& a : ts.audit_log)
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
-            saw_error_audit = true;
-    CHECK(saw_error_audit);
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
 }

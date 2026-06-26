@@ -140,11 +140,12 @@ enrolled agent populates within minutes (jittered first sync), not instantly.
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
 the last for a whole report rejected at the source-map cap) — watch the
 `need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing. Shipped alert rules for both signals live in the
-`yuzu-inventory` group of `docs/prometheus/yuzu-alerts.yml`:
-`YuzuInventorySustainedIngestErrors` (a non-zero `error` rate held for 15m) and
-`YuzuInventoryHighNeedFullRatio` (>20% of ingests are `need_full` for 15m —
-hash-skip is not taking, so agents keep re-sending full payloads).
+whose ingest is failing. Shipped alert rules live in the `yuzu-inventory` group of
+`docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
+`error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
+`need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked), and
+`YuzuInventoryReportRejected` (a whole report rejected at the source-map cap).
 
 ## See also
 
