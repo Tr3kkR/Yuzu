@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`installed_apps` (Windows) now reads the registry as UTF-8, fixing mangled
+  non-ASCII app/publisher/user names (#1662).** The plugin read uninstall-key
+  values via the ANSI registry APIs (`RegQueryValueExA` etc.), which return
+  strings in the system code page (cp1252 on Western Windows), not UTF-8; the
+  downstream `sanitize_utf8` scrub then replaced the invalid bytes with `?` (e.g.
+  `Café` → `Caf?`). Now that installed-software lands in a queryable typed store,
+  that corrupted the stored data and broke the exact-match query `WHERE name=$1`
+  for any non-ASCII name. All registry/path reads in both the system and
+  per-user enumeration paths are switched to the wide (`W`) APIs +
+  `WideCharToMultiByte(CP_UTF8, …)`, so names are correct UTF-8; the per-user
+  path additionally fixes the `ProfileImagePath`-derived `username` and the
+  `NTUSER.DAT` hive load for non-ASCII profile directories. No wire/format
+  change. (The server-side ingest seam already scrubbed invalid bytes to U+FFFD
+  defensively — PR #1661 — so this was a data-quality fix, not a safety issue.)
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service
   previously short-circuited silently and never emitted `guard.compliant`, so the

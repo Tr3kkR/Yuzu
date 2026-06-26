@@ -131,62 +131,93 @@ std::string sanitize_utf8(const std::string& s) {
 // ── Windows: read apps from a registry uninstall key ──────────────────────
 
 #ifdef _WIN32
-void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
+// Convert a UTF-16 registry string to UTF-8. Length-aware (does NOT assume NUL
+// termination): RegQueryValueExW may return data without a trailing NUL, so we
+// pass the exact WCHAR count rather than relying on -1. Mirrors the canonical
+// wide_to_utf8 in agents/core/src/process_enum.cpp, duplicated here for plugin
+// build isolation across the SDK ABI boundary.
+//
+// #1662: the previous A-variant registry calls returned strings in the system
+// ANSI code page (cp1252 on Western Windows), not UTF-8; sanitize_utf8() then
+// replaced the invalid bytes with '?' (e.g. "Café" -> "Caf?"), which both
+// corrupts the stored data and breaks the typed-store exact-match query
+// `WHERE name=$1` for any non-ASCII app/publisher.
+std::string wide_to_utf8(const wchar_t* w, int wlen) {
+    if (!w || wlen <= 0) {
+        return {};
+    }
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, wlen, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, wlen, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+void enumerate_uninstall_key(HKEY root, const wchar_t* subkey, REGSAM extra_sam,
                              std::vector<AppInfo>& apps) {
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) !=
+    if (RegOpenKeyExW(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) !=
         ERROR_SUCCESS) {
         return;
     }
 
-    char name_buf[256]{};
+    wchar_t name_buf[256]{};
     DWORD idx = 0;
-    DWORD name_len = sizeof(name_buf);
+    DWORD name_len = ARRAYSIZE(name_buf); // count in WCHARs, excludes the NUL
 
-    while (RegEnumKeyExA(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+    while (RegEnumKeyExW(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
            ERROR_SUCCESS) {
         HKEY app_key{};
-        if (RegOpenKeyExA(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
-            auto read_str = [&](const char* value_name) -> std::string {
-                char buf[512]{};
-                DWORD size = sizeof(buf);
+        if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
+            auto read_str = [&](const wchar_t* value_name) -> std::string {
+                wchar_t buf[512]{};
+                DWORD size = sizeof(buf); // in BYTES, per the RegQueryValueEx contract
                 DWORD type = 0;
-                if (RegQueryValueExA(app_key, value_name, nullptr, &type,
-                                     reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if (type == REG_SZ && size > 0) {
-                        return std::string(buf, size - 1);
+                if (RegQueryValueExW(app_key, value_name, nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS &&
+                    type == REG_SZ && size >= sizeof(wchar_t)) {
+                    int wlen = static_cast<int>(size / sizeof(wchar_t));
+                    // Strip a single trailing NUL if the value carried one (the
+                    // API includes it for properly-stored REG_SZ, omits it
+                    // otherwise — wide_to_utf8 is length-aware either way).
+                    if (buf[wlen - 1] == L'\0') {
+                        --wlen;
                     }
+                    return wide_to_utf8(buf, wlen);
                 }
                 return {};
             };
 
-            auto display_name = read_str("DisplayName");
+            auto display_name = read_str(L"DisplayName");
             if (!display_name.empty()) {
                 // Skip system components and updates without meaningful names
-                auto sys_component = read_str("SystemComponent");
+                auto sys_component = read_str(L"SystemComponent");
                 if (sys_component == "1") {
                     RegCloseKey(app_key);
-                    name_len = sizeof(name_buf);
+                    name_len = ARRAYSIZE(name_buf);
                     continue;
                 }
 
                 AppInfo app;
                 app.name = std::move(display_name);
-                app.version = read_str("DisplayVersion");
-                app.publisher = read_str("Publisher");
-                app.install_date = read_str("InstallDate");
+                app.version = read_str(L"DisplayVersion");
+                app.publisher = read_str(L"Publisher");
+                app.install_date = read_str(L"InstallDate");
                 apps.push_back(std::move(app));
             }
             RegCloseKey(app_key);
         }
-        name_len = sizeof(name_buf);
+        name_len = ARRAYSIZE(name_buf);
     }
     RegCloseKey(hkey);
 }
 
 std::vector<AppInfo> get_installed_apps_windows() {
     std::vector<AppInfo> apps;
-    static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    static const wchar_t* kUninstallKey =
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
     // 64-bit HKLM
     enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, apps);
@@ -419,40 +450,52 @@ public:
 private:
     int do_list_per_user([[maybe_unused]] yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-        // Enumerate user profiles from the ProfileList registry key
-        static const char* kProfileListKey =
-            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
-        static const char* kUninstallKey =
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+        // Enumerate user profiles from the ProfileList registry key.
+        // #1662: wide (W) registry + path APIs throughout so a non-ASCII profile
+        // name (e.g. C:\Users\José) yields a correct UTF-8 `username` and the
+        // NTUSER.DAT hive of such a profile still loads.
+        static const wchar_t* kProfileListKey =
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+        static const wchar_t* kUninstallKey =
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
         HKEY profiles_key{};
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kProfileListKey, 0,
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0,
                           KEY_READ | KEY_ENUMERATE_SUB_KEYS, &profiles_key) != ERROR_SUCCESS) {
             ctx.write_output("error|failed to open ProfileList registry key");
             return 1;
         }
 
-        char sid_buf[256]{};
+        wchar_t sid_buf[256]{};
         DWORD idx = 0;
-        DWORD sid_len = sizeof(sid_buf);
+        DWORD sid_len = ARRAYSIZE(sid_buf);
 
-        while (RegEnumKeyExA(profiles_key, idx++, sid_buf, &sid_len,
+        while (RegEnumKeyExW(profiles_key, idx++, sid_buf, &sid_len,
                              nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-            std::string sid(sid_buf, sid_len);
-            sid_len = sizeof(sid_buf);
+            std::wstring sid_w(sid_buf, sid_len);
+            sid_len = ARRAYSIZE(sid_buf);
+            // SIDs are pure ASCII (S-1-5-…), so the narrow form is exact.
+            std::string sid = wide_to_utf8(sid_w.c_str(), static_cast<int>(sid_w.size()));
 
             // Read ProfileImagePath to get the username
             HKEY sid_key{};
-            if (RegOpenKeyExA(profiles_key, sid.c_str(), 0, KEY_READ, &sid_key) != ERROR_SUCCESS)
+            if (RegOpenKeyExW(profiles_key, sid_w.c_str(), 0, KEY_READ, &sid_key) != ERROR_SUCCESS)
                 continue;
 
-            char path_buf[512]{};
-            DWORD path_size = sizeof(path_buf);
+            wchar_t path_buf[512]{};
+            DWORD path_size = sizeof(path_buf); // in BYTES
             DWORD type = 0;
-            std::string username = sid; // fallback to SID
-            if (RegQueryValueExA(sid_key, "ProfileImagePath", nullptr, &type,
-                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS) {
-                std::string profile_path(path_buf, path_size > 0 ? path_size - 1 : 0);
+            std::wstring profile_path_w;        // kept wide for the NTUSER.DAT load below
+            std::string username = sid;         // fallback to SID
+            if (RegQueryValueExW(sid_key, L"ProfileImagePath", nullptr, &type,
+                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS &&
+                type == REG_SZ && path_size >= sizeof(wchar_t)) {
+                int wlen = static_cast<int>(path_size / sizeof(wchar_t));
+                if (path_buf[wlen - 1] == L'\0') {
+                    --wlen;
+                }
+                profile_path_w.assign(path_buf, static_cast<size_t>(wlen));
+                std::string profile_path = wide_to_utf8(path_buf, wlen);
                 auto last_sep = profile_path.find_last_of("\\/");
                 if (last_sep != std::string::npos)
                     username = profile_path.substr(last_sep + 1);
@@ -464,24 +507,24 @@ private:
                 continue;
 
             // Try to read the user's Uninstall key from HKU\<SID>
-            std::string user_uninstall = sid + "\\" + kUninstallKey;
+            std::wstring user_uninstall = sid_w + L"\\" + kUninstallKey;
             std::vector<AppInfo> user_apps;
             enumerate_uninstall_key(HKEY_USERS, user_uninstall.c_str(), 0, user_apps);
 
-            if (user_apps.empty()) {
+            if (user_apps.empty() && !profile_path_w.empty()) {
                 // User hive may not be loaded — try loading NTUSER.DAT
-                std::string ntuser_path = std::string(path_buf) + "\\NTUSER.DAT";
-                std::string mount_key = "YUZU_APPS_" + sid;
+                std::wstring ntuser_path = profile_path_w + L"\\NTUSER.DAT";
+                std::wstring mount_key = L"YUZU_APPS_" + sid_w;
 
                 // Attempt to expand environment variables in the path
-                char expanded[512]{};
-                ExpandEnvironmentStringsA(ntuser_path.c_str(), expanded, sizeof(expanded));
+                wchar_t expanded[512]{};
+                ExpandEnvironmentStringsW(ntuser_path.c_str(), expanded, ARRAYSIZE(expanded));
 
-                LONG load_res = RegLoadKeyA(HKEY_USERS, mount_key.c_str(), expanded);
+                LONG load_res = RegLoadKeyW(HKEY_USERS, mount_key.c_str(), expanded);
                 if (load_res == ERROR_SUCCESS) {
-                    std::string mounted_uninstall = mount_key + "\\" + kUninstallKey;
+                    std::wstring mounted_uninstall = mount_key + L"\\" + kUninstallKey;
                     enumerate_uninstall_key(HKEY_USERS, mounted_uninstall.c_str(), 0, user_apps);
-                    RegUnLoadKeyA(HKEY_USERS, mount_key.c_str());
+                    RegUnLoadKeyW(HKEY_USERS, mount_key.c_str());
                 }
             }
 
