@@ -389,3 +389,25 @@ groups:
             or a non-conforming agent — check the agent version and the warn-level
             "oversized ... blob" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryReportRejected
+        # outcome=rejected = a whole report carrying too many sources (content_hashes /
+        # plugin_data map > 64) was rejected at the ingest entry. DISTINCT from
+        # outcome=dropped (over-cap blob): this path does NOT nack, so the agent advances
+        # to the weekly floor rather than resending forever — different runbook. The
+        # framework wires ~1 source, so a non-zero rate signals a malformed / abusive /
+        # corrupted agent, not cap drift (gov consistency).
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="rejected"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest rejecting over-cap reports"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="rejected"} is non-zero: one or more
+            agents are sending an inventory report whose source map exceeds the
+            kMaxSources cap (64) — the whole report is rejected (NOT nacked; the agent
+            advances to its weekly full-floor). The framework wires ~1 source, so this
+            signals a malformed/abusive/corrupted agent — check the agent version and the
+            warn-level "carries too many sources" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"

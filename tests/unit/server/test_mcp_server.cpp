@@ -3167,7 +3167,7 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     // sustained outage still leaves a behavioural trail.
     bool saw_error_audit = false;
     for (const auto& a : ts.audit_log)
-        if (a == "mcp.query_installed_software|error")
+        if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_error_audit = true;
     CHECK(saw_error_audit);
 }

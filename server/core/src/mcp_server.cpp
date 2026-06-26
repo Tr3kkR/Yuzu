@@ -1404,7 +1404,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Audit the degraded access (gov compliance CC7.2): a CVE-triage caller
                     // under a sustained outage must still leave a behavioural trail
                     // (who/when/what filter), mirroring the success/denied audits below.
-                    mcp_audit("error", "store degraded; " + audit_key);
+                    mcp_audit("failure", "store degraded; " + audit_key);
                     res.set_content(error_response(id, kInternalError,
                                                    "Software inventory store degraded — query failed"),
                                     "application/json");

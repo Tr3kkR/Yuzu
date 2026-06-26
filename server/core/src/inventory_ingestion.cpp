@@ -174,13 +174,15 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         // not amplify resends to a misbehaving agent; the empty ack means the agent records
         // the cycle done until the weekly floor. Safety rests on the legit source count
         // (1 today) staying far below kMaxSources, so a legit report is never dropped here.
-        // Emit the dropped-outcome metric for observability (parity with the oversized-blob
-        // path below; gov consistency/compliance) so a flooding agent isn't WARN-only.
+        // Emit a DISTINCT `rejected` outcome (NOT `dropped` — that label's alert/runbook is
+        // oversized-blob-specific: nacked + never-self-heals; this reject is neither) so a
+        // flooding agent is observable without misdirecting the dropped-blob runbook (gov
+        // consistency). YuzuInventoryReportRejected alerts on it.
         spdlog::warn("inventory: report from agent={} carries too many sources "
                      "(hashes={}, blobs={}, cap={}) — rejecting whole report",
                      agent_id, report.content_hashes_size(), report.plugin_data_size(),
                      kMaxSources);
-        emit("__report__", "dropped");
+        emit("__report__", "rejected");
         return;
     }
 

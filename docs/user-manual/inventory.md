@@ -137,7 +137,8 @@ only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
 
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
-(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped`) — watch the
+(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
+the last for a whole report rejected at the source-map cap) — watch the
 `need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
 whose ingest is failing. Shipped alert rules for both signals live in the
 `yuzu-inventory` group of `docs/prometheus/yuzu-alerts.yml`:
