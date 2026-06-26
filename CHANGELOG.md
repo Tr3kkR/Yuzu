@@ -20,10 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
     **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
   - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
-    `/api/v1/guaranteed-state/events?agent_id=`, and now
-    `/api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`) **fails closed** with
-    `503` + `Sec-Audit-Failed: true` and serves no PII. The baseline-device route previously
-    discarded the result and served regardless — it now matches its `dex.device.view` siblings.
+    `/api/v1/guaranteed-state/events?agent_id=`, and
+    `/api/v1/guaranteed-state/device-compliance`) **fails closed** with
+    `503` + `Sec-Audit-Failed: true` and serves no PII.
   - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
     `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
     matching the `query_responses` / `revoke_certificate` convention.
@@ -47,6 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   REST/dashboard/workflow siblings that read the same response store and the `aggregate_responses`
   MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
   token creator's RBAC, not the service tag.)*
+
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
 
 ### Changed
 
@@ -73,28 +90,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
   service guard remains observe-only on the compliant edge (parity deferred).
 
-### Security
-
-- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
-  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
-  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
-  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
-  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
-  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
-  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
-  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
-  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
-  `401`/`403` denial bodies from
-  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
-  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
-  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
-  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
-  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
-  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
-  the audit subsystem recovers."
-
 ### Added
 
+- **Guardian — name-anchored, device-applicable compliance REST.**
+  New `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
+  looks a Baseline up by **name** (a stable constant such as `ServiceNow Compliance`, not
+  a churning `baseline_id`) and returns the Guards **actually applicable to the device**
+  each with the device's last reported verdict (`compliant` | `drifted` | `errored` |
+  `pending`), plus counts and a `last_updated` freshness stamp. One Baseline carries a
+  **superset** of Guards, each scoped via `scope_expr`, so the push arms a different
+  subset per machine; the endpoint returns the `deployed_snapshot` intersected with the
+  Guards the device has reported, so an out-of-scope Guard is **absent** (not `pending`)
+  and two machines querying the same Baseline name legitimately see different Guards.
+  `total_guards` is that applicable count. A not-yet-deployed Baseline returns
+  `deployed:false` with empty guards (consumer renders "No Baseline Deployed"), and
+  member edits appear only after a re-deploy. A *deployed* Baseline returning
+  `total_guards:0` with `last_updated:null` is **not assessable** (the device is
+  offline / newly-enrolled, or every Guard is out of its scope), **not compliant** — a
+  CMDB consumer must cross-reference device liveness and never render `0/0` as green.
+  Designed for embedding Guardian compliance into an external CMDB / ITSM CI record
+  (e.g. ServiceNow).
+  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
+  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
+  device is in — a previously group-scoped token now gets `403` for out-of-scope
+  devices, where a flat global check would have passed them; global tokens are
+  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
+  layer as `auth.scoped_permission_required`). A behavioural-PII read, so it **fails
+  closed**: if the `guardian.device.view` audit row cannot persist it returns `503` +
+  `Sec-Audit-Failed: true` and **withholds** the compliance body (parity with
+  `GET /api/v1/dex/devices/{id}`, governance #1549) — the `503` is returned before the
+  `404`, so an audit outage never reveals baseline existence without durable evidence
+  (CC7.2). **Behaviour change for API consumers:** an audit-store outage now yields
+  `503` where this unreleased route previously returned `200`; on the fleet-polled
+  CMDB path a *sustained* outage 503s every poll fleet-wide (no degraded-serve
+  fallback). Both query params are required, length-capped (`256` /
+  `auth::kMaxAgentIdLength`), and rejected if they contain control characters
+  (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use the A4 envelope
+  (`correlation_id`), while the `403` is the auth/RBAC layer's denial body (not the A4
+  envelope; exact shape varies by denial reason — RBAC vs service-scope).
+  The response carries a machine-readable **`assessable`** flag (`false` for a draft
+  Baseline or a deployed Baseline this device has reported no applicable Guard against —
+  the consumer must not compute a `0/0` compliance %) and **`snapshot_total`** (the
+  Baseline's full deployed-member superset, an upper bound on coverage). **Caution:** the
+  report-driven denominator can *over-estimate* compliance on a partial report (an
+  in-scope-but-unreported Guard is absent, not `pending`), so consumers must not gate on
+  `compliant/total_guards` until the per-device `scope_expr` computed denominator lands
+  (deferred). `X-Correlation-Id` is set on every response (parity with the
+  `dex.device.view` siblings); a guard reported with an unrecognized verdict token keeps
+  its real `updated_at` (no longer suppressed); a baseline-store *fault* returns a
+  retryable `503` (not the `404` a CMDB would read as "delete this CI") on a transient
+  fault; and the guard-name lookup chunks its `IN`-list so a Baseline larger than
+  `SQLITE_MAX_VARIABLE_NUMBER` still resolves every name. A `YuzuAuditPersistFailures`
+  Prometheus alert (`docs/prometheus/yuzu-alerts.yml`) now fires when behavioural-data
+  routes 503 fleet-wide on an audit-store outage.
 - **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
   page's **Get live info** button now returns a full live system snapshot — a KPI strip
   (uptime, process / service / connection / user counts) over a grid of collapsible,
@@ -264,24 +312,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the device (device / comm / short reason) — the raw kernel `MESSAGE` is never
   shipped (`[dex][linux][kmsg][privacy]` pins). Linux server DEX coverage grows from
   7 to 13 reused signals, all in the same `/dex` display groups.
-- **Guardian — baseline-anchored per-device compliance REST.**
-  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
-  returns one Baseline's deployed Guards each with the device's last reported verdict
-  (`compliant` | `drifted` | `errored` | `pending`), plus counts and a `last_updated`
-  freshness stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced
-  set, not the live member list); a not-yet-deployed Baseline returns `deployed:false`
-  with empty guards (consumer renders "No Baseline Deployed"), and member edits
-  appear only after a re-deploy. Designed for embedding Guardian compliance into an
-  external CMDB / ITSM CI record (e.g. ServiceNow).
-  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
-  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
-  device is in — a previously group-scoped token now gets `403` for out-of-scope
-  devices, where a flat global check would have passed them; global tokens are
-  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
-  layer as `auth.scoped_permission_required`). Path params are length-capped
-  (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
-  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
-  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`
