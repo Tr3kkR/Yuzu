@@ -437,3 +437,49 @@ groups:
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryReadDegraded
+        # An AUTHORITATIVE inventory read (query_software / get_agent_software)
+        # returned nullopt — a store/pool/query degrade, NOT a silent empty.
+        # /readyz deliberately stays green under pure pool saturation (it trips
+        # only on connection failure, to avoid false LB evictions), so this is
+        # otherwise dashboard-invisible: the store-agnostic
+        # yuzu_pg_acquire_timeout_total moves but nothing inventory-specific does
+        # (#1675). reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_inventory_read_degrade_total{reason="{{ $labels.reason }}"} is
+            non-zero: a fleet/agent software query returned a degrade (nullopt)
+            rather than data. pool_acquire_timeout/query_error correlate with
+            yuzu_pg_* saturation or outage; store_not_open means the store failed to
+            open at boot. A fleet vulnerability query ("which devices run <CVE>")
+            reads as degraded, NOT "installed nowhere" — do not trust a zero-result
+            inventory answer while this fires.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryStaleAgents
+        # Agents whose installed-software inventory has not refreshed within the
+        # staleness window (two missed daily sync cycles). A liveness/freshness
+        # signal: a rising count means agents stopped syncing inventory (offline,
+        # broken sync source, or the source disabled), so fleet software answers go
+        # stale. The threshold is a FLEET-SIZE-DEPENDENT placeholder — tune per
+        # deployment (a small absolute count is normal churn; a fleet-wide spike is
+        # the signal). Correlate with yuzu_fleet_agents_healthy to separate
+        # "agents offline" from "sync source broken".
+        expr: |
+          max(yuzu_inventory_stale_agents) by (source) > 50
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} agents have stale {{ $labels.source }} inventory"
+          description: >-
+            yuzu_inventory_stale_agents{source="{{ $labels.source }}"} has exceeded
+            the freshness threshold for 1h — that many agents have not synced this
+            inventory source in over two daily cycles. Check for a fleet-wide agent
+            outage, a broken/disabled sync source, or a network partition.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"

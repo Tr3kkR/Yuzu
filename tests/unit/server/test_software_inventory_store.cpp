@@ -14,8 +14,11 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -395,4 +398,164 @@ TEST_CASE("ingest rejects a report carrying too many sources (map-cardinality ca
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
     }
+}
+
+TEST_CASE("batched insert round-trips a large set, array metacharacters, and empty (#1664)",
+          "[pg][software_inventory]") {
+    // The per-row INSERT loop is now one `unnest($N::text[])` statement. These
+    // exercise it against a real backend: bulk correctness, the text[] literal
+    // escaping (to_text_array — unit-tested in test_pg_array.cpp, end-to-end
+    // here), and the empty-entries skip.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("the documented max (kMaxEntries) inserts via one unnest() and reads back complete") {
+        // 20 000 rows — the kMaxEntries cap, i.e. the largest payload the ingest
+        // accepts. A multi-row VALUES would exceed libpq's 65535-param ceiling
+        // here (5 params/row); the unnest path binds a constant 5 params.
+        constexpr int kRows = 20000;
+        std::vector<SoftwareEntry> rows;
+        rows.reserve(kRows);
+        for (int i = 0; i < kRows; ++i)
+            rows.push_back({"pkg-" + std::to_string(i), std::to_string(i), "Pub", "2026-01-01"});
+        const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+        REQUIRE(store.apply_installed_software("agent-big", h, rows, 1000) ==
+                InventoryIngestOutcome::kStored);
+        auto got = store.get_agent_software("agent-big");
+        REQUIRE(got.has_value());
+        CHECK(got->size() == kRows);
+    }
+
+    SECTION("array metacharacters in name/publisher survive the text[] literal round-trip") {
+        // Comma, double-quote, backslash, and braces are exactly the bytes
+        // to_text_array escapes; a regression would corrupt or 22P02-reject the
+        // whole batch. Verified via the exact-name fleet query (collation-stable).
+        const std::string meta = "a,b\"c\\d{e}";
+        std::vector<SoftwareEntry> rows = {{meta, "1", "Vendor, Inc.", ""}, {"Plain", "2", "", ""}};
+        const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+        REQUIRE(store.apply_installed_software("agent-meta", h, rows, 1000) ==
+                InventoryIngestOutcome::kStored);
+        SoftwareFleetQuery q;
+        q.name = meta;
+        auto fl = store.query_software(q);
+        REQUIRE(fl.has_value());
+        REQUIRE(fl->size() == 1);
+        CHECK((*fl)[0].agent_id == "agent-meta");
+        CHECK((*fl)[0].entry.publisher == "Vendor, Inc.");
+    }
+
+    SECTION("a full payload with zero entries stores nothing and is a clean empty") {
+        std::vector<SoftwareEntry> none;
+        const std::string h = SoftwareInventoryStore::canonical_hash(none);
+        REQUIRE(store.apply_installed_software("agent-empty", h, none, 1000) ==
+                InventoryIngestOutcome::kStored);
+        auto got = store.get_agent_software("agent-empty");
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+        // Hash-only follow-up with the same (empty) hash → touched proves the
+        // parent row + the empty content_hash persisted.
+        CHECK(store.apply_installed_software("agent-empty", h, std::nullopt, 2000) ==
+              InventoryIngestOutcome::kTouched);
+    }
+}
+
+TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675)",
+          "[pg][software_inventory]") {
+    // The authoritative-read degrade is dashboard-invisible (/readyz stays green
+    // under pure saturation), so the counter is the only signal. Dropping the
+    // schema under the open store forces a query_error on both reads.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareFleetQuery q;
+    q.name = "Chrome";
+    CHECK_FALSE(store.query_software(q).has_value()); // degraded → nullopt
+    CHECK_FALSE(store.get_agent_software("agent-a").has_value());
+    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 2.0);
+}
+
+TEST_CASE("count_stale_agents counts agents past the freshness cutoff (stale gauge feed)",
+          "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::vector<SoftwareEntry> rows = {{"Chrome", "1", "", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    // last_seen is taken from collected_at: agent-old at 1000, agent-new at 5000.
+    REQUIRE(store.apply_installed_software("agent-old", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-new", h, rows, 5000) ==
+            InventoryIngestOutcome::kStored);
+
+    auto none = store.count_stale_agents(1000); // last_seen < 1000 → neither
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+    auto one = store.count_stale_agents(2000); // 1000 < 2000 stale, 5000 not
+    REQUIRE(one.has_value());
+    CHECK(*one == 1);
+    auto both = store.count_stale_agents(6000); // both < 6000
+    REQUIRE(both.has_value());
+    CHECK(*both == 2);
+}
+
+TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phase (#1664)",
+          "[pg][software_inventory][seam]") {
+    // Drives the seam with a LIVE registry (the other seam tests pass nullptr) and
+    // asserts the histogram fires once per phase: a full payload → phase=full, a
+    // hash-only follow-up → phase=hash_only.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+
+    const std::string blob = blob1("Chrome", "119", "Google", "2026-01-01");
+    const std::string h =
+        SoftwareInventoryStore::canonical_hash({{"Chrome", "119", "Google", "2026-01-01"}});
+
+    {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = h;
+        (*rep.mutable_plugin_data())["installed_software"] = blob; // full payload
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-hist", rep, ack, &metrics);
+    }
+    {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = h; // hash-only (no blob)
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-hist", rep, ack, &metrics);
+    }
+
+    auto full = metrics
+                    .histogram("yuzu_inventory_ingest_duration_seconds",
+                               {{"source", "installed_software"}, {"phase", "full"}})
+                    .snapshot();
+    auto hash_only = metrics
+                         .histogram("yuzu_inventory_ingest_duration_seconds",
+                                    {{"source", "installed_software"}, {"phase", "hash_only"}})
+                         .snapshot();
+    CHECK(full.count == 1);
+    CHECK(hash_only.count == 1);
 }

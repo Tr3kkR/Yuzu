@@ -37,6 +37,10 @@
 #include <string_view>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server::pg {
 class PgPool;
 }
@@ -86,6 +90,15 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_inventory_read_degrade_total{reason}`, #1675) and any future
+    /// store-internal metric. Set ONCE during single-threaded startup, before
+    /// the gRPC/REST surfaces begin serving — the pointer is read without
+    /// synchronisation on the serving threads, so a later swap would race. A
+    /// null registry (the default, e.g. in unit tests) disables emission; every
+    /// emit site is null-guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     /// Canonical content hash over a machine-scope software list — the SAME
     /// algorithm the agent uses (sorted+deduplicated; fields unit-separated
     /// 0x1F, entries record-separated 0x1E; SHA-256 hex), so the agent's
@@ -124,9 +137,21 @@ public:
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
 
+    /// Count agents whose `installed_software` inventory has not been refreshed
+    /// since `stale_before_secs` (epoch seconds) — i.e. `last_seen <
+    /// stale_before_secs`. Feeds the `yuzu_inventory_stale_agents` freshness
+    /// gauge from the metrics sweep. Uses a SHORT bounded acquire (NOT the query
+    /// timeout): the sweep shares its serial budget with security-relevant
+    /// revocation teardown, and pool saturation is the very condition this gauge
+    /// instruments, so it must give up fast. `std::nullopt` on a store/pool/query
+    /// degrade — the caller leaves the gauge at its previous (stale) value rather
+    /// than publishing a false zero.
+    [[nodiscard]] std::optional<std::int64_t> count_stale_agents(std::int64_t stale_before_secs);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server

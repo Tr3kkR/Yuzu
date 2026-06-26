@@ -101,6 +101,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
+  (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
+  `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
+  collapsing the per-agent connection-hold and `statement_timeout` exposure that, under a cold-cache
+  `need_full` herd, could saturate the shared Postgres pool and flip healthy agents touched→full.
+  Three series make the path measurable: `yuzu_inventory_ingest_duration_seconds{source}` (the
+  pooled-connection + transaction hold time), `yuzu_inventory_read_degrade_total{reason}` (an
+  authoritative read that degraded rather than returning a silent empty — otherwise invisible since
+  `/readyz` stays green under pure saturation; the per-site WARN is now sampled to avoid flooding the
+  log at agentic fan-out), and `yuzu_inventory_stale_agents{source}` (a freshness gauge). New
+  `YuzuInventoryReadDegraded` and `YuzuInventoryStaleAgents` alert rules ship in the `yuzu-inventory`
+  group.
+
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
   shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
   `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no

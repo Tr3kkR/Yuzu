@@ -140,12 +140,35 @@ enrolled agent populates within minutes (jittered first sync), not instantly.
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
 the last for a whole report rejected at the source-map cap) — watch the
 `need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing. Shipped alert rules live in the `yuzu-inventory` group of
+whose ingest is failing. Three further series sharpen the picture:
+
+- `yuzu_inventory_ingest_duration_seconds{source,phase}` (histogram) — how long
+  applying one source's report holds a pooled Postgres connection (advisory lock +
+  the atomic replace, whose inserts are now batched into a single `unnest()`
+  statement). `phase=full` is the full-payload replace; `phase=hash_only` is the
+  cheap hash-skip compare + `last_seen` bump — split so the steady-state
+  hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
+  a cold-cache `need_full` herd.
+- `yuzu_inventory_read_degrade_total{reason}` (counter, reason ∈ `store_not_open` /
+  `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
+  a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
+  pool saturation, so without this counter a degraded fleet software query is
+  otherwise invisible. The per-degrade WARN is sampled (1st then every 100th per
+  site) so a fan-out outage can't flood the log; the counter is the continuous
+  signal.
+- `yuzu_inventory_stale_agents{source}` (gauge) — agents that have not synced this
+  source within the staleness window (two missed daily cycles), a freshness /
+  liveness signal sampled on the metrics sweep.
+
+Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked), and
-`YuzuInventoryReportRejected` (a whole report rejected at the source-map cap).
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
+`YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
+`YuzuInventoryReadDegraded` (a read returned a degrade by reason), and
+`YuzuInventoryStaleAgents` (a fleet-size-tunable count of agents whose inventory
+has gone stale).
 
 ## See also
 
