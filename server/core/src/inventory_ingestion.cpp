@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -224,8 +225,11 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         // yuzu_inventory_ingest_total{source,outcome}.
         const char* phase = rows.has_value() ? "full" : "hash_only";
         const auto ingest_t0 = std::chrono::steady_clock::now();
-        InventoryIngestOutcome outcome =
-            store.apply_installed_software(agent_id, claimed_hash, rows, collected_at);
+        // rows is not read after this call (phase is computed above), so move it
+        // in — the store takes the optional by value and moves the entries out,
+        // avoiding a copy of up to kMaxEntries rows on the ingest hot path (UP-8).
+        InventoryIngestOutcome outcome = store.apply_installed_software(
+            agent_id, claimed_hash, std::move(rows), collected_at);
         if (metrics) {
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();

@@ -115,9 +115,13 @@ public:
     ///    replacing all of this agent's rows + upserting the parent in one
     ///    transaction → kStored.
     /// `collected_at` is epoch seconds (0 → server wall-clock now).
-    InventoryIngestOutcome apply_installed_software(
-        std::string_view agent_id, std::string_view claimed_hash,
-        const std::optional<std::vector<SoftwareEntry>>& rows, std::int64_t collected_at);
+    /// `rows` is taken BY VALUE so the full-payload path can `std::move` the
+    /// entries into normalization instead of copying up to kMaxEntries structs on
+    /// the ingest hot path (UP-8); pass `std::move` at the call site.
+    InventoryIngestOutcome apply_installed_software(std::string_view agent_id,
+                                                    std::string_view claimed_hash,
+                                                    std::optional<std::vector<SoftwareEntry>> rows,
+                                                    std::int64_t collected_at);
 
     /// All installed software for one agent (per-device drill-down), name-sorted.
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure (degraded —

@@ -618,3 +618,42 @@ TEST_CASE("count_stale_agents returns nullopt on a backend degrade (freeze-count
     }
     CHECK_FALSE(store.count_stale_agents(1'000'000).has_value()); // degrade → nullopt, never 0
 }
+
+TEST_CASE("delete_agent removes both the child rows and the parent state row",
+          "[pg][software_inventory]") {
+    // delete_agent deletes from installed_software AND inventory_state in one txn.
+    // Verify both halves: the child rows are gone (get returns an empty VALUE, not
+    // nullopt) AND the parent state row is gone (a hash-only follow-up sees a cold
+    // cache → kNeedFull, not kTouched on a stale parent).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
+                                       {"Firefox", "120", "Mozilla", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-del", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    {
+        auto pre = store.get_agent_software("agent-del");
+        REQUIRE(pre.has_value());
+        REQUIRE(pre->size() == 2);
+    }
+
+    store.delete_agent("agent-del");
+
+    auto post = store.get_agent_software("agent-del");
+    REQUIRE(post.has_value()); // store still open + query OK → empty VALUE, not a degrade
+    CHECK(post->empty());      // child rows gone
+    // Parent state row gone: a hash-only report now hits a cold cache.
+    CHECK(store.apply_installed_software("agent-del", h, std::nullopt, 2000) ==
+          InventoryIngestOutcome::kNeedFull);
+
+    // A delete of an unknown agent is a no-op (best-effort), not a throw or a degrade.
+    store.delete_agent("agent-never-existed");
+    auto other = store.get_agent_software("agent-never-existed");
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
+}

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -201,7 +202,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
 
 InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     std::string_view agent_id, std::string_view claimed_hash,
-    const std::optional<std::vector<SoftwareEntry>>& rows, std::int64_t collected_at) {
+    std::optional<std::vector<SoftwareEntry>> rows, std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return InventoryIngestOutcome::kError;
 
@@ -247,7 +248,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     }
 
     // ── Full payload: recompute the hash from the rows, replace atomically ─────
-    std::vector<SoftwareEntry> entries = *rows;
+    // Move out of the by-value optional — no copy of the (up to kMaxEntries) rows.
+    std::vector<SoftwareEntry> entries = std::move(*rows);
     normalize(entries);
     const std::string server_hash = SoftwareInventoryStore::canonical_hash(entries);
     const std::string agent_id_s{agent_id};
