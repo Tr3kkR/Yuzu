@@ -274,6 +274,32 @@ groups:
             churn.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-events-dropped"
 
+  - name: yuzu-audit
+    # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
+    # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503
+    # and serve no PII (CC7.2). yuzu_server_audit_emit_failed_total is the only signal
+    # this is happening — without this alert a fleet-polled CMDB (ServiceNow) integration
+    # blackouts silently (sre-1, #1647).
+    rules:
+      - alert: YuzuAuditPersistFailures
+        expr: |
+          increase(yuzu_server_audit_emit_failed_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit events failing to persist — behavioural-data routes are 503ing"
+          description: >-
+            yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
+            fail-closed audit-on-open (guardian.device.view, dex.device.view,
+            dex.signal.view) is returning 503 and withholding PII, so a ServiceNow /
+            CMDB poll blackouts fleet-wide. Check audit.db health (/healthz
+            stores.audit) and free disk on the data directory. Note: a bad_alloc-class
+            throw in the audit pipeline fails closed the same way but does NOT bump this
+            counter (it is catch-logged only) — correlate with a spike in 503s on the
+            behavioural routes.
+          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
     # (TTL + cap), so cap-eviction silently discards another operator's in-flight

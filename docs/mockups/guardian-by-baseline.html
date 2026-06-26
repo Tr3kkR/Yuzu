@@ -34,6 +34,11 @@
   body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
   .wrap{max-width:1040px;margin:0 auto}
   a{color:inherit;text-decoration:none}
+  /* shared Guardian sub-nav (matches guardian-hub / guardian-catalogue / guardian-trends) */
+  .subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border);padding-bottom:.7rem;margin-bottom:1rem;flex-wrap:wrap}
+  .subnav a{font-size:.78rem;color:var(--muted);border:1px solid transparent;border-radius:.35rem;padding:.22rem .6rem}
+  .subnav a.on{color:var(--white);border-color:var(--accent)}
+  .subnav .sp{margin-left:auto;font-size:.7rem;color:var(--muted)}
   h2{font-size:1.15rem;margin:0 0 .15rem;color:var(--white)}
   .sub{color:var(--muted);font-size:.78rem;margin-bottom:1rem}
   .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.3rem 0 .5rem}
@@ -96,7 +101,7 @@
   .gname{color:var(--white);font-weight:600}
   .num{text-align:right;font-variant-numeric:tabular-nums}
   .sev{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em}
-  .sev.high{color:var(--red)} .sev.medium{color:var(--yellow)} .sev.low{color:var(--lightblue)}
+  .sev.critical{color:var(--red)} .sev.high{color:#ff8a52} .sev.medium{color:var(--yellow)} .sev.low{color:var(--lightblue)}
   .mode.observe{color:var(--lightblue);font-weight:700} .mode.enforce{color:var(--yellow);font-weight:700}
   .st-ok{color:var(--green);font-weight:600} .st-drift{color:var(--yellow);font-weight:600} .st-unk{color:var(--slate)}
   .muted{color:var(--muted)}
@@ -116,14 +121,15 @@
 
 <!-- ════════════════ VIEW 1 — BY-BASELINE LIST ════════════════ -->
 <div id="view-list">
-  <h2>Guardian</h2>
-  <div class="sub">Guaranteed State enforcement — live status, Guards &amp; Baselines</div>
-  <div class="tabs">
-    <span class="tab">Fleet</span>
-    <span class="tab">By Guard</span>
-    <span class="tab active">By Baseline</span>
-    <span class="win">window:<b>24h</b><b class="on">7d</b><b>30d</b></span>
+  <div class="subnav">
+    <a href="guardian-hub.html">Overview</a>
+    <a class="on" href="guardian-by-baseline.html">Baselines</a>
+    <a href="guardian-catalogue.html">Guards</a>
+    <a href="guardian-trends.html">Trends</a>
+    <span class="sp">152 enrolled &middot; 148 reporting (97%)</span>
   </div>
+  <h2>Baselines</h2>
+  <div class="sub">The deployable units — each bundles member Guards + an assignment + a draft/deployed lifecycle.</div>
 
   <!-- CIS Windows 11 — deployed, all-Observe -->
   <div class="blcard" onclick="showDetail()">
