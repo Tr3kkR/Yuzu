@@ -167,6 +167,21 @@ and that `installed_apps` is present in the agent's `--plugin-dir`. The sync als
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
 
+**Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
+initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
+APIs, which return the system code page (cp1252 on Western installs), so any
+non-ASCII character in an app or publisher name was stored as `?` (e.g. `Café` →
+`Caf?`). This is fixed in the release containing #1662 (the plugin now reads via
+`Reg*W` + UTF-8). After upgrading an agent, the corrected names land on that
+agent's **next daily sync** — typically within hours, not the weekly full-floor,
+because the changed bytes change the content hash and force a full re-send (it is
+*not* gated behind the weekly floor). Until then, an exact-match query
+(`WHERE name = 'Café'`) returns zero rows for that device. To force the refresh
+immediately on a device, **restart the Yuzu agent** there — the first sync after
+restart sends a full list. Note that app *counts* can rise slightly after the
+fix: names that previously collapsed to the same `?`-mangled string (e.g. two
+different non-ASCII apps) now separate into distinct rows.
+
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
 the last for a whole report rejected at the source-map cap) — watch the

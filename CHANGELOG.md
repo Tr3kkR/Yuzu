@@ -125,6 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
+  `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
+  strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
+  UTF-8 scrub then replaced the resulting invalid bytes with `?` (`Café` → `Caf?`), so any app or
+  publisher with a non-ASCII name was corrupted in the output — and, now that the names land in the
+  typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
+  now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
+  (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
+  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
+  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
+  unknown). No proto/wire change.
+
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service
   previously short-circuited silently and never emitted `guard.compliant`, so the
