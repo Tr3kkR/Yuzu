@@ -230,16 +230,71 @@ std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_
     std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE baseline_id = ?;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        // A prepare failure (DB locked/corrupt) otherwise reads as a benign
+        // not-found — log so a degraded read is visible.
+        spdlog::error("BaselineStore::get_baseline: prepare failed: {}", sqlite3_errmsg(db_));
         return std::nullopt;
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<Baseline> result;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        result = read_baseline_row(s);
-    sqlite3_finalize(s);
+    if (sqlite3_step(s.get()) == SQLITE_ROW)
+        result = read_baseline_row(s.get());
+    return result;
+}
+
+std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& name,
+                                                            bool* store_ok) const {
+    // Optimistic: only a store FAULT (db-null / prepare-fail) clears this; a genuine
+    // not-found leaves it true so the caller 404s rather than 503s (UP-13/sre-2).
+    if (store_ok)
+        *store_ok = true;
+    std::shared_lock lock(mtx_);
+    if (!db_) {
+        if (store_ok)
+            *store_ok = false;
+        return std::nullopt;
+    }
+    // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
+    const std::string sql = std::string("SELECT ") + kBaselineColumns +
+                            " FROM guaranteed_state_baselines WHERE name = ? LIMIT 1;";
+    // SqliteStmt RAII (sqlite_raii.hpp): finalizes on every exit including an
+    // exception thrown by read_baseline_row's std::string construction between
+    // prepare and finalize — mirrors deployed_member_rule_ids, the safer sibling.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        // Observability (SRE): a prepare failure (DB locked/corrupt) otherwise returns
+        // the SAME std::nullopt as a genuine not-found, so the REST route 404s and a
+        // CMDB consumer reads it as "no such baseline" — masking a store fault as
+        // benign with no signal. Log it so a degraded read is visible; the legitimate
+        // not-found path stays quiet. Name omitted (prepare failure is name-independent
+        // and the value is caller-influenced).
+        spdlog::error("BaselineStore::get_baseline_by_name: prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        if (store_ok)
+            *store_ok = false;  // fault, not a miss → caller 503s (retryable)
+        return std::nullopt;
+    }
+    sqlite3_bind_text(s.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    std::optional<Baseline> result;
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW) {
+        result = read_baseline_row(s.get());
+    } else if (rc != SQLITE_DONE) {
+        // The "DB locked/corrupt" fault the store_ok contract names surfaces at STEP
+        // (SQLITE_BUSY/LOCKED/IOERR/CORRUPT), not just prepare — SQLITE_DONE is the
+        // clean no-row not-found. Classify a non-DONE step rc as a fault so the route
+        // 503s (retryable), not 404 (which a CMDB reads as "delete this CI"). Without
+        // this the fix is defeated at the step layer (#1623 Gate-8 cpp-safety).
+        spdlog::error("BaselineStore::get_baseline_by_name: step failed (rc={}): {}", rc,
+                      sqlite3_errmsg(db_));
+        if (store_ok)
+            *store_ok = false;
+    }
     return result;
 }
 
@@ -248,14 +303,16 @@ std::vector<Baseline> BaselineStore::list_baselines() const {
     std::vector<Baseline> out;
     if (!db_)
         return out;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines ORDER BY name;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("BaselineStore::list_baselines: prepare failed: {}", sqlite3_errmsg(db_));
         return out;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s));
-    sqlite3_finalize(s);
+    }
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.push_back(read_baseline_row(s.get()));
     return out;
 }
 
@@ -577,15 +634,18 @@ std::vector<Baseline> BaselineStore::list_deployed_baselines() const {
     std::vector<Baseline> out;
     if (!db_)
         return out;
-    sqlite3_stmt* s = nullptr;
     const std::string sql = std::string("SELECT ") + kBaselineColumns +
                             " FROM guaranteed_state_baselines WHERE lifecycle = ? ORDER BY name;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("BaselineStore::list_deployed_baselines: prepare failed: {}",
+                      sqlite3_errmsg(db_));
         return out;
-    sqlite3_bind_text(s, 1, kBaselineDeployed, -1, SQLITE_STATIC);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s));
-    sqlite3_finalize(s);
+    }
+    sqlite3_bind_text(s.get(), 1, kBaselineDeployed, -1, SQLITE_STATIC);
+    while (sqlite3_step(s.get()) == SQLITE_ROW)
+        out.push_back(read_baseline_row(s.get()));
     return out;
 }
 
