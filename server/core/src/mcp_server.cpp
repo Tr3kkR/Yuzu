@@ -1392,12 +1392,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // that mutates on sync cadence; keyset is the #1634 follow-up.
                 q.limit = static_cast<int>(
                     std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                const std::string audit_key = !q.name.empty() ? ("name=" + q.name)
+                                              : !q.agent_id.empty() ? ("agent=" + q.agent_id)
+                                                                    : std::string("fleet");
                 auto rows_opt = software_inventory_store->query_software(q);
                 if (!rows_opt) {
                     // Store degraded (pool/query failure) — surface it, never return
                     // success+[]. A silent empty here reads as "installed nowhere" for a
                     // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
                     // failure-vs-empty). Distinct message from the null-store case above.
+                    // Audit the degraded access (gov compliance CC7.2): a CVE-triage caller
+                    // under a sustained outage must still leave a behavioural trail
+                    // (who/when/what filter), mirroring the success/denied audits below.
+                    mcp_audit("error", "store degraded; " + audit_key);
                     res.set_content(error_response(id, kInternalError,
                                                    "Software inventory store degraded — query failed"),
                                     "application/json");
@@ -1454,10 +1461,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("publisher", r.entry.publisher)
                                 .add("install_date", r.entry.install_date));
                 }
-                const std::string audit_key =
-                    !q.name.empty()       ? ("name=" + q.name)
-                    : !q.agent_id.empty() ? ("agent=" + q.agent_id)
-                                          : std::string("fleet");
                 // A scope-dropped read is security-relevant — audit it distinctly (mirrors
                 // #1634) with the DISTINCT dropped-device count, and fold its persistence
                 // bool into audit_persisted (a dropped denial-evidence row is the MORE

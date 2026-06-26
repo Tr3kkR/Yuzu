@@ -500,10 +500,10 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include "pg/pg_raii.hpp"               // PgResult
 #include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
 
-#include <libpq-fe.h> // PGRES_COMMAND_OK
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
 #include <httplib.h>
+#include <libpq-fe.h> // PGRES_COMMAND_OK
 
 #include <memory>
 #include <stdexcept>
@@ -3161,5 +3161,13 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     REQUIRE(res->status == 200);
     CHECK(res->body.find("\"error\"") != std::string::npos); // JSON-RPC error, not a result
     CHECK(res->body.find("Software inventory store degraded") != std::string::npos);
+    CHECK(res->body.find("-32603") != std::string::npos);    // kInternalError, not kInvalidParams (gov QE)
     CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
+    // The degraded access is audited (gov compliance CC7.2): a CVE-triage caller under a
+    // sustained outage still leaves a behavioural trail.
+    bool saw_error_audit = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_installed_software|error")
+            saw_error_audit = true;
+    CHECK(saw_error_audit);
 }

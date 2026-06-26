@@ -89,7 +89,9 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
                 InventoryIngestOutcome::kStored);
         CHECK(store.apply_installed_software("agent-b", h, std::nullopt, 2000) ==
               InventoryIngestOutcome::kTouched);
-        CHECK(store.get_agent_software("agent-b").value().size() == 2);
+        auto b = store.get_agent_software("agent-b");
+        REQUIRE(b.has_value());
+        CHECK(b->size() == 2);
     }
 
     SECTION("hash-only with no stored record (cold cache) → need_full") {
@@ -137,7 +139,9 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         agentpb::InventoryAck ack;
         yuzu::server::ingest_inventory_report(store, "agent-x", rep, ack);
         CHECK(ack.need_full_size() == 0);
-        CHECK(store.get_agent_software("agent-x").value().size() == 1);
+        auto x = store.get_agent_software("agent-x");
+        REQUIRE(x.has_value());
+        CHECK(x->size() == 1);
     }
 
     SECTION("hash-only on a cold cache → ack.need_full lists the source") {
@@ -368,13 +372,27 @@ TEST_CASE("ingest rejects a report carrying too many sources (map-cardinality ca
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
 
-    agentpb::InventoryReport rep;
-    for (int i = 0; i < 100; ++i) // > kMaxSources (64)
-        (*rep.mutable_content_hashes())["src-" + std::to_string(i)] = "h";
-    agentpb::InventoryAck ack;
-    yuzu::server::ingest_inventory_report(store, "agent-flood", rep, ack);
-    CHECK(ack.need_full_size() == 0); // whole report dropped, no per-source nack
-    auto rows = store.get_agent_software("agent-flood");
-    REQUIRE(rows.has_value());
-    CHECK(rows->empty()); // nothing ingested
+    SECTION("content_hashes map over cap → rejected") {
+        agentpb::InventoryReport rep;
+        for (int i = 0; i < 100; ++i) // > kMaxSources (64)
+            (*rep.mutable_content_hashes())["src-" + std::to_string(i)] = "h";
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-flood", rep, ack);
+        CHECK(ack.need_full_size() == 0); // whole report dropped, no per-source nack
+        auto rows = store.get_agent_software("agent-flood");
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty()); // nothing ingested
+    }
+
+    SECTION("plugin_data map over cap → rejected (the OR's right arm)") {
+        agentpb::InventoryReport rep;
+        for (int i = 0; i < 100; ++i)
+            (*rep.mutable_plugin_data())["src-" + std::to_string(i)] = "blob";
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-flood2", rep, ack);
+        CHECK(ack.need_full_size() == 0);
+        auto rows = store.get_agent_software("agent-flood2");
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
 }

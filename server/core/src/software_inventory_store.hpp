@@ -109,7 +109,9 @@ public:
     /// All installed software for one agent (per-device drill-down), name-sorted.
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure (degraded —
     /// distinct from an empty value = genuinely no rows). An empty `agent_id` is a
-    /// precondition miss, not a degrade → empty value.
+    /// precondition miss, not a degrade → empty value. Callers MUST surface a `nullopt`
+    /// degrade (e.g. an error/banner), NOT `.value_or({})` it back into a silent empty —
+    /// that re-opens the fail-open A4 violation this contract closes (gov UP-5).
     [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
     get_agent_software(std::string_view agent_id);
 

@@ -108,6 +108,12 @@ workers (gated on `Inventory:Read`):
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
+- **On store degradation (authoritative reads, ADR-0016 §7):** if the Postgres
+  store cannot be read (pool-acquire timeout or query error), the tool returns a
+  JSON-RPC error (`kInternalError`) rather than an empty result. Treat any error
+  response as "unknown — do **not** proceed as if nothing is installed". A
+  genuinely empty result (no error, zero rows) means the query succeeded and
+  matched nothing in your scope.
 
 A dedicated REST endpoint and a software dashboard / per-device drill-down view
 are planned follow-ons.

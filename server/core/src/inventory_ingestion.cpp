@@ -170,10 +170,17 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
     if (agent_id.empty())
         return;
     if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
+        // Whole-report reject (malformed/abusive). Deliberately NO need_full nack — we do
+        // not amplify resends to a misbehaving agent; the empty ack means the agent records
+        // the cycle done until the weekly floor. Safety rests on the legit source count
+        // (1 today) staying far below kMaxSources, so a legit report is never dropped here.
+        // Emit the dropped-outcome metric for observability (parity with the oversized-blob
+        // path below; gov consistency/compliance) so a flooding agent isn't WARN-only.
         spdlog::warn("inventory: report from agent={} carries too many sources "
                      "(hashes={}, blobs={}, cap={}) — rejecting whole report",
                      agent_id, report.content_hashes_size(), report.plugin_data_size(),
                      kMaxSources);
+        emit("__report__", "dropped");
         return;
     }
 
