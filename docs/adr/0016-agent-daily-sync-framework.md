@@ -177,6 +177,13 @@ Therefore we **coexist, not replace**:
   section on the existing `/device` drill-down, and a dedicated fleet-wide
   software dashboard.
 
+> **Update (2026-06-26):** the REST read surface shipped as
+> `GET /api/v1/inventory/software` (`Inventory:Read`, management-group scoped,
+> degrade→503-never-empty per §7, set-and-proceed audit per §8) — the REST sibling
+> of `query_installed_software`, mirrored 1:1. See `docs/user-manual/inventory.md`
+> §REST and `docs/user-manual/rest-api.md`. Remaining follow-ons: the `/device`
+> drill-down section and the fleet-wide software dashboard.
+
 ## Consequences
 
 **Positive**

@@ -147,6 +147,16 @@ curl -H "Authorization: Bearer $TOKEN" \
   Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
   succeeded and matched nothing in your scope.
 
+**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
+endpoint).** The 1000-row cap is applied by the store *before* the management-group
+scope filter runs. So a narrow-scope operator querying a popular title across a large
+fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
+their own rows, because the cap was consumed by out-of-scope devices that sort ahead
+of yours. **That is "incomplete", not "absent in your scope."** Until keyset
+pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
+the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
+filter, so your in-scope rows fit under the cap.
+
 A software dashboard / per-device drill-down view are planned follow-ons.
 
 ## Access control

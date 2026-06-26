@@ -622,6 +622,8 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
+        // NOTE: the preceding literal segment (incl. /inventory/software) is ~12 KB —
+        // the NEXT path added to it will likely need its own `)json" R"json(` split.
         R"json(
     "/bundles": {
       "post": {"summary": "Dispatch a live-query bundle: fan one instruction into up to 32 plugin actions on one device (ADR-0011)", "tags": ["Bundles"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id", "steps"], "properties": {"agent_id": {"type": "string", "description": "The single target device"}, "steps": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "required": ["plugin", "action"], "properties": {"plugin": {"type": "string"}, "action": {"type": "string"}, "params": {"type": "object", "additionalProperties": {"type": "string"}}}}}}}}}}, "responses": {"202": {"description": "Accepted; returns {bundle_id, agent_id, expected}. Poll GET /bundles/{id} to collate."}, "400": {"description": "Invalid JSON, missing/empty agent_id, missing/empty steps, >32 steps, unsafe identifier, or param size caps"}, "403": {"description": "Requires Execution:Execute"}, "500": {"description": "Authenticated session has no principal"}, "503": {"description": "Dispatch unavailable"}}}
@@ -3141,8 +3143,10 @@ void RestApiV1::register_routes(
     // installed-software is machine-scope, carries no end-user PII and no
     // works-council co-determination trigger (ADR-0016 §8), so it is NOT behavioural
     // PII — withholding data on an audit-persist miss is unwarranted. We still capture
-    // the persist bool and surface audit_persisted:false, matching the MCP tool's
-    // honesty contract.
+    // the persist bool and surface audit_persisted:false, AND route every audit call
+    // through the #1647 throw-safe kernel `detail::try_persist_audit` (a throwing audit
+    // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
+    // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
              [auth_fn, perm_fn, audit_fn, software_inventory_store, inventory_scope_fn](
                  const httplib::Request& req, httplib::Response& res) {
@@ -3156,7 +3160,15 @@ void RestApiV1::register_routes(
                      return; // auth_fn wrote 401
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return; // perm_fn wrote 401/403
-                 if (!software_inventory_store || !software_inventory_store->is_open()) {
+                 // Null-store ONLY (not `!is_open()`): a constructed-but-closed store
+                 // deliberately falls through to query_software(), which returns nullopt →
+                 // the AUDITED degrade branch below (CC7.2 trail + MCP parity — MCP guards
+                 // only `!store` too). A live server never serves a closed store anyway
+                 // (server.cpp sets startup_failed_ and refuses to boot with one), so
+                 // dropping the `!is_open()` short-circuit is defensive: it keeps the
+                 // who/when/what trail intact against a future boot-gating refactor
+                 // (gov arch-NICE-1 / compliance-CC7.2 / unhappy UP-7).
+                 if (!software_inventory_store) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "software inventory store not available", cid),
@@ -3168,10 +3180,11 @@ void RestApiV1::register_routes(
                  q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
                  q.name = req.has_param("name") ? req.get_param_value("name") : "";
                  // Clamp in 64-bit BEFORE narrowing (mirror the MCP tool / query_responses):
-                 // limit:0 reads as "done, no rows"; a negative/wrapped value would bind
-                 // unbounded and defeat the cap. No offset — the scope filter runs AFTER the
-                 // store LIMIT, so paging would yield unstable windows over a sync-mutating
-                 // table; keyset is the #1634 follow-up.
+                 // limit<1 clamps to 1 and limit>1000 clamps to 1000; clamping in int64
+                 // first stops a negative/wrapped value from binding unbounded and defeating
+                 // the cap. No offset — the scope filter runs AFTER the store LIMIT, so paging
+                 // would yield unstable windows over a sync-mutating table; keyset is the
+                 // #1634 follow-up.
                  std::int64_t want = 100;
                  if (req.has_param("limit")) {
                      try {
@@ -3196,9 +3209,12 @@ void RestApiV1::register_routes(
                      // A silent empty reads as "installed nowhere" for a fleet vuln query
                      // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
                      // Audit the degraded access (CC7.2): a CVE-triage caller under a sustained
-                     // outage must still leave a who/when/what trail.
-                     audit_fn(req, "inventory.software.query", "failure", "Inventory", audit_key,
-                              "store degraded; cid=" + cid);
+                     // outage must still leave a who/when/what trail. Routed through the #1647
+                     // throw-safe kernel (NOT raw audit_fn) so a throwing audit sink can't eat
+                     // the 503 — exact parity with the MCP sibling's mcp_audit (gov chaos CH-3).
+                     (void)detail::try_persist_audit(audit_fn, req, "inventory.software.query",
+                                                     "failure", "Inventory", audit_key,
+                                                     "store degraded; cid=" + cid);
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503,
@@ -3257,17 +3273,24 @@ void RestApiV1::register_routes(
                  }
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
-                 // bool, surface audit_persisted:false, never withhold. A scope-dropped read is
-                 // security-relevant → audit it distinctly with the DISTINCT dropped count.
+                 // bool, surface audit_persisted:false, never withhold. Routed through the
+                 // #1647 throw-safe kernel `try_persist_audit` (NOT raw audit_fn) so a throwing
+                 // audit sink returns false → audit_persisted:false instead of escaping the
+                 // lambda as a 500 with no trail — exact throw-safety parity with the MCP
+                 // sibling's mcp_audit (gov chaos CH-3). We use the kernel, NOT the fail-closed
+                 // emit_behavioral_audit, because this machine-scope data is set-and-proceed.
+                 // A scope-dropped read is security-relevant → audit it distinctly with the
+                 // DISTINCT dropped count.
                  bool denied_ok = true;
                  if (scope_filtered)
-                     denied_ok = audit_fn(req, "inventory.software.query", "denied", "Inventory",
-                                          audit_key,
-                                          "scope: filtered " + std::to_string(dropped_agents) +
-                                              " out-of-management-group device(s); cid=" + cid);
+                     denied_ok = detail::try_persist_audit(
+                         audit_fn, req, "inventory.software.query", "denied", "Inventory", audit_key,
+                         "scope: filtered " + std::to_string(dropped_agents) +
+                             " out-of-management-group device(s); cid=" + cid);
                  const bool audit_ok =
-                     audit_fn(req, "inventory.software.query", "success", "Inventory", audit_key,
-                              "rows=" + std::to_string(arr.size()) + " cid=" + cid) &&
+                     detail::try_persist_audit(audit_fn, req, "inventory.software.query", "success",
+                                               "Inventory", audit_key,
+                                               "rows=" + std::to_string(arr.size()) + " cid=" + cid) &&
                      denied_ok;
 
                  JObj data;

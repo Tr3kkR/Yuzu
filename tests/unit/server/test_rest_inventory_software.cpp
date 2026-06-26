@@ -38,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,13 @@ struct InvHarness {
 
     std::string session_user{"admin"};
     bool allow_perm{true};
+    // When false, audit_fn reports a persistence failure (returns false) so a test can
+    // exercise the set-and-proceed `audit_persisted:false` honesty field.
+    bool audit_ok{true};
+    // When true, audit_fn THROWS (bad_alloc-class / locked audit DB) — exercises the
+    // #1647 throw-safe kernel: the route must not 500, it must serve with
+    // audit_persisted:false (gov chaos CH-3, parity with the MCP sibling).
+    bool audit_throws{false};
     // null = unwired-equivalent (predicate always allows → no drops); set it to a
     // real allow/deny lambda to exercise the scope filter.
     std::function<bool(const std::string&, const std::string&)> scope_fn;
@@ -92,8 +100,10 @@ struct InvHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
+            if (audit_throws)
+                throw std::runtime_error("audit sink down");
             audit_log.push_back({action, result, target_id, detail});
-            return true;
+            return audit_ok;
         };
         // Always pass a non-null predicate that delegates to scope_fn; when scope_fn
         // is unset it allows every agent (legacy-open equivalent → no drops).
@@ -138,12 +148,16 @@ TEST_CASE("REST inventory/software: null store → 503, never an empty 200",
     auto res = h.sink.Get("/api/v1/inventory/software");
     REQUIRE(res);
     CHECK(res->status == 503);
-    // A4 error envelope + correlation id echoed on every path.
+    // A4 error envelope + correlation id echoed on every path. Structural assert (not a
+    // substring search): the body is a JSON object with an `error` key and — crucially —
+    // NO `data` key, so it can never be mistaken for a success-with-empty-list (the
+    // fail-open ADR-0016 §7 closes): a vuln-triage caller must read "unknown", not
+    // "installed nowhere".
     CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
-    CHECK(res->body.find("\"error\"") != std::string::npos);
-    // Crucially NOT a success-with-empty-list (the fail-open A4 violation ADR-0016 §7
-    // closes): a vuln-triage caller must read "unknown", not "installed nowhere".
-    CHECK(res->body.find("\"software\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
 }
 
 TEST_CASE("REST inventory/software: RBAC deny → 403, no success audit",
@@ -286,6 +300,95 @@ TEST_CASE("REST inventory/software: non-integer limit → 400", "[pg][rest][inve
     CHECK(res->status == 400);
 }
 
+TEST_CASE("REST inventory/software: ?agent_id= narrows to one device",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"Slack", "4.0", "Slack", ""}});
+    seed(store, "dev-b", {{"Zoom", "5.0", "Zoom", ""}});
+
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?agent_id=dev-a");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& sw = body.at("data").at("software");
+    REQUIRE(sw.size() == 1);
+    CHECK(sw[0].at("agent_id").get<std::string>() == "dev-a");
+    CHECK(sw[0].at("name").get<std::string>() == "Slack");
+    CHECK(h.has_audit("success"));
+}
+
+TEST_CASE("REST inventory/software: over-max limit clamps (no error, no cap defeat)",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"AAA", "1", "", ""}, {"BBB", "1", "", ""}, {"CCC", "1", "", ""}});
+
+    InvHarness h{&store};
+    // limit=5000 > 1000 cap: must clamp (200, all rows), NOT error, NOT bind 5000. The
+    // lower bind is proven by the limit=1 truncation test; both share the same
+    // std::clamp<int64_t>(want,1,1000) call, so this guards the upper bound + the
+    // "negative/wrapped value defeats the cap" hazard.
+    auto res = h.sink.Get("/api/v1/inventory/software?limit=5000");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body.at("data").at("count").get<int>() == 3);
+    CHECK_FALSE(body.at("data").contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("REST inventory/software: failed audit surfaces audit_persisted:false (set-and-proceed)",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"Slack", "4.0", "Slack", ""}});
+
+    InvHarness h{&store};
+    h.audit_ok = false; // audit_fn reports a persistence failure
+    auto res = h.sink.Get("/api/v1/inventory/software");
+    REQUIRE(res);
+    // Set-and-proceed: data STILL served (machine-scope, non-behavioural), but the body
+    // honestly flags the lost evidence row — never withheld (distinct from the fail-closed
+    // per-device behavioural routes).
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.at("data").at("software").size() == 1);
+    CHECK(body.at("data").at("audit_persisted").get<bool>() == false);
+}
+
+TEST_CASE("REST inventory/software: devices_omitted counts DISTINCT dropped agents, not rows",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // dev-b (the dropped agent) carries TWO matching rows — devices_omitted must be 1, not 2
+    // (guards the `if (inserted)` distinct-count guard against a row-count regression).
+    seed(store, "dev-a", {{"Common", "1", "", ""}});
+    seed(store, "dev-b", {{"Common", "1", "", ""}, {"Common", "2", "", ""}});
+
+    InvHarness h{&store};
+    h.scope_fn = [](const std::string&, const std::string& agent) { return agent == "dev-a"; };
+    auto res = h.sink.Get("/api/v1/inventory/software?name=Common");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& data = body.at("data");
+    CHECK(data.at("software").size() == 1);          // only dev-a's row
+    CHECK(data.at("devices_omitted").get<int>() == 1); // dev-b counted ONCE despite 2 rows
+}
+
 TEST_CASE("REST inventory/software: store degrade → 503 + failure audit, never empty",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -304,10 +407,35 @@ TEST_CASE("REST inventory/software: store degrade → 503 + failure audit, never
     auto res = h.sink.Get("/api/v1/inventory/software?name=Chrome");
     REQUIRE(res);
     CHECK(res->status == 503);
-    // NEVER a success-with-empty-list: the body must not carry a software array.
-    CHECK(res->body.find("\"software\"") == std::string::npos);
+    // NEVER a success-with-empty-list — structural assert: an A4 error envelope, no `data`.
     CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
     // The degrade path is distinct from null-store precisely in this audit emission.
     CHECK(h.has_audit("failure"));
     CHECK_FALSE(h.has_audit("success"));
+}
+
+TEST_CASE("REST inventory/software: throwing audit_fn does not 500 (throw-safe set-and-proceed)",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"Slack", "4.0", "Slack", ""}});
+
+    InvHarness h{&store};
+    h.audit_throws = true; // audit sink throws (bad_alloc-class / locked audit DB)
+    auto res = h.sink.Get("/api/v1/inventory/software");
+    REQUIRE(res);
+    // The throw is caught by detail::try_persist_audit → returns false → the route STILL
+    // serves 200 with audit_persisted:false, NEVER a 500 with no trail (gov chaos CH-3 —
+    // throw-safety parity with the MCP sibling's mcp_audit, which wraps the same kernel).
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.at("data").at("software").size() == 1);
+    CHECK(body.at("data").at("audit_persisted").get<bool>() == false);
 }
