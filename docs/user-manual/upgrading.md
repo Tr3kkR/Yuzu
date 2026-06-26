@@ -244,7 +244,12 @@ Before upgrading any component:
   collection entirely, pass **`--inventory-disable`** / set
   `YUZU_AGENT_INVENTORY_DISABLE` on the agent (deploy-time opt-out). Reads are
   gated on the new `Inventory:Read` RBAC securable; today the data is queryable via
-  direct SQL (see [Installed-Software Inventory](inventory.md)).
+  direct SQL (see [Installed-Software Inventory](inventory.md)). On a **non-English
+  fleet**, upgrading across #1662 changes stored names: app/publisher names that
+  earlier builds mangled to `?` (cp1252) are rewritten to correct UTF-8 on each
+  agent's next daily sync, so any query automation that matched the corrupted `?`
+  strings will return nothing afterward — see the non-ASCII troubleshooting note in
+  [Installed-Software Inventory](inventory.md) for the force-resync path.
 
 ## Upgrading the Server
 
