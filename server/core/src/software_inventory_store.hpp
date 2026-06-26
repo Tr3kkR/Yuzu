@@ -37,6 +37,10 @@
 #include <string_view>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server::pg {
 class PgPool;
 }
@@ -86,6 +90,15 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_inventory_read_degrade_total{reason}`, #1675) and any future
+    /// store-internal metric. Set ONCE during single-threaded startup, before
+    /// the gRPC/REST surfaces begin serving — the pointer is read without
+    /// synchronisation on the serving threads, so a later swap would race. A
+    /// null registry (the default, e.g. in unit tests) disables emission; every
+    /// emit site is null-guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     /// Canonical content hash over a machine-scope software list — the SAME
     /// algorithm the agent uses (sorted+deduplicated; fields unit-separated
     /// 0x1F, entries record-separated 0x1E; SHA-256 hex), so the agent's
@@ -102,9 +115,13 @@ public:
     ///    replacing all of this agent's rows + upserting the parent in one
     ///    transaction → kStored.
     /// `collected_at` is epoch seconds (0 → server wall-clock now).
-    InventoryIngestOutcome apply_installed_software(
-        std::string_view agent_id, std::string_view claimed_hash,
-        const std::optional<std::vector<SoftwareEntry>>& rows, std::int64_t collected_at);
+    /// `rows` is taken BY VALUE so the full-payload path can `std::move` the
+    /// entries into normalization instead of copying up to kMaxEntries structs on
+    /// the ingest hot path (UP-8); pass `std::move` at the call site.
+    InventoryIngestOutcome apply_installed_software(std::string_view agent_id,
+                                                    std::string_view claimed_hash,
+                                                    std::optional<std::vector<SoftwareEntry>> rows,
+                                                    std::int64_t collected_at);
 
     /// All installed software for one agent (per-device drill-down), name-sorted.
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure (degraded —
@@ -124,9 +141,26 @@ public:
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
 
+    /// Count agents whose `installed_software` inventory has not been refreshed
+    /// since `stale_before_secs` (epoch seconds) — i.e. `last_seen <
+    /// stale_before_secs`. Feeds the `yuzu_inventory_stale_agents` freshness
+    /// gauge from the metrics sweep, which shares its serial thread with the
+    /// security-relevant revocation-teardown backstop. BOTH the lease acquire
+    /// AND the query execution are bounded so neither can stall that teardown
+    /// (CH-IN3/UP-2): a 250ms bounded acquire, and a per-statement
+    /// `SET LOCAL statement_timeout = '250ms'` inside the txn (the acquire alone
+    /// does NOT bound execution — a bloated-table seq-scan would otherwise run to
+    /// the pool's 30s statement_timeout). `std::nullopt` on a store/pool/query
+    /// degrade (incl. the execution-timeout) — the caller leaves the gauge at its
+    /// previous value rather than publishing a false zero, and increments
+    /// `yuzu_inventory_stale_count_unavailable_total` so a frozen gauge is
+    /// distinguishable from a true low.
+    [[nodiscard]] std::optional<std::int64_t> count_stale_agents(std::int64_t stale_before_secs);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server

@@ -308,6 +308,34 @@ public:
                           "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
                           "leading pool-saturation indicator",
                           "histogram");
+        // Installed-software inventory observability (ADR-0016; #1664/#1675).
+        metrics_.describe("yuzu_inventory_ingest_total",
+                          "Inventory-report ingest outcomes by source and outcome "
+                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "counter");
+        metrics_.describe("yuzu_inventory_ingest_duration_seconds",
+                          "Time to apply one inventory source's report — the pooled-connection + "
+                          "transaction hold time per ingest, by source and phase "
+                          "(full = full-payload replace; hash_only = hash-skip compare) (#1664)",
+                          "histogram");
+        metrics_.describe("yuzu_inventory_read_degrade_total",
+                          "Authoritative inventory reads that returned a degrade (no data) rather "
+                          "than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
+                          "under pure pool saturation, so this is the read-path degrade signal "
+                          "(#1675)",
+                          "counter");
+        metrics_.describe("yuzu_inventory_stale_agents",
+                          "Agents whose installed-software inventory has not synced within the "
+                          "staleness window (two missed daily cycles) — a freshness/liveness signal, "
+                          "by source",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
+                          "Times the stale-agents freshness count could not be computed (pool "
+                          "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
+                          "was held at its prior value — a non-zero rate means that gauge may be "
+                          "frozen, not genuinely low",
+                          "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -1935,6 +1963,9 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
+                // Set-once before serving (race-free): wires the read-degrade
+                // counter (#1675) + the stale-agents freshness gauge feed.
+                software_inventory_store_->set_metrics(&metrics_);
                 agent_service_.set_software_inventory_store(software_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_software_inventory_store(software_inventory_store_.get());
@@ -2398,6 +2429,41 @@ public:
                     metrics_.gauge("yuzu_pg_pool_size").set(static_cast<double>(pg_pool_->size()));
                     metrics_.gauge("yuzu_pg_pool_waiters")
                         .set(static_cast<double>(pg_pool_->waiters()));
+                }
+                // Installed-software inventory freshness gauge: agents whose
+                // installed_software has not synced within the staleness window
+                // (two missed daily cycles — the daily-sync cadence bumps
+                // last_seen on every touched/stored sync, so >2 days flags an
+                // agent that has stopped syncing, comfortably clear of the
+                // per-agent phase-spread + jitter). count_stale_agents bounds BOTH
+                // its acquire (250ms) and its execution (per-statement
+                // statement_timeout) so it cannot delay the revocation-teardown
+                // backstop that shares this serial sweep thread (CH-IN3/UP-2).
+                // NOTE: this sweep runs on health_recompute_thread_, which holds a
+                // pool lease here — it MUST be join()ed before pg_pool_.reset() in
+                // stop() (it is); do not reorder shutdown without preserving that.
+                // On a degrade count_stale_agents returns nullopt: hold the gauge
+                // at its prior value (no false 0) AND bump a distinct
+                // unavailable-counter so a frozen gauge is distinguishable from a
+                // genuine low under contention (the 250ms acquire can expire while
+                // the 3000ms read budget still clears, so ReadDegraded may stay
+                // dormant — sre UP-3).
+                if (software_inventory_store_) {
+                    // TODO(ADR-0016 source #2): iterate sources instead of
+                    // hardcoding installed_software once a second sync source lands
+                    // (inventory_state + the {source} gauge label are source-agnostic).
+                    constexpr std::int64_t kInventoryStaleWindowSecs = 2 * 24 * 60 * 60;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        kInventoryStaleWindowSecs;
+                    if (auto stale = software_inventory_store_->count_stale_agents(cutoff))
+                        metrics_.gauge("yuzu_inventory_stale_agents",
+                                       {{"source", "installed_software"}})
+                            .set(static_cast<double>(*stale));
+                    else
+                        metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
                 }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
