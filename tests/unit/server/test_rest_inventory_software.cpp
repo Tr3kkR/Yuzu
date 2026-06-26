@@ -4,16 +4,19 @@
 // This is the REST sibling of the governed MCP query_installed_software tool; the
 // route mirrors that handler 1:1. The tests pin the REST-specific surface:
 //   - Inventory:Read gate (RBAC deny → no data).
-//   - Null/closed store → 503 (A4 error), NEVER a 200 empty list. The store-degrade
-//     branch (query_software → std::nullopt on an OPEN store whose query then fails)
-//     maps to the SAME 503-not-empty path; it is exercised at the store+MCP layer
-//     (test_software_inventory_store.cpp degrade SECTION + test_mcp_server.cpp [pg]
-//     drop-path) and is a 3-line transcription here — inducing a mid-flight pool
-//     failure under a live store is not cheap at the route layer, so the null-store
-//     503 below is the REST-layer guard for "never empty on unavailable".
+//   - Two DISTINCT 503 paths, both asserted "never an empty 200":
+//       * null/closed store → 503 "not available", NO audit (the store was never
+//         consulted, so there is no access to record);
+//       * OPEN store, query_software → std::nullopt (pool-acquire timeout / query
+//         error) → 503 "degraded" AND a "failure" audit row (CC7.2: a triage caller
+//         under a sustained outage still leaves a who/when/what trail). These are
+//         NOT the same path — they differ precisely in the audit emission — so both
+//         are tested here (the degrade path via a size-1 pool whose only lease is
+//         held in-test, forcing try_acquire_for to time out).
 //   - Management-group scope FILTER (drops out-of-scope agents) + devices_omitted +
 //     a distinct "denied" audit row.
 //   - limit cap → result_truncated_by_cap; bad limit → 400.
+//   - OpenAPI discoverability (A1): the path appears in /api/v1/openapi.json.
 //
 // Fixture mirrors the in-process TestRouteSink pattern (no socket, no acceptor
 // thread, no TSan risk) from test_rest_software_packages.cpp.
@@ -153,6 +156,19 @@ TEST_CASE("REST inventory/software: RBAC deny → 403, no success audit",
     CHECK_FALSE(h.has_audit("success"));
 }
 
+TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverability)",
+          "[rest][inventory_software]") {
+    InvHarness h{/*store=*/nullptr};
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto spec = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+    REQUIRE(spec["paths"].contains("/inventory/software"));
+    CHECK(spec["paths"]["/inventory/software"].contains("get"));
+}
+
 // ── Live-PG branches ─────────────────────────────────────────────────────────
 
 namespace {
@@ -268,4 +284,30 @@ TEST_CASE("REST inventory/software: non-integer limit → 400", "[pg][rest][inve
     auto res = h.sink.Get("/api/v1/inventory/software?limit=abc");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("REST inventory/software: store degrade → 503 + failure audit, never empty",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB(db);
+    // size-1 pool: after the ctor migration releases its lease, the single connection
+    // is free. We hold it for the duration of the request, so query_software's
+    // try_acquire_for(kQueryAcquireTimeout) times out → std::nullopt → the route's
+    // DEGRADE branch (distinct from null-store: it audits "failure"). This is the
+    // authoritative-read contract (ADR-0016 §7) that drew a BLOCKING last round.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held = pool.acquire(); // starve the pool — the only connection is now ours
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=Chrome");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // NEVER a success-with-empty-list: the body must not carry a software array.
+    CHECK(res->body.find("\"software\"") == std::string::npos);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    // The degrade path is distinct from null-store precisely in this audit emission.
+    CHECK(h.has_audit("failure"));
+    CHECK_FALSE(h.has_audit("success"));
 }
