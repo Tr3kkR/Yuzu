@@ -48,7 +48,7 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 19);
+    REQUIRE(types.size() == 20);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -66,6 +66,7 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("License"));
     CHECK(has("FileRetrieval"));
     CHECK(has("GuaranteedState"));
+    CHECK(has("Inventory"));
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -79,11 +80,11 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 19 types * 5 CRUD ops = 95 permissions, plus a single targeted Push
-    // grant on GuaranteedState = 96 permissions total. Push is deliberately
+    // 20 types * 5 CRUD ops = 100 permissions, plus a single targeted Push
+    // grant on GuaranteedState = 101 permissions total. Push is deliberately
     // NOT cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults().
-    CHECK(perms.size() == 96);
+    // rbac_store.cpp seed_defaults(). (20th type: Inventory, ADR-0016.)
+    CHECK(perms.size() == 101);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -101,8 +102,8 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 18 types * Read only (everything except Infrastructure)
-    CHECK(perms.size() == 18);
+    // 19 types * Read only (everything except Infrastructure; incl. Inventory)
+    CHECK(perms.size() == 19);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -428,11 +429,11 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
     CHECK(role->description.find("IT Service") != std::string::npos);
 
     auto perms = store.get_role_permissions("ITServiceOwner");
-    // 16 types * 5 CRUD ops = 80 permissions, plus the targeted Push grant on
-    // GuaranteedState = 81 permissions total. Push is deliberately NOT
+    // 17 types * 5 CRUD ops = 85 permissions, plus the targeted Push grant on
+    // GuaranteedState = 86 permissions total. Push is deliberately NOT
     // cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults().
-    CHECK(perms.size() == 81);
+    // rbac_store.cpp seed_defaults(). (17th type: Inventory, ADR-0016.)
+    CHECK(perms.size() == 86);
     size_t push_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");

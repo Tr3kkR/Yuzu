@@ -39,6 +39,7 @@
 #include "inventory_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -1921,6 +1922,25 @@ public:
                 gateway_service_->set_inventory_store(inventory_store_.get());
         }
 
+        // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+        // Coexists with the generic InventoryStore above (the sync-framework
+        // baseline). Fails closed like every PG store (ADR-0007/0008): a
+        // reachable database whose schema cannot be created/opened must not
+        // serve degraded. Wires BOTH server entry points to the typed store.
+        if (pg_pool_ && !startup_failed_) {
+            software_inventory_store_ = std::make_unique<SoftwareInventoryStore>(*pg_pool_);
+            if (!software_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software inventory store migration/open "
+                              "failed (database reachable but the software_inventory_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                agent_service_.set_software_inventory_store(software_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_software_inventory_store(software_inventory_store_.get());
+            }
+        }
+
         // Phase 7: Directory Sync (AD/Entra integration)
         {
             auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
@@ -2805,6 +2825,16 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // Same discipline for the software-inventory store (gov cpp-safety): null the
+        // borrowed raw pointers in both ingest services, then drop the store, BEFORE
+        // the pool — otherwise the store briefly holds a dangling PgPool& after the
+        // pool resets (no UAF today since the gRPC drain has quiesced every ingest
+        // handler, but it matches the offline-store contract and is safe if the store
+        // ever gains a pool-touching dtor).
+        agent_service_.set_software_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_software_inventory_store(nullptr);
+        software_inventory_store_.reset();
         pg_pool_.reset();
     }
 
@@ -4272,10 +4302,20 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca.db isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
+            // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
+            // not here, so /healthz could report "healthy" with a degraded store —
+            // the same gap the Guardian/CA rows above closed. The server fails
+            // closed at boot if PG is unreachable, so on a running server these are
+            // normally open; the row catches a post-boot store-level failure.
+            bool offline_endpoint_ok =
+                offline_endpoint_store_ && offline_endpoint_store_->is_open();
+            bool software_inventory_ok =
+                software_inventory_store_ && software_inventory_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok;
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                                 offline_endpoint_ok && software_inventory_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4290,7 +4330,9 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
-                  {"ca", ca_ok ? "ok" : "error"}}},
+                  {"ca", ca_ok ? "ok" : "error"},
+                  {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
+                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4446,6 +4488,11 @@ private:
                 // the pool answered.
                 {"offline_endpoint_store",
                  offline_endpoint_store_ && offline_endpoint_store_->is_open()},
+                // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
+                // state post-boot makes ReportInventory silently ack with no
+                // ingest and no readiness signal — surface it (gov Pattern E).
+                {"software_inventory_store",
+                 software_inventory_store_ && software_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -9072,6 +9119,19 @@ private:
                     return rbac_store_->check_scoped_permission(username, "Response", "Read",
                                                                 agent_id, mgmt_group_store_.get());
                 },
+                // ADR-0016: the typed daily-sync software store + its per-device
+                // Inventory-scope predicate for query_installed_software. SAME
+                // management-group chokepoint as the response predicate above, but
+                // bound to ("Inventory","Read") — so an operator's fleet-wide software
+                // query returns only devices inside their groups (cross-operator
+                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                software_inventory_store_.get(),
+                [this](const std::string& username, const std::string& agent_id) -> bool {
+                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                        return true;
+                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
+                                                                agent_id, mgmt_group_store_.get());
+                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_);
@@ -9467,6 +9527,9 @@ private:
 
     // Phase 7: Inventory Store (Issue 7.17)
     std::unique_ptr<InventoryStore> inventory_store_;
+    // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+    // Declared after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
