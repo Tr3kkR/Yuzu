@@ -196,12 +196,53 @@ different non-ASCII apps) now separate into distinct rows.
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
 the last for a whole report rejected at the source-map cap) — watch the
 `need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing. Shipped alert rules live in the `yuzu-inventory` group of
+whose ingest is failing. Four further series sharpen the picture:
+
+- `yuzu_inventory_ingest_duration_seconds{source,phase}` (histogram) — how long
+  applying one source's report holds a pooled Postgres connection (advisory lock +
+  the atomic replace, whose inserts are now batched into a single `unnest()`
+  statement). `phase=full` is the full-payload replace; `phase=hash_only` is the
+  cheap hash-skip compare + `last_seen` bump — split so the steady-state
+  hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
+  a cold-cache `need_full` herd.
+- `yuzu_inventory_read_degrade_total{reason}` (counter, reason ∈ `store_not_open` /
+  `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
+  a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
+  pool saturation, so without this counter a degraded fleet software query is
+  otherwise invisible. The per-degrade WARN is sampled (1st then every 100th per
+  site) so a fan-out outage can't flood the log; the counter is the continuous
+  signal.
+- `yuzu_inventory_stale_agents{source}` (gauge) — agents that have not synced this
+  source within the staleness window (two missed daily cycles), a freshness /
+  liveness signal sampled on the metrics sweep. On a degrade the gauge **holds its
+  prior value** (it is never set to a false `0`), so pair it with the counter below
+  to know whether a low reading is current.
+- `yuzu_inventory_stale_count_unavailable_total` (counter) — the freshness count
+  could not be computed (pool saturation / query timeout) and the gauge above was
+  held at its prior value. A non-zero rate means `yuzu_inventory_stale_agents` may
+  be **frozen, not genuinely low** — the freeze-detector that travels with the
+  gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
+  it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+
+Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked), and
-`YuzuInventoryReportRejected` (a whole report rejected at the source-map cap).
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
+`YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
+`YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
+`YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
+leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
+freshness gauge may be frozen).
+
+`YuzuInventoryStaleAgents` ships **disabled** (commented out) in the same group:
+the `yuzu_inventory_stale_agents` gauge has no fleet-size-independent absolute
+threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn on a
+50k fleet), and a fleet-relative ratio against `yuzu_fleet_agents_healthy` needs
+explicit `on()/group_left()` matching with a denominator caveat. **Enable it** once
+you have observed your fleet's normal stale-count baseline and set the threshold to
+~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
+separate "agents offline" from "sync source broken / disabled".
 
 ## See also
 
