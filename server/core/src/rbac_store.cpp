@@ -144,7 +144,8 @@ void RbacStore::seed_defaults() {
                            "SoftwareDeployment",
                            "License",
                            "FileRetrieval",
-                           "GuaranteedState"};
+                           "GuaranteedState",
+                           "Inventory"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -244,8 +245,8 @@ void RbacStore::seed_defaults() {
         }
     }
     // PlatformEngineer: read on operational types for context
-    const char* pe_read_types[] = {"Execution", "Schedule", "Approval",
-                                   "Tag",       "AuditLog", "Response"};
+    const char* pe_read_types[] = {"Execution", "Schedule", "Approval", "Tag",
+                                   "AuditLog",  "Response",  "Inventory"};
     for (auto* t : pe_read_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -344,6 +345,12 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'License', 'Read', 'allow');",
         nullptr, nullptr, nullptr);
+    // Operator: read on Inventory — triaging a device includes seeing its
+    // installed software (ADR-0016).
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Inventory', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
     // Operator: read + write on FileRetrieval
     sqlite3_exec(
         db_,
@@ -414,7 +421,8 @@ void RbacStore::seed_defaults() {
                                 "SoftwareDeployment",
                                 "License",
                                 "FileRetrieval",
-                                "GuaranteedState"};
+                                "GuaranteedState",
+                                "Inventory"};
     // Same Push-restriction rationale as Administrator above: CRUD cross-type,
     // Push only on GuaranteedState where it is actually consulted.
     for (auto* t : itso_types) {
@@ -453,7 +461,8 @@ void RbacStore::seed_defaults() {
                                   "SoftwareDeployment",
                                   "License",
                                   "FileRetrieval",
-                                  "GuaranteedState"};
+                                  "GuaranteedState",
+                                  "Inventory"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

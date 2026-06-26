@@ -221,10 +221,16 @@ message InventoryReport {
 
   // Key-value blobs per plugin; plugins define their own schemas.
   map<string, bytes> plugin_data = 3;
+
+  // ADR-0016 daily-sync hash-skip — see priv/proto/agent.proto.
+  map<string, string> content_hashes = 4;
 }
 
 message InventoryAck {
   bool received = 1;
+
+  // ADR-0016 cold-cache resync — see priv/proto/agent.proto.
+  repeated string need_full = 2;
 }
 
 // ── OTA Updates ─────────────────────────────────────────────────────────────

@@ -48,6 +48,13 @@ error, transient unreachable) splits stores into two **declared** kinds:
 The posture is part of the store's documented contract (header comment + per-store ADR) and
 drives its acquire discipline and error handling. Most migrated stores are authoritative.
 
+Posture is declared **per operation-class (ingest vs read), not strictly per store.** A typed
+projection fed by a self-healing agent push is **ingest-fail-soft + read-authoritative**: a failed
+ingest is fine (the agent re-pushes), but a read has no in-memory authoritative layer to fall back
+on, so a silent empty would be fail-open. `SoftwareInventoryStore` (ADR-0016 §7) is the worked
+example — classifying it durability-on-top *wholesale* (the original header did) is the
+misclassification this split guards against.
+
 ### 2. One shared pool; backpressure is lease discipline, not partitioning
 
 ADR-0008's single `PgPool` stays. No per-class pools, per-store budgets, or priority queues —

@@ -56,6 +56,15 @@ struct Config {
     bool dex_disable{false}; // --dex-disable / YUZU_AGENT_DEX_DISABLE: deploy-time opt-out;
                              // when set, the crash recorder never arms and no crash
                              // telemetry is collected.
+
+    // Agent daily-sync (ADR-0016) — installed-software inventory to central Postgres.
+    bool inventory_disable{false}; // --inventory-disable / YUZU_AGENT_INVENTORY_DISABLE:
+                                   // deploy-time opt-out; when set, the daily-sync thread
+                                   // never starts and no installed-software inventory is
+                                   // collected or pushed. On personally-assigned devices,
+                                   // installed-software enumeration may be works-council
+                                   // co-determination-relevant — this is the control for
+                                   // jurisdictions/agreements that require it off.
 };
 
 /**

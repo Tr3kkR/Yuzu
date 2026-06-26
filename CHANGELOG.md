@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
+  pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
+  with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
+  fleet scale: each endpoint spreads its sync by a stable per-agent phase offset (no lockstep), and
+  when a source's content is unchanged since the last successful sync it sends only a **content hash**
+  instead of the full list (hash-skip); the server replies `need_full` to force a resend on a cold
+  cache, with a weekly full-floor as a backstop. Installed software lands in a new born-on-Postgres
+  **`SoftwareInventoryStore`** (normalized rows — portable SQL, no JSONB — so fleet-wide queries
+  like "which devices run X" are first-class), via a shared ingest seam wired identically on the
+  direct and gateway paths. Reads are gated on a new **`Inventory` RBAC securable** (`Inventory:Read`).
+  Reuses the existing `installed_apps` plugin (Windows/Linux/macOS) in-process — no new collector.
+  Hardened for fleet-scale resilience: a per-source blob cap sized below the gRPC message ceiling,
+  exponential agent-side backoff on consecutive `need_full` resends (so a server cold-cache or store
+  outage cannot drive a flat-cadence full-resend storm), a `yuzu_inventory_ingest_total{source,outcome}`
+  metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
+  **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
+  scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
+  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
+  privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
+  (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and
+  server — so a non-UTF-8 registry string can never trigger a PostgreSQL TEXT-reject resend loop;
+  concurrent full-replaces for one agent are serialized with a transaction-scoped advisory lock (no
+  row/hash divergence); a transient empty collection is skipped rather than wiping stored inventory;
+  an over-cap blob raises a dedicated `dropped`-outcome alert (it never self-heals); and
+  `query_installed_software` reports `devices_omitted` so a scoped caller can distinguish "outside my
+  scope" from "not installed". **Reads are authoritative** (ADR-0016 §7): `query_installed_software`
+  returns a JSON-RPC error — never a silent `success` with empty rows — when the Postgres store is
+  degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
+  hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
+  wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
 ### Security
 
 - **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal

@@ -222,12 +222,37 @@ message InventoryReport {
   string session_id = 1;
   yuzu.common.v1.Timestamp collected_at = 2;
 
-  // Key-value blobs per plugin; plugins define their own schemas.
+  // Per-source full payload, keyed by data-type (e.g. "installed_software").
+  // For the daily-sync framework (ADR-0016) a key is present here ONLY when the
+  // source's content changed since the agent's last successful sync (or the
+  // server asked for a full resync via InventoryAck.need_full, or the weekly
+  // full-floor fired). When unchanged, the key is OMITTED here and carried in
+  // content_hashes only — the hash-skip optimisation (kind to the network at
+  // fleet scale).
   map<string, bytes> plugin_data = 3;
+
+  // Per-source canonical content hash, keyed by the same data-type key as
+  // plugin_data. ALWAYS sent for every source that came due this cycle, whether
+  // or not its blob is present. The server compares this against its stored
+  // (server-recomputed) hash: match -> touch last_seen; mismatch + blob present
+  // -> replace; mismatch + blob absent -> reply need_full. The agent's claimed
+  // hash is NEVER stored as authoritative — the server recomputes from the rows
+  // it receives. See ADR-0016 §4. GATEWAY: this field was added to the gateway's
+  // vendored agent.proto + agent_pb.erl/gateway_pb.erl so it survives the proxy
+  // re-encode (the csr_pem trap) — without that regen it is silently dropped on
+  // the gateway hop and the hash-skip degrades to always-full.
+  map<string, string> content_hashes = 4;
 }
 
 message InventoryAck {
   bool received = 1;
+
+  // Data-type keys the server could not materialise from a hash-only report
+  // (cold cache: no record, or stored-hash mismatch with no blob). The agent
+  // re-pushes the full payload for each listed source on its next sync (or
+  // immediately). ADR-0016 §4. GATEWAY: regenerated alongside content_hashes so
+  // the nack survives the return hop.
+  repeated string need_full = 2;
 }
 
 // ── OTA Updates ─────────────────────────────────────────────────────────────
