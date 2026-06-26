@@ -636,6 +636,13 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     const std::string h = SoftwareInventoryStore::canonical_hash(rows);
     REQUIRE(store.apply_installed_software("agent-del", h, rows, 1000) ==
             InventoryIngestOutcome::kStored);
+    // A bystander agent that must SURVIVE the delete — without this, a DELETE
+    // missing its `WHERE agent_id=$1` (a whole-table wipe) would pass every other
+    // assertion here. This is the minimal proof the delete is agent-scoped.
+    std::vector<SoftwareEntry> by_rows = {{"Edge", "120", "Microsoft", ""}};
+    const std::string by_h = SoftwareInventoryStore::canonical_hash(by_rows);
+    REQUIRE(store.apply_installed_software("agent-bystander", by_h, by_rows, 1000) ==
+            InventoryIngestOutcome::kStored);
     {
         auto pre = store.get_agent_software("agent-del");
         REQUIRE(pre.has_value());
@@ -650,6 +657,15 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     // Parent state row gone: a hash-only report now hits a cold cache.
     CHECK(store.apply_installed_software("agent-del", h, std::nullopt, 2000) ==
           InventoryIngestOutcome::kNeedFull);
+
+    // Cross-agent isolation: the bystander's child rows AND parent state row are
+    // untouched (its hash-only follow-up still matches → kTouched, not kNeedFull).
+    auto bystander = store.get_agent_software("agent-bystander");
+    REQUIRE(bystander.has_value());
+    REQUIRE(bystander->size() == 1);
+    CHECK((*bystander)[0].name == "Edge");
+    CHECK(store.apply_installed_software("agent-bystander", by_h, std::nullopt, 2000) ==
+          InventoryIngestOutcome::kTouched);
 
     // A delete of an unknown agent is a no-op (best-effort), not a throw or a degrade.
     store.delete_agent("agent-never-existed");
