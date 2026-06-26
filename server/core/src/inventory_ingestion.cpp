@@ -32,6 +32,12 @@ constexpr const char* kSourceInstalledSoftware = "installed_software";
 constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024; // 3 MiB per source
 constexpr std::size_t kMaxEntries = 20000;
 constexpr std::size_t kMaxFieldLen = 1024;
+// The sync framework wires a small fixed number of sources (1 today; a handful
+// ever). A report carrying an implausibly large content_hashes / plugin_data map is
+// malformed or abusive — reject it wholesale (defense-in-depth; already bounded by
+// the 4 MiB gRPC receive ceiling, but an explicit cap is cheaper to reason about).
+// gov fjarvis LOW.
+constexpr int kMaxSources = 64;
 
 // Replace every byte that is not part of a valid UTF-8 sequence with U+FFFD (the
 // replacement character, EF BF BD). "Valid" is exactly what PostgreSQL's UTF8
@@ -163,6 +169,13 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
     };
     if (agent_id.empty())
         return;
+    if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
+        spdlog::warn("inventory: report from agent={} carries too many sources "
+                     "(hashes={}, blobs={}, cap={}) — rejecting whole report",
+                     agent_id, report.content_hashes_size(), report.plugin_data_size(),
+                     kMaxSources);
+        return;
+    }
 
     std::int64_t collected_at = 0;
     if (report.has_collected_at())

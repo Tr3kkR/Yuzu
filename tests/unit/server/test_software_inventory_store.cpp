@@ -70,16 +70,18 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
         CHECK(store.apply_installed_software("agent-a", h, rows, 1000) ==
               InventoryIngestOutcome::kStored);
         auto got = store.get_agent_software("agent-a");
-        REQUIRE(got.size() == 2);
-        CHECK(got[0].name == "Chrome");
-        CHECK(got[1].name == "Firefox");
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 2);
+        CHECK((*got)[0].name == "Chrome");
+        CHECK((*got)[1].name == "Firefox");
 
         SoftwareFleetQuery q;
         q.name = "Chrome";
         auto fl = store.query_software(q);
-        REQUIRE(fl.size() == 1);
-        CHECK(fl[0].agent_id == "agent-a");
-        CHECK(fl[0].entry.version == "119");
+        REQUIRE(fl.has_value());
+        REQUIRE(fl->size() == 1);
+        CHECK((*fl)[0].agent_id == "agent-a");
+        CHECK((*fl)[0].entry.version == "119");
     }
 
     SECTION("hash-only matching the stored hash → touched, no row change") {
@@ -87,7 +89,7 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
                 InventoryIngestOutcome::kStored);
         CHECK(store.apply_installed_software("agent-b", h, std::nullopt, 2000) ==
               InventoryIngestOutcome::kTouched);
-        CHECK(store.get_agent_software("agent-b").size() == 2);
+        CHECK(store.get_agent_software("agent-b").value().size() == 2);
     }
 
     SECTION("hash-only with no stored record (cold cache) → need_full") {
@@ -110,8 +112,9 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
         REQUIRE(store.apply_installed_software("agent-d", h2, rows2, 3000) ==
                 InventoryIngestOutcome::kStored);
         auto got = store.get_agent_software("agent-d");
-        REQUIRE(got.size() == 1);
-        CHECK(got[0].version == "120");
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        CHECK((*got)[0].version == "120");
     }
 }
 
@@ -134,7 +137,7 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         agentpb::InventoryAck ack;
         yuzu::server::ingest_inventory_report(store, "agent-x", rep, ack);
         CHECK(ack.need_full_size() == 0);
-        CHECK(store.get_agent_software("agent-x").size() == 1);
+        CHECK(store.get_agent_software("agent-x").value().size() == 1);
     }
 
     SECTION("hash-only on a cold cache → ack.need_full lists the source") {
@@ -165,7 +168,11 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         yuzu::server::ingest_inventory_report(store, "agent-oversized", rep, ack);
         REQUIRE(ack.need_full_size() == 1);
         CHECK(ack.need_full(0) == "installed_software");
-        CHECK(store.get_agent_software("agent-oversized").empty());
+        // Store open + query OK + zero rows = an empty VALUE (a genuine "nothing"),
+        // NOT nullopt (which is reserved for a degrade — ADR-0016 §7).
+        auto os = store.get_agent_software("agent-oversized");
+        REQUIRE(os.has_value());
+        CHECK(os->empty());
     }
 }
 
@@ -192,8 +199,9 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     yuzu::server::ingest_inventory_report(store, "agent-utf8", rep, ack);
     CHECK(ack.need_full_size() == 0); // STORED, not kError-nacked (PG accepted valid UTF-8)
     auto rows = store.get_agent_software("agent-utf8");
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].name == std::string(1023, 'a')); // boundary-truncated, valid UTF-8
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].name == std::string(1023, 'a')); // boundary-truncated, valid UTF-8
 }
 
 TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches the agent (UP-IN1)",
@@ -222,9 +230,10 @@ TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches
     CHECK(ack.need_full_size() == 0); // STORED, not 22021-rejected → kError-nacked
 
     auto rows = store.get_agent_software("agent-utf8-scrub");
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].name == std::string("Caf\xef\xbf\xbd")); // raw 0xE9 scrubbed to U+FFFD
-    CHECK(rows[0].name.find('\xe9') == std::string::npos);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].name == std::string("Caf\xef\xbf\xbd")); // raw 0xE9 scrubbed to U+FFFD
+    CHECK((*rows)[0].name.find('\xe9') == std::string::npos);
 
     // Cross-pin: a hash-only follow-up carrying the agent's hash → touched (no
     // need_full) proves the server-recomputed stored hash equals the agent's, i.e.
@@ -267,8 +276,9 @@ TEST_CASE("ingest scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard
     CHECK(ack.need_full_size() == 0); // PG accepted the scrubbed valid UTF-8
 
     auto rows = store.get_agent_software("agent-scrub-vec");
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].name == expected); // server scrub == agent scrub, byte-for-byte
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].name == expected); // server scrub == agent scrub, byte-for-byte
 }
 
 TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 kError path)",
@@ -305,4 +315,66 @@ TEST_CASE("ingest_inventory_report nacks need_full when the store ERRORS (UP-2 k
     yuzu::server::ingest_inventory_report(store, "agent-err", rep, ack);
     REQUIRE(ack.need_full_size() == 1);
     CHECK(ack.need_full(0) == "installed_software");
+}
+
+TEST_CASE("reads are AUTHORITATIVE: a degrade returns nullopt, distinct from a true empty "
+          "(ADR-0016 §7 / fjarvis HIGH)",
+          "[pg][software_inventory]") {
+    // The frozen ADR-0016 §7 contract: a read surfaces a store/pool/query failure as
+    // nullopt, NEVER a silent empty — else a fleet vuln query reads a transient PG
+    // failure as "installed nowhere" (the fail-open A4 violation fjarvis blocked on).
+    // A genuine zero-row read stays an empty VALUE.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("a genuine zero-row read is an empty VALUE, not nullopt") {
+        SoftwareFleetQuery q;
+        q.name = "No Such Package";
+        auto fl = store.query_software(q);
+        REQUIRE(fl.has_value()); // not a degrade
+        CHECK(fl->empty());      // genuinely nothing installed
+        auto one = store.get_agent_software("no-such-agent");
+        REQUIRE(one.has_value());
+        CHECK(one->empty());
+    }
+
+    SECTION("a backend failure (schema dropped) returns nullopt, not a silent empty") {
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            pg::PgResult drop =
+                pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                std::vector<std::string>{});
+            REQUIRE(drop.status() == PGRES_COMMAND_OK);
+        }
+        SoftwareFleetQuery q;
+        q.name = "Chrome";
+        CHECK_FALSE(store.query_software(q).has_value());          // degraded → nullopt
+        CHECK_FALSE(store.get_agent_software("agent-a").has_value()); // not a silent empty
+    }
+}
+
+TEST_CASE("ingest rejects a report carrying too many sources (map-cardinality cap)",
+          "[pg][software_inventory][seam]") {
+    // Defense-in-depth (fjarvis LOW): the framework wires a small fixed number of
+    // sources; an implausibly large content_hashes/plugin_data map is malformed or
+    // abusive and the whole report is rejected (no per-source processing, no rows).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    agentpb::InventoryReport rep;
+    for (int i = 0; i < 100; ++i) // > kMaxSources (64)
+        (*rep.mutable_content_hashes())["src-" + std::to_string(i)] = "h";
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-flood", rep, ack);
+    CHECK(ack.need_full_size() == 0); // whole report dropped, no per-source nack
+    auto rows = store.get_agent_software("agent-flood");
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty()); // nothing ingested
 }

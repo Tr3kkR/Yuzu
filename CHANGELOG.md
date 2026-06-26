@@ -35,7 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row/hash divergence); a transient empty collection is skipped rather than wiping stored inventory;
   an over-cap blob raises a dedicated `dropped`-outcome alert (it never self-heals); and
   `query_installed_software` reports `devices_omitted` so a scoped caller can distinguish "outside my
-  scope" from "not installed".
+  scope" from "not installed". **Reads are authoritative** (ADR-0016 §7): `query_installed_software`
+  returns a JSON-RPC error — never a silent `success` with empty rows — when the Postgres store is
+  degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
+  hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
+  wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
 
 ### Security
 

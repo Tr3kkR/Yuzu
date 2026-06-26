@@ -495,8 +495,12 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include "mcp_server.hpp"
 
+#include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "pg/pg_raii.hpp"               // PgResult
 #include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
+
+#include <libpq-fe.h> // PGRES_COMMAND_OK
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
 #include <httplib.h>
@@ -3124,4 +3128,38 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+}
+
+TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
+          "(ADR-0016 §7 / fjarvis HIGH)",
+          "[mcp][pg][inventory]") {
+    // THE regression guard for the blocking finding: when the store cannot read
+    // (pool/query failure → query_software returns nullopt), the tool must return a
+    // JSON-RPC error, NOT success with empty content — a fleet vuln query must not
+    // read a transient PG failure as "installed nowhere" (authoritative reads, A4).
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Degrade: drop the schema so the next query's PGRES status is an error.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA software_inventory_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":78,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("\"error\"") != std::string::npos); // JSON-RPC error, not a result
+    CHECK(res->body.find("Software inventory store degraded") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
 }

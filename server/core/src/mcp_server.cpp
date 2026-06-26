@@ -1392,7 +1392,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 // that mutates on sync cadence; keyset is the #1634 follow-up.
                 q.limit = static_cast<int>(
                     std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
-                auto rows = software_inventory_store->query_software(q);
+                auto rows_opt = software_inventory_store->query_software(q);
+                if (!rows_opt) {
+                    // Store degraded (pool/query failure) — surface it, never return
+                    // success+[]. A silent empty here reads as "installed nowhere" for a
+                    // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
+                    // failure-vs-empty). Distinct message from the null-store case above.
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Software inventory store degraded — query failed"),
+                                    "application/json");
+                    return;
+                }
+                auto& rows = *rows_opt;
 
                 // Cap hit BEFORE scope filtering → result incomplete (the store's hard
                 // ceiling kFleetQueryRowCap >> 1000, so the binding cap is q.limit).

@@ -206,7 +206,9 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // reachable when a slow ingest outlives the agent's 30s client deadline and
         // the scheduler retries). The lock is transaction-scoped (auto-released at
         // COMMIT/ROLLBACK); distinct agents hash to distinct keys, so steady-state
-        // contention is nil. hashtext()→int4 widened to the bigint overload.
+        // contention is nil. hashtextextended() gives a native 64-bit key (vs the
+        // 32-bit hashtext) so cross-agent false contention is negligible (gov fjarvis
+        // LOW); correctness never depended on it (the DELETE+INSERT is agent-scoped).
         //
         // Blocking (not try_) on purpose: same-agent contention is the rare
         // post-restart-retry case; the loser WAITS for the winner to commit, then
@@ -216,7 +218,7 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // taxonomy is sre's gate, out of scope for this round). The wait is
         // transaction-scoped + bounded by the pool's statement_timeout; a distinct
         // "contended" outcome label is the right pool-hygiene follow-up.
-        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                                           std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
@@ -257,15 +259,23 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     return InventoryIngestOutcome::kStored;
 }
 
-std::vector<SoftwareEntry> SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
+std::optional<std::vector<SoftwareEntry>>
+SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
+    // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent
+    // empty. !open_ / no-lease / query-error are degrades; an empty agent_id is a
+    // precondition miss (genuine empty, not a degrade).
+    if (!open_) {
+        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — store not open");
+        return std::nullopt;
+    }
     std::vector<SoftwareEntry> out;
-    if (!open_ || agent_id.empty())
+    if (agent_id.empty())
         return out;
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::debug("SoftwareInventoryStore: get_agent_software skipped, no connection ({})",
-                      pool_.last_error());
-        return out;
+        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — no connection ({})",
+                     pool_.last_error());
+        return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -274,9 +284,9 @@ std::vector<SoftwareEntry> SoftwareInventoryStore::get_agent_software(std::strin
         "WHERE agent_id = $1 ORDER BY name, version LIMIT $2::bigint",
         std::vector<std::string>{std::string(agent_id), std::to_string(kFleetQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::debug("SoftwareInventoryStore: get_agent_software failed: {}",
-                      PQerrorMessage(lease.get()));
-        return out;
+        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::nullopt;
     }
     const int n = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(n));
@@ -291,15 +301,20 @@ std::vector<SoftwareEntry> SoftwareInventoryStore::get_agent_software(std::strin
     return out;
 }
 
-std::vector<SoftwareFleetRow> SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
-    std::vector<SoftwareFleetRow> out;
-    if (!open_)
-        return out;
+std::optional<std::vector<SoftwareFleetRow>>
+SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
+    // AUTHORITATIVE read (ADR-0016 §7): a store/pool/query failure returns nullopt
+    // (degraded), never a silent empty — a fleet vuln query must not read a PG hiccup
+    // as "installed nowhere". An empty value = genuinely no matches.
+    if (!open_) {
+        spdlog::warn("SoftwareInventoryStore: query_software degraded — store not open");
+        return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::debug("SoftwareInventoryStore: query_software skipped, no connection ({})",
-                      pool_.last_error());
-        return out;
+        spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({})",
+                     pool_.last_error());
+        return std::nullopt;
     }
     int limit = q.limit > 0 ? q.limit : 1000;
     if (limit > kFleetQueryRowCap)
@@ -326,10 +341,11 @@ std::vector<SoftwareFleetRow> SoftwareInventoryStore::query_software(const Softw
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::debug("SoftwareInventoryStore: query_software failed: {}",
-                      PQerrorMessage(lease.get()));
-        return out;
+        spdlog::warn("SoftwareInventoryStore: query_software degraded — query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::nullopt;
     }
+    std::vector<SoftwareFleetRow> out;
     const int n = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {

@@ -15,14 +15,21 @@
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement,
-/// uses `RETURNING`. Normalized rows only — NO JSONB/GIN. Posture is
-/// **durability-on-top, not authoritative** (the agent + weekly full-floor are the
-/// source of truth): reads are **fail-soft** (a transient store/pool error returns
-/// empty + logs), and ingest tolerates a transient outage (next sync + the floor
-/// self-heal). CAVEAT: a fail-soft empty read is not distinguishable from "no rows"
-/// at this layer — surfacing store-degraded distinctly to callers (so a fleet
-/// vuln query can't read a PG hiccup as "installed nowhere") is a tracked
-/// fleet-scale-hardening follow-up.
+/// uses `RETURNING`. Normalized rows only — NO JSONB/GIN. Failure posture splits by
+/// axis (ADR-0012 §1 + ADR-0016 §7) — unlike `OfflineEndpointStore` there is NO
+/// in-memory authoritative read layer; this store IS the only server-side read
+/// representation of installed software, so it is NOT durability-on-top for reads:
+///   - **Data:** a projection — the agent + weekly full-floor are the source of truth.
+///   - **Ingest:** fail-soft — a transient PG outage returns kError + nacks; the next
+///     sync + the floor self-heal (the agent re-pushes). A blip degrades durability,
+///     never correctness.
+///   - **Reads:** AUTHORITATIVE — a store/pool/query failure returns `std::nullopt`
+///     (logged at warn), NEVER a silent empty. A silent-empty read on a fleet vuln
+///     query ("which devices run <CVE>") reads as "installed nowhere" — the fail-open
+///     A4 violation ADR-0016 §7 forbids ("surface errors, never silent-empty").
+///     `nullopt` = degraded (could not read); an empty *value* = a genuine zero-row
+///     result. Staleness is acceptable (return the last projection); failure-as-empty
+///     is not.
 
 #include <cstdint>
 #include <optional>
@@ -100,12 +107,17 @@ public:
         const std::optional<std::vector<SoftwareEntry>>& rows, std::int64_t collected_at);
 
     /// All installed software for one agent (per-device drill-down), name-sorted.
-    /// Empty on error (fail-soft read).
-    [[nodiscard]] std::vector<SoftwareEntry> get_agent_software(std::string_view agent_id);
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure (degraded —
+    /// distinct from an empty value = genuinely no rows). An empty `agent_id` is a
+    /// precondition miss, not a degrade → empty value.
+    [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
+    get_agent_software(std::string_view agent_id);
 
-    /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling
-    /// regardless of `limit`. Empty on error.
-    [[nodiscard]] std::vector<SoftwareFleetRow> query_software(const SoftwareFleetQuery& q);
+    /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
+    /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure
+    /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
+    [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
+    query_software(const SoftwareFleetQuery& q);
 
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
