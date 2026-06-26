@@ -115,8 +115,39 @@ workers (gated on `Inventory:Read`):
   genuinely empty result (no error, zero rows) means the query succeeded and
   matched nothing in your scope.
 
-A dedicated REST endpoint and a software dashboard / per-device drill-down view
-are planned follow-ons.
+### REST (for automation / scripts)
+
+The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
+`Inventory:Read`), the agentic-first sibling of the MCP tool:
+
+```bash
+# Which devices run Google Chrome (fleet-wide, within your scope)?
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=Google%20Chrome"
+
+# Everything on one device
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+```
+
+- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
+  `name` and `agent_id` for a fleet-wide scan.
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
+  "meta": {"api_version": "v1"}}`. Each row is
+  `{agent_id, name, version, publisher, install_date}`.
+- **Scoped to your management groups**, exactly like the MCP tool: out-of-scope
+  devices are dropped (and the omission audited), and `devices_omitted` reports the
+  count. A positive value means matching software exists outside your scope — an
+  empty or short result does **not** mean the software is absent fleet-wide.
+- `result_truncated_by_cap: true` (present only when set) means more rows exist past
+  `limit` (keyset pagination is a follow-up, #1634).
+- **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
+  `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
+  transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
+  Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
+  succeeded and matched nothing in your scope.
+
+A software dashboard / per-device drill-down view are planned follow-ons.
 
 ## Access control
 

@@ -13,6 +13,7 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "response_templates_engine.hpp"
+#include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
@@ -616,6 +617,9 @@ const std::string& openapi_spec() {
     },
     "/inventory/query": {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
+    },
+    "/inventory/software": {
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
         R"json(
@@ -938,7 +942,8 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -949,7 +954,8 @@ void RestApiV1::register_routes(
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
-                    std::move(scoped_perm_fn));
+                    std::move(scoped_perm_fn), software_inventory_store,
+                    std::move(inventory_scope_fn));
 }
 
 void RestApiV1::register_routes(
@@ -965,7 +971,8 @@ void RestApiV1::register_routes(
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn) {
+    LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -3111,6 +3118,165 @@ void RestApiV1::register_routes(
         res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
                         "application/json");
     });
+
+    // GET /api/v1/inventory/software — typed daily-sync installed-software FLEET read
+    // (ADR-0016). The REST sibling of the governed MCP query_installed_software tool;
+    // mirrors it 1:1 (Inventory:Read → store → cap → management-group scope filter →
+    // audit). DISTINCT from the generic /api/v1/inventory/* routes above, which read
+    // the generic blob InventoryStore on Infrastructure-class data — this reads the
+    // typed SoftwareInventoryStore (normalized rows). Single path segment, so it does
+    // not collide with the two-segment /api/v1/inventory/{agent}/{plugin} regex.
+    // Agentic-first A1: a fleet software dashboard + a /device drill-down section
+    // (planned follow-ons) sit on this same data + scope contract.
+    //
+    // Audit posture is deliberately SET-AND-PROCEED (plain audit_fn), NOT the
+    // fail-closed emit_behavioral_audit the per-device DEX/device routes use:
+    // installed-software is machine-scope, carries no end-user PII and no
+    // works-council co-determination trigger (ADR-0016 §8), so it is NOT behavioural
+    // PII — withholding data on an audit-persist miss is unwarranted. We still capture
+    // the persist bool and surface audit_persisted:false, matching the MCP tool's
+    // honesty contract.
+    sink.Get("/api/v1/inventory/software",
+             [auth_fn, perm_fn, audit_fn, software_inventory_store, inventory_scope_fn](
+                 const httplib::Request& req, httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
+
+                 // Resolve the principal first — the per-row scope predicate below needs
+                 // the username (the flat Inventory:Read gate is not a per-device check).
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return; // auth_fn wrote 401
+                 if (!perm_fn(req, res, "Inventory", "Read"))
+                     return; // perm_fn wrote 401/403
+                 if (!software_inventory_store || !software_inventory_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "software inventory store not available", cid),
+                         "application/json");
+                     return;
+                 }
+
+                 SoftwareFleetQuery q;
+                 q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 q.name = req.has_param("name") ? req.get_param_value("name") : "";
+                 // Clamp in 64-bit BEFORE narrowing (mirror the MCP tool / query_responses):
+                 // limit:0 reads as "done, no rows"; a negative/wrapped value would bind
+                 // unbounded and defeat the cap. No offset — the scope filter runs AFTER the
+                 // store LIMIT, so paging would yield unstable windows over a sync-mutating
+                 // table; keyset is the #1634 follow-up.
+                 std::int64_t want = 100;
+                 if (req.has_param("limit")) {
+                     try {
+                         want = std::stoll(req.get_param_value("limit"));
+                     } catch (...) {
+                         res.status = 400;
+                         res.set_content(
+                             detail::error_json_a4(400, "invalid limit (expected integer)", cid),
+                             "application/json");
+                         return;
+                     }
+                 }
+                 q.limit = static_cast<int>(std::clamp<std::int64_t>(want, 1, 1000));
+
+                 const std::string audit_key = !q.name.empty()      ? ("name=" + q.name)
+                                               : !q.agent_id.empty() ? ("agent=" + q.agent_id)
+                                                                     : std::string("fleet");
+
+                 auto rows_opt = software_inventory_store->query_software(q);
+                 if (!rows_opt) {
+                     // Store degraded (pool/query failure) — surface it, NEVER an empty list.
+                     // A silent empty reads as "installed nowhere" for a fleet vuln query
+                     // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
+                     // Audit the degraded access (CC7.2): a CVE-triage caller under a sustained
+                     // outage must still leave a who/when/what trail.
+                     audit_fn(req, "inventory.software.query", "failure", "Inventory", audit_key,
+                              "store degraded; cid=" + cid);
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503,
+                                               "software inventory store degraded — query failed",
+                                               cid, 5000, "retry the request"),
+                         "application/json");
+                     return;
+                 }
+                 auto& rows = *rows_opt;
+
+                 // Cap hit BEFORE scope filtering → result incomplete (the store's hard ceiling
+                 // >> 1000, so the binding cap is q.limit). Captured pre-filter: the filter
+                 // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
+                 // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
+                 // filter, so a narrow-scope operator may see few of their own rows in one page
+                 // (signalled by result_truncated_by_cap); cross-operator ISOLATION holds
+                 // regardless. Narrow-scope completeness over a wide fleet is the keyset
+                 // follow-up (#1634).
+                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
+
+                 // Management-group scope filter (mirrors the MCP tool / query_responses #1550).
+                 // The flat Inventory:Read gate is not a per-device ownership check, so without
+                 // this an operator could read other operators' devices' software fleet-wide by
+                 // name. Filter per-agent through the injected predicate, memoised per distinct
+                 // agent_id. Unwired (RBAC-off / test) → no filter (legacy-open), matching the
+                 // MCP default + require_scoped_permission.
+                 bool scope_filtered = false;
+                 std::size_t dropped_agents = 0;
+                 if (inventory_scope_fn) {
+                     std::unordered_map<std::string, bool> memo;
+                     std::vector<SoftwareFleetRow> visible;
+                     visible.reserve(rows.size());
+                     for (auto& r : rows) {
+                         auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                         if (inserted)
+                             m->second = inventory_scope_fn(session->username, r.agent_id);
+                         if (m->second) {
+                             visible.push_back(std::move(r));
+                         } else {
+                             scope_filtered = true;
+                             if (inserted) // count each DISTINCT dropped device once
+                                 ++dropped_agents;
+                         }
+                     }
+                     rows.swap(visible);
+                 }
+
+                 JArr arr;
+                 for (const auto& r : rows) {
+                     arr.add(JObj()
+                                 .add("agent_id", r.agent_id)
+                                 .add("name", r.entry.name)
+                                 .add("version", r.entry.version)
+                                 .add("publisher", r.entry.publisher)
+                                 .add("install_date", r.entry.install_date));
+                 }
+
+                 // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
+                 // bool, surface audit_persisted:false, never withhold. A scope-dropped read is
+                 // security-relevant → audit it distinctly with the DISTINCT dropped count.
+                 bool denied_ok = true;
+                 if (scope_filtered)
+                     denied_ok = audit_fn(req, "inventory.software.query", "denied", "Inventory",
+                                          audit_key,
+                                          "scope: filtered " + std::to_string(dropped_agents) +
+                                              " out-of-management-group device(s); cid=" + cid);
+                 const bool audit_ok =
+                     audit_fn(req, "inventory.software.query", "success", "Inventory", audit_key,
+                              "rows=" + std::to_string(arr.size()) + " cid=" + cid) &&
+                     denied_ok;
+
+                 JObj data;
+                 data.raw("software", arr.str());
+                 data.add("count", arr.size());
+                 // Surface the count of devices dropped by the scope filter (0 when none) so an
+                 // agentic caller can tell "out of my scope" from "not installed anywhere": a
+                 // positive value means matching software exists outside the caller's scope
+                 // (gov UP-12 false-negative guard). The audit row carries it too.
+                 data.add("devices_omitted", static_cast<int64_t>(dropped_agents));
+                 if (hit_cap)
+                     data.add("result_truncated_by_cap", true);
+                 if (!audit_ok)
+                     data.add("audit_persisted", false);
+                 res.set_content(ok_json(data.str()), "application/json");
+             });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
 

@@ -8985,7 +8985,21 @@ private:
             // require_scoped_permission closure the dashboard device routes + the
             // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
             // held to the same per-device scope (defined once above, not re-inlined).
-            scoped_perm_fn);
+            scoped_perm_fn,
+            // ADR-0016: the typed daily-sync software store + its per-device
+            // Inventory-scope predicate for GET /api/v1/inventory/software. SAME
+            // management-group chokepoint (check_scoped_permission) as the MCP
+            // query_installed_software tool, bound to ("Inventory","Read"), so a
+            // REST worker's fleet-wide software query returns only devices inside
+            // their groups (cross-operator isolation). MUST be wired here; the
+            // param defaults to {} = no filter (unscoped fleet read).
+            software_inventory_store_.get(),
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                    return true;
+                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
+                                                            mgmt_group_store_.get());
+            });
 
         // -- Register MCP server routes ----------------------------------------
 
