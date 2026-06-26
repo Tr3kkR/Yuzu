@@ -73,6 +73,18 @@ const std::vector<pg::PgMigration>& migrations() {
          // order → ordered index scan + early LIMIT termination. Leading `name`
          // subsumes the old single-column index, so the index count is unchanged.
          "CREATE INDEX installed_software_name_idx  ON installed_software (name, agent_id);"},
+        {2,
+         // (source, last_seen) serves the freshness count (count_stale_agents):
+         // `WHERE source=$1 AND last_seen<$2`. Without it the count is a full
+         // seq-scan of inventory_state on every metrics sweep; with it the count
+         // is an index range scan touching only the stale rows — stale-proportional,
+         // not fleet-proportional. This bounds the count's execution time on the
+         // metrics-sweep thread that also runs the revocation-teardown backstop
+         // (CH-IN3/UP-2), complementing the per-statement statement_timeout cap in
+         // count_stale_agents. Leading `source` matches the equality predicate;
+         // `last_seen` serves the range.
+         "CREATE INDEX inventory_state_source_lastseen_idx "
+         "ON inventory_state (source, last_seen);"},
     };
     return kMigrations;
 }
@@ -292,15 +304,24 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
                 publishers.emplace_back(e.publisher);
                 dates.emplace_back(e.install_date);
             }
+            // push_back (not a braced init-list) so each large to_text_array
+            // prvalue is MOVED into params, not copied — an init_list's backing
+            // array is `const std::string[]`, forcing copies of these up-to-MB
+            // literals on the hot path (cpp-expert).
+            std::vector<std::string> params;
+            params.reserve(5);
+            params.push_back(agent_id_s);
+            params.push_back(pg::to_text_array(names));
+            params.push_back(pg::to_text_array(versions));
+            params.push_back(pg::to_text_array(publishers));
+            params.push_back(pg::to_text_array(dates));
             pg::PgResult ins = pg::exec_params(
                 c,
                 "INSERT INTO software_inventory_store.installed_software "
                 "(agent_id, name, version, publisher, install_date) "
                 "SELECT $1, n, v, p, d "
                 "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS t(n, v, p, d)",
-                std::vector<std::string>{agent_id_s, pg::to_text_array(names),
-                                         pg::to_text_array(versions), pg::to_text_array(publishers),
-                                         pg::to_text_array(dates)});
+                params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return false;
         }
@@ -474,22 +495,38 @@ std::optional<std::int64_t>
 SoftwareInventoryStore::count_stale_agents(std::int64_t stale_before_secs) {
     if (!open_)
         return std::nullopt;
-    auto lease = pool_.try_acquire_for(kStaleCountAcquireTimeout);
-    if (!lease)
-        return std::nullopt; // saturated → leave the gauge stale, never block teardown
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT count(*) FROM software_inventory_store.inventory_state "
-        "WHERE source = $1 AND last_seen < $2::bigint",
-        std::vector<std::string>{kSourceInstalledSoftware, std::to_string(stale_before_secs)});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-        return std::nullopt;
-    const char* txt = PQgetvalue(res.get(), 0, 0);
-    const auto len = static_cast<std::size_t>(PQgetlength(res.get(), 0, 0));
-    std::int64_t count = 0;
-    if (std::from_chars(txt, txt + len, count).ec != std::errc{})
-        return std::nullopt;
-    return count;
+    std::optional<std::int64_t> result;
+    // Run inside a txn so a `SET LOCAL statement_timeout` caps the count's
+    // EXECUTION, not merely the lease acquire. This runs on the metrics-sweep
+    // thread that next runs the revocation-teardown backstop (server.cpp), so a
+    // bloated-table seq-scan must NOT be allowed to run to the pool's 30s
+    // statement_timeout (CH-IN3/UP-2) — the 250ms acquire bounds only the wait
+    // for a connection, never the query. SET LOCAL reverts at COMMIT/ROLLBACK; a
+    // timeout makes the SELECT error → with_txn_for ROLLs back → nullopt → the
+    // caller holds the gauge at its prior value. The (source,last_seen) index
+    // (migration v2) keeps the steady-state plan an index scan so the cap is
+    // never reached; the cap defends against bloat / plan regression.
+    pool_.with_txn_for(kStaleCountAcquireTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(c, "SET LOCAL statement_timeout = '250ms'",
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT count(*) FROM software_inventory_store.inventory_state "
+            "WHERE source = $1 AND last_seen < $2::bigint",
+            std::vector<std::string>{kSourceInstalledSoftware, std::to_string(stale_before_secs)});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+            return false;
+        const char* txt = PQgetvalue(res.get(), 0, 0);
+        const auto len = static_cast<std::size_t>(PQgetlength(res.get(), 0, 0));
+        std::int64_t count = 0;
+        if (std::from_chars(txt, txt + len, count).ec != std::errc{})
+            return false;
+        result = count;
+        return true;
+    });
+    return result;
 }
 
 } // namespace yuzu::server

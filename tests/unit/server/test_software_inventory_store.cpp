@@ -444,6 +444,7 @@ TEST_CASE("batched insert round-trips a large set, array metacharacters, and emp
         REQUIRE(fl.has_value());
         REQUIRE(fl->size() == 1);
         CHECK((*fl)[0].agent_id == "agent-meta");
+        CHECK((*fl)[0].entry.name == meta); // exact round-trip, not just queryable
         CHECK((*fl)[0].entry.publisher == "Vendor, Inc.");
     }
 
@@ -558,4 +559,62 @@ TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phas
                          .snapshot();
     CHECK(full.count == 1);
     CHECK(hash_only.count == 1);
+}
+
+TEST_CASE("read-degrade store_not_open reason fires when the store failed to open (#1675)",
+          "[pg][software_inventory]") {
+    // The store_not_open degrade reason (the other testable degrade besides
+    // query_error). Force open_=false by wiping the version record after a normal
+    // open so a second construction re-runs the v1 DDL against the already-existing
+    // tables → migration fails → !is_open(). Then both authoritative reads must
+    // bump the store_not_open counter.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    { // first construction creates the schema, tables, and the schema_meta row
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    { // wipe the applied-version record so the runner re-applies v1 over live tables
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult del = pg::exec_params(
+            lease.get(),
+            "DELETE FROM public.schema_meta WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(del.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore store{pool};
+    REQUIRE_FALSE(store.is_open()); // migration re-run failed → store_not_open
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    SoftwareFleetQuery q;
+    q.name = "Chrome";
+    CHECK_FALSE(store.query_software(q).has_value());
+    CHECK_FALSE(store.get_agent_software("agent-a").has_value());
+    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "store_not_open"}})
+              .value() == 2.0);
+}
+
+TEST_CASE("count_stale_agents returns nullopt on a backend degrade (freeze-counter trigger)",
+          "[pg][software_inventory]") {
+    // The server gauge sweep bumps yuzu_inventory_stale_count_unavailable_total in
+    // the else-branch of `if (auto stale = count_stale_agents(...))`. Prove the
+    // store method returns nullopt (not a false 0) when the backend is unavailable,
+    // so the gauge holds its prior value and the freeze counter fires.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(store.count_stale_agents(1'000'000).has_value()); // degrade → nullopt, never 0
 }

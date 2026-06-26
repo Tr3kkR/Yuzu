@@ -35,17 +35,24 @@
 /// encoding (e.g. UTF-8 well-formedness for a UTF8 database) — this builder
 /// only guarantees a syntactically well-formed array literal.
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
 
-inline std::string to_text_array(const std::vector<std::string_view>& elems) {
+[[nodiscard]] inline std::string to_text_array(const std::vector<std::string_view>& elems) {
+    // Two-pass exact reserve: sum the element bytes plus 3 framing bytes each
+    // (two quotes + a separating comma) plus the enclosing braces, so the common
+    // (no-escape) case never reallocates — important on the up-to-20k-element
+    // batch-ingest hot path. The rare `\`/`"` escape doubles a byte and falls
+    // back to the string's geometric growth.
+    std::size_t budget = 2;
+    for (const auto& e : elems)
+        budget += e.size() + 3;
     std::string out;
-    // '{' + per element ~ ("…",) + '}'. Reserve a small per-element budget so the
-    // common (short, unescaped) case never reallocates.
-    out.reserve(elems.size() * 8 + 2);
+    out.reserve(budget);
     out.push_back('{');
     for (std::size_t i = 0; i < elems.size(); ++i) {
         if (i != 0)

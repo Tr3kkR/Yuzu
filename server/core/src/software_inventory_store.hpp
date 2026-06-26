@@ -140,12 +140,17 @@ public:
     /// Count agents whose `installed_software` inventory has not been refreshed
     /// since `stale_before_secs` (epoch seconds) — i.e. `last_seen <
     /// stale_before_secs`. Feeds the `yuzu_inventory_stale_agents` freshness
-    /// gauge from the metrics sweep. Uses a SHORT bounded acquire (NOT the query
-    /// timeout): the sweep shares its serial budget with security-relevant
-    /// revocation teardown, and pool saturation is the very condition this gauge
-    /// instruments, so it must give up fast. `std::nullopt` on a store/pool/query
-    /// degrade — the caller leaves the gauge at its previous (stale) value rather
-    /// than publishing a false zero.
+    /// gauge from the metrics sweep, which shares its serial thread with the
+    /// security-relevant revocation-teardown backstop. BOTH the lease acquire
+    /// AND the query execution are bounded so neither can stall that teardown
+    /// (CH-IN3/UP-2): a 250ms bounded acquire, and a per-statement
+    /// `SET LOCAL statement_timeout = '250ms'` inside the txn (the acquire alone
+    /// does NOT bound execution — a bloated-table seq-scan would otherwise run to
+    /// the pool's 30s statement_timeout). `std::nullopt` on a store/pool/query
+    /// degrade (incl. the execution-timeout) — the caller leaves the gauge at its
+    /// previous value rather than publishing a false zero, and increments
+    /// `yuzu_inventory_stale_count_unavailable_total` so a frozen gauge is
+    /// distinguishable from a true low.
     [[nodiscard]] std::optional<std::int64_t> count_stale_agents(std::int64_t stale_before_secs);
 
 private:
