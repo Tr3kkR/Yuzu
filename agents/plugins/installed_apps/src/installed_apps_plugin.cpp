@@ -169,6 +169,23 @@ std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
     return from_wide(buf, static_cast<int>(nch));
 }
 
+// RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
+// BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
+// while any subtree handle is open, so a leaked HKEY on a throw path would defeat
+// the HiveUnloadGuard in do_list_per_user. Destruction order guarantees these
+// callee handles close as the exception leaves enumerate_uninstall_key, before
+// the caller's unload guard runs (#1662 Gate-8).
+struct HKeyCloser {
+    HKEY h;
+    explicit HKeyCloser(HKEY k) : h(k) {}
+    ~HKeyCloser() {
+        if (h)
+            RegCloseKey(h);
+    }
+    HKeyCloser(const HKeyCloser&) = delete;
+    HKeyCloser& operator=(const HKeyCloser&) = delete;
+};
+
 void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                              std::vector<AppInfo>& apps) {
     HKEY hkey{};
@@ -176,6 +193,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                       KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) != ERROR_SUCCESS) {
         return;
     }
+    HKeyCloser hkey_guard{hkey};
 
     // RegEnumKeyExW's lpcchName is a WCHAR COUNT, not a byte size. Bind the array
     // size and every reset to one constant so the byte-vs-count unit cannot skew —
@@ -189,6 +207,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
            ERROR_SUCCESS) {
         HKEY app_key{};
         if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
+            HKeyCloser app_guard{app_key};
             auto read_str = [&](const char* value_name) -> std::string {
                 wchar_t buf[512]{};
                 DWORD size = sizeof(buf); // size in BYTES
@@ -207,9 +226,8 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 // Skip system components and updates without meaningful names
                 auto sys_component = read_str("SystemComponent");
                 if (sys_component == "1") {
-                    RegCloseKey(app_key);
                     name_len = kNameBufLen;
-                    continue;
+                    continue; // app_guard closes app_key
                 }
 
                 AppInfo app;
@@ -219,11 +237,9 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 app.install_date = read_str("InstallDate");
                 apps.push_back(std::move(app));
             }
-            RegCloseKey(app_key);
         }
         name_len = kNameBufLen;
     }
-    RegCloseKey(hkey);
 }
 
 std::vector<AppInfo> get_installed_apps_windows() {
