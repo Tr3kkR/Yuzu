@@ -342,6 +342,16 @@ TEST_CASE("REST inventory/software: over-max limit clamps (no error, no cap defe
     auto body = nlohmann::json::parse(res->body);
     CHECK(body.at("data").at("count").get<int>() == 3);
     CHECK_FALSE(body.at("data").contains("result_truncated_by_cap"));
+
+    // The FLOOR arm of the clamp (gov Gate-8 N1): a negative/zero limit must NOT bind
+    // `LIMIT -1` (unbounded in Postgres — the exact cap-defeat the int64 clamp guards).
+    // Both clamp to 1 → exactly one row, no error.
+    for (const char* q : {"limit=-1", "limit=0"}) {
+        auto r = h.sink.Get(std::string("/api/v1/inventory/software?") + q);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(nlohmann::json::parse(r->body).at("data").at("count").get<int>() == 1);
+    }
 }
 
 TEST_CASE("REST inventory/software: failed audit surfaces audit_persisted:false (set-and-proceed)",
