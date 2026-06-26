@@ -3123,9 +3123,16 @@ void RestApiV1::register_routes(
     // (ADR-0016). The REST sibling of the governed MCP query_installed_software tool;
     // mirrors it 1:1 (Inventory:Read → store → cap → management-group scope filter →
     // audit). DISTINCT from the generic /api/v1/inventory/* routes above, which read
-    // the generic blob InventoryStore on Infrastructure-class data — this reads the
-    // typed SoftwareInventoryStore (normalized rows). Single path segment, so it does
-    // not collide with the two-segment /api/v1/inventory/{agent}/{plugin} regex.
+    // the generic blob InventoryStore — this reads the typed SoftwareInventoryStore
+    // (normalized rows). Single path segment, so it does not collide with the
+    // two-segment /api/v1/inventory/{agent}/{plugin} regex.
+    //
+    // CONSISTENCY NOTE: the sibling generic routes share this securable (Inventory:Read)
+    // but are NOT management-group scoped (the #1676 cross-operator gap). This endpoint
+    // is the SCOPED reference shape they should converge to under #1676 — the fix
+    // direction is "scope the generics up to this bar", not "move this endpoint to a
+    // separate prefix". Until #1676 lands, mixed scoping under /inventory is a known,
+    // ticketed gap, not an oversight.
     // Agentic-first A1: a fleet software dashboard + a /device drill-down section
     // (planned follow-ons) sit on this same data + scope contract.
     //
