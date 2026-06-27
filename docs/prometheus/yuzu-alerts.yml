@@ -351,3 +351,184 @@ groups:
             HTTP thread-pool starvation affecting unrelated routes. Reduce
             concurrent bundle dispatches, reduce steps-per-bundle, or prioritise
             the deferred async-dispatch fix (UP-15).
+
+  # Agent daily-sync / installed-software inventory (ADR-0016). The
+  # yuzu_inventory_ingest_total{source,outcome} counter is otherwise measured but
+  # unoperationalised (gov sre). need_full + error are the degradation signals.
+  - name: yuzu-inventory
+    rules:
+      - alert: YuzuInventorySustainedIngestErrors
+        # outcome=error = a store/pool failure on ingest. Correlated with yuzu_pg_*
+        # = a transient PG outage (self-heals); uncorrelated + low/persistent = a
+        # device stuck on a payload the store keeps rejecting — grep the warn-level
+        # SoftwareInventoryStore log for the agent_id.
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="error"}[15m])) > 0.001
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest sustaining errors"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="error"} has been non-zero for 15m.
+            If correlated with yuzu_pg_connect_failed_total it is a transient
+            Postgres outage (self-heals via the next sync + weekly full-floor); if
+            uncorrelated it is likely one or more devices whose payload the store
+            keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
+            the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryHighNeedFullRatio
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="need_full"}[15m]))
+          / clamp_min(sum(rate(yuzu_inventory_ingest_total[15m])), 0.0001) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software need_full ratio > 20%"
+          description: >-
+            Over 20% of inventory ingest outcomes are need_full for 15m. Expected
+            transiently after a server DB restore (cold cache — agents re-send full,
+            then settle); a sustained ratio suggests hash drift or agents stuck in a
+            resend cycle.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryDroppedBlobs
+        # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
+        # outcome=error this NEVER self-heals: the agent resends the same over-cap
+        # payload and backs off forever (the agent's own cap should prevent reaching
+        # here, so a non-zero rate signals agent/server cap drift after a version
+        # skew, or a non-conforming agent). Deliberately a SEPARATE alert — folding
+        # it into YuzuInventorySustainedIngestErrors would mislabel a permanent
+        # condition as the self-healing transient-PG-outage case (gov sre).
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="dropped"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest dropping over-cap blobs"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
+            agents are sending an installed-software blob over the 3 MiB cap, which
+            is dropped + nacked and will NOT self-heal (the agent resends the same
+            payload). Likely an agent/server cap-constant drift after a version skew,
+            or a non-conforming agent — check the agent version and the warn-level
+            "oversized ... blob" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryReportRejected
+        # outcome=rejected = a whole report carrying too many sources (content_hashes /
+        # plugin_data map > 64) was rejected at the ingest entry. DISTINCT from
+        # outcome=dropped (over-cap blob): this path does NOT nack, so the agent advances
+        # to the weekly floor rather than resending forever — different runbook. The
+        # framework wires ~1 source, so a non-zero rate signals a malformed / abusive /
+        # corrupted agent, not cap drift (gov consistency).
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="rejected"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software ingest rejecting over-cap reports"
+          description: >-
+            yuzu_inventory_ingest_total{outcome="rejected"} is non-zero: one or more
+            agents are sending an inventory report whose source map exceeds the
+            kMaxSources cap (64) — the whole report is rejected (NOT nacked; the agent
+            advances to its weekly full-floor). The framework wires ~1 source, so this
+            signals a malformed/abusive/corrupted agent — check the agent version and the
+            warn-level "carries too many sources" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryReadDegraded
+        # An AUTHORITATIVE inventory read (query_software / get_agent_software)
+        # returned a degrade (no data), NOT a silent empty. /readyz deliberately
+        # stays green under pure pool saturation (it trips only on connection
+        # failure, to avoid false LB evictions), so this is otherwise
+        # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
+        # moves but nothing inventory-specific does (#1675).
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_inventory_read_degrade_total{reason="{{ $labels.reason }}"} is
+            non-zero: a fleet/agent software query returned a degrade (no data)
+            rather than a result. pool_acquire_timeout/query_error correlate with
+            yuzu_pg_* saturation or outage; store_not_open means the store failed to
+            open at boot. A fleet vulnerability query ("which devices run <CVE>")
+            reads as degraded, NOT "installed nowhere" — do not trust a zero-result
+            inventory answer while this fires.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryIngestSlow
+        # Leading indicator for ingest transaction-hold saturation: full-payload
+        # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
+        # measures time-to-GET a connection — this measures total txn hold
+        # (incl. statement execution), so it fires even when the pool hands out
+        # connections quickly but transactions run slow. The default histogram
+        # buckets cap at 10s, so the 10-30s saturation tail collapses into +Inf;
+        # the +Inf-minus-le=10 complement is the buildable signal today (extending
+        # the buckets into the 10-60s range is a tracked follow-up). Fires ahead of
+        # YuzuInventoryReadDegraded (sre).
+        expr: |
+          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
+          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
+          > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software full-payload ingests exceeding 10s"
+          description: >-
+            More than ~6/min full-payload inventory ingests are holding a Postgres
+            connection >10s — a leading indicator of pool saturation under a
+            need_full herd, ahead of read-path degradation. Correlate with
+            yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryStaleCountUnavailable
+        # The stale-agents freshness count could not be computed (pool saturation
+        # or query timeout) on the metrics sweep, so yuzu_inventory_stale_agents is
+        # FROZEN at its prior value — a low reading may be stale, not genuine. This
+        # is the freeze-detector that travels with the gauge: the 250ms count
+        # acquire can expire under moderate contention while the 3000ms read budget
+        # still clears, so YuzuInventoryReadDegraded may stay dormant (sre UP-3).
+        # Fleet-size-independent, so it ships ACTIVE (unlike YuzuInventoryStaleAgents).
+        expr: |
+          rate(yuzu_inventory_stale_count_unavailable_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software freshness gauge may be frozen"
+          description: >-
+            yuzu_inventory_stale_count_unavailable_total is rising: the freshness
+            count keeps timing out, so yuzu_inventory_stale_agents is held at its
+            last value and may read healthy during an actual outage. Investigate
+            Postgres pool saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
+      # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
+      # is no fleet-size-independent absolute threshold: >50 is day-one noise on a
+      # 100-device pilot (a weekend of offline laptops) and 0.1% ambient churn on a
+      # 50k fleet (desensitising). A fleet-relative ratio against
+      # yuzu_fleet_agents_healthy needs explicit on()/group_left() vector matching
+      # (the label sets differ) and a denominator caveat (offline agents drop
+      # "healthy"), so there is no clean self-calibrating form. ENABLE this rule
+      # once you have observed your fleet's normal stale-count baseline and set the
+      # threshold to ~5-10% of your expected active fleet. Correlate with
+      # yuzu_fleet_agents_healthy to separate "agents offline" from "sync source broken".
+      # - alert: YuzuInventoryStaleAgents
+      #   expr: |
+      #     max(yuzu_inventory_stale_agents) by (source) > 50
+      #   for: 1h
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "{{ $value }} agents have stale {{ $labels.source }} inventory"
+      #     description: >-
+      #       yuzu_inventory_stale_agents{source="{{ $labels.source }}"} has exceeded
+      #       the freshness threshold for 1h — that many agents have not synced this
+      #       inventory source in over two daily cycles. Check for a fleet-wide agent
+      #       outage, a broken/disabled sync source, or a network partition.
+      #     runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"

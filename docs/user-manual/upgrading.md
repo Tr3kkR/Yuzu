@@ -228,6 +228,28 @@ Before upgrading any component:
   project treats the *capability to observe* as the works-council co-determination
   trigger, so EU deployments should note the new Windows coverage as they did for
   the DEX signals. See [Network Quality](network.md) → Collection & privacy.
+- [ ] **New daily installed-software sync (ADR-0016):** on agent upgrade, agents
+  begin syncing their **machine-wide installed-software** inventory to the server
+  once per ~24 h over the existing gRPC channel (hash-skip keeps unchanged hosts
+  to a tiny hash, not the full list). Three operator-visible effects: (a) new daily
+  outbound `ReportInventory` traffic per agent — adjust egress baselines/firewall
+  expectations; (b) the data lands in a **new Postgres schema**
+  (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
+  the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
+  (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
+  debug). Machine-scope only, no end-user PII (no username collection) — but the
+  data is device-attributable, and on **personally-assigned devices** installed-
+  software enumeration may be **works-council co-determination-relevant** (see the
+  works-council note in [Installed-Software Inventory](inventory.md)). To suppress
+  collection entirely, pass **`--inventory-disable`** / set
+  `YUZU_AGENT_INVENTORY_DISABLE` on the agent (deploy-time opt-out). Reads are
+  gated on the new `Inventory:Read` RBAC securable; today the data is queryable via
+  direct SQL (see [Installed-Software Inventory](inventory.md)). On a **non-English
+  fleet**, upgrading across #1662 changes stored names: app/publisher names that
+  earlier builds mangled to `?` (cp1252) are rewritten to correct UTF-8 on each
+  agent's next daily sync, so any query automation that matched the corrupted `?`
+  strings will return nothing afterward — see the non-ASCII troubleshooting note in
+  [Installed-Software Inventory](inventory.md) for the force-resync path.
 
 ## Upgrading the Server
 

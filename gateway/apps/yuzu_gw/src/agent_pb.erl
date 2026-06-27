@@ -124,11 +124,13 @@
 -type 'yuzu.agent.v1.InventoryReport'() ::
       #{session_id              => unicode:chardata(), % = 1, optional
         collected_at            => 'yuzu.common.v1.Timestamp'(), % = 2, optional
-        plugin_data             => #{unicode:chardata() => iodata()} % = 3
+        plugin_data             => #{unicode:chardata() => iodata()}, % = 3
+        content_hashes          => #{unicode:chardata() => unicode:chardata()} % = 4
        }.
 
 -type 'yuzu.agent.v1.InventoryAck'() ::
-      #{received                => boolean() | 0 | 1 % = 1, optional
+      #{received                => boolean() | 0 | 1, % = 1, optional
+        need_full               => [unicode:chardata()] % = 2, repeated
        }.
 
 -type 'yuzu.agent.v1.CheckForUpdateRequest'() ::
@@ -766,28 +768,44 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B1
          end,
+    B3 = case M of
+             #{plugin_data := F3} ->
+                 TrF3 = 'tr_encode_yuzu.agent.v1.InventoryReport.plugin_data'(F3, TrUserData),
+                 if TrF3 == [] -> B2;
+                    true -> 'e_field_yuzu.agent.v1.InventoryReport_plugin_data'(TrF3, B2, TrUserData)
+                 end;
+             _ -> B2
+         end,
     case M of
-        #{plugin_data := F3} ->
-            TrF3 = 'tr_encode_yuzu.agent.v1.InventoryReport.plugin_data'(F3, TrUserData),
-            if TrF3 == [] -> B2;
-               true -> 'e_field_yuzu.agent.v1.InventoryReport_plugin_data'(TrF3, B2, TrUserData)
+        #{content_hashes := F4} ->
+            TrF4 = 'tr_encode_yuzu.agent.v1.InventoryReport.content_hashes'(F4, TrUserData),
+            if TrF4 == [] -> B3;
+               true -> 'e_field_yuzu.agent.v1.InventoryReport_content_hashes'(TrF4, B3, TrUserData)
             end;
-        _ -> B2
+        _ -> B3
     end.
 
 'encode_msg_yuzu.agent.v1.InventoryAck'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.InventoryAck'(Msg, <<>>, TrUserData).
 
 
 'encode_msg_yuzu.agent.v1.InventoryAck'(#{} = M, Bin, TrUserData) ->
+    B1 = case M of
+             #{received := F1} ->
+                 begin
+                     TrF1 = id(F1, TrUserData),
+                     if TrF1 =:= false -> Bin;
+                        true -> e_type_bool(TrF1, <<Bin/binary, 8>>, TrUserData)
+                     end
+                 end;
+             _ -> Bin
+         end,
     case M of
-        #{received := F1} ->
-            begin
-                TrF1 = id(F1, TrUserData),
-                if TrF1 =:= false -> Bin;
-                   true -> e_type_bool(TrF1, <<Bin/binary, 8>>, TrUserData)
-                end
+        #{need_full := F2} ->
+            TrF2 = id(F2, TrUserData),
+            if TrF2 == [] -> B1;
+               true -> 'e_field_yuzu.agent.v1.InventoryAck_need_full'(TrF2, B1, TrUserData)
             end;
-        _ -> Bin
+        _ -> B1
     end.
 
 'encode_msg_yuzu.agent.v1.CheckForUpdateRequest'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.CheckForUpdateRequest'(Msg, <<>>, TrUserData).
@@ -1299,6 +1317,23 @@ encode_msg(Msg, MsgName, Opts) ->
     Bin3 = 'e_mfield_yuzu.agent.v1.InventoryReport_plugin_data'('tr_encode_yuzu.agent.v1.InventoryReport.plugin_data[x]'(Elem, TrUserData), Bin2, TrUserData),
     'e_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, Bin3, TrUserData);
 'e_field_yuzu.agent.v1.InventoryReport_plugin_data'([], Bin, _TrUserData) -> Bin.
+
+'e_mfield_yuzu.agent.v1.InventoryReport_content_hashes'(Msg, Bin, TrUserData) ->
+    SubBin = 'encode_msg_map<string,string>'(Msg, <<>>, TrUserData),
+    Bin2 = e_varint(byte_size(SubBin), Bin),
+    <<Bin2/binary, SubBin/binary>>.
+
+'e_field_yuzu.agent.v1.InventoryReport_content_hashes'([Elem | Rest], Bin, TrUserData) ->
+    Bin2 = <<Bin/binary, 34>>,
+    Bin3 = 'e_mfield_yuzu.agent.v1.InventoryReport_content_hashes'('tr_encode_yuzu.agent.v1.InventoryReport.content_hashes[x]'(Elem, TrUserData), Bin2, TrUserData),
+    'e_field_yuzu.agent.v1.InventoryReport_content_hashes'(Rest, Bin3, TrUserData);
+'e_field_yuzu.agent.v1.InventoryReport_content_hashes'([], Bin, _TrUserData) -> Bin.
+
+'e_field_yuzu.agent.v1.InventoryAck_need_full'([Elem | Rest], Bin, TrUserData) ->
+    Bin2 = <<Bin/binary, 18>>,
+    Bin3 = e_type_string(id(Elem, TrUserData), Bin2, TrUserData),
+    'e_field_yuzu.agent.v1.InventoryAck_need_full'(Rest, Bin3, TrUserData);
+'e_field_yuzu.agent.v1.InventoryAck_need_full'([], Bin, _TrUserData) -> Bin.
 
 'e_mfield_yuzu.agent.v1.CheckForUpdateRequest_platform'(Msg, Bin, TrUserData) ->
     SubBin = 'encode_msg_yuzu.common.v1.Platform'(Msg, <<>>, TrUserData),
@@ -2435,47 +2470,60 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
     'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
 'decode_msg_yuzu.agent.v1.InventoryReport'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Bin, 0, 0, 0, id(<<>>, TrUserData), id('$undef', TrUserData), 'tr_decode_init_default_yuzu.agent.v1.InventoryReport.plugin_data'([], TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Bin,
+                                                       0,
+                                                       0,
+                                                       0,
+                                                       id(<<>>, TrUserData),
+                                                       id('$undef', TrUserData),
+                                                       'tr_decode_init_default_yuzu.agent.v1.InventoryReport.plugin_data'([], TrUserData),
+                                                       'tr_decode_init_default_yuzu.agent.v1.InventoryReport.content_hashes'([], TrUserData),
+                                                       TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<>>, 0, 0, _, F@_1, F@_2, R1, TrUserData) ->
-    S1 = #{session_id => F@_1, plugin_data => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.plugin_data'(R1, TrUserData)},
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryReport_content_hashes'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(<<>>, 0, 0, _, F@_1, F@_2, R1, R2, TrUserData) ->
+    S1 = #{session_id => F@_1, plugin_data => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.plugin_data'(R1, TrUserData), content_hashes => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.content_hashes'(R2, TrUserData)},
     if F@_2 == '$undef' -> S1;
        true -> S1#{collected_at => F@_2}
     end;
-'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.InventoryReport'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.InventoryReport'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 32 - 7 -> 'dg_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        10 -> 'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
-        18 -> 'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
-        26 -> 'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
+        10 -> 'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, TrUserData);
+        18 -> 'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, TrUserData);
+        26 -> 'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, TrUserData);
+        34 -> 'd_field_yuzu.agent.v1.InventoryReport_content_hashes'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.InventoryReport'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<>>, 0, 0, _, F@_1, F@_2, R1, TrUserData) ->
-    S1 = #{session_id => F@_1, plugin_data => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.plugin_data'(R1, TrUserData)},
+'dg_read_field_def_yuzu.agent.v1.InventoryReport'(<<>>, 0, 0, _, F@_1, F@_2, R1, R2, TrUserData) ->
+    S1 = #{session_id => F@_1, plugin_data => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.plugin_data'(R1, TrUserData), content_hashes => 'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.content_hashes'(R2, TrUserData)},
     if F@_2 == '$undef' -> S1;
        true -> S1#{collected_at => F@_2}
     end.
 
-'d_field_yuzu.agent.v1.InventoryReport_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
-'d_field_yuzu.agent.v1.InventoryReport_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, TrUserData) ->
+'d_field_yuzu.agent.v1.InventoryReport_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.InventoryReport_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'d_field_yuzu.agent.v1.InventoryReport_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, TrUserData).
 
-'d_field_yuzu.agent.v1.InventoryReport_collected_at'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
-'d_field_yuzu.agent.v1.InventoryReport_collected_at'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, Prev, F@_3, TrUserData) ->
+'d_field_yuzu.agent.v1.InventoryReport_collected_at'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.InventoryReport_collected_at'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'d_field_yuzu.agent.v1.InventoryReport_collected_at'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, Prev, F@_3, F@_4, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_yuzu.common.v1.Timestamp'(Bs, TrUserData), TrUserData), Rest2} end,
     'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF,
                                                        0,
@@ -2486,74 +2534,89 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
                                                           true -> 'merge_msg_yuzu.common.v1.Timestamp'(Prev, NewFValue, TrUserData)
                                                        end,
                                                        F@_3,
+                                                       F@_4,
                                                        TrUserData).
 
-'d_field_yuzu.agent.v1.InventoryReport_plugin_data'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
-'d_field_yuzu.agent.v1.InventoryReport_plugin_data'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, Prev, TrUserData) ->
+'d_field_yuzu.agent.v1.InventoryReport_plugin_data'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.InventoryReport_plugin_data'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'d_field_yuzu.agent.v1.InventoryReport_plugin_data'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, Prev, F@_4, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_map<string,bytes>'(Bs, TrUserData), TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF, 0, 0, F, F@_1, F@_2, 'tr_decode_repeated_add_elem_yuzu.agent.v1.InventoryReport.plugin_data'(NewFValue, Prev, TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF, 0, 0, F, F@_1, F@_2, 'tr_decode_repeated_add_elem_yuzu.agent.v1.InventoryReport.plugin_data'(NewFValue, Prev, TrUserData), F@_4, TrUserData).
 
-'skip_varint_yuzu.agent.v1.InventoryReport'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'skip_varint_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
-'skip_varint_yuzu.agent.v1.InventoryReport'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
+'d_field_yuzu.agent.v1.InventoryReport_content_hashes'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.InventoryReport_content_hashes'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'d_field_yuzu.agent.v1.InventoryReport_content_hashes'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, Prev, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_map<string,string>'(Bs, TrUserData), TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(RestF, 0, 0, F, F@_1, F@_2, F@_3, 'tr_decode_repeated_add_elem_yuzu.agent.v1.InventoryReport.content_hashes'(NewFValue, Prev, TrUserData), TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.InventoryReport'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.agent.v1.InventoryReport'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.InventoryReport'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) ->
+'skip_varint_yuzu.agent.v1.InventoryReport'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'skip_varint_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'skip_varint_yuzu.agent.v1.InventoryReport'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.InventoryReport'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.agent.v1.InventoryReport'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.InventoryReport'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, TrUserData).
 
-'skip_group_yuzu.agent.v1.InventoryReport'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, TrUserData) ->
+'skip_group_yuzu.agent.v1.InventoryReport'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, TrUserData).
 
-'skip_32_yuzu.agent.v1.InventoryReport'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
+'skip_32_yuzu.agent.v1.InventoryReport'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData).
 
-'skip_64_yuzu.agent.v1.InventoryReport'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
+'skip_64_yuzu.agent.v1.InventoryReport'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, TrUserData).
 
-'decode_msg_yuzu.agent.v1.InventoryAck'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Bin, 0, 0, 0, id(false, TrUserData), TrUserData).
+'decode_msg_yuzu.agent.v1.InventoryAck'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Bin, 0, 0, 0, id(false, TrUserData), id([], TrUserData), TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, Z1, Z2, F, F@_1, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(<<>>, 0, 0, _, F@_1, _) -> #{received => F@_1};
-'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Other, Z1, Z2, F, F@_1, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.InventoryAck'(Other, Z1, Z2, F, F@_1, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'd_field_yuzu.agent.v1.InventoryAck_need_full'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(<<>>, 0, 0, _, F@_1, R1, TrUserData) -> #{received => F@_1, need_full => lists_reverse(R1, TrUserData)};
+'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Other, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.InventoryAck'(Other, Z1, Z2, F, F@_1, F@_2, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 32 - 7 -> 'dg_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, TrUserData) when N < 32 - 7 -> 'dg_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        8 -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, 0, 0, 0, F@_1, TrUserData);
+        8 -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, 0, 0, 0, F@_1, F@_2, TrUserData);
+        18 -> 'd_field_yuzu.agent.v1.InventoryAck_need_full'(Rest, 0, 0, 0, F@_1, F@_2, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.InventoryAck'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<>>, 0, 0, _, F@_1, _) -> #{received => F@_1}.
+'dg_read_field_def_yuzu.agent.v1.InventoryAck'(<<>>, 0, 0, _, F@_1, R1, TrUserData) -> #{received => F@_1, need_full => lists_reverse(R1, TrUserData)}.
 
-'d_field_yuzu.agent.v1.InventoryAck_received'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'d_field_yuzu.agent.v1.InventoryAck_received'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, TrUserData) ->
+'d_field_yuzu.agent.v1.InventoryAck_received'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryAck_received'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, TrUserData);
+'d_field_yuzu.agent.v1.InventoryAck_received'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, TrUserData) ->
     {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(RestF, 0, 0, F, NewFValue, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(RestF, 0, 0, F, NewFValue, F@_2, TrUserData).
 
-'skip_varint_yuzu.agent.v1.InventoryAck'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'skip_varint_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, TrUserData);
-'skip_varint_yuzu.agent.v1.InventoryAck'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'d_field_yuzu.agent.v1.InventoryAck_need_full'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, TrUserData) when N < 57 -> 'd_field_yuzu.agent.v1.InventoryAck_need_full'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, TrUserData);
+'d_field_yuzu.agent.v1.InventoryAck_need_full'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, Prev, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(RestF, 0, 0, F, F@_1, cons(NewFValue, Prev, TrUserData), TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.InventoryAck'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 57 -> 'skip_length_delimited_yuzu.agent.v1.InventoryAck'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.InventoryAck'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) ->
+'skip_varint_yuzu.agent.v1.InventoryAck'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'skip_varint_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData);
+'skip_varint_yuzu.agent.v1.InventoryAck'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.InventoryAck'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, TrUserData) when N < 57 -> 'skip_length_delimited_yuzu.agent.v1.InventoryAck'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.InventoryAck'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest2, 0, 0, F, F@_1, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest2, 0, 0, F, F@_1, F@_2, TrUserData).
 
-'skip_group_yuzu.agent.v1.InventoryAck'(Bin, _, Z2, FNum, F@_1, TrUserData) ->
+'skip_group_yuzu.agent.v1.InventoryAck'(Bin, _, Z2, FNum, F@_1, F@_2, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, 0, Z2, FNum, F@_1, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, 0, Z2, FNum, F@_1, F@_2, TrUserData).
 
-'skip_32_yuzu.agent.v1.InventoryAck'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'skip_32_yuzu.agent.v1.InventoryAck'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData).
 
-'skip_64_yuzu.agent.v1.InventoryAck'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'skip_64_yuzu.agent.v1.InventoryAck'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.InventoryAck'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData).
 
 'decode_msg_yuzu.agent.v1.CheckForUpdateRequest'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateRequest'(Bin, 0, 0, 0, id(<<>>, TrUserData), id(<<>>, TrUserData), id('$undef', TrUserData), TrUserData).
 
@@ -3787,20 +3850,32 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{collected_at := PFcollected_at}, _} -> S2#{collected_at => PFcollected_at};
              {_, _} -> S2
          end,
+    S4 = case {PMsg, NMsg} of
+             {#{plugin_data := PFplugin_data}, #{plugin_data := NFplugin_data}} -> S3#{plugin_data => 'tr_merge_yuzu.agent.v1.InventoryReport.plugin_data'(PFplugin_data, NFplugin_data, TrUserData)};
+             {_, #{plugin_data := NFplugin_data}} -> S3#{plugin_data => NFplugin_data};
+             {#{plugin_data := PFplugin_data}, _} -> S3#{plugin_data => PFplugin_data};
+             {_, _} -> S3
+         end,
     case {PMsg, NMsg} of
-        {#{plugin_data := PFplugin_data}, #{plugin_data := NFplugin_data}} -> S3#{plugin_data => 'tr_merge_yuzu.agent.v1.InventoryReport.plugin_data'(PFplugin_data, NFplugin_data, TrUserData)};
-        {_, #{plugin_data := NFplugin_data}} -> S3#{plugin_data => NFplugin_data};
-        {#{plugin_data := PFplugin_data}, _} -> S3#{plugin_data => PFplugin_data};
-        {_, _} -> S3
+        {#{content_hashes := PFcontent_hashes}, #{content_hashes := NFcontent_hashes}} -> S4#{content_hashes => 'tr_merge_yuzu.agent.v1.InventoryReport.content_hashes'(PFcontent_hashes, NFcontent_hashes, TrUserData)};
+        {_, #{content_hashes := NFcontent_hashes}} -> S4#{content_hashes => NFcontent_hashes};
+        {#{content_hashes := PFcontent_hashes}, _} -> S4#{content_hashes => PFcontent_hashes};
+        {_, _} -> S4
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.InventoryAck'/3}).
-'merge_msg_yuzu.agent.v1.InventoryAck'(PMsg, NMsg, _) ->
+'merge_msg_yuzu.agent.v1.InventoryAck'(PMsg, NMsg, TrUserData) ->
     S1 = #{},
+    S2 = case {PMsg, NMsg} of
+             {_, #{received := NFreceived}} -> S1#{received => NFreceived};
+             {#{received := PFreceived}, _} -> S1#{received => PFreceived};
+             _ -> S1
+         end,
     case {PMsg, NMsg} of
-        {_, #{received := NFreceived}} -> S1#{received => NFreceived};
-        {#{received := PFreceived}, _} -> S1#{received => PFreceived};
-        _ -> S1
+        {#{need_full := PFneed_full}, #{need_full := NFneed_full}} -> S2#{need_full => 'erlang_++'(PFneed_full, NFneed_full, TrUserData)};
+        {_, #{need_full := NFneed_full}} -> S2#{need_full => NFneed_full};
+        {#{need_full := PFneed_full}, _} -> S2#{need_full => PFneed_full};
+        {_, _} -> S2
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.CheckForUpdateRequest'/3}).
@@ -4383,9 +4458,14 @@ verify_msg(Msg, MsgName, Opts) ->
         #{plugin_data := F3} -> 'v_map<string,bytes>'(F3, [plugin_data | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{content_hashes := F4} -> 'v_map<string,string>'(F4, [content_hashes | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (session_id) -> ok;
                       (collected_at) -> ok;
                       (plugin_data) -> ok;
+                      (content_hashes) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -4400,7 +4480,17 @@ verify_msg(Msg, MsgName, Opts) ->
         #{received := F1} -> v_type_bool(F1, [received | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{need_full := F2} ->
+            if is_list(F2) ->
+                   _ = [v_type_string(Elem, [need_full | Path], TrUserData) || Elem <- F2],
+                   ok;
+               true -> mk_type_error({invalid_list_of, string}, F2, [need_full | Path])
+            end;
+        _ -> ok
+    end,
     lists:foreach(fun (received) -> ok;
+                      (need_full) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -4877,6 +4967,21 @@ cons(Elem, Acc, _TrUserData) -> [Elem | Acc].
 -compile({inline,'tr_decode_repeated_add_elem_yuzu.agent.v1.CommandRequest.parameters'/3}).
 'tr_decode_repeated_add_elem_yuzu.agent.v1.CommandRequest.parameters'(Elem, L, _) -> mt_add_item_m(Elem, L).
 
+-compile({inline,'tr_decode_init_default_yuzu.agent.v1.InventoryReport.content_hashes'/2}).
+'tr_decode_init_default_yuzu.agent.v1.InventoryReport.content_hashes'(_, _) -> mt_empty_map_m().
+
+-compile({inline,'tr_merge_yuzu.agent.v1.InventoryReport.content_hashes'/3}).
+'tr_merge_yuzu.agent.v1.InventoryReport.content_hashes'(X1, X2, _) -> mt_merge_maps_m(X1, X2).
+
+-compile({inline,'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.content_hashes'/2}).
+'tr_decode_repeated_finalize_yuzu.agent.v1.InventoryReport.content_hashes'(L, TrUserData) -> id(L, TrUserData).
+
+-compile({inline,'tr_encode_yuzu.agent.v1.InventoryReport.content_hashes'/2}).
+'tr_encode_yuzu.agent.v1.InventoryReport.content_hashes'(X, _) -> mt_map_to_list_m(X).
+
+-compile({inline,'tr_decode_repeated_add_elem_yuzu.agent.v1.InventoryReport.content_hashes'/3}).
+'tr_decode_repeated_add_elem_yuzu.agent.v1.InventoryReport.content_hashes'(Elem, L, _) -> mt_add_item_m(Elem, L).
+
 -compile({inline,'tr_decode_init_default_yuzu.agent.v1.AgentInfo.scopable_tags'/2}).
 'tr_decode_init_default_yuzu.agent.v1.AgentInfo.scopable_tags'(_, _) -> mt_empty_map_m().
 
@@ -4918,6 +5023,9 @@ cons(Elem, Acc, _TrUserData) -> [Elem | Acc].
 
 -compile({inline,'tr_encode_yuzu.agent.v1.CommandRequest.parameters[x]'/2}).
 'tr_encode_yuzu.agent.v1.CommandRequest.parameters[x]'(X, _) -> mt_maptuple_to_pseudomsg_m(X).
+
+-compile({inline,'tr_encode_yuzu.agent.v1.InventoryReport.content_hashes[x]'/2}).
+'tr_encode_yuzu.agent.v1.InventoryReport.content_hashes[x]'(X, _) -> mt_maptuple_to_pseudomsg_m(X).
 
 -compile({inline,'tr_encode_yuzu.agent.v1.InventoryReport.plugin_data[x]'/2}).
 'tr_encode_yuzu.agent.v1.InventoryReport.plugin_data[x]'(X, _) -> mt_maptuple_to_pseudomsg_m(X).
@@ -5002,8 +5110,9 @@ get_msg_defs() ->
      {{msg, 'yuzu.agent.v1.InventoryReport'},
       [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => collected_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
-       #{name => plugin_data, fnum => 3, rnum => 4, type => {map, string, bytes}, occurrence => repeated, opts => []}]},
-     {{msg, 'yuzu.agent.v1.InventoryAck'}, [#{name => received, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}]},
+       #{name => plugin_data, fnum => 3, rnum => 4, type => {map, string, bytes}, occurrence => repeated, opts => []},
+       #{name => content_hashes, fnum => 4, rnum => 5, type => {map, string, string}, occurrence => repeated, opts => []}]},
+     {{msg, 'yuzu.agent.v1.InventoryAck'}, [#{name => received, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}, #{name => need_full, fnum => 2, rnum => 3, type => string, occurrence => repeated, opts => []}]},
      {{msg, 'yuzu.agent.v1.CheckForUpdateRequest'},
       [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => current_version, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},
@@ -5174,8 +5283,9 @@ find_msg_def('yuzu.agent.v1.CommandResponse') ->
 find_msg_def('yuzu.agent.v1.InventoryReport') ->
     [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => collected_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
-     #{name => plugin_data, fnum => 3, rnum => 4, type => {map, string, bytes}, occurrence => repeated, opts => []}];
-find_msg_def('yuzu.agent.v1.InventoryAck') -> [#{name => received, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}];
+     #{name => plugin_data, fnum => 3, rnum => 4, type => {map, string, bytes}, occurrence => repeated, opts => []},
+     #{name => content_hashes, fnum => 4, rnum => 5, type => {map, string, string}, occurrence => repeated, opts => []}];
+find_msg_def('yuzu.agent.v1.InventoryAck') -> [#{name => received, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}, #{name => need_full, fnum => 2, rnum => 3, type => string, occurrence => repeated, opts => []}];
 find_msg_def('yuzu.agent.v1.CheckForUpdateRequest') ->
     [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => current_version, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},

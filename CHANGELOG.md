@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
+  pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
+  with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
+  fleet scale: each endpoint spreads its sync by a stable per-agent phase offset (no lockstep), and
+  when a source's content is unchanged since the last successful sync it sends only a **content hash**
+  instead of the full list (hash-skip); the server replies `need_full` to force a resend on a cold
+  cache, with a weekly full-floor as a backstop. Installed software lands in a new born-on-Postgres
+  **`SoftwareInventoryStore`** (normalized rows — portable SQL, no JSONB — so fleet-wide queries
+  like "which devices run X" are first-class), via a shared ingest seam wired identically on the
+  direct and gateway paths. Reads are gated on a new **`Inventory` RBAC securable** (`Inventory:Read`).
+  Reuses the existing `installed_apps` plugin (Windows/Linux/macOS) in-process — no new collector.
+  Hardened for fleet-scale resilience: a per-source blob cap sized below the gRPC message ceiling,
+  exponential agent-side backoff on consecutive `need_full` resends (so a server cold-cache or store
+  outage cannot drive a flat-cadence full-resend storm), a `yuzu_inventory_ingest_total{source,outcome}`
+  metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
+  **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
+  scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
+  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
+  privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
+  (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and
+  server — so a non-UTF-8 registry string can never trigger a PostgreSQL TEXT-reject resend loop;
+  concurrent full-replaces for one agent are serialized with a transaction-scoped advisory lock (no
+  row/hash divergence); a transient empty collection is skipped rather than wiping stored inventory;
+  an over-cap blob raises a dedicated `dropped`-outcome alert (it never self-heals); and
+  `query_installed_software` reports `devices_omitted` so a scoped caller can distinguish "outside my
+  scope" from "not installed". **Reads are authoritative** (ADR-0016 §7): `query_installed_software`
+  returns a JSON-RPC error — never a silent `success` with empty rows — when the Postgres store is
+  degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
+  hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
+  wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
 ### Security
 
 - **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
@@ -67,6 +101,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
+  (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
+  `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
+  collapsing the per-agent connection-hold and `statement_timeout` exposure that, under a cold-cache
+  `need_full` herd, could saturate the shared Postgres pool and flip healthy agents touched→full.
+  New series make the path measurable: `yuzu_inventory_ingest_duration_seconds{source,phase}` (the
+  pooled-connection + transaction hold time, split `full` vs `hash_only`), `yuzu_inventory_read_degrade_total{reason}`
+  (an authoritative read that degraded rather than returning a silent empty — otherwise invisible
+  since `/readyz` stays green under pure saturation; the per-site WARN is now sampled to avoid
+  flooding the log at agentic fan-out), `yuzu_inventory_stale_agents{source}` (a freshness gauge,
+  fed by an execution-bounded count so it can never stall the revocation-teardown sweep it shares a
+  thread with), and `yuzu_inventory_stale_count_unavailable_total` (a freeze-detector so a held gauge
+  is distinguishable from a genuine low). New `YuzuInventoryReadDegraded`, `YuzuInventoryIngestSlow`,
+  and `YuzuInventoryStaleCountUnavailable` alert rules ship active in the `yuzu-inventory` group;
+  `YuzuInventoryStaleAgents` ships disabled (no fleet-size-independent threshold — enable after
+  baselining, see `docs/user-manual/inventory.md`).
+
 - **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
   shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
   `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
@@ -78,6 +129,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
 
 ### Fixed
+
+- **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
+  `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
+  strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
+  UTF-8 scrub then replaced the resulting invalid bytes with `?` (`Café` → `Caf?`), so any app or
+  publisher with a non-ASCII name was corrupted in the output — and, now that the names land in the
+  typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
+  now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
+  (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
+  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
+  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
+  unknown). No proto/wire change.
 
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service

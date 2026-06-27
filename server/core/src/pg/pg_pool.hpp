@@ -206,6 +206,15 @@ public:
     ///    should treat one connection-level retry as routine.
     bool with_txn(const std::function<bool(PGconn*)>& fn);
 
+    /// As `with_txn`, but the connection is acquired with a bounded deadline
+    /// (`try_acquire_for`) instead of the blocking `acquire()`. Returns false if
+    /// no connection is available within `timeout`. Hot-path transactional
+    /// writes (e.g. the inventory full-payload replace) MUST use this so a
+    /// saturated pool — e.g. a fleet-wide need_full storm — cannot block a gRPC
+    /// worker indefinitely (ADR-0012 bounded-acquire discipline; gov UP-3).
+    bool with_txn_for(std::chrono::milliseconds timeout,
+                      const std::function<bool(PGconn*)>& fn);
+
     /// False when the conninfo failed to parse at construction.
     [[nodiscard]] bool valid() const noexcept { return valid_; }
 
@@ -235,6 +244,9 @@ public:
     [[nodiscard]] bool connect_breaker_open() const;
 
 private:
+    // Shared BEGIN/run/COMMIT-or-ROLLBACK body for with_txn / with_txn_for, so
+    // the PQTRANS_INERROR commit-guard lives in exactly one place.
+    bool run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn);
     void release(PGconn* conn) noexcept;
     Lease acquire_internal(const std::chrono::steady_clock::time_point* deadline);
     /// Connect with the pool's effective parameters. Called WITHOUT the lock

@@ -16,7 +16,9 @@
 #include "guaranteed_state_store.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
+#include "software_inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -642,6 +644,70 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* context,
     response->mutable_server_time()->set_millis_epoch(now_ms);
 
     spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
+    return grpc::Status::OK;
+}
+
+// -- ReportInventory ----------------------------------------------------------
+
+grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
+                                               const pb::InventoryReport* request,
+                                               pb::InventoryAck* response) {
+    metrics_
+        .counter("yuzu_grpc_requests_total",
+                 {{"method", "ReportInventory"}, {"status", "received"}})
+        .increment();
+
+    if (auto s = reject_revoked_peer(context, "report_inventory"); !s.ok())
+        return s;
+
+    // Validate session → resolve agent_id (mirrors Heartbeat).
+    const auto& session_id = request->session_id();
+    std::string agent_id;
+    {
+        std::lock_guard lock(pending_mu_);
+        auto it = pending_by_session_id_.find(std::string(session_id));
+        if (it != pending_by_session_id_.end())
+            agent_id = it->second.agent_id;
+    }
+    if (agent_id.empty()) {
+        auto session = registry_.find_by_session(session_id);
+        if (session)
+            agent_id = session->agent_id;
+    }
+    if (agent_id.empty()) {
+        response->set_received(false);
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
+    }
+
+    response->set_received(true);
+    if (!software_inventory_store_ || !software_inventory_store_->is_open()) {
+        // PG store not wired / not open — ack so the agent does not wedge; the
+        // next sync + the weekly full-floor recover once the store is back.
+        return grpc::Status::OK;
+    }
+
+    // Normalized installed_software via the shared seam (ADR-0016 §5) — the same
+    // seam the gateway ProxyInventory path uses. Isolate ingest failures so a
+    // bad payload can't fail the RPC into a retry loop.
+    //
+    // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): unlike
+    // GatewayUpstreamServiceImpl::ProxyInventory, this direct path does NOT also
+    // upsert *generic* (non-typed) plugin_data keys into the generic InventoryStore.
+    // Latent + non-regressive in slice 1: the agent registers exactly one source
+    // (installed_software, routed through the typed seam on both paths), and
+    // installed_software was never a live generic-store key. When a second, generic
+    // sync source lands, fold the generic-blob upsert INTO ingest_inventory_report
+    // (pass the InventoryStore&) so both paths stay symmetric — do NOT add a parallel
+    // loop here. Tracked as the source-#2 blocker.
+    try {
+        ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response, &metrics_);
+    } catch (const std::exception& ex) {
+        spdlog::warn("ReportInventory: ingest threw for agent {} — acked: {}", agent_id, ex.what());
+    } catch (...) {
+        spdlog::warn("ReportInventory: ingest threw unknown exception for agent {} — acked",
+                     agent_id);
+    }
+    spdlog::debug("ReportInventory from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
 }
 
