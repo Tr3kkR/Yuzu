@@ -133,11 +133,13 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_win_str_utils.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
+    include_directories('../agents/plugins/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
