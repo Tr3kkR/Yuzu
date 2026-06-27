@@ -100,6 +100,11 @@ TEST_CASE("catalogue: 110 distinct obs_types, every spec complete", "[dex][catal
     // types (dex_perf_breach via the state poller). The two counts therefore
     // differ BY DESIGN; each side's drift-net still bites for its own additions.
     CHECK(types.size() == std::size(kAllObsTypes)); // 110 Windows signals
+    // Absolute pin (governance consistency N1): the array-relative check above passes
+    // at ANY count if kAllObsTypes and the catalogue drift together. Bind the
+    // documented 110 directly so a silent +1/-1 to both still fails here.
+    CHECK(types.size() == 110u);
+    CHECK(std::size(kAllObsTypes) == 110u);
     for (const char* t : kAllObsTypes)
         CHECK(types.count(t) == 1);
 }
@@ -740,6 +745,14 @@ TEST_CASE("REAL records: kernel-power 507 modern standby exit carries DRIPS resi
         {{"DripsResidencyInUs", "200"}, {"DurationInUs", "100"}, {"Reason", "0"}});
     REQUIRE(clamped);
     CHECK(clamped->metric == 100.0);
+
+    // DurationInUs=0 (a firmware edge logging an instantaneous standby) must not
+    // divide-by-zero — the extractor guards dur>0 and yields 0%, never UB (governance QE).
+    const auto zero_dur = extract_signal(
+        "System", "Microsoft-Windows-Kernel-Power", 507, 4,
+        {{"DripsResidencyInUs", "0"}, {"DurationInUs", "0"}, {"Reason", "0"}});
+    REQUIRE(zero_dur);
+    CHECK(zero_dur->metric == 0.0);
 }
 
 TEST_CASE("REAL records: Netwtw10 7025 adapter D3 dump (positional, vendor-coupled)",
@@ -792,6 +805,17 @@ TEST_CASE("REAL records: Kernel-Power 521 battery — healthy change suppressed,
     REQUIRE(aband);
     CHECK(aband->reason == "abandoned");
     CHECK(aband->metric == 2.0);
+
+    // A forged/drifted count near INT_MAX must not overflow when summed (parse_int
+    // upper-clamps each count to 1e6; the metric is the clamped, non-negative sum,
+    // never signed-overflow UB — governance cpp-expert S1).
+    const auto forged = extract_signal("System", "Microsoft-Windows-Kernel-Power", 521, 4,
+                                       {{"ErrorBatteryCount", "2000000000"},
+                                        {"AbandonedBatteryCount", "2000000000"}});
+    REQUIRE(forged);
+    CHECK(forged->obs_type == "hw.battery_error");
+    CHECK(forged->metric > 0.0);        // still a signal, not suppressed
+    CHECK(forged->metric <= 2000000.0); // clamped sum (2 × 1e6 ceiling), no overflow
 }
 
 TEST_CASE("REAL records: SCM 7011 service unresponsive — params reversed (param2=service)",

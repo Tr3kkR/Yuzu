@@ -70,11 +70,16 @@ std::uint32_t parse_hex_u32(const std::string& s) {
 
 // Parse a small non-negative count field (battery counts etc.); garbage / empty /
 // negative → 0, so a drifted or forged field is a no-op rather than a throw.
+// Upper-clamped: a forged field near INT_MAX would otherwise overflow (UB) when
+// two parsed counts are summed (cf. x_battery_error's nerr + naband). Real count
+// fields are single digits, so a 1e6 ceiling is loss-free for any genuine value.
 int parse_int(const std::string& s) {
     if (s.empty()) return 0;
     try {
         const int v = std::stoi(s);
-        return v > 0 ? v : 0;
+        if (v <= 0) return 0;
+        constexpr int kMaxCount = 1'000'000;
+        return v > kMaxCount ? kMaxCount : v;
     } catch (...) {
         return 0;
     }
