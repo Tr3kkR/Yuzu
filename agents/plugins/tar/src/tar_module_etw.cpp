@@ -81,6 +81,7 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <atomic>
 #include <cstring> // std::memset (stale-session props reset)
@@ -125,16 +126,12 @@ std::int64_t filetime_to_unix(LARGE_INTEGER ft) {
     return (ft.QuadPart - kEpochDelta) / 10000000LL;
 }
 
-std::wstring utf8_to_wide(const std::string& s) {
-    if (s.empty())
-        return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0)
-        return {};
-    std::wstring w(static_cast<std::size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
-    return w;
-}
+// Delegating shims onto the shared win_str.hpp helper (#1681) -- removes the
+// duplicated WideCharToMultiByte boilerplate while keeping these tar-local
+// signatures (std::string / std::wstring) and call sites unchanged. Both the old
+// local copies and the shared helper treat the input as NUL-terminated, so the
+// conversion is behaviour-identical for the (NUL-free) paths this collector handles.
+std::wstring utf8_to_wide(const std::string& s) { return yuzu::win::to_wide(s); }
 
 // The Kernel-Process IMAGE event delivers ImageName as an NT object-manager
 // device path (\Device\HarddiskVolumeN\...). WinVerifyTrust and GetFileAttributesExW
@@ -150,16 +147,7 @@ std::string nt_path_to_win32(const std::string& p) {
     return p;
 }
 
-std::string wide_to_utf8(const std::wstring& w) {
-    if (w.empty())
-        return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 0)
-        return {};
-    std::string s(static_cast<std::size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
-    return s;
-}
+std::string wide_to_utf8(const std::wstring& w) { return yuzu::win::from_wide(w.c_str()); }
 
 // Read a named UInt32 property from a decoded event. Returns false if absent.
 bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {

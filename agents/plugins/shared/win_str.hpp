@@ -3,12 +3,16 @@
 // A single canonical home (#1681) for the wide<->UTF-8 conversion that several
 // agent plugins had each re-derived. The actual prior landscape (do NOT trust the
 // originating issue's "~6 byte-identical" shorthand): the full trio existed only in
-// installed_apps; `registry` carries to_wide + from_wide (no reg_sz_to_utf8 -- it
-// inlines that); `wmi`/`interaction`/`tar_module_etw`/`services` each carry a single,
+// installed_apps; `registry` carried to_wide + from_wide (no reg_sz_to_utf8 -- it
+// inlines that); `wmi`/`interaction`/`tar_module_etw`/`services` each carried a single,
 // sometimes-renamed wide converter; `processes` has none and no registry access.
-// Those existing copies are deliberately NOT migrated in #1681/#1682 -- only the four
-// previously-ANSI siblings (vuln_scan/os_info/sccm/windows_updates) consume this
-// header so far; aligning the rest is a tracked follow-up.
+// Consumers now: vuln_scan/os_info/sccm/windows_updates (the previously-ANSI siblings,
+// #1682) PLUS registry/wmi/services/interaction/tar_module_etw (de-dup migration --
+// their local copies were removed in favour of this header; tar/services keep their
+// own signature shims that delegate here). The remaining inline converters live in
+// agent CORE (process_enum.cpp, dex_observer.cpp), which is outside agents/plugins/
+// and cannot reach this plugin-shared header -- consolidating those is a separate
+// follow-up. installed_apps keeps its own copy for now (its #1662 fix is on `dev`).
 //
 // These depend only on WideCharToMultiByte / MultiByteToWideChar -- no other Win32
 // surface -- so a header-only home gives one source of truth while preserving build

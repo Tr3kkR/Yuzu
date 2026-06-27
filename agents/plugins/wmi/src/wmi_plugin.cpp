@@ -24,6 +24,7 @@
 #include <windows.h>
 #include <comdef.h>
 #include <wbemidl.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -34,22 +35,13 @@ namespace {
 YuzuPluginContext* g_ctx = nullptr;
 
 #ifdef _WIN32
-std::wstring to_wide(std::string_view s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring ws(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), ws.data(), len);
-    return ws;
-}
+// to_wide now comes from the shared agents/plugins/shared/win_str.hpp (#1681)
+// instead of a local copy; behaviour-identical for valid input.
+using yuzu::win::to_wide;
 
-std::string from_bstr(BSTR bs) {
-    if (!bs) return {};
-    int sz = WideCharToMultiByte(CP_UTF8, 0, bs, -1, nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(sz), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, bs, -1, s.data(), sz, nullptr, nullptr);
-    if (!s.empty() && s.back() == '\0') s.pop_back();
-    return s;
-}
+// BSTR is an OLECHAR* (wchar_t*). The prior local copy read it as NUL-terminated
+// (-1), so the shared from_wide with its default length is behaviour-identical.
+std::string from_bstr(BSTR bs) { return yuzu::win::from_wide(bs); }
 
 std::string variant_to_string(VARIANT& v) {
     switch (v.vt) {

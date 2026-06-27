@@ -155,18 +155,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
   `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
   Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
-  plugin still compiles its own copy and build isolation is preserved); the four siblings consume it.
-  Several other plugins still carry their own ad-hoc converters (only `installed_apps` had the full
-  trio; `registry` has two; `wmi`/`interaction`/`tar_module_etw`/`services` carry one apiece) — those
-  are deliberately **not** migrated here and are tracked as a follow-up. `reg_sz_to_utf8` stops at the
+  plugin still compiles its own copy and build isolation is preserved). Nine plugins now consume it:
+  the four siblings above, plus a **de-dup migration** of `registry`, `wmi`, `services`, `interaction`,
+  and `tar_module_etw`, whose hand-rolled converters (only `installed_apps` had the full trio;
+  `registry` had two; the rest one apiece) are removed in favour of the shared helper
+  (`tar_module_etw`/`services` keep thin signature shims that delegate to it). The remaining inline
+  converters live in agent **core** (`process_enum.cpp`, `dex_observer.cpp`), which is outside
+  `agents/plugins/` and cannot reach the plugin-shared header — consolidating those is a tracked
+  follow-up; `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
   first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
   `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
   prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
   four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
   cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
   trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
-  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows by unit test + a
-  per-plugin compile; the live-registry non-ASCII smoke on the agent VM remains the e2e acceptance step.)
+  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows: unit tests + a
+  per-plugin MSVC compile, and an end-to-end smoke inside the Hyper-V agent VM that seeded a non-ASCII
+  `DisplayName` "Café Ñoño 日本語" under `HKCU\…\Uninstall` and confirmed it round-tripped byte-exact
+  UTF-8 through the real `RegEnumKeyExW` + `reg_sz_to_utf8` read path.)
 
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service
