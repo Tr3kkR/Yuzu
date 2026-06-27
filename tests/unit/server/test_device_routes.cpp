@@ -193,6 +193,14 @@ TEST_CASE("device live run: audit-persist gap surfaces Sec-Audit-Failed, still p
         CHECK(h.dispatched == 1);
         CHECK(r->body.find("/fragments/device/live/result") != std::string::npos);
     }
+    SECTION("clean path sets NO Sec-Audit-Failed header") {
+        LiveHarness h; // audit_ok=true, audit_throws=false
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(h.audited == "device.live.uptime|dispatched|a-1");
+    }
 }
 
 // The regression centrepiece: the result poll keeps pointers into the responses

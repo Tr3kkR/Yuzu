@@ -58,6 +58,7 @@ struct TarHarness {
     std::string os = "linux";
     std::string proc_output = kProcOut;
     std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
 
     struct AuditRow {
@@ -121,7 +122,7 @@ struct TarHarness {
             // site was reached; the throw then exercises the shared helper's catch-arm.
             if (audit_throws)
                 throw std::runtime_error("audit DB write blew up");
-            return true; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
+            return audit_ok; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit);
     }
@@ -405,5 +406,61 @@ TEST_CASE("tar routes: a throwing audit_fn is caught + flags Sec-Audit-Failed at
         CHECK(r->status == 200);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(h.find_audit("tar.sources.configure", "dispatched") != nullptr);
+    }
+}
+
+// #1647: a DROPPED (returns-false) audit row is the realistic failure path (audit DB
+// locked/full). Before this PR the tar sites discarded the bool and set NO header; now
+// they surface Sec-Audit-Failed while still rendering (set-and-proceed). Also pins the
+// idempotent-header guard: the two MULTI-CALL surfaces (dns+arp, the configure loop)
+// must emit Sec-Audit-Failed AT MOST ONCE even when several audits in one request fail.
+TEST_CASE("tar routes: dropped audit row flags Sec-Audit-Failed once; clean path sets none",
+          "[tar][routes][audit]") {
+    SECTION("/run dropped row — set-and-proceed (header + still dispatches)") {
+        TarHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/tar/process-tree/run?device=dev-A&preset=10m");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("process-tree/result") != std::string::npos); // dispatch not blocked
+    }
+    SECTION("/device-net both dns+arp drop — header emitted exactly once (multimap guard)") {
+        TarHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1); // not two field-lines
+        CHECK(h.find_audit("tar.dns.read", "dispatched") != nullptr);
+        CHECK(h.find_audit("tar.arp.read", "dispatched") != nullptr);
+    }
+    SECTION("/device-net both dns+arp throw — header still exactly once") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A"));
+        REQUIRE(r);
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+    }
+    SECTION("/capture-sources/push two sources both drop — header exactly once over the loop") {
+        TarHarness h;
+        h.audit_ok = false;
+        // Two known sources toggled in one request; the per-source audit loop fails twice.
+        auto r = h.sink.Post(
+            "/fragments/tar/capture-sources/push?device=dev-A&changes=process%3Don,tcp%3Doff", "");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+    }
+    SECTION("clean path sets NO Sec-Audit-Failed header") {
+        TarHarness h; // audit_ok=true, audit_throws=false
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(is_32_hex(extract_token(r->body))); // tree rendered normally
     }
 }

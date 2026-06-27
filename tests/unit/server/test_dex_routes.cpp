@@ -1025,6 +1025,25 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(dispatched == 1);
         CHECK(seen_sql.find("$ProcPerf_Hourly") != std::string::npos);
+        // The audit verb was actually reached (row recorded before the throw) — not a
+        // header set by some unrelated path.
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("procperf: a dropped audit row flags Sec-Audit-Failed, still polls") {
+        audit_ok = false;
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("perf clean path sets NO Sec-Audit-Failed header") {
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty()); // audit_ok=true, no throw
+        CHECK(audited == "dex.device.perf.query|success|WS-1");
     }
 }
 
