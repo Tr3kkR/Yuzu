@@ -187,11 +187,16 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
         HKEY app_key{};
         if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
             HKeyCloser app_guard{app_key};
-            auto read_str = [&](const char* value_name) -> std::string {
+            // Value names are compile-time wide literals -> no per-iteration to_wide
+            // allocation in this hot loop (hundreds of apps x 3 reads), and the only
+            // throwing call left is the post-read reg_sz_to_utf8, on which app_guard
+            // still releases app_key (#1682 Gate-4 R4). buf is written as bytes and
+            // read back through its declared wchar_t lvalue (LPBYTE is alignment-1).
+            auto read_str = [&](const wchar_t* value_name) -> std::string {
                 wchar_t buf[512]{};
                 DWORD size = sizeof(buf); // size in BYTES
                 DWORD type = 0;
-                if (RegQueryValueExW(app_key, yuzu::win::to_wide(value_name).c_str(), nullptr, &type,
+                if (RegQueryValueExW(app_key, value_name, nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
                     if (type == REG_SZ && size >= sizeof(wchar_t)) {
                         return yuzu::win::reg_sz_to_utf8(buf, size);
@@ -200,11 +205,11 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 return {};
             };
 
-            auto display_name = read_str("DisplayName");
+            auto display_name = read_str(L"DisplayName");
             if (!display_name.empty()) {
-                auto sys_component = read_str("SystemComponent");
+                auto sys_component = read_str(L"SystemComponent");
                 if (sys_component != "1") {
-                    auto version = read_str("DisplayVersion");
+                    auto version = read_str(L"DisplayVersion");
                     apps.push_back({std::move(display_name), std::move(version)});
                 }
             }

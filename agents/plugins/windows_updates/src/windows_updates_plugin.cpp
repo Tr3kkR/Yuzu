@@ -566,15 +566,16 @@ std::vector<std::string> get_default_patch_targets() {
             LR"(SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate)",
             0, KEY_READ, &hkey) == ERROR_SUCCESS) {
         wchar_t buf[512]{};
-        DWORD buf_size = sizeof(buf); // size in BYTES
+        DWORD buf_size = sizeof(buf); // BYTES; buf read back as wchar_t (LPBYTE is align-1)
         DWORD type = 0;
-        if (RegQueryValueExW(hkey, L"WUServer", nullptr, &type,
-                             reinterpret_cast<LPBYTE>(buf), &buf_size) == ERROR_SUCCESS &&
-            (type == REG_SZ || type == REG_EXPAND_SZ) && buf_size >= sizeof(wchar_t)) {
+        const LONG rc = RegQueryValueExW(hkey, L"WUServer", nullptr, &type,
+                                         reinterpret_cast<LPBYTE>(buf), &buf_size);
+        RegCloseKey(hkey); // closed before the allocating convert -- no leak window (#1682 R1)
+        if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) &&
+            buf_size >= sizeof(wchar_t)) {
             std::string wsus = yuzu::win::reg_sz_to_utf8(buf, buf_size);
             if (!wsus.empty()) targets.push_back(wsus);
         }
-        RegCloseKey(hkey);
     }
 #elif defined(__linux__)
     // Try to read apt sources.list for repository URLs

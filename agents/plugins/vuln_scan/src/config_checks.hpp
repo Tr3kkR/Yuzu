@@ -88,23 +88,27 @@ inline std::string read_proc_value(const char* path) {
 namespace detail {
 
 inline std::string read_registry_string(HKEY root, const char* subkey, const char* value_name) {
-    HKEY hkey{};
     // Reg*W so a non-ASCII config value survives as UTF-8 rather than cp1252
-    // mojibake when it lands in a stored vuln finding (#1662 / #1682).
-    if (RegOpenKeyExW(root, yuzu::win::to_wide(subkey).c_str(), 0, KEY_READ, &hkey) != ERROR_SUCCESS)
+    // mojibake when it lands in a stored vuln finding (#1662 / #1682). Widen the
+    // names BEFORE opening so the only operation between open and RegCloseKey is the
+    // non-allocating RegQueryValueExW; reg_sz_to_utf8 runs AFTER close, so a
+    // std::bad_alloc cannot leak the HKEY (#1682 Gate-4 R1).
+    const std::wstring wsubkey = yuzu::win::to_wide(subkey);
+    const std::wstring wvalue = yuzu::win::to_wide(value_name);
+    HKEY hkey{};
+    if (RegOpenKeyExW(root, wsubkey.c_str(), 0, KEY_READ, &hkey) != ERROR_SUCCESS)
         return {};
     wchar_t buf[512]{};
-    DWORD size = sizeof(buf); // size in BYTES
-    DWORD type = 0;
-    std::string result;
-    if (RegQueryValueExW(hkey, yuzu::win::to_wide(value_name).c_str(), nullptr, &type,
-                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-        if ((type == REG_SZ || type == REG_EXPAND_SZ) && size >= sizeof(wchar_t)) {
-            result = yuzu::win::reg_sz_to_utf8(buf, size);
-        }
+    DWORD size = sizeof(buf); // size in BYTES; buf written as bytes, read back through
+    DWORD type = 0;           // its declared wchar_t lvalue (LPBYTE is alignment-1)
+    const LONG rc = RegQueryValueExW(hkey, wvalue.c_str(), nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size);
+    RegCloseKey(hkey); // closed before the allocating convert -- no leak window
+    if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) &&
+        size >= sizeof(wchar_t)) {
+        return yuzu::win::reg_sz_to_utf8(buf, size);
     }
-    RegCloseKey(hkey);
-    return result;
+    return {};
 }
 
 // Numeric read -- the value is a DWORD, never decoded into a string, so it carries

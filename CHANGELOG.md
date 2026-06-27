@@ -153,12 +153,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
   probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
   picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
-  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters — previously duplicated byte-identically across
-  ~6 plugins — are extracted to a single Windows-only header `agents/plugins/shared/win_str.hpp`
-  (`namespace yuzu::win`, header-only so each plugin still compiles its own copy and build isolation is
-  preserved) and gain deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`: round-trip,
-  trailing-NUL strip, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator, lone-surrogate → U+FFFD,
-  null/empty). No proto/wire change.
+  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
+  Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  plugin still compiles its own copy and build isolation is preserved); the four siblings consume it.
+  Several other plugins still carry their own ad-hoc converters (only `installed_apps` had the full
+  trio; `registry` has two; `wmi`/`interaction`/`tar_module_etw`/`services` carry one apiece) — those
+  are deliberately **not** migrated here and are tracked as a follow-up. `reg_sz_to_utf8` stops at the
+  first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
+  `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
+  prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
+  four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
+  cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
+  trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
+  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows by unit test + a
+  per-plugin compile; the live-registry non-ASCII smoke on the agent VM remains the e2e acceptance step.)
 
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service

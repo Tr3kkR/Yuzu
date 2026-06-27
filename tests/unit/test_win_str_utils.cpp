@@ -2,9 +2,10 @@
 // helpers extracted in #1681 (agents/plugins/shared/win_str.hpp).
 //
 // Windows-only: the helpers and the cases that exercise them are #ifdef _WIN32.
-// On other platforms this compiles to an empty translation unit so the file can
-// be listed unconditionally in tests/meson.build (same convention as the
-// test_dex_win_poll.cpp Windows-only cases).
+// On other platforms this compiles to an empty translation unit, so the file is
+// listed unconditionally in tests/meson.build (the platform-gated-body / listed-
+// unconditionally convention the OS-specific test cases use) rather than guarded
+// with a meson host_machine conditional.
 //
 // These are pure-function tests -- no registry I/O, no advapi32 -- mirroring the
 // REG_SZ byte-count convention that RegQueryValueExW hands reg_sz_to_utf8.
@@ -99,6 +100,26 @@ TEST_CASE("reg_sz_to_utf8 floors a non-wchar-multiple size", "[win][str][reg]") 
 TEST_CASE("reg_sz_to_utf8 preserves non-ASCII (Café)", "[win][str][reg]") {
     std::vector<wchar_t> buf = {L'C', L'a', L'f', L'\u00E9', L'\0'};
     REQUIRE(reg_sz_to_utf8(buf.data(), bytes_of(buf)) == kCafeUtf8);
+}
+
+TEST_CASE("reg_sz_to_utf8 stops at the first NUL (malformed interior NUL)", "[win][str][reg]") {
+    // REG_SZ is NUL-terminated by convention; an interior NUL is malformed. Stopping
+    // at the first NUL yields a clean prefix instead of letting the embedded NUL
+    // survive into the output and silently truncate the whole line at the SDK's
+    // const char* write_output boundary (#1682 Gate-4 R6).
+    std::vector<wchar_t> buf = {L'F', L'o', L'o', L'\0', L'B', L'a', L'r', L'\0'};
+    REQUIRE(reg_sz_to_utf8(buf.data(), bytes_of(buf)) == "Foo");
+}
+
+TEST_CASE("reg_sz_to_utf8 converts a full 512-wchar value with no terminator",
+          "[win][str][reg]") {
+    // The buffer-full, unterminated REG_SZ case exercised at the reg_sz_to_utf8 ENTRY
+    // point (previously covered only via from_wide directly). No NUL to stop at, so
+    // all 512 wchars convert.
+    const std::vector<wchar_t> buf(512, L'y');
+    const std::string out = reg_sz_to_utf8(buf.data(), bytes_of(buf));
+    REQUIRE(out.size() == 512);
+    REQUIRE(out == std::string(512, 'y'));
 }
 
 TEST_CASE("reg_sz_to_utf8 handles null buffer and empty payload", "[win][str][reg]") {
