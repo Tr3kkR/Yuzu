@@ -274,6 +274,7 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"listening", "network_diag", "listening", "device.live.listening"},
         {"connections", "network_diag", "connections", "device.live.connections"},
         {"capture_sources", "tar", "status", "device.live.capture_sources"},
+        {"disk", "disk_space", "free", "device.live.disk"},
     };
     for (const auto& c : cases) {
         LiveHarness h;
@@ -393,6 +394,31 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         REQUIRE(r);
         CHECK(r->body.find("445") != std::string::npos);
         CHECK(r->body.find("id=\"ls-kpi-listen\"") != std::string::npos);
+    }
+    SECTION("disk well-formed line: table + free-% KPI (100 - used)") {
+        LiveHarness h;
+        // 100 GiB total, 25 GiB free, 75% used.
+        h.fake_rows = {{"a-1", 1, "disk|C:\\|107374182400|26843545600|75", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_space-test"
+                            "&agent_id=a-1&kind=disk&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("id=\"ls-kpi-disk\"") != std::string::npos);
+        CHECK(r->body.find("25%") != std::string::npos);       // KPI free% = 100 - 75
+        CHECK(r->body.find("100.0 GiB") != std::string::npos); // human()-formatted total
+    }
+    SECTION("disk: short line skipped; unmeasured total<=0 dashed + off the KPI; bad field zeros") {
+        LiveHarness h;
+        // line1 (3 fields) -> skipped; line2 total 0 -> dash, excluded from worst-used;
+        // line3 non-numeric pct -> zero-default, no crash, drives the KPI.
+        h.fake_rows = {{"a-1", 1, "disk|C:\\|123\n"
+                                  "disk|D:\\|0|0|0\n"
+                                  "disk|/|107374182400|107374182400|x", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_space-test"
+                            "&agent_id=a-1&kind=disk&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("&mdash;") != std::string::npos);        // D: total 0 -> dash
+        CHECK(r->body.find("id=\"ls-cnt-disk\"") != std::string::npos);
+        CHECK(r->body.find(">2<") != std::string::npos);            // 2 rows parsed (short line skipped)
     }
 }
 

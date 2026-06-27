@@ -820,7 +820,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.identity.device_name` | device_name | Q | WLM | *(none)* | hostname:string |
 | `device.identity.domain` | domain | Q | WLM | *(none)* | domain:string, domain_type:string |
 | `device.identity.ou` | ou | Q | WLM | *(none)* | ou:string |
-| `device.diagnostics.disk_space` | disk_space | Q | WLM | *(none)* | drive:string, total_gb:int64, free_gb:int64 |
+| `crossplatform.storage.free` | free | Q | WLM | path:string (optional, default = volume root) | path:string, total_bytes:int64, free_bytes:int64, percent_used:int32 |
 | `device.diagnostics.cpu_usage` | cpu_usage | Q | WLM | *(none)* | cpu_percent:int32 |
 | `device.diagnostics.memory_usage` | memory_usage | Q | WLM | *(none)* | total_mb:int64, used_mb:int64, percent:int32 |
 

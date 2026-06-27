@@ -237,3 +237,41 @@ TEST_CASE("device live capture sources: toggle state + $-table + read-only link"
     CHECK(h.find("/tar") != std::string::npos);      // configure-on-TAR link (read-only here)
     CHECK(render_device_live_capture_sources({}).find("not running") != std::string::npos);
 }
+
+TEST_CASE("device live disk: usage-bar tones, low-free floor, clamp, unmeasured, escaping",
+          "[device][ui]") {
+    constexpr long long kGiB = 1024LL * 1024 * 1024;
+    SECTION("ok tone: ample free, human-readable sizes") {
+        const auto h = render_device_live_disk({{"C:\\", 500 * kGiB, 200 * kGiB, 60}});
+        CHECK(h.find("ls-bar-ok") != std::string::npos);
+        CHECK(h.find("60%") != std::string::npos);
+        CHECK(h.find("500.0 GiB") != std::string::npos); // human() formats the raw bytes
+    }
+    SECTION("red tone mirrors BOTH halves of storage.low (>=90% used OR <5GiB free)") {
+        const auto full = render_device_live_disk({{"/", 100 * kGiB, 1 * kGiB, 99}});
+        CHECK(full.find("ls-bar-bad") != std::string::npos);
+        // 70% used but only 2 GiB free → still red via the low-free floor.
+        const auto lowfree = render_device_live_disk({{"/", 100 * kGiB, 2 * kGiB, 70}});
+        CHECK(lowfree.find("ls-bar-bad") != std::string::npos);
+    }
+    SECTION("warn tone: 75-90% used with ample free") {
+        const auto h = render_device_live_disk({{"/", 1000 * kGiB, 200 * kGiB, 80}});
+        CHECK(h.find("ls-bar-warn") != std::string::npos);
+    }
+    SECTION("unmeasured (total<=0) renders a dash, never a false-healthy bar") {
+        const auto h = render_device_live_disk({{"/", 0, 0, 0}});
+        CHECK(h.find("&mdash;") != std::string::npos);
+        CHECK(h.find("ls-bar-ok") == std::string::npos);
+    }
+    SECTION("percent clamped into [0,100]") {
+        const auto h = render_device_live_disk({{"/", 10 * kGiB, 0, 150}});
+        CHECK(h.find("100%") != std::string::npos);
+        CHECK(h.find("150%") == std::string::npos);
+    }
+    SECTION("path HTML-escaped; empty -> note") {
+        const auto h = render_device_live_disk({{"<x>", 1024, 512, 50}});
+        CHECK(h.find("&lt;x&gt;") != std::string::npos);
+        CHECK(h.find("<x>") == std::string::npos);
+        CHECK(render_device_live_disk({}).find("No volume reported") != std::string::npos);
+    }
+}

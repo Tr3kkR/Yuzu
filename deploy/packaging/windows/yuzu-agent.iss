@@ -74,6 +74,7 @@ Source: "{#BuildDir}\agents\plugins\device_identity\device_identity.dll"; DestDi
 Source: "{#BuildDir}\agents\plugins\os_info\os_info.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\hardware\hardware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\storage\storage.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\disk_space\disk_space.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\filesystem\filesystem.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\users\users.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\installed_apps\installed_apps.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
