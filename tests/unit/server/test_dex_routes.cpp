@@ -895,6 +895,14 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 200);
         CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The new per-event observation drill (#1639) now routes through the SAME
+        // emit_behavioral_audit chokepoint — a dropped evidence row flags the header
+        // but the detail panel still renders (HTML set-and-proceed).
+        auto obs = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obs);
+        CHECK(obs->status == 200);
+        CHECK(obs->get_header_value("Sec-Audit-Failed") == "true");
     }
 
     // #1647 item 1: a throwing audit_fn (bad_alloc-class) was previously silent on
@@ -916,6 +924,13 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 200);
         CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The per-event observation drill (#1639) is caught by the same shared helper:
+        // the throw never escapes the handler, header flagged, fragment still rendered.
+        auto obs = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obs);
+        CHECK(obs->status == 200);
+        CHECK(obs->get_header_value("Sec-Audit-Failed") == "true");
     }
 
     // Re-review blocker: the per-device DEX surface must be management-scoped (mirror

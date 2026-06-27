@@ -2750,21 +2750,23 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                          "text/html; charset=utf-8");
                      return;
                  }
-                 if (audit_fn_)
-                     // Record the obs_type in the detail so usage-class opens (e.g.
-                     // process.crashed/hung — what a person ran) stay SEPARATELY
-                     // COUNTABLE from machine-class opens in the audit log (the
-                     // works-council co-determination requirement; cf.
-                     // dex.device.procperf.query). obs_type is a controlled catalogue
-                     // string, never user input.
-                     // obs_type + event_id are AGENT-controlled — sanitize before the
-                     // audit detail (a compromised agent could embed NUL/control chars;
-                     // see clean_audit_id). Parameterized binding stops SQL injection;
-                     // this stops audit-trail truncation/log-injection.
-                     audit_fn_(req, "dex.observation.view", "success", "Agent", id,
-                               "DEX single-observation detail: " +
-                                   clean_audit_id(obs->obs_type, 64) + " (event " +
-                                   clean_audit_id(obs->event_id) + ")");
+                 // Record the obs_type in the detail so usage-class opens (e.g.
+                 // process.crashed/hung — what a person ran) stay SEPARATELY
+                 // COUNTABLE from machine-class opens in the audit log (the
+                 // works-council co-determination requirement; cf.
+                 // dex.device.procperf.query). obs_type is a controlled catalogue
+                 // string, never user input.
+                 // obs_type + event_id are AGENT-controlled — sanitize before the
+                 // audit detail (a compromised agent could embed NUL/control chars;
+                 // see clean_audit_id). Parameterized binding stops SQL injection;
+                 // this stops audit-trail truncation/log-injection.
+                 // Shared #1647 chokepoint (mirrors dex.device.view above): a dropped
+                 // evidence row flags via Sec-Audit-Failed but STILL renders — HTML
+                 // surface set-and-proceed; a throwing audit_fn is caught, not silent.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.observation.view", "success", "Agent", id,
+                     "DEX single-observation detail: " + clean_audit_id(obs->obs_type, 64) +
+                         " (event " + clean_audit_id(obs->event_id) + ")");
                  res.set_content(render_dex_observation_fragment(*obs),
                                  "text/html; charset=utf-8");
              });
