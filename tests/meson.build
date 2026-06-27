@@ -141,7 +141,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
-    include_directories('../agents/plugins/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
@@ -211,7 +211,7 @@ tar_test_exe = executable(
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
-    include_directories('../agents/plugins/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
+    include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,

@@ -17,11 +17,14 @@
 // processes, device_identity, filesystem, hardware, ioc, content_dist, and the
 // tar_dns_collector / tar_proc_etw / tar_proc_perf / tar_arp_collector siblings), as do
 // several agent-CORE files (process_enum, dex_observer, guard_file, guard_registry,
-// guard_service, temp_file, trigger_engine) which sit outside agents/plugins/ and cannot
-// reach this plugin-shared header. installed_apps keeps its own copy too (its #1662 fix is
-// already on `dev`). A comprehensive sweep of the remaining sites is a tracked follow-up --
-// do NOT read this list as exhaustive; grep `WideCharToMultiByte`/`MultiByteToWideChar` for
-// the live set.
+// guard_service, temp_file, trigger_engine). This header was relocated from
+// agents/plugins/shared/ to agents/shared/ so BOTH agents/core/ and agents/plugins/ can
+// reach it (core could not include a plugin-shared header without inverting the
+// dependency direction); the remaining core + plugin de-dup lands in this same change.
+// installed_apps keeps its own copy (its #1662 fix is already on `dev`; the first-NUL vs
+// trailing-NUL divergence below means aligning it is a deliberate, separately-reviewed
+// step). Do NOT read any in-comment list as exhaustive; grep
+// `WideCharToMultiByte`/`MultiByteToWideChar` for the live set.
 //
 // These depend only on WideCharToMultiByte / MultiByteToWideChar -- no other Win32
 // surface -- so a header-only home gives one source of truth while preserving build
@@ -44,8 +47,8 @@
 // would yield an empty wstring -- opening the ROOT key / reading the DEFAULT value --
 // so validate any runtime-derived name before use.
 
-#ifndef YUZU_PLUGINS_SHARED_WIN_STR_HPP
-#define YUZU_PLUGINS_SHARED_WIN_STR_HPP
+#ifndef YUZU_SHARED_WIN_STR_HPP
+#define YUZU_SHARED_WIN_STR_HPP
 
 #ifdef _WIN32
 
@@ -125,4 +128,4 @@ inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
 
 #endif // _WIN32
 
-#endif // YUZU_PLUGINS_SHARED_WIN_STR_HPP
+#endif // YUZU_SHARED_WIN_STR_HPP

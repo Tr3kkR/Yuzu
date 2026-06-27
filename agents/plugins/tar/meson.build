@@ -55,7 +55,7 @@ shared_library(
     'src/tar_fleet_snapshot.cpp',
   ),
   name_prefix: '',
-  include_directories: include_directories('../shared'),  # win_str.hpp (#1681, tar_module_etw)
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, tar_module_etw)
   cpp_args: tar_cpp_args,
   dependencies: tar_deps,
   install: true,
