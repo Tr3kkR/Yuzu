@@ -113,9 +113,12 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user. Leave empty to return all types.
+          service, user, arp, dns. arp/dns are opt-in device-state sources
+          (ADR-0015) reached only by an explicit filter — they are excluded
+          from the default (empty-filter) feed. Leave empty to return the
+          core process/network/service/user types.
         validation:
-          enum: [process, network, service, user, ""]
+          enum: [process, network, service, user, arp, dns, ""]
       limit:
         type: string
         displayName: Result Limit
@@ -246,7 +249,7 @@ spec:
       type:
         type: string
         displayName: Event Type Filter
-        description: Filter by event type (process, network, service, user).
+        description: Filter by event type (process, network, service, user, arp, dns).
       limit:
         type: string
         displayName: Result Limit
@@ -330,10 +333,15 @@ spec:
         type: string
         displayName: Redaction Patterns
         description: >
-          JSON array of glob patterns for command-line redaction. Any
-          process command line matching a pattern has its cmdline replaced
-          with "[REDACTED by TAR]". Default patterns: ["*password*",
-          "*secret*", "*token*", "*api_key*", "*credential*"].
+          JSON array of case-insensitive SUBSTRING patterns (not glob) for
+          command-line redaction. Leading/trailing `*` are stripped; `?` and
+          `[abc]` are literals. Any process command line containing a pattern
+          has its cmdline replaced with "[REDACTED by TAR]". At most 256
+          elements of at most 256 characters each; over-cap elements are
+          dropped at load. Default patterns: ["*password*", "*secret*",
+          "*token*", "*api_key*", "*credential*"]. These defaults are ALWAYS
+          MERGED IN — your patterns are ADDED to them, never replace them, so an
+          empty or all-invalid array cannot disable the baseline redaction.
       process_enabled:
         type: string
         displayName: Process Collector Enabled
@@ -372,19 +380,45 @@ spec:
           agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
+      arp_enabled:
+        type: string
+        displayName: ARP Collector Enabled
+        description: >
+          Enable or disable the ARP / neighbour-table capture source (ADR-0015).
+          Opt-in: "false" by default. See process_enabled for semantics.
+          Windows-only collector today (Linux/macOS planned). Requires agent
+          v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      dns_enabled:
+        type: string
+        displayName: DNS Cache Collector Enabled
+        description: >
+          Enable or disable the DNS resolver-cache capture source (ADR-0015).
+          Opt-in: "false" by default — the DNS cache reveals visited domains
+          (usage-class telemetry under the works-council posture; enabling is
+          audited). Windows-only collector today (Linux/macOS planned). Requires
+          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
       network_capture_method:
         type: string
         displayName: Network Capture Method
         description: >
-          TCP capture mechanism. "polling" (default) drives the collector
-          via the platform polling API (iphlpapi on Windows,
-          /proc/net/tcp* on Linux, libproc on macOS) at fast_interval
-          cadence. Other values (iphlpapi, procfs, lsof, etw,
-          endpoint_security) can be pre-staged for forthcoming
-          kernel-event collectors but are accepted-but-not-yet-implemented;
-          the agent emits a warn line. The mechanism actually in force is
-          observable via network_capture_method_effective in the status
-          action (always polling today). Requires agent v0.12.0+.
+          TCP capture mechanism. "polling" (always accepted) drives the
+          collector via the platform polling API at fast_interval cadence and
+          is the only mechanism wired today. Validation is OS-AWARE and scoped to
+          the NETWORK (tcp) source: besides "polling", only the tcp-source method
+          valid on the RUNNING host's OS is accepted — iphlpapi on Windows, procfs
+          on Linux, proc_pidfdinfo on macOS (run the `compatibility` action for the
+          live list). Process-source methods such as "etw" / "endpoint_security"
+          are NOT network_capture_method values and are rejected even on their own
+          OS. A method belonging to a DIFFERENT OS is also rejected, so a Linux
+          agent can no longer store "iphlpapi". A host-valid future method is
+          accepted for pre-staging; the agent emits a warn line and continues
+          polling until that collector lands. The mechanism actually in force is
+          observable via network_capture_method_effective in the status action
+          (always polling today). Requires agent v0.12.0+.
       process_stabilization_exclusions:
         type: string
         displayName: Process Stabilization Exclusions
@@ -395,8 +429,12 @@ spec:
           dwarf real activity. Trade-off: forensic completeness — anything
           matching is invisible to TAR. Leading and trailing `*` are
           stripped (so `*-helper*` is the same as `-helper`). NOT real
-          glob — `?` and `[abc]` are treated as literals. Requires agent
-          v0.12.0+. Example: '["chrome-helper","ms-edge-helper"]'.
+          glob — `?` and `[abc]` are treated as literals. At most 256
+          elements of at most 256 characters each, and the EFFECTIVE substring
+          (after stripping `*`) must be at least 3 characters — a shorter core
+          like "a" or "*a*" would match almost every process and is rejected
+          at configure AND dropped at load. Requires agent v0.12.0+. Example:
+          '["chrome-helper","ms-edge-helper"]'.
 
   result:
     columns:

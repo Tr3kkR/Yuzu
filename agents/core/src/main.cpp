@@ -166,6 +166,13 @@ int main(int argc, char* argv[]) {
                  "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
         ->envname("YUZU_AGENT_DEX_DISABLE");
 
+    app.add_flag("--inventory-disable", cfg.inventory_disable,
+                 "Disable the daily installed-software inventory sync (ADR-0016): collect "
+                 "and push no installed-software inventory. Deploy-time opt-out for "
+                 "jurisdictions / works-council agreements that require it off; not a "
+                 "server-side runtime toggle.")
+        ->envname("YUZU_AGENT_INVENTORY_DISABLE");
+
     // Windows service management
     bool install_service = false;
     bool remove_service = false;

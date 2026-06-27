@@ -102,7 +102,8 @@ struct TarHarness {
                 it != params.end() && it->second.find("$Process_Live") != std::string::npos;
             return {is_proc ? kProcCmd : kTcpCmd, 1};
         };
-        auto responses = [this](const std::string& cmd) -> std::vector<DexAgentResponse> {
+        auto responses = [this](const std::string& cmd,
+                                 const std::string& /*agent_id*/) -> std::vector<DexAgentResponse> {
             if (cmd == kProcCmd)
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)
@@ -110,8 +111,10 @@ struct TarHarness {
             return {};
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string& tid, const std::string& d) {
+                            const std::string&, const std::string& tid,
+                            const std::string& d) -> bool {
             audit_log.push_back({a, r, tid, d});
+            return true; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit);
     }

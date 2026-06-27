@@ -2,6 +2,7 @@
 
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
+#include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 
 #include <algorithm>
 #include <cctype>
@@ -527,7 +528,12 @@ struct DexFamilyRollup {
     int64_t events = 0;
     int active = 0;
     int total = 0;
-    int64_t devices = 0;
+    // #1374: the MAX of member signals' distinct-device counts, NOT the family-wide
+    // union. Two disjoint 50-device signals yield 50, not 100. Named explicitly so
+    // the UI label and the health-deduction basis agree (a true union would need a
+    // per-family COUNT(DISTINCT agent_id) query — deferred; this is a secondary,
+    // already-cross-family-overlapping composite).
+    int64_t max_signal_devices = 0;
     const DexSignalCount* top = nullptr;
     bool benign = false;
 };
@@ -548,8 +554,8 @@ DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
         r.events += c->count;
         if (c->count > 0)
             ++r.active;
-        if (c->distinct_devices > r.devices)
-            r.devices = c->distinct_devices;
+        if (c->distinct_devices > r.max_signal_devices)
+            r.max_signal_devices = c->distinct_devices; // #1374: max, not union (see field doc)
         if (!r.top || c->count > r.top->count)
             r.top = c;
     }
@@ -855,13 +861,15 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
               osf == "all" ? "on your fleet" : "on " + osf);
     h += tile(r.benign ? "ok" : (r.events > 0 ? "warn" : ""), num(r.events),
               r.benign ? "Reports (window)" : "Events (window)", "");
-    h += tile("", num(r.devices), "Devices affected", "");
+    h += tile("", num(r.max_signal_devices), "Peak signal devices", "largest single signal");
     h += "</div>";
 
     h += "<div class=\"gp-sech\">Signals in this family</div>";
     h += "<div class=\"gp-note\">Every catalogued type is listed. <b>Monitored</b> rows are watched "
          "by a connected platform (lit even at zero events); <b>not collected</b> rows have no "
-         "platform in view that emits them. Devices is the blast radius (distinct devices).</div>";
+         "platform in view that emits them. <b>Peak signal devices</b> above is the largest single "
+         "signal's distinct-device count, not the family-wide union (two disjoint 50-device signals "
+         "read 50, not 100); the per-signal counts below are exact.</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Signal</th><th>Coverage</th>"
          "<th class=\"gp-num\">Events</th><th class=\"gp-num\">Devices</th><th>Last seen</th>"
          "</tr></thead><tbody>";
@@ -1129,7 +1137,8 @@ DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, i
                 break;
             }
         const DexFamilyRollup rr = g ? dex_family_rollup(*g, signals) : DexFamilyRollup{};
-        double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+        // #1374: largest single-signal device radius, not the family union (see field doc).
+        double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
         if (impact > 1.0)
             impact = 1.0;
         const double ded = dex_severity_points(fw.severity) * dex_preset_mult(fw, preset) * impact;
@@ -1147,7 +1156,11 @@ double dex_family_health_deduction(const DexSignalGroup& g,
     if (N <= 0)
         return 0.0;
     const DexFamilyRollup rr = dex_family_rollup(g, signals);
-    double impact = static_cast<double>(rr.devices) / static_cast<double>(N);
+    // #1374: impact uses the largest single-signal device radius, not the family
+    // union — documented in the methodology so the number and label agree. A union
+    // would deduct more for disjoint-device families; this stays the (intentionally
+    // approximate, cross-family-overlapping) secondary composite.
+    double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
     if (impact > 1.0)
         impact = 1.0;
     for (const auto& fw : dex_family_weights())
@@ -2619,9 +2632,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  // open, mirroring /fragments/dex/device, so the "audit-logged on
                  // open" banner the fragment shows is true and the SOC 2
                  // compensating control applies (governance B4).
-                 if (audit_fn_)
-                     audit_fn_(req, "dex.signal.view", "success", "ObsType", type,
-                               "DEX per-signal most-affected devices");
+                 // Capture the audit bool (#1549 review): a dropped evidence row on
+                 // this PII drill-down is a works-council/SOC 2 gap. HTML surface →
+                 // flag via Sec-Audit-Failed but STILL render (a transient audit
+                 // hiccup must not blank the dashboard); the REST sibling fails closed.
+                 // Shared helper (#1647) adds the catch-arm log the inline copy lacked.
+                 (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.signal.view",
+                                                     "success", "ObsType", type,
+                                                     "DEX per-signal most-affected devices");
                  const auto vis = resolve_visible(req); // scope the most-affected-devices list
                  res.set_content(
                      render_dex_catalogue_signal_fragment(store_, since, window_days, type, os,
@@ -2685,9 +2703,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string w =
             window_token(window_to_days(req.has_param("window") ? req.get_param_value("window")
                                                                 : "7d"));
-        if (audit_fn_)
-            audit_fn_(req, "dex.device.view", "success", "Agent", id,
-                      "DEX per-device signal history");
+        // Capture the audit bool (#1549 review): surface a dropped evidence row on
+        // this PII drill-down via Sec-Audit-Failed; HTML surface still renders.
+        // Shared helper (#1647) adds the catch-arm log the inline copy lacked.
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "dex.device.view", "success",
+                                            "Agent", id, "DEX per-device signal history");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
         std::optional<DexPerfSnapshot> snap;
@@ -2891,10 +2911,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
         const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-        if (audit_fn_)
-            audit_fn_(req, "dex.device.perf.query", sent > 0 ? "success" : "no_agents", "Agent",
-                      id, "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
-                              " agent(s) command_id=" + command_id);
+        // Capture the audit bool (#1549 governance): surface a dropped evidence row on
+        // this usage-class dispatch via Sec-Audit-Failed; HTML surface still renders.
+        if (audit_fn_ &&
+            !audit_fn_(req, "dex.device.perf.query", sent > 0 ? "success" : "no_agents", "Agent",
+                       id, "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
+                               " agent(s) command_id=" + command_id))
+            res.set_header("Sec-Audit-Failed", "true");
         if (sent == 0) {
             note(res, "Device offline &mdash; the live performance query needs a connected "
                       "agent.");
@@ -2936,7 +2959,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* failed = nullptr;
-        const auto rows = responses_fn_(command_id);
+        // #1634: scope at the store seam (q.agent_id), not only the post-filter below.
+        const auto rows = responses_fn_(command_id, id);
         for (const auto& r : rows) {
             if (r.agent_id != id)
                 continue; // another agent's rows are never rendered here
@@ -3012,11 +3036,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
                  const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-                 if (audit_fn_)
-                     audit_fn_(req, "dex.device.procperf.query",
-                               sent > 0 ? "success" : "no_agents", "Agent", id,
-                               "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
-                                   std::to_string(sent) + " agent(s) command_id=" + command_id);
+                 // Capture the audit bool (#1549 governance): the procperf probe is
+                 // usage-class (works-council-relevant); surface a dropped evidence row
+                 // via Sec-Audit-Failed; HTML surface still renders.
+                 if (audit_fn_ &&
+                     !audit_fn_(req, "dex.device.procperf.query",
+                                sent > 0 ? "success" : "no_agents", "Agent", id,
+                                "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
+                                    std::to_string(sent) + " agent(s) command_id=" + command_id))
+                     res.set_header("Sec-Audit-Failed", "true");
                  if (sent == 0) {
                      note(res, "Device offline &mdash; the live per-app query needs a connected "
                                "agent.");
@@ -3060,7 +3088,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  }
                  const DexAgentResponse* with_output = nullptr;
                  const DexAgentResponse* failed = nullptr;
-                 const auto rows = responses_fn_(command_id);
+                 // #1634: scope at the store seam (q.agent_id), not only the post-filter.
+                 const auto rows = responses_fn_(command_id, id);
                  for (const auto& r : rows) {
                      if (r.agent_id != id)
                          continue; // another agent's rows are never rendered here

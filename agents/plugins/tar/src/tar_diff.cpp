@@ -72,7 +72,10 @@ bool icontains(const std::string& haystack, const std::string& needle) {
     return it != haystack.end();
 }
 
-/// Strip leading/trailing '*' from a glob pattern to get the core substring.
+/// Strip leading/trailing '*' from a pattern to get the core substring. NOTE:
+/// matching is case-insensitive SUBSTRING containment, NOT real glob — `?` and
+/// `[abc]` are treated as literals; only leading/trailing `*` are honoured (as a
+/// readability affordance), then stripped here before the substring search.
 std::string strip_stars(const std::string& pattern) {
     std::string result = pattern;
     while (!result.empty() && result.front() == '*')
@@ -561,6 +564,74 @@ std::vector<UserEvent> compute_user_events(
     for (const auto& u : previous) {
         if (!curr_map.contains(make_key(u)))
             events.push_back({timestamp, snapshot_id, "logout", u.user, u.domain, u.logon_type, u.session_id});
+    }
+
+    return events;
+}
+
+std::vector<ArpEvent> compute_arp_events(
+    const std::vector<ArpEntry>& previous,
+    const std::vector<ArpEntry>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<ArpEvent> events;
+
+    // \x1f (unit separator) cannot appear in an interface/IP/MAC string, so the
+    // composite key is collision-free without escaping.
+    auto make_key = [](const ArpEntry& a) -> std::string {
+        return a.iface + "\x1f" + a.ip_address + "\x1f" + a.mac_address;
+    };
+
+    std::unordered_map<std::string, const ArpEntry*> prev_map;
+    for (const auto& a : previous) prev_map[make_key(a)] = &a;
+    std::unordered_map<std::string, const ArpEntry*> curr_map;
+    for (const auto& a : current) curr_map[make_key(a)] = &a;
+
+    // entry_type is intentionally NOT in the key — a dynamic/static flap on the
+    // same binding is a value update, not an appeared/removed transition.
+    for (const auto& a : current) {
+        if (!prev_map.contains(make_key(a)))
+            events.push_back({timestamp, snapshot_id, "appeared", a.iface,
+                              a.ip_address, a.mac_address, a.entry_type});
+    }
+    for (const auto& a : previous) {
+        if (!curr_map.contains(make_key(a)))
+            events.push_back({timestamp, snapshot_id, "removed", a.iface,
+                              a.ip_address, a.mac_address, a.entry_type});
+    }
+
+    return events;
+}
+
+std::vector<DnsEvent> compute_dns_events(
+    const std::vector<DnsEntry>& previous,
+    const std::vector<DnsEntry>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<DnsEvent> events;
+
+    // Key on the resolution identity only. \x1f separates the fields (DNS data —
+    // e.g. a TXT record — may legitimately contain ':' or '|', so those are unsafe
+    // delimiters). ttl_remaining_s is excluded so the per-tick TTL decrement does
+    // not churn appeared/removed.
+    auto make_key = [](const DnsEntry& d) -> std::string {
+        return d.name + "\x1f" + d.record_type + "\x1f" + d.data;
+    };
+
+    std::unordered_map<std::string, const DnsEntry*> prev_map;
+    for (const auto& d : previous) prev_map[make_key(d)] = &d;
+    std::unordered_map<std::string, const DnsEntry*> curr_map;
+    for (const auto& d : current) curr_map[make_key(d)] = &d;
+
+    for (const auto& d : current) {
+        if (!prev_map.contains(make_key(d)))
+            events.push_back({timestamp, snapshot_id, "appeared", d.name,
+                              d.record_type, d.data, d.ttl_remaining_s, d.source});
+    }
+    for (const auto& d : previous) {
+        if (!curr_map.contains(make_key(d)))
+            events.push_back({timestamp, snapshot_id, "removed", d.name,
+                              d.record_type, d.data, d.ttl_remaining_s, d.source});
     }
 
     return events;

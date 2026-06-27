@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <vector>
@@ -116,6 +117,44 @@ TEST_CASE("Histogram: bucket boundaries", "[metrics][histogram]") {
     REQUIRE(snap.boundaries == defaults);
     REQUIRE(snap.count == 0);
     REQUIRE(snap.sum == 0.0);
+}
+
+TEST_CASE("Histogram: seconds_buckets_60s extends the tail past 10s (#1686)",
+          "[metrics][histogram]") {
+    auto ext = Histogram::seconds_buckets_60s();
+    CHECK(ext.front() == 0.005);
+    CHECK(ext.back() == 60.0);
+    // The default set is a strict prefix; the extension only ADDS the 10-60s tail.
+    auto defaults = Histogram::default_buckets();
+    REQUIRE(ext.size() > defaults.size());
+    CHECK(std::equal(defaults.begin(), defaults.end(), ext.begin()));
+}
+
+TEST_CASE("MetricsRegistry: histogram bucket overload seeds custom buckets at creation (#1686)",
+          "[metrics][registry][histogram]") {
+    MetricsRegistry reg;
+
+    // Labeled overload: a 20s observation lands in le="20", NOT collapsed into
+    // +Inf beyond the default 10s ceiling — the whole point of the seam.
+    reg.histogram("ingest_seconds", {{"phase", "full"}}, Histogram::seconds_buckets_60s())
+        .observe(20.0);
+    const auto out = reg.serialize();
+    CHECK(out.find("ingest_seconds_bucket{phase=\"full\",le=\"20\"} 1") != std::string::npos);
+    CHECK(out.find("ingest_seconds_bucket{phase=\"full\",le=\"10\"} 0") != std::string::npos);
+    CHECK(out.find("ingest_seconds_count{phase=\"full\"} 1") != std::string::npos);
+
+    // No-labels overload (unambiguous against the Labels overload — vector<double>).
+    reg.histogram("acquire_seconds", Histogram::seconds_buckets_60s()).observe(30.0);
+    CHECK(reg.serialize().find("acquire_seconds_bucket{le=\"30\"} 1") != std::string::npos);
+
+    // Buckets are fixed at first creation: a later call with DIFFERENT (default)
+    // buckets must NOT re-bucket the existing series — the 60s-range boundary it
+    // was born with survives (default_buckets() has no le="30").
+    reg.histogram("acquire_seconds", Histogram::default_buckets()).observe(0.001);
+    // le="30" survives (the series kept its 60s boundaries) AND accumulates: the
+    // 30.0 and 0.001 observations are both ≤ 30, so the cumulative count is 2 — a
+    // default-bucket re-bind would have dropped the le="30" series entirely.
+    CHECK(reg.serialize().find("acquire_seconds_bucket{le=\"30\"} 2") != std::string::npos);
 }
 
 // ── MetricFamily ────────────────────────────────────────────────────────────

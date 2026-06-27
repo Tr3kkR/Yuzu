@@ -132,10 +132,13 @@ agent_test_exe = executable(
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
+    'unit/test_inventory_sync.cpp',
+    'unit/test_installed_apps_registry_utf8.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
@@ -225,6 +228,7 @@ if build_server
       'unit/server/test_mfa_step_up.cpp',
       'unit/server/test_mfa_qr.cpp',
       'unit/server/test_mfa_store.cpp',
+      'unit/server/test_auth_lockout.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
@@ -235,6 +239,8 @@ if build_server
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
       'unit/server/test_audit_store.cpp',
+      'unit/server/test_rest_audit_sample.cpp',
+      'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
@@ -311,6 +317,7 @@ if build_server
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_rest_software_packages.cpp',
+      'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',
@@ -335,6 +342,8 @@ if build_server
       'unit/server/test_pg_hardening.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
+      'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_pg_array.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

@@ -5,11 +5,14 @@
  *   "list"        — List running processes: PID, name.
  *   "list_hashed" — List running processes with the SHA-256 of the on-disk
  *                   executable image + its path: proc|pid|name|sha256|path.
+ *   "list_tree"   — List running processes with parent PID + image hash for
+ *                   tree reconstruction: proc|pid|ppid|name|sha256|path.
  *   "query"       — Filter process list by case-insensitive name match.
  *
  * Output is pipe-delimited via write_output():
- *   proc|pid|name                (list / query)
- *   proc|pid|name|sha256|path    (list_hashed; sha256/path empty if unresolved)
+ *   proc|pid|name                  (list / query)
+ *   proc|pid|name|sha256|path      (list_hashed; sha256/path empty if unresolved)
+ *   proc|pid|ppid|name|sha256|path (list_tree; ppid 0 = root; sha256/path empty if unresolved)
  */
 
 #include <yuzu/agent/plugin_loader.hpp> // yuzu::agent::sha256_file
@@ -50,6 +53,7 @@ namespace {
 
 struct ProcessInfo {
     unsigned long pid;
+    unsigned long ppid = 0; // parent PID (0 when unknown / a root) — for list_tree
     std::string name;
 };
 
@@ -83,6 +87,7 @@ std::vector<ProcessInfo> enumerate_processes() {
         do {
             ProcessInfo pi;
             pi.pid = pe.th32ProcessID;
+            pi.ppid = pe.th32ParentProcessID;
             // Wide to narrow (ASCII process names)
             int len =
                 WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, nullptr, 0, nullptr, nullptr);
@@ -127,14 +132,22 @@ std::vector<ProcessInfo> enumerate_processes() {
         ProcessInfo pi;
         pi.pid = std::stoul(entry->d_name);
         std::string line;
+        bool have_name = false, have_ppid = false;
         while (std::getline(ifs, line)) {
-            if (line.starts_with("Name:")) {
+            if (!have_name && line.starts_with("Name:")) {
+                auto pos = line.find_first_not_of(" \t", 5);
+                if (pos != std::string::npos)
+                    pi.name = line.substr(pos);
+                have_name = true;
+            } else if (!have_ppid && line.starts_with("PPid:")) {
                 auto pos = line.find_first_not_of(" \t", 5);
                 if (pos != std::string::npos) {
-                    pi.name = line.substr(pos);
+                    try { pi.ppid = std::stoul(line.substr(pos)); } catch (...) {}
                 }
-                break;
+                have_ppid = true;
             }
+            if (have_name && have_ppid)
+                break; // PPid follows Name in /proc/<pid>/status — both captured
         }
         procs.push_back(std::move(pi));
     }
@@ -144,7 +157,7 @@ std::vector<ProcessInfo> enumerate_processes() {
 #elif defined(__APPLE__)
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
-    FILE* pipe = popen("ps -axo pid,comm", "r");
+    FILE* pipe = popen("ps -axo pid,ppid,comm", "r");
     if (!pipe)
         return procs;
 
@@ -164,7 +177,7 @@ std::vector<ProcessInfo> enumerate_processes() {
         if (line.empty())
             continue;
 
-        // Parse: "  PID COMMAND"
+        // Parse: "  PID  PPID COMMAND"
         auto pos = line.find_first_not_of(' ');
         if (pos == std::string::npos)
             continue;
@@ -178,7 +191,19 @@ std::vector<ProcessInfo> enumerate_processes() {
         } catch (...) {
             continue;
         }
-        auto cmd_start = line.find_first_not_of(' ', space);
+        // PPID column
+        auto ppid_start = line.find_first_not_of(' ', space);
+        if (ppid_start == std::string::npos)
+            continue;
+        auto ppid_end = line.find(' ', ppid_start);
+        if (ppid_end == std::string::npos)
+            continue;
+        try {
+            pi.ppid = std::stoul(line.substr(ppid_start, ppid_end - ppid_start));
+        } catch (...) {
+            pi.ppid = 0;
+        }
+        auto cmd_start = line.find_first_not_of(' ', ppid_end);
         if (cmd_start != std::string::npos) {
             pi.name = line.substr(cmd_start);
         }
@@ -266,7 +291,7 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"list", "list_hashed", "query", nullptr};
+        static const char* acts[] = {"list", "list_hashed", "list_tree", "query", nullptr};
         return acts;
     }
 
@@ -281,6 +306,9 @@ public:
         if (action == "list_hashed") {
             return do_list_hashed(ctx);
         }
+        if (action == "list_tree") {
+            return do_list_tree(ctx);
+        }
         if (action == "query") {
             return do_query(ctx, params);
         }
@@ -294,6 +322,34 @@ private:
         auto procs = enumerate_processes();
         for (const auto& p : procs) {
             ctx.write_output(std::format("proc|{}|{}", p.pid, sanitize_field(p.name)));
+        }
+        return 0;
+    }
+
+    // proc|pid|ppid|name|sha256|path — the parent-PID edges the server reconstructs
+    // into a live process tree (device-page "Get live info"), with the SHA-256 of the
+    // on-disk image + its resolved path on each node (so the tree is the single
+    // process view — no separate flat hashed list). ppid is 0 for a root / unresolved
+    // parent; sha256/path are empty when the path can't be resolved or the image is
+    // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
+    int do_list_tree(yuzu::CommandContext& ctx) {
+        static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
+        auto procs = enumerate_processes();
+        std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        for (const auto& p : procs) {
+            std::string path = resolve_exe_path(p.pid);
+            std::string hash;
+            if (!path.empty()) {
+                auto it = hash_cache.find(path);
+                if (it != hash_cache.end()) {
+                    hash = it->second;
+                } else {
+                    hash = yuzu::agent::sha256_file(path, kMaxHashBytes);
+                    hash_cache.emplace(path, hash);
+                }
+            }
+            ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
+                                         sanitize_field(p.name), hash, sanitize_field(path)));
         }
         return 0;
     }

@@ -18,7 +18,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,9 +35,11 @@ struct LiveHarness {
 
     int dispatched = 0;
     int fake_sent = 1;
-    std::string seen_plugin, seen_action, seen_id;
-    std::vector<DexAgentResponse> fake_rows; // what the response store "has"
-    std::string audited;                     // "action|result|target_id"
+    std::string seen_plugin, seen_action, seen_id;            // LAST dispatch (compat)
+    std::vector<std::pair<std::string, std::string>> seen_dispatches; // ALL (plugin,action)
+    std::vector<DexAgentResponse> fake_rows;                  // default response store contents
+    std::unordered_map<std::string, std::vector<DexAgentResponse>> rows_by_cmd; // per-command override
+    std::string audited;                                      // "action|result|target_id"
     bool allow_execute = true;
 
     LiveHarness() {
@@ -60,13 +64,21 @@ struct LiveHarness {
             seen_plugin = plugin;
             seen_action = action;
             seen_id = ids.empty() ? "" : ids.front();
+            seen_dispatches.emplace_back(plugin, action);
             // command_id prefix MUST be <plugin>- so the result route accepts it.
             return {plugin + "-test", fake_sent};
         };
-        auto responses = [this](const std::string&) { return fake_rows; };
+        auto responses = [this](const std::string& cmd, const std::string& /*agent_id*/) {
+            // #1634: production scopes by agent_id at the store seam; the stub returns
+            // by command_id and relies on the route's post-filter for isolation tests.
+            auto it = rows_by_cmd.find(cmd);
+            return it != rows_by_cmd.end() ? it->second : fake_rows;
+        };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
             audited = a + "|" + r + "|" + tid;
+            return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
         };
         // store is unused by the live routes — pass nullptr deliberately.
         routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
@@ -76,13 +88,22 @@ struct LiveHarness {
 
 } // namespace
 
-TEST_CASE("device live shell: serves one auto-firing run panel per kind", "[device][routes]") {
+TEST_CASE("device live shell: serves a collapsible card per kind + chrome", "[device][routes]") {
     LiveHarness h;
     auto r = h.sink.Get("/fragments/device/live?id=a-1");
     REQUIRE(r);
     CHECK(r->status == 200);
+    // uptime is the hidden KPI loader; the cards cover the rest of the snapshot.
     CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=uptime") != std::string::npos);
-    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=processes") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=process_tree") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=services") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=arp") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=dns_cache") != std::string::npos);
+    CHECK(r->body.find("/fragments/device/live/run?id=a-1&amp;kind=capture_sources") != std::string::npos);
+    // Snapshot chrome: collapsible cards + expand-all + pop-out (CSP-safe inline handlers).
+    CHECK(r->body.find("class=\"ls-card\"") != std::string::npos);
+    CHECK(r->body.find("lsToggleAll(this)") != std::string::npos);
+    CHECK(r->body.find("lsPopOut(event,this)") != std::string::npos);
 }
 
 TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[device][routes]") {
@@ -98,8 +119,10 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         CHECK(r->body.find("/fragments/device/live/result?command_id=os_info-test") !=
               std::string::npos);
         CHECK(r->body.find("kind=uptime") != std::string::npos);
-        // Usage vs machine-health audit split (works-council posture).
-        CHECK(h.audited == "device.live.uptime|success|a-1");
+        // Usage vs machine-health audit split (works-council posture). The result
+        // is "dispatched" (not "success") — the outcome isn't known at dispatch time
+        // and this stays in lockstep with the REST sibling.
+        CHECK(h.audited == "device.live.uptime|dispatched|a-1");
     }
     SECTION("processes -> processes/list_hashed, audited as device.live.processes") {
         LiveHarness h;
@@ -107,7 +130,7 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         REQUIRE(r);
         CHECK(h.seen_plugin == "processes");
         CHECK(h.seen_action == "list_hashed"); // hashed variant carries the SHA-256
-        CHECK(h.audited == "device.live.processes|success|a-1");
+        CHECK(h.audited == "device.live.processes|dispatched|a-1");
     }
     SECTION("offline device (sent=0): honest note, no polling, no auto-fire") {
         LiveHarness h;
@@ -140,14 +163,15 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
 // (the original bug) is a use-after-free; these sections drive that path with
 // real output and assert the rendered result.
 TEST_CASE("device live result: output renders, server survives the poll", "[device][routes]") {
-    SECTION("uptime output -> value tile, polling stops") {
+    SECTION("uptime output -> KPI out-of-band swap, polling stops") {
         LiveHarness h;
         h.fake_rows = {{"a-1", 0, "uptime_seconds|181740\nuptime_display|2d 2h 29m", ""}};
         auto r = h.sink.Get(
             "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
         REQUIRE(r);
         CHECK(r->body.find("2d 2h 29m") != std::string::npos);
-        CHECK(r->body.find("Uptime") != std::string::npos);
+        CHECK(r->body.find("id=\"ls-kpi-uptime\"") != std::string::npos); // fills the KPI tile
+        CHECK(r->body.find("hx-swap-oob=\"true\"") != std::string::npos);
         CHECK(r->body.find("hx-trigger") == std::string::npos); // resolved, no re-poll
     }
     SECTION("processes output -> PID/name/hash table (proc|pid|name|sha256|path)") {
@@ -236,6 +260,157 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
     }
 }
 
+// The expanded live-snapshot kinds each map to ONE real plugin action with its own
+// audit verb. process_tree additionally dual-dispatches its connection join.
+TEST_CASE("device live run: expanded kinds map to the right plugin/action + audit",
+          "[device][routes]") {
+    struct Case { const char* kind; const char* plugin; const char* action; const char* verb; };
+    const Case cases[] = {
+        {"services", "services", "list", "device.live.services"},
+        {"users", "users", "logged_on", "device.live.users"},
+        {"netconfig", "network_config", "ip_addresses", "device.live.netconfig"},
+        {"arp", "network_config", "arp", "device.live.arp"},
+        {"dns_cache", "network_config", "dns_cache", "device.live.dns_cache"},
+        {"listening", "network_diag", "listening", "device.live.listening"},
+        {"connections", "network_diag", "connections", "device.live.connections"},
+        {"capture_sources", "tar", "status", "device.live.capture_sources"},
+    };
+    for (const auto& c : cases) {
+        LiveHarness h;
+        auto r = h.sink.Get(std::string("/fragments/device/live/run?id=a-1&kind=") + c.kind);
+        REQUIRE(r);
+        CHECK(h.seen_plugin == c.plugin);
+        CHECK(h.seen_action == c.action);
+        // Post-dispatch audit result is "dispatched" (dev's #1549 convention; the
+        // browser polls /result separately), uniform across all live kinds.
+        CHECK(h.audited == std::string(c.verb) + "|dispatched|a-1");
+    }
+}
+
+TEST_CASE("device live process_tree: dual-dispatch (list_tree + connections), joined",
+          "[device][routes]") {
+    SECTION("run dispatches BOTH the tree and the connections, audited as process_tree") {
+        LiveHarness h;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=process_tree");
+        REQUIRE(r);
+        CHECK(h.dispatched == 2);
+        bool tree = false, conns = false;
+        for (const auto& [p, a] : h.seen_dispatches) {
+            if (p == "processes" && a == "list_tree") tree = true;
+            if (p == "network_diag" && a == "connections") conns = true;
+        }
+        CHECK(tree);
+        CHECK(conns);
+        CHECK(h.audited == "device.live.process_tree|dispatched|a-1");
+        // The poll URL carries BOTH command ids so the result can join them.
+        CHECK(r->body.find("command_id=processes-test") != std::string::npos);
+        CHECK(r->body.find("command_id2=network_diag-test") != std::string::npos);
+    }
+    SECTION("result reconstructs the tree and joins connections by pid") {
+        LiveHarness h;
+        h.rows_by_cmd["processes-test"] = {
+            {"a-1", 1, "proc|4|0|System||\nproc|800|4|svchost.exe|abc123|C:\\\\svchost.exe", ""}};
+        h.rows_by_cmd["network_diag-test"] = {
+            {"a-1", 1, "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=network_diag-test&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("svchost.exe") != std::string::npos);
+        CHECK(r->body.find("140.82.112.4:443") != std::string::npos); // joined connection chip
+        CHECK(r->body.find("abc123") != std::string::npos);           // hash on the node
+        CHECK(r->body.find("id=\"ls-kpi-procs\"") != std::string::npos); // OOB process count
+    }
+    SECTION("a network_diag- secondary id is the ONLY accepted command_id2 prefix") {
+        LiveHarness h;
+        // A foreign secondary prefix (e.g. tar-) must be rejected.
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=tar-evil&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    SECTION("secondary not ready: tree renders best-effort WITHOUT connections, no re-poll") {
+        LiveHarness h;
+        // Primary terminal-SUCCESS with output; secondary has no rows yet (empty).
+        h.rows_by_cmd["processes-test"] = {{"a-1", 1, "proc|800|4|svchost.exe|abc|", ""}};
+        // command_id2 present in the URL but rows_by_cmd has no network_diag-test entry → empty.
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
+                            "&command_id2=network_diag-test&agent_id=a-1&kind=process_tree&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("svchost.exe") != std::string::npos); // tree still renders
+        CHECK(r->body.find("tt-net") == std::string::npos);      // no connection chips (best-effort)
+        CHECK(r->body.find("hx-trigger") == std::string::npos);  // primary terminal -> not re-polled
+    }
+}
+
+// Result-route render coverage for the table kinds (the B1 macOS services field-shape
+// divergence + the arp honest-error path were governance Gate-4 findings).
+TEST_CASE("device live result: table kinds parse + render", "[device][routes]") {
+    SECTION("services Windows 5-field shape: state + running count") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|Spooler|Print Spooler|Running|Automatic\n"
+                                  "svc|wuauserv|Windows Update|Stopped|Manual", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("Print Spooler") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos);      // OOB count: 1 running
+        CHECK(r->body.find("id=\"ls-kpi-svc\"") != std::string::npos);
+    }
+    SECTION("services macOS 4-field svc|label|pid|status: State shows status, not PID (B1)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("running") != std::string::npos); // status, from f[3]
+        CHECK(r->body.find("1 run") != std::string::npos);   // counted as running (not the PID)
+    }
+    SECTION("services Linux 4-field svc|name|status|desc: State shows status") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "svc|sshd|running|OpenSSH server", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("sshd") != std::string::npos);
+        CHECK(r->body.find("running") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos);
+    }
+    SECTION("arp non-Windows error payload -> honest error note, not silent blank") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "error|arp not available on this platform", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=network_config-test"
+                            "&agent_id=a-1&kind=arp&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(r->body.find("not available on this platform") != std::string::npos);
+    }
+    SECTION("listening rows render with proto/port/pid") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "listen|tcp|0.0.0.0|445|4", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=network_diag-test"
+                            "&agent_id=a-1&kind=listening&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("445") != std::string::npos);
+        CHECK(r->body.find("id=\"ls-kpi-listen\"") != std::string::npos);
+    }
+}
+
+TEST_CASE("device live capture_sources: tar status -> read-only source table", "[device][routes]") {
+    LiveHarness h;
+    h.fake_rows = {{"a-1", 1,
+                    "config|process_enabled|true\nconfig|process_live_rows|1234\n"
+                    "config|arp_enabled|false\nconfig|arp_live_rows|0",
+                    ""}};
+    auto r = h.sink.Get("/fragments/device/live/result?command_id=tar-test"
+                        "&agent_id=a-1&kind=capture_sources&n=1");
+    REQUIRE(r);
+    CHECK(r->body.find("$Process_Live") != std::string::npos);
+    CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
+    CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
+    CHECK(r->body.find("/tar") != std::string::npos);                  // configure-on-TAR link
+}
+
 // The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
 // they must gate GuaranteedState:Read and audit-on-open (parity with the sibling
 // /fragments/dex/device). Governance Gate-2/3/4 BLOCKING.
@@ -256,9 +431,15 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
     auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
     auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
     std::vector<std::string> audited;
-    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+    bool audit_ok = true;      // flip to simulate a dropped evidence row (#1647)
+    bool audit_throws = false; // flip to simulate a bad_alloc-class throw from audit_fn (#1647)
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
+                     const std::string&, const std::string& tid, const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549).
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        return audit_ok;
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
@@ -285,6 +466,37 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
         }
         CHECK(saw_dex);
         CHECK(saw_guardian);
+    }
+    // #1647: a per-device behavioural-PII lens whose audit row silently fails to
+    // persist must surface the gap (Sec-Audit-Failed) — but as an HTML dashboard
+    // surface it SET-AND-PROCEEDS (a transient audit hiccup must not blank the
+    // operator's lens, unlike the strict REST per-device endpoints that fail closed).
+    SECTION("audit-persist failure -> Sec-Audit-Failed header, fragment still renders") {
+        allow_read = true;
+        audit_ok = false; // the evidence row cannot persist
+        auto dex = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(dex);
+        CHECK(dex->status == 200); // set-and-proceed
+        CHECK(dex->get_header_value("Sec-Audit-Failed") == "true");
+        auto gd = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(gd);
+        CHECK(gd->status == 200);
+        CHECK(gd->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    // #1647 item 1: a bad_alloc-class throw out of audit_fn was previously silent
+    // (no try/catch). The shared helper catches it, logs, flags the header, and the
+    // handler still returns a response instead of letting the throw escape.
+    SECTION("a throwing audit_fn is caught + flagged, never escapes the handler") {
+        allow_read = true;
+        audit_throws = true;
+        auto dex = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(dex);
+        CHECK(dex->status == 200);
+        CHECK(dex->get_header_value("Sec-Audit-Failed") == "true");
+        auto gd = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(gd);
+        CHECK(gd->status == 200);
+        CHECK(gd->get_header_value("Sec-Audit-Failed") == "true");
     }
 }
 
@@ -338,11 +550,15 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         ++dispatched;
         return {plugin + "-x", 1};
     };
-    auto responses = [](const std::string&) { return std::vector<DexAgentResponse>{}; };
+    auto responses = [](const std::string&, const std::string&) {
+        return std::vector<DexAgentResponse>{};
+    };
     std::vector<std::string> audited;
     auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+                            const std::string&, const std::string& tid,
+                            const std::string&) -> bool {
         audited.push_back(a + "|" + tid);
+        return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
     };
     yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;

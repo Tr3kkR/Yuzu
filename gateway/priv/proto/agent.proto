@@ -221,10 +221,19 @@ message InventoryReport {
 
   // Key-value blobs per plugin; plugins define their own schemas.
   map<string, bytes> plugin_data = 3;
+
+  // ADR-0016 daily-sync hash-skip. Per-source content hash (always present per
+  // due source); the blob in plugin_data is omitted when unchanged. Regenerated
+  // into agent_pb/gateway_pb so it survives the gateway proxy re-encode.
+  map<string, string> content_hashes = 4;
 }
 
 message InventoryAck {
   bool received = 1;
+
+  // ADR-0016: sources the server could not materialise from a hash-only report
+  // (cold cache / drift) — the agent re-pushes the full payload for each.
+  repeated string need_full = 2;
 }
 
 // ── OTA Updates ─────────────────────────────────────────────────────────────

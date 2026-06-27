@@ -138,6 +138,66 @@ std::vector<yuzu::tar::NetConnection> json_to_connections(const std::string& s) 
     return result;
 }
 
+json arp_to_json(const std::vector<yuzu::tar::ArpEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"interface", e.iface},
+                       {"ip_address", e.ip_address},
+                       {"mac_address", e.mac_address},
+                       {"entry_type", e.entry_type}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::ArpEntry> json_to_arp(const std::string& s) {
+    std::vector<yuzu::tar::ArpEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::ArpEntry e;
+            e.iface = j.value("interface", "");
+            e.ip_address = j.value("ip_address", "");
+            e.mac_address = j.value("mac_address", "");
+            e.entry_type = j.value("entry_type", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
+json dns_to_json(const std::vector<yuzu::tar::DnsEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"name", e.name},
+                       {"record_type", e.record_type},
+                       {"data", e.data},
+                       {"ttl_remaining_s", e.ttl_remaining_s},
+                       {"source", e.source}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::DnsEntry> json_to_dns(const std::string& s) {
+    std::vector<yuzu::tar::DnsEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::DnsEntry e;
+            e.name = j.value("name", "");
+            e.record_type = j.value("record_type", "");
+            e.data = j.value("data", "");
+            e.ttl_remaining_s = j.value("ttl_remaining_s", int64_t{0});
+            e.source = j.value("source", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
 json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
     json arr = json::array();
     for (const auto& s : svcs) {
@@ -199,19 +259,27 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
-    auto stored = db.get_config("redaction_patterns");
-    if (stored.empty())
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {"*password*", "*secret*", "*token*", "*api_key*", "*credential*"};
-    }
+    // The built-in patterns (`kDefaultRedactionPatterns` — password/secret/token/
+    // api_key/credential) are the baseline content-protection layer for
+    // process_live, and they MUST always apply: an operator can ADD patterns via
+    // configure but can never fully DISABLE redaction. So union the defaults into
+    // whatever is stored — fail-closed (fjarvis HIGH). A bare `parse_pattern_config`
+    // fallback was fail-OPEN: it returns the safe built-in set only for an empty or
+    // non-array value, but a *valid array whose elements all get dropped* (`[]`,
+    // `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is empty) returns an
+    // EMPTY vector — silently disabling redaction so `password`/`token`/`secret`
+    // land in process_live in plaintext. collect_fast and procperf called this
+    // without the union do_fleet_snapshot already applied; centralising it here
+    // closes all three paths at once and removes the divergent local default list.
+    // #541 — parse_pattern_config still bounds + sanitises at load (drops
+    // non-string/empty/over-long, truncates to the element cap), because this runs
+    // every fast-collect cycle on whatever is stored. ensure_redaction_defaults
+    // then unions the built-ins — the single, unit-tested home of the fail-closed
+    // guarantee, shared with do_fleet_snapshot.
+    std::vector<std::string> result;
+    if (auto v = yuzu::tar::parse_pattern_config(db.get_config("redaction_patterns")))
+        result = std::move(*v);
+    return yuzu::tar::ensure_redaction_defaults(std::move(result));
 }
 
 // Per-source enable/disable (issue #59). The default for a source with no
@@ -237,16 +305,16 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     auto stored = db.get_config("process_stabilization_exclusions");
     if (stored.empty())
         return {};
-    try {
-        auto arr = json::parse(stored);
-        std::vector<std::string> patterns;
-        for (const auto& p : arr) {
-            patterns.push_back(p.get<std::string>());
-        }
-        return patterns;
-    } catch (...) {
-        return {};
-    }
+    // #541 — bound + sanitise at load (see load_redaction_patterns), AND enforce
+    // the ≥3-char effective-core floor here (require_min_core_len=true): unlike
+    // redaction, a sub-floor exclusion like ["a"] or ["*a*"] silently drops every
+    // process whose name contains that core, so a value persisted before the
+    // floor existed (no-tamper upgrade) or tampered out of band must be filtered
+    // on this hot path, not just rejected at configure. A non-array stored value
+    // yields no exclusions (the safe default — nothing dropped).
+    if (auto v = yuzu::tar::parse_pattern_config(stored, /*require_min_core_len=*/true))
+        return std::move(*v);
+    return {};
 }
 
 } // namespace
@@ -260,10 +328,9 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",       "query",         "snapshot",
-                                     "export",       "configure",     "collect_fast",
-                                     "collect_slow", "collect_perf",  "rollup",
-                                     "sql",          "compatibility", "fleet_snapshot",
+        static const char* acts[] = {"status",    "query",        "snapshot",      "export",
+                                     "configure", "collect_fast", "collect_slow",  "collect_perf",
+                                     "rollup",    "sql",          "compatibility", "fleet_snapshot",
                                      nullptr};
         return acts;
     }
@@ -380,7 +447,8 @@ public:
             if (source_enabled(*db_, "process")) {
                 const auto boot_key = std::to_string(yuzu::tar::boot_time_unix());
                 if (db_->get_config("last_backfill_boot_ts", "") == boot_key) {
-                    spdlog::info("TAR: boot-backfill already done this boot (agent restart) — skipped");
+                    spdlog::info(
+                        "TAR: boot-backfill already done this boot (agent restart) — skipped");
                 } else {
                     const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
                     std::error_code ec;
@@ -408,12 +476,14 @@ public:
                             typed.push_back(std::move(pe));
                         }
                         if (typed.empty()) {
-                            spdlog::info("TAR: boot AutoLogger trace had no pre-session process events");
+                            spdlog::info(
+                                "TAR: boot AutoLogger trace had no pre-session process events");
                             db_->set_config("last_backfill_boot_ts", boot_key);
                         } else if (db_->insert_process_events(typed)) {
                             db_->set_config("last_backfill_boot_ts", boot_key);
-                            spdlog::info("TAR: boot-backfilled {} process events from the ETW AutoLogger",
-                                         typed.size());
+                            spdlog::info(
+                                "TAR: boot-backfilled {} process events from the ETW AutoLogger",
+                                typed.size());
                         } else {
                             // Leave the key unset so the next restart retries.
                             spdlog::warn("TAR: boot-backfill insert failed (continuing; "
@@ -560,7 +630,12 @@ private:
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_fast_impl(yuzu::CommandContext& ctx) {
+    // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
+    // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
+    // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    int collect_fast_impl(yuzu::CommandContext& ctx,
+                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -636,9 +711,9 @@ private:
                         pending_stream_evs_ = std::move(evs);
                         if (pending_stream_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_stream_evs_.size() - kPendingStreamCap;
-                            pending_stream_evs_.erase(
-                                pending_stream_evs_.begin(),
-                                pending_stream_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                            pending_stream_evs_.erase(pending_stream_evs_.begin(),
+                                                      pending_stream_evs_.begin() +
+                                                          static_cast<std::ptrdiff_t>(excess));
                         }
                         ctx.write_output("error|process insert failed");
                         return 1;
@@ -652,8 +727,9 @@ private:
                 // the agent's lifetime after a single burst). Also surfaced via
                 // the `status` action (process_stream_dropped).
                 if (auto d = proc_stream_->dropped(); d > last_logged_dropped_) {
-                    spdlog::warn("TAR: process stream ring overflow — {} dropped (+{} since last drain)",
-                                 d, d - last_logged_dropped_);
+                    spdlog::warn(
+                        "TAR: process stream ring overflow — {} dropped (+{} since last drain)", d,
+                        d - last_logged_dropped_);
                     last_logged_dropped_ = d;
                 }
 
@@ -693,9 +769,9 @@ private:
                 auto current = yuzu::agent::enumerate_processes();
 
                 // Stabilization exclusions: drop processes whose name matches any
-                // exclusion pattern. The patterns reuse the same glob semantics
-                // as redaction (case-insensitive substring with optional '*' on
-                // either side stripped). Excluded processes never enter the
+                // exclusion pattern. The patterns reuse the same matching as
+                // redaction (case-insensitive substring with optional '*' on
+                // either side stripped — NOT real glob). Excluded processes never enter the
                 // diff, so their birth/death events are silently dropped — the
                 // documented forensic-completeness trade-off.
                 if (!stab_excl.empty()) {
@@ -753,8 +829,8 @@ private:
         // dropped there and never persisted. Empty off Linux (collector stub).
         if (db_->get_config("netqual_enabled", "false") == "true") {
             auto samples = yuzu::tar::collect_tcp_quality();
-            auto rows = yuzu::tar::select_netqual_rows(samples, ts, snap_id,
-                                                       yuzu::tar::kNetQualTopN);
+            auto rows =
+                yuzu::tar::select_netqual_rows(samples, ts, snap_id, yuzu::tar::kNetQualTopN);
             if (!rows.empty()) {
                 // OPT-IN source: a netqual insert failure must NOT fail the whole
                 // collect_fast tick — the always-on tcp/process legs already
@@ -766,6 +842,47 @@ private:
                 else
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
             }
+        }
+
+        // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
+        // source_enabled returns false until an operator turns it on. Windows-only
+        // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
+        // failure — the always-on legs above already committed, so a failure here
+        // must not misreport a healthy tick; the diff baseline is advanced ONLY on
+        // success so a failed insert retries the same deltas next tick.
+        if (source_enabled(*db_, "arp")) {
+            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
+            auto previous = json_to_arp(db_->get_state("arp"));
+            auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_arp_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state("arp", arp_to_json(current).dump());
+        }
+
+        // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
+        // Device-level resolver-cache state; NOT per-process (no pid). Same
+        // non-fatal / advance-on-success discipline as the arp leg.
+        if (source_enabled(*db_, "dns")) {
+            auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
+            auto previous = json_to_dns(db_->get_state("dns"));
+            auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_dns_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: dns insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state("dns", dns_to_json(current).dump());
         }
 
         // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
@@ -833,9 +950,9 @@ private:
                     pending_module_evs_ = std::move(mevs);
                     if (pending_module_evs_.size() > kPendingStreamCap) {
                         const auto excess = pending_module_evs_.size() - kPendingStreamCap;
-                        pending_module_evs_.erase(
-                            pending_module_evs_.begin(),
-                            pending_module_evs_.begin() + static_cast<std::ptrdiff_t>(excess));
+                        pending_module_evs_.erase(pending_module_evs_.begin(),
+                                                  pending_module_evs_.begin() +
+                                                      static_cast<std::ptrdiff_t>(excess));
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
@@ -849,7 +966,8 @@ private:
             // Self-heal: no poll fallback for modules — if the session ended, stop
             // and report module_capture_method=none (vs going silently blind).
             if (!module_stream_->running()) {
-                spdlog::warn("TAR: module stream ended — module capture stopped (no poll fallback)");
+                spdlog::warn(
+                    "TAR: module stream ended — module capture stopped (no poll fallback)");
                 module_stream_->stop();
                 module_stream_active_ = false;
             }
@@ -860,8 +978,31 @@ private:
     }
 
     int do_collect_fast(yuzu::CommandContext& ctx) {
+        // SRE/UP-1: enumerate the syscall-heavy opt-in network sources (arp via
+        // GetIpNetTable2; dns via DnsGetCacheDataTable + up to kDnsEntryCap cache-only
+        // DnsQuery_W calls) BEFORE taking collect_mu_, so a large host cache cannot
+        // stall the always-on process/tcp legs or the fleet-snapshot pump (mirrors
+        // do_collect_perf's lock-free counter read). The diff/insert/state-save still
+        // run under collect_mu_ inside collect_fast_impl.
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        return collect_fast_impl(ctx);
+        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
     }
 
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
@@ -1147,10 +1288,9 @@ private:
         // process keys) so agentic consumers read by key presence without a
         // presence check. "none" when there is no live session: off-Windows, or
         // when module_enabled was false at start so the session never started.
-        ctx.write_output(std::format("config|module_capture_method|{}",
-                                     (module_stream_active_ && module_stream_)
-                                         ? module_stream_->method_name()
-                                         : "none"));
+        ctx.write_output(std::format(
+            "config|module_capture_method|{}",
+            (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
         return 0;
@@ -1253,7 +1393,22 @@ private:
             sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
                   "'' AS detail_json FROM user_live" +
                   where + tail;
+        } else if (type_filter == "arp") {
+            // ADR-0015. detail_json carries a human summary (ip @ mac [iface]); the
+            // full row is available via tar.sql over $ARP_Live.
+            sql = "SELECT ts, 'arp' AS event_type, action, snapshot_id, "
+                  "(ip_address || ' @ ' || mac_address || ' [' || interface || ']') AS detail_json "
+                  "FROM arp_live" +
+                  where + tail;
+        } else if (type_filter == "dns") {
+            sql = "SELECT ts, 'dns' AS event_type, action, snapshot_id, "
+                  "(name || ' ' || record_type || ' ' || data) AS detail_json "
+                  "FROM dns_live" +
+                  where + tail;
         } else {
+            // No-filter union stays the core four-source event timeline. arp/dns
+            // are device-state caches (opt-in, dns is PII) — reachable only via an
+            // explicit type filter above or tar.sql, never the default feed.
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
                   "process_live" +
@@ -1349,6 +1504,10 @@ private:
                 table = "service_live";
             else if (type_filter == "user")
                 table = "user_live";
+            else if (type_filter == "arp") // ADR-0015
+                table = "arp_live";
+            else if (type_filter == "dns") // ADR-0015
+                table = "dns_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
@@ -1380,8 +1539,26 @@ private:
     // ── snapshot action (force immediate full collection) ─────────────────────
 
     int do_snapshot(yuzu::CommandContext& ctx) {
+        // Pre-enumerate arp/dns lock-free (same rationale as do_collect_fast).
+        const bool arp_on = source_enabled(*db_, "arp");
+        const bool dns_on = source_enabled(*db_, "dns");
+        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        std::vector<yuzu::tar::DnsEntry> dns_pre;
+        // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
+        // export over an opaque heap list; isolate any throw so a bad list degrades
+        // this tick to empty rather than crossing the plugin ABI boundary.
+        try {
+            if (arp_on)
+                arp_pre = yuzu::tar::enumerate_arp();
+            if (dns_on)
+                dns_pre = yuzu::tar::enumerate_dns();
+        } catch (...) {
+            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            arp_pre.clear();
+            dns_pre.clear();
+        }
         std::lock_guard lock(collect_mu_);
-        collect_fast_impl(ctx);
+        collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
         collect_slow_impl(ctx);
         ctx.write_output("tar|snapshot|complete");
         return 0;
@@ -1406,9 +1583,10 @@ private:
     // disabled, the corresponding list is emitted empty with truncated_*=false
     // and the snapshot carries `source_paused.process` / `.tcp` markers.
     //
-    // Redaction: kDefaultRedactionPatterns is unioned with the operator-loaded
-    // patterns so an empty config does NOT disable redaction
-    // (governance round 1, sec-M1 + compliance-F3).
+    // Redaction: load_redaction_patterns now unions kDefaultRedactionPatterns
+    // (via ensure_redaction_defaults) internally, so an empty/all-dropped config
+    // does NOT disable redaction on ANY collect path — this snapshot included
+    // (governance round 1, sec-M1 + compliance-F3; #1532 fail-closed).
     int do_fleet_snapshot(yuzu::CommandContext& ctx) {
         std::lock_guard lock(collect_mu_);
         auto ts = now_epoch_seconds();
@@ -1452,15 +1630,12 @@ private:
             connections = yuzu::tar::merge_live_and_recent_connections(live, recent, ts);
         }
 
-        // Defence-in-depth: union operator patterns with the compiled-in
-        // defaults so an empty/missing config still applies *password*, *secret*,
-        // *token*, *api_key*, *credential*. The `should_redact` matcher returns
-        // true on the first hit, so duplicates are harmless.
+        // Redaction defaults are now unioned inside load_redaction_patterns (so
+        // every collect path — collect_fast, procperf, and this snapshot — is
+        // uniformly fail-closed; no stored value can disable *password*/*secret*/
+        // *token*/*api_key*/*credential*). The previously-separate union here is
+        // therefore redundant; keep the single source of truth in the loader.
         auto redaction = load_redaction_patterns(*db_);
-        for (const auto& def : yuzu::tar::kDefaultRedactionPatterns) {
-            if (std::find(redaction.begin(), redaction.end(), def) == redaction.end())
-                redaction.push_back(def);
-        }
 
         spdlog::info("tar.fleet_snapshot host={} procs={} conns={} ips={} "
                      "process_on={} tcp_on={}",
@@ -1487,7 +1662,17 @@ private:
         int slow_secs = 0;
         int days = 0;
 
-        // M13: Validate ALL parameters BEFORE writing any to the database
+        // M13 contract: validate EVERY parameter in the request in PHASE 1 and
+        // only persist them in PHASE 2 once all pass. A request that mixes a
+        // valid change with a later invalid one is therefore rejected atomically
+        // — nothing is written. (Previously the writes were interleaved with the
+        // validators, so e.g. a request carrying a valid `process_enabled=false`
+        // followed by an invalid exclusion list would persist the disable —
+        // silently turning off capture — yet return an error to the caller.)
+        // No db_->set_config / apply_source_enabled_transition call happens until
+        // the "Phase 2" block below; every path before it only reads + validates.
+
+        // ── Phase 1: validate everything (no writes) ─────────────────────────
         if (!retention.empty()) {
             try {
                 days = std::stoi(std::string{retention});
@@ -1518,37 +1703,24 @@ private:
             }
         }
 
-        // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
             return 1;
         }
 
-        // Now persist all validated values
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
-            changed = true;
-        }
-
-        if (fast_secs > 0) {
-            db_->set_config("fast_interval_seconds", std::string{fast_interval});
-            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-            changed = true;
-        }
-
-        if (slow_secs > 0) {
-            db_->set_config("slow_interval_seconds", std::string{slow_interval});
-            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-            changed = true;
-        }
-
-        if (!redaction.empty()) {
-            // Validate it's a JSON array of non-empty strings
+        // redaction_patterns — validate a JSON array of non-empty strings.
+        const bool have_redaction = !redaction.empty();
+        if (have_redaction) {
             try {
                 auto arr = json::parse(std::string{redaction});
                 if (!arr.is_array()) {
                     ctx.write_output("error|redaction_patterns must be a JSON array of strings");
+                    return 1;
+                }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(std::format("error|redaction_patterns exceeds the {}-element "
+                                                 "limit",
+                                                 yuzu::tar::kMaxPatternArrayElements));
                     return 1;
                 }
                 for (const auto& elem : arr) {
@@ -1557,10 +1729,12 @@ private:
                             "error|redaction_patterns must contain only non-empty strings");
                         return 1;
                     }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/false)) {
+                        ctx.write_output(std::format("error|redaction_patterns: {}", *err));
+                        return 1;
+                    }
                 }
-                db_->set_config("redaction_patterns", std::string{redaction});
-                ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
-                changed = true;
             } catch (...) {
                 ctx.write_output("error|redaction_patterns must be valid JSON array");
                 return 1;
@@ -1568,19 +1742,13 @@ private:
         }
 
         // ── Per-source enable/disable (issue #59) ─────────────────────────────
-        // Operators can disable any of the four collectors on a host without
-        // editing source. Disabled collectors short-circuit in
-        // collect_fast/slow but still permit `query` against existing rows
-        // (so historical data remains readable while new captures stop).
-        //
-        // PR-A: when a transition enable→disable happens, record the wall-clock
-        // timestamp in `<source>_paused_at` so the server-side retention-paused
-        // dashboard list (#547) can render "paused since" without inferring it
-        // from the audit log. The reverse transition clears the value to "0"
-        // (we do not delete keys — a missing key would be ambiguous with "never
-        // paused"). The timestamp is operator-facing wall-clock seconds; clock
-        // skew is acceptable because the surface is "paused since approximately
-        // X" and the ground truth is the agent's view.
+        // Operators can disable any collector on a host without editing source.
+        // Disabled collectors short-circuit in collect_fast/slow but still permit
+        // `query` against existing rows. Collect the validated (source, value)
+        // toggles here; the transition is applied in Phase 2. PR-A: enable→disable
+        // records `<source>_paused_at` (wall-clock) for the retention-paused
+        // dashboard list (#547); the reverse clears it to "0".
+        std::vector<std::pair<std::string, std::string>> source_toggles;
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string key = std::format("{}_enabled", src.name);
             auto val = params.get(key);
@@ -1591,6 +1759,106 @@ private:
                 ctx.write_output(std::format("error|{} must be 'true' or 'false'", key));
                 return 1;
             }
+            // M13 two-phase contract (#1532): collect the validated toggle now;
+            // the actual transition (and its #538 collect_mu_ serialisation +
+            // baseline reset) is applied in Phase 2, so a later invalid parameter
+            // in the same request writes nothing.
+            source_toggles.emplace_back(std::string{src.name}, std::move(v));
+        }
+
+        // ── Network capture method surface (issue #59) ───────────────────────
+        // Today only "polling" is wired. ETW (Windows) and Endpoint Security
+        // (macOS) are accepted-and-stored values per the schema registry's
+        // OsSupport metadata so an operator can pre-stage the configuration, but
+        // the collector continues to use polling until the implementation lands.
+        const auto net_param = params.get("network_capture_method");
+        const bool have_net = !net_param.empty();
+        std::string net_method{net_param};
+        if (have_net && net_method != "polling") {
+            // "polling" is a sentinel meaning "use the platform default" — the
+            // only mechanism wired today — and is accepted unconditionally even
+            // though no os_support row carries it as a capture_method (governance
+            // C-1 / QA Finding 2 round-trip). #540 — validate any other value
+            // against THIS host's OS accept-list, not the OS-blind union, so a
+            // Linux agent cannot store 'iphlpapi' nor a Windows agent 'procfs'.
+            auto accepted =
+                yuzu::tar::accepted_capture_methods_for_os("tcp", yuzu::tar::current_platform_os());
+            if (std::find(accepted.begin(), accepted.end(), net_method) == accepted.end()) {
+                std::string list = "polling";
+                for (const auto& m2 : accepted) {
+                    list += ",";
+                    list += m2;
+                }
+                ctx.write_output(
+                    std::format("error|network_capture_method '{}' is not accepted on this OS "
+                                "(must be one of: {})",
+                                net_method, list));
+                return 1;
+            }
+        }
+
+        // ── Process stabilization exclusions (issue #59) ─────────────────────
+        // Case-insensitive substring patterns whose churn is excluded from
+        // process events (noisy short-lived helpers). Validate here; persist in
+        // Phase 2. Trade-off: anything matching is invisible to TAR, hence the
+        // require_min_core_len floor that rejects over-broad 1–2 char patterns.
+        const auto excl_param = params.get("process_stabilization_exclusions");
+        const bool have_excl = !excl_param.empty();
+        if (have_excl) {
+            try {
+                auto arr = json::parse(std::string{excl_param});
+                if (!arr.is_array()) {
+                    ctx.write_output("error|process_stabilization_exclusions must be a JSON array");
+                    return 1;
+                }
+                if (arr.size() > yuzu::tar::kMaxPatternArrayElements) {
+                    ctx.write_output(
+                        std::format("error|process_stabilization_exclusions exceeds the {}-element "
+                                    "limit",
+                                    yuzu::tar::kMaxPatternArrayElements));
+                    return 1;
+                }
+                for (const auto& elem : arr) {
+                    if (!elem.is_string() || elem.get<std::string>().empty()) {
+                        ctx.write_output("error|process_stabilization_exclusions must contain only "
+                                         "non-empty strings");
+                        return 1;
+                    }
+                    if (auto err = yuzu::tar::validate_config_pattern(
+                            elem.get<std::string>(), /*require_min_core_len=*/true)) {
+                        ctx.write_output(
+                            std::format("error|process_stabilization_exclusions: {}", *err));
+                        return 1;
+                    }
+                }
+            } catch (...) {
+                ctx.write_output("error|process_stabilization_exclusions must be valid JSON array");
+                return 1;
+            }
+        }
+
+        // ── Phase 2: persist (every parameter above is already validated) ────
+        if (days > 0) {
+            db_->set_config("retention_days", std::string{retention});
+            ctx.write_output(std::format("config|retention_days|{}", retention));
+            changed = true;
+        }
+        if (fast_secs > 0) {
+            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
+            changed = true;
+        }
+        if (slow_secs > 0) {
+            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
+            changed = true;
+        }
+        if (have_redaction) {
+            db_->set_config("redaction_patterns", std::string{redaction});
+            ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
+            changed = true;
+        }
+        for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
             {
                 // #538: collect_fast/slow hold collect_mu_ for their whole
@@ -1602,8 +1870,8 @@ private:
                 // "stopped" events on re-enable. No deadlock: do_configure runs
                 // without collect_mu_ held and the helper re-acquires nothing.
                 std::lock_guard lock(collect_mu_);
-                transition_ok =
-                    yuzu::tar::apply_source_enabled_transition(*db_, src.name, v, now_epoch_seconds());
+                transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
+                                                                           now_epoch_seconds());
                 if (transition_ok && v == "false") {
                     // The interval samplers (perf / procperf) keep their previous
                     // reading in memory, not in a diff-state row, so the
@@ -1618,107 +1886,57 @@ private:
                     // docs/user-manual/tar.md). default-constructed → valid=false,
                     // which derive_sample/derive_proc_samples treat as "no baseline"
                     // (records nothing on the next tick).
-                    if (src.name == "perf")
+                    if (src_name == "perf")
                         prev_perf_ = yuzu::tar::PerfCounters{};
-                    else if (src.name == "procperf")
+                    else if (src_name == "procperf")
                         prev_proc_ = yuzu::tar::ProcSnapshot{};
                 }
             }
             if (!transition_ok) {
                 // #538/UP-1: a disable that could not clear the baseline leaves
-                // the source ENABLED (fail-safe). Report it so the operator can
-                // retry rather than believing the source was stopped.
+                // the source ENABLED (fail-safe). This is an apply-time I/O failure
+                // (a busy DB), not a validation failure — Phase 1 already validated
+                // every parameter — so the two-phase atomicity contract still holds:
+                // the only writes that could precede this are the scalar set_config
+                // calls above, and the source stays enabled rather than being left
+                // disabled with a stale baseline. Report it so the operator retries.
                 ctx.write_output(std::format(
-                    "error|{} disable failed: could not clear collection baseline "
+                    "error|{}_enabled disable failed: could not clear collection baseline "
                     "(database busy); source left enabled",
-                    key));
+                    src_name));
                 return 1;
             }
-            ctx.write_output(std::format("config|{}|{}", key, v));
-            // Echo the resulting paused_at so the operator/dashboard sees the
-            // transition timestamp without an extra status round-trip. We
-            // re-read it post-write rather than re-deriving the transition
-            // here — single source of truth.
-            std::string paused_at_key = std::format("{}_paused_at", src.name);
+            ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Echo the resulting paused_at so the dashboard sees the transition
+            // timestamp without an extra status round-trip — single source of
+            // truth (re-read, not re-derived).
+            std::string paused_at_key = std::format("{}_paused_at", src_name);
             ctx.write_output(
                 std::format("config|{}|{}", paused_at_key, db_->get_config(paused_at_key, "0")));
             changed = true;
         }
-
-        // ── Network capture method surface (issue #59) ───────────────────────
-        // Today only "polling" is wired. ETW (Windows) and Endpoint Security
-        // (macOS) are accepted-and-stored values per the schema registry's
-        // OsSupport metadata so an operator can pre-stage the configuration,
-        // but the collector continues to use polling until the relevant
-        // implementation lands. Validation rejects unknown methods so a typo
-        // does not silently re-default to polling.
-        if (auto m = params.get("network_capture_method"); !m.empty()) {
-            std::string method{m};
-            // "polling" is a sentinel meaning "use the platform default" —
-            // the only mechanism actually wired today. It is intentionally
-            // accepted unconditionally even though no os_support row carries
-            // it as a capture_method (the per-OS rows describe the underlying
-            // platform API: iphlpapi / procfs / proc_pidfdinfo). Without this
-            // special case `tar.status` would report `polling` as the default
-            // but `tar.configure network_capture_method=polling` would be
-            // rejected — the round trip would be broken (governance C-1 /
-            // QA Finding 2).
-            if (method != "polling") {
-                auto accepted = yuzu::tar::accepted_capture_methods("tcp");
-                if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
-                    std::string list = "polling";
-                    for (const auto& m2 : accepted) {
-                        list += ",";
-                        list += m2;
-                    }
-                    ctx.write_output(std::format(
-                        "error|network_capture_method '{}' is not accepted (must be one of: {})",
-                        method, list));
-                    return 1;
-                }
+        if (have_net) {
+            if (net_method != "polling") {
                 // Surface that no kernel-event collector is wired yet so an
                 // operator pre-staging 'etw' / 'endpoint_security' isn't
-                // surprised that the collector keeps polling under the hood.
+                // surprised the collector keeps polling under the hood.
                 ctx.write_output(
                     std::format("warn|network_capture_method '{}' accepted but not yet "
                                 "implemented; collector will continue polling",
-                                method));
+                                net_method));
             }
-            db_->set_config("network_capture_method", method);
-            ctx.write_output(std::format("config|network_capture_method|{}", method));
+            db_->set_config("network_capture_method", net_method);
+            ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+            changed = true;
+        }
+        if (have_excl) {
+            db_->set_config("process_stabilization_exclusions", std::string{excl_param});
+            ctx.write_output(std::format("config|process_stabilization_exclusions|{}", excl_param));
             changed = true;
         }
 
-        // ── Process stabilization exclusions (issue #59) ─────────────────────
-        // List of process-name glob patterns whose churn should be excluded
-        // from process events. Useful for noisy short-lived helpers (CI
-        // runners, IDE indexers, telemetry agents) that produce thousands
-        // of birth/death rows per minute and dwarf the actual process
-        // activity an operator wants to see. Trade-off: forensic completeness
-        // is reduced — anything matching these patterns is invisible to TAR.
-        if (auto exc = params.get("process_stabilization_exclusions"); !exc.empty()) {
-            try {
-                auto arr = json::parse(std::string{exc});
-                if (!arr.is_array()) {
-                    ctx.write_output("error|process_stabilization_exclusions must be a JSON array");
-                    return 1;
-                }
-                for (const auto& elem : arr) {
-                    if (!elem.is_string() || elem.get<std::string>().empty()) {
-                        ctx.write_output("error|process_stabilization_exclusions must contain only "
-                                         "non-empty strings");
-                        return 1;
-                    }
-                }
-                db_->set_config("process_stabilization_exclusions", std::string{exc});
-                ctx.write_output(std::format("config|process_stabilization_exclusions|{}", exc));
-                changed = true;
-            } catch (...) {
-                ctx.write_output("error|process_stabilization_exclusions must be valid JSON array");
-                return 1;
-            }
-        }
-
+        // Phase 1 returns early on any invalid parameter, so reaching here with
+        // nothing changed means the request carried no recognised parameter.
         if (!changed) {
             ctx.write_output("error|no valid configuration parameters provided");
             return 1;

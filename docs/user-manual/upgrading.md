@@ -10,12 +10,103 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
+
+## ⚠️ Breaking: account lockout is ON by default
+
+This release adds account lockout for failed **local-password** logins (SOC 2
+CC6.3) and it is **active by default** (`--auth-lockout-threshold=5`,
+`--auth-lockout-window-secs=900`) **on any deployment that runs with a
+persistent auth database** — i.e. one started with `--data-dir`.
+
+> **⚠️ `--data-dir` is required.** Lockout state lives in the persistent
+> `auth.db`, which only exists when the server is started with `--data-dir`.
+> The shipped **container images and compose files** pass `--data-dir
+> /var/lib/yuzu`, so lockout genuinely is on by default there. The
+> **systemd/.deb** unit now also passes `--data-dir /var/lib/yuzu` (added in
+> this release) — but if you run a **custom invocation** without `--data-dir`,
+> the server falls back to in-memory auth and lockout (and session persistence)
+> is silently **off**. The server logs a loud startup `WARN` in that state.
+> Set `--data-dir` to make the control active.
+
+No further config change is required to opt in — a deployment that already runs
+with `--data-dir` gains the behavior the instant you start the new build.
+
+What changes on upgrade:
+
+- After **5 consecutive failed `POST /login` attempts** a local-password account
+  is locked for **15 minutes**. While locked, every login attempt — *including
+  one with the correct password* — returns the **same generic 401 as a bad
+  password** (no `Retry-After`, no "you are locked" message; this is deliberate,
+  to avoid a username-enumeration / lock-state oracle).
+- The lock **auto-expires** after the window — it is never permanent — and a
+  user who waits it out regains a full attempt budget.
+- Scope is **local-password only**. SSO/OIDC logins (throttled by your IdP) and
+  API/automation tokens are **unaffected** — no automation breakage.
+
+**Highest-risk targets** on upgrade: shared or service accounts that log in with
+a password, and any password-rotation / monitoring automation that may submit a
+stale password in a loop — these can now lock themselves out where previously
+nothing happened.
+
+**Before upgrading, do ONE of:**
+
+1. Accept the default (recommended for most) — it closes a real
+   credential-stuffing surface. Make sure operators know the recovery path
+   below.
+2. Raise the threshold if you also rate-limit at the network layer
+   (NIST 800-63B §5.2.2 suggests ≥10): `--auth-lockout-threshold=10`.
+3. Disable it (not recommended; constitutes a deviation from the CC6.3 hardened
+   baseline): `--auth-lockout-threshold=0` (the server logs a startup `WARN`).
+
+**Recovery if an account is locked out:**
+
+- Another admin can clear it immediately:
+  `POST /api/v1/users/{username}/unlock` (`UserManagement:Write`, MFA step-up).
+- Or wait out the window (default 15 min).
+- **Single-admin deployments:** there is no self-service unlock for the *only*
+  admin (the unlock endpoint requires a second privileged principal), so either
+  wait out the window or use the offline recovery procedure in
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery.
+## Behaviour change: operator/API tags now beat agent self-report (#1411)
+
+An agent's self-reported tags (`scopable_tags`, synced on every Register) can no
+longer overwrite an operator- or API-set tag for the same `(agent_id, key)` — the
+operator/API value is now authoritative. This closes a path where a rogue or
+misconfigured agent could self-assign into an operator-declared benchmark cohort.
+
+**Who this affects:** only an operator who *deliberately* relied on agent-reported
+values winning over an operator/API-set tag for the same key. After upgrade those
+agent values stop overriding — silently (no error, no log line); an affected device
+simply drops out of the cohort the operator-set value defines.
+
+**Verify:** audit the `source` column — `GET /api/v1/tags?agent_id=<id>` shows whether
+each key is `server`- (operator/API) or `agent`-sourced.
+
+**Remediate:** if an agent-reported value was the *intended* one, re-set it explicitly
+via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
+the agent reports that the operator never set are unaffected.
+
+## Behaviour change: MCP approval-gated calls now return -32004, not -32006 (#1470)
+
+Supervised-tier MCP tokens that attempt an approval-gated operation now receive
+JSON-RPC error code `-32004` (`TierDenied`) instead of `-32006` (`ApprovalRequired`).
+The A4 contract reserves `-32006` for a response that carries a pollable `approval_id`
++ `status_url`; because approval re-dispatch (Phase 2) is not yet implemented,
+returning `-32006` would violate that contract. The operation is still denied and
+audited; the `error.data.remediation` field points to the REST API / dashboard
+approval workflow.
+
+**Who this affects:** any MCP client that explicitly matched on `-32006` to detect an
+approval-required state. After upgrade those handlers receive `-32004` instead; update
+the match to `-32004` and leave `-32006` reserved for the future Phase 2 envelope (see
+`docs/user-manual/mcp.md` → "-32004: Tier denied (including approval-gated operations)").
+`operator`-tier executions are auto-approved and are unaffected.
 
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
@@ -137,6 +228,28 @@ Before upgrading any component:
   project treats the *capability to observe* as the works-council co-determination
   trigger, so EU deployments should note the new Windows coverage as they did for
   the DEX signals. See [Network Quality](network.md) → Collection & privacy.
+- [ ] **New daily installed-software sync (ADR-0016):** on agent upgrade, agents
+  begin syncing their **machine-wide installed-software** inventory to the server
+  once per ~24 h over the existing gRPC channel (hash-skip keeps unchanged hosts
+  to a tiny hash, not the full list). Three operator-visible effects: (a) new daily
+  outbound `ReportInventory` traffic per agent — adjust egress baselines/firewall
+  expectations; (b) the data lands in a **new Postgres schema**
+  (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
+  the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
+  (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
+  debug). Machine-scope only, no end-user PII (no username collection) — but the
+  data is device-attributable, and on **personally-assigned devices** installed-
+  software enumeration may be **works-council co-determination-relevant** (see the
+  works-council note in [Installed-Software Inventory](inventory.md)). To suppress
+  collection entirely, pass **`--inventory-disable`** / set
+  `YUZU_AGENT_INVENTORY_DISABLE` on the agent (deploy-time opt-out). Reads are
+  gated on the new `Inventory:Read` RBAC securable; today the data is queryable via
+  direct SQL (see [Installed-Software Inventory](inventory.md)). On a **non-English
+  fleet**, upgrading across #1662 changes stored names: app/publisher names that
+  earlier builds mangled to `?` (cp1252) are rewritten to correct UTF-8 on each
+  agent's next daily sync, so any query automation that matched the corrupted `?`
+  strings will return nothing afterward — see the non-ASCII troubleshooting note in
+  [Installed-Software Inventory](inventory.md) for the force-resync path.
 
 ## Upgrading the Server
 

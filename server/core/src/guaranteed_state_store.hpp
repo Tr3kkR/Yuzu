@@ -404,6 +404,12 @@ public:
     // For per-request name resolution on read paths like the baseline-anchored
     // per-device status route, where the full rule body is never needed.
     std::unordered_map<std::string, std::string> rule_names() const;
+    // Bounded variant of rule_names(): resolve names ONLY for the given rule_ids
+    // (e.g. a baseline's deployed members) via WHERE rule_id IN (?,…), so the
+    // fleet-polled per-device read path does not materialize the whole authored
+    // catalogue per request. Empty input → empty map.
+    std::unordered_map<std::string, std::string>
+    rule_names_for(const std::vector<std::string>& rule_ids) const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;
@@ -441,6 +447,14 @@ public:
         return observations_proj_failures_.load();
     }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
+    // PK/UNIQUE-conflict drops at the single-row insert_event (redelivery, an
+    // event_seq_ reset on an agent crash-loop, a clock-skewed fleet, or a forged
+    // event_id pre-claim #1360). The conflicting event is NOT written; counting it
+    // closes the CC7.3 evidence gap (#1414) so an auditor can distinguish "no
+    // drift observed" from "drift observed but silently discarded". The batch
+    // insert_events path is excluded by design — it aborts the whole batch loudly
+    // (returns an error) rather than dropping one row and continuing.
+    uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -455,6 +469,7 @@ private:
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
+    std::atomic<uint64_t> events_dropped_{0}; // #1414: PK/UNIQUE-conflict ingest drops
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;

@@ -292,3 +292,29 @@ TEST_CASE("TAR diff: TCP post-restart with empty previous yields all-connected",
         CHECK(e.event_action == "connected");
     }
 }
+
+TEST_CASE("TAR warehouse rollups: arp/dns are live + hourly only (ADR-0015)",
+          "[tar][warehouse][rollup][arp][dns]") {
+    // ARP/DNS have a live + hourly tier only — assert the hourly rollup exists and
+    // the daily/monthly tiers do NOT (so a future incorrect granularity is caught).
+    CHECK_FALSE(rollup_sql("arp", "hourly").empty());
+    CHECK(rollup_sql("arp", "daily").empty());
+    CHECK(rollup_sql("arp", "monthly").empty());
+    CHECK(rollup_sql("arp", "hourly").find("FROM arp_live") != std::string::npos);
+    CHECK(rollup_sql("arp", "hourly").find("INSERT INTO arp_hourly") != std::string::npos);
+
+    CHECK_FALSE(rollup_sql("dns", "hourly").empty());
+    CHECK(rollup_sql("dns", "daily").empty());
+    CHECK(rollup_sql("dns", "monthly").empty());
+    CHECK(rollup_sql("dns", "hourly").find("FROM dns_live") != std::string::npos);
+    CHECK(rollup_sql("dns", "hourly").find("INSERT INTO dns_hourly") != std::string::npos);
+
+    // DDL + $-name translation + the read-only authorizer reach the new tables.
+    auto ddl = generate_warehouse_ddl();
+    CHECK(ddl.find("arp_live") != std::string::npos);
+    CHECK(ddl.find("dns_hourly") != std::string::npos);
+    CHECK(translate_dollar_name("$ARP_Live").value_or("") == "arp_live");
+    CHECK(translate_dollar_name("$DNS_Hourly").value_or("") == "dns_hourly");
+    CHECK(is_queryable_table("arp_live"));
+    CHECK(is_queryable_table("dns_live"));
+}

@@ -92,3 +92,39 @@ future requirement forces static libpq (e.g. single-file server distribution), a
 to the triplet's static-override regex and re-run the canary — the meson wiring already
 lists the static closure (pgcommon/pgport + system libs) so no build-graph change is needed.
 Linux/macOS remain fully static as assumed.
+
+## Update (2026-06-22) — schema naming, non-transactional migrations, thin construction helper
+
+Three refinements from the grill-with-docs session that fixed the author-facing store contract
+(ADR-0012):
+
+- **Schema name = `snake_case(FullClassName)`, the `Store` suffix included.** A store's Postgres
+  schema is the snake_case of its full C++ class name *including* `Store`: `OfflineEndpointStore`
+  → `offline_endpoint_store`, `ResponseStore` → `response_store`, `ApiTokenStore` →
+  `api_token_store`. The rule is **rigorous equality** — the schema reads straight back to the
+  class for troubleshooting — not the shorter purpose-names the Decision above illustrated
+  (`response`, `audit`, `guardian`, `vuln_graph`); **treat those as `*_store` now.** Acronyms are
+  single words (PascalCase already collapses them: `RbacStore` → `rbac_store`, `CaStore` →
+  `ca_store`); all-caps acronyms are **forbidden** in store class names so the mapping stays
+  one-to-one. The `PgMigrationRunner` identifier regex / reserved-name check is unchanged and
+  remains the runtime backstop. The one shipped schema that predates this rule, `endpoint_state`,
+  is **renamed to `offline_endpoint_store`** (implementation follow-up; safe pre-alpha — its data
+  reconstructs from heartbeats).
+
+- **Migrations stay transactional; the non-transactional kind is deferred, its rule pinned.** The
+  Future-evolution note in `pg_migration_runner.hpp` stands: statements that cannot run in a
+  transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`, `ALTER TYPE ADD VALUE`) cannot be a
+  `PgMigration` today, and the non-transactional migration kind is **not built speculatively** (no
+  store needs it). Rule for authors: initial DDL on a new/empty table uses normal transactional
+  migrations (a plain `CREATE INDEX` on an empty table is fine); an index/DDL added to an
+  **already-large** table during a live rolling upgrade requires the non-transactional kind, which
+  **must be built (self-schema-qualifying, outside a txn) before that migration ships**. Do not
+  weaken the transactional default to sneak one in.
+
+- **The "optional thin ctor helper" becomes mandatory before the fan-out.** The Decision above
+  left a thin non-polymorphic helper optional. With *all* stores migrating (ADR-0006 Update) over
+  a uniform construction-fail-closed contract, the helper — `open_with_migrations(pool, schema,
+  migrations)` plus a `server.cpp` construction helper that flips `startup_failed_` on
+  `!is_open()` — is extracted **once** before the 28-store fan-out, so the fail-closed wiring is
+  not hand-written 28 times. Non-virtual, no backend abstraction (ADR-0007/0008 compliant). This
+  is an implementation follow-up.

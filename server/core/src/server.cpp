@@ -39,6 +39,7 @@
 #include "inventory_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -307,6 +308,37 @@ public:
                           "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
                           "leading pool-saturation indicator",
                           "histogram");
+        // Birth the series with the extended 10-60s buckets ONCE here (#1686) so the
+        // hot per-acquire observe path uses the cheap name-only lookup and never
+        // allocates a throwaway bucket vector per acquire.
+        metrics_.histogram("yuzu_pg_acquire_wait_seconds", yuzu::Histogram::seconds_buckets_60s());
+        // Installed-software inventory observability (ADR-0016; #1664/#1675).
+        metrics_.describe("yuzu_inventory_ingest_total",
+                          "Inventory-report ingest outcomes by source and outcome "
+                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "counter");
+        metrics_.describe("yuzu_inventory_ingest_duration_seconds",
+                          "Time to apply one inventory source's report — the pooled-connection + "
+                          "transaction hold time per ingest, by source and phase "
+                          "(full = full-payload replace; hash_only = hash-skip compare)",
+                          "histogram");
+        metrics_.describe("yuzu_inventory_read_degrade_total",
+                          "Authoritative inventory reads that returned a degrade (no data) rather "
+                          "than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
+                          "under pure pool saturation, so this is the read-path degrade signal",
+                          "counter");
+        metrics_.describe("yuzu_inventory_stale_agents",
+                          "Agents whose installed-software inventory has not synced within the "
+                          "staleness window (two missed daily cycles) — a freshness/liveness signal, "
+                          "by source",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
+                          "Times the stale-agents freshness count could not be computed (pool "
+                          "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
+                          "was held at its prior value — a non-zero rate means that gauge may be "
+                          "frozen, not genuinely low",
+                          "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -409,7 +441,7 @@ public:
                           "gauge this cycle (a subset of net_reporting{os}). Denominator for "
                           "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) — a "
                           "Windows device reports a retransmit fact but it is withheld from the "
-                          "gauge (#1465), so Windows is absent here", "gauge");
+                          "gauge, so Windows is absent here", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
                           "DORMANT (measurement-first), per `os`: absent unless an agent still emits "
                           "the retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
@@ -485,7 +517,7 @@ public:
         //     — revoked token replay; investigate originating IP
         metrics_.describe("yuzu_device_token_binding_mismatch_total",
                           "Device-token presenter did not match the bound device_id "
-                          "(#826 stolen-token impersonation attempt)",
+                          "(stolen-token impersonation attempt)",
                           "counter");
         metrics_.describe("yuzu_device_token_unbound_legacy_total",
                           "Device-token validation refused because the stored row has "
@@ -508,7 +540,7 @@ public:
         // <agent_id>` accompanies each increment.
         metrics_.describe("yuzu_enrollment_token_race_lost_total",
                           "Enrollment-token consume lost the atomic-claim race "
-                          "(#827 — leaked token presented by a second agent)",
+                          "(leaked token presented by a second agent)",
                           "counter");
         // Low-signal enrollment-token rejection bucket. Variants are
         // `not_found`, `revoked`, `expired`, `invalid_input`,
@@ -569,12 +601,12 @@ public:
         // distinguishes the accommodation that fired.
         metrics_.describe("yuzu_grpc_subscribe_peer_advisory_total",
                           "Subscribe RPC peer-IP mismatch tolerated under a NAT-aware "
-                          "accommodation instead of rejected (#1128). Labelled event=security "
+                          "accommodation instead of rejected. Labelled event=security "
                           "(SIEM-routing tag) and reason (mtls_identity_match|trusted_nat_cidr)",
                           "counter");
         metrics_.describe("yuzu_register_denied_total",
                           "Register/ProxyRegister rejected an admin-denied agent before "
-                          "consuming its enrollment token (#1067). Labelled source "
+                          "consuming its enrollment token. Labelled source "
                           "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
                           "persistently-denied identity hammering Register is a "
                           "credential-abuse signal",
@@ -602,6 +634,12 @@ public:
                           "Total Guaranteed-State events currently persisted", "gauge");
         metrics_.describe("yuzu_server_guardian_events_written_total",
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_dropped_total",
+                          "Cumulative Guaranteed-State events dropped at ingest on an event_id "
+                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
+                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
+                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -945,6 +983,11 @@ public:
                     metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
                 };
                 opts.observer.on_acquire_wait_seconds = [this](double s) {
+                    // The series is born with the extended 10-60s buckets at metric
+                    // registration (#1686), so this hot per-acquire path uses the
+                    // cheap name-only lookup — no throwaway bucket-vector alloc per
+                    // acquire. (Birth runs at startup, before the pool exists, so the
+                    // name-only lookup always resolves to the 60s-bucket series.)
                     metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
                 };
                 pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
@@ -1915,6 +1958,28 @@ public:
                 gateway_service_->set_inventory_store(inventory_store_.get());
         }
 
+        // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+        // Coexists with the generic InventoryStore above (the sync-framework
+        // baseline). Fails closed like every PG store (ADR-0007/0008): a
+        // reachable database whose schema cannot be created/opened must not
+        // serve degraded. Wires BOTH server entry points to the typed store.
+        if (pg_pool_ && !startup_failed_) {
+            software_inventory_store_ = std::make_unique<SoftwareInventoryStore>(*pg_pool_);
+            if (!software_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software inventory store migration/open "
+                              "failed (database reachable but the software_inventory_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Set-once before serving (race-free): wires the read-degrade
+                // counter (#1675) + the stale-agents freshness gauge feed.
+                software_inventory_store_->set_metrics(&metrics_);
+                agent_service_.set_software_inventory_store(software_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_software_inventory_store(software_inventory_store_.get());
+            }
+        }
+
         // Phase 7: Directory Sync (AD/Entra integration)
         {
             auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
@@ -2373,6 +2438,41 @@ public:
                     metrics_.gauge("yuzu_pg_pool_waiters")
                         .set(static_cast<double>(pg_pool_->waiters()));
                 }
+                // Installed-software inventory freshness gauge: agents whose
+                // installed_software has not synced within the staleness window
+                // (two missed daily cycles — the daily-sync cadence bumps
+                // last_seen on every touched/stored sync, so >2 days flags an
+                // agent that has stopped syncing, comfortably clear of the
+                // per-agent phase-spread + jitter). count_stale_agents bounds BOTH
+                // its acquire (250ms) and its execution (per-statement
+                // statement_timeout) so it cannot delay the revocation-teardown
+                // backstop that shares this serial sweep thread (CH-IN3/UP-2).
+                // NOTE: this sweep runs on health_recompute_thread_, which holds a
+                // pool lease here — it MUST be join()ed before pg_pool_.reset() in
+                // stop() (it is); do not reorder shutdown without preserving that.
+                // On a degrade count_stale_agents returns nullopt: hold the gauge
+                // at its prior value (no false 0) AND bump a distinct
+                // unavailable-counter so a frozen gauge is distinguishable from a
+                // genuine low under contention (the 250ms acquire can expire while
+                // the 3000ms read budget still clears, so ReadDegraded may stay
+                // dormant — sre UP-3).
+                if (software_inventory_store_) {
+                    // TODO(ADR-0016 source #2): iterate sources instead of
+                    // hardcoding installed_software once a second sync source lands
+                    // (inventory_state + the {source} gauge label are source-agnostic).
+                    constexpr std::int64_t kInventoryStaleWindowSecs = 2 * 24 * 60 * 60;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        kInventoryStaleWindowSecs;
+                    if (auto stale = software_inventory_store_->count_stale_agents(cutoff))
+                        metrics_.gauge("yuzu_inventory_stale_agents",
+                                       {{"source", "installed_software"}})
+                            .set(static_cast<double>(*stale));
+                    else
+                        metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
+                }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
@@ -2521,6 +2621,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->event_count()));
                     metrics_.gauge("yuzu_server_guardian_events_written_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_dropped_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -2797,6 +2899,16 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // Same discipline for the software-inventory store (gov cpp-safety): null the
+        // borrowed raw pointers in both ingest services, then drop the store, BEFORE
+        // the pool — otherwise the store briefly holds a dangling PgPool& after the
+        // pool resets (no UAF today since the gRPC drain has quiesced every ingest
+        // handler, but it matches the offline-store contract and is safe if the store
+        // ever gains a pool-touching dtor).
+        agent_service_.set_software_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_software_inventory_store(nullptr);
+        software_inventory_store_.reset();
         pg_pool_.reset();
     }
 
@@ -4264,10 +4376,20 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca.db isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
+            // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
+            // not here, so /healthz could report "healthy" with a degraded store —
+            // the same gap the Guardian/CA rows above closed. The server fails
+            // closed at boot if PG is unreachable, so on a running server these are
+            // normally open; the row catches a post-boot store-level failure.
+            bool offline_endpoint_ok =
+                offline_endpoint_store_ && offline_endpoint_store_->is_open();
+            bool software_inventory_ok =
+                software_inventory_store_ && software_inventory_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok;
+                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                                 offline_endpoint_ok && software_inventory_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4282,7 +4404,9 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
-                  {"ca", ca_ok ? "ok" : "error"}}},
+                  {"ca", ca_ok ? "ok" : "error"},
+                  {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
+                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4438,6 +4562,11 @@ private:
                 // the pool answered.
                 {"offline_endpoint_store",
                  offline_endpoint_store_ && offline_endpoint_store_->is_open()},
+                // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
+                // state post-boot makes ReportInventory silently ack with no
+                // ingest and no readiness signal — surface it (gov Pattern E).
+                {"software_inventory_store",
+                 software_inventory_store_ && software_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8238,11 +8367,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8433,12 +8565,15 @@ private:
         device_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
             guaranteed_state_store_.get(),
-            // "Get live info" dispatches real plugin instructions (os_info/uptime,
-            // processes/list_hashed) through the shared chokepoint. DELIBERATELY an
+            // "Get live info" dispatches real read-only plugin instructions through the
+            // shared chokepoint — the live-snapshot cards (processes/list_tree +
+            // network_diag/connections, services/list, users/logged_on,
+            // network_config/{ip_addresses,arp,dns_cache}, network_diag/listening +
+            // connections, tar/status) plus os_info/uptime for the KPI. DELIBERATELY an
             // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
-            // the executions drawer): the live shell auto-fires one panel per kind on
-            // every device-page open, so tracking would flood the drawer with two
-            // executions per view. This matches the already-shipped DEX device-perf
+            // the executions drawer): the snapshot auto-fires one query per card when an
+            // operator clicks Get live info, so tracking would flood the drawer with a
+            // burst of executions per view. This matches the already-shipped DEX device-perf
             // panel (also execution_id="") and the compliance polchk- skip — the same
             // high-frequency-read rationale. Agentic-first parity (a machine-readable
             // MCP/REST equivalent + discovery) for live-info AND the DEX-perf sibling
@@ -8452,11 +8587,14 @@ private:
                                            /*execution_id=*/"");
             },
             // Narrow ResponseStore seam for the result poll.
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8480,11 +8618,14 @@ private:
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+            [this](const std::string& command_id,
+                   const std::string& agent_id) -> std::vector<DexAgentResponse> {
                 std::vector<DexAgentResponse> out;
                 if (!response_store_)
                     return out;
-                for (const auto& r : response_store_->query(command_id))
+                ResponseQuery q;
+                q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
+                for (const auto& r : response_store_->query(command_id, q))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -8904,13 +9045,35 @@ private:
             // the /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
             net_perf_fn,
+            // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
+            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
+            // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
+            [this](const std::string& username) -> bool {
+                auto* db = auth_mgr_.auth_db_ptr();
+                return db && db->clear_failed_logins(username).has_value();
+            },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
-            // Per-device-scoped permission (management-group aware) for that route —
-            // the SAME named closure DeviceRoutes already uses for the dashboard
-            // Guardian device lens (defined once above), not a re-inlined duplicate
-            // that two copies would have to keep in sync.
-            scoped_perm_fn);
+            // Per-device-scoped permission (management-group aware): the SAME
+            // require_scoped_permission closure the dashboard device routes + the
+            // agentic-first /api/v1/dex/devices/* endpoints use, so a REST worker is
+            // held to the same per-device scope (defined once above, not re-inlined).
+            scoped_perm_fn,
+            // ADR-0016: the typed daily-sync software store + its per-device
+            // Inventory-scope predicate for GET /api/v1/inventory/software. SAME
+            // management-group chokepoint (check_scoped_permission) as the MCP
+            // query_installed_software tool, bound to ("Inventory","Read"), so a
+            // REST worker's fleet-wide software query returns only devices inside
+            // their groups (cross-operator isolation). MUST be wired here; the
+            // param defaults to {} = no filter (unscoped fleet read).
+            software_inventory_store_.get(),
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                    return true;
+                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
+                                                            mgmt_group_store_.get());
+            });
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -9026,6 +9189,37 @@ private:
                 dex_perf_fn,
                 // N1: the shared network-quality provider (fragments + REST + MCP).
                 net_perf_fn,
+                // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
+                // query_responses{execution_id}. Wired to check_scoped_permission —
+                // the SAME management-group chokepoint the per-device REST/dashboard
+                // routes use — so an operator collects only the agents inside their
+                // groups, not any execution's rows by id. The MCP handler resolves the
+                // principal ONCE (it already authed) and passes `username` in, so this
+                // does NOT re-resolve the session per agent. RBAC off / no store →
+                // legacy-open (no filter), matching require_scoped_permission.
+                // CAVEAT (#1634): for a service-scoped token this checks the token
+                // CREATOR's RBAC scope, not the service-tag confinement that
+                // require_scoped_permission's service branch applies — a pre-existing
+                // MCP confinement limitation this does not fully close.
+                [this](const std::string& username, const std::string& agent_id) -> bool {
+                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                        return true;
+                    return rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                agent_id, mgmt_group_store_.get());
+                },
+                // ADR-0016: the typed daily-sync software store + its per-device
+                // Inventory-scope predicate for query_installed_software. SAME
+                // management-group chokepoint as the response predicate above, but
+                // bound to ("Inventory","Read") — so an operator's fleet-wide software
+                // query returns only devices inside their groups (cross-operator
+                // isolation). MUST be wired here; the param defaults to {} = no filter.
+                software_inventory_store_.get(),
+                [this](const std::string& username, const std::string& agent_id) -> bool {
+                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+                        return true;
+                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
+                                                                agent_id, mgmt_group_store_.get());
+                },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_);
@@ -9421,6 +9615,9 @@ private:
 
     // Phase 7: Inventory Store (Issue 7.17)
     std::unique_ptr<InventoryStore> inventory_store_;
+    // Typed software-inventory projection — born-on-Postgres (ADR-0016).
+    // Declared after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
