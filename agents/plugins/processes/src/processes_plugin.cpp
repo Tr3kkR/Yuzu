@@ -37,6 +37,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 #ifdef __linux__
@@ -88,14 +89,8 @@ std::vector<ProcessInfo> enumerate_processes() {
             ProcessInfo pi;
             pi.pid = pe.th32ProcessID;
             pi.ppid = pe.th32ParentProcessID;
-            // Wide to narrow (ASCII process names)
-            int len =
-                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, nullptr, 0, nullptr, nullptr);
-            if (len > 0) {
-                pi.name.resize(static_cast<size_t>(len - 1));
-                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, pi.name.data(), len, nullptr,
-                                    nullptr);
-            }
+            // Wide to narrow (#1681) — -1 convert, trailing NUL dropped.
+            pi.name = yuzu::win::from_wide(pe.szExeFile);
             procs.push_back(std::move(pi));
         } while (Process32NextW(snap, &pe));
     }
@@ -242,13 +237,9 @@ std::string resolve_exe_path(unsigned long pid) {
     DWORD sz = static_cast<DWORD>(wbuf.size());
     std::string path;
     if (QueryFullProcessImageNameW(hg.h, 0, wbuf.data(), &sz) && sz > 0) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), static_cast<int>(sz), nullptr, 0,
-                                      nullptr, nullptr);
-        if (len > 0) {
-            path.resize(static_cast<size_t>(len));
-            WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), static_cast<int>(sz), path.data(), len,
-                                nullptr, nullptr);
-        }
+        // (#1681) QueryFullProcessImageNameW writes `sz` chars excluding the NUL,
+        // so from_wide's counted form is exact (no trailing-NUL pop fires).
+        path = yuzu::win::from_wide(wbuf.data(), static_cast<int>(sz));
     }
     return path; // ~HandleGuard closes the handle on every path
 }
