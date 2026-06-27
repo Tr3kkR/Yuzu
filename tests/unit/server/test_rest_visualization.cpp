@@ -59,7 +59,8 @@ struct VizHarness {
 
     RestApiV1 api;
 
-    VizHarness() : inst_db(uniq("rest-viz-inst")), resp_db(uniq("rest-viz-resp")) {
+    explicit VizHarness(RestApiV1::ResponseScopeFn scope_fn = {})
+        : inst_db(uniq("rest-viz-inst")), resp_db(uniq("rest-viz-resp")) {
         fs::remove(inst_db);
         fs::remove(resp_db);
         instruction_store = std::make_unique<InstructionStore>(inst_db);
@@ -114,7 +115,22 @@ struct VizHarness {
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
-                            /*guaranteed_state_store=*/nullptr);
+                            /*guaranteed_state_store=*/nullptr,
+                            /*metrics_registry=*/nullptr,
+                            /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr,
+                            /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{},
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{},
+                            /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr,
+                            /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
+                            /*inventory_scope_fn=*/{},
+                            /*response_scope_fn=*/std::move(scope_fn));
     }
 
     ~VizHarness() {
@@ -497,4 +513,64 @@ TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec a
     fs::remove(db_path);
     fs::remove(db_path.string() + "-wal");
     fs::remove(db_path.string() + "-shm");
+}
+
+TEST_CASE("REST visualization: management-group scope drops out-of-scope agents' rows (#1634)",
+          "[rest][visualization][scope]") {
+    // The flat Response:Read gate is not a per-agent ownership check, so without
+    // the scope filter an operator charts another operator's execution by id.
+    // Same fixture as the pie round-trip, but the injected scope predicate admits
+    // only agent-1 — agent-2's rows (sshd) must never reach the chart transform.
+    auto scope_fn = [](const std::string& /*username*/, const std::string& agent_id) -> bool {
+        return agent_id == "agent-1";
+    };
+    VizHarness h{scope_fn};
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+
+    h.push_response(
+        "cmd-S1", "agent-1",
+        "1|chrome|/usr/bin/chrome|d\n2|chrome|/usr/bin/chrome|d\n3|firefox|/usr/bin/ff|c");
+    h.push_response("cmd-S1", "agent-2", "1|chrome|/usr/bin/chrome|d\n2|sshd|/usr/sbin/sshd|s");
+
+    auto res = h.sink.Get("/api/v1/executions/cmd-S1/visualization?definition_id=" + def_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("data"));
+    auto& d = body["data"];
+    std::map<std::string, double> got;
+    for (size_t i = 0; i < d["labels"].size(); ++i)
+        got[d["labels"][i].get<std::string>()] = d["series"][0]["data"][i].get<double>();
+    // Only agent-1's rows fold into the chart.
+    CHECK(got["chrome"] == 2); // agent-1's two chrome rows only (agent-2's third excluded)
+    CHECK(got["firefox"] == 1);
+    CHECK(got.find("sshd") == got.end()); // agent-2's sshd never charted
+    CHECK(d["meta"]["responses_total"] == 1);
+    // sshd never appears anywhere in the body.
+    CHECK(res->body.find("sshd") == std::string::npos);
+    // The out-of-scope drop is recorded on the success audit detail.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.audit_log[0].detail.find("scope_dropped=1") != std::string::npos);
+}
+
+TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak (#1634)",
+          "[rest][visualization][scope]") {
+    auto scope_fn = [](const std::string&, const std::string&) -> bool { return false; };
+    VizHarness h{scope_fn};
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,"title":"t"})";
+    auto def_id = h.make_def(spec, "procfetch");
+    h.push_response("cmd-S2", "agent-1", "1|chrome|/usr/bin/chrome|d");
+    h.push_response("cmd-S2", "agent-2", "1|sshd|/usr/sbin/sshd|s");
+
+    auto res = h.sink.Get("/api/v1/executions/cmd-S2/visualization?definition_id=" + def_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["meta"]["responses_total"] == 0);
+    CHECK(res->body.find("chrome") == std::string::npos);
+    CHECK(res->body.find("sshd") == std::string::npos);
 }
