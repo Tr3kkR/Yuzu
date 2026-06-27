@@ -84,8 +84,12 @@ std::string entry_type_for_state(NL_NEIGHBOR_STATE st) {
 
 std::string iface_alias(const NET_LUID& luid, NET_IFINDEX idx) {
     wchar_t alias[IF_MAX_STRING_SIZE + 1]{};
-    if (ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1) == NO_ERROR)
-        return yuzu::win::from_wide(alias); // (#1681) internal buffer -> shared -1 convert
+    if (ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1) == NO_ERROR) {
+        // (#1681) internal buffer -> shared -1 convert; keep the if<N> fallback for the
+        // (unreachable) empty-conversion case to stay byte-identical to the pre-de-dup code.
+        if (auto a = yuzu::win::from_wide(alias); !a.empty())
+            return a;
+    }
     return std::format("if{}", static_cast<unsigned long>(idx));
 }
 

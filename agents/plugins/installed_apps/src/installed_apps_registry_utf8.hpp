@@ -33,6 +33,11 @@
 #include <string>
 #include <string_view>
 
+// NOTE (#1681): this is the ONE conversion site deliberately NOT migrated to the shared
+// `agents/shared/win_str.hpp`. `reg_sz_to_utf8` below strips ALL trailing NULs, whereas the
+// shared helper stops at the FIRST NUL -- aligning would change output bytes for a value
+// containing an interior NUL, so it is a separately-reviewed step (tracked follow-up), not
+// an oversight. Do NOT fold this into the shared header without that review.
 namespace yuzu::installed_apps::reg_utf8 {
 
 // UTF-8 -> UTF-16 (for passing UTF-8 subkey / value names to the *W APIs).
