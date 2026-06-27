@@ -52,7 +52,10 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   `install_date` may be empty (`''`) — the `installed_apps` plugin does not
   guarantee them on every platform/package.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
-  device sync bookkeeping.
+  device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
+  (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
+  `collected_at` — so the recency filters and freshness gauge below are immune to
+  agent clock skew (#1685).
 
 Today it is queried with **direct SQL**, e.g.:
 
@@ -168,12 +171,17 @@ whose ingest is failing. Four further series sharpen the picture:
   `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
-  otherwise invisible. The per-degrade WARN is sampled (1st then every 100th per
-  site) so a fan-out outage can't flood the log; the counter is the continuous
+  otherwise invisible. The per-degrade WARN is sampled per site — the leading edge
+  of each outage *episode* (a degrade arriving after a quiet gap), then every 100th
+  within it — so a fan-out outage can't flood the log while a second, later outage
+  still logs its onset rather than staying silent; the counter is the continuous
   signal.
 - `yuzu_inventory_stale_agents{source}` (gauge) — agents that have not synced this
   source within the staleness window (two missed daily cycles), a freshness /
-  liveness signal sampled on the metrics sweep. On a degrade the gauge **holds its
+  liveness signal sampled on the metrics sweep. Staleness keys on the **server
+  receipt time** (`inventory_state.last_seen`), not the agent's `collected_at`, so a
+  future-skewed or hostile agent cannot pin itself "fresh" and hide a dark endpoint
+  (#1685). On a degrade the gauge **holds its
   prior value** (it is never set to a false `0`), so pair it with the counter below
   to know whether a low reading is current.
 - `yuzu_inventory_stale_count_unavailable_total` (counter) — the freshness count

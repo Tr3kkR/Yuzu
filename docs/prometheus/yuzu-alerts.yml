@@ -466,11 +466,12 @@ groups:
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
         # measures time-to-GET a connection — this measures total txn hold
         # (incl. statement execution), so it fires even when the pool hands out
-        # connections quickly but transactions run slow. The default histogram
-        # buckets cap at 10s, so the 10-30s saturation tail collapses into +Inf;
-        # the +Inf-minus-le=10 complement is the buildable signal today (extending
-        # the buckets into the 10-60s range is a tracked follow-up). Fires ahead of
-        # YuzuInventoryReadDegraded (sre).
+        # connections quickly but transactions run slow. The histogram buckets now
+        # extend into the 10-60s range (#1686), so the saturation tail is resolved
+        # into le=15/20/30/45/60 rather than collapsing into +Inf — the
+        # +Inf-minus-le=10 complement below is an honest count of full ingests over
+        # 10s, and histogram_quantile over the tail now yields a real p99. Fires
+        # ahead of YuzuInventoryReadDegraded (sre).
         expr: |
           sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
           - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
