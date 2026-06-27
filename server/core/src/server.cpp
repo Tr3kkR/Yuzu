@@ -308,6 +308,10 @@ public:
                           "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
                           "leading pool-saturation indicator",
                           "histogram");
+        // Birth the series with the extended 10-60s buckets ONCE here (#1686) so the
+        // hot per-acquire observe path uses the cheap name-only lookup and never
+        // allocates a throwaway bucket vector per acquire.
+        metrics_.histogram("yuzu_pg_acquire_wait_seconds", yuzu::Histogram::seconds_buckets_60s());
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
@@ -316,14 +320,13 @@ public:
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report — the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
-                          "(full = full-payload replace; hash_only = hash-skip compare) (#1664)",
+                          "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal "
-                          "(#1675)",
+                          "under pure pool saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -438,7 +441,7 @@ public:
                           "gauge this cycle (a subset of net_reporting{os}). Denominator for "
                           "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) — a "
                           "Windows device reports a retransmit fact but it is withheld from the "
-                          "gauge (#1465), so Windows is absent here", "gauge");
+                          "gauge, so Windows is absent here", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
                           "DORMANT (measurement-first), per `os`: absent unless an agent still emits "
                           "the retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
@@ -514,7 +517,7 @@ public:
         //     — revoked token replay; investigate originating IP
         metrics_.describe("yuzu_device_token_binding_mismatch_total",
                           "Device-token presenter did not match the bound device_id "
-                          "(#826 stolen-token impersonation attempt)",
+                          "(stolen-token impersonation attempt)",
                           "counter");
         metrics_.describe("yuzu_device_token_unbound_legacy_total",
                           "Device-token validation refused because the stored row has "
@@ -537,7 +540,7 @@ public:
         // <agent_id>` accompanies each increment.
         metrics_.describe("yuzu_enrollment_token_race_lost_total",
                           "Enrollment-token consume lost the atomic-claim race "
-                          "(#827 — leaked token presented by a second agent)",
+                          "(leaked token presented by a second agent)",
                           "counter");
         // Low-signal enrollment-token rejection bucket. Variants are
         // `not_found`, `revoked`, `expired`, `invalid_input`,
@@ -598,12 +601,12 @@ public:
         // distinguishes the accommodation that fired.
         metrics_.describe("yuzu_grpc_subscribe_peer_advisory_total",
                           "Subscribe RPC peer-IP mismatch tolerated under a NAT-aware "
-                          "accommodation instead of rejected (#1128). Labelled event=security "
+                          "accommodation instead of rejected. Labelled event=security "
                           "(SIEM-routing tag) and reason (mtls_identity_match|trusted_nat_cidr)",
                           "counter");
         metrics_.describe("yuzu_register_denied_total",
                           "Register/ProxyRegister rejected an admin-denied agent before "
-                          "consuming its enrollment token (#1067). Labelled source "
+                          "consuming its enrollment token. Labelled source "
                           "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
                           "persistently-denied identity hammering Register is a "
                           "credential-abuse signal",
@@ -980,6 +983,11 @@ public:
                     metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
                 };
                 opts.observer.on_acquire_wait_seconds = [this](double s) {
+                    // The series is born with the extended 10-60s buckets at metric
+                    // registration (#1686), so this hot per-acquire path uses the
+                    // cheap name-only lookup — no throwaway bucket-vector alloc per
+                    // acquire. (Birth runs at startup, before the pool exists, so the
+                    // name-only lookup always resolves to the 60s-bucket series.)
                     metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
                 };
                 pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));

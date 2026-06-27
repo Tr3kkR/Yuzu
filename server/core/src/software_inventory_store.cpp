@@ -86,6 +86,30 @@ const std::vector<pg::PgMigration>& migrations() {
          // `last_seen` serves the range.
          "CREATE INDEX inventory_state_source_lastseen_idx "
          "ON inventory_state (source, last_seen);"},
+        {3,
+         // #1685 data-backfill. The WRITE fix (apply_installed_software now stamps
+         // last_seen/first_seen with the server receipt time, not the agent's
+         // collected_at) is forward-only: a dark agent can't re-stamp itself. Any
+         // PRE-FIX row whose last_seen was written from a future-skewed agent clock
+         // sits AHEAD of now and would never satisfy `last_seen < now − 2d`, so a
+         // disappeared endpoint stays hidden from the freshness gauge forever (the
+         // issue's exact worst case, persisting in live data). Clamp every future
+         // timestamp down to now with LEAST — honest past/now values are untouched —
+         // so those rows re-enter the staleness window (a fresh 2d grace from deploy,
+         // after which a still-dark agent flags correctly). first_seen is clamped too
+         // (governance UP-10): it was also seeded from collected_at pre-fix, so a
+         // future content-age consumer could otherwise read now − first_seen as
+         // negative; first_seen has no consumer today, this is forward defence.
+         // NOTE: this one-time backfill uses the Postgres server clock (now()), while
+         // the runtime write + the staleness cutoff (server.cpp) use the app-process
+         // system_clock. Co-located / NTP-synced they agree; any residual app↔PG skew
+         // is immaterial against the 2-day window (governance UP-1, NICE). DML, not
+         // DDL — runs in the migration txn.
+         "UPDATE inventory_state SET "
+         "  last_seen  = LEAST(last_seen,  EXTRACT(EPOCH FROM now())::bigint), "
+         "  first_seen = LEAST(first_seen, EXTRACT(EPOCH FROM now())::bigint) "
+         "WHERE last_seen  > EXTRACT(EPOCH FROM now())::bigint "
+         "   OR first_seen > EXTRACT(EPOCH FROM now())::bigint;"},
     };
     return kMigrations;
 }
@@ -146,23 +170,44 @@ void normalize(std::vector<SoftwareEntry>& entries) {
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
-// Sample the per-site WARN: log the 1st occurrence then every Nth. Under a
-// sustained read outage at agentic fan-out (10k queries) an unsampled per-read
-// WARN floods the log; the counter is the authoritative continuous signal, the
-// log a sampled breadcrumb.
+// Sample the per-site WARN: log a new outage episode's leading edge then every
+// Nth within it. Under a sustained read outage at agentic fan-out (10k queries)
+// an unsampled per-read WARN floods the log; the counter is the authoritative
+// continuous signal, the log a sampled breadcrumb.
 constexpr std::uint64_t kReadDegradeLogSample = 100;
+// Quiet gap (seconds) after which the next degrade at a site is treated as a new
+// outage EPISODE, re-logging its leading edge. Without this, process-lifetime
+// sampling spends its one "1st" on the first-ever outage, so a second distinct
+// outage (after recovery) stays silent until the next %N — its onset invisible
+// (UP-6). The lifetime counter is never reset; this governs log fidelity only.
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
-// Bump the read-degrade counter (always) and return this site's running
-// occurrence count; the caller logs a sampled subset via should_log_degrade().
-std::uint64_t note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
-                                std::atomic<std::uint64_t>& seen) {
+// Per-site degrade-WARN state: lifetime occurrence count + the last degrade's
+// timestamp (for episode-boundary detection). One `static` instance per call
+// site.
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+struct DegradeLog {
+    bool should_log;
+    std::uint64_t occurrence;
+};
+
+// Bump the read-degrade counter (always), advance the sampler, and decide whether
+// this degrade should emit a sampled WARN: the leading edge of a new episode, or
+// every Nth within one. The count/timestamp updates are two independent atomics,
+// so under concurrent degrades at one site a benign duplicate leading-edge WARN
+// is possible — acceptable for a log breadcrumb; the counter stays exact.
+DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
+                             DegradeSampler& s) {
     if (metrics)
         metrics->counter("yuzu_inventory_read_degrade_total", {{"reason", reason}}).increment();
-    return seen.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-
-bool should_log_degrade(std::uint64_t occurrence) {
-    return occurrence == 1 || (occurrence % kReadDegradeLogSample) == 0;
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return {new_episode || (n % kReadDegradeLogSample) == 0, n};
 }
 
 } // namespace
@@ -202,11 +247,19 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
 
 InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     std::string_view agent_id, std::string_view claimed_hash,
-    std::optional<std::vector<SoftwareEntry>> rows, std::int64_t collected_at) {
+    std::optional<std::vector<SoftwareEntry>> rows, [[maybe_unused]] std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return InventoryIngestOutcome::kError;
 
-    const std::int64_t ts = collected_at > 0 ? collected_at : now_secs();
+    // last_seen / first_seen are the SERVER receipt time, NOT the agent-supplied
+    // collected_at. The stale-agents freshness gauge compares last_seen against
+    // `server_now − 2d` (server.cpp), so both sides of that comparison must be on
+    // ONE clock; trusting collected_at let a future-skewed or hostile agent pin
+    // last_seen ahead of now so it never counted as stale — hiding a dark endpoint
+    // (#1685, ADR-0016 Update 2026-06-27). collected_at stays in the ingest
+    // contract (proto-carried) but no longer drives any persisted timestamp;
+    // migration v3 clamps pre-fix rows whose last_seen was stamped into the future.
+    const std::int64_t ts = now_secs();
 
     // ── Hash-only report: compare against the stored (server-recomputed) hash ──
     if (!rows.has_value()) {
@@ -355,12 +408,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     // empty. !open_ / no-lease / query-error are degrades; an empty agent_id is a
     // precondition miss (genuine empty, not a degrade).
     if (!open_) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto n = note_read_degrade(metrics_, kReasonStoreNotOpen, seen);
-        if (should_log_degrade(n))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — store not open "
                          "(occurrence {})",
-                         n);
+                         d.occurrence);
         return std::nullopt;
     }
     std::vector<SoftwareEntry> out;
@@ -368,12 +420,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         return out;
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto n = note_read_degrade(metrics_, kReasonPoolTimeout, seen);
-        if (should_log_degrade(n))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — no connection ({}) "
                          "(occurrence {})",
-                         pool_.last_error(), n);
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(
@@ -383,12 +434,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         "WHERE agent_id = $1 ORDER BY name, version LIMIT $2::bigint",
         std::vector<std::string>{std::string(agent_id), std::to_string(kFleetQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto occ = note_read_degrade(metrics_, kReasonQueryError, seen);
-        if (should_log_degrade(occ))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — query failed: {} "
                          "(occurrence {})",
-                         PQerrorMessage(lease.get()), occ);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     const int n = PQntuples(res.get());
@@ -410,22 +460,20 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     // (degraded), never a silent empty — a fleet vuln query must not read a PG hiccup
     // as "installed nowhere". An empty value = genuinely no matches.
     if (!open_) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto n = note_read_degrade(metrics_, kReasonStoreNotOpen, seen);
-        if (should_log_degrade(n))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: query_software degraded — store not open "
                          "(occurrence {})",
-                         n);
+                         d.occurrence);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto n = note_read_degrade(metrics_, kReasonPoolTimeout, seen);
-        if (should_log_degrade(n))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({}) "
                          "(occurrence {})",
-                         pool_.last_error(), n);
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
     int limit = q.limit > 0 ? q.limit : 1000;
@@ -453,12 +501,11 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        static std::atomic<std::uint64_t> seen{0};
-        const auto occ = note_read_degrade(metrics_, kReasonQueryError, seen);
-        if (should_log_degrade(occ))
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: query_software degraded — query failed: {} "
                          "(occurrence {})",
-                         PQerrorMessage(lease.get()), occ);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     std::vector<SoftwareFleetRow> out;
