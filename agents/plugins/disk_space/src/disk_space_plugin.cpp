@@ -54,6 +54,24 @@ std::wstring utf8_to_wide(std::string_view s) {
     MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
     return w;
 }
+
+// RAII guard: set the thread error mode on construction, restore on scope exit.
+// Suppresses the Windows session-0 hard-error dialog around a disk query on a
+// not-ready removable / BitLocker-locked volume (which would otherwise block a
+// dispatch-pool worker). Thread-scoped — never the process-wide SetErrorMode,
+// which would race other workers in the bounded pool.
+class ThreadErrorModeGuard {
+public:
+    explicit ThreadErrorModeGuard(DWORD mode) noexcept {
+        ::SetThreadErrorMode(mode, &prev_);
+    }
+    ~ThreadErrorModeGuard() { ::SetThreadErrorMode(prev_, nullptr); }
+    ThreadErrorModeGuard(const ThreadErrorModeGuard&) = delete;
+    ThreadErrorModeGuard& operator=(const ThreadErrorModeGuard&) = delete;
+
+private:
+    DWORD prev_ = 0;
+};
 #endif
 
 int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
@@ -75,14 +93,12 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
     ULARGE_INTEGER avail_to_caller{}, total{}, total_free{};
-    // Suppress the Windows session-0 hard-error dialog for a not-ready removable
-    // or BitLocker-locked volume — without this the call can block this worker
-    // thread awaiting a dialog dismissal that never comes, starving the agent's
-    // bounded dispatch pool. Thread-scoped + restored immediately after.
-    DWORD prev_err_mode = 0;
-    ::SetThreadErrorMode(SEM_FAILCRITICALERRORS, &prev_err_mode);
-    const BOOL ok = ::GetDiskFreeSpaceExW(wpath.c_str(), &avail_to_caller, &total, &total_free);
-    ::SetThreadErrorMode(prev_err_mode, nullptr);
+    BOOL ok;
+    {
+        // Suppress the session-0 hard-error dialog around the query (see the guard).
+        ThreadErrorModeGuard err_guard{SEM_FAILCRITICALERRORS};
+        ok = ::GetDiskFreeSpaceExW(wpath.c_str(), &avail_to_caller, &total, &total_free);
+    }
     if (!ok) {
         ctx.write_output(std::format("error|failed to query disk space for path: {}", path));
         return 1;
